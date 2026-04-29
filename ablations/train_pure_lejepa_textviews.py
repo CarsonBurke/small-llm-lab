@@ -62,6 +62,7 @@ class Hyperparameters(base.Hyperparameters):
     pure_lejepa_sigreg_points = int(os.environ.get("PURE_LEJEPA_SIGREG_POINTS", "17"))
     pure_lejepa_sigreg_t_max = float(os.environ.get("PURE_LEJEPA_SIGREG_T_MAX", "5.0"))
     pure_lejepa_sigreg_tokens = int(os.environ.get("PURE_LEJEPA_SIGREG_TOKENS", "4096"))
+    lejepa_vectorize_views = bool(int(os.environ.get("LEJEPA_VECTORIZE_VIEWS", "1")))
 
     if not base.Hyperparameters.tie_embeddings:
         raise ValueError("Pure LeJEPA text-view ablation keeps the baseline tied embedding setup; set TIE_EMBEDDINGS=1")
@@ -131,6 +132,8 @@ class PureLeJEPATextViewsGPT(base.GPT):
         self.global_keep = float(args.pure_lejepa_global_keep)
         self.local_span_frac = float(args.pure_lejepa_local_span_frac)
         self.sigreg_tokens = int(args.pure_lejepa_sigreg_tokens)
+        self.vectorize_views = bool(args.lejepa_vectorize_views)
+        self.collect_lejepa_diagnostics = False
         self.projector = LeJEPATextProjector(
             input_dim=args.model_dim,
             hidden_dim=args.pure_lejepa_proj_hidden,
@@ -142,14 +145,29 @@ class PureLeJEPATextViewsGPT(base.GPT):
 
         dirs = torch.randn(args.pure_lejepa_sigreg_slices, args.pure_lejepa_proj_dim, dtype=torch.float32)
         dirs = F.normalize(dirs, dim=-1)
-        t = torch.linspace(
-            -args.pure_lejepa_sigreg_t_max,
-            args.pure_lejepa_sigreg_t_max,
-            args.pure_lejepa_sigreg_points,
-            dtype=torch.float32,
-        )
+        if args.pure_lejepa_sigreg_points % 2 == 1:
+            t = torch.linspace(
+                0.0,
+                args.pure_lejepa_sigreg_t_max,
+                args.pure_lejepa_sigreg_points // 2 + 1,
+                dtype=torch.float32,
+            )
+            sigreg_integral_factor = 2.0
+        else:
+            t = torch.linspace(
+                -args.pure_lejepa_sigreg_t_max,
+                args.pure_lejepa_sigreg_t_max,
+                args.pure_lejepa_sigreg_points,
+                dtype=torch.float32,
+            )
+            sigreg_integral_factor = 1.0
         self.register_buffer("sigreg_dirs", dirs, persistent=False)
         self.register_buffer("sigreg_t", t, persistent=False)
+        self.register_buffer(
+            "sigreg_integral_factor",
+            torch.tensor(sigreg_integral_factor, dtype=torch.float32),
+            persistent=False,
+        )
         self.register_buffer("last_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("last_inv_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("last_sigreg_loss", torch.zeros((), dtype=torch.float32), persistent=False)
@@ -231,43 +249,62 @@ class PureLeJEPATextViewsGPT(base.GPT):
         return self.projector(self.masked_pool(hidden, mask))
 
     def stochastic_projected_input_views(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        masks = [
-            self.global_mask(input_ids),
-            self.global_mask(input_ids),
-            self.local_mask(input_ids),
-            self.local_mask(input_ids),
-        ]
-        pooled = []
-        projected = []
-        for mask in masks:
-            hidden = self.encode_hidden(input_ids, mask)
-            pooled_view = self.masked_pool(hidden, mask)
-            pooled.append(pooled_view)
-            projected.append(self.projector(pooled_view))
-        return torch.stack(projected, dim=0), torch.stack(masks, dim=0), torch.stack(pooled, dim=0)
+        masks = torch.stack(
+            [
+                self.global_mask(input_ids),
+                self.global_mask(input_ids),
+                self.local_mask(input_ids),
+                self.local_mask(input_ids),
+            ],
+            dim=0,
+        )
+        if not self.vectorize_views:
+            pooled = []
+            projected = []
+            for mask in masks:
+                hidden = self.encode_hidden(input_ids, mask)
+                pooled_view = self.masked_pool(hidden, mask)
+                pooled.append(pooled_view)
+                projected.append(self.projector(pooled_view))
+            return torch.stack(projected, dim=0), masks, torch.stack(pooled, dim=0)
 
-    def _samples_for_sigreg(self, views: Tensor) -> Tensor:
-        samples = views.reshape(-1, views.size(-1))
-        if samples.size(0) <= self.sigreg_tokens:
-            return samples
-        stride = max(samples.size(0) // self.sigreg_tokens, 1)
-        return samples[::stride][: self.sigreg_tokens]
+        view_count, bsz, seqlen = masks.shape
+        flat_input_ids = (
+            input_ids.unsqueeze(0)
+            .expand(view_count, -1, -1)
+            .reshape(view_count * bsz, seqlen)
+        )
+        flat_masks = masks.reshape(view_count * bsz, seqlen)
+        hidden = self.encode_hidden(flat_input_ids, flat_masks)
+        pooled = self.masked_pool(hidden, flat_masks).reshape(view_count, bsz, -1)
+        projected = self.projector(pooled.reshape(view_count * bsz, -1)).reshape(view_count, bsz, -1)
+        return projected, masks, pooled
 
-    def _sigreg_loss_for_samples(self, samples: Tensor) -> Tensor:
-        samples = self._samples_for_sigreg(samples).float()
-        dirs = self.sigreg_dirs.to(device=samples.device, dtype=torch.float32)
-        t = self.sigreg_t.to(device=samples.device, dtype=torch.float32)
-        gaussian_cf = torch.exp(-0.5 * t.square()).view(1, -1)
-        proj = samples @ dirs.T
-        angles = proj.unsqueeze(-1) * t.view(1, 1, -1)
-        real = torch.cos(angles).mean(dim=0)
-        imag = torch.sin(angles).mean(dim=0)
-        err = (real - gaussian_cf).square() + imag.square()
-        return samples.size(0) * torch.trapz(err * gaussian_cf, t, dim=-1).mean()
+    def _sample_views_for_sigreg(self, views: Tensor) -> Tensor:
+        view_count, samples_per_view, dim = views.shape
+        if samples_per_view <= self.sigreg_tokens:
+            return views
+        stride = max(samples_per_view // self.sigreg_tokens, 1)
+        return views[:, ::stride, :][:, : self.sigreg_tokens, :].reshape(view_count, -1, dim)
 
     def sigreg_loss(self, views: Tensor) -> Tensor:
-        view_losses = [self._sigreg_loss_for_samples(view) for view in views]
-        return torch.stack(view_losses).mean()
+        samples = self._sample_views_for_sigreg(views).float()
+        dirs = self.sigreg_dirs.to(device=samples.device, dtype=torch.float32)
+        t = self.sigreg_t.to(device=samples.device, dtype=torch.float32)
+        gaussian_cf = torch.exp(-0.5 * t.square()).view(1, 1, -1)
+
+        proj = torch.einsum("vnd,md->vnm", samples, dirs)
+        angles = proj.unsqueeze(-1) * t.view(1, 1, 1, -1)
+        real = torch.cos(angles).mean(dim=1)
+        imag = torch.sin(angles).mean(dim=1)
+        err = (real - gaussian_cf).square() + imag.square()
+        integral = self.sigreg_integral_factor.to(device=samples.device) * torch.trapz(
+            err * gaussian_cf,
+            t,
+            dim=-1,
+        )
+        per_view = samples.size(1) * integral.mean(dim=-1)
+        return per_view.mean()
 
     def effective_rank(self, samples: Tensor) -> Tensor:
         with torch.autocast(device_type=samples.device.type, enabled=False):
@@ -304,15 +341,6 @@ class PureLeJEPATextViewsGPT(base.GPT):
                 F.normalize(views[2].float(), dim=-1) * F.normalize(views[3].float(), dim=-1)
             ).sum(dim=-1).mean()
             view_spread = (views.float() - center.float()).square().sum(dim=-1).sqrt().mean()
-            view_eff_rank = torch.stack([self.effective_rank(view) for view in views]).mean()
-            global_mask_jaccard = (masks[0] & masks[1]).sum(dim=1).float() / (masks[0] | masks[1]).sum(dim=1).clamp_min(1).float()
-            local_mask_jaccard = (masks[2] & masks[3]).sum(dim=1).float() / (masks[2] | masks[3]).sum(dim=1).clamp_min(1).float()
-            global_pooled_cos = (
-                F.normalize(pooled[0].float(), dim=-1) * F.normalize(pooled[1].float(), dim=-1)
-            ).sum(dim=-1).mean()
-            local_pooled_cos = (
-                F.normalize(pooled[2].float(), dim=-1) * F.normalize(pooled[3].float(), dim=-1)
-            ).sum(dim=-1).mean()
 
         self.last_loss.copy_(loss.detach())
         self.last_inv_loss.copy_(inv_loss.detach())
@@ -321,11 +349,26 @@ class PureLeJEPATextViewsGPT(base.GPT):
         self.last_global_cos.copy_(global_cos)
         self.last_local_cos.copy_(local_cos)
         self.last_view_spread.copy_(view_spread)
-        self.last_view_eff_rank.copy_(view_eff_rank)
-        self.last_global_mask_jaccard.copy_(global_mask_jaccard.mean())
-        self.last_local_mask_jaccard.copy_(local_mask_jaccard.mean())
-        self.last_global_pooled_cos.copy_(global_pooled_cos)
-        self.last_local_pooled_cos.copy_(local_pooled_cos)
+        if self.collect_lejepa_diagnostics:
+            with torch.no_grad():
+                view_eff_rank = torch.stack([self.effective_rank(view) for view in views]).mean()
+                global_mask_jaccard = (masks[0] & masks[1]).sum(dim=1).float() / (
+                    masks[0] | masks[1]
+                ).sum(dim=1).clamp_min(1).float()
+                local_mask_jaccard = (masks[2] & masks[3]).sum(dim=1).float() / (
+                    masks[2] | masks[3]
+                ).sum(dim=1).clamp_min(1).float()
+                global_pooled_cos = (
+                    F.normalize(pooled[0].float(), dim=-1) * F.normalize(pooled[1].float(), dim=-1)
+                ).sum(dim=-1).mean()
+                local_pooled_cos = (
+                    F.normalize(pooled[2].float(), dim=-1) * F.normalize(pooled[3].float(), dim=-1)
+                ).sum(dim=-1).mean()
+            self.last_view_eff_rank.copy_(view_eff_rank)
+            self.last_global_mask_jaccard.copy_(global_mask_jaccard.mean())
+            self.last_local_mask_jaccard.copy_(local_mask_jaccard.mean())
+            self.last_global_pooled_cos.copy_(global_pooled_cos)
+            self.last_local_pooled_cos.copy_(local_pooled_cos)
         return loss
 
     def probe_ce_loss(self, input_ids: Tensor, target_ids: Tensor, detach_hidden: bool) -> Tensor:
@@ -516,7 +559,8 @@ def main() -> None:
         f"global_keep={args.pure_lejepa_global_keep} local_span_frac={args.pure_lejepa_local_span_frac} "
         f"sigreg_slices={args.pure_lejepa_sigreg_slices} sigreg_points={args.pure_lejepa_sigreg_points} "
         f"sigreg_t_max={args.pure_lejepa_sigreg_t_max} sigreg_tokens={args.pure_lejepa_sigreg_tokens} "
-        f"head=detached_linear_probe"
+        f"sigreg_effective_t_points={base_model.sigreg_t.numel()} "
+        f"vectorize_views={int(args.lejepa_vectorize_views)} head=detached_linear_probe"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} lejepa_optimizer:adamw lejepa_lr:{args.lejepa_lr} "
@@ -635,6 +679,12 @@ def main() -> None:
         schedule_pos = step % (args.lejepa_steps_per_probe + 1)
         stage = "lejepa" if schedule_pos < args.lejepa_steps_per_probe else "probe"
         base_model.set_stage(stage)
+        next_step = step + 1
+        will_log_train = (
+            args.train_log_every > 0
+            and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
+        base_model.collect_lejepa_diagnostics = stage == "lejepa" and will_log_train
         active_optimizers = pretrain_optimizers if stage == "lejepa" else probe_optimizers
         if stage == "lejepa":
             base_model.resample_sigreg_dirs(step)
@@ -668,11 +718,12 @@ def main() -> None:
                 train_global_cos += base_model.last_global_cos.detach()
                 train_local_cos += base_model.last_local_cos.detach()
                 train_view_spread += base_model.last_view_spread.detach()
-                train_view_eff_rank += base_model.last_view_eff_rank.detach()
-                train_global_mask_jaccard += base_model.last_global_mask_jaccard.detach()
-                train_local_mask_jaccard += base_model.last_local_mask_jaccard.detach()
-                train_global_pooled_cos += base_model.last_global_pooled_cos.detach()
-                train_local_pooled_cos += base_model.last_local_pooled_cos.detach()
+                if base_model.collect_lejepa_diagnostics:
+                    train_view_eff_rank += base_model.last_view_eff_rank.detach()
+                    train_global_mask_jaccard += base_model.last_global_mask_jaccard.detach()
+                    train_local_mask_jaccard += base_model.last_local_mask_jaccard.detach()
+                    train_global_pooled_cos += base_model.last_global_pooled_cos.detach()
+                    train_local_pooled_cos += base_model.last_local_pooled_cos.detach()
             else:
                 train_probe_loss += base_model.last_probe_loss.detach()
                 train_probe_acc += base_model.last_probe_acc.detach()
@@ -686,11 +737,12 @@ def main() -> None:
             train_global_cos /= grad_accum_steps
             train_local_cos /= grad_accum_steps
             train_view_spread /= grad_accum_steps
-            train_view_eff_rank /= grad_accum_steps
-            train_global_mask_jaccard /= grad_accum_steps
-            train_local_mask_jaccard /= grad_accum_steps
-            train_global_pooled_cos /= grad_accum_steps
-            train_local_pooled_cos /= grad_accum_steps
+            if base_model.collect_lejepa_diagnostics:
+                train_view_eff_rank /= grad_accum_steps
+                train_global_mask_jaccard /= grad_accum_steps
+                train_local_mask_jaccard /= grad_accum_steps
+                train_global_pooled_cos /= grad_accum_steps
+                train_local_pooled_cos /= grad_accum_steps
         else:
             train_probe_loss /= grad_accum_steps
             train_probe_acc /= grad_accum_steps
@@ -709,10 +761,7 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
+        should_log_train = will_log_train
         if should_log_train:
             if stage == "lejepa":
                 diag = base_model.token_view_diagnostics()
