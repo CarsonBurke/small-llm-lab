@@ -15,9 +15,9 @@ Ablation-driven development. Every change must show measurable BPB improvement a
 4. Scale to full run, validate on 8xH100
 
 ## Ablation Protocol
-- Default: 2000 steps, val every 400 steps
+- Default: 2000 steps, val every 20 steps
 - Compare against baseline_2k reference
-- Log everything to tensorboard (`tb_logs/`) and `ablation_results/<name>/`
+- Store canonical metrics in `ablation_results/<name>/metrics.jsonl`; TensorBoard (`tb_logs/`) is fed from that stream
 - A change is worth keeping if it improves BPB at step 2000 by >0.005
 
 ## Key Files
@@ -25,7 +25,7 @@ Ablation-driven development. Every change must show measurable BPB improvement a
 - `sota_train_gpt.py` — decompressed #1 submission, patched for SDPA (no FA3)
 - `ablation.py` — run experiments: `python3 ablation.py --steps 2000 --name <name>`
 - `plot_ablations.py` — compare runs visually
-- `tb_watcher.py` — live tensorboard from log files
+- `tb_watcher.py` — live tensorboard from `metrics.jsonl`
 - `NOTES.md` — working notes, reference numbers, time estimates
 
 ## Commands
@@ -40,5 +40,6 @@ python3 ablation.py --name <name> --env KEY=VALUE                 # override
 ## Conventions
 - Experiment scripts go in repo root, named descriptively
 - Never modify `train_gpt.py` (upstream baseline) — fork for experiments
-- Results in `ablation_results/<run_name>/result.json`
+- Metrics in `ablation_results/<run_name>/metrics.jsonl`
+- Summary in `ablation_results/<run_name>/result.json`
 - Tensorboard in `tb_logs/<run_name>/`
