@@ -1,0 +1,52 @@
+{
+  "phase": "latent_vapo_dapo",
+  "args": {
+    "checkpoint": "ablation_results/fresh_lejepa_srms_pope_zero_b128_mathmix_2k/pretraining_checkpoint.pt",
+    "output": "ablation_results/latent_vapo_dapo_mathckpt_gate",
+    "steps": 2000,
+    "math_data": "postraining/data/dapo-math-17k.parquet",
+    "prompt_tokens": 384,
+    "continuation_tokens": 128,
+    "prompts_per_rollout": 16,
+    "samples_per_prompt": 8,
+    "ppo_epochs": 2,
+    "max_stream_steps": 0,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "gate_lr": 0.0001,
+    "renderer_lr": 1e-06,
+    "critic_lr": 0.0003,
+    "value_bins": 101,
+    "value_sigma_ratio": 2.0,
+    "value_prior": 0.05,
+    "transition_lr": 0.0001,
+    "gate_entropy_coef": 0.001,
+    "beta_nll_beta": 0.5,
+    "positive_lm_weight": 0.1,
+    "positive_reward_threshold": 0.5,
+    "value_warmup_steps": 50,
+    "bpb_every": 80,
+    "aime_every": 80,
+    "aime_data": "postraining/data/aime-2024.parquet",
+    "aime_samples": 32,
+    "aime_max_tokens": 512,
+    "aime_chunk": 32,
+    "save_every": 50,
+    "rollout_only": true,
+    "gate_min_within_group_reward_std": 0.01,
+    "resume": null,
+    "seed": 1337
+  },
+  "base": {
+    "checkpoint": "ablation_results/fresh_lejepa_srms_pope_zero_b128_mathmix_2k/pretraining_checkpoint.pt",
+    "architecture": "fresh_lejepa_shared_rms_v1_probes_pope_zero_scratch_2k"
+  },
+  "critic": {
+    "init": "scratch",
+    "architecture": "fresh_lejepa_shared_rms_v1_probes_pope_zero_scratch_2k",
+    "value_bins": 101,
+    "value_sigma_ratio": 2.0,
+    "value_prior": 0.05,
+    "parameters": 28925101
+  }
+}

@@ -1,0 +1,105 @@
+{
+  "name": "fresh_lejepa_shared_rms_v1_pope_zero_b128_scratch_2k_v2",
+  "script": "fresh_lejepa_train_v1_probe_shared_rms_pope_zero.py",
+  "overrides": {
+    "FRESH_CHECKPOINT_EVERY": "200"
+  },
+  "steps": 2000,
+  "val_every": 200,
+  "elapsed_seconds": 4352.2413074970245,
+  "final_val_bpb": 1.4966,
+  "final_val_loss": 2.5269,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 4.1052,
+      "val_loss": 6.9315
+    },
+    {
+      "step": 200,
+      "step_avg_ms": 1935.77,
+      "train_time_ms": 387154.0,
+      "type": "val",
+      "val_bpb": 1.9665,
+      "val_loss": 3.3204
+    },
+    {
+      "step": 400,
+      "step_avg_ms": 1935.42,
+      "train_time_ms": 774168.0,
+      "type": "val",
+      "val_bpb": 1.7888,
+      "val_loss": 3.0203
+    },
+    {
+      "step": 600,
+      "step_avg_ms": 1935.82,
+      "train_time_ms": 1161494.0,
+      "type": "val",
+      "val_bpb": 1.6767,
+      "val_loss": 2.831
+    },
+    {
+      "step": 800,
+      "step_avg_ms": 1936.25,
+      "train_time_ms": 1548997.0,
+      "type": "val",
+      "val_bpb": 1.6193,
+      "val_loss": 2.734
+    },
+    {
+      "step": 1000,
+      "step_avg_ms": 1939.06,
+      "train_time_ms": 1939057.0,
+      "type": "val",
+      "val_bpb": 1.5808,
+      "val_loss": 2.6691
+    },
+    {
+      "step": 1200,
+      "step_avg_ms": 1941.44,
+      "train_time_ms": 2329729.0,
+      "type": "val",
+      "val_bpb": 1.5547,
+      "val_loss": 2.6251
+    },
+    {
+      "step": 1400,
+      "step_avg_ms": 1942.78,
+      "train_time_ms": 2719897.0,
+      "type": "val",
+      "val_bpb": 1.5362,
+      "val_loss": 2.5937
+    },
+    {
+      "step": 1600,
+      "step_avg_ms": 1943.1,
+      "train_time_ms": 3108965.0,
+      "type": "val",
+      "val_bpb": 1.5221,
+      "val_loss": 2.57
+    },
+    {
+      "step": 1800,
+      "step_avg_ms": 1943.47,
+      "train_time_ms": 3498253.0,
+      "type": "val",
+      "val_bpb": 1.5067,
+      "val_loss": 2.5441
+    },
+    {
+      "step": 2000,
+      "step_avg_ms": 1944.12,
+      "train_time_ms": 3888232.0,
+      "type": "val",
+      "val_bpb": 1.4966,
+      "val_loss": 2.5269
+    }
+  ],
+  "returncode": 0
+}

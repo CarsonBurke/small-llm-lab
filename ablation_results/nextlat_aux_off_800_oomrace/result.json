@@ -1,0 +1,18 @@
+{
+  "name": "nextlat_aux_off_800",
+  "script": "nextlat_train_gpt.py",
+  "overrides": {
+    "NEXTLAT_LAMBDA_MSE": "0",
+    "NEXTLAT_LAMBDA_KL": "0"
+  },
+  "steps": 800,
+  "val_every": 20,
+  "elapsed_seconds": 10.229193687438965,
+  "final_val_bpb": null,
+  "final_val_loss": null,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [],
+  "returncode": 1,
+  "error": "_functorch/_aot_autograd/runtime_wrappers.py\", line 2844, in forward\n    fw_outs = call_func_at_runtime_with_args(\n        CompiledFunction.compiled_fw,\n    ...<2 lines>...\n        disable_amp=disable_amp,\n    )\n  File \"/usr/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/utils.py\", line 126, in call_func_at_runtime_with_args\n    out = normalize_as_list(f(args))\n                            ~^^^^^^\n  File \"/usr/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 850, in wrapper\n    return compiled_fn(runtime_args)\n  File \"/usr/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 1055, in inner_fn\n    outs = compiled_fn(args)\n  File \"/usr/lib/python3.14/site-packages/torch/_inductor/output_code.py\", line 725, in __call__\n    return self.current_callable(inputs)\n           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^\n  File \"/var/tmp/torchinductor_marvin/uo/cuouuwxkjapgr2hzyfacgymnj5rxpqhqvntyidg6dq3umtakltbf.py\", line 3510, in call\n    buf71 = empty_strided_cuda((64, 1024, 1024), (1048576, 1024, 1), torch.bfloat16)\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 128.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 229.44 MiB is free. Process 4579 has 17.37 MiB memory in use. Process 4410 has 140.34 MiB memory in use. Process 10422 has 94.30 MiB memory in use. Process 4556 has 11.97 MiB memory in use. Process 3747773 has 3.83 GiB memory in use. Process 223022 has 4.78 GiB memory in use. Process 225258 has 15.47 GiB memory in use. Including non-PyTorch memory, this process has 3.23 GiB memory in use. Of the allocated memory 2.56 GiB is allocated by PyTorch, and 9.40 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)\n"
+}
