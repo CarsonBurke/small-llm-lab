@@ -200,7 +200,6 @@ class LatentThoughtModel(nn.Module):
         self.transition = GaussianTransitionHead(model_dim)
         self.gate = ThinkEmitGate(model_dim)
         self.adapter = ThoughtAdapter(model_dim)
-        self.latent_critic = type(backbone.policy_probe)(model_dim, 1)
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.backbone.embed_tokens(token_ids)
@@ -254,15 +253,17 @@ class LatentThoughtModel(nn.Module):
         return self.step(self.embed_tokens(token_ids[:, None]), caches, position)
 
     def thought_input(self, thought: Tensor) -> Tensor:
-        return self.adapter(thought.to(self.backbone.tok_emb.weight.dtype))[:, None]
-
-    def latent_value(self, belief: Tensor, predicted: Tensor) -> Tensor:
-        features = torch.cat((belief.detach(), predicted.detach()), dim=-1)
-        return self.latent_critic(features).squeeze(-1)
+        # The adapter runs in fp32 on the raw thought and the result is
+        # rounded to the embedding dtype afterwards — the same cast order as
+        # ``assemble_stream_latents`` — so rollout and replay agree exactly
+        # and the fp32 adapter never sees a low-precision operand.
+        return self.adapter(thought.float())[:, None].to(
+            self.backbone.tok_emb.weight.dtype
+        )
 
     def new_parameters(self):
         """Post-training parameters that do not exist in the pretrained checkpoint."""
-        for module in (self.transition, self.gate, self.adapter, self.latent_critic):
+        for module in (self.transition, self.gate, self.adapter):
             yield from module.parameters()
 
     def load_backbone_checkpoint(self, state: dict[str, Tensor]) -> None:

@@ -91,6 +91,28 @@ def test_v2_pretraining_and_rl_checkpoints_reconstruct_architecture(tmp_path):
     assert isinstance(resumed, FreshLeJEPAGPTV2)
 
 
+def test_load_model_keeps_fp32_masters_and_reproduces_outputs(tmp_path):
+    # Pretraining trains fp32 master weights; a whole-body bf16 cast at load
+    # time measurably degrades real checkpoints (+0.32 val BPB on the PoPE 2k
+    # run), so load_model must reproduce the source model exactly.
+    torch.manual_seed(11)
+    model = FreshLeJEPAGPTV2(**DEFAULT_MODEL_CONFIG).eval()
+    checkpoint = tmp_path / "fp32.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "metadata": {"architecture": ARCHITECTURE, "model": DEFAULT_MODEL_CONFIG},
+        },
+        checkpoint,
+    )
+    loaded = load_model(checkpoint, torch.device("cpu")).eval()
+    assert all(p.dtype == torch.float32 for p in loaded.parameters())
+    ids = torch.randint(0, DEFAULT_MODEL_CONFIG["vocab_size"], (2, 8))
+    targets = torch.randint(0, DEFAULT_MODEL_CONFIG["vocab_size"], (2, 8))
+    with torch.no_grad():
+        assert torch.equal(loaded(ids, targets), model(ids, targets))
+
+
 def test_v2_policy_compiles_with_dynamic_sequence():
     model = tiny_v2().eval()
     compiled = torch.compile(model.policy_logits, dynamic=True, fullgraph=False, backend="eager")

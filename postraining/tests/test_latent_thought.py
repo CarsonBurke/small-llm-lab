@@ -210,16 +210,3 @@ def test_new_parameters_exclude_backbone_and_strict_load_round_trips():
     wrapper.load_backbone_checkpoint(
         {key: value.clone() for key, value in backbone.state_dict().items()}
     )
-
-
-def test_latent_value_is_scalar_per_sequence_and_detached_from_backbone():
-    torch.manual_seed(29)
-    backbone = _pope_model()
-    wrapper = LatentThoughtModel(backbone)
-    belief = torch.randn(3, 32, requires_grad=True)
-    predicted = torch.randn(3, 32, requires_grad=True)
-    value = wrapper.latent_value(belief, predicted)
-    assert value.shape == (3,)
-    value.sum().backward()
-    assert belief.grad is None
-    assert predicted.grad is None

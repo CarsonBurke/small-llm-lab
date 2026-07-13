@@ -9,7 +9,6 @@ import torch
 
 import train_gpt as baseline
 from fresh_lejepa_train import EXPERIMENT_ARCHITECTURE, FreshLeJEPAGPT
-from train_gpt import CastedLinear, restore_low_dim_params_to_fp32
 
 
 @contextmanager
@@ -171,13 +170,14 @@ def load_model(
 
         model_class = FreshLeJEPASharedRMSProjectorV1Probes
     with construction:
-        model = model_class(**config).to(device).bfloat16()
+        # Pretraining trains fp32 master weights and lets autocast (or
+        # CastedLinear) drop precision per-op; a whole-body bf16 cast is NOT
+        # equivalent — measured +0.32 val BPB on the PoPE 2k checkpoint
+        # (phase math and norms are precision-sensitive) — so the loaded
+        # model keeps the checkpoint's fp32 masters.
+        model = model_class(**config).to(device)
         model.model_config = config
         model.architecture = architecture
-        for module in model.modules():
-            if isinstance(module, CastedLinear):
-                module.float()
-        restore_low_dim_params_to_fp32(model)
     state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
     model.load_state_dict(state, strict=True)
     for parameter in model.parameters():
