@@ -33,13 +33,15 @@ def main() -> None:
     device = torch.device("cuda")
     model = load_model(args.checkpoint, device)
     model.eval()
+    if hasattr(model, "fold_input_projector_for_inference"):
+        model.fold_input_projector_for_inference()
     tokenizer = spm.SentencePieceProcessor(model_file=args.tokenizer)
     rows = load_unique_math_rows(args.test_file)
     results = []
     for row in rows:
-        _, responses = generate_group(
+        _, responses, _, _ = generate_group(
             model, tokenizer, prompt_text(row), args.samples, args.max_tokens,
-            args.temperature, args.top_p,
+            args.temperature, args.top_p, capture_stats=False,
         )
         ground_truth = row["reward_model"]["ground_truth"]
         for response in responses:
