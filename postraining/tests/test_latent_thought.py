@@ -36,13 +36,12 @@ def test_token_step_matches_backbone_generation_step():
     caches_b = backbone.make_generation_cache(2, ids.size(1), torch.device("cpu"))
     with torch.no_grad():
         for position in range(ids.size(1)):
-            logits, value, caches_a = backbone.generation_step(
+            logits, _, caches_a = backbone.generation_step(
                 ids[:, position], caches_a, position
             )
             output = wrapper.token_step(ids[:, position], caches_b, position)
             caches_b = output.caches
             torch.testing.assert_close(output.logits, logits)
-            torch.testing.assert_close(output.value, value)
 
 
 def test_cached_generation_matches_full_forward_beyond_pretraining_context():

@@ -175,13 +175,16 @@ class ThoughtAdapter(nn.Module):
 
 @dataclass
 class StepOutput:
-    """Everything one stream step exposes to rollout and training code."""
+    """Everything one stream step exposes to rollout and training code.
+
+    No value: the critic is a separate model that scores stored streams in
+    parallel (``refresh_old_statistics``); the stepwise path never values.
+    """
 
     belief: Tensor
     predicted: Tensor
     input_latent: Tensor
     logits: Tensor
-    value: Tensor
     caches: list[tuple[Tensor, ...]]
 
 
@@ -234,13 +237,11 @@ class LatentThoughtModel(nn.Module):
         predicted = backbone.prediction_latent(belief)
         features = backbone.generation_probe_features(input_latent, belief, predicted)
         logits = backbone.logits_from_features(features).squeeze(1)
-        value = backbone.values_from_features(features).squeeze(1)
         return StepOutput(
             belief=belief.squeeze(1),
             predicted=predicted.squeeze(1),
             input_latent=input_latent.squeeze(1),
             logits=logits,
-            value=value,
             caches=next_caches,
         )
 

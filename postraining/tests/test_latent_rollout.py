@@ -155,7 +155,7 @@ def test_stream_storage_is_internally_consistent():
     assert float(batch.thoughts[pads].abs().sum()) == 0.0
 
 
-def test_replay_reproduces_rollout_values_and_logprobs():
+def test_replay_reproduces_rollout_logprobs():
     wrapper = _wrapper()
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
     backbone = wrapper.backbone
@@ -163,7 +163,6 @@ def test_replay_reproduces_rollout_values_and_logprobs():
         stream_inputs, beliefs = replay_beliefs(wrapper, batch)
         predicted = backbone.prediction_latent(beliefs)
         features = torch.cat((stream_inputs, predicted), dim=-1)
-        values = backbone.values_from_features(features).float()
         gate_logprobs = wrapper.gate.log_prob(batch.gate_actions.float(), beliefs)
         logits = backbone.logits_from_features(features).float()
         token_targets = torch.zeros_like(batch.token_ids)
@@ -172,9 +171,9 @@ def test_replay_reproduces_rollout_values_and_logprobs():
             -1, token_targets[..., None]
         ).squeeze(-1)
     mask = batch.action_mask.bool()
-    torch.testing.assert_close(
-        values[mask], batch.old_values[mask], rtol=2e-4, atol=2e-4
-    )
+    # The rollout never values: old_values stay zero until the separate
+    # critic fills them in refresh_old_statistics.
+    assert float(batch.old_values.abs().sum()) == 0.0
     unforced = mask & ~batch.forced_mask.bool()
     torch.testing.assert_close(
         gate_logprobs[unforced], batch.old_gate_logprobs[unforced], rtol=2e-4, atol=2e-4

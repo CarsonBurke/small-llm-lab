@@ -122,6 +122,8 @@ def rollout_continuations(
     emit_mask = torch.zeros_like(action_mask)
     old_gate_logprobs = torch.zeros_like(action_mask)
     old_token_logprobs = torch.zeros_like(action_mask)
+    # Stays zero through the rollout; refresh_old_statistics fills it from
+    # the separate critic before anything consumes it.
     old_values = torch.zeros_like(action_mask)
 
     kind[:, :prompt_length] = TOKEN_SLOT
@@ -157,7 +159,6 @@ def rollout_continuations(
         gate_actions[record, position] = action[record]
         forced_mask[record & forced, position] = 1.0
         old_gate_logprobs[record, position] = gate_logprob[record].float()
-        old_values[record, position] = output.value[record].float()
         emits = record & (action == EMIT)
         thinks = record & (action == THINK)
         old_token_logprobs[emits, position] = token_logprob[emits]
