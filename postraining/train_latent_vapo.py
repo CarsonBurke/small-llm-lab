@@ -12,10 +12,14 @@ D4-faithful separation of concerns on top of a frozen pretrained trunk:
   real token), never by policy gradient.
 - The policy trunk, embeddings, projectors, and adapter do not train at all.
 
-Rewards are Tier 0 of the curriculum: continuation match (longest common
-prefix + character F1) against the true FineWeb continuation.  ``--rollout-only``
-is the tier's learnability gate: it reports whether rewards vary within
-prompt groups at the initial 50/50 gate before any update is attempted.
+Data and rewards follow the VAPO paper exactly: prompts are DAPO-Math-17K,
+the terminal reward is the binary Minerva-style verifier on the EOS-truncated
+generation, positives for the auxiliary LM loss are verifier-correct
+trajectories, and AIME 2024 avg@k is the eval.  Each prompt group rolls out
+as its own batch (prompts vary in length), and each group is one PPO
+minibatch.  ``--rollout-only`` is the learnability gate: it reports whether
+rewards vary within prompt groups at the initial 50/50 gate before any
+update is attempted.
 
     python3 -m postraining.train_latent_vapo \
         --checkpoint ablation_results/<run>/pretraining_checkpoint.pt \
@@ -51,7 +55,6 @@ from postraining.latent_rollout import (
     THOUGHT_SLOT,
     LatentRolloutBatch,
     assign_terminal_rewards,
-    continuation_reward,
     emitted_token_rows,
     grounded_transition_mask,
     refresh_old_statistics,
@@ -74,7 +77,11 @@ def sample_prompt_batch(
     seq_len: int,
     grad_accum: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Carve (prompt, reference-continuation) pairs from the token stream."""
+    """Carve (prompt, reference-continuation) pairs from the token stream.
+
+    Training no longer uses this (RL data is DAPO-Math only); it remains for
+    ``sample_latent --fineweb`` inspection.
+    """
     needed = prompt_tokens + continuation_tokens
     if needed > seq_len:
         raise ValueError("prompt + continuation must fit in one training sequence")
@@ -88,15 +95,41 @@ def sample_prompt_batch(
     )
 
 
-def score_rollout(
-    batch: LatentRolloutBatch, reference_ids: torch.Tensor, tokenizer
+class MathPromptSampler:
+    """Epoch-shuffled DAPO prompt stream with a resumable cursor."""
+
+    def __init__(self, rows: list[dict], seed: int):
+        if not rows:
+            raise ValueError("no math prompts loaded")
+        self.rows = rows
+        self.seed = seed
+        self.cursor = 0
+        self._epoch = -1
+        self._order: list[int] = []
+
+    def next_rows(self, count: int) -> list[dict]:
+        picked = []
+        while len(picked) < count:
+            epoch, offset = divmod(self.cursor, len(self.rows))
+            if epoch != self._epoch:
+                self._epoch = epoch
+                self._order = list(range(len(self.rows)))
+                random.Random(self.seed * 1_000_003 + epoch).shuffle(self._order)
+            picked.append(self.rows[self._order[offset]])
+            self.cursor += 1
+        return picked
+
+
+def score_math_rollout(
+    batch: LatentRolloutBatch, truth: str, tokenizer, eos: int
 ) -> None:
-    """Decode emissions against references and write terminal rewards."""
+    """Binary verifier rewards on EOS-truncated decoded emissions."""
     scores = []
-    for emitted, reference in zip(emitted_token_rows(batch), reference_ids.tolist(), strict=True):
-        scores.append(
-            continuation_reward(tokenizer.decode(emitted), tokenizer.decode(reference))
-        )
+    for emitted in emitted_token_rows(batch):
+        if eos >= 0 and eos in emitted:
+            emitted = emitted[: emitted.index(eos) + 1]
+        correct, _ = verify_answer(tokenizer.decode(emitted), truth)
+        scores.append(float(correct))
     assign_terminal_rewards(
         batch, torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device)
     )
@@ -109,7 +142,7 @@ def evaluate_aime_latent(
     rows: list[dict],
     samples: int,
     max_new_tokens: int,
-    max_consecutive_thinks: int,
+    max_stream_steps: int,
     chunk: int,
     seed: int,
     device: torch.device,
@@ -144,7 +177,8 @@ def evaluate_aime_latent(
                 batch = trim_stream(
                     rollout_continuations(
                         wrapper, prompt_ids.expand(width, -1), max_new_tokens,
-                        max_consecutive_thinks, 1.0, 0.7,
+                        max_stream_steps, 1.0, 0.7,
+                        eos_id=eos if eos >= 0 else None,
                     )
                 )
                 think_actions += float(
@@ -204,10 +238,25 @@ def rollout_diagnostics(
         "think_run_mean": float(runs.mean()) if runs.numel() else 0.0,
         "think_run_std": float(runs.std(unbiased=False)) if runs.numel() else 0.0,
         "think_runs_per_trajectory": runs.numel() / batch.reward_scalar.numel(),
-        "forced_fraction": float(batch.forced_mask.sum() / actions),
+        "emits_per_trajectory": float(batch.emit_mask.sum(1).mean()),
         "actions_per_trajectory": float(batch.action_mask.sum(1).mean()),
         "old_value_mean": float(batch.old_values[generated].mean()) if generated.any() else 0.0,
     }
+
+
+def aggregate_diagnostics(
+    groups: list[LatentRolloutBatch], samples_per_prompt: int
+) -> dict[str, float | int]:
+    """Mean of per-group rollout diagnostics; trajectory counts are summed."""
+    per_group = [rollout_diagnostics(group, samples_per_prompt) for group in groups]
+    aggregated: dict[str, float | int] = {}
+    for key in per_group[0]:
+        values = [metrics[key] for metrics in per_group]
+        if key == "trajectories":
+            aggregated[key] = int(sum(values))
+        else:
+            aggregated[key] = float(sum(values) / len(values))
+    return aggregated
 
 
 def gradient_norm(parameters) -> float:
@@ -270,7 +319,7 @@ def update_minibatch(
         optimizers["critic"].step()
         return metrics
 
-    gate_mask = batch.action_mask * (1.0 - batch.forced_mask)
+    gate_mask = batch.action_mask
     new_gate_logprobs = wrapper.gate.log_prob(batch.gate_actions.float(), beliefs)
     gate_loss, gate_clip = clipped_policy_loss(
         new_gate_logprobs, batch.old_gate_logprobs, advantages, gate_mask
@@ -334,15 +383,15 @@ def update_minibatch(
         )
         log_std = wrapper.transition.log_std(beliefs[batch.action_mask.bool()])
     metrics.update(
-        gate_loss=float(gate_loss),
+        gate_loss=float(gate_loss.detach()),
         gate_clip_fraction=float(gate_clip),
-        gate_entropy=float(gate_entropy),
+        gate_entropy=float(gate_entropy.detach()),
         emit_probability=float(emit_probability),
-        renderer_loss=float(renderer_loss),
+        renderer_loss=float(renderer_loss.detach()),
         renderer_clip_fraction=float(renderer_clip),
-        positive_lm_loss=float(positive_lm),
+        positive_lm_loss=float(positive_lm.detach()),
         positive_fraction=float(positive.float().mean()),
-        transition_nll=float(transition_nll),
+        transition_nll=float(transition_nll.detach()),
         log_std_mean=float(log_std.mean()) if log_std.numel() else 0.0,
         advantage_mean=float(masked_token_mean(advantages, batch.action_mask)),
         advantage_std=float(
@@ -365,7 +414,7 @@ def save_checkpoint(
     optimizers: dict[str, torch.optim.Optimizer],
     step: int,
     args: argparse.Namespace,
-    loader: "baseline.DistributedTokenLoader",
+    sampler: MathPromptSampler,
 ) -> None:
     payload = {
         "step": step,
@@ -373,7 +422,7 @@ def save_checkpoint(
         "critic": critic.state_dict(),
         "optimizers": {name: opt.state_dict() for name, opt in optimizers.items()},
         "args": vars(args),
-        "loader": {"file_idx": loader.stream.file_idx, "pos": loader.stream.pos},
+        "sampler_cursor": sampler.cursor,
         "cpu_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
         "python_rng": random.getstate(),
@@ -389,13 +438,20 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--prompt-tokens", type=int, default=256)
-    parser.add_argument("--continuation-tokens", type=int, default=64)
+    parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
+    # Prompt budget: DAPO prompts longer than this keep their TAIL (the
+    # question and answer-format instruction sit at the end).
+    parser.add_argument("--prompt-tokens", type=int, default=384)
+    parser.add_argument("--continuation-tokens", type=int, default=128)
     parser.add_argument("--prompts-per-rollout", type=int, default=16)
-    parser.add_argument("--samples-per-prompt", type=int, default=4)
+    # Each prompt group is one PPO minibatch (prompts vary in length, so
+    # groups are separate batches end to end).
+    parser.add_argument("--samples-per-prompt", type=int, default=8)
     parser.add_argument("--ppo-epochs", type=int, default=2)
-    parser.add_argument("--minibatch-trajectories", type=int, default=32)
-    parser.add_argument("--max-consecutive-thinks", type=int, default=4)
+    # Total generated-slot budget per trajectory (thinks + emits).  Thinking
+    # is never forcibly interrupted; overthinking costs emitted tokens and
+    # therefore reward.  0 means the default of 4x the emit cap.
+    parser.add_argument("--max-stream-steps", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--gate-lr", type=float, default=1e-4)
@@ -407,10 +463,10 @@ def main() -> None:
     # HL-Gauss projection sigma as a fraction of bin width (cleanrl v215 /
     # Dreamer4 default).
     parser.add_argument("--value-sigma-ratio", type=float, default=2.0)
-    # Head bias starts at the projected prior; Tier-0 rewards sit ~0.37, and
-    # a prior near the reward mean removes the early decode transient a
-    # 0-prior causes (the target mass otherwise starts on floored far bins).
-    parser.add_argument("--value-prior", type=float, default=0.35)
+    # Head bias starts at the projected prior; binary verifier rewards start
+    # near-zero for a small model, and a prior near the expected reward mean
+    # removes the early decode transient a far-off prior causes.
+    parser.add_argument("--value-prior", type=float, default=0.05)
     parser.add_argument("--transition-lr", type=float, default=1e-4)
     parser.add_argument("--gate-entropy-coef", type=float, default=1e-3)
     parser.add_argument("--beta-nll-beta", type=float, default=0.5)
@@ -438,9 +494,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda")
-    trajectories = args.prompts_per_rollout * args.samples_per_prompt
-    if trajectories % args.minibatch_trajectories:
-        raise ValueError("rollout trajectories must divide into whole minibatches")
+    max_stream_steps = args.max_stream_steps or 4 * args.continuation_tokens
+    # The eval budget always scales with its own emit cap; an explicit
+    # --max-stream-steps is a training-rollout knob.
+    aime_stream_steps = 4 * args.aime_max_tokens
 
     backbone = load_model(args.checkpoint, device)
     backbone.eval()
@@ -481,13 +538,14 @@ def main() -> None:
     }
 
     tokenizer = spm.SentencePieceProcessor(model_file=FreshHyperparameters.tokenizer_path)
+    eos = tokenizer.eos_id()
     aime_rows = (
         load_unique_math_rows(args.aime_data)
         if args.aime_every > 0 and not args.rollout_only
         else []
     )
+    sampler = MathPromptSampler(load_unique_math_rows(args.math_data), args.seed)
     seq_len = FreshHyperparameters.train_seq_len
-    loader = baseline.DistributedTokenLoader(FreshHyperparameters.train_files, 0, 1, device)
     luts = baseline.build_sentencepiece_luts(tokenizer, FreshHyperparameters.vocab_size, device)
     val_tokens = baseline.load_validation_tokens(FreshHyperparameters.val_files, seq_len)
 
@@ -502,10 +560,7 @@ def main() -> None:
         torch.set_rng_state(payload["cpu_rng"])
         torch.cuda.set_rng_state_all(payload["cuda_rng"])
         random.setstate(payload["python_rng"])
-        stream = loader.stream
-        stream.file_idx = int(payload["loader"]["file_idx"])
-        stream.tokens = baseline.load_data_shard(stream.files[stream.file_idx])
-        stream.pos = int(payload["loader"]["pos"])
+        sampler.cursor = int(payload["sampler_cursor"])
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -514,7 +569,7 @@ def main() -> None:
     (output / "manifest.json").write_text(
         json.dumps(
             {
-                "phase": "latent_vapo_tier0",
+                "phase": "latent_vapo_dapo",
                 "args": vars(args),
                 "base": {
                     "checkpoint": str(args.checkpoint),
@@ -534,23 +589,28 @@ def main() -> None:
         + "\n"
     )
 
-    def collect() -> LatentRolloutBatch:
-        prompt_ids, reference_ids = sample_prompt_batch(
-            loader, args.prompt_tokens, args.continuation_tokens,
-            args.prompts_per_rollout, args.samples_per_prompt, seq_len,
-        )
-        batch = rollout_continuations(
-            wrapper, prompt_ids, args.continuation_tokens,
-            args.max_consecutive_thinks, args.temperature, args.top_p,
-        )
-        batch = trim_stream(batch)
-        score_rollout(batch, reference_ids, tokenizer)
-        # Stepwise rollout and parallel replay disagree numerically at bf16
-        # scale; recompute the stored PPO statistics through the update-step
-        # replay path so epoch-0 ratios are exactly one.  This also fills
-        # old_values from the separate critic (the rollout never values).
-        refresh_old_statistics(wrapper, critic, batch)
-        return batch
+    def collect() -> list[LatentRolloutBatch]:
+        """One rollout: a scored prompt group per sampled DAPO problem."""
+        groups = []
+        for row in sampler.next_rows(args.prompts_per_rollout):
+            prompt_ids = torch.tensor(
+                tokenizer.encode(prompt_text(row)), dtype=torch.long, device=device
+            )[-args.prompt_tokens:]
+            batch = rollout_continuations(
+                wrapper, prompt_ids[None].expand(args.samples_per_prompt, -1),
+                args.continuation_tokens, max_stream_steps,
+                args.temperature, args.top_p, eos_id=eos,
+            )
+            batch = trim_stream(batch)
+            score_math_rollout(batch, row["reward_model"]["ground_truth"], tokenizer, eos)
+            # Stepwise rollout and parallel replay disagree numerically at
+            # bf16 scale; recompute the stored PPO statistics through the
+            # update-step replay path so epoch-0 ratios are exactly one.
+            # This also fills old_values from the separate critic (the
+            # rollout never values).
+            refresh_old_statistics(wrapper, critic, batch)
+            groups.append(batch)
+        return groups
 
     def teacher_forced_bpb() -> float:
         """Pretraining-style val BPB (teacher-forced): the do-no-harm guard."""
@@ -564,7 +624,7 @@ def main() -> None:
         wrapper.eval()
         metrics = evaluate_aime_latent(
             wrapper, tokenizer, aime_rows, args.aime_samples, args.aime_max_tokens,
-            args.max_consecutive_thinks, args.aime_chunk, args.seed, device,
+            aime_stream_steps, args.aime_chunk, args.seed, device,
         )
         logger.log(type="aime", step=step, **metrics)
         tensorboard.add_scalar("aime/accuracy", metrics["accuracy"], step)
@@ -572,8 +632,7 @@ def main() -> None:
         print(f"step:{step} aime_avg@{args.aime_samples}:{metrics['accuracy']:.4f}", flush=True)
 
     if args.rollout_only:
-        batch = collect()
-        metrics = rollout_diagnostics(batch, args.samples_per_prompt)
+        metrics = aggregate_diagnostics(collect(), args.samples_per_prompt)
         passed = metrics["within_group_reward_std"] >= args.gate_min_within_group_reward_std
         logger.log(type="rollout_gate", passed=passed, **metrics)
         print(json.dumps({"passed": bool(passed), **metrics}, sort_keys=True))
@@ -588,11 +647,17 @@ def main() -> None:
         if aime_rows:
             aime_eval(0)
         for warmup in range(1, args.value_warmup_steps + 1):
-            batch = collect()
-            metrics = update_minibatch(
-                wrapper, critic, batch, optimizers, args.gate_entropy_coef,
-                args.beta_nll_beta, value_only=True,
-            )
+            group_metrics = [
+                update_minibatch(
+                    wrapper, critic, group, optimizers, args.gate_entropy_coef,
+                    args.beta_nll_beta, value_only=True,
+                )
+                for group in collect()
+            ]
+            metrics = {
+                key: float(sum(m[key] for m in group_metrics) / len(group_metrics))
+                for key in group_metrics[0]
+            }
             logger.log(type="value_warmup", step=warmup, **metrics)
             for key, value in metrics.items():
                 tensorboard.add_scalar(f"value_warmup/{key}", value, warmup)
@@ -604,36 +669,18 @@ def main() -> None:
     while step < args.steps:
         previous_step = step
         started = time.perf_counter()
-        batch = collect()
-        rollout_metrics = rollout_diagnostics(batch, args.samples_per_prompt)
+        groups = collect()
+        rollout_metrics = aggregate_diagnostics(groups, args.samples_per_prompt)
         logger.log(type="rollout", step=step, **rollout_metrics)
         for key, value in rollout_metrics.items():
             tensorboard.add_scalar(f"rollout/{key}", value, step)
 
         for _ in range(args.ppo_epochs):
-            order = torch.randperm(batch.reward_scalar.numel())
-            for start in range(0, order.numel(), args.minibatch_trajectories):
+            for index in torch.randperm(len(groups)).tolist():
                 step += 1
-                indices = order[start : start + args.minibatch_trajectories]
-                mini = LatentRolloutBatch(
-                    **{
-                        field: (
-                            getattr(batch, field)[indices]
-                            if isinstance(getattr(batch, field), torch.Tensor)
-                            else getattr(batch, field)
-                        )
-                        for field in (
-                            "kind", "token_ids", "thoughts", "gate_actions",
-                            "action_mask", "forced_mask", "emit_mask",
-                            "old_gate_logprobs", "old_token_logprobs",
-                            "old_values", "rewards", "reward_scalar",
-                            "prompt_length",
-                        )
-                    }
-                )
                 metrics = update_minibatch(
-                    wrapper, critic, mini, optimizers, args.gate_entropy_coef,
-                    args.beta_nll_beta,
+                    wrapper, critic, groups[index], optimizers,
+                    args.gate_entropy_coef, args.beta_nll_beta,
                     positive_lm_weight=args.positive_lm_weight,
                     positive_reward_threshold=args.positive_reward_threshold,
                 )
@@ -655,11 +702,11 @@ def main() -> None:
         if crossed_interval(previous_step, step, args.save_every):
             save_checkpoint(
                 output / "latent_vapo_checkpoint.pt", wrapper, critic,
-                optimizers, step, args, loader,
+                optimizers, step, args, sampler,
             )
     save_checkpoint(
         output / "latent_vapo_checkpoint.pt", wrapper, critic,
-        optimizers, step, args, loader,
+        optimizers, step, args, sampler,
     )
     tensorboard.close()
 

@@ -1,258 +1,152 @@
-# Latent World Model and VAPO Post-Training Plan
+# Latent-Thought VAPO Post-Training Plan
 
-## Goal
+Research fork on top of the parameter-golf pretraining stack. Not bound by
+the 16 MB / 10-minute competition budget; teacher-forced FineWeb val BPB is
+kept only as a do-no-harm regression guard.
 
-Start from `fresh_lejepa_shared_rms_v1_probes_1k`, preserve the successful
-shared-RMS transformer and large residual probes, and move all multi-step
-reasoning into a stochastic latent world model. A lightweight renderer turns
-selected latent states into vocabulary tokens, but rendered tokens never enter
-the world-model transition path.
+## What is built (postraining/)
 
-At each rollout step the model:
+### Backbone and wrapper
 
-1. samples the next latent belief with a JEDI-style transition;
-2. samples a Bernoulli THINK/EMIT action;
-3. on EMIT, renders exactly one token; and
-4. continues autoregressing in latent space after either action.
+- Base model: `FreshLeJEPASharedRMSV1PoPE` (9-layer U-Net GPT, dim 512,
+  8Q/4KV GQA, 1024-piece SentencePiece BPE, PoPE attention, fp32 masters).
+  Current checkpoint lineage is recorded in each run's `manifest.json`.
+- `LatentThoughtModel` (latent_thought.py) wraps the frozen backbone with
+  three small heads:
+  - `GaussianTransitionHead`: diagonal heteroscedastic Gaussian over the next
+    projected token latent. The mean is the frozen pretrained prediction
+    path; only a state-dependent log-std is new. (The earlier JEDI/EDM
+    diffusion-transition design was dropped: a Gaussian around the pretrained
+    predictor gives a tractable PPO log-density with none of the
+    reverse-chain ratio machinery.)
+  - `ThinkEmitGate`: zero-init Bernoulli head — exactly 50/50 at start.
+  - `ThoughtAdapter`: zero-init residual correction for injected thoughts, so
+    an untrained thought is exactly the sampled imagined next-token latent.
+- With the gate forced to EMIT, the wrapper is step-for-step identical to the
+  backbone's `generation_step` (pinned by tests).
 
-The model has a 20,480-position active attention/KV context and a separate
-20,480 emitted-token response limit. There is deliberately no hidden-step,
-total-latent-step, or wall-clock limit: a longer rollout uses a rolling window
-over its most recent 20,480 world-model positions.
+### Rollouts (latent_rollout.py)
 
-## Model
+- THINK samples a latent from the transition head and feeds it back through
+  the adapter (occupies a stream position, renders nothing); EMIT samples a
+  token from the renderer (the pretrained `policy_probe` LM head) and feeds
+  it back through the embedding.
+- Thinking is **unlimited**: no consecutive-think watchdog, no forced EMITs.
+  The only bound is `max_stream_steps` generated slots (thinks + emits);
+  overthinking costs emitted tokens and therefore reward. (The old 4-think
+  watchdog and its forced-action PPO exclusions were removed.)
+- Everything PPO needs is stored as replayable data; `replay_beliefs` /
+  `refresh_old_statistics` recompute statistics through the exact update-step
+  code path so epoch-0 PPO ratios are exactly 1.
 
-### Checkpoint migration
+### Critic (value_model.py, hl_gauss.py)
 
-- Load every shape-compatible shared-RMS V1 weight from
-  `ablation_results/fresh_lejepa_shared_rms_v1_probes_1k/pretraining_checkpoint.pt`.
-- Allow missing keys only for the new stochastic transition, gate, action
-  embeddings, positional-extension state, and new critic state. Any other
-  missing, unexpected, or mismatched key is an error.
-- Preserve the transformer, shared token encoder, final RMSNorm, large
-  `ResidualProbe` actor/critic shapes, and FP32 SIGReg path.
-- This checkpoint is selected because it is the only completed shared-RMS V1
-  run with a full `pretraining_checkpoint.pt`; the nominal V1 2K run stopped at
-  step 490 and contains metrics only.
-- The checkpoint contains no diffusion denoiser. Port the V5-to-V9
-  `BeliefTransitionEDM` and recursive-loss implementation into the shared-RMS
-  V1 architecture as new modules; do not claim or assume inherited transition
-  weights. The V9 belief gain of roughly 0.028 at step 1K is weak evidence, so
-  transition usefulness is an explicit gate before RL.
-- Treat long-context training as weight adaptation with a fresh optimizer, not
-  an optimizer/RNG continuation.
+- `SeparateCritic`: a **from-scratch** trunk of the same architecture class
+  (fully trainable, ~28.9M params, training-only scaffolding) with its own
+  thought adapter and an HL-Gauss categorical value head (cleanrl v215
+  recipe: 101 bins on [0,1], sigma_ratio 2.0, zero-weight head with
+  projected-prior bias, softmax-CE to truncated-Gaussian two-hot targets, no
+  value clipping, no advantage normalization).
+- The policy's stepwise path never computes values; the critic scores stored
+  streams in parallel. Rationale: thought content receives no policy
+  gradient by design (D4), so a critic reading the policy trunk read
+  latents that nothing was training — hence a separate model.
 
-### Latent state and stochastic transition
+### Training (train_latent_vapo.py)
 
-- The state is the contextual, post-transformer RMS-normalized belief.
-- The predictive target is the next contextual belief from the same live
-  encoder, detached at the target boundary; no EMA or target network is used.
-- Replace the deterministic next-belief predictor with JEDI-style EDM
-  preconditioning, its log-normal noise distribution, three denoising steps,
-  teacher/predicted-conditioning switching, and the paper's bounded latent
-  parameterization.
-- The transition attends to the full cached latent history and the previous
-  THINK/EMIT action. Zero-initialized action embeddings let RL learn distinct
-  private-thought and emitted-token dynamics without perturbing pretraining.
-- Keep SIGReg in FP32 on contextual beliefs and differentiable denoised
-  predictions. Use effective SIGReg microbatch 128.
-- Define alignment exactly. Given tokens `x[0..T]`, the encoder produces
-  contextual beliefs `b_t` from inputs through `x_t`; the transition consumes
-  state through `b_t` and predicts `b_hat_(t+1)` against
-  `stopgrad(b_(t+1))`. The renderer consumes projected `embedding(x_t)` and
-  `b_hat_(t+1)` and predicts `x_(t+1)`. It never receives the teacher
-  `b_(t+1)`, preventing next-token leakage.
+- VAPO-aligned: length-adaptive GAE (λ from |trajectory|), clip-higher PPO,
+  50-iteration value warmup (MC returns) before any policy update,
+  positive-example LM loss on correct trajectories, transition head trained
+  only on grounded transitions via β-NLL (world model, never policy
+  gradient).
+- Diagnostics: think-run length stats, per-loss grad norms (gate, renderer,
+  transition, critic), emit probability, emits/actions per trajectory,
+  teacher-forced val BPB guard, AIME24 avg@k eval through the latent policy.
+- `sample_latent.py` inspects the trained policy; its decoded output marks
+  every think run inline as `{n}🪙`.
 
-### THINK/EMIT gate
+## Pretraining: math-mix corpus (open data only)
 
-- Add a zero-initialized Bernoulli head over the current belief. It therefore
-  begins post-training at exactly 50% EMIT.
-- Mask and freeze the gate during predictive pretraining; every pretraining
-  position is rendered and no hidden thinking is taught.
-- Sample the gate in training and evaluation. Do not use class-index argmax:
-  equal zero logits can otherwise select THINK forever before training. Clamp
-  only numerical underflow so both Bernoulli outcomes retain nonzero sampling
-  probability; report gate probabilities as well as sampled behavior.
-- EMIT produces one token. THINK produces none. Both append a latent state and
-  action to the world-model history.
+RL needs a base model that can actually score on verifiable math; a
+FineWeb-only 27M model earns exactly zero verifier reward (no gradient).
+`build_math_mix_dataset.py` builds `data/datasets/mathmix_v3_sp1024`
+(500M tokens, challenge shard format, same tokenizer):
 
-### Renderer and critics
+| slice | fraction | source |
+|---|---|---|
+| FineWeb | 45% | existing tokenized shards (BOS-split, stitched across files) |
+| FineMath-4+ | 25% | HuggingFaceTB/finemath (math web prose) |
+| DeepMind math train-easy | 21% | mathematics_dataset v1.0 tarball, 18 verifier-compatible modules, worksheet docs |
+| OpenMathInstruct-2 | 9% | gsm8k/augmented_gsm8k rows: problem + short solution |
 
-- Reuse the winning V1 large residual actor instead of introducing an MoE or a
-  compressed probe.
-- Preserve its successful input semantics:
-  `concat(detach(project(current_token_embedding)),
-  detach(predicted_next_latent))`.
-- Initially, `current_token` is the final prompt token. THINK leaves it
-  unchanged; EMIT replaces it with the newly emitted token. This gives the
-  renderer one-token lexical continuity without feeding tokens into the world
-  model or giving the renderer an independent temporal reasoning stack.
-- Renderer CE and PPO cannot backpropagate through either detached input.
-- During adaptation, log renderer CE with the predicted latent intact, zeroed,
-  and batch-shuffled. Require a measurable gain from the aligned predicted
-  latent over both controls before beginning RL. This tests decodability
-  without letting token CE reshape the world model.
-- Keep the vocabulary output learned and untied from the input embedding.
-- Use two critics: a latent critic for plan-level return and the V1-shaped
-  detached probe critic for emitted-token return.
+- Every QA answer is formatted `Answer: <x>` (exactly what
+  `verify_answer` extracts) and **closed with EOS** — the tokenizer
+  normalizes newlines away, so EOS is the model's only learnable stop
+  signal. Rollouts/evals truncate at the first EOS.
+- **Half of all QA docs are wrapped in the verbatim DAPO-Math-17K prompt
+  template** (preamble + problem + `Remember to put your answer on its own
+  line after "Answer:".` + response). The v2 corpus lacked this, and the
+  v2-pretrained model produced an `Answer:` line in 0/1024 emit-only DAPO
+  rollouts — it treated template-wrapped problems as prose to continue.
+  Template compliance, not math difficulty, was the reward-variance
+  blocker; DAPO ground truths are mostly small integers, so a compliant
+  model earns occasional lucky hits, which is all RL needs to start.
+- No homemade/synthetic data: all sources are published open datasets
+  (Apache-2.0 / CC-BY-4.0 / ODC-By). The template wrapper is the RL
+  prompt's own text, not synthetic content.
+- Val shard is pure FineWeb, copied unchanged, so BPB stays comparable.
+  (v2 reference: final FineWeb val BPB 1.5849 vs 1.4966 for FineWeb-only —
+  expected, 55% of tokens are no longer FineWeb.)
+- Run: `ablation.py --script fresh_lejepa_train_v1_probe_shared_rms_pope_zero.py
+  --env DATA_PATH=data/datasets/mathmix_v3_sp1024` (2k steps, b128).
 
-## Pre-RL Adaptation and Context
+## RL: exclusively the VAPO paper's setup
 
-### Predictive adaptation
+Post-training uses **only** what the paper uses — no FineWeb continuation
+rewards, no synthetic RL tasks:
 
-Run 2,000 steps after checkpoint migration:
+- Training prompts: DAPO-Math-17K (`postraining/data/dapo-math-17k.parquet`,
+  ~17k unique problems) with the binary Minerva-style verifier as terminal
+  reward. (The paper never names its RL dataset; "identical experimental
+  settings" to DAPO pins it to DAPO-Math-17K.)
+- Eval: AIME 2024 avg@32 at temperature 1.0 / top-p 0.7.
+- Paper alignment kept: value warmup, length-adaptive GAE, clip-higher,
+  positive-example LM loss, token-level (here: action-level) loss; critic is
+  HL-Gauss instead of MSE (deliberate deviation, documented above).
 
-- train future-belief diffusion prediction, renderer CE, critics, and FP32
-  SIGReg;
-- keep the gate masked and frozen;
-- use effective microbatch 128 and the parameter-golf optimizer conventions;
-- use a 0.3x learning-rate multiplier for the reused encoder/backbone relative
-  to the newly initialized denoiser; and
-- save full resumable checkpoints at 1K and 2K.
+### Postmortem: why Tier 0 died
 
-Report two different likelihood metrics:
+Tier-0 (FineWeb continuation reward = prefix match + char F1) was RL
+reproducing the pretraining objective through a worse optimizer: reward rose
+by gaming F1 while BPB drifted up, and the gate correctly learned that
+thinking never helps next-token prediction on web text. Runs
+`latent_vapo_tier0_v2` (probe critic) and `_v3` (separate HL-Gauss critic,
+killed at step ~240) are kept as artifacts; v3's calibrated critic held the
+gate near 50/50 where v2's miscalibrated one collapsed it — the
+critic works, the task was wrong.
 
-- teacher-forced BPB uses the real `x_t` in the V1 renderer input and remains
-  comparable with pretraining; and
-- latent-rollout BPB/NLL feeds back only the most recently emitted token while
-  beliefs advance open-loop. It is a new metric and is not compared directly
-  with the teacher-forced baseline.
+## Status / order of execution
 
-Reject adaptation for collapse, non-finite gradients, negligible transition
-belief gain, or no renderer gain from the predicted latent. Treat short-context
-teacher-forced BPB as a regression diagnostic, not the Parameter Golf
-competition's 0.005 keep/discard rule: this is an intentionally larger research
-fork outside the 16 MB/10-minute competition target.
-
-### PoPE context ablation
-
-- PoPE replaces YaRN as the sole proposed long-context mechanism.
-- PoPE is a separate from-scratch shared-RMS V1 experiment; never convert the
-  existing RoPE checkpoint because PoPE changes Q/K content geometry.
-- Faithfully implement softplus Q/K magnitudes, real/imaginary components, and
-  learned phase offsets while adapting complex attention and caching to 8Q/4KV
-  GQA.
-- At the original 1,024 context and effective B128, compare a matched
-  from-scratch RoPE 2K control with PoPE 2K. Continue the PoPE winner through
-  low-learning-rate stages at 4,096, 8,192, and finally 20,480. The last stage
-  supplies genuine target-length training because 20,480 is beyond the roughly
-  10x extrapolation demonstrated by PoPE, while avoiding the roughly 20x
-  attention cost during bulk pretraining. Validate at 2K, 4K, 8K, 10K, 16K,
-  and the required 20,480 context after every continuation stage.
-- Implement incremental complex K caching with absolute positions and a rolling
-  20,480-position window. Tokens older than the active window are evicted; the
-  rollout itself may continue.
-- Keep PoPE only for material short- or long-context likelihood/retrieval gain
-  that justifies its measured memory and throughput cost. Record the result as
-  a research ablation rather than a Parameter Golf competition submission.
-
-## Latent VAPO
-
-### Rollout topology
-
-For each prompt, sample four independent latent plans and four renderer samples
-per plan, yielding 16 responses. The four renderings share their plan's latent
-and gate trajectory but sample tokens independently.
-
-- Stop a rendering on EOS or 20,480 emitted tokens.
-- Stop a plan when all four renderings stop.
-- A sampled Bernoulli with a nonzero numerical EMIT probability terminates
-  almost surely while preserving the requested lack of a hidden-step policy
-  cap. The harness must still detect process failure/OOM externally and mark
-  the rollout failed rather than fabricating a truncated reward.
-
-### PPO-compatible diffusion
-
-- Use stochastic Gaussian reverse transitions around the three-step JEDI/EDM
-  sampler so the world model has a tractable policy log-probability.
-- Store every sampled reverse-chain state/action, its conditioning state,
-  timestep/sigma, old Gaussian log-density, final latent, and gate action/log-
-  probability. Recompute the new policy's density of those same stored states;
-  never re-inject or re-sample stored noise under the new parameters.
-- Apply a reverse-step sigma floor and bounded log-ratio before exponentiation
-  so the near-zero final EDM step cannot create infinite PPO ratios.
-- Before full integration, require a standalone diffusion-PPO toy latent
-  bandit to improve reward reliably and to reproduce ratio 1 before updates.
-
-### Hierarchical credit assignment
-
-- A plan's terminal world-model/gate reward is the mean reward of its four
-  renderings. A rendering's terminal residual reward is its reward minus that
-  plan mean, isolating wording quality from latent-plan quality.
-- Feed these two terminal rewards into their respective latent and renderer
-  critics and length-adaptive GAE. Do not also normalize over the four plans as
-  a second advantage estimator. Normalize final GAE advantages over the full
-  valid update batch, with an epsilon/std-zero guard. Keep four-plan and four-
-  renderer group statistics as diagnostics.
-- World-model PPO updates only stochastic latent transitions. Gate PPO updates
-  the Bernoulli policy and action-conditioned transition. Renderer PPO updates
-  only the detached actor probe.
-- Apply length-adaptive GAE separately to latent/gate and emitted-token
-  sequences. Keep policy updates disabled until the rollout has both positive
-  and negative rewards and each critic beats its constant-prediction baseline;
-  50 updates is an upper warmup default, not an unconditional switch point.
-- During RL use PPO plus FP32 SIGReg for the world model: no predictive replay,
-  EMA, frozen-reference KL, or supervised future-belief loss.
-- Retain VAPO's correct-response renderer NLL auxiliary with weight 0.1.
-- Preserve VAPO's target configuration of 512 prompts, 16 responses, two PPO
-  epochs, mini-batch 512, actor/world-model LR `1e-6`, and critic LR `2e-6`,
-  but do not start there on one RTX 5090. Scale through explicit rollout gates:
-  16 prompts/256 emitted tokens, 64/1,024, 128/4,096, then 512/20,480. Advance
-  only after measuring wall time, CPU-spill size, peak VRAM, reward health, and
-  update stability at the prior stage.
-
-## TensorBoard and Run Artifacts
-
-Keep the main dashboard small enough to diagnose runs at a glance.
-
-### Outcomes
-
-- train reward, exact-match accuracy, and positive-group fraction;
-- AIME 2024 pass@1 and sampled pass@k; and
-- reward/accuracy versus emitted response length.
-
-### Rollouts
-
-- emitted tokens mean/p95/max and truncation fraction;
-- hidden steps mean/p95/max and hidden-to-emitted ratio;
-- EMIT fraction, gate entropy, and EOS fraction;
-- within-plan renderer reward variance; and
-- across-plan mean-reward variance.
-
-### Learning health
-
-- world-model, gate, and renderer PPO loss, approximate KL, clip fraction,
-  entropy, ratio statistics, and gradient norm;
-- both critic losses and explained variance;
-- renderer correct-response NLL;
-- SIGReg loss and effective-rank ratio; and
-- during predictive adaptation only: diffusion loss by noise level,
-  teacher/predicted-conditioning fraction, renderer CE, and BPB.
-
-### Performance and provenance
-
-- latent steps/s, emitted tokens/s, rollout/update time, peak VRAM, KV-cache
-  memory, and stored-trajectory memory;
-- write the same metrics to JSONL; and
-- store architecture, exact checkpoint lineage, positional method, sampler
-  settings, loss weights, git state, and commands in each run manifest.
-
-## Verification and Execution Order
-
-1. Test strict checkpoint migration, detached gradient boundaries, gate masking,
-   absolute cached positions, full/cached equivalence, diffusion log-probability
-   recomputation, and 4x4 advantage grouping.
-2. Run the matched from-scratch RoPE/PoPE CUDA smokes and 2K ablation.
-3. Continue PoPE to longer sequences and verify the full 20,480 active context.
-4. Port V9 JEDI modules into shared-RMS V1 and run the 2K predictive adaptation.
-5. Require transition belief gain plus aligned-latent renderer gain; report
-   teacher-forced and open-loop likelihood separately.
-6. Prove diffusion PPO on the toy latent bandit, including ratio/sigma tests.
-7. Run a tiny latent-RL gradient smoke proving each loss updates only its
-   intended subsystem.
-8. Scale rollout size/cap through the staged resource gates, then run VAPO with
-   reward-health-gated critic warmup and evaluate AIME 2024 on the paper-aligned
-   training-step-versus-accuracy schedule.
-9. Stop variants with collapse, unstable diffusion ratios, renderer-to-world-
-   model gradient leakage, no latent decodability gain, or infeasible measured
-   rollout cost.
+1. ~~Separate HL-Gauss critic + tests~~ — done, reviewed clean.
+2. ~~Unlimited thinking (watchdog removed)~~ — done.
+3. ~~Math-mix corpus from open datasets~~ — v2 built, superseded by
+   `mathmix_v3_sp1024` (DAPO-templated QA docs; manifest in the dataset dir).
+4. ~~DAPO rollout plumbing~~ — done, reviewed (one real finding: AIME eval
+   didn't thread `eos_id` into rollouts; fixed + regression test). Group =
+   per-prompt rollout batch = PPO minibatch; verifier-scored terminal
+   rewards; EOS-truncated generations; resumable `MathPromptSampler`.
+5. ~~v2 math-mix pretraining~~ — `fresh_lejepa_srms_pope_zero_b128_mathmix_2k`,
+   final FineWeb val BPB 1.5849. Emit-only sampling: instant
+   `Answer: <n> <eos>` on bare worksheet prompts, but 0/1024 `Answer:` lines
+   on real DAPO prompts → zero reward variance, RL gate correctly refused.
+   Root cause: the DAPO instruction template never appeared in pretraining.
+6. **v3 math-mix pretraining** —
+   `fresh_lejepa_srms_pope_zero_b128_mathmix_v3_2k` (in flight). Gate:
+   emit-only DAPO hit-rate probe must show nonzero within-group reward
+   variance (`postraining/dapo_hit_rate_probe.py`, 64 prompts x 16 samples).
+7. **Smoke RL run** on DAPO-Math with the v3 checkpoint;
+   `--rollout-only` gate first (`gate_min_within_group_reward_std`).
+8. Full run + AIME curve. Honest ceiling: a 27M model will not meaningfully
+   solve DAPO/AIME problems; the research question is whether latent
+   thinking earns reward above the emit-only baseline under a real verifier,
+   not leaderboard accuracy.

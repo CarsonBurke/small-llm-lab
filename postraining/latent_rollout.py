@@ -4,16 +4,20 @@ A rollout interleaves two action types at every generated stream position:
 the gate decides THINK or EMIT from the belief; EMIT samples a token from the
 renderer and feeds it back through the embedding (the pretrained closed loop),
 THINK samples a latent from the transition head and feeds it back through the
-adapter (it occupies a stream position but renders nothing).  A watchdog
-forces EMIT after ``max_consecutive_thinks`` so a 50/50-initialized gate can
-never stall generation; forced decisions are excluded from gate PPO.
+adapter (it occupies a stream position but renders nothing).  Thinking is
+unlimited: the only bound is ``max_stream_steps`` generated slots (thinks and
+emits combined), so a row that thinks too much simply runs out of budget and
+finishes with fewer emitted tokens — a cost the policy pays through reward,
+not through forced actions.
 
 Everything PPO needs later is stored as replayable *data* (token ids, sampled
 thoughts, actions), not activations: ``replay_beliefs`` reassembles the exact
 stream inputs and recomputes every belief in one parallel teacher-forced
 forward, which is where new log-probs, values, and the transition's grounded
-beta-NLL targets come from.  Rewards are Tier-0 continuation match: longest
-common prefix plus character F1 against the reference continuation.
+beta-NLL targets come from.  Rewards are terminal and task-defined by the
+caller (the DAPO trainer writes binary verifier scores through
+``assign_terminal_rewards``); ``continuation_reward`` survives only for the
+``sample_latent --fineweb`` inspection tool.
 """
 
 from __future__ import annotations
@@ -46,7 +50,6 @@ class LatentRolloutBatch:
     thoughts: Tensor
     gate_actions: Tensor
     action_mask: Tensor
-    forced_mask: Tensor
     emit_mask: Tensor
     old_gate_logprobs: Tensor
     old_token_logprobs: Tensor
@@ -99,18 +102,29 @@ def rollout_continuations(
     wrapper: LatentThoughtModel,
     prompt_ids: Tensor,
     max_new_tokens: int,
-    max_consecutive_thinks: int,
+    max_stream_steps: int,
     temperature: float,
     top_p: float,
     generator: torch.Generator | None = None,
+    eos_id: int | None = None,
 ) -> LatentRolloutBatch:
-    """Roll the gate-conditioned stream forward from a (batch, P) prompt."""
+    """Roll the gate-conditioned stream forward from a (batch, P) prompt.
+
+    ``max_stream_steps`` is the total generated-slot budget per row (thinks
+    plus emits); ``max_new_tokens`` caps emitted tokens within it.  Thinking
+    is never forcibly interrupted — a row that spends its whole budget
+    thinking just emits fewer tokens.  With ``eos_id`` set, a row finishes
+    the moment it emits that token (the EOS itself is recorded), matching
+    the EOS-truncated decode the verifier scores.
+    """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
+    if max_stream_steps < max_new_tokens:
+        raise ValueError("max_stream_steps must be at least max_new_tokens")
     device = prompt_ids.device
     batch, prompt_length = prompt_ids.shape
     model_dim = wrapper.backbone.tok_emb.embedding_dim
-    max_stream = prompt_length + max_new_tokens * (1 + max_consecutive_thinks)
+    max_stream = prompt_length + max_stream_steps
     caches = wrapper.make_generation_cache(batch, max_stream, device)
 
     kind = torch.full((batch, max_stream), PAD_SLOT, dtype=torch.long, device=device)
@@ -118,7 +132,6 @@ def rollout_continuations(
     thoughts = torch.zeros((batch, max_stream, model_dim), dtype=torch.float32, device=device)
     gate_actions = torch.zeros((batch, max_stream), dtype=torch.long, device=device)
     action_mask = torch.zeros((batch, max_stream), dtype=torch.float32, device=device)
-    forced_mask = torch.zeros_like(action_mask)
     emit_mask = torch.zeros_like(action_mask)
     old_gate_logprobs = torch.zeros_like(action_mask)
     old_token_logprobs = torch.zeros_like(action_mask)
@@ -136,17 +149,12 @@ def rollout_continuations(
     assert output is not None
 
     emitted = torch.zeros(batch, dtype=torch.long, device=device)
-    consecutive_thinks = torch.zeros(batch, dtype=torch.long, device=device)
+    ended = torch.zeros(batch, dtype=torch.bool, device=device)
     position = prompt_length - 1
-    while position < max_stream - 1 and bool((emitted < max_new_tokens).any()):
-        active = emitted < max_new_tokens
+    while position < max_stream - 1 and bool((~ended & (emitted < max_new_tokens)).any()):
+        active = ~ended & (emitted < max_new_tokens)
         belief = output.belief
-        action, _ = wrapper.gate.sample(belief, generator=generator)
-        forced = consecutive_thinks >= max_consecutive_thinks
-        action = torch.where(forced, torch.full_like(action, EMIT), action)
-        # Log-prob of the EXECUTED action; forced positions are excluded from
-        # gate PPO via forced_mask, so their stored value is never consumed.
-        gate_logprob = wrapper.gate.log_prob(action, belief)
+        action, gate_logprob = wrapper.gate.sample(belief, generator=generator)
 
         token = top_p_sample(output.logits, temperature, top_p)
         token_logprob = (
@@ -157,7 +165,6 @@ def rollout_continuations(
         record = active
         action_mask[record, position] = 1.0
         gate_actions[record, position] = action[record]
-        forced_mask[record & forced, position] = 1.0
         old_gate_logprobs[record, position] = gate_logprob[record].float()
         emits = record & (action == EMIT)
         thinks = record & (action == THINK)
@@ -169,9 +176,8 @@ def rollout_continuations(
         kind[thinks, next_position] = THOUGHT_SLOT
         thoughts[thinks, next_position] = thought[thinks]
         emitted += emits.long()
-        consecutive_thinks = torch.where(
-            thinks, consecutive_thinks + 1, torch.zeros_like(consecutive_thinks)
-        )
+        if eos_id is not None:
+            ended |= emits & (token == eos_id)
 
         # Finished rows keep stepping on token 0 (their next slot stays PAD,
         # so the zero-initialized token_ids row feeds the embedding; every
@@ -191,7 +197,6 @@ def rollout_continuations(
         thoughts=thoughts,
         gate_actions=gate_actions,
         action_mask=action_mask,
-        forced_mask=forced_mask,
         emit_mask=(gate_actions == EMIT).float() * action_mask,
         old_gate_logprobs=old_gate_logprobs,
         old_token_logprobs=old_token_logprobs,

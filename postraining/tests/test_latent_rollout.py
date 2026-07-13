@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 import train_gpt as baseline
@@ -23,8 +24,10 @@ from postraining.latent_rollout import (
 from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
 from postraining.model_io import _pope_construction
 from postraining.train_latent_vapo import (
+    MathPromptSampler,
     evaluate_aime_latent,
     sample_prompt_batch,
+    score_math_rollout,
     think_run_lengths,
     update_minibatch,
 )
@@ -87,11 +90,12 @@ def _critic(seed: int = 11) -> SeparateCritic:
     return critic
 
 
-def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, max_thinks=2, seed=7):
+def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, stream_steps=None, seed=7):
     prompt_ids = torch.randint(0, 32, (batch, prompt))
     generator = torch.Generator().manual_seed(seed)
     result = rollout_continuations(
-        wrapper, prompt_ids, new_tokens, max_thinks, 1.0, 1.0, generator=generator
+        wrapper, prompt_ids, new_tokens, stream_steps or 8 * new_tokens,
+        1.0, 1.0, generator=generator,
     )
     return trim_stream(result)
 
@@ -113,29 +117,36 @@ def test_rollout_emits_exactly_the_requested_tokens():
         assert len(row) == 5
 
 
-def test_rollout_watchdog_bounds_consecutive_thinks():
+def test_thinking_is_unbounded_and_stream_budget_truncates():
     wrapper = _wrapper()
-    # Bias the gate hard toward THINK so the watchdog must fire.
+    # Bias the gate hard toward THINK: no watchdog interrupts, so runs grow
+    # past the old 4-think cap and rows exhaust the stream budget instead of
+    # being forced to emit.
     with torch.no_grad():
         wrapper.gate.head.bias.fill_(-5.0)
-    batch = _rollout(wrapper, batch=2, prompt=4, new_tokens=3, max_thinks=2)
-    kinds = batch.kind
-    for row in range(kinds.size(0)):
+    stream_steps = 24
+    batch = _rollout(
+        wrapper, batch=2, prompt=4, new_tokens=3, stream_steps=stream_steps
+    )
+    generated = batch.kind[:, batch.prompt_length:]
+    assert int(generated.size(1)) <= stream_steps
+    longest_run = 0
+    for row in range(generated.size(0)):
         run = 0
-        for slot in kinds[row, batch.prompt_length:].tolist():
-            if slot == THOUGHT_SLOT:
-                run += 1
-                assert run <= 2
-            elif slot == TOKEN_SLOT:
-                run = 0
-    assert float(batch.forced_mask.sum()) > 0
-    # Forced EMITs are excluded from the gate PPO mask by construction.
-    gate_mask = batch.action_mask * (1.0 - batch.forced_mask)
-    assert float((gate_mask * batch.forced_mask).sum()) == 0.0
-    # Even a THINK-saturated gate emits exactly the requested tokens: the
-    # worst-case max_stream sizing leaves no truncation path.
-    for row in emitted_token_rows(batch):
-        assert len(row) == 3
+        for slot in generated[row].tolist():
+            run = run + 1 if slot == THOUGHT_SLOT else 0
+            longest_run = max(longest_run, run)
+    assert longest_run > 4
+    # Truncated rows emit fewer than the requested tokens and never more.
+    rows = emitted_token_rows(batch)
+    assert all(len(row) <= 3 for row in rows)
+    assert any(len(row) < 3 for row in rows)
+
+
+def test_stream_budget_smaller_than_emit_cap_is_rejected():
+    wrapper = _wrapper()
+    with pytest.raises(ValueError):
+        rollout_continuations(wrapper, torch.randint(0, 32, (1, 4)), 8, 4, 1.0, 1.0)
 
 
 def test_stream_storage_is_internally_consistent():
@@ -174,9 +185,8 @@ def test_replay_reproduces_rollout_logprobs():
     # The rollout never values: old_values stay zero until the separate
     # critic fills them in refresh_old_statistics.
     assert float(batch.old_values.abs().sum()) == 0.0
-    unforced = mask & ~batch.forced_mask.bool()
     torch.testing.assert_close(
-        gate_logprobs[unforced], batch.old_gate_logprobs[unforced], rtol=2e-4, atol=2e-4
+        gate_logprobs[mask], batch.old_gate_logprobs[mask], rtol=2e-4, atol=2e-4
     )
     emits = batch.emit_mask.bool()
     torch.testing.assert_close(
@@ -263,9 +273,7 @@ def test_update_minibatch_trains_heads_but_never_the_policy_trunk():
         critic.trunk.blocks[0].attn.proj.weight, critic_trunk_before
     )
     assert not torch.equal(wrapper.transition.log_std_head.bias, log_std_before)
-    assert not torch.equal(wrapper.gate.head.weight, gate_before) or float(
-        batch.action_mask.sum()
-    ) == float(batch.forced_mask.sum())
+    assert not torch.equal(wrapper.gate.head.weight, gate_before)
 
 
 def test_refresh_old_statistics_matches_the_update_code_path_exactly():
@@ -387,7 +395,7 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy():
     ]
     metrics = evaluate_aime_latent(
         wrapper, _Tokenizer(), rows, samples=4, max_new_tokens=3,
-        max_consecutive_thinks=2, chunk=3, seed=5, device=torch.device("cpu"),
+        max_stream_steps=12, chunk=3, seed=5, device=torch.device("cpu"),
     )
     # Every decode reads "Answer: 42": row one is always right, row two
     # always wrong, so accuracy pins both counting and verification.
@@ -398,7 +406,7 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy():
     before = torch.get_rng_state()
     evaluate_aime_latent(
         wrapper, _Tokenizer(), rows[:1], samples=2, max_new_tokens=2,
-        max_consecutive_thinks=2, chunk=2, seed=5, device=torch.device("cpu"),
+        max_stream_steps=8, chunk=2, seed=5, device=torch.device("cpu"),
     )
     assert torch.equal(before, torch.get_rng_state())
 
@@ -472,3 +480,111 @@ def test_think_run_lengths_matches_hand_computation():
     lengths = think_run_lengths(kind)
     assert sorted(lengths.tolist()) == [1.0, 2.0, 3.0]
     assert think_run_lengths(kind[1:2]).numel() == 0
+
+
+def test_rollout_stops_rows_at_eos_and_records_nothing_after():
+    wrapper = _wrapper()
+    eos = 5
+    prompt_ids = torch.randint(0, 32, (8, 4))
+    generator = torch.Generator().manual_seed(13)
+    batch = trim_stream(
+        rollout_continuations(
+            wrapper, prompt_ids, 16, 64, 1.0, 1.0,
+            generator=generator, eos_id=eos,
+        )
+    )
+    rows = emitted_token_rows(batch)
+    # Uniform-ish sampling over 32 pieces across 8 rows x up to 16 emits
+    # makes an EOS hit near-certain; guard so the assertions below bite.
+    assert any(eos in row for row in rows)
+    for index, row in enumerate(rows):
+        if eos not in row:
+            continue
+        assert row[-1] == eos
+        # The EOS emit is the final non-pad slot: the row went inactive, so
+        # no thinks, emits, or gate decisions follow it.
+        alive = batch.kind[index] != PAD_SLOT
+        last = int(alive.nonzero().max())
+        assert batch.kind[index, last] == TOKEN_SLOT
+        assert int(batch.token_ids[index, last]) == eos
+        assert not batch.action_mask[index, last + 1:].any()
+
+
+def test_math_prompt_sampler_resumes_deterministically_across_epochs():
+    rows = [{"id": index} for index in range(7)]
+    full = MathPromptSampler(rows, seed=3).next_rows(10)
+    # Ten draws from seven rows crosses an epoch boundary; the first epoch
+    # must be a permutation of the corpus, not a with-replacement sample.
+    assert sorted(row["id"] for row in full[:7]) == list(range(7))
+    resumed = MathPromptSampler(rows, seed=3)
+    resumed.cursor = 4
+    assert resumed.next_rows(6) == full[4:]
+    # A different seed reorders the stream.
+    assert MathPromptSampler(rows, seed=4).next_rows(10) != full
+
+
+def test_score_math_rollout_scores_the_verifier_on_truncated_decodes():
+    wrapper = _wrapper()
+    eos = 5
+    batch = _rollout(wrapper, batch=4, prompt=4, new_tokens=8)
+
+    class _Tokenizer:
+        def __init__(self):
+            self.calls = []
+
+        def decode(self, ids: list[int]) -> str:
+            self.calls.append(list(ids))
+            return "Answer: 42"
+
+    tokenizer = _Tokenizer()
+    score_math_rollout(batch, "42", tokenizer, eos)
+    assert batch.reward_scalar.tolist() == [1.0, 1.0, 1.0, 1.0]
+    # One decode per row, each EOS-truncated: EOS may only appear last.
+    assert len(tokenizer.calls) == 4
+    for ids in tokenizer.calls:
+        assert eos not in ids[:-1]
+    # Rewards land once per row, on the final gate-decision position.
+    assert torch.equal(batch.rewards.sum(dim=1), batch.reward_scalar)
+    positions = batch.action_mask.size(1) - 1 - batch.action_mask.flip(1).argmax(1)
+    assert torch.equal(
+        batch.rewards.gather(1, positions.unsqueeze(1)).squeeze(1),
+        batch.reward_scalar,
+    )
+    score_math_rollout(batch, "7", tokenizer, eos)
+    assert batch.reward_scalar.tolist() == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_evaluate_aime_latent_threads_eos_into_the_rollout(monkeypatch):
+    wrapper = _wrapper()
+
+    class _Tokenizer:
+        def __init__(self, eos: int):
+            self.eos = eos
+
+        def eos_id(self) -> int:
+            return self.eos
+
+        def encode(self, text: str) -> list[int]:
+            return [1, 2, 3]
+
+        def decode(self, ids: list[int]) -> str:
+            return "Answer: 42"
+
+    rows = [{"prompt": [{"content": "q"}], "reward_model": {"ground_truth": "42"}}]
+    seen = []
+
+    def _spy(*args, **kwargs):
+        seen.append(kwargs.get("eos_id"))
+        return rollout_continuations(*args, **kwargs)
+
+    import postraining.train_latent_vapo as trainer
+
+    monkeypatch.setattr(trainer, "rollout_continuations", _spy)
+    # A real EOS id must reach the rollout so eval rows stop at EOS exactly
+    # like training rollouts; the sentinel -1 must map to no EOS handling.
+    for eos, expected in ((5, 5), (-1, None)):
+        evaluate_aime_latent(
+            wrapper, _Tokenizer(eos), rows, samples=2, max_new_tokens=2,
+            max_stream_steps=8, chunk=2, seed=5, device=torch.device("cpu"),
+        )
+        assert seen and seen[-1] == expected

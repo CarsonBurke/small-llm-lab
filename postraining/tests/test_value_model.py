@@ -31,7 +31,7 @@ def _batch(seed: int = 5):
     generator = torch.Generator().manual_seed(9)
     with torch.no_grad():
         return trim_stream(
-            rollout_continuations(wrapper, prompt_ids, 4, 2, 1.0, 1.0, generator=generator)
+            rollout_continuations(wrapper, prompt_ids, 4, 16, 1.0, 1.0, generator=generator)
         )
 
 

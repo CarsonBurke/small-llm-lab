@@ -50,6 +50,54 @@ def gate_trace(kind_row: torch.Tensor, prompt_length: int) -> str:
     )
 
 
+def decode_with_think_markers(
+    tokenizer,
+    kind_row: torch.Tensor,
+    token_row: torch.Tensor,
+    prompt_length: int,
+    eos: int = -1,
+) -> str:
+    """Continuation text with an inline ``{n}🪙`` marker per THINK run.
+
+    Emitted tokens are decoded in contiguous segments; SentencePiece strips a
+    segment-leading space, so it is restored from the first piece's ``▁``
+    whenever the segment is not the very start of the continuation.
+    """
+    parts: list[str] = []
+    segment: list[int] = []
+    run = 0
+    at_start = True
+
+    def flush_segment() -> None:
+        nonlocal segment, at_start
+        if segment:
+            text = tokenizer.decode(segment)
+            if not at_start and tokenizer.id_to_piece(segment[0]).startswith("▁"):
+                text = " " + text
+            parts.append(text)
+            segment = []
+            at_start = False
+
+    for slot, token in zip(
+        kind_row[prompt_length:].tolist(), token_row[prompt_length:].tolist()
+    ):
+        if slot == THOUGHT_SLOT:
+            flush_segment()
+            run += 1
+        elif slot == TOKEN_SLOT:
+            if run:
+                parts.append(f"{run}🪙")
+                at_start = False
+                run = 0
+            segment.append(token)
+            if token == eos:
+                break
+    flush_segment()
+    if run:
+        parts.append(f"{run}🪙")
+    return "".join(parts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -70,10 +118,16 @@ def main() -> None:
     parser.add_argument("--continuation-tokens", type=int, default=64)
     parser.add_argument("--samples", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--max-consecutive-thinks", type=int, default=4)
+    # Total generated-slot budget (thinks + emits); 0 = 4x the emit cap.
+    parser.add_argument("--max-stream-steps", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--emit-only", action="store_true",
+        help="pin the gate to EMIT so sampling is exactly the backbone LM "
+        "(no latent thinking)",
+    )
     args = parser.parse_args()
     modes = sum(value is not None for value in (args.prompt, args.aime_row, args.fineweb))
     if modes != 1:
@@ -100,6 +154,13 @@ def main() -> None:
     else:
         print("policy: untrained heads over the pretraining checkpoint")
     wrapper.eval()
+    if args.emit_only:
+        # Zero gate weight + saturated bias: EMIT with probability ~1, which
+        # is step-identical to backbone generation (pinned by tests).
+        with torch.no_grad():
+            wrapper.gate.head.weight.zero_()
+            wrapper.gate.head.bias.fill_(30.0)
+        print("gate pinned to EMIT: sampling the backbone LM directly")
 
     import sentencepiece as spm
 
@@ -121,7 +182,8 @@ def main() -> None:
             batch = trim_stream(
                 rollout_continuations(
                     wrapper, prompt_ids, args.continuation_tokens,
-                    args.max_consecutive_thinks, args.temperature, args.top_p,
+                    args.max_stream_steps or 4 * args.continuation_tokens,
+                    args.temperature, args.top_p,
                 )
             )
         for index, emitted in enumerate(emitted_token_rows(batch)):
@@ -133,9 +195,13 @@ def main() -> None:
                 prompt_tail = tokenizer.decode(prompt_ids[index][-48:].tolist())
                 print(f"=== prompt {index // args.samples}  (…{prompt_tail!r})")
                 print(f"reference: {reference!r}")
+            marked = decode_with_think_markers(
+                tokenizer, batch.kind[index], batch.token_ids[index],
+                batch.prompt_length,
+            )
             print(f"--- sample {index % args.samples}  reward: {reward:.3f}  "
                   f"(thinks: {trace.count('t')})")
-            print(f"generated: {generated!r}")
+            print(f"generated: {marked!r}")
             print()
         return
 
@@ -152,6 +218,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
+    eos = tokenizer.eos_id()
     prompt_ids = torch.tensor(tokenizer.encode(text), dtype=torch.long, device=device)
     with torch.no_grad():
         batch = trim_stream(
@@ -159,25 +226,29 @@ def main() -> None:
                 wrapper,
                 prompt_ids[None].expand(args.samples, -1),
                 args.max_new_tokens,
-                args.max_consecutive_thinks,
+                args.max_stream_steps or 4 * args.max_new_tokens,
                 args.temperature,
                 args.top_p,
+                eos_id=eos if eos >= 0 else None,
             )
         )
 
-    eos = tokenizer.eos_id()
     for index, emitted in enumerate(emitted_token_rows(batch)):
         if eos >= 0 and eos in emitted:
             emitted = emitted[: emitted.index(eos) + 1]
         trace = gate_trace(batch.kind[index], batch.prompt_length)
         thinks = trace.count("t")
         decoded = tokenizer.decode(emitted)
+        marked = decode_with_think_markers(
+            tokenizer, batch.kind[index], batch.token_ids[index],
+            batch.prompt_length, eos=eos,
+        )
         print(f"--- sample {index}  (thinks: {thinks}, emits: {trace.count('E')})")
         print(f"trace: {trace}")
         if truth is not None:
             is_correct, prediction = verify_answer(decoded, truth)
             print(f"verdict: {'CORRECT' if is_correct else 'wrong'} (extracted: {prediction})")
-        print(decoded)
+        print(marked)
         print()
 
 
