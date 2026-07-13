@@ -399,7 +399,12 @@ def main():
     parser.add_argument("--compare", action="store_true", help="Compare existing results")
     parser.add_argument("--sweep", type=str, default=None, help="Run a preset sweep (lr, dim, layers)")
     parser.add_argument("--script", type=str, default="train_gpt.py", help="Training script to use")
-    parser.add_argument("--env", type=str, nargs="*", default=[], help="Extra env vars as KEY=VALUE")
+    # action="extend" so repeated --env flags accumulate instead of the last
+    # silently overwriting the rest (which drops e.g. DATA_PATH).
+    parser.add_argument(
+        "--env", type=str, nargs="*", action="extend", default=[],
+        help="Extra env vars as KEY=VALUE (repeatable)",
+    )
     args = parser.parse_args()
 
     if args.compare:

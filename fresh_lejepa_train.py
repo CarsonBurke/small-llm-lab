@@ -512,9 +512,56 @@ def main() -> None:
         return model
 
     checkpoint_every = int(os.environ.get("FRESH_CHECKPOINT_EVERY", "0"))
+    resume_from = os.environ.get("FRESH_RESUME_FROM")
+    resume_pending = bool(resume_from)
     original_eval_val = baseline.eval_val
 
+    def restore_checkpoint(caller: dict) -> None:
+        """Continue a killed run: load the rolling checkpoint at the step-0 val.
+
+        This fires inside the training loop's first eval_val, after the
+        compile-warmup restore, so the loaded weights/optimizer states are
+        what the first measured step trains.  The data loader is fast-forwarded
+        by the same next_batch cadence training used, and iterations must be
+        set to the REMAINING steps: the LR warmdown only depends on
+        ``iterations - step``, so the schedule continues exactly.  Muon's
+        momentum warmup is step-based — pass MUON_MOMENTUM_WARMUP_STEPS=0
+        when the source step is past it.
+        """
+        payload = torch.load(resume_from, map_location="cpu", weights_only=False)
+        tracked_models[0].load_state_dict(payload["model"], strict=True)
+        for optimizer, state in zip(
+            tracked_optimizers, payload["optimizers"], strict=True
+        ):
+            optimizer.load_state_dict(state)
+        loader = caller["train_loader"]
+        hyper = caller["args"]
+        accum = caller["grad_accum_steps"]
+        for _ in range(int(payload["step"]) * accum):
+            loader.next_batch(hyper.train_batch_tokens, hyper.train_seq_len, accum)
+        torch.set_rng_state(payload["cpu_rng"])
+        torch.cuda.set_rng_state_all(payload["cuda_rng"])
+        random.setstate(payload["python_rng"])
+        print(
+            f"resumed from {resume_from} (source step {payload['step']}); "
+            f"running {FreshHyperparameters.iterations} remaining steps",
+            flush=True,
+        )
+
     def checkpointing_eval_val(*args, **kwargs):
+        nonlocal resume_pending
+        caller_locals = inspect.currentframe().f_back.f_locals
+        if (
+            resume_pending
+            # The first eval from the measured training loop: only its frame
+            # has the post-warmup train_loader, and the int8 round-trip eval
+            # (quant_state) must never re-trigger a load.
+            and "train_loader" in caller_locals
+            and "quant_state" not in caller_locals
+            and tracked_models
+        ):
+            restore_checkpoint(caller_locals)
+            resume_pending = False
         result = original_eval_val(*args, **kwargs)
         # Read the true step from the caller (baseline.main), which stays
         # correct when the wallclock cap forces an off-cadence validation.
