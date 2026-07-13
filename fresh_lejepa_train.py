@@ -19,8 +19,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 import train_gpt as baseline
+
+EXPERIMENT_ARCHITECTURE = "fresh_lejepa_attached_target_detached_probes_v1"
+EXPERIMENT_SOURCE = Path(__file__)
 
 
 class FreshHyperparameters(baseline.Hyperparameters):
@@ -43,12 +47,36 @@ class ResidualProbe(nn.Module):
         self.hidden2 = baseline.CastedLinear(width, width)
         self.output = baseline.CastedLinear(width, output_dim, bias=False)
         self.output._zero_init = True
+        nn.init.zeros_(self.output.weight)
 
     def forward(self, x: Tensor) -> Tensor:
         x = F.silu(self.input(x))
         x = x + F.silu(self.hidden1(F.rms_norm(x, (x.size(-1),))))
         x = x + F.silu(self.hidden2(F.rms_norm(x, (x.size(-1),))))
         return self.output(F.rms_norm(x, (x.size(-1),)))
+
+
+def _sigreg_projection_statistic(
+    embeddings: Tensor,
+    directions: Tensor,
+    t: Tensor,
+    phi: Tensor,
+    weights: Tensor,
+    position_chunk: int,
+) -> Tensor:
+    """One projection shard, factored out so backward can recompute its activations."""
+    batch, length, _ = embeddings.shape
+    statistic = embeddings.new_zeros((), dtype=torch.float32)
+    for position_start in range(0, length, position_chunk):
+        samples = embeddings[
+            :, position_start : position_start + position_chunk
+        ].transpose(0, 1).float()
+        projected = samples @ directions
+        x_t = projected.unsqueeze(-1) * t
+        err = (x_t.cos().mean(dim=1) - phi).square()
+        err = err + x_t.sin().mean(dim=1).square()
+        statistic = statistic + (err @ weights).sum() * batch
+    return statistic
 
 
 class SIGReg(nn.Module):
@@ -59,6 +87,7 @@ class SIGReg(nn.Module):
         self.num_proj = num_proj
         self.proj_chunk = proj_chunk
         self.position_chunk = position_chunk
+        self.checkpoint_projection_chunks = True
         t = torch.linspace(0, 3, knots, dtype=torch.float32)
         dt = 3 / (knots - 1)
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
@@ -68,24 +97,42 @@ class SIGReg(nn.Module):
         self.register_buffer("phi", phi)
         self.register_buffer("weights", weights * phi)
 
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        # The characteristic-function quadrature is a numerical statistic, not
+        # model state.  Keep it in FP32 when the surrounding model is cast to
+        # BF16, matching the LeJEPA/LeWM reference implementations.
+        for name in ("t", "phi", "weights"):
+            setattr(self, name, getattr(self, name).float())
+        return self
+
     @torch.compiler.disable
     def forward(self, embeddings: Tensor) -> Tensor:
         # LeWM regularizes the batch distribution independently at every time.
         # Chunk both axes, but preserve the exact all-position/all-projection mean.
-        batch, length, dim = embeddings.shape
-        statistic = embeddings.new_zeros((), dtype=torch.float32)
-        for projection_start in range(0, self.num_proj, self.proj_chunk):
-            width = min(self.proj_chunk, self.num_proj - projection_start)
-            directions = torch.randn(dim, width, device=embeddings.device)
-            directions = directions / directions.norm(dim=0, keepdim=True).clamp_min(1e-12)
-            for position_start in range(0, length, self.position_chunk):
-                samples = embeddings[:, position_start : position_start + self.position_chunk].transpose(0, 1).float()
-                projected = samples @ directions
-                x_t = projected.unsqueeze(-1) * self.t
-                err = (x_t.cos().mean(dim=1) - self.phi).square()
-                err = err + x_t.sin().mean(dim=1).square()
-                statistic = statistic + (err @ self.weights).sum() * batch
-        return statistic / (length * self.num_proj)
+        with torch.autocast(device_type=embeddings.device.type, enabled=False):
+            batch, length, dim = embeddings.shape
+            statistic = embeddings.new_zeros((), dtype=torch.float32)
+            for projection_start in range(0, self.num_proj, self.proj_chunk):
+                width = min(self.proj_chunk, self.num_proj - projection_start)
+                directions = torch.randn(dim, width, device=embeddings.device, dtype=torch.float32)
+                directions = directions / directions.norm(dim=0, keepdim=True).clamp_min(1e-12)
+                args = (
+                    embeddings,
+                    directions,
+                    self.t,
+                    self.phi,
+                    self.weights,
+                    self.position_chunk,
+                )
+                if self.checkpoint_projection_chunks and embeddings.requires_grad:
+                    contribution = checkpoint(
+                        _sigreg_projection_statistic, *args, use_reentrant=False
+                    )
+                else:
+                    contribution = _sigreg_projection_statistic(*args)
+                statistic = statistic + contribution
+            return statistic / (length * self.num_proj)
 
 
 class NonCachingRotary(baseline.Rotary):
@@ -100,6 +147,9 @@ class NonCachingRotary(baseline.Rotary):
 class FreshLeJEPAGPT(baseline.GPT):
     """Baseline causal predictor plus detached policy and critic probes."""
 
+    return_loss_components = False
+    defer_sigreg = False
+
     def __init__(self, *args, **kwargs):
         vocab_size = kwargs.get("vocab_size", args[0] if args else None)
         model_dim = kwargs.get("model_dim", args[2] if len(args) > 2 else None)
@@ -110,8 +160,7 @@ class FreshLeJEPAGPT(baseline.GPT):
         # Register these under blocks so the unmodified baseline optimizer sees
         # every experimental matrix.  The critic has no gradients in pretraining.
         owner = self.blocks[-1]
-        owner.policy_probe = ResidualProbe(model_dim, vocab_size)
-        owner.critic_probe = ResidualProbe(model_dim, 1)
+        self.install_probes(owner, model_dim, vocab_size)
         for block in self.blocks:
             rotary = NonCachingRotary(block.attn.head_dim)
             rotary.inv_freq.copy_(block.attn.rotary.inv_freq)
@@ -122,7 +171,18 @@ class FreshLeJEPAGPT(baseline.GPT):
             FreshHyperparameters.sigreg_proj_chunk,
             FreshHyperparameters.sigreg_position_chunk,
         )
-        self._init_weights()
+
+    def make_policy_probe(self, model_dim: int, vocab_size: int) -> nn.Module:
+        return ResidualProbe(model_dim, vocab_size)
+
+    def make_critic_probe(self, model_dim: int) -> nn.Module:
+        return ResidualProbe(model_dim, 1)
+
+    def install_probes(
+        self, owner: nn.Module, model_dim: int, vocab_size: int
+    ) -> None:
+        owner.policy_probe = self.make_policy_probe(model_dim, vocab_size)
+        owner.critic_probe = self.make_critic_probe(model_dim)
 
     @property
     def policy_probe(self) -> ResidualProbe:
@@ -146,7 +206,10 @@ class FreshLeJEPAGPT(baseline.GPT):
         return result
 
     def latent_features(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
-        token_latent = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
+        token_latent = self.embed_tokens(input_ids)
+        return token_latent, self.predict_from_token_latent(token_latent)
+
+    def temporal_belief_from_token_latent(self, token_latent: Tensor) -> Tensor:
         predicted = token_latent
         x0 = token_latent
         skips: list[Tensor] = []
@@ -157,25 +220,62 @@ class FreshLeJEPAGPT(baseline.GPT):
             if skips:
                 predicted = predicted + self.skip_weights[i].to(predicted.dtype)[None, None, :] * skips.pop()
             predicted = self.blocks[self.num_encoder_layers + i](predicted, x0)
-        return token_latent, self.final_norm(predicted)
+        return self.final_norm(predicted)
+
+    def predict_from_token_latent(self, token_latent: Tensor) -> Tensor:
+        return self.prediction_latent(
+            self.temporal_belief_from_token_latent(token_latent)
+        )
+
+    def training_latents(
+        self, input_ids: Tensor, target_ids: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        token_latent, predicted = self.latent_features(input_ids)
+        return token_latent, predicted, self.target_latent(target_ids)
+
+    def embed_tokens(self, input_ids: Tensor) -> Tensor:
+        return F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
 
     def detached_probe_features(self, input_ids: Tensor) -> Tensor:
         token_latent, predicted = self.latent_features(input_ids)
+        return self.probe_features(token_latent, predicted)
+
+    def probe_features(self, token_latent: Tensor, predicted: Tensor) -> Tensor:
         return torch.cat((token_latent.detach(), predicted.detach()), dim=-1)
 
+    def sigreg_features(self, token_latent: Tensor) -> Tensor:
+        return token_latent
+
+    def training_sigreg_features(
+        self, token_latent: Tensor, target_latent: Tensor
+    ) -> Tensor:
+        return self.sigreg_features(token_latent)
+
+    def prediction_latent(self, predicted: Tensor) -> Tensor:
+        return predicted
+
+    def target_latent(self, target_ids: Tensor) -> Tensor:
+        return self.embed_tokens(target_ids)
+
     def policy_logits(self, input_ids: Tensor) -> Tensor:
-        raw = self.policy_probe(self.detached_probe_features(input_ids))
+        return self.logits_from_features(self.detached_probe_features(input_ids))
+
+    def logits_from_features(self, features: Tensor) -> Tensor:
+        raw = self.policy_probe(features)
         return self.logit_softcap * torch.tanh(raw / self.logit_softcap)
 
     def values(self, input_ids: Tensor) -> Tensor:
-        return self.critic_probe(self.detached_probe_features(input_ids)).squeeze(-1)
+        return self.values_from_features(self.detached_probe_features(input_ids))
+
+    def values_from_features(self, features: Tensor) -> Tensor:
+        return self.critic_probe(features).squeeze(-1)
 
     def _attention_step(
         self,
         attention: baseline.CausalSelfAttention,
         x: Tensor,
         cache: tuple[Tensor, Tensor],
-        position: int,
+        position: int | Tensor,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """One-token GQA attention step used by post-training rollouts."""
         batch, _, dim = x.shape
@@ -193,10 +293,17 @@ class FreshLeJEPAGPT(baseline.GPT):
         q = baseline.apply_rotary_emb(q, cos, sin)
         k = baseline.apply_rotary_emb(k, cos, sin)
         q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
-        cache[0][:, :, position : position + 1].copy_(k)
-        cache[1][:, :, position : position + 1].copy_(v)
-        prefix_k = cache[0][:, :, : position + 1]
-        prefix_v = cache[1][:, :, : position + 1]
+        if torch.is_tensor(position):
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, v)
+            prefix_k = torch.narrow(cache[0], 2, 0, position + 1)
+            prefix_v = torch.narrow(cache[1], 2, 0, position + 1)
+        else:
+            cache[0][:, :, position : position + 1].copy_(k)
+            cache[1][:, :, position : position + 1].copy_(v)
+            prefix_k = cache[0][:, :, : position + 1]
+            prefix_v = cache[1][:, :, : position + 1]
         y = F.scaled_dot_product_attention(
             q, prefix_k, prefix_v, is_causal=False,
             enable_gqa=attention.num_kv_heads != attention.num_heads,
@@ -210,7 +317,7 @@ class FreshLeJEPAGPT(baseline.GPT):
         x: Tensor,
         x0: Tensor,
         cache: tuple[Tensor, Tensor],
-        position: int,
+        position: int | Tensor,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         mix = block.resid_mix.to(x.dtype)
         x = mix[0][None, None] * x + mix[1][None, None] * x0
@@ -223,10 +330,10 @@ class FreshLeJEPAGPT(baseline.GPT):
         self,
         token_ids: Tensor,
         caches: list[tuple[Tensor, Tensor]],
-        position: int,
+        position: int | Tensor,
     ) -> tuple[Tensor, Tensor, list[tuple[Tensor, Tensor]]]:
         """Consume one token and return next-token logits, value, and KV caches."""
-        token_latent = F.rms_norm(self.tok_emb(token_ids[:, None]), (self.tok_emb.embedding_dim,))
+        token_latent = self.embed_tokens(token_ids[:, None])
         predicted = token_latent
         skips: list[Tensor] = []
         next_caches = list(caches)
@@ -242,12 +349,17 @@ class FreshLeJEPAGPT(baseline.GPT):
             predicted, next_caches[i] = self._block_step(
                 self.blocks[i], predicted, token_latent, caches[i], position
             )
-        predicted = self.final_norm(predicted)
-        features = torch.cat((token_latent.detach(), predicted.detach()), dim=-1)
-        raw = self.policy_probe(features).squeeze(1)
-        logits = self.logit_softcap * torch.tanh(raw / self.logit_softcap)
-        value = self.critic_probe(features).squeeze(1).squeeze(-1)
+        belief = self.final_norm(predicted)
+        predicted = self.prediction_latent(belief)
+        features = self.generation_probe_features(token_latent, belief, predicted)
+        logits = self.logits_from_features(features).squeeze(1)
+        value = self.values_from_features(features).squeeze(1)
         return logits, value, next_caches
+
+    def generation_probe_features(
+        self, token_latent: Tensor, belief: Tensor, predicted: Tensor
+    ) -> Tensor:
+        return self.probe_features(token_latent, predicted)
 
     def make_generation_cache(
         self, batch_size: int, max_length: int, device: torch.device
@@ -265,23 +377,31 @@ class FreshLeJEPAGPT(baseline.GPT):
         return caches
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        token_latent, predicted = self.latent_features(input_ids)
-        detached = torch.cat((token_latent.detach(), predicted.detach()), dim=-1)
-        raw_logits = self.policy_probe(detached)
-        logits = self.logit_softcap * torch.tanh(raw_logits / self.logit_softcap)
+        token_latent, predicted, target_latent = self.training_latents(input_ids, target_ids)
+        detached = self.probe_features(token_latent, predicted)
+        logits = self.logits_from_features(detached)
         policy_loss = F.cross_entropy(logits.float().flatten(0, 1), target_ids.flatten())
         if not self.training:
             return policy_loss
 
         # Deliberately attached: gradients enter the target embedding branch.
-        target_latent = F.rms_norm(self.tok_emb(target_ids), (self.tok_emb.embedding_dim,))
         latent_loss = F.mse_loss(predicted.float(), target_latent.float())
-        sigreg_loss = self.sigreg(token_latent)
-        return (
+        if self.defer_sigreg:
+            sigreg_loss = policy_loss.detach().new_zeros(())
+        else:
+            sigreg_loss = self.sigreg(
+                self.training_sigreg_features(token_latent, target_latent)
+            )
+        total_loss = (
             policy_loss
             + FreshHyperparameters.latent_loss_weight * latent_loss
             + FreshHyperparameters.sigreg_weight * sigreg_loss
         )
+        if self.return_loss_components:
+            return total_loss, torch.stack(
+                (policy_loss.detach(), latent_loss.detach(), sigreg_loss.detach())
+            )
+        return total_loss
 
 
 def main() -> None:
@@ -332,7 +452,7 @@ def main() -> None:
     if int(os.environ.get("RANK", "0")) == 0:
         tokenizer = Path(FreshHyperparameters.tokenizer_path)
         metadata = {
-            "architecture": "fresh_lejepa_attached_target_detached_probes_v1",
+            "architecture": EXPERIMENT_ARCHITECTURE,
             "model": {
                 key: getattr(FreshHyperparameters, key)
                 for key in (
@@ -346,6 +466,7 @@ def main() -> None:
                 "sigreg_weight": FreshHyperparameters.sigreg_weight,
                 "sigreg_knots": FreshHyperparameters.sigreg_knots,
                 "sigreg_num_proj": FreshHyperparameters.sigreg_num_proj,
+                "sigreg_proj_chunk": FreshHyperparameters.sigreg_proj_chunk,
                 "sigreg_position_chunk": FreshHyperparameters.sigreg_position_chunk,
             },
             "seed": FreshHyperparameters.seed,
@@ -362,7 +483,11 @@ def main() -> None:
                     "train_seq_len",
                 )
             },
+            "grad_accum_steps": int(os.environ.get("GRAD_ACCUM_STEPS", "8")),
+            "sigreg_compute_dtype": "float32",
         }
+        if hasattr(FreshLeJEPAGPT, "experiment_metadata"):
+            metadata["experiment"] = FreshLeJEPAGPT.experiment_metadata()
         metadata_path = Path("fresh_lejepa_metadata.json")
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
         if "RUN_ID" in os.environ:
@@ -372,7 +497,7 @@ def main() -> None:
             if Path("final_model.int8.ptz").exists():
                 shutil.copy2("final_model.int8.ptz", run_dir / "final_model.int8.ptz")
             shutil.copy2(metadata_path, run_dir / metadata_path.name)
-            shutil.copy2(Path(__file__), run_dir / Path(__file__).name)
+            shutil.copy2(EXPERIMENT_SOURCE, run_dir / EXPERIMENT_SOURCE.name)
             checkpoint = {
                 "step": FreshHyperparameters.iterations,
                 "model": torch.load("final_model.pt", map_location="cpu", weights_only=True),
