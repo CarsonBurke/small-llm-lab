@@ -22,7 +22,12 @@ from postraining.latent_rollout import (
 )
 from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
 from postraining.model_io import _pope_construction
-from postraining.train_latent_vapo import sample_prompt_batch, update_minibatch
+from postraining.train_latent_vapo import (
+    evaluate_aime_latent,
+    sample_prompt_batch,
+    think_run_lengths,
+    update_minibatch,
+)
 
 KWARGS = dict(
     vocab_size=32, num_layers=3, model_dim=32, num_heads=4, num_kv_heads=2,
@@ -345,6 +350,74 @@ def test_sample_prompt_batch_groups_and_aligns_references():
     assert not torch.equal(prompt_ids[0], prompt_ids[2])
 
 
+def test_evaluate_aime_latent_scores_through_the_gate_policy():
+    wrapper = _wrapper()
+
+    class _Tokenizer:
+        def eos_id(self) -> int:
+            return -1
+
+        def encode(self, text: str) -> list[int]:
+            return [1, 2, 3]
+
+        def decode(self, ids: list[int]) -> str:
+            return "Answer: 42" if ids else ""
+
+    rows = [
+        {"prompt": [{"content": "question"}], "reward_model": {"ground_truth": "42"}},
+        {"prompt": [{"content": "other"}], "reward_model": {"ground_truth": "7"}},
+    ]
+    metrics = evaluate_aime_latent(
+        wrapper, _Tokenizer(), rows, samples=4, max_new_tokens=3,
+        max_consecutive_thinks=2, chunk=3, seed=5, device=torch.device("cpu"),
+    )
+    # Every decode reads "Answer: 42": row one is always right, row two
+    # always wrong, so accuracy pins both counting and verification.
+    assert metrics["samples"] == 8
+    assert metrics["accuracy"] == 0.5
+    assert 0.0 <= metrics["think_fraction"] <= 1.0
+    # The eval must not perturb training RNG state.
+    before = torch.get_rng_state()
+    evaluate_aime_latent(
+        wrapper, _Tokenizer(), rows[:1], samples=2, max_new_tokens=2,
+        max_consecutive_thinks=2, chunk=2, seed=5, device=torch.device("cpu"),
+    )
+    assert torch.equal(before, torch.get_rng_state())
+
+
+def test_positive_lm_loss_applies_only_above_the_reward_threshold():
+    wrapper = _wrapper()
+    backbone = wrapper.backbone
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    optimizers = {
+        "gate": torch.optim.AdamW(wrapper.gate.parameters(), lr=1e-3, weight_decay=0.0),
+        "renderer": torch.optim.AdamW(
+            backbone.policy_probe.parameters(), lr=1e-4, weight_decay=0.0
+        ),
+        "critic": torch.optim.AdamW(
+            backbone.critic_probe.parameters(), lr=1e-4, weight_decay=0.0
+        ),
+        "transition": torch.optim.AdamW(
+            wrapper.transition.parameters(), lr=1e-3, weight_decay=0.0
+        ),
+    }
+    assign_terminal_rewards(batch, torch.tensor([0.9, 0.1, 0.6, 0.2]))
+    metrics = update_minibatch(
+        wrapper, batch, optimizers, 1e-3, 0.5, positive_lm_weight=0.1
+    )
+    assert metrics["positive_fraction"] == 0.5
+    # NLL of real emitted tokens under a softcapped 32-way softmax is
+    # strictly positive whenever any trajectory qualifies.
+    assert metrics["positive_lm_loss"] > 0.0
+    # No qualifying trajectory: the loss term is exactly zero.
+    assign_terminal_rewards(batch, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+    metrics = update_minibatch(
+        wrapper, batch, optimizers, 1e-3, 0.5, positive_lm_weight=0.1
+    )
+    assert metrics["positive_fraction"] == 0.0
+    assert metrics["positive_lm_loss"] == 0.0
+
+
 def test_value_only_update_touches_only_the_critic():
     wrapper = _wrapper()
     backbone = wrapper.backbone
@@ -366,3 +439,20 @@ def test_value_only_update_touches_only_the_critic():
         torch.equal(before, after)
         for before, after in zip(policy_before, backbone.policy_probe.parameters())
     )
+
+
+def test_think_run_lengths_matches_hand_computation():
+    T, H, P = TOKEN_SLOT, THOUGHT_SLOT, PAD_SLOT
+    kind = torch.tensor(
+        [
+            # Runs of 2 and 1; a trailing think run cut off by padding.
+            [T, T, H, H, T, H, P, P],
+            # No thinks at all.
+            [T, T, T, T, T, T, T, P],
+            # Single run of 3 reaching the stream end.
+            [T, T, T, T, T, H, H, H],
+        ]
+    )
+    lengths = think_run_lengths(kind)
+    assert sorted(lengths.tolist()) == [1.0, 2.0, 3.0]
+    assert think_run_lengths(kind[1:2]).numel() == 0

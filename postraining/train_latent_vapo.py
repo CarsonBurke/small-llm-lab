@@ -39,9 +39,13 @@ from postraining.core import (
     clipped_policy_loss,
     generalized_advantage_estimate,
     length_adaptive_lambda,
+    load_unique_math_rows,
     masked_token_mean,
+    positive_example_lm_loss,
+    verify_answer,
 )
 from postraining.latent_rollout import (
+    THOUGHT_SLOT,
     LatentRolloutBatch,
     assign_terminal_rewards,
     continuation_reward,
@@ -54,6 +58,7 @@ from postraining.latent_rollout import (
 )
 from postraining.latent_thought import LatentThoughtModel
 from postraining.model_io import load_model
+from postraining.train_vapo import prompt_text
 
 
 def sample_prompt_batch(
@@ -93,6 +98,88 @@ def score_rollout(
     )
 
 
+@torch.no_grad()
+def evaluate_aime_latent(
+    wrapper: LatentThoughtModel,
+    tokenizer,
+    rows: list[dict],
+    samples: int,
+    max_new_tokens: int,
+    max_consecutive_thinks: int,
+    chunk: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, float | int]:
+    """AIME avg@k through the latent THINK/EMIT policy itself.
+
+    Matches the VAPO paper's protocol (average pass rate over ``samples``
+    generations at temperature 1.0 / top-p 0.7) but generation runs the
+    gate-conditioned rollout, so the evaluated policy is exactly the trained
+    one — including its latent thinking.  RNG state is saved and restored so
+    the eval never perturbs training reproducibility.
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state()
+    python_state = random.getstate()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    random.seed(seed)
+    eos = tokenizer.eos_id()
+    correct = 0
+    total = 0
+    think_actions = 0.0
+    actions = 0.0
+    try:
+        for row in rows:
+            prompt_ids = torch.tensor(
+                tokenizer.encode(prompt_text(row)), dtype=torch.long, device=device
+            )[None]
+            truth = row["reward_model"]["ground_truth"]
+            for start in range(0, samples, chunk):
+                width = min(chunk, samples - start)
+                batch = trim_stream(
+                    rollout_continuations(
+                        wrapper, prompt_ids.expand(width, -1), max_new_tokens,
+                        max_consecutive_thinks, 1.0, 0.7,
+                    )
+                )
+                think_actions += float(
+                    ((batch.gate_actions == 0).float() * batch.action_mask).sum()
+                )
+                actions += float(batch.action_mask.sum())
+                for emitted in emitted_token_rows(batch):
+                    if eos >= 0 and eos in emitted:
+                        emitted = emitted[: emitted.index(eos) + 1]
+                    is_correct, _ = verify_answer(tokenizer.decode(emitted), truth)
+                    correct += int(is_correct)
+                    total += 1
+    finally:
+        torch.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state)
+        random.setstate(python_state)
+    return {
+        "accuracy": correct / max(total, 1),
+        "samples": total,
+        "think_fraction": think_actions / max(actions, 1.0),
+    }
+
+
+def think_run_lengths(kind: torch.Tensor) -> torch.Tensor:
+    """Lengths of every consecutive-THOUGHT run in a (batch, stream) kind map.
+
+    Runs are per-row (a row never opens with a thought — prompts are token
+    slots), so flattening start/end indices row-major keeps them paired.
+    """
+    thinks = kind == THOUGHT_SLOT
+    previous = torch.zeros_like(thinks)
+    previous[:, 1:] = thinks[:, :-1]
+    following = torch.zeros_like(thinks)
+    following[:, :-1] = thinks[:, 1:]
+    starts = (thinks & ~previous).flatten().nonzero().squeeze(-1)
+    ends = (thinks & ~following).flatten().nonzero().squeeze(-1)
+    return (ends - starts + 1).float()
+
+
 def rollout_diagnostics(
     batch: LatentRolloutBatch, samples_per_prompt: int
 ) -> dict[str, float | int]:
@@ -101,6 +188,7 @@ def rollout_diagnostics(
     think_fraction = float(
         ((batch.gate_actions == 0).float() * batch.action_mask).sum() / actions
     )
+    runs = think_run_lengths(batch.kind)
     grouped = batch.reward_scalar.reshape(-1, samples_per_prompt)
     return {
         "trajectories": batch.reward_scalar.numel(),
@@ -109,6 +197,9 @@ def rollout_diagnostics(
         "reward_std": float(batch.reward_scalar.std(unbiased=False)),
         "within_group_reward_std": float(grouped.std(dim=1, unbiased=False).mean()),
         "think_fraction": think_fraction,
+        "think_run_mean": float(runs.mean()) if runs.numel() else 0.0,
+        "think_run_std": float(runs.std(unbiased=False)) if runs.numel() else 0.0,
+        "think_runs_per_trajectory": runs.numel() / batch.reward_scalar.numel(),
         "forced_fraction": float(batch.forced_mask.sum() / actions),
         "actions_per_trajectory": float(batch.action_mask.sum(1).mean()),
         "old_value_mean": float(batch.old_values[generated].mean()) if generated.any() else 0.0,
@@ -122,6 +213,8 @@ def update_minibatch(
     gate_entropy_coef: float,
     beta: float,
     value_only: bool = False,
+    positive_lm_weight: float = 0.0,
+    positive_reward_threshold: float = 0.5,
 ) -> dict[str, float]:
     backbone = wrapper.backbone
     for optimizer in optimizers.values():
@@ -178,6 +271,15 @@ def update_minibatch(
         new_token_logprobs, batch.old_token_logprobs, advantages, batch.emit_mask
     )
 
+    # VAPO modification #6: NLL on positive trajectories' emitted tokens,
+    # via the same helper the token trainer uses.  The paper flags positives
+    # by verifier correctness; Tier 0 has no binary verifier, so a reward
+    # threshold stands in until Tier 2 rewards land.
+    positive = batch.reward_scalar >= positive_reward_threshold
+    positive_lm = positive_example_lm_loss(
+        new_token_logprobs, batch.emit_mask, positive
+    )
+
     grounded = grounded_transition_mask(batch)
     latent_targets = wrapper.embed_tokens(token_targets)
     transition_nll = wrapper.transition.beta_nll(
@@ -188,6 +290,7 @@ def update_minibatch(
         gate_loss
         - gate_entropy_coef * gate_entropy
         + renderer_loss
+        + positive_lm_weight * positive_lm
         + value_loss
         + transition_nll
     )
@@ -195,6 +298,7 @@ def update_minibatch(
         raise RuntimeError(
             "non-finite loss before optimizer step: "
             f"gate={float(gate_loss)} renderer={float(renderer_loss)} "
+            f"positive_lm={float(positive_lm)} "
             f"value={float(value_loss)} transition={float(transition_nll)}"
         )
     total.backward()
@@ -213,6 +317,8 @@ def update_minibatch(
         emit_probability=float(emit_probability),
         renderer_loss=float(renderer_loss),
         renderer_clip_fraction=float(renderer_clip),
+        positive_lm_loss=float(positive_lm),
+        positive_fraction=float(positive.float().mean()),
         transition_nll=float(transition_nll),
         log_std_mean=float(log_std.mean()) if log_std.numel() else 0.0,
         advantage_mean=float(masked_token_mean(advantages, batch.action_mask)),
@@ -272,8 +378,19 @@ def main() -> None:
     parser.add_argument("--transition-lr", type=float, default=1e-4)
     parser.add_argument("--gate-entropy-coef", type=float, default=1e-3)
     parser.add_argument("--beta-nll-beta", type=float, default=0.5)
-    parser.add_argument("--value-warmup-steps", type=int, default=25)
-    parser.add_argument("--bpb-every", type=int, default=50)
+    parser.add_argument("--positive-lm-weight", type=float, default=0.1)
+    parser.add_argument("--positive-reward-threshold", type=float, default=0.5)
+    # VAPO paper: 50 value-pretraining steps before policy updates.
+    parser.add_argument("--value-warmup-steps", type=int, default=50)
+    parser.add_argument("--bpb-every", type=int, default=80)
+    parser.add_argument("--aime-every", type=int, default=80)
+    parser.add_argument("--aime-data", default="postraining/data/aime-2024.parquet")
+    parser.add_argument("--aime-samples", type=int, default=32)
+    parser.add_argument("--aime-max-tokens", type=int, default=512)
+    # Rollout positions are sequential, so batching all samples of a problem
+    # into one rollout is nearly free parallelism; lower this only if VRAM
+    # becomes the constraint.
+    parser.add_argument("--aime-chunk", type=int, default=32)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--rollout-only", action="store_true")
     parser.add_argument("--gate-min-within-group-reward-std", type=float, default=0.01)
@@ -318,6 +435,11 @@ def main() -> None:
     }
 
     tokenizer = spm.SentencePieceProcessor(model_file=FreshHyperparameters.tokenizer_path)
+    aime_rows = (
+        load_unique_math_rows(args.aime_data)
+        if args.aime_every > 0 and not args.rollout_only
+        else []
+    )
     seq_len = FreshHyperparameters.train_seq_len
     loader = baseline.DistributedTokenLoader(FreshHyperparameters.train_files, 0, 1, device)
     luts = baseline.build_sentencepiece_luts(tokenizer, FreshHyperparameters.vocab_size, device)
@@ -382,6 +504,17 @@ def main() -> None:
         )
         return bpb
 
+    def aime_eval(step: int) -> None:
+        wrapper.eval()
+        metrics = evaluate_aime_latent(
+            wrapper, tokenizer, aime_rows, args.aime_samples, args.aime_max_tokens,
+            args.max_consecutive_thinks, args.aime_chunk, args.seed, device,
+        )
+        logger.log(type="aime", step=step, **metrics)
+        tensorboard.add_scalar("aime/accuracy", metrics["accuracy"], step)
+        tensorboard.add_scalar("aime/think_fraction", metrics["think_fraction"], step)
+        print(f"step:{step} aime_avg@{args.aime_samples}:{metrics['accuracy']:.4f}", flush=True)
+
     if args.rollout_only:
         batch = collect()
         metrics = rollout_diagnostics(batch, args.samples_per_prompt)
@@ -396,6 +529,8 @@ def main() -> None:
         logger.log(type="bpb", step=0, val_bpb=bpb)
         tensorboard.add_scalar("guard/val_bpb", bpb, 0)
         print(f"step:0 teacher-forced val_bpb:{bpb:.4f}", flush=True)
+        if aime_rows:
+            aime_eval(0)
         for warmup in range(1, args.value_warmup_steps + 1):
             batch = collect()
             metrics = update_minibatch(
@@ -441,7 +576,10 @@ def main() -> None:
                     }
                 )
                 metrics = update_minibatch(
-                    wrapper, mini, optimizers, args.gate_entropy_coef, args.beta_nll_beta
+                    wrapper, mini, optimizers, args.gate_entropy_coef,
+                    args.beta_nll_beta,
+                    positive_lm_weight=args.positive_lm_weight,
+                    positive_reward_threshold=args.positive_reward_threshold,
                 )
                 logger.log(
                     type="train", step=step,
@@ -456,6 +594,8 @@ def main() -> None:
             bpb = teacher_forced_bpb()
             logger.log(type="bpb", step=step, val_bpb=bpb)
             tensorboard.add_scalar("guard/val_bpb", bpb, step)
+        if aime_rows and crossed_interval(previous_step, step, args.aime_every):
+            aime_eval(step)
         if crossed_interval(previous_step, step, args.save_every):
             save_checkpoint(
                 output / "latent_vapo_checkpoint.pt", wrapper, optimizers, step, args, loader
