@@ -187,3 +187,16 @@ def load_model(
     for parameter in model.critic_probe.parameters():
         parameter.requires_grad_(True)
     return model
+
+
+def fresh_trunk(reference, device: torch.device):
+    """A fresh, randomly initialized, fully trainable instance of a loaded
+    model's architecture — same class and config, none of its weights."""
+    construction = (
+        _pope_construction() if "_pope_" in reference.architecture else nullcontext()
+    )
+    with construction:
+        model = type(reference)(**reference.model_config).to(device)
+    model.model_config = reference.model_config
+    model.architecture = reference.architecture
+    return model

@@ -28,6 +28,7 @@ from postraining.train_latent_vapo import (
     think_run_lengths,
     update_minibatch,
 )
+from postraining.value_model import SeparateCritic
 
 KWARGS = dict(
     vocab_size=32, num_layers=3, model_dim=32, num_heads=4, num_kv_heads=2,
@@ -71,6 +72,19 @@ def _bf16_wrapper(seed: int = 3) -> LatentThoughtModel:
         for parameter in probe.parameters():
             parameter.requires_grad_(True)
     return LatentThoughtModel(backbone)
+
+
+def _critic(seed: int = 11) -> SeparateCritic:
+    torch.manual_seed(seed)
+    with _pope_construction():
+        trunk = FreshLeJEPASharedRMSV1PoPE(**KWARGS).eval()
+    critic = SeparateCritic(trunk, num_bins=17, sigma_ratio=2.0).eval()
+    # The v215 head init (zero weight, prior bias) makes every value the
+    # constant prior; de-zero the weight so values are input-dependent and
+    # the exactness assertions below carry weight.
+    with torch.no_grad():
+        critic.head.weight.normal_(std=0.05)
+    return critic
 
 
 def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, max_thinks=2, seed=7):
@@ -211,8 +225,9 @@ def test_terminal_reward_lands_on_the_last_action():
         assert float(batch.action_mask[row, position + 1 :].sum()) == 0.0
 
 
-def test_update_minibatch_trains_heads_but_never_the_trunk():
+def test_update_minibatch_trains_heads_but_never_the_policy_trunk():
     wrapper = _wrapper()
+    critic = _critic()
     backbone = wrapper.backbone
     with torch.no_grad():
         backbone.policy_probe.output.weight.normal_(std=0.02)
@@ -224,6 +239,9 @@ def test_update_minibatch_trains_heads_but_never_the_trunk():
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
     assign_terminal_rewards(batch, torch.rand(4))
     trunk_before = backbone.blocks[0].attn.c_qkv.weight.clone()
+    # Fresh trunks zero-init output projections, so at step one the gradient
+    # reaches attn.proj (whose input is nonzero) but not yet c_qkv behind it.
+    critic_trunk_before = critic.trunk.blocks[0].attn.proj.weight.clone()
     gate_before = wrapper.gate.head.weight.clone()
     log_std_before = wrapper.transition.log_std_head.bias.clone()
     optimizers = {
@@ -231,18 +249,20 @@ def test_update_minibatch_trains_heads_but_never_the_trunk():
         "renderer": torch.optim.AdamW(
             backbone.policy_probe.parameters(), lr=1e-3, weight_decay=0.0
         ),
-        "critic": torch.optim.AdamW(
-            backbone.critic_probe.parameters(), lr=1e-3, weight_decay=0.0
-        ),
+        "critic": torch.optim.AdamW(critic.parameters(), lr=1e-3, weight_decay=0.0),
         "transition": torch.optim.AdamW(
             wrapper.transition.parameters(), lr=1e-2, weight_decay=0.0
         ),
     }
-    metrics = update_minibatch(wrapper, batch, optimizers, 1e-3, 0.5)
+    metrics = update_minibatch(wrapper, critic, batch, optimizers, 1e-3, 0.5)
     assert all(
         torch.isfinite(torch.tensor(value)) for value in metrics.values()
     ), metrics
     torch.testing.assert_close(backbone.blocks[0].attn.c_qkv.weight, trunk_before)
+    # The separate critic is fully trainable: value CE must reach its trunk.
+    assert not torch.equal(
+        critic.trunk.blocks[0].attn.proj.weight, critic_trunk_before
+    )
     assert not torch.equal(wrapper.transition.log_std_head.bias, log_std_before)
     assert not torch.equal(wrapper.gate.head.weight, gate_before) or float(
         batch.action_mask.sum()
@@ -251,12 +271,13 @@ def test_update_minibatch_trains_heads_but_never_the_trunk():
 
 def test_refresh_old_statistics_matches_the_update_code_path_exactly():
     wrapper = _wrapper()
+    critic = _critic()
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
-    refresh_old_statistics(wrapper, batch)
+    refresh_old_statistics(wrapper, critic, batch)
     backbone = wrapper.backbone
     with torch.no_grad():
         beliefs, _, features, token_targets = replay_head_inputs(wrapper, batch)
-        values = backbone.values_from_features(features).float()
+        values = critic.values(batch).float()
         gate_logprobs = wrapper.gate.log_prob(batch.gate_actions.float(), beliefs)
         token_logprobs = (
             backbone.logits_from_features(features)
@@ -275,31 +296,29 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     # never see a bf16 operand in either the stepwise rollout or the
     # parallel replay, and one full update must stay finite.
     wrapper = _bf16_wrapper()
+    critic = _critic()  # the separate critic always runs fp32
     assert wrapper.backbone.tok_emb.weight.dtype == torch.bfloat16
     # Zero-init probe/gate outputs would make the clip-fraction assertions
     # below vacuous (both code paths output exactly zero); randomize them so
     # the ratio-one property is actually load-bearing.
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.backbone.critic_probe.output.weight.normal_(std=0.02)
         wrapper.gate.head.weight.normal_(std=0.02)
     batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
     assert batch.thoughts.dtype == torch.float32
-    refresh_old_statistics(wrapper, batch)
+    refresh_old_statistics(wrapper, critic, batch)
     assign_terminal_rewards(batch, torch.rand(2))
     optimizers = {
         "gate": torch.optim.AdamW(wrapper.gate.parameters(), lr=1e-3, weight_decay=0.0),
         "renderer": torch.optim.AdamW(
             wrapper.backbone.policy_probe.parameters(), lr=1e-4, weight_decay=0.0
         ),
-        "critic": torch.optim.AdamW(
-            wrapper.backbone.critic_probe.parameters(), lr=1e-4, weight_decay=0.0
-        ),
+        "critic": torch.optim.AdamW(critic.parameters(), lr=1e-4, weight_decay=0.0),
         "transition": torch.optim.AdamW(
             wrapper.transition.parameters(), lr=1e-3, weight_decay=0.0
         ),
     }
-    metrics = update_minibatch(wrapper, batch, optimizers, 1e-3, 0.5)
+    metrics = update_minibatch(wrapper, critic, batch, optimizers, 1e-3, 0.5)
     assert all(
         torch.isfinite(torch.tensor(value)) for value in metrics.values()
     ), metrics
@@ -387,6 +406,7 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy():
 
 def test_positive_lm_loss_applies_only_above_the_reward_threshold():
     wrapper = _wrapper()
+    critic = _critic()
     backbone = wrapper.backbone
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
     optimizers = {
@@ -394,16 +414,14 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
         "renderer": torch.optim.AdamW(
             backbone.policy_probe.parameters(), lr=1e-4, weight_decay=0.0
         ),
-        "critic": torch.optim.AdamW(
-            backbone.critic_probe.parameters(), lr=1e-4, weight_decay=0.0
-        ),
+        "critic": torch.optim.AdamW(critic.parameters(), lr=1e-4, weight_decay=0.0),
         "transition": torch.optim.AdamW(
             wrapper.transition.parameters(), lr=1e-3, weight_decay=0.0
         ),
     }
     assign_terminal_rewards(batch, torch.tensor([0.9, 0.1, 0.6, 0.2]))
     metrics = update_minibatch(
-        wrapper, batch, optimizers, 1e-3, 0.5, positive_lm_weight=0.1
+        wrapper, critic, batch, optimizers, 1e-3, 0.5, positive_lm_weight=0.1
     )
     assert metrics["positive_fraction"] == 0.5
     # NLL of real emitted tokens under a softcapped 32-way softmax is
@@ -412,7 +430,7 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
     # No qualifying trajectory: the loss term is exactly zero.
     assign_terminal_rewards(batch, torch.tensor([0.1, 0.2, 0.3, 0.4]))
     metrics = update_minibatch(
-        wrapper, batch, optimizers, 1e-3, 0.5, positive_lm_weight=0.1
+        wrapper, critic, batch, optimizers, 1e-3, 0.5, positive_lm_weight=0.1
     )
     assert metrics["positive_fraction"] == 0.0
     assert metrics["positive_lm_loss"] == 0.0
@@ -420,20 +438,19 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
 
 def test_value_only_update_touches_only_the_critic():
     wrapper = _wrapper()
+    critic = _critic()
     backbone = wrapper.backbone
     batch = _rollout(wrapper, batch=2)
     assign_terminal_rewards(batch, torch.rand(2))
-    critic_before = [p.clone() for p in backbone.critic_probe.parameters()]
+    critic_before = [p.clone() for p in critic.parameters()]
     policy_before = [p.clone() for p in backbone.policy_probe.parameters()]
     optimizers = {
-        "critic": torch.optim.AdamW(
-            backbone.critic_probe.parameters(), lr=1e-2, weight_decay=0.0
-        ),
+        "critic": torch.optim.AdamW(critic.parameters(), lr=1e-2, weight_decay=0.0),
     }
-    update_minibatch(wrapper, batch, optimizers, 0.0, 0.5, value_only=True)
+    update_minibatch(wrapper, critic, batch, optimizers, 0.0, 0.5, value_only=True)
     assert any(
         not torch.equal(before, after)
-        for before, after in zip(critic_before, backbone.critic_probe.parameters())
+        for before, after in zip(critic_before, critic.parameters())
     )
     assert all(
         torch.equal(before, after)

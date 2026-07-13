@@ -280,7 +280,7 @@ def replay_head_inputs(
 
 @torch.no_grad()
 def refresh_old_statistics(
-    wrapper: LatentThoughtModel, batch: LatentRolloutBatch
+    wrapper: LatentThoughtModel, critic, batch: LatentRolloutBatch
 ) -> None:
     """Overwrite the stored PPO statistics with parallel-replay recomputations.
 
@@ -290,10 +290,13 @@ def refresh_old_statistics(
     ``old_values``/``old_gate_logprobs``/``old_token_logprobs`` through the
     exact update-step code path removes the drift; positions outside the
     consuming masks are overwritten too, but nothing ever reads them.
+
+    ``old_values`` come from the separate critic model — the rollout itself
+    never computes values, so this is where GAE's baseline is filled in.
     """
     backbone = wrapper.backbone
     beliefs, _, features, token_targets = replay_head_inputs(wrapper, batch)
-    batch.old_values.copy_(backbone.values_from_features(features).float())
+    batch.old_values.copy_(critic.values(batch).float())
     batch.old_gate_logprobs.copy_(
         wrapper.gate.log_prob(batch.gate_actions.float(), beliefs).float()
     )

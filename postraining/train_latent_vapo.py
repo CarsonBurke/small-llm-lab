@@ -2,12 +2,15 @@
 
 D4-faithful separation of concerns on top of a frozen pretrained trunk:
 
-- PPO trains the gate (Bernoulli THINK/EMIT), the renderer (policy probe),
-  and the critic (critic probe) from stored-stream rollouts.
+- PPO trains the gate (Bernoulli THINK/EMIT) and the renderer (policy probe)
+  from stored-stream rollouts.
+- The critic is a SEPARATE from-scratch model (same architecture class,
+  fresh weights, fully trainable, no SIGReg or latent prediction) trained
+  purely by HL-Gauss cross-entropy on [0, 1] value targets.
 - The transition head stays a predictive world model: its log-std trains by
   beta-NLL on grounded transitions (stream positions whose next input was a
   real token), never by policy gradient.
-- The trunk, embeddings, projectors, and adapter do not train here at all.
+- The policy trunk, embeddings, projectors, and adapter do not train at all.
 
 Rewards are Tier 0 of the curriculum: continuation match (longest common
 prefix + character F1) against the true FineWeb continuation.  ``--rollout-only``
@@ -57,8 +60,9 @@ from postraining.latent_rollout import (
     trim_stream,
 )
 from postraining.latent_thought import LatentThoughtModel
-from postraining.model_io import load_model
+from postraining.model_io import fresh_trunk, load_model
 from postraining.train_vapo import prompt_text
+from postraining.value_model import SeparateCritic
 
 
 def sample_prompt_batch(
@@ -206,8 +210,17 @@ def rollout_diagnostics(
     }
 
 
+def gradient_norm(parameters) -> float:
+    total = 0.0
+    for parameter in parameters:
+        if parameter.grad is not None:
+            total += float(parameter.grad.detach().float().square().sum())
+    return total**0.5
+
+
 def update_minibatch(
     wrapper: LatentThoughtModel,
+    critic: SeparateCritic,
     batch: LatentRolloutBatch,
     optimizers: dict[str, torch.optim.Optimizer],
     gate_entropy_coef: float,
@@ -237,19 +250,23 @@ def update_minibatch(
     advantages = advantages.detach()
     value_targets = value_targets.detach()
 
-    values = backbone.values_from_features(features).float()
-    value_loss = masked_token_mean(
-        (values - value_targets).square(), batch.action_mask
-    )
+    # Separate critic, HL-Gauss (cleanrl v215): softmax-CE against the
+    # Gaussian-smoothed projection of the scalar targets, no value clipping.
+    value_logits = critic.value_logits(batch)
+    value_ce = critic.support.cross_entropy(value_logits, value_targets)
+    value_loss = masked_token_mean(value_ce, batch.action_mask)
+    with torch.no_grad():
+        values = critic.support.to_expected_scalar(value_logits)
     metrics: dict[str, float] = {
-        "value_loss": float(value_loss),
-        "value_mean": float(masked_token_mean(values.detach(), batch.action_mask)),
+        "value_loss": float(value_loss.detach()),
+        "value_mean": float(masked_token_mean(values, batch.action_mask)),
         "value_target_mean": float(masked_token_mean(value_targets, batch.action_mask)),
     }
     if value_only:
         if not torch.isfinite(value_loss):
             raise RuntimeError(f"non-finite value loss: {metrics}")
         value_loss.backward()
+        metrics["critic_grad_norm"] = gradient_norm(critic.parameters())
         optimizers["critic"].step()
         return metrics
 
@@ -302,6 +319,12 @@ def update_minibatch(
             f"value={float(value_loss)} transition={float(transition_nll)}"
         )
     total.backward()
+    grad_norms = {
+        "transition_grad_norm": gradient_norm(wrapper.transition.parameters()),
+        "renderer_grad_norm": gradient_norm(backbone.policy_probe.parameters()),
+        "critic_grad_norm": gradient_norm(critic.parameters()),
+        "gate_grad_norm": gradient_norm(wrapper.gate.parameters()),
+    }
     for optimizer in optimizers.values():
         optimizer.step()
 
@@ -330,6 +353,7 @@ def update_minibatch(
             ** 0.5
         ),
         reward=float(batch.reward_scalar.mean()),
+        **grad_norms,
     )
     return metrics
 
@@ -337,6 +361,7 @@ def update_minibatch(
 def save_checkpoint(
     path: Path,
     wrapper: LatentThoughtModel,
+    critic: SeparateCritic,
     optimizers: dict[str, torch.optim.Optimizer],
     step: int,
     args: argparse.Namespace,
@@ -345,6 +370,7 @@ def save_checkpoint(
     payload = {
         "step": step,
         "model": wrapper.state_dict(),
+        "critic": critic.state_dict(),
         "optimizers": {name: opt.state_dict() for name, opt in optimizers.items()},
         "args": vars(args),
         "loader": {"file_idx": loader.stream.file_idx, "pos": loader.stream.pos},
@@ -374,7 +400,17 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--gate-lr", type=float, default=1e-4)
     parser.add_argument("--renderer-lr", type=float, default=1e-6)
-    parser.add_argument("--critic-lr", type=float, default=2e-6)
+    # The VAPO paper's 2e-6 presumes a value model initialized from pretrained
+    # weights; this critic trains from scratch and needs a scratch-training lr.
+    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--value-bins", type=int, default=101)
+    # HL-Gauss projection sigma as a fraction of bin width (cleanrl v215 /
+    # Dreamer4 default).
+    parser.add_argument("--value-sigma-ratio", type=float, default=2.0)
+    # Head bias starts at the projected prior; Tier-0 rewards sit ~0.37, and
+    # a prior near the reward mean removes the early decode transient a
+    # 0-prior causes (the target mass otherwise starts on floored far bins).
+    parser.add_argument("--value-prior", type=float, default=0.35)
     parser.add_argument("--transition-lr", type=float, default=1e-4)
     parser.add_argument("--gate-entropy-coef", type=float, default=1e-3)
     parser.add_argument("--beta-nll-beta", type=float, default=0.5)
@@ -409,13 +445,24 @@ def main() -> None:
     backbone = load_model(args.checkpoint, device)
     backbone.eval()
     # load_model freezes everything except the probes; that is exactly the
-    # RL trainable surface plus the new heads enabled below.
+    # RL trainable surface plus the new heads enabled below.  The backbone's
+    # critic probe is unused here (the critic is a separate model) — freeze it.
     wrapper = LatentThoughtModel(backbone).to(device)
     for parameter in wrapper.new_parameters():
+        parameter.requires_grad_(False)
+    for parameter in backbone.critic_probe.parameters():
         parameter.requires_grad_(False)
     for module in (wrapper.gate, wrapper.transition):
         for parameter in module.parameters():
             parameter.requires_grad_(True)
+
+    critic = SeparateCritic(
+        fresh_trunk(backbone, device),
+        num_bins=args.value_bins,
+        sigma_ratio=args.value_sigma_ratio,
+        prior_value=args.value_prior,
+    ).to(device)
+    critic.eval()  # no dropout in this architecture; keep norms deterministic
 
     optimizers = {
         "gate": torch.optim.AdamW(
@@ -426,8 +473,7 @@ def main() -> None:
             weight_decay=0.0, fused=True,
         ),
         "critic": torch.optim.AdamW(
-            backbone.critic_probe.parameters(), lr=args.critic_lr,
-            weight_decay=0.0, fused=True,
+            critic.parameters(), lr=args.critic_lr, weight_decay=0.0, fused=True,
         ),
         "transition": torch.optim.AdamW(
             wrapper.transition.parameters(), lr=args.transition_lr, weight_decay=0.0
@@ -449,6 +495,7 @@ def main() -> None:
     if args.resume:
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         wrapper.load_state_dict(payload["model"], strict=True)
+        critic.load_state_dict(payload["critic"], strict=True)
         for name, optimizer in optimizers.items():
             optimizer.load_state_dict(payload["optimizers"][name])
         start_step = int(payload["step"])
@@ -473,6 +520,14 @@ def main() -> None:
                     "checkpoint": str(args.checkpoint),
                     "architecture": backbone.architecture,
                 },
+                "critic": {
+                    "init": "scratch",
+                    "architecture": backbone.architecture,
+                    "value_bins": args.value_bins,
+                    "value_sigma_ratio": args.value_sigma_ratio,
+                    "value_prior": args.value_prior,
+                    "parameters": sum(p.numel() for p in critic.parameters()),
+                },
             },
             indent=2,
         )
@@ -492,8 +547,9 @@ def main() -> None:
         score_rollout(batch, reference_ids, tokenizer)
         # Stepwise rollout and parallel replay disagree numerically at bf16
         # scale; recompute the stored PPO statistics through the update-step
-        # replay path so epoch-0 ratios are exactly one.
-        refresh_old_statistics(wrapper, batch)
+        # replay path so epoch-0 ratios are exactly one.  This also fills
+        # old_values from the separate critic (the rollout never values).
+        refresh_old_statistics(wrapper, critic, batch)
         return batch
 
     def teacher_forced_bpb() -> float:
@@ -534,7 +590,7 @@ def main() -> None:
         for warmup in range(1, args.value_warmup_steps + 1):
             batch = collect()
             metrics = update_minibatch(
-                wrapper, batch, optimizers, args.gate_entropy_coef,
+                wrapper, critic, batch, optimizers, args.gate_entropy_coef,
                 args.beta_nll_beta, value_only=True,
             )
             logger.log(type="value_warmup", step=warmup, **metrics)
@@ -576,7 +632,7 @@ def main() -> None:
                     }
                 )
                 metrics = update_minibatch(
-                    wrapper, mini, optimizers, args.gate_entropy_coef,
+                    wrapper, critic, mini, optimizers, args.gate_entropy_coef,
                     args.beta_nll_beta,
                     positive_lm_weight=args.positive_lm_weight,
                     positive_reward_threshold=args.positive_reward_threshold,
@@ -598,10 +654,12 @@ def main() -> None:
             aime_eval(step)
         if crossed_interval(previous_step, step, args.save_every):
             save_checkpoint(
-                output / "latent_vapo_checkpoint.pt", wrapper, optimizers, step, args, loader
+                output / "latent_vapo_checkpoint.pt", wrapper, critic,
+                optimizers, step, args, loader,
             )
     save_checkpoint(
-        output / "latent_vapo_checkpoint.pt", wrapper, optimizers, step, args, loader
+        output / "latent_vapo_checkpoint.pt", wrapper, critic,
+        optimizers, step, args, loader,
     )
     tensorboard.close()
 
