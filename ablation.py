@@ -54,6 +54,13 @@ def parse_time_ms(text: str) -> float | None:
 
 def parse_log_line(line: str) -> dict | None:
     """Parse a single log line into a metric dict."""
+    churn_match = re.match(r"churn_stats\s+(.*)", line)
+    if churn_match:
+        metrics = parse_extra_metrics(churn_match.group(1))
+        # stepless by design: emitted just before the val line it belongs to,
+        # MetricsWriter folds it into that val entry
+        return {"type": "churn_stats", **metrics} if metrics else None
+
     diag_match = re.match(r"token_view_diag:step:(\d+)/\d+\s+(.*)", line)
     if diag_match:
         entry = {
@@ -111,6 +118,7 @@ class MetricsWriter:
         self.metrics_file = metrics_path.open("a", encoding="utf-8")
         self._prev_train_loss = None
         self._last_train_time_ms = None
+        self._pending_churn: dict | None = None
 
     @staticmethod
     def _extra_scalar_tag(key: str) -> str:
@@ -152,15 +160,24 @@ class MetricsWriter:
             return f"lejepa/{key}"
         if key.startswith("probe_"):
             return f"probe/{key.removeprefix('probe_')}"
+        if re.match(r"(?:rewire|support|hnorm)_l\d+$", key):
+            return f"churn/{key}"
         if key.startswith("codebook_"):
             return f"probe/{key}"
         return f"train/{key}"
 
     def write_entry(self, entry: dict) -> None:
+        if entry["type"] == "churn_stats":
+            self._pending_churn = {k: v for k, v in entry.items() if k != "type"}
+            return
         if entry["type"] == "train":
             self._last_train_time_ms = entry["train_time_ms"]
-        elif entry["type"] == "val" and entry["train_time_ms"] == 0.0 and self._last_train_time_ms is not None:
-            entry = {**entry, "train_time_ms": self._last_train_time_ms}
+        elif entry["type"] == "val":
+            if entry["train_time_ms"] == 0.0 and self._last_train_time_ms is not None:
+                entry = {**entry, "train_time_ms": self._last_train_time_ms}
+            if self._pending_churn:
+                entry = {**entry, **self._pending_churn}
+                self._pending_churn = None
         self.metrics_file.write(json.dumps(entry, sort_keys=True) + "\n")
         self.metrics_file.flush()
         if entry["type"] == "val":
