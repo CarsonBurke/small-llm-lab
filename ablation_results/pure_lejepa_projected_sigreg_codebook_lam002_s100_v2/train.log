@@ -1,0 +1,1100 @@
+"""
+Interleaved next-token LeJEPA ablation forked from train_normuon.py.
+
+LeJEPA updates:
+- no CE loss, no stop-grad target, no EMA, no negatives
+- encode the causal token sequence once and predict the projected next-token
+  embedding from the current causal hidden state
+- add sample-count-scaled SIGReg over sampled context, target, and token-codebook
+  latents in the LeJEPA projection space
+
+Detached CE probe updates:
+- freeze the learned representation by detaching hidden states
+- train only a small next-token CE probe/head; by default this is a latent
+  codebook softmax using predictor(h[t]) against projected token embeddings
+- run one detached probe update after every LEJEPA_STEPS_PER_PROBE LeJEPA updates
+- validation reports detached probe CE/BPB as the primary val metrics and under
+  the probe TensorBoard category
+"""
+
+from __future__ import annotations
+
+import copy
+import io
+import os
+import random
+import subprocess
+import sys
+import time
+import zlib
+from pathlib import Path
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.distributed.nn.functional import all_reduce as differentiable_all_reduce
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import train_normuon as base  # noqa: E402
+
+
+class Hyperparameters(base.Hyperparameters):
+    lejepa_steps_per_probe = int(os.environ.get("LEJEPA_STEPS_PER_PROBE", "10"))
+    lejepa_lr = float(os.environ.get("LEJEPA_LR", "0.0001"))
+    lejepa_weight_decay = float(os.environ.get("LEJEPA_WEIGHT_DECAY", "0.05"))
+    lejepa_probe_lr = float(os.environ.get("LEJEPA_PROBE_LR", os.environ.get("HEAD_LR", "0.02")))
+    lejepa_probe_kind = os.environ.get("LEJEPA_PROBE_KIND", "codebook")
+    lejepa_codebook_scale_init = float(os.environ.get("LEJEPA_CODEBOOK_SCALE_INIT", "10.0"))
+    lejepa_codebook_chunk_tokens = int(os.environ.get("LEJEPA_CODEBOOK_CHUNK_TOKENS", "16384"))
+    pure_lejepa_lambda = float(os.environ.get("PURE_LEJEPA_LAMBDA", "0.002"))
+    pure_lejepa_proj_dim = int(os.environ.get("PURE_LEJEPA_PROJ_DIM", "128"))
+    pure_lejepa_proj_hidden = int(
+        os.environ.get(
+            "PURE_LEJEPA_PROJ_HIDDEN",
+            str(2 * int(os.environ.get("PURE_LEJEPA_PROJ_DIM", "128"))),
+        )
+    )
+    pure_lejepa_proj_dropout = float(os.environ.get("PURE_LEJEPA_PROJ_DROPOUT", "0.0"))
+    pure_lejepa_pred_hidden = int(
+        os.environ.get("PURE_LEJEPA_PRED_HIDDEN", os.environ.get("PURE_LEJEPA_PROJ_HIDDEN", str(pure_lejepa_proj_hidden)))
+    )
+    pure_lejepa_sigreg_slices = int(os.environ.get("PURE_LEJEPA_SIGREG_SLICES", "1024"))
+    pure_lejepa_sigreg_points = int(os.environ.get("PURE_LEJEPA_SIGREG_POINTS", "17"))
+    pure_lejepa_sigreg_t_max = float(os.environ.get("PURE_LEJEPA_SIGREG_T_MAX", "5.0"))
+    pure_lejepa_sigreg_tokens = int(os.environ.get("PURE_LEJEPA_SIGREG_TOKENS", "1024"))
+    pure_lejepa_sigreg_slice_chunk = int(os.environ.get("PURE_LEJEPA_SIGREG_SLICE_CHUNK", "256"))
+
+    if not base.Hyperparameters.tie_embeddings:
+        raise ValueError("Pure LeJEPA text-view ablation keeps the baseline tied embedding setup; set TIE_EMBEDDINGS=1")
+    if lejepa_steps_per_probe <= 0:
+        raise ValueError(f"LEJEPA_STEPS_PER_PROBE must be positive, got {lejepa_steps_per_probe}")
+    if lejepa_lr <= 0.0:
+        raise ValueError(f"LEJEPA_LR must be positive, got {lejepa_lr}")
+    if lejepa_weight_decay < 0.0:
+        raise ValueError(f"LEJEPA_WEIGHT_DECAY must be non-negative, got {lejepa_weight_decay}")
+    if lejepa_probe_lr <= 0.0:
+        raise ValueError(f"LEJEPA_PROBE_LR must be positive, got {lejepa_probe_lr}")
+    if lejepa_probe_kind not in {"linear", "codebook"}:
+        raise ValueError(f"LEJEPA_PROBE_KIND must be 'linear' or 'codebook', got {lejepa_probe_kind!r}")
+    if lejepa_codebook_scale_init <= 0.0:
+        raise ValueError(f"LEJEPA_CODEBOOK_SCALE_INIT must be positive, got {lejepa_codebook_scale_init}")
+    if lejepa_codebook_chunk_tokens <= 0:
+        raise ValueError(f"LEJEPA_CODEBOOK_CHUNK_TOKENS must be positive, got {lejepa_codebook_chunk_tokens}")
+    if pure_lejepa_lambda < 0.0 or pure_lejepa_lambda > 1.0:
+        raise ValueError(f"PURE_LEJEPA_LAMBDA must be in [0, 1], got {pure_lejepa_lambda}")
+    if pure_lejepa_proj_dim <= 0:
+        raise ValueError(f"PURE_LEJEPA_PROJ_DIM must be positive, got {pure_lejepa_proj_dim}")
+    if pure_lejepa_proj_hidden <= 0:
+        raise ValueError(f"PURE_LEJEPA_PROJ_HIDDEN must be positive, got {pure_lejepa_proj_hidden}")
+    if pure_lejepa_pred_hidden <= 0:
+        raise ValueError(f"PURE_LEJEPA_PRED_HIDDEN must be positive, got {pure_lejepa_pred_hidden}")
+    if pure_lejepa_proj_dropout < 0.0 or pure_lejepa_proj_dropout >= 1.0:
+        raise ValueError(f"PURE_LEJEPA_PROJ_DROPOUT must be in [0, 1), got {pure_lejepa_proj_dropout}")
+    if pure_lejepa_sigreg_slices <= 0:
+        raise ValueError(f"PURE_LEJEPA_SIGREG_SLICES must be positive, got {pure_lejepa_sigreg_slices}")
+    if pure_lejepa_sigreg_points < 2:
+        raise ValueError(f"PURE_LEJEPA_SIGREG_POINTS must be at least 2, got {pure_lejepa_sigreg_points}")
+    if pure_lejepa_sigreg_t_max <= 0.0:
+        raise ValueError(f"PURE_LEJEPA_SIGREG_T_MAX must be positive, got {pure_lejepa_sigreg_t_max}")
+    if pure_lejepa_sigreg_tokens <= 0:
+        raise ValueError(f"PURE_LEJEPA_SIGREG_TOKENS must be positive, got {pure_lejepa_sigreg_tokens}")
+    if pure_lejepa_sigreg_slice_chunk <= 0:
+        raise ValueError(
+            f"PURE_LEJEPA_SIGREG_SLICE_CHUNK must be positive, got {pure_lejepa_sigreg_slice_chunk}"
+        )
+
+
+class LeJEPATextProjector(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = base.CastedLinear(input_dim, hidden_dim, bias=False)
+        self.fc2 = base.CastedLinear(hidden_dim, output_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.dropout(x)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = F.gelu(self.fc1(x))
+        x = F.rms_norm(x, (x.size(-1),))
+        return self.fc2(x)
+
+
+class LeJEPANextTokenPredictor(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = base.CastedLinear(input_dim, hidden_dim, bias=False)
+        self.fc2 = base.CastedLinear(hidden_dim, output_dim, bias=False)
+        nn.init.zeros_(self.fc2.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.dropout(x)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = F.gelu(self.fc1(x))
+        x = F.rms_norm(x, (x.size(-1),))
+        return self.fc2(x)
+
+
+class PureLeJEPATextViewsGPT(base.GPT):
+    def __init__(self, args: Hyperparameters):
+        super().__init__(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=True,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+        )
+        self.lm_head = None
+        self.stage = "lejepa"
+        self.lejepa_lambda = float(args.pure_lejepa_lambda)
+        self.sigreg_tokens = int(args.pure_lejepa_sigreg_tokens)
+        self.sigreg_slice_chunk = int(args.pure_lejepa_sigreg_slice_chunk)
+        self.probe_kind = args.lejepa_probe_kind
+        self.codebook_chunk_tokens = int(args.lejepa_codebook_chunk_tokens)
+        self.eval_head = "probe"
+        self.collect_lejepa_diagnostics = False
+        self.projector = LeJEPATextProjector(
+            input_dim=args.model_dim,
+            hidden_dim=args.pure_lejepa_proj_hidden,
+            output_dim=args.pure_lejepa_proj_dim,
+            dropout=args.pure_lejepa_proj_dropout,
+        )
+        self.predictor = LeJEPANextTokenPredictor(
+            input_dim=args.model_dim,
+            hidden_dim=args.pure_lejepa_pred_hidden,
+            output_dim=args.pure_lejepa_proj_dim,
+            dropout=args.pure_lejepa_proj_dropout,
+        )
+        self.probe_head = (
+            base.CastedLinear(args.model_dim, args.vocab_size, bias=False)
+            if args.lejepa_probe_kind == "linear"
+            else None
+        )
+        if self.probe_head is not None:
+            nn.init.zeros_(self.probe_head.weight)
+        self.codebook_logit_scale = (
+            nn.Parameter(torch.tensor(float(args.lejepa_codebook_scale_init)).log())
+            if args.lejepa_probe_kind == "codebook"
+            else None
+        )
+        self.codebook_bias = (
+            nn.Parameter(torch.zeros(args.vocab_size, dtype=torch.float32))
+            if args.lejepa_probe_kind == "codebook"
+            else None
+        )
+
+        dirs = torch.randn(args.pure_lejepa_sigreg_slices, args.pure_lejepa_proj_dim, dtype=torch.float32)
+        dirs = F.normalize(dirs, dim=-1)
+        if args.pure_lejepa_sigreg_points % 2 == 1:
+            t = torch.linspace(
+                0.0,
+                args.pure_lejepa_sigreg_t_max,
+                args.pure_lejepa_sigreg_points // 2 + 1,
+                dtype=torch.float32,
+            )
+            sigreg_integral_factor = 2.0
+        else:
+            t = torch.linspace(
+                -args.pure_lejepa_sigreg_t_max,
+                args.pure_lejepa_sigreg_t_max,
+                args.pure_lejepa_sigreg_points,
+                dtype=torch.float32,
+            )
+            sigreg_integral_factor = 1.0
+        self.register_buffer("sigreg_dirs", dirs, persistent=False)
+        self.register_buffer("sigreg_t", t, persistent=False)
+        self.register_buffer(
+            "sigreg_integral_factor",
+            torch.tensor(sigreg_integral_factor, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer("last_loss", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_inv_loss", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_sigreg_loss", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_view_norm", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_global_cos", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_local_cos", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_view_spread", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_view_eff_rank", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_view_eff_rank_ratio", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_sigreg_view_eff_rank", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_sigreg_view_eff_rank_ratio", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_sigreg_samples", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_global_mask_jaccard", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_local_mask_jaccard", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_global_pooled_cos", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_local_pooled_cos", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_probe_loss", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_probe_acc", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("last_probe_entropy", torch.zeros((), dtype=torch.float32), persistent=False)
+
+    def set_stage(self, stage: str) -> None:
+        if stage not in {"lejepa", "probe"}:
+            raise ValueError(f"unknown stage {stage!r}")
+        self.stage = stage
+
+    def set_eval_head(self, eval_head: str) -> None:
+        if eval_head not in {"native", "probe"}:
+            raise ValueError(f"unknown eval head {eval_head!r}")
+        self.eval_head = eval_head
+
+    def clear_rotary_caches(self) -> None:
+        for module in self.modules():
+            if hasattr(module, "_cos_cached"):
+                module._cos_cached = None
+            if hasattr(module, "_sin_cached"):
+                module._sin_cached = None
+            if hasattr(module, "_seq_len_cached"):
+                module._seq_len_cached = 0
+
+    def encode_hidden(self, input_ids: Tensor, input_mask: Tensor | None = None) -> Tensor:
+        x = self.tok_emb(input_ids)
+        if input_mask is not None:
+            x = x * input_mask.to(dtype=x.dtype).unsqueeze(-1)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        checkpoint_blocks = self.training and self.stage == "lejepa"
+        for i in range(self.num_encoder_layers):
+            block = self.blocks[i]
+            x = checkpoint(block, x, x0, use_reentrant=False) if checkpoint_blocks else block(x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            block = self.blocks[self.num_encoder_layers + i]
+            x = checkpoint(block, x, x0, use_reentrant=False) if checkpoint_blocks else block(x, x0)
+        return self.final_norm(x)
+
+    def _sample_token_latents(self, latents: Tensor, sample_count: int | None = None) -> Tensor:
+        flat = latents.reshape(-1, latents.size(-1))
+        sample_count = min(flat.size(0), self.sigreg_tokens if sample_count is None else sample_count)
+        if flat.size(0) > sample_count:
+            idx = torch.randperm(flat.size(0), device=flat.device)[:sample_count]
+            flat = flat.index_select(0, idx)
+        return flat
+
+    def _sample_vocab_latents(self, device: torch.device, sample_count: int) -> Tensor:
+        vocab = self.tok_emb.weight
+        sample_count = min(vocab.size(0), sample_count)
+        if vocab.size(0) > sample_count:
+            idx = torch.randint(vocab.size(0), (sample_count,), device=device)
+            vocab = vocab.index_select(0, idx)
+        return self.projector(vocab)
+
+    def _sample_views_for_sigreg(self, views: Tensor) -> Tensor:
+        view_count, samples_per_view, dim = views.shape
+        if samples_per_view <= self.sigreg_tokens:
+            return views
+        stride = max(samples_per_view // self.sigreg_tokens, 1)
+        return views[:, ::stride, :][:, : self.sigreg_tokens, :].reshape(view_count, -1, dim)
+
+    def sigreg_loss(self, views: Tensor) -> Tensor:
+        samples = self._sample_views_for_sigreg(views).float()
+        dirs = self.sigreg_dirs.to(device=samples.device, dtype=torch.float32)
+        t = self.sigreg_t.to(device=samples.device, dtype=torch.float32)
+        gaussian_cf = torch.exp(-0.5 * t.square()).view(1, 1, -1)
+
+        count = torch.tensor(float(samples.size(1)), device=samples.device, dtype=torch.float32)
+        if dist.is_available() and dist.is_initialized():
+            count = differentiable_all_reduce(count, op=dist.ReduceOp.SUM)
+
+        integral_sum = torch.zeros(samples.size(0), device=samples.device, dtype=torch.float32)
+        slice_count = 0
+        for dirs_chunk in dirs.split(self.sigreg_slice_chunk, dim=0):
+            proj = torch.einsum("vnd,md->vnm", samples, dirs_chunk)
+            angles = proj.unsqueeze(-1) * t.view(1, 1, 1, -1)
+            real_sum = torch.cos(angles).sum(dim=1)
+            imag_sum = torch.sin(angles).sum(dim=1)
+            if dist.is_available() and dist.is_initialized():
+                real_sum = differentiable_all_reduce(real_sum, op=dist.ReduceOp.SUM)
+                imag_sum = differentiable_all_reduce(imag_sum, op=dist.ReduceOp.SUM)
+            real = real_sum / count.clamp_min(1.0)
+            imag = imag_sum / count.clamp_min(1.0)
+            err = (real - gaussian_cf).square() + imag.square()
+            integral = self.sigreg_integral_factor.to(device=samples.device) * torch.trapz(
+                err * gaussian_cf,
+                t,
+                dim=-1,
+            )
+            integral_sum = integral_sum + integral.sum(dim=-1)
+            slice_count += dirs_chunk.size(0)
+        per_view = count * integral_sum / max(slice_count, 1)
+        self.last_sigreg_samples.copy_(count.detach())
+        return per_view.mean()
+
+    def effective_rank(self, samples: Tensor) -> Tensor:
+        with torch.autocast(device_type=samples.device.type, enabled=False):
+            samples = samples.to(dtype=torch.float32)
+            centered = samples - samples.mean(dim=0, keepdim=True)
+            cov = (centered.T @ centered) / max(samples.size(0) - 1, 1)
+            eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+            eig_norm = eig / eig.sum().clamp_min(1e-12)
+            return torch.exp(-(eig_norm * eig_norm.clamp_min(1e-12).log()).sum())
+
+    @torch.no_grad()
+    def resample_sigreg_dirs(self, step: int) -> None:
+        device = self.sigreg_dirs.device
+        dtype = self.sigreg_dirs.dtype
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(step))
+        dirs = torch.randn(self.sigreg_dirs.shape, generator=generator, device=device, dtype=torch.float32)
+        dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        self.sigreg_dirs.copy_(dirs.to(dtype=dtype))
+
+    def training_loss(self, input_ids: Tensor) -> Tensor:
+        hidden = self.encode_hidden(input_ids)
+        bsz, seqlen, hidden_dim = hidden.shape
+        context_hidden = hidden[:, :-1]
+        context = self.projector(context_hidden.reshape(-1, hidden_dim)).reshape(bsz, seqlen - 1, -1)
+        target_tokens = self.tok_emb(input_ids[:, 1:])
+        target = self.projector(target_tokens.reshape(-1, hidden_dim)).reshape_as(context)
+        pred = self.predictor(context_hidden.reshape(-1, hidden_dim)).reshape_as(target)
+
+        inv_loss = (pred.float() - target.float()).square().mean()
+        sigreg_sample_count = min(
+            self.sigreg_tokens,
+            context.numel() // context.size(-1),
+            target.numel() // target.size(-1),
+            self.tok_emb.weight.size(0),
+        )
+        context_samples = self._sample_token_latents(context, sigreg_sample_count)
+        target_samples = self._sample_token_latents(target, sigreg_sample_count)
+        vocab_samples = self._sample_vocab_latents(input_ids.device, sigreg_sample_count)
+        sigreg_views = torch.stack([context_samples, target_samples, vocab_samples], dim=0)
+        sigreg_loss = self.sigreg_loss(sigreg_views)
+        loss = (1.0 - self.lejepa_lambda) * inv_loss + self.lejepa_lambda * sigreg_loss
+
+        with torch.no_grad():
+            target_f = target.float()
+            pred_f = pred.float()
+            context_f = context.float()
+            view_norm = target_f.norm(dim=-1).mean()
+            global_cos = (
+                F.normalize(pred_f, dim=-1) * F.normalize(target_f, dim=-1)
+            ).sum(dim=-1).mean()
+            local_cos = (
+                F.normalize(context_f, dim=-1) * F.normalize(target_f, dim=-1)
+            ).sum(dim=-1).mean()
+            view_spread = (pred_f - target_f).square().sum(dim=-1).sqrt().mean()
+
+        self.last_loss.copy_(loss.detach())
+        self.last_inv_loss.copy_(inv_loss.detach())
+        self.last_sigreg_loss.copy_(sigreg_loss.detach())
+        self.last_view_norm.copy_(view_norm)
+        self.last_global_cos.copy_(global_cos)
+        self.last_local_cos.copy_(local_cos)
+        self.last_view_spread.copy_(view_spread)
+        if self.collect_lejepa_diagnostics:
+            with torch.no_grad():
+                view_eff_rank = torch.stack([self.effective_rank(view) for view in sigreg_views]).mean()
+                view_rank_denom = min(max(sigreg_views.size(1) - 1, 1), sigreg_views.size(-1))
+                view_eff_rank_ratio = view_eff_rank / max(view_rank_denom, 1)
+                sigreg_view_eff_rank = view_eff_rank
+                sigreg_view_eff_rank_ratio = view_eff_rank_ratio
+                global_mask_jaccard = torch.zeros((), device=hidden.device, dtype=torch.float32)
+                local_mask_jaccard = torch.zeros((), device=hidden.device, dtype=torch.float32)
+                global_pooled_cos = global_cos
+                local_pooled_cos = local_cos
+            self.last_view_eff_rank.copy_(view_eff_rank)
+            self.last_view_eff_rank_ratio.copy_(view_eff_rank_ratio)
+            self.last_sigreg_view_eff_rank.copy_(sigreg_view_eff_rank)
+            self.last_sigreg_view_eff_rank_ratio.copy_(sigreg_view_eff_rank_ratio)
+            self.last_global_mask_jaccard.copy_(global_mask_jaccard.mean())
+            self.last_local_mask_jaccard.copy_(local_mask_jaccard.mean())
+            self.last_global_pooled_cos.copy_(global_pooled_cos)
+            self.last_local_pooled_cos.copy_(local_pooled_cos)
+        return loss
+
+    def probe_ce_loss(self, input_ids: Tensor, target_ids: Tensor, detach_hidden: bool) -> Tensor:
+        if self.probe_kind == "codebook":
+            return self.codebook_probe_ce_loss(input_ids, target_ids)
+
+        if self.probe_head is None:
+            raise RuntimeError("linear probe requested but probe_head is not initialized")
+        if detach_hidden:
+            with torch.no_grad():
+                hidden = self.encode_hidden(input_ids)
+        else:
+            hidden = self.encode_hidden(input_ids)
+        logits = self.probe_head(hidden.reshape(-1, hidden.size(-1)))
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        targets = target_ids.reshape(-1)
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        with torch.no_grad():
+            probs = logits.float().softmax(dim=-1)
+            entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1).mean()
+            acc = (logits.argmax(dim=-1) == targets).float().mean()
+        self.last_probe_loss.copy_(loss.detach())
+        self.last_probe_acc.copy_(acc)
+        self.last_probe_entropy.copy_(entropy)
+        return loss
+
+    def codebook_probe_ce_loss(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        if self.codebook_logit_scale is None or self.codebook_bias is None:
+            raise RuntimeError("codebook probe requested but codebook calibration params are not initialized")
+        projector_was_training = self.projector.training
+        predictor_was_training = self.predictor.training
+        self.projector.eval()
+        self.predictor.eval()
+        with torch.no_grad():
+            hidden = self.encode_hidden(input_ids)
+            pred = self.predictor(hidden.reshape(-1, hidden.size(-1))).float()
+            vocab = self.projector(self.tok_emb.weight).float()
+            pred = F.normalize(pred, dim=-1)
+            vocab = F.normalize(vocab, dim=-1)
+        if projector_was_training:
+            self.projector.train()
+        if predictor_was_training:
+            self.predictor.train()
+
+        targets = target_ids.reshape(-1)
+        scale = self.codebook_logit_scale.float().exp().clamp(max=100.0)
+        loss_sum = pred.new_zeros(())
+        entropy_sum = pred.new_zeros(())
+        correct_sum = pred.new_zeros(())
+        total = targets.numel()
+        for start in range(0, total, self.codebook_chunk_tokens):
+            end = min(start + self.codebook_chunk_tokens, total)
+            logits = scale * (pred[start:end] @ vocab.T) + self.codebook_bias.float()
+            loss_sum = loss_sum + F.cross_entropy(logits, targets[start:end], reduction="sum")
+            with torch.no_grad():
+                probs = logits.softmax(dim=-1)
+                entropy_sum = entropy_sum + (-(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)).sum()
+                correct_sum = correct_sum + (logits.argmax(dim=-1) == targets[start:end]).float().sum()
+
+        denom = max(total, 1)
+        loss = loss_sum / denom
+        self.last_probe_loss.copy_(loss.detach())
+        self.last_probe_acc.copy_((correct_sum / denom).detach())
+        self.last_probe_entropy.copy_((entropy_sum / denom).detach())
+        return loss
+
+    def native_ce_loss(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        hidden = self.encode_hidden(input_ids)
+        logits = F.linear(hidden.reshape(-1, hidden.size(-1)), self.tok_emb.weight)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        if self.training and self.stage == "lejepa":
+            return self.training_loss(input_ids)
+        if not self.training and self.eval_head == "native":
+            return self.native_ce_loss(input_ids, target_ids)
+        return self.probe_ce_loss(input_ids, target_ids, detach_hidden=self.training)
+
+    @torch.no_grad()
+    def token_view_diagnostics(self) -> dict[str, float]:
+        was_training = self.projector.training
+        self.projector.eval()
+        tok = self.projector(self.tok_emb.weight).float()
+        if was_training:
+            self.projector.train()
+        tok_centered = tok - tok.mean(dim=0, keepdim=True)
+        cov = (tok_centered.T @ tok_centered) / max(tok.size(0) - 1, 1)
+        eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+        eig_norm = eig / eig.sum().clamp_min(1e-12)
+        eff_rank = torch.exp(-(eig_norm * eig_norm.clamp_min(1e-12).log()).sum())
+        tok_unit = F.normalize(tok, dim=-1)
+        cos_mat = tok_unit @ tok_unit.T
+        vocab = cos_mat.size(0)
+        cos_off = (cos_mat.sum() - cos_mat.diag().sum()) / max(cos_mat.numel() - vocab, 1)
+        return {
+            "token_view_norm_mean": float(tok.norm(dim=-1).mean().item()),
+            "token_view_norm_std": float(tok.norm(dim=-1).std(correction=0).item()),
+            "token_view_dim_std_mean": float(tok.std(dim=0, correction=0).mean().item()),
+            "token_view_eff_rank": float(eff_rank.item()),
+            "token_view_eff_rank_ratio": float((eff_rank / tok.size(-1)).item()),
+            "token_view_cos_off_mean": float(cos_off.item()),
+            "dirs_sum": float(self.sigreg_dirs.to(torch.float32).sum().item()),
+        }
+
+
+def main() -> None:
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+    base.zeropower_via_newtonschulz5 = torch.compile(base.zeropower_via_newtonschulz5)
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if 8 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    grad_accum_steps = 8 // world_size
+    grad_scale = 1.0 / grad_accum_steps
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master_process = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
+
+    logfile = None
+    if master_process:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg: str, console: bool = True) -> None:
+        if not master_process:
+            return
+        if console:
+            print(msg)
+        if logfile is not None:
+            with open(logfile, "a", encoding="utf-8") as f:
+                print(msg, file=f)
+
+    log0(code, console=False)
+    log0("=" * 100, console=False)
+    log0(f"Running Python {sys.version}", console=False)
+    log0(f"Running PyTorch {torch.__version__}", console=False)
+    log0(
+        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+        console=False,
+    )
+    log0("=" * 100, console=False)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    if not args.tokenizer_path.endswith(".model"):
+        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(
+            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+        )
+    dataset_dir = Path(args.data_path).resolve()
+    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    val_tokens = base.load_validation_tokens(args.val_files, args.train_seq_len)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = base.build_sentencepiece_luts(
+        sp, args.vocab_size, device
+    )
+    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+
+    base_model = PureLeJEPATextViewsGPT(args).to(device).bfloat16()
+    for module in base_model.modules():
+        if isinstance(module, base.CastedLinear):
+            module.float()
+    base.restore_low_dim_params_to_fp32(base_model)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    model: nn.Module = (
+        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True)
+        if distributed
+        else compiled_model
+    )
+    eval_model: nn.Module = base_model
+
+    named_params = list(base_model.named_parameters())
+    probe_param_names = {"probe_head.weight", "codebook_logit_scale", "codebook_bias"}
+    lejepa_params = [
+        p
+        for name, p in named_params
+        if name not in probe_param_names
+    ]
+    optimizer_lejepa = torch.optim.AdamW(
+        [
+            {
+                "params": lejepa_params,
+                "lr": args.lejepa_lr,
+                "base_lr": args.lejepa_lr,
+                "weight_decay": args.lejepa_weight_decay,
+            }
+        ],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    if args.lejepa_probe_kind == "linear":
+        probe_params = [base_model.probe_head.weight]
+    else:
+        if base_model.codebook_logit_scale is None or base_model.codebook_bias is None:
+            raise RuntimeError("codebook probe selected without codebook calibration params")
+        probe_params = [base_model.codebook_logit_scale, base_model.codebook_bias]
+    optimizer_probe = torch.optim.Adam(
+        [{"params": probe_params, "lr": args.lejepa_probe_lr, "base_lr": args.lejepa_probe_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    pretrain_optimizers: list[torch.optim.Optimizer] = [optimizer_lejepa]
+    probe_optimizers: list[torch.optim.Optimizer] = [optimizer_probe]
+    optimizers: list[torch.optim.Optimizer] = pretrain_optimizers + probe_optimizers
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"model_params:{n_params}")
+    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"pure_lejepa_nexttoken:lambda={args.pure_lejepa_lambda} proj_dim={args.pure_lejepa_proj_dim} "
+        f"proj_hidden={args.pure_lejepa_proj_hidden} proj_dropout={args.pure_lejepa_proj_dropout} "
+        f"pred_hidden={args.pure_lejepa_pred_hidden} "
+        f"schedule=interleaved lejepa_steps_per_probe={args.lejepa_steps_per_probe} "
+        f"lejepa_lr={args.lejepa_lr} "
+        f"lejepa_weight_decay={args.lejepa_weight_decay} probe_lr={args.lejepa_probe_lr} "
+        f"sigreg_slices={args.pure_lejepa_sigreg_slices} sigreg_points={args.pure_lejepa_sigreg_points} "
+        f"sigreg_t_max={args.pure_lejepa_sigreg_t_max} sigreg_tokens={args.pure_lejepa_sigreg_tokens} "
+        f"sigreg_slice_chunk={args.pure_lejepa_sigreg_slice_chunk} sigreg_space=projected_context_target_vocab "
+        f"sigreg_effective_t_points={base_model.sigreg_t.numel()} "
+        f"target=next_token_embedding_latent head=detached_online_{args.lejepa_probe_kind}_probe "
+        f"codebook_scale_init={args.lejepa_codebook_scale_init} "
+        f"codebook_chunk_tokens={args.lejepa_codebook_chunk_tokens}"
+    )
+    log0(
+        f"tie_embeddings:{args.tie_embeddings} lejepa_optimizer:adamw lejepa_lr:{args.lejepa_lr} "
+        f"probe_lr:{args.lejepa_probe_lr}"
+    )
+    log0(
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(f"seed:{args.seed}")
+
+    train_loader = base.DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    def zero_grad_all() -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            if warmdown_start <= step < args.iterations:
+                return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+            return 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        base_model.set_stage("lejepa")
+        for warmup_step in range(args.warmup_steps):
+            base_model.resample_sigreg_dirs(warmup_step)
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    warmup_loss = model(x, y)
+                (warmup_loss * grad_scale).backward()
+            for opt in pretrain_optimizers:
+                opt.step()
+            zero_grad_all()
+            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all()
+        if distributed:
+            model.require_backward_grad_sync = True
+        train_loader = base.DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    training_time_ms = 0.0
+    stop_after_step: int | None = None
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    step = 0
+    while True:
+        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        if should_validate:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            base_model.set_eval_head("probe")
+            val_loss, val_bpb = base.eval_val(
+                args,
+                eval_model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+            base_model.clear_rotary_caches()
+            base_model.set_eval_head("probe")
+            log0(
+                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"probe_val_loss:{val_loss:.4f} probe_val_bpb:{val_bpb:.4f} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+            )
+            if args.val_loss_every > 0:
+                diag = base_model.token_view_diagnostics()
+                log0(
+                    "token_view_diag:"
+                    f"step:{step}/{args.iterations} "
+                    f"token_view_norm_mean:{diag['token_view_norm_mean']:.4f} "
+                    f"token_view_norm_std:{diag['token_view_norm_std']:.4f} "
+                    f"token_view_dim_std_mean:{diag['token_view_dim_std_mean']:.4f} "
+                    f"token_view_eff_rank:{diag['token_view_eff_rank']:.4f} "
+                    f"token_view_eff_rank_ratio:{diag['token_view_eff_rank_ratio']:.4f} "
+                    f"token_view_cos_off_mean:{diag['token_view_cos_off_mean']:.4f} "
+                    f"dirs_sum:{diag['dirs_sum']:.4f}"
+                )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if stop_after_step is not None and step < args.iterations:
+                log0(
+                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                    f"step:{step}/{args.iterations}"
+                )
+            break
+
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+        schedule_pos = step % (args.lejepa_steps_per_probe + 1)
+        stage = "lejepa" if schedule_pos < args.lejepa_steps_per_probe else "probe"
+        base_model.set_stage(stage)
+        next_step = step + 1
+        will_log_train = (
+            args.train_log_every > 0
+            and (
+                next_step <= 10
+                or next_step % args.train_log_every == 0
+                or stage == "probe"
+                or stop_after_step is not None
+            )
+        )
+        base_model.collect_lejepa_diagnostics = stage == "lejepa" and will_log_train
+        active_optimizers = pretrain_optimizers if stage == "lejepa" else probe_optimizers
+        if stage == "lejepa":
+            base_model.resample_sigreg_dirs(step)
+        zero_grad_all()
+        train_loss = torch.zeros((), device=device)
+        train_inv_loss = torch.zeros((), device=device)
+        train_sigreg_loss = torch.zeros((), device=device)
+        train_view_norm = torch.zeros((), device=device)
+        train_global_cos = torch.zeros((), device=device)
+        train_local_cos = torch.zeros((), device=device)
+        train_view_spread = torch.zeros((), device=device)
+        train_view_eff_rank = torch.zeros((), device=device)
+        train_view_eff_rank_ratio = torch.zeros((), device=device)
+        train_sigreg_view_eff_rank = torch.zeros((), device=device)
+        train_sigreg_view_eff_rank_ratio = torch.zeros((), device=device)
+        train_sigreg_samples = torch.zeros((), device=device)
+        train_global_mask_jaccard = torch.zeros((), device=device)
+        train_local_mask_jaccard = torch.zeros((), device=device)
+        train_global_pooled_cos = torch.zeros((), device=device)
+        train_local_pooled_cos = torch.zeros((), device=device)
+        train_probe_loss = torch.zeros((), device=device)
+        train_probe_acc = torch.zeros((), device=device)
+        train_probe_entropy = torch.zeros((), device=device)
+        for micro_step in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
+            train_loss += loss.detach()
+            if stage == "lejepa":
+                train_inv_loss += base_model.last_inv_loss.detach()
+                train_sigreg_loss += base_model.last_sigreg_loss.detach()
+                train_view_norm += base_model.last_view_norm.detach()
+                train_global_cos += base_model.last_global_cos.detach()
+                train_local_cos += base_model.last_local_cos.detach()
+                train_view_spread += base_model.last_view_spread.detach()
+                train_sigreg_samples += base_model.last_sigreg_samples.detach()
+                if base_model.collect_lejepa_diagnostics:
+                    train_view_eff_rank += base_model.last_view_eff_rank.detach()
+                    train_view_eff_rank_ratio += base_model.last_view_eff_rank_ratio.detach()
+                    train_sigreg_view_eff_rank += base_model.last_sigreg_view_eff_rank.detach()
+                    train_sigreg_view_eff_rank_ratio += base_model.last_sigreg_view_eff_rank_ratio.detach()
+                    train_global_mask_jaccard += base_model.last_global_mask_jaccard.detach()
+                    train_local_mask_jaccard += base_model.last_local_mask_jaccard.detach()
+                    train_global_pooled_cos += base_model.last_global_pooled_cos.detach()
+                    train_local_pooled_cos += base_model.last_local_pooled_cos.detach()
+            else:
+                train_probe_loss += base_model.last_probe_loss.detach()
+                train_probe_acc += base_model.last_probe_acc.detach()
+                train_probe_entropy += base_model.last_probe_entropy.detach()
+            (loss * grad_scale).backward()
+        train_loss /= grad_accum_steps
+        if stage == "lejepa":
+            train_inv_loss /= grad_accum_steps
+            train_sigreg_loss /= grad_accum_steps
+            train_view_norm /= grad_accum_steps
+            train_global_cos /= grad_accum_steps
+            train_local_cos /= grad_accum_steps
+            train_view_spread /= grad_accum_steps
+            train_sigreg_samples /= grad_accum_steps
+            if base_model.collect_lejepa_diagnostics:
+                train_view_eff_rank /= grad_accum_steps
+                train_view_eff_rank_ratio /= grad_accum_steps
+                train_sigreg_view_eff_rank /= grad_accum_steps
+                train_sigreg_view_eff_rank_ratio /= grad_accum_steps
+                train_global_mask_jaccard /= grad_accum_steps
+                train_local_mask_jaccard /= grad_accum_steps
+                train_global_pooled_cos /= grad_accum_steps
+                train_local_pooled_cos /= grad_accum_steps
+        else:
+            train_probe_loss /= grad_accum_steps
+            train_probe_acc /= grad_accum_steps
+            train_probe_entropy /= grad_accum_steps
+
+        for opt in active_optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+
+        if args.grad_clip_norm > 0:
+            active_params = [p for opt in active_optimizers for group in opt.param_groups for p in group["params"]]
+            torch.nn.utils.clip_grad_norm_(active_params, args.grad_clip_norm)
+        for opt in active_optimizers:
+            opt.step()
+        zero_grad_all()
+
+        step += 1
+        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        should_log_train = will_log_train
+        if should_log_train:
+            if stage == "lejepa":
+                diag = base_model.token_view_diagnostics()
+                log0(
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"stage_id:0.0 lejepa_loss:{train_loss.item():.4f} "
+                    f"inv_loss:{train_inv_loss.item():.4f} sigreg_loss:{train_sigreg_loss.item():.4f} "
+                    f"view_norm:{train_view_norm.item():.4f} global_cos:{train_global_cos.item():.4f} "
+                    f"local_cos:{train_local_cos.item():.4f} view_spread:{train_view_spread.item():.4f} "
+                    f"view_eff_rank:{train_view_eff_rank.item():.4f} "
+                    f"view_eff_rank_ratio:{train_view_eff_rank_ratio.item():.4f} "
+                    f"latent_eff_rank:{train_view_eff_rank.item():.4f} "
+                    f"latent_eff_rank_ratio:{train_view_eff_rank_ratio.item():.4f} "
+                    f"sigreg_view_eff_rank:{train_sigreg_view_eff_rank.item():.4f} "
+                    f"sigreg_view_eff_rank_ratio:{train_sigreg_view_eff_rank_ratio.item():.4f} "
+                    f"sigreg_samples:{train_sigreg_samples.item():.0f} "
+                    f"next_pred_cos:{train_global_pooled_cos.item():.4f} "
+                    f"context_target_cos:{train_local_pooled_cos.item():.4f} "
+                    f"token_view_eff_rank:{diag['token_view_eff_rank']:.4f} "
+                    f"token_view_eff_rank_ratio:{diag['token_view_eff_rank_ratio']:.4f} "
+                    f"token_view_cos_off_mean:{diag['token_view_cos_off_mean']:.4f} "
+                    f"token_view_dim_std_mean:{diag['token_view_dim_std_mean']:.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                )
+            else:
+                if base_model.probe_head is None:
+                    probe_norm = torch.zeros((), device=device)
+                else:
+                    probe_norm = base_model.probe_head.weight.detach().float().norm(dim=-1).mean()
+                if base_model.codebook_logit_scale is None or base_model.codebook_bias is None:
+                    codebook_scale = torch.zeros((), device=device)
+                    codebook_bias_norm = torch.zeros((), device=device)
+                else:
+                    codebook_scale = base_model.codebook_logit_scale.detach().float().exp()
+                    codebook_bias_norm = base_model.codebook_bias.detach().float().norm()
+                log0(
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"stage_id:1.0 probe_loss:{train_probe_loss.item():.4f} "
+                    f"probe_acc:{train_probe_acc.item():.4f} probe_entropy:{train_probe_entropy.item():.4f} "
+                    f"probe_head_norm:{probe_norm.item():.4f} "
+                    f"codebook_scale:{codebook_scale.item():.4f} "
+                    f"codebook_bias_norm:{codebook_bias_norm.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                )
+
+        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        if distributed and max_wallclock_ms is not None:
+            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
+            reached_cap = bool(reached_cap_tensor.item())
+        if stop_after_step is None and reached_cap:
+            stop_after_step = step
+
+    log0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+
+    if master_process:
+        torch.save(base_model.state_dict(), "final_model.pt")
+        model_bytes = os.path.getsize("final_model.pt")
+        code_bytes = len(code.encode("utf-8"))
+        log0(f"Serialized model: {model_bytes} bytes")
+        log0(f"Code size: {code_bytes} bytes")
+        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    quant_obj, quant_stats = base.quantize_state_dict_int8(base_model.state_dict())
+    quant_buf = io.BytesIO()
+    torch.save(quant_obj, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_raw_bytes = len(quant_raw)
+    if master_process:
+        with open("final_model.int8.ptz", "wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        code_bytes = len(code.encode("utf-8"))
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log0(
+            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        )
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+
+    if distributed:
+        dist.barrier()
+    with open("final_model.int8.ptz", "rb") as f:
+        quant_blob_disk = f.read()
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    base_model.load_state_dict(base.dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.set_eval_head("probe")
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    q_val_loss, q_val_bpb = base.eval_val(
+        args,
+        eval_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    base_model.clear_rotary_caches()
+    torch.cuda.synchronize()
+    log0(
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+    )
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+Running Python 3.14.4 (main, Apr 11 2026, 09:29:24) [GCC 15.2.1 20260209]
+Running PyTorch 2.11.0
+Failed to initialize NVML: Driver/library version mismatch
+NVML library version: 595.71
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17388617
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+pure_lejepa_nexttoken:lambda=0.002 proj_dim=128 proj_hidden=256 proj_dropout=0.0 pred_hidden=256 schedule=interleaved lejepa_steps_per_probe=10 lejepa_lr=0.0001 lejepa_weight_decay=0.05 probe_lr=0.02 sigreg_slices=1024 sigreg_points=17 sigreg_t_max=5.0 sigreg_tokens=1024 sigreg_slice_chunk=256 sigreg_space=projected_context_target_vocab sigreg_effective_t_points=9 target=next_token_embedding_latent head=detached_online_codebook_probe codebook_scale_init=10.0 codebook_chunk_tokens=16384
+tie_embeddings:True lejepa_optimizer:adamw lejepa_lr:0.0001 probe_lr:0.02
+train_batch_tokens:524288 train_seq_len:1024 iterations:100 warmup_steps:20 max_wallclock_seconds:0.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/100 val_loss:6.9315 val_bpb:4.1052 probe_val_loss:6.9315 probe_val_bpb:4.1052 train_time:0ms step_avg:0.01ms
+token_view_diag:step:0/100 token_view_norm_mean:6.5142 token_view_norm_std:0.4073 token_view_dim_std_mean:0.5424 token_view_eff_rank:89.1393 token_view_eff_rank_ratio:0.6964 token_view_cos_off_mean:0.1132 dirs_sum:20.5688
+step:1/100 train_loss:0.6610 stage_id:0.0 lejepa_loss:0.6610 inv_loss:0.3379 sigreg_loss:162.1250 view_norm:6.5625 global_cos:0.0000 local_cos:0.1260 view_spread:6.5625 view_eff_rank:77.7500 view_eff_rank_ratio:0.6074 latent_eff_rank:77.7500 latent_eff_rank_ratio:0.6074 sigreg_view_eff_rank:77.7500 sigreg_view_eff_rank_ratio:0.6074 sigreg_samples:1024 next_pred_cos:0.0000 context_target_cos:0.1260 token_view_eff_rank:88.1443 token_view_eff_rank_ratio:0.6886 token_view_cos_off_mean:0.0898 token_view_dim_std_mean:0.5509 train_time:4421ms step_avg:4421.19ms
+step:2/100 train_loss:0.6153 stage_id:0.0 lejepa_loss:0.6153 inv_loss:0.3247 sigreg_loss:145.3750 view_norm:6.4688 global_cos:0.2673 local_cos:0.0731 view_spread:6.4375 view_eff_rank:77.5000 view_eff_rank_ratio:0.6055 latent_eff_rank:77.5000 latent_eff_rank_ratio:0.6055 sigreg_view_eff_rank:77.5000 sigreg_view_eff_rank_ratio:0.6055 sigreg_samples:1024 next_pred_cos:0.2673 context_target_cos:0.0731 token_view_eff_rank:87.0445 token_view_eff_rank_ratio:0.6800 token_view_cos_off_mean:0.0638 token_view_dim_std_mean:0.5593 train_time:5878ms step_avg:2938.93ms
+step:3/100 train_loss:0.5891 stage_id:0.0 lejepa_loss:0.5891 inv_loss:0.3110 sigreg_loss:139.2500 view_norm:6.3438 global_cos:0.2186 local_cos:0.0277 view_spread:6.3086 view_eff_rank:77.5000 view_eff_rank_ratio:0.6055 latent_eff_rank:77.5000 latent_eff_rank_ratio:0.6055 sigreg_view_eff_rank:77.5000 sigreg_view_eff_rank_ratio:0.6055 sigreg_samples:1024 next_pred_cos:0.2186 context_target_cos:0.0277 token_view_eff_rank:85.9467 token_view_eff_rank_ratio:0.6715 token_view_cos_off_mean:0.0510 token_view_dim_std_mean:0.5674 train_time:7363ms step_avg:2454.19ms
+step:4/100 train_loss:0.5713 stage_id:0.0 lejepa_loss:0.5713 inv_loss:0.3049 sigreg_loss:133.5000 view_norm:6.2852 global_cos:0.1947 local_cos:0.0083 view_spread:6.2266 view_eff_rank:76.8750 view_eff_rank_ratio:0.6006 latent_eff_rank:76.8750 latent_eff_rank_ratio:0.6006 sigreg_view_eff_rank:76.8750 sigreg_view_eff_rank_ratio:0.6006 sigreg_samples:1024 next_pred_cos:0.1947 context_target_cos:0.0083 token_view_eff_rank:84.7404 token_view_eff_rank_ratio:0.6620 token_view_cos_off_mean:0.0353 token_view_dim_std_mean:0.5757 train_time:8853ms step_avg:2213.15ms
+step:5/100 train_loss:0.5550 stage_id:0.0 lejepa_loss:0.5550 inv_loss:0.2964 sigreg_loss:129.5000 view_norm:6.1875 global_cos:0.1586 local_cos:-0.0047 view_spread:6.1484 view_eff_rank:76.4375 view_eff_rank_ratio:0.5972 latent_eff_rank:76.4375 latent_eff_rank_ratio:0.5972 sigreg_view_eff_rank:76.4375 sigreg_view_eff_rank_ratio:0.5972 sigreg_samples:1024 next_pred_cos:0.1586 context_target_cos:-0.0047 token_view_eff_rank:83.5217 token_view_eff_rank_ratio:0.6525 token_view_cos_off_mean:0.0266 token_view_dim_std_mean:0.5839 train_time:10338ms step_avg:2067.56ms
+step:6/100 train_loss:0.5442 stage_id:0.0 lejepa_loss:0.5442 inv_loss:0.2913 sigreg_loss:126.5000 view_norm:6.1250 global_cos:0.1327 local_cos:-0.0062 view_spread:6.0938 view_eff_rank:75.6875 view_eff_rank_ratio:0.5913 latent_eff_rank:75.6875 latent_eff_rank_ratio:0.5913 sigreg_view_eff_rank:75.6875 sigreg_view_eff_rank_ratio:0.5913 sigreg_samples:1024 next_pred_cos:0.1327 context_target_cos:-0.0062 token_view_eff_rank:82.3303 token_view_eff_rank_ratio:0.6432 token_view_cos_off_mean:0.0207 token_view_dim_std_mean:0.5918 train_time:11831ms step_avg:1971.89ms
+step:7/100 train_loss:0.5346 stage_id:0.0 lejepa_loss:0.5346 inv_loss:0.2866 sigreg_loss:124.1250 view_norm:6.0781 global_cos:0.1165 local_cos:-0.0073 view_spread:6.0312 view_eff_rank:75.5625 view_eff_rank_ratio:0.5903 latent_eff_rank:75.5625 latent_eff_rank_ratio:0.5903 sigreg_view_eff_rank:75.5625 sigreg_view_eff_rank_ratio:0.5903 sigreg_samples:1024 next_pred_cos:0.1165 context_target_cos:-0.0073 token_view_eff_rank:81.1091 token_view_eff_rank_ratio:0.6337 token_view_cos_off_mean:0.0143 token_view_dim_std_mean:0.5998 train_time:13319ms step_avg:1902.73ms
+step:8/100 train_loss:0.5231 stage_id:0.0 lejepa_loss:0.5231 inv_loss:0.2837 sigreg_loss:119.7500 view_norm:6.0312 global_cos:0.0958 local_cos:-0.0062 view_spread:6.0000 view_eff_rank:75.4375 view_eff_rank_ratio:0.5894 latent_eff_rank:75.4375 latent_eff_rank_ratio:0.5894 sigreg_view_eff_rank:75.4375 sigreg_view_eff_rank_ratio:0.5894 sigreg_samples:1024 next_pred_cos:0.0958 context_target_cos:-0.0062 token_view_eff_rank:79.9475 token_view_eff_rank_ratio:0.6246 token_view_cos_off_mean:0.0108 token_view_dim_std_mean:0.6074 train_time:14806ms step_avg:1850.78ms
+step:9/100 train_loss:0.5176 stage_id:0.0 lejepa_loss:0.5176 inv_loss:0.2805 sigreg_loss:118.7500 view_norm:5.9727 global_cos:0.0834 local_cos:-0.0051 view_spread:5.9570 view_eff_rank:75.1250 view_eff_rank_ratio:0.5869 latent_eff_rank:75.1250 latent_eff_rank_ratio:0.5869 sigreg_view_eff_rank:75.1250 sigreg_view_eff_rank_ratio:0.5869 sigreg_samples:1024 next_pred_cos:0.0834 context_target_cos:-0.0051 token_view_eff_rank:78.8258 token_view_eff_rank_ratio:0.6158 token_view_cos_off_mean:0.0082 token_view_dim_std_mean:0.6148 train_time:16298ms step_avg:1810.87ms
+step:10/100 train_loss:0.5071 stage_id:0.0 lejepa_loss:0.5071 inv_loss:0.2769 sigreg_loss:115.3125 view_norm:5.9219 global_cos:0.0740 local_cos:-0.0052 view_spread:5.9062 view_eff_rank:74.3125 view_eff_rank_ratio:0.5806 latent_eff_rank:74.3125 latent_eff_rank_ratio:0.5806 sigreg_view_eff_rank:74.3125 sigreg_view_eff_rank_ratio:0.5806 sigreg_samples:1024 next_pred_cos:0.0740 context_target_cos:-0.0052 token_view_eff_rank:77.7123 token_view_eff_rank_ratio:0.6071 token_view_cos_off_mean:0.0058 token_view_dim_std_mean:0.6220 train_time:17788ms step_avg:1778.75ms
+step:11/100 train_loss:7.2559 stage_id:1.0 probe_loss:7.2500 probe_acc:0.0005 probe_entropy:6.6250 probe_head_norm:0.0000 codebook_scale:9.7462 codebook_bias_norm:0.6398 train_time:22172ms step_avg:2015.64ms
+step:20/100 train_loss:0.4546 stage_id:0.0 lejepa_loss:0.4546 inv_loss:0.2450 sigreg_loss:105.1250 view_norm:5.4414 global_cos:0.0431 local_cos:0.0006 view_spread:5.4453 view_eff_rank:67.8750 view_eff_rank_ratio:0.5303 latent_eff_rank:67.8750 latent_eff_rank_ratio:0.5303 sigreg_view_eff_rank:67.8750 sigreg_view_eff_rank_ratio:0.5303 sigreg_samples:1024 next_pred_cos:0.0431 context_target_cos:0.0006 token_view_eff_rank:69.3061 token_view_eff_rank_ratio:0.5415 token_view_cos_off_mean:-0.0000 token_view_dim_std_mean:0.6735 train_time:35111ms step_avg:1755.55ms
+step:20/100 val_loss:6.8939 val_bpb:4.0830 probe_val_loss:6.8939 probe_val_bpb:4.0830 train_time:35201ms step_avg:1760.07ms
+token_view_diag:step:20/100 token_view_norm_mean:7.4817 token_view_norm_std:1.5449 token_view_dim_std_mean:0.6735 token_view_eff_rank:69.3061 token_view_eff_rank_ratio:0.5415 token_view_cos_off_mean:-0.0000 dirs_sum:20.5688
+step:22/100 train_loss:6.8603 stage_id:1.0 probe_loss:6.8555 probe_acc:0.0180 probe_entropy:6.7500 probe_head_norm:0.0000 codebook_scale:9.5866 codebook_bias_norm:1.1867 train_time:36777ms step_avg:1671.70ms
+step:30/100 train_loss:0.4170 stage_id:0.0 lejepa_loss:0.4170 inv_loss:0.2169 sigreg_loss:100.1875 view_norm:5.0000 global_cos:0.0571 local_cos:0.0007 view_spread:4.9961 view_eff_rank:63.0938 view_eff_rank_ratio:0.4929 latent_eff_rank:63.0938 latent_eff_rank_ratio:0.4929 sigreg_view_eff_rank:63.0938 sigreg_view_eff_rank_ratio:0.4929 sigreg_samples:1024 next_pred_cos:0.0571 context_target_cos:0.0007 token_view_eff_rank:63.2470 token_view_eff_rank_ratio:0.4941 token_view_cos_off_mean:-0.0006 token_view_dim_std_mean:0.7024 train_time:48190ms step_avg:1606.34ms
+step:33/100 train_loss:6.7666 stage_id:1.0 probe_loss:6.7695 probe_acc:0.0247 probe_entropy:6.4805 probe_head_norm:0.0000 codebook_scale:9.4241 codebook_bias_norm:1.6533 train_time:51248ms step_avg:1552.98ms
+step:40/100 train_loss:0.3887 stage_id:0.0 lejepa_loss:0.3887 inv_loss:0.1842 sigreg_loss:102.4375 view_norm:4.5000 global_cos:0.0701 local_cos:0.0019 view_spread:4.4844 view_eff_rank:59.2500 view_eff_rank_ratio:0.4629 latent_eff_rank:59.2500 latent_eff_rank_ratio:0.4629 sigreg_view_eff_rank:59.2500 sigreg_view_eff_rank_ratio:0.4629 sigreg_samples:1024 next_pred_cos:0.0701 context_target_cos:0.0019 token_view_eff_rank:58.8907 token_view_eff_rank_ratio:0.4601 token_view_cos_off_mean:-0.0007 token_view_dim_std_mean:0.7127 train_time:61289ms step_avg:1532.23ms
+step:40/100 val_loss:6.7072 val_bpb:3.9724 probe_val_loss:6.7072 probe_val_bpb:3.9724 train_time:61379ms step_avg:1534.48ms
+token_view_diag:step:40/100 token_view_norm_mean:7.6730 token_view_norm_std:2.5551 token_view_dim_std_mean:0.7127 token_view_eff_rank:58.8907 token_view_eff_rank_ratio:0.4601 token_view_cos_off_mean:-0.0007 dirs_sum:0.1588
+step:44/100 train_loss:6.7099 stage_id:1.0 probe_loss:6.7070 probe_acc:0.0289 probe_entropy:6.4023 probe_head_norm:0.0000 codebook_scale:9.2584 codebook_bias_norm:2.1207 train_time:65788ms step_avg:1495.17ms
+step:50/100 train_loss:0.3752 stage_id:0.0 lejepa_loss:0.3752 inv_loss:0.1547 sigreg_loss:110.5000 view_norm:4.0156 global_cos:0.0795 local_cos:0.0037 view_spread:3.9961 view_eff_rank:56.4375 view_eff_rank_ratio:0.4409 latent_eff_rank:56.4375 latent_eff_rank_ratio:0.4409 sigreg_view_eff_rank:56.4375 sigreg_view_eff_rank_ratio:0.4409 sigreg_samples:1024 next_pred_cos:0.0795 context_target_cos:0.0037 token_view_eff_rank:54.9619 token_view_eff_rank_ratio:0.4294 token_view_cos_off_mean:-0.0007 token_view_dim_std_mean:0.7186 train_time:74397ms step_avg:1487.95ms
+step:55/100 train_loss:6.7262 stage_id:1.0 probe_loss:6.7227 probe_acc:0.0335 probe_entropy:6.3750 probe_head_norm:0.0000 codebook_scale:9.0902 codebook_bias_norm:2.5910 train_time:80332ms step_avg:1460.59ms
+step:60/100 train_loss:0.3637 stage_id:0.0 lejepa_loss:0.3637 inv_loss:0.1381 sigreg_loss:112.8750 view_norm:3.7266 global_cos:0.0829 local_cos:0.0029 view_spread:3.7129 view_eff_rank:55.3125 view_eff_rank_ratio:0.4321 latent_eff_rank:55.3125 latent_eff_rank_ratio:0.4321 sigreg_view_eff_rank:55.3125 sigreg_view_eff_rank_ratio:0.4321 sigreg_samples:1024 next_pred_cos:0.0829 context_target_cos:0.0029 token_view_eff_rank:51.1751 token_view_eff_rank_ratio:0.3998 token_view_cos_off_mean:-0.0008 token_view_dim_std_mean:0.7283 train_time:87435ms step_avg:1457.24ms
+step:60/100 val_loss:6.6483 val_bpb:3.9375 probe_val_loss:6.6483 probe_val_bpb:3.9375 train_time:87523ms step_avg:1458.71ms
+token_view_diag:step:60/100 token_view_norm_mean:7.5736 token_view_norm_std:3.3291 token_view_dim_std_mean:0.7283 token_view_eff_rank:51.1751 token_view_eff_rank_ratio:0.3998 token_view_cos_off_mean:-0.0008 dirs_sum:-19.0471
+step:66/100 train_loss:6.5661 stage_id:1.0 probe_loss:6.5625 probe_acc:0.0405 probe_entropy:6.3008 probe_head_norm:0.0000 codebook_scale:8.9231 codebook_bias_norm:3.0737 train_time:94786ms step_avg:1436.15ms
+step:70/100 train_loss:0.3628 stage_id:0.0 lejepa_loss:0.3628 inv_loss:0.1317 sigreg_loss:115.6250 view_norm:3.5664 global_cos:0.1089 local_cos:0.0040 view_spread:3.5449 view_eff_rank:53.5938 view_eff_rank_ratio:0.4187 latent_eff_rank:53.5938 latent_eff_rank_ratio:0.4187 sigreg_view_eff_rank:53.5938 sigreg_view_eff_rank_ratio:0.4187 sigreg_samples:1024 next_pred_cos:0.1089 context_target_cos:0.0040 token_view_eff_rank:47.6429 token_view_eff_rank_ratio:0.3722 token_view_cos_off_mean:-0.0009 token_view_dim_std_mean:0.7415 train_time:100441ms step_avg:1434.88ms
+step:77/100 train_loss:6.3434 stage_id:1.0 probe_loss:6.3438 probe_acc:0.0532 probe_entropy:6.1406 probe_head_norm:0.0000 codebook_scale:8.7589 codebook_bias_norm:3.5685 train_time:109141ms step_avg:1417.42ms
+step:80/100 train_loss:0.3555 stage_id:0.0 lejepa_loss:0.3555 inv_loss:0.1253 sigreg_loss:115.1875 view_norm:3.4805 global_cos:0.1389 local_cos:0.0045 view_spread:3.4434 view_eff_rank:53.0000 view_eff_rank_ratio:0.4141 latent_eff_rank:53.0000 latent_eff_rank_ratio:0.4141 sigreg_view_eff_rank:53.0000 sigreg_view_eff_rank_ratio:0.4141 sigreg_samples:1024 next_pred_cos:0.1389 context_target_cos:0.0045 token_view_eff_rank:44.4252 token_view_eff_rank_ratio:0.3471 token_view_cos_off_mean:-0.0009 token_view_dim_std_mean:0.7579 train_time:113378ms step_avg:1417.23ms
+step:80/100 val_loss:6.2965 val_bpb:3.7291 probe_val_loss:6.2965 probe_val_bpb:3.7291 train_time:113467ms step_avg:1418.34ms
+token_view_diag:step:80/100 token_view_norm_mean:7.7320 token_view_norm_std:3.8121 token_view_dim_std_mean:0.7579 token_view_eff_rank:44.4252 token_view_eff_rank_ratio:0.3471 token_view_cos_off_mean:-0.0009 dirs_sum:45.9377
+step:88/100 train_loss:6.1965 stage_id:1.0 probe_loss:6.1992 probe_acc:0.0551 probe_entropy:5.8555 probe_head_norm:0.0000 codebook_scale:8.5950 codebook_bias_norm:4.0619 train_time:123649ms step_avg:1405.11ms
+step:90/100 train_loss:0.3521 stage_id:0.0 lejepa_loss:0.3521 inv_loss:0.1262 sigreg_loss:113.0000 view_norm:3.5098 global_cos:0.1892 local_cos:0.0051 view_spread:3.4395 view_eff_rank:51.2188 view_eff_rank_ratio:0.4001 latent_eff_rank:51.2188 latent_eff_rank_ratio:0.4001 sigreg_view_eff_rank:51.2188 sigreg_view_eff_rank_ratio:0.4001 sigreg_samples:1024 next_pred_cos:0.1892 context_target_cos:0.0051 token_view_eff_rank:41.4139 token_view_eff_rank_ratio:0.3235 token_view_cos_off_mean:-0.0009 token_view_dim_std_mean:0.7735 train_time:126575ms step_avg:1406.39ms
+step:99/100 train_loss:6.3036 stage_id:1.0 probe_loss:6.3008 probe_acc:0.0501 probe_entropy:5.2656 probe_head_norm:0.0000 codebook_scale:8.4420 codebook_bias_norm:4.5250 train_time:138543ms step_avg:1399.43ms
+step:100/100 train_loss:0.3460 stage_id:0.0 lejepa_loss:0.3460 inv_loss:0.1245 sigreg_loss:110.9375 view_norm:3.6211 global_cos:0.2739 local_cos:0.0089 view_spread:3.4590 view_eff_rank:48.1250 view_eff_rank_ratio:0.3760 latent_eff_rank:48.1250 latent_eff_rank_ratio:0.3760 sigreg_view_eff_rank:48.1250 sigreg_view_eff_rank_ratio:0.3760 sigreg_samples:1024 next_pred_cos:0.2739 context_target_cos:0.0089 token_view_eff_rank:38.6970 token_view_eff_rank_ratio:0.3023 token_view_cos_off_mean:-0.0008 token_view_dim_std_mean:0.7893 train_time:140021ms step_avg:1400.21ms
+step:100/100 val_loss:6.2995 val_bpb:3.7309 probe_val_loss:6.2995 probe_val_bpb:3.7309 train_time:140116ms step_avg:1401.16ms
+token_view_diag:step:100/100 token_view_norm_mean:7.9981 token_view_norm_std:4.1110 token_view_dim_std_mean:0.7893 token_view_eff_rank:38.6970 token_view_eff_rank_ratio:0.3023 token_view_cos_off_mean:-0.0008 dirs_sum:1.4751
+peak memory allocated: 3201 MiB reserved: 3590 MiB
+Serialized model: 68541981 bytes
+Code size: 50963 bytes
+Total submission size: 68592944 bytes
+Serialized model int8+zlib: 5590864 bytes (payload:17575202 raw_torch:17622857 payload_ratio:3.90x)
+Total submission size int8+zlib: 5641827 bytes
+final_int8_zlib_roundtrip val_loss:6.3664 val_bpb:3.7705 eval_time:44430ms
+final_int8_zlib_roundtrip_exact val_loss:6.36636334 val_bpb:3.77051897

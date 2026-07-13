@@ -1,0 +1,96 @@
+{
+  "name": "fresh_lejepa_v5_swiglu_2k",
+  "script": "fresh_lejepa_train_v5_swiglu.py",
+  "overrides": {},
+  "steps": 2000,
+  "val_every": 200,
+  "elapsed_seconds": 3748.8450100421906,
+  "final_val_bpb": 1.5113,
+  "final_val_loss": 2.5517,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 4.1052,
+      "val_loss": 6.9315
+    },
+    {
+      "step": 200,
+      "step_avg_ms": 1764.2,
+      "train_time_ms": 352841.0,
+      "type": "val",
+      "val_bpb": 1.9237,
+      "val_loss": 3.2481
+    },
+    {
+      "step": 400,
+      "step_avg_ms": 1775.2,
+      "train_time_ms": 710079.0,
+      "type": "val",
+      "val_bpb": 1.7343,
+      "val_loss": 2.9282
+    },
+    {
+      "step": 600,
+      "step_avg_ms": 1766.57,
+      "train_time_ms": 1059944.0,
+      "type": "val",
+      "val_bpb": 1.6596,
+      "val_loss": 2.8021
+    },
+    {
+      "step": 800,
+      "step_avg_ms": 1762.39,
+      "train_time_ms": 1409911.0,
+      "type": "val",
+      "val_bpb": 1.6138,
+      "val_loss": 2.7249
+    },
+    {
+      "step": 1000,
+      "step_avg_ms": 1759.84,
+      "train_time_ms": 1759842.0,
+      "type": "val",
+      "val_bpb": 1.576,
+      "val_loss": 2.6611
+    },
+    {
+      "step": 1200,
+      "step_avg_ms": 1763.72,
+      "train_time_ms": 2116460.0,
+      "type": "val",
+      "val_bpb": 1.5531,
+      "val_loss": 2.6224
+    },
+    {
+      "step": 1400,
+      "step_avg_ms": 1763.38,
+      "train_time_ms": 2468729.0,
+      "type": "val",
+      "val_bpb": 1.5355,
+      "val_loss": 2.5926
+    },
+    {
+      "step": 1600,
+      "step_avg_ms": 1762.37,
+      "train_time_ms": 2819797.0,
+      "type": "val",
+      "val_bpb": 1.5264,
+      "val_loss": 2.5773
+    },
+    {
+      "step": 1800,
+      "step_avg_ms": 1763.38,
+      "train_time_ms": 3174089.0,
+      "type": "val",
+      "val_bpb": 1.5113,
+      "val_loss": 2.5517
+    }
+  ],
+  "returncode": -2,
+  "error": "fresh_lejepa_train_v5_swiglu.py\", line 93, in main\n    v1.main()\n    ~~~~~~~^^\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train.py\", line 436, in main\n    # into an intractably large full graph.\n  File \"/home/marvin/Documents/repositories/parameter-golf/train_gpt.py\", line 311, in main\n        return int(t.numel()) * int(t.element_size())\n                                    ^^^^^^^^^^^^^^^^^\n    \n    \n    def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:\n    ^^^^^^^^^^^^^^^^^\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train_v4.py\", line 166, in deferred_sigreg_loss\n    return self.sigreg(trajectory_latent)\n           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/usr/lib/python3.14/site-packages/torch/_dynamo/eval_frame.py\", line 1298, in _fn\n    return fn(*args, **kwargs)\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train.py\", line 129, in forward\n    contribution = checkpoint(\n        _sigreg_projection_statistic, *args, use_reentrant=False\n    )\n  File \"/usr/lib/python3.14/site-packages/torch/_compile.py\", line 54, in inner\n    return disable_fn(*args, **kwargs)\n  File \"/usr/lib/python3.14/site-packages/torch/_dynamo/eval_frame.py\", line 1298, in _fn\n    return fn(*args, **kwargs)\n  File \"/usr/lib/python3.14/site-packages/torch/utils/checkpoint.py\", line 518, in checkpoint\n    ret = function(*args, **kwargs)\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train.py\", line 78, in _sigreg_projection_statistic\n    statistic = statistic + (err @ weights).sum() * batch\n    ^^^^^^^^^\nKeyboardInterrupt\n"
+}

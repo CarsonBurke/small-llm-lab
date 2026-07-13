@@ -1,0 +1,63 @@
+{
+  "name": "fresh_lejepa_shared_bn_v1_probes_1k_retry",
+  "script": "fresh_lejepa_train_v1_probe_shared_projector.py",
+  "overrides": {},
+  "steps": 1000,
+  "val_every": 200,
+  "elapsed_seconds": 1806.1262381076813,
+  "final_val_bpb": 1.5719,
+  "final_val_loss": 2.6542,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 4.1052,
+      "val_loss": 6.9315
+    },
+    {
+      "step": 200,
+      "step_avg_ms": 1554.01,
+      "train_time_ms": 310802.0,
+      "type": "val",
+      "val_bpb": 1.8052,
+      "val_loss": 3.048
+    },
+    {
+      "step": 400,
+      "step_avg_ms": 1542.98,
+      "train_time_ms": 617192.0,
+      "type": "val",
+      "val_bpb": 1.6873,
+      "val_loss": 2.849
+    },
+    {
+      "step": 600,
+      "step_avg_ms": 1540.24,
+      "train_time_ms": 924142.0,
+      "type": "val",
+      "val_bpb": 1.6337,
+      "val_loss": 2.7584
+    },
+    {
+      "step": 800,
+      "step_avg_ms": 1538.13,
+      "train_time_ms": 1230500.0,
+      "type": "val",
+      "val_bpb": 1.5953,
+      "val_loss": 2.6935
+    },
+    {
+      "step": 1000,
+      "step_avg_ms": 1538.57,
+      "train_time_ms": 1538571.0,
+      "type": "val",
+      "val_bpb": 1.5719,
+      "val_loss": 2.6542
+    }
+  ],
+  "returncode": 0
+}

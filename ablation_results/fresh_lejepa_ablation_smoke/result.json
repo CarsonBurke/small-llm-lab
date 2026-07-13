@@ -1,0 +1,42 @@
+{
+  "name": "fresh_lejepa_ablation_smoke",
+  "script": "fresh_lejepa_train.py",
+  "overrides": {
+    "FRESH_LEJEPA_WORK_DIR": "/tmp/fresh_lejepa_ablation_smoke",
+    "DATA_PATH": "/tmp/fresh_lejepa_smoke/data",
+    "TOKENIZER_PATH": "/home/marvin/Documents/repositories/parameter-golf/data/tokenizers/fineweb_1024_bpe.model",
+    "TRAIN_SEQ_LEN": "16",
+    "TRAIN_BATCH_TOKENS": "128",
+    "VAL_BATCH_SIZE": "128",
+    "WARMUP_STEPS": "0",
+    "FRESH_LEJEPA_SIGREG_NUM_PROJ": "8",
+    "FRESH_LEJEPA_SIGREG_PROJ_CHUNK": "4",
+    "FRESH_LEJEPA_SIGREG_POSITION_CHUNK": "4"
+  },
+  "steps": 1,
+  "val_every": 1,
+  "elapsed_seconds": 18.731507062911987,
+  "final_val_bpb": 3.9481,
+  "final_val_loss": 6.9104,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 3.9602,
+      "val_loss": 6.9315
+    },
+    {
+      "step": 1,
+      "step_avg_ms": 11904.83,
+      "train_time_ms": 11905.0,
+      "type": "val",
+      "val_bpb": 3.9481,
+      "val_loss": 6.9104
+    }
+  ],
+  "returncode": 0
+}

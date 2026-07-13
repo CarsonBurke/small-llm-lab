@@ -1,0 +1,39 @@
+{
+  "name": "pure_lejepa_codebook_probe_postreview_smoke",
+  "script": "ablations/train_pure_lejepa_textviews.py",
+  "overrides": {
+    "TRAIN_BATCH_TOKENS": "8192",
+    "VAL_BATCH_SIZE": "8192",
+    "TRAIN_SEQ_LEN": "128",
+    "PURE_LEJEPA_SIGREG_SLICES": "128",
+    "PURE_LEJEPA_SIGREG_TOKENS": "4096"
+  },
+  "steps": 12,
+  "val_every": 20,
+  "elapsed_seconds": 418.9674916267395,
+  "final_val_bpb": 4.2637,
+  "final_val_loss": 7.1991,
+  "final_probe_val_bpb": 4.2637,
+  "final_probe_val_loss": 7.1991,
+  "val_entries": [
+    {
+      "step": 0,
+      "val_loss": 6.9315,
+      "val_bpb": 4.1052,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "probe_val_loss": 6.9315,
+      "probe_val_bpb": 4.1052
+    },
+    {
+      "step": 12,
+      "val_loss": 7.1991,
+      "val_bpb": 4.2637,
+      "train_time_ms": 6335.0,
+      "type": "val",
+      "probe_val_loss": 7.1991,
+      "probe_val_bpb": 4.2637
+    }
+  ],
+  "returncode": 0
+}

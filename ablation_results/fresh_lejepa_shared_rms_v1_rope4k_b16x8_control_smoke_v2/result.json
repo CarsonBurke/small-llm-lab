@@ -1,0 +1,42 @@
+{
+  "name": "fresh_lejepa_shared_rms_v1_rope4k_b16x8_control_smoke_v2",
+  "script": "fresh_lejepa_train_v1_probe_shared_rms_yarn.py",
+  "overrides": {
+    "TRAIN_SEQ_LEN": "4096",
+    "TRAIN_BATCH_TOKENS": "524288",
+    "GRAD_ACCUM_STEPS": "8",
+    "WARMUP_STEPS": "1",
+    "FRESH_SIGREG_EFFECTIVE_BATCH": "128",
+    "FRESH_POSITION_MODE": "rope",
+    "FRESH_YARN_PRETRAINED_CONTEXT": "1024",
+    "FRESH_YARN_TARGET_CONTEXT": "65536",
+    "FRESH_LEJEPA_WORK_DIR": "/tmp/parameter-golf-rope4k-control-smoke-v2",
+    "FRESH_YARN_INIT_CHECKPOINT": "/home/marvin/Documents/repositories/parameter-golf/ablation_results/fresh_lejepa_shared_rms_v1_probes_1k/pretraining_checkpoint.pt"
+  },
+  "steps": 1,
+  "val_every": 1,
+  "elapsed_seconds": 154.66579508781433,
+  "final_val_bpb": 1.6694,
+  "final_val_loss": 2.8186,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 1.6073,
+      "val_loss": 2.7138
+    },
+    {
+      "step": 1,
+      "step_avg_ms": 3055.01,
+      "train_time_ms": 3055.0,
+      "type": "val",
+      "val_bpb": 1.6694,
+      "val_loss": 2.8186
+    }
+  ],
+  "returncode": 0
+}

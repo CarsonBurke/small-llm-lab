@@ -1,0 +1,3 @@
+{"step": 0, "step_avg_ms": 0.01, "train_time_ms": 0.0, "type": "val", "val_bpb": 1.6073, "val_loss": 2.7138}
+{"sigreg_loss": 3.65, "step": 1, "step_avg_ms": 3053.64, "train_loss": 3.5009, "train_time_ms": 3054.0, "type": "train"}
+{"step": 1, "step_avg_ms": 3055.01, "train_time_ms": 3055.0, "type": "val", "val_bpb": 1.6694, "val_loss": 2.8186}

@@ -1,0 +1,40 @@
+{
+  "name": "fresh_lejepa_v6_belief_dropout_2k",
+  "script": "fresh_lejepa_train_v6_belief_dropout.py",
+  "overrides": {},
+  "steps": 2000,
+  "val_every": 200,
+  "elapsed_seconds": 983.328254699707,
+  "final_val_bpb": 1.7745,
+  "final_val_loss": 2.9962,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 4.1052,
+      "val_loss": 6.9315
+    },
+    {
+      "step": 200,
+      "step_avg_ms": 1789.37,
+      "train_time_ms": 357875.0,
+      "type": "val",
+      "val_bpb": 1.9582,
+      "val_loss": 3.3063
+    },
+    {
+      "step": 400,
+      "step_avg_ms": 1783.4,
+      "train_time_ms": 713358.0,
+      "type": "val",
+      "val_bpb": 1.7745,
+      "val_loss": 2.9962
+    }
+  ],
+  "returncode": -2,
+  "error": "8ms\nstep:460/2000 train_loss:3.6778 policy_loss:3.0220 latent_loss:0.4224 sigreg_loss:2.5936 train_time:820733ms step_avg:1784.20ms\nstep:470/2000 train_loss:3.6671 policy_loss:3.0178 latent_loss:0.4083 sigreg_loss:2.6769 train_time:838914ms step_avg:1784.92ms\nTraceback (most recent call last):\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train_v6_belief_dropout.py\", line 87, in <module>\n    main()\n    ~~~~^^\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train_v6_belief_dropout.py\", line 81, in main\n    v1.main()\n    ~~~~~~~^^\n  File \"/home/marvin/Documents/repositories/parameter-golf/fresh_lejepa_train.py\", line 447, in main\n    baseline.main()\n    ~~~~~~~~~~~~~^^\n  File \"/home/marvin/Documents/repositories/parameter-golf/train_gpt.py\", line 314, in main\n    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/site-packages/torch/_tensor.py\", line 631, in backward\n    torch.autograd.backward(\n    ~~~~~~~~~~~~~~~~~~~~~~~^\n        self, gradient, retain_graph, create_graph, inputs=inputs\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/usr/lib/python3.14/site-packages/torch/autograd/__init__.py\", line 379, in backward\n    _engine_run_backward(\n    ~~~~~~~~~~~~~~~~~~~~^\n        tensors,\n        ^^^^^^^^\n    ...<5 lines>...\n        accumulate_grad=True,\n        ^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/usr/lib/python3.14/site-packages/torch/autograd/graph.py\", line 882, in _engine_run_backward\n    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        t_outputs, *args, **kwargs\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )  # Calls into the C++ engine to run the backward pass\n    ^\nKeyboardInterrupt\n"
+}

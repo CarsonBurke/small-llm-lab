@@ -1,0 +1,31 @@
+{
+  "name": "fresh_lejepa_v2_shared_projector_smoke2",
+  "script": "fresh_lejepa_train_v2_shared_projector.py",
+  "overrides": {},
+  "steps": 2,
+  "val_every": 2,
+  "elapsed_seconds": 147.94445252418518,
+  "final_val_bpb": 4.0421,
+  "final_val_loss": 6.8249,
+  "final_probe_val_bpb": null,
+  "final_probe_val_loss": null,
+  "val_entries": [
+    {
+      "step": 0,
+      "step_avg_ms": 0.01,
+      "train_time_ms": 0.0,
+      "type": "val",
+      "val_bpb": 4.1053,
+      "val_loss": 6.9316
+    },
+    {
+      "step": 2,
+      "step_avg_ms": 1476.11,
+      "train_time_ms": 2952.0,
+      "type": "val",
+      "val_bpb": 4.0421,
+      "val_loss": 6.8249
+    }
+  ],
+  "returncode": 0
+}

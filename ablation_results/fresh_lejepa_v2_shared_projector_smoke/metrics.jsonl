@@ -1,0 +1,4 @@
+{"step": 0, "step_avg_ms": 0.01, "train_time_ms": 0.0, "type": "val", "val_bpb": 4.1053, "val_loss": 6.9316}
+{"step": 1, "step_avg_ms": 1549.19, "train_loss": 8.8409, "train_time_ms": 1549.0, "type": "train"}
+{"step": 2, "step_avg_ms": 1542.11, "train_loss": 8.3249, "train_time_ms": 3084.0, "type": "train"}
+{"step": 2, "step_avg_ms": 1542.58, "train_time_ms": 3085.0, "type": "val", "val_bpb": 4.0409, "val_loss": 6.8229}

@@ -1,0 +1,4 @@
+{"step": 0, "step_avg_ms": 0.01, "train_time_ms": 0.0, "type": "val", "val_bpb": 4.1052, "val_loss": 6.9315}
+{"latent_loss": 0.284, "policy_loss": 6.9315, "sigreg_loss": 36.1105, "step": 1, "step_avg_ms": 1730.7, "train_loss": 1.8483, "train_time_ms": 1731.0, "type": "train"}
+{"latent_loss": 0.2852, "policy_loss": 6.8906, "sigreg_loss": 27.5555, "step": 2, "step_avg_ms": 1723.94, "train_loss": 1.6528, "train_time_ms": 3448.0, "type": "train"}
+{"step": 2, "step_avg_ms": 1724.44, "train_time_ms": 3449.0, "type": "val", "val_bpb": 4.0122, "val_loss": 6.7744}

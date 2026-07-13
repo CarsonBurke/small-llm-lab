@@ -1,0 +1,15 @@
+{"step": 0, "step_avg_ms": 0.01, "train_time_ms": 0.0, "type": "val", "val_bpb": 4.1052, "val_loss": 6.9315}
+{"latent_loss": 0.2862, "policy_loss": 6.9315, "sigreg_loss": 36.1177, "step": 1, "step_avg_ms": 2223.52, "train_loss": 10.4682, "train_time_ms": 2224.0, "type": "train"}
+{"latent_loss": 0.2847, "policy_loss": 6.8839, "sigreg_loss": 27.4075, "step": 2, "step_avg_ms": 2228.84, "train_loss": 9.6352, "train_time_ms": 4458.0, "type": "train"}
+{"latent_loss": 0.3443, "policy_loss": 6.7535, "sigreg_loss": 16.6063, "step": 3, "step_avg_ms": 2223.59, "train_loss": 8.5924, "train_time_ms": 6671.0, "type": "train"}
+{"latent_loss": 0.4693, "policy_loss": 6.6212, "sigreg_loss": 9.33, "step": 4, "step_avg_ms": 2216.91, "train_loss": 7.9302, "train_time_ms": 8868.0, "type": "train"}
+{"latent_loss": 0.6137, "policy_loss": 6.4598, "sigreg_loss": 4.941, "step": 5, "step_avg_ms": 2212.18, "train_loss": 7.5182, "train_time_ms": 11061.0, "type": "train"}
+{"latent_loss": 0.7685, "policy_loss": 6.3104, "sigreg_loss": 2.6943, "step": 6, "step_avg_ms": 2209.13, "train_loss": 7.3214, "train_time_ms": 13255.0, "type": "train"}
+{"latent_loss": 0.9241, "policy_loss": 6.1167, "sigreg_loss": 1.7624, "step": 7, "step_avg_ms": 2207.34, "train_loss": 7.1994, "train_time_ms": 15451.0, "type": "train"}
+{"latent_loss": 1.0412, "policy_loss": 5.9392, "sigreg_loss": 1.7296, "step": 8, "step_avg_ms": 2205.69, "train_loss": 7.136, "train_time_ms": 17646.0, "type": "train"}
+{"latent_loss": 1.0185, "policy_loss": 5.7693, "sigreg_loss": 1.6749, "step": 9, "step_avg_ms": 2204.27, "train_loss": 6.9385, "train_time_ms": 19838.0, "type": "train"}
+{"latent_loss": 0.9236, "policy_loss": 5.6289, "sigreg_loss": 1.5924, "step": 10, "step_avg_ms": 2203.51, "train_loss": 6.6958, "train_time_ms": 22035.0, "type": "train"}
+{"latent_loss": 0.7074, "policy_loss": 4.7697, "sigreg_loss": 2.5306, "step": 20, "step_avg_ms": 2212.58, "train_loss": 5.7048, "train_time_ms": 44252.0, "type": "train"}
+{"latent_loss": 0.6657, "policy_loss": 4.395, "sigreg_loss": 2.5272, "step": 30, "step_avg_ms": 2209.12, "train_loss": 5.2882, "train_time_ms": 66274.0, "type": "train"}
+{"latent_loss": 0.6124, "policy_loss": 4.0997, "sigreg_loss": 2.6171, "step": 40, "step_avg_ms": 2210.44, "train_loss": 4.9476, "train_time_ms": 88417.0, "type": "train"}
+{"latent_loss": 0.59, "policy_loss": 3.9455, "sigreg_loss": 2.6898, "step": 50, "step_avg_ms": 2211.88, "train_loss": 4.7776, "train_time_ms": 110594.0, "type": "train"}
