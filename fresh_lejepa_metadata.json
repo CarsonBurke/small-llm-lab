@@ -39,7 +39,7 @@
     "adam_eps": 1e-08,
     "warmup_steps": 20,
     "warmdown_iters": 0,
-    "iterations": 2,
+    "iterations": 2000,
     "train_batch_tokens": 524288,
     "train_seq_len": 1024
   },
