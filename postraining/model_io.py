@@ -2,12 +2,40 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
 
+import train_gpt as baseline
 from fresh_lejepa_train import EXPERIMENT_ARCHITECTURE, FreshLeJEPAGPT
 from train_gpt import CastedLinear, restore_low_dim_params_to_fp32
+
+
+@contextmanager
+def _pope_construction():
+    """Reproduce the pretraining monkeypatches PoPE construction depends on.
+
+    The PoPE block is instantiated through ``baseline.CausalSelfAttention``,
+    and ``delta_c`` must join the control-tensor patterns so the fp32 restore
+    treats phase offsets exactly as pretraining did.
+    """
+    import fresh_lejepa_train_v1_probe_shared_rms_pope as pope
+
+    if pope.PolarCausalSelfAttention.position_mode != "pope":
+        raise ValueError(
+            "loading a PoPE checkpoint requires FRESH_POSITION_MODE=pope "
+            f"(got {pope.PolarCausalSelfAttention.position_mode!r})"
+        )
+    original_attention = baseline.CausalSelfAttention
+    original_patterns = baseline.CONTROL_TENSOR_NAME_PATTERNS
+    baseline.CausalSelfAttention = pope.PolarCausalSelfAttention
+    baseline.CONTROL_TENSOR_NAME_PATTERNS = original_patterns + ("delta_c",)
+    try:
+        yield
+    finally:
+        baseline.CausalSelfAttention = original_attention
+        baseline.CONTROL_TENSOR_NAME_PATTERNS = original_patterns
 
 
 DEFAULT_MODEL_CONFIG = {
@@ -25,8 +53,11 @@ DEFAULT_MODEL_CONFIG = {
 }
 
 
-def load_model(checkpoint: str | Path, device: torch.device) -> FreshLeJEPAGPT:
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+def load_model(
+    checkpoint: str | Path, device: torch.device, payload: dict | None = None
+) -> FreshLeJEPAGPT:
+    if payload is None:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     config = dict(DEFAULT_MODEL_CONFIG)
     architecture = EXPERIMENT_ARCHITECTURE
     if isinstance(payload, dict) and "metadata" in payload:
@@ -125,13 +156,28 @@ def load_model(checkpoint: str | Path, device: torch.device) -> FreshLeJEPAGPT:
         from fresh_lejepa_train_v2_predicted_only import FreshLeJEPAV2PredictedOnly
 
         model_class = FreshLeJEPAV2PredictedOnly
-    model = model_class(**config).to(device).bfloat16()
-    model.model_config = config
-    model.architecture = architecture
-    for module in model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(model)
+    construction = nullcontext()
+    if "_pope_" in architecture:
+        from fresh_lejepa_train_v1_probe_shared_rms_pope import (
+            FreshLeJEPASharedRMSV1PoPE,
+        )
+
+        model_class = FreshLeJEPASharedRMSV1PoPE
+        construction = _pope_construction()
+    elif architecture.endswith("rope_scratch_1k_control"):
+        from fresh_lejepa_train_v1_probe_shared_rms_projector import (
+            FreshLeJEPASharedRMSProjectorV1Probes,
+        )
+
+        model_class = FreshLeJEPASharedRMSProjectorV1Probes
+    with construction:
+        model = model_class(**config).to(device).bfloat16()
+        model.model_config = config
+        model.architecture = architecture
+        for module in model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(model)
     state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
     model.load_state_dict(state, strict=True)
     for parameter in model.parameters():
