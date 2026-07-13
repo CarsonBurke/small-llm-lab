@@ -9,6 +9,7 @@ adds experiment hyperparameters.
 
 from __future__ import annotations
 
+import inspect
 import json
 import hashlib
 import os
@@ -404,6 +405,70 @@ class FreshLeJEPAGPT(baseline.GPT):
         return total_loss
 
 
+def build_run_metadata() -> dict:
+    tokenizer = Path(FreshHyperparameters.tokenizer_path)
+    metadata = {
+        "architecture": EXPERIMENT_ARCHITECTURE,
+        "model": {
+            key: getattr(FreshHyperparameters, key)
+            for key in (
+                "vocab_size", "num_layers", "model_dim", "num_heads",
+                "num_kv_heads", "mlp_mult", "tie_embeddings", "rope_base",
+                "logit_softcap", "qk_gain_init", "tied_embed_init_std",
+            )
+        },
+        "loss": {
+            "latent_weight": FreshHyperparameters.latent_loss_weight,
+            "sigreg_weight": FreshHyperparameters.sigreg_weight,
+            "sigreg_knots": FreshHyperparameters.sigreg_knots,
+            "sigreg_num_proj": FreshHyperparameters.sigreg_num_proj,
+            "sigreg_proj_chunk": FreshHyperparameters.sigreg_proj_chunk,
+            "sigreg_position_chunk": FreshHyperparameters.sigreg_position_chunk,
+        },
+        "seed": FreshHyperparameters.seed,
+        "tokenizer": {
+            "path": FreshHyperparameters.tokenizer_path,
+            "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
+        },
+        "optimizer": {
+            key: getattr(FreshHyperparameters, key)
+            for key in (
+                "embed_lr", "head_lr", "tied_embed_lr", "matrix_lr", "scalar_lr",
+                "muon_momentum", "muon_backend_steps", "beta1", "beta2", "adam_eps",
+                "warmup_steps", "warmdown_iters", "iterations", "train_batch_tokens",
+                "train_seq_len",
+            )
+        },
+        "grad_accum_steps": int(os.environ.get("GRAD_ACCUM_STEPS", "8")),
+        "sigreg_compute_dtype": "float32",
+    }
+    if hasattr(FreshLeJEPAGPT, "experiment_metadata"):
+        metadata["experiment"] = FreshLeJEPAGPT.experiment_metadata()
+    return metadata
+
+
+def save_pretraining_checkpoint(
+    run_dir: Path,
+    step: int,
+    model_state: dict[str, Tensor],
+    optimizers: list[torch.optim.Optimizer],
+) -> None:
+    payload = {
+        "step": step,
+        "model": model_state,
+        "optimizers": [optimizer.state_dict() for optimizer in optimizers],
+        "metadata": build_run_metadata(),
+        "cpu_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all(),
+        "python_rng": random.getstate(),
+    }
+    # Write-then-rename so an interrupt mid-save never corrupts the previous
+    # rolling checkpoint.
+    tmp_path = run_dir / "pretraining_checkpoint.pt.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, run_dir / "pretraining_checkpoint.pt")
+
+
 def main() -> None:
     work_dir = os.environ.get("FRESH_LEJEPA_WORK_DIR")
     if work_dir:
@@ -438,56 +503,61 @@ def main() -> None:
             kwargs["fullgraph"] = False
         return original_compile(target, *args, **kwargs)
 
+    tracked_models: list[nn.Module] = []
+    experiment_model_class = FreshLeJEPAGPT
+
+    def tracked_model_factory(*args, **kwargs):
+        model = experiment_model_class(*args, **kwargs)
+        tracked_models.append(model)
+        return model
+
+    checkpoint_every = int(os.environ.get("FRESH_CHECKPOINT_EVERY", "0"))
+    original_eval_val = baseline.eval_val
+
+    def checkpointing_eval_val(*args, **kwargs):
+        result = original_eval_val(*args, **kwargs)
+        # Read the true step from the caller (baseline.main), which stays
+        # correct when the wallclock cap forces an off-cadence validation.
+        # The post-training int8 round-trip eval fires after quantized weights
+        # were loaded back into the model; its frame is recognizable by the
+        # decompressed `quant_state` local and must never overwrite the
+        # rolling checkpoint.
+        caller = inspect.currentframe().f_back.f_locals
+        step = caller.get("step")
+        if (
+            checkpoint_every > 0
+            and isinstance(step, int)
+            and 0 < step <= FreshHyperparameters.iterations
+            and step % checkpoint_every == 0
+            and "quant_state" not in caller
+            and int(os.environ.get("RANK", "0")) == 0
+            and "RUN_ID" in os.environ
+            and tracked_models
+        ):
+            run_dir = Path(__file__).resolve().parent / "ablation_results" / os.environ["RUN_ID"]
+            run_dir.mkdir(parents=True, exist_ok=True)
+            model_state = {
+                key: value.detach().to("cpu", copy=True)
+                for key, value in tracked_models[0].state_dict().items()
+            }
+            save_pretraining_checkpoint(run_dir, step, model_state, tracked_optimizers)
+        return result
+
     baseline.Hyperparameters = FreshHyperparameters
-    baseline.GPT = FreshLeJEPAGPT
+    baseline.GPT = tracked_model_factory
     baseline.torch.optim.Adam = tracked_adam
     baseline.Muon = TrackedMuon
     baseline.torch.compile = experiment_compile
+    baseline.eval_val = checkpointing_eval_val
     try:
         baseline.main()
     finally:
         baseline.torch.optim.Adam = original_adam
         baseline.Muon = original_muon
         baseline.torch.compile = original_compile
+        baseline.eval_val = original_eval_val
     if int(os.environ.get("RANK", "0")) == 0:
-        tokenizer = Path(FreshHyperparameters.tokenizer_path)
-        metadata = {
-            "architecture": EXPERIMENT_ARCHITECTURE,
-            "model": {
-                key: getattr(FreshHyperparameters, key)
-                for key in (
-                    "vocab_size", "num_layers", "model_dim", "num_heads",
-                    "num_kv_heads", "mlp_mult", "tie_embeddings", "rope_base",
-                    "logit_softcap", "qk_gain_init", "tied_embed_init_std",
-                )
-            },
-            "loss": {
-                "latent_weight": FreshHyperparameters.latent_loss_weight,
-                "sigreg_weight": FreshHyperparameters.sigreg_weight,
-                "sigreg_knots": FreshHyperparameters.sigreg_knots,
-                "sigreg_num_proj": FreshHyperparameters.sigreg_num_proj,
-                "sigreg_proj_chunk": FreshHyperparameters.sigreg_proj_chunk,
-                "sigreg_position_chunk": FreshHyperparameters.sigreg_position_chunk,
-            },
-            "seed": FreshHyperparameters.seed,
-            "tokenizer": {
-                "path": FreshHyperparameters.tokenizer_path,
-                "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
-            },
-            "optimizer": {
-                key: getattr(FreshHyperparameters, key)
-                for key in (
-                    "embed_lr", "head_lr", "tied_embed_lr", "matrix_lr", "scalar_lr",
-                    "muon_momentum", "muon_backend_steps", "beta1", "beta2", "adam_eps",
-                    "warmup_steps", "warmdown_iters", "iterations", "train_batch_tokens",
-                    "train_seq_len",
-                )
-            },
-            "grad_accum_steps": int(os.environ.get("GRAD_ACCUM_STEPS", "8")),
-            "sigreg_compute_dtype": "float32",
-        }
-        if hasattr(FreshLeJEPAGPT, "experiment_metadata"):
-            metadata["experiment"] = FreshLeJEPAGPT.experiment_metadata()
+        metadata = build_run_metadata()
         metadata_path = Path("fresh_lejepa_metadata.json")
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
         if "RUN_ID" in os.environ:
@@ -498,16 +568,12 @@ def main() -> None:
                 shutil.copy2("final_model.int8.ptz", run_dir / "final_model.int8.ptz")
             shutil.copy2(metadata_path, run_dir / metadata_path.name)
             shutil.copy2(EXPERIMENT_SOURCE, run_dir / EXPERIMENT_SOURCE.name)
-            checkpoint = {
-                "step": FreshHyperparameters.iterations,
-                "model": torch.load("final_model.pt", map_location="cpu", weights_only=True),
-                "optimizers": [optimizer.state_dict() for optimizer in tracked_optimizers],
-                "metadata": metadata,
-                "cpu_rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state_all(),
-                "python_rng": random.getstate(),
-            }
-            torch.save(checkpoint, run_dir / "pretraining_checkpoint.pt")
+            save_pretraining_checkpoint(
+                run_dir,
+                FreshHyperparameters.iterations,
+                torch.load("final_model.pt", map_location="cpu", weights_only=True),
+                tracked_optimizers,
+            )
 
 
 if __name__ == "__main__":
