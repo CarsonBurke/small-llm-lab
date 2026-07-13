@@ -3,15 +3,15 @@ Interleaved next-token LeJEPA ablation forked from train_normuon.py.
 
 LeJEPA updates:
 - no CE loss, no stop-grad target, no EMA, no negatives
-- encode the causal token sequence once and predict the projected next-token
-  embedding from the current causal hidden state
-- add sample-count-scaled SIGReg over sampled context, target, and token-codebook
-  latents in the LeJEPA projection space
+- encode the causal token sequence once and predict the projected next-position
+  encoder state from the projected current encoder state
+- add sample-count-scaled SIGReg over sampled context and target latents in
+  the LeJEPA projection space
 
 Detached CE probe updates:
 - freeze the learned representation by detaching hidden states
-- train only a small next-token CE probe/head; by default this is a latent
-  codebook softmax using predictor(h[t]) against projected token embeddings
+- train only a next-token linear CE probe/head by default; the latent codebook
+  softmax probe remains available via LEJEPA_PROBE_KIND=codebook
 - run one detached probe update after every LEJEPA_STEPS_PER_PROBE LeJEPA updates
 - validation reports detached probe CE/BPB as the primary val metrics and under
   the probe TensorBoard category
@@ -48,7 +48,7 @@ class Hyperparameters(base.Hyperparameters):
     lejepa_lr = float(os.environ.get("LEJEPA_LR", "0.0001"))
     lejepa_weight_decay = float(os.environ.get("LEJEPA_WEIGHT_DECAY", "0.05"))
     lejepa_probe_lr = float(os.environ.get("LEJEPA_PROBE_LR", os.environ.get("HEAD_LR", "0.02")))
-    lejepa_probe_kind = os.environ.get("LEJEPA_PROBE_KIND", "codebook")
+    lejepa_probe_kind = os.environ.get("LEJEPA_PROBE_KIND", "linear")
     lejepa_codebook_scale_init = float(os.environ.get("LEJEPA_CODEBOOK_SCALE_INIT", "10.0"))
     lejepa_codebook_chunk_tokens = int(os.environ.get("LEJEPA_CODEBOOK_CHUNK_TOKENS", "16384"))
     pure_lejepa_lambda = float(os.environ.get("PURE_LEJEPA_LAMBDA", "0.002"))
@@ -171,7 +171,7 @@ class PureLeJEPATextViewsGPT(base.GPT):
             dropout=args.pure_lejepa_proj_dropout,
         )
         self.predictor = LeJEPANextTokenPredictor(
-            input_dim=args.model_dim,
+            input_dim=args.pure_lejepa_proj_dim,
             hidden_dim=args.pure_lejepa_pred_hidden,
             output_dim=args.pure_lejepa_proj_dim,
             dropout=args.pure_lejepa_proj_dropout,
@@ -285,14 +285,6 @@ class PureLeJEPATextViewsGPT(base.GPT):
             flat = flat.index_select(0, idx)
         return flat
 
-    def _sample_vocab_latents(self, device: torch.device, sample_count: int) -> Tensor:
-        vocab = self.tok_emb.weight
-        sample_count = min(vocab.size(0), sample_count)
-        if vocab.size(0) > sample_count:
-            idx = torch.randint(vocab.size(0), (sample_count,), device=device)
-            vocab = vocab.index_select(0, idx)
-        return self.projector(vocab)
-
     def _sample_views_for_sigreg(self, views: Tensor) -> Tensor:
         view_count, samples_per_view, dim = views.shape
         if samples_per_view <= self.sigreg_tokens:
@@ -357,23 +349,20 @@ class PureLeJEPATextViewsGPT(base.GPT):
         hidden = self.encode_hidden(input_ids)
         bsz, seqlen, hidden_dim = hidden.shape
         context_hidden = hidden[:, :-1]
-        sigreg_context = self.projector(hidden.reshape(bsz * seqlen, hidden_dim)).reshape(bsz, seqlen, -1)
+        target_hidden = hidden[:, 1:]
         context = self.projector(context_hidden.reshape(-1, hidden_dim)).reshape(bsz, seqlen - 1, -1)
-        target_tokens = self.tok_emb(input_ids[:, 1:])
-        target = self.projector(target_tokens.reshape(-1, hidden_dim)).reshape_as(context)
-        pred = self.predictor(context_hidden.reshape(-1, hidden_dim)).reshape_as(target)
+        target = self.projector(target_hidden.reshape(-1, hidden_dim)).reshape_as(context)
+        pred = self.predictor(context.reshape(-1, context.size(-1))).reshape_as(target)
 
         inv_loss = (pred.float() - target.float()).square().mean()
         sigreg_sample_count = min(
             self.sigreg_tokens,
-            sigreg_context.numel() // sigreg_context.size(-1),
+            context.numel() // context.size(-1),
             target.numel() // target.size(-1),
-            self.tok_emb.weight.size(0),
         )
-        context_samples = self._sample_token_latents(sigreg_context, sigreg_sample_count)
+        context_samples = self._sample_token_latents(context, sigreg_sample_count)
         target_samples = self._sample_token_latents(target, sigreg_sample_count)
-        vocab_samples = self._sample_vocab_latents(input_ids.device, sigreg_sample_count)
-        sigreg_views = torch.stack([context_samples, target_samples, vocab_samples], dim=0)
+        sigreg_views = torch.stack([context_samples, target_samples], dim=0)
         sigreg_loss = self.sigreg_loss(sigreg_views)
         loss = (1.0 - self.lejepa_lambda) * inv_loss + self.lejepa_lambda * sigreg_loss
 
@@ -452,7 +441,8 @@ class PureLeJEPATextViewsGPT(base.GPT):
         self.predictor.eval()
         with torch.no_grad():
             hidden = self.encode_hidden(input_ids)
-            pred = self.predictor(hidden.reshape(-1, hidden.size(-1))).float()
+            context = self.projector(hidden.reshape(-1, hidden.size(-1)))
+            pred = self.predictor(context).float()
             vocab = self.projector(self.tok_emb.weight).float()
             pred = F.normalize(pred, dim=-1)
             vocab = F.normalize(vocab, dim=-1)
@@ -658,7 +648,7 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"pure_lejepa_nexttoken:lambda={args.pure_lejepa_lambda} proj_dim={args.pure_lejepa_proj_dim} "
+        f"pure_lejepa_next_hidden_target:lambda={args.pure_lejepa_lambda} proj_dim={args.pure_lejepa_proj_dim} "
         f"proj_hidden={args.pure_lejepa_proj_hidden} proj_dropout={args.pure_lejepa_proj_dropout} "
         f"pred_hidden={args.pure_lejepa_pred_hidden} "
         f"schedule=interleaved lejepa_steps_per_probe={args.lejepa_steps_per_probe} "
@@ -666,9 +656,9 @@ def main() -> None:
         f"lejepa_weight_decay={args.lejepa_weight_decay} probe_lr={args.lejepa_probe_lr} "
         f"sigreg_slices={args.pure_lejepa_sigreg_slices} sigreg_points={args.pure_lejepa_sigreg_points} "
         f"sigreg_t_max={args.pure_lejepa_sigreg_t_max} sigreg_tokens={args.pure_lejepa_sigreg_tokens} "
-        f"sigreg_slice_chunk={args.pure_lejepa_sigreg_slice_chunk} sigreg_space=projected_context_target_vocab "
+        f"sigreg_slice_chunk={args.pure_lejepa_sigreg_slice_chunk} sigreg_space=projected_context_target "
         f"sigreg_effective_t_points={base_model.sigreg_t.numel()} "
-        f"target=next_token_embedding_latent head=detached_online_{args.lejepa_probe_kind}_probe "
+        f"target=next_position_encoder_latent head=detached_online_{args.lejepa_probe_kind}_probe "
         f"codebook_scale_init={args.lejepa_codebook_scale_init} "
         f"codebook_chunk_tokens={args.lejepa_codebook_chunk_tokens}"
     )
