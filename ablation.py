@@ -19,7 +19,6 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -28,51 +27,90 @@ from torch.utils.tensorboard import SummaryWriter
 REPO_ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = REPO_ROOT / "ablation_results"
 TB_DIR = REPO_ROOT / "tb_logs"
+SANITIZED_ENV_PREFIXES = ("PURE_LEJEPA_", "LEJEPA_")
+
+
+def parse_extra_metrics(extras: str) -> dict[str, float]:
+    metrics = {}
+    for key, value in re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*):([+-]?(?:\d+\.?\d*|\.\d+))", extras):
+        if key == "train_time" or key.startswith("native_"):
+            continue
+        if key == "step_avg":
+            key = "step_avg_ms"
+        metrics[key] = float(value)
+    return metrics
+
+
+def parse_time_ms(text: str) -> float | None:
+    match = re.search(r"train_time:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*(ms|m)?", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2) or "ms"
+    if unit == "m":
+        return value * 60_000
+    return value
 
 
 def parse_log_line(line: str) -> dict | None:
     """Parse a single log line into a metric dict."""
+    diag_match = re.match(r"token_view_diag:step:(\d+)/\d+\s+(.*)", line)
+    if diag_match:
+        entry = {
+            "step": int(diag_match.group(1)),
+            "type": "diag",
+        }
+        extras = diag_match.group(2).strip()
+        if extras:
+            entry.update(parse_extra_metrics(extras))
+        return entry
+
     val_match = re.match(
-        r"step:(\d+)/\d+\s+val_loss:([\d.]+)\s+val_bpb:([\d.]+)\s+train_time:([\d.]+)ms",
+        r"(?:step:)?(\d+)/\d+\s+val_loss:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s+val_bpb:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*(.*)",
         line,
     )
     if val_match:
-        return {
+        extras = val_match.group(4).strip()
+        entry = {
             "step": int(val_match.group(1)),
             "val_loss": float(val_match.group(2)),
             "val_bpb": float(val_match.group(3)),
-            "train_time_ms": float(val_match.group(4)),
+            "train_time_ms": parse_time_ms(extras) or 0.0,
             "type": "val",
         }
+        if extras:
+            entry.update(parse_extra_metrics(extras))
+        return entry
     train_match = re.match(
-        r"step:(\d+)/\d+\s+train_loss:([\d.]+)\s+(.*?)train_time:([\d.]+)ms\s+step_avg:([\d.]+)ms",
+        r"(?:step:)?(\d+)/\d+\s+train_loss:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*(.*)",
         line,
     )
     if train_match:
+        extras = train_match.group(3).strip()
+        train_time_ms = parse_time_ms(extras)
+        if train_time_ms is None:
+            return None
         entry = {
             "step": int(train_match.group(1)),
             "train_loss": float(train_match.group(2)),
-            "train_time_ms": float(train_match.group(4)),
-            "step_avg_ms": float(train_match.group(5)),
+            "train_time_ms": train_time_ms,
             "type": "train",
         }
-        extras = train_match.group(3).strip()
         if extras:
-            for key, value in re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*):([+-]?(?:\d+\.?\d*|\.\d+))", extras):
-                entry[key] = float(value)
+            entry.update(parse_extra_metrics(extras))
         return entry
     return None
 
 
-class LiveTBWriter:
-    """Watches a log file and streams metrics to tensorboard in real-time."""
+class MetricsWriter:
+    """Streams parsed metrics to JSONL and tensorboard."""
 
-    def __init__(self, log_path: Path, name: str):
-        self.log_path = log_path
-        self.writer = SummaryWriter(log_dir=str(TB_DIR / name))
-        self.seen_lines = 0
-        self._stop = threading.Event()
+    def __init__(self, metrics_path: Path, name: str):
+        self.metrics_path = metrics_path
+        self.writer = SummaryWriter(log_dir=str(TB_DIR / name), max_queue=512, flush_secs=10)
+        self.metrics_file = metrics_path.open("a", encoding="utf-8")
         self._prev_train_loss = None
+        self._last_train_time_ms = None
 
     @staticmethod
     def _extra_scalar_tag(key: str) -> str:
@@ -88,61 +126,92 @@ class LiveTBWriter:
             "local_mask_jaccard",
             "global_pooled_cos",
             "local_pooled_cos",
+            "pooled_view_eff_rank",
+            "pooled_view_eff_rank_ratio",
+            "sigreg_view_eff_rank",
+            "sigreg_view_eff_rank_ratio",
+            "latent_eff_rank",
+            "latent_eff_rank_ratio",
+            "next_pred_cos",
+            "context_target_cos",
             "token_view_eff_rank",
+            "token_view_eff_rank_ratio",
             "token_view_cos_off_mean",
             "token_view_dim_std_mean",
+            "view_eff_rank_ratio",
+            "sigreg_samples",
+            "dirs_sum",
         }
         if key == "stage_id":
             return "stage/id"
+        if key == "step_avg_ms":
+            return "perf/step_avg_ms"
         if key.startswith("lejepa_"):
             return f"lejepa/{key.removeprefix('lejepa_')}"
         if key in lejepa_keys:
             return f"lejepa/{key}"
         if key.startswith("probe_"):
             return f"probe/{key.removeprefix('probe_')}"
+        if key.startswith("codebook_"):
+            return f"probe/{key}"
         return f"train/{key}"
 
-    def _poll(self):
-        while not self._stop.is_set():
-            if not self.log_path.exists():
-                self._stop.wait(1)
-                continue
-            lines = self.log_path.read_text().splitlines()
-            for line in lines[self.seen_lines:]:
-                entry = parse_log_line(line)
-                if not entry:
+    def write_entry(self, entry: dict) -> None:
+        if entry["type"] == "train":
+            self._last_train_time_ms = entry["train_time_ms"]
+        elif entry["type"] == "val" and entry["train_time_ms"] == 0.0 and self._last_train_time_ms is not None:
+            entry = {**entry, "train_time_ms": self._last_train_time_ms}
+        self.metrics_file.write(json.dumps(entry, sort_keys=True) + "\n")
+        self.metrics_file.flush()
+        if entry["type"] == "val":
+            time_s = int(entry["train_time_ms"] / 1000)
+            self.writer.add_scalar("val/bpb", entry["val_bpb"], entry["step"])
+            self.writer.add_scalar("val/loss", entry["val_loss"], entry["step"])
+            self.writer.add_scalar("time/val_bpb", entry["val_bpb"], time_s)
+            self.writer.add_scalar("time/val_loss", entry["val_loss"], time_s)
+            for key, value in entry.items():
+                if key in {"step", "type", "val_loss", "val_bpb", "train_time_ms"}:
                     continue
-                time_s = int(entry["train_time_ms"] / 1000)
-                if entry["type"] == "val":
-                    self.writer.add_scalar("val/bpb", entry["val_bpb"], entry["step"])
-                    self.writer.add_scalar("val/loss", entry["val_loss"], entry["step"])
-                    self.writer.add_scalar("time/val_bpb", entry["val_bpb"], time_s)
-                    self.writer.add_scalar("time/val_loss", entry["val_loss"], time_s)
-                elif entry["type"] == "train":
-                    self.writer.add_scalar("train/loss", entry["train_loss"], entry["step"])
-                    self.writer.add_scalar("time/train_loss", entry["train_loss"], time_s)
-                    if self._prev_train_loss is not None:
-                        delta = entry["train_loss"] - self._prev_train_loss
-                        self.writer.add_scalar("train/loss_delta", delta, entry["step"])
-                    self._prev_train_loss = entry["train_loss"]
-                    for key, value in entry.items():
-                        if key in {"step", "type", "train_loss", "train_time_ms", "step_avg_ms"}:
-                            continue
-                        self.writer.add_scalar(self._extra_scalar_tag(key), value, entry["step"])
-                    if "step_avg_ms" in entry:
-                        self.writer.add_scalar("perf/step_avg_ms", entry["step_avg_ms"], entry["step"])
-                self.writer.flush()
-            self.seen_lines = len(lines)
-            self._stop.wait(2)
+                self.writer.add_scalar(self._extra_scalar_tag(key), value, entry["step"])
+        elif entry["type"] == "train":
+            time_s = int(entry["train_time_ms"] / 1000)
+            self.writer.add_scalar("train/loss", entry["train_loss"], entry["step"])
+            self.writer.add_scalar("time/train_loss", entry["train_loss"], time_s)
+            if self._prev_train_loss is not None:
+                delta = entry["train_loss"] - self._prev_train_loss
+                self.writer.add_scalar("train/loss_delta", delta, entry["step"])
+            self._prev_train_loss = entry["train_loss"]
+            for key, value in entry.items():
+                if key in {"step", "type", "train_loss", "train_time_ms", "step_avg_ms"}:
+                    continue
+                self.writer.add_scalar(self._extra_scalar_tag(key), value, entry["step"])
+            if "step_avg_ms" in entry:
+                self.writer.add_scalar("perf/step_avg_ms", entry["step_avg_ms"], entry["step"])
+        elif entry["type"] == "diag":
+            for key, value in entry.items():
+                if key in {"step", "type"}:
+                    continue
+                self.writer.add_scalar(self._extra_scalar_tag(key), value, entry["step"])
 
-    def start(self):
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        self._thread.join(timeout=5)
+    def close(self) -> None:
+        self.metrics_file.close()
         self.writer.close()
+
+
+def read_metrics_jsonl(metrics_path: Path) -> list[dict]:
+    entries = []
+    if not metrics_path.exists():
+        return entries
+    with metrics_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
 
 
 def run_config(
@@ -166,14 +235,21 @@ def run_config(
     log_file = REPO_ROOT / "logs" / f"{name}.txt"
     if log_file.exists():
         log_file.unlink()
+    metrics_path = run_dir / "metrics.jsonl"
+    if metrics_path.exists():
+        metrics_path.unlink()
 
     env = os.environ.copy()
+    for key in list(env):
+        if any(key.startswith(prefix) for prefix in SANITIZED_ENV_PREFIXES):
+            env.pop(key)
     env.update({
         "ITERATIONS": str(steps),
         "VAL_LOSS_EVERY": str(val_every),
         "TRAIN_LOG_EVERY": "10",
         "MAX_WALLCLOCK_SECONDS": "0",
         "WARMDOWN_ITERS": "0",  # flat LR; warmdown is same for all archs so skip it
+        "PYTHONUNBUFFERED": "1",
         "RUN_ID": name,
     })
     env.update(env_overrides)
@@ -186,35 +262,48 @@ def run_config(
         print(f"  overrides: {env_overrides}")
     print(f"{'='*60}\n")
 
-    # Start live TB writer
-    log_path = REPO_ROOT / "logs" / f"{name}.txt"
-    tb_writer = LiveTBWriter(log_path, name)
-    tb_writer.start()
-
     t0 = time.time()
-    proc = subprocess.run(
-        [sys.executable, script],
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    output_lines = []
+    metrics_writer = MetricsWriter(metrics_path, name)
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-u", script],
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output_lines.append(line)
+            entry = parse_log_line(line)
+            if entry:
+                metrics_writer.write_entry(entry)
+        proc.wait()
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise
+    finally:
+        metrics_writer.close()
     elapsed = time.time() - t0
 
-    # Stop TB writer
-    tb_writer.stop()
-
-    # Parse full log
-    log_text = proc.stdout + "\n" + proc.stderr
-    entries = []
-    for line in log_text.splitlines():
-        entry = parse_log_line(line)
-        if entry:
-            entries.append(entry)
+    entries = read_metrics_jsonl(metrics_path)
+    output_text = "".join(output_lines)
 
     val_entries = [e for e in entries if e["type"] == "val"]
     final_bpb = val_entries[-1]["val_bpb"] if val_entries else None
     final_loss = val_entries[-1]["val_loss"] if val_entries else None
+    final_probe_bpb = val_entries[-1].get("probe_val_bpb") if val_entries else None
+    final_probe_loss = val_entries[-1].get("probe_val_loss") if val_entries else None
 
     result = {
         "name": name,
@@ -225,25 +314,24 @@ def run_config(
         "elapsed_seconds": elapsed,
         "final_val_bpb": final_bpb,
         "final_val_loss": final_loss,
+        "final_probe_val_bpb": final_probe_bpb,
+        "final_probe_val_loss": final_probe_loss,
         "val_entries": val_entries,
         "returncode": proc.returncode,
     }
 
     if proc.returncode != 0:
-        result["error"] = proc.stderr[-2000:] if proc.stderr else "unknown error"
+        result["error"] = output_text[-2000:] if output_text else "unknown error"
         print(f"  ERROR (rc={proc.returncode})")
-        print(proc.stderr[-1000:])
+        print(output_text[-1000:])
     else:
         print(f"  Final BPB: {final_bpb:.4f}" if final_bpb else "  No val results found")
         print(f"  Elapsed: {elapsed:.1f}s")
 
-    # Save result JSON + copy log to run dir
+    # Save result JSON; metrics.jsonl is the canonical machine-readable record.
     result_path = run_dir / "result.json"
     with open(result_path, "w") as f:
         json.dump(result, f, indent=2)
-    if log_path.exists():
-        import shutil
-        shutil.copy2(log_path, run_dir / "train.log")
     print(f"  Saved: {run_dir}/")
 
     return result
@@ -272,13 +360,14 @@ def compare_results(results_dir: Path) -> None:
             seen.add(r["name"])
             unique.append(r)
 
-    print(f"\n{'Name':<40} {'Steps':>6} {'BPB':>8} {'Loss':>8} {'Time':>8}")
-    print("-" * 74)
+    print(f"\n{'Name':<40} {'Steps':>6} {'BPB':>8} {'Probe':>8} {'Loss':>8} {'Time':>8}")
+    print("-" * 83)
     for r in sorted(unique, key=lambda x: x.get("final_val_bpb") or 99):
         bpb = f"{r['final_val_bpb']:.4f}" if r.get("final_val_bpb") else "FAIL"
+        probe = f"{r['final_probe_val_bpb']:.4f}" if r.get("final_probe_val_bpb") else "-"
         loss = f"{r['final_val_loss']:.4f}" if r.get("final_val_loss") else "-"
         time_s = f"{r['elapsed_seconds']:.0f}s" if r.get("elapsed_seconds") else "-"
-        print(f"{r['name']:<40} {r['steps']:>6} {bpb:>8} {loss:>8} {time_s:>8}")
+        print(f"{r['name']:<40} {r['steps']:>6} {bpb:>8} {probe:>8} {loss:>8} {time_s:>8}")
 
 
 def build_sweep(sweep_type: str, steps: int, val_every: int) -> list[tuple[str, dict]]:
