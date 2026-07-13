@@ -5,20 +5,24 @@ eval use, so what you see is exactly the trained policy — including where it
 chose to think.  Works against the pretraining checkpoint alone (untrained
 gate) or with a latent-VAPO checkpoint layered on top.
 
-    # An AIME problem by index, 4 samples:
+    # An AIME problem by index, 4 samples (the base --checkpoint is resolved
+    # from the run's manifest.json when omitted):
     python3 -m postraining.sample_latent \
-        --checkpoint ablation_results/<run>/pretraining_checkpoint.pt \
         --wrapper-checkpoint postraining/runs/<name>/latent_vapo_checkpoint.pt \
         --aime-row 0 --samples 4
 
-    # Arbitrary text:
-    python3 -m postraining.sample_latent --checkpoint ... --prompt "The sky"
+    # Arbitrary text against the raw pretraining checkpoint:
+    python3 -m postraining.sample_latent \
+        --checkpoint ablation_results/<run>/pretraining_checkpoint.pt \
+        --prompt "The sky"
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import textwrap
+from pathlib import Path
 
 import torch
 
@@ -48,7 +52,11 @@ def gate_trace(kind_row: torch.Tensor, prompt_length: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="base pretraining checkpoint; defaults to the one recorded in "
+        "the wrapper checkpoint's run manifest",
+    )
     parser.add_argument("--wrapper-checkpoint", default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--aime-row", type=int, default=None)
@@ -70,6 +78,14 @@ def main() -> None:
     modes = sum(value is not None for value in (args.prompt, args.aime_row, args.fineweb))
     if modes != 1:
         parser.error("exactly one of --prompt, --aime-row, or --fineweb is required")
+    if args.checkpoint is None:
+        if args.wrapper_checkpoint is None:
+            parser.error("--checkpoint is required without --wrapper-checkpoint")
+        manifest = Path(args.wrapper_checkpoint).parent / "manifest.json"
+        if not manifest.exists():
+            parser.error(f"cannot resolve the base checkpoint: {manifest} not found")
+        args.checkpoint = json.loads(manifest.read_text())["base"]["checkpoint"]
+        print(f"base checkpoint (from manifest): {args.checkpoint}")
 
     device = torch.device("cuda")
     backbone = load_model(args.checkpoint, device)
