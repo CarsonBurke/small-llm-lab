@@ -1,16 +1,150 @@
 # TODO
 
-## GPU queue (v3 runner — detached, gated on the user's trading_bot_0 job exiting)
-Runner: scratchpad/queue3.sh, log queue3.log. Relaunched 14:12 Jul 13 with churn first;
-sparse_churn_2k started 14:20 (user's train-planner finished). Earlier context:
-`sparse_fast_smoke_v2` DONE (2738.79ms/step — radix-select path bought ~nothing over 2712;
-BPB 2.5443@40); fast-2k rerun deliberately killed for the perf push (`*_rerun_killed_early`).
-1. `sparse_churn_2k` — RUNNING; churn arm quality gate vs baseline 1.2967@2k (>0.005 threshold);
-   also reports real step time (est ~1400ms/step from 168.8ms/micro)
-2. `baseline_sparse_entmax_fast_2k` — scan-arm quality gate rerun (killed run was pacing dense:
+## Latent RL — attached-CE lineage (user, Jul 18; see LATENT_RL_PLAN.md "Attached-CE lineage")
+mlq chain, each stage `--after-success` the previous:
+CHAIN HISTORY: job 97 cancelled by request @1540 (no ckpt). Rerun job 111 lost @~1860
+(mlq runner died); its step-1500 rolling checkpoint survived. Mid-train probes (bench
+avg@32): 7.1%@500 → 14.4%@1000 → 15.1%@1500 — PLATEAU after step 1000; AIME ~0 throughout
+(3/960 @1000, noise); answer-line compliance 100% everywhere; transcripts recorded
+(eval_aime now always writes *_transcripts_step*.jsonl). Sufficiency call: pretraining
+sufficient, RL is the lever with slope; user approved post-training Jul 18.
+GATE RESULT (job 129, Jul 18): FAILED exit 2 on DAPO-Math — 128/128 trajectories reward
+0.0, within_group_reward_std 0.0; DAPO probe (131) confirmed emit-only 0/512+ hits →
+task difficulty, not thought noise. Latent mechanics nominal (think_fraction 0.501).
+COLD-START FIX (user-approved Jul 18): 50/50 zero-init gate is reward-starved — measured
+~1e-4 hit rate vs 13.9% emit-only at IDENTICAL sampling (temp 1.0/top-p 1.0), so untrained
+noisy thoughts (not sampling config) collapse accuracy; value warmup "instant convergence"
+was the tell (critic hit the exact HL-Gauss CE floor 1.4292 predicting constant 0).
+New `--init-think-probability 0.1` sets the gate head BIAS (weights stay zero); sigma
+unchanged at -1.5. Jobs 133 (b8 samples) and 134 (zero-init, starved; dir staged as
+`latent_vapo_dm_v1_zeroinit_starved`) superseded by job 135 (`latent_vapo_dm_v1`,
+samples-per-prompt 32, init think 10%).
+COMPILE (user prescription Jul 18, in progress): torch.compile reduce-overhead/CUDA
+graphs "almost exactly like pretraining, for both models" — implemented behind
+`--compile` (default on) + `--replay-bucket 64`; static key_mask stepping path
+(full-cache masked SDPA, 0-dim tensor positions, persistent zeroed
+mark_static_address caches), compiled replay_head_inputs rebound in both consumer
+modules + compiled critic.value_logits; refresh_old_statistics now grad-enabled so
+refresh/update share one compiled artifact (epoch-0 ratio exactness). See
+LATENT_RL_PLAN.md "torch.compile" section. Eager job 135 timings for comparison:
+collect ~14-16 s, iteration ~20 s (32 minibatches). Red-team verdict applied:
+stepwise-only cudagraphs (replay/critic get plain compile — output-lifetime hazard),
+compiled surface = step_core (pure tensors, no dataclass/cache aliasing in graph),
+rollout finish-check sync relaxed to every 16 steps (was a per-step D2H serializer);
+diff review APPROVED after: remainder eval chunks now PAD to cache width (dynamic
+fallback through the compiled step could LRU-evict training graphs), epoch-0
+clip-fraction==0 runtime guard added (prints WARNING if refresh/update artifacts
+diverge). Deferred lever if collect still dominates: batch all 16 groups into one
+left-padded rollout (~6500->~900 step iterations, amortizes eager sampling 16x).
+OPS: job 135 cancelled @~step 736 (rolling ckpt @700); job 136 = compiled benchmark
+(--steps 160, warmup 2); next = resume 135's run with --compile from
+postraining/runs/latent_vapo_dm_v1/latent_vapo_checkpoint.pt after verifying
+benchmark correctness (epoch-0 guard silent, sane val_bpb/rewards) + speedup.
+BUCKET CAP LEAK (found via jobs 136/137 never converging — collect stuck 47-123 s
+from persistent silent inductor compiles): trim_stream capped the bucketed length at
+the ORIGINAL stream length, so any group whose content reached the last partial
+bucket leaked an arbitrary stream shape -> unbounded compile set. Fixed: trim now
+PADS BEYOND the original stream to the strict bucket boundary (pad columns are the
+natural all-PAD state; padding-invariance test extended with a forced pad-beyond
+case at multiple=64). Job 136 correctness evidence unaffected (epoch-0 guard
+exactly 0, val_bpb flat 1.4297-1.4303, step-0 evals match eager, GPU 100%/459 W in
+steady regions vs 220 W eager). Job 138 = fixed steady-state probe (192 steps,
+--replay-bucket 128); decision: steady collect < eager 14-16 s -> resume compiled,
+else --no-compile (top_p>=1 multinomial fast path helps eager too).
+BATCHED ROLLOUT (Jul 18, user-approved): all 16 prompt groups roll out as ONE
+left-padded batch (512 rows; per-row 2-D key_mask threaded through all three
+attention steps; pad-region queries attend all-True — REQUIRED, a fully-masked
+SDPA row is NaN and would poison real queries via deeper-layer K/V;
+split_rollout_groups clones each group minus its pad columns so downstream is
+unchanged). Position shift exact (PoPE/RoPE/YaRN relative — red-team verified
+the math). --rollout-groups (default 16), eager-only. Red-team: SOUND; diff
+review: APPROVED. --compile default flipped to FALSE (measured 2.6x slower +
+blocks the batched path). New think-credit metrics: think/emit_advantage_mean,
+think_action_count (update), think_reward_correlation, reward_mean_thinking vs
+_pure_emit, thinking_trajectory_fraction (rollout). Job 140 = batched timing
+probe (queued behind 139); job 141 = sample dump (sample_latent --math-rows
+--json-out) for the HTML report. Untested corner (low risk): RoPE/yarn 2-D
+key_mask branches (equivalence test covers PoPE only).
+GATE AUDIT VERDICT (think fraction 0.10 -> 0.02): mechanisms all clean EXCEPT
+lambda-clamp credit starvation — length_adaptive_lambda alpha=0.05 (VAPO's
+thousand-token calibration) clamps lambda to EXACTLY 0 at this run's 12-23
+action trajectories -> GAE = TD(0) -> terminal reward credits nothing >1 step
+back (lambda^m = 0) -> THINK decisions structurally never receive reward
+credit; decline direction likely genuine (zero-init adapter thoughts noisy;
+bench rose 4.8->15.2% while think fell) but irreversibility is mechanical.
+FIX: --gae-lambda-alpha (default 1.0: lambda = 1 - 1/L, credit horizon =
+trajectory length; L=15 -> 0.93). Ruled out: budget confound (thinks don't
+consume emit cap; 13-24 of 512 slots), BCE signs, position alignment,
+positive-LM leak, warmup bias, refresh divergence (gate clip exactly 0).
+Job 142 = step microbenchmark (eager narrow vs reduce-overhead vs MANUAL
+cuda-graph capture, batch 32+512, profiler cudaGraphLaunch counts) — tests
+whether compiled slowness is dynamo per-call overhead, not attention FLOPs
+(the FLOP math says full-cache SDPA is ~us-level; 2.6 ms/step unexplained).
+VERDICT (job 138, clean iters 2-4 with ZERO compile spikes): compiled collect
+36-40 s vs eager 11-16 s, minibatch 0.13 s vs 0.11 s, iteration 42-57 s vs
+14-19 s. The static-cache cudagraph step pays masked SDPA over the FULL ~900-slot
+cache every step (~4x the attention FLOPs of eager's prefix-only step) — swamps
+the ~3.5 ms/step launch savings at this model size; 459 W was busy-work, not
+throughput. New bucket shapes also still appeared at iter 5 (streams lengthen as
+policy shifts) re-paying ~30 s compiles. DECISION: resumed eager. Job 139 =
+latent_vapo_dm_v1_resume (--resume from ckpt step ~700, --no-compile, otherwise
+job-135 args verbatim); eager still gains the top_p>=1 multinomial fast path
+(no per-step full-vocab sort) and SYNC_EVERY=16 finish check vs original 135.
+Compile plumbing stays in tree behind --compile for a future larger model /
+batched-rollout revisit; next perf lever remains batch-all-16-groups (helps
+eager directly: ~6500 -> ~900 sequential steps).
+CURRENT CHAIN (curriculum lever per plan/red-team): RL prompts switch to
+`postraining/data/deepmind-interpolate-rl.parquet` (18k problems, built by
+build_deepmind_rl_prompts.py from interpolate splits, 144 eval problems excluded,
+zero overlap verified; model scores 15.1% avg@32 there = mixed-success regime VAPO
+needs). 132 gate (BINDING) → 133 full latent VAPO v2 (`postraining/runs/latent_vapo_dm_v1`),
+both on `.../checkpoint_step1500_snapshot.pt` with `--math-data` override. AIME + bench
+evals unchanged (bench stays held out).
+1. `pope_attached_mathmix_v3_2k` — from-scratch attached-CE pretraining on mathmix_v3
+   (FineWeb-only attached-CE ckpt can't be continued: PoPE pretraining hard-rejects
+   checkpoint init by design, and train_adaptation's detached-belief CE can't teach
+   the trunk math/template compliance)
+2. `pope_attached_dapo_probe` — emit-only DAPO hit-rate/compliance probe (informational)
+3. `pope_attached_aime_probe` — emit-only AIME avg@32, informational (hard AIME gate is
+   lottery noise at 27M; user's periodic-AIME requirement satisfied by probing after
+   every pretraining stage + every 80 RL steps; on no signal anywhere, extend math
+   pretraining and re-probe). AIME = eval of record; marginal improvement counts (user)
+3b. `pope_attached_bench_probe` — emit-only deepmind-interpolate-easy avg@32 (144
+   held-out same-difficulty problems, build_deepmind_eval_set.py; user-approved easier
+   benchmark). RL trainer also evals it every 80 steps (bench/accuracy)
+NOTE: algorithm is VAPO everywhere; "DAPO" = the DAPO-Math-17K prompt dataset/verifier
+4. `latent_vapo_attached_gate` — `train_latent_vapo --rollout-only` reward-variance gate
+   (BINDING: exit 2 stops the chain)
+5. `latent_vapo_attached_v1` — full latent VAPO **v2** (user redesign, Jul 18): FULL-MODEL
+   training (no frozen trunk — world model retrained from "will be" to "should be" by
+   per-dim thought PPO through the prediction path + token PPO), fixed thought sigma
+   (log -1.5; no beta-NLL, no entropy, no KL), NO pretraining objective at RL time
+   (user, Jul 18: SIGReg + latent target-prediction dropped — the PPO-ptx anchor was
+   built then rejected as a "will be"-vs-"should be" objective conflict; val-BPB guard
+   is the sole drift alarm); actor accumulates over each PPO epoch (1 trunk step/epoch,
+   red-teamed), renderer probe pinned at --renderer-lr 1e-6; ckpt every 50.
+   Jul 19 context correction: rerun from the clean belief-attached checkpoint
+   with prompt cap 1024, emitted-answer cap 1024, total THINK+EMIT budget 4096
+   (5120 max context), and rollout-groups 4 for 32GB cache fit. Run AIME24
+   avg@32 once from the final latent checkpoint rather than paying for it every
+   80 steps.
+   Jobs 100/101 HELD during the v2 rework — release after review completes.
+   train_adaptation.py/adaptation_core.py deleted (frozen-trunk artifacts).
+
+## GPU queue (v4 runner — detached, gated on the user's trading_bot_0 job exiting)
+Runner: scratchpad/queue4.sh, log queue4.log. User stopped sparse_churn_2k at step 1140
+(pre-TB-stats launch; staged `*_prestats_killed_step1140`; trajectory: 1.6284@300 1.5683@400
+1.5330@500 1.5012@600 — steady ~+0.05 BPB behind the scan arm; 1641ms/step measured) to
+prioritize the cross-layer arm. queue3 history: `sparse_fast_smoke_v2` DONE (2738.79ms/step —
+radix-select bought ~nothing over 2712; BPB 2.5443@40); fast-2k rerun killed for the perf push.
+1. `xlayer_smoke` — 40 steps; first run of the cross-layer arm (step time + sanity);
+   gated on XLAYER_REVIEWED sentinel (written; two adversarial reviews clean)
+2. `sparse_xlayer_2k` — cross-layer quality gate
+3. `sparse_churn_2k` — RERUN with churn/* TB stats (rewire/support/hnorm per layer at val
+   cadence via metrics.jsonl; deterministic reproduction of the killed run)
+4. `baseline_sparse_entmax_fast_2k` — scan-arm quality gate rerun (killed run was pacing dense:
    1.4112@800 vs 1.4116, 1.3567@1300)
-3. `nextlat_aux_off_800` — lambdas=0 probe (NEXTLAT_LAMBDA_MSE=0 NEXTLAT_LAMBDA_KL=0);
-   13:17 attempt was rc=2 (stray positional arg, no data) — rerun is the real one
+5. `nextlat_aux_off_800` — lambdas=0 probe (NEXTLAT_LAMBDA_MSE=0 NEXTLAT_LAMBDA_KL=0)
 
 ## Old queue (dead, for the record)
 1. ~~`baseline_pope_zero_2k`~~ — killed at ~step 850 (bpb 1.4324@800 vs baseline 1.4116; with-gain PoPE underperforms)
