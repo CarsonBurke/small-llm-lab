@@ -28,7 +28,15 @@ import torch
 
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
 from fresh_lejepa_train import FreshHyperparameters
-from postraining.core import load_unique_math_rows, verify_answer
+from postraining.core import (
+    POSTTRAIN_PROMPT_TOKENS,
+    POSTTRAIN_RESPONSE_TOKENS,
+    POSTTRAIN_STREAM_TOKENS,
+    encode_prompt,
+    load_unique_math_rows,
+    validate_posttraining_context_budget,
+    verify_answer,
+)
 from postraining.latent_rollout import (
     THOUGHT_SLOT,
     TOKEN_SLOT,
@@ -37,7 +45,10 @@ from postraining.latent_rollout import (
     rollout_continuations,
     trim_stream,
 )
-from postraining.latent_thought import LatentThoughtModel
+from postraining.latent_thought import (
+    LatentThoughtModel,
+    validate_renderer_checkpoint,
+)
 from postraining.model_io import load_model
 from postraining.train_vapo import prompt_text
 
@@ -55,7 +66,7 @@ def decode_with_think_markers(
     kind_row: torch.Tensor,
     token_row: torch.Tensor,
     prompt_length: int,
-    eos: int = -1,
+    stop_ids: tuple[int, ...] = (),
 ) -> str:
     """Continuation text with an inline ``{n}🪙`` marker per THINK run.
 
@@ -89,9 +100,12 @@ def decode_with_think_markers(
                 parts.append(f"{run}🪙")
                 at_start = False
                 run = 0
-            segment.append(token)
-            if token == eos:
+            if token in stop_ids:
+                # Control pieces (BOS/EOS) decode to nothing — show them.
+                flush_segment()
+                parts.append(tokenizer.id_to_piece(token))
                 break
+            segment.append(token)
     flush_segment()
     if run:
         parts.append(f"{run}🪙")
@@ -114,24 +128,51 @@ def main() -> None:
         help="sample N Tier-0 training pairs: real FineWeb prompt + reference "
         "continuation, scored with the actual continuation reward",
     )
-    parser.add_argument("--prompt-tokens", type=int, default=256)
+    parser.add_argument(
+        "--math-rows", type=int, default=None, metavar="N",
+        help="sample N seeded-random problems from --math-data with "
+        "--samples rollouts each, verifier-scored",
+    )
+    parser.add_argument(
+        "--math-data", default="postraining/data/deepmind-interpolate-rl.parquet"
+    )
+    parser.add_argument(
+        "--json-out", default=None,
+        help="also write the sampled records as JSON (math-rows mode only)",
+    )
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=POSTTRAIN_PROMPT_TOKENS
+    )
+    parser.add_argument("--fineweb-prompt-tokens", type=int, default=256)
     parser.add_argument("--continuation-tokens", type=int, default=64)
     parser.add_argument("--samples", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
+    )
     # Total generated-slot budget (thinks + emits); 0 = 4x the emit cap.
-    parser.add_argument("--max-stream-steps", type=int, default=0)
+    parser.add_argument(
+        "--max-stream-steps", type=int, default=POSTTRAIN_STREAM_TOKENS
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--emit-only", action="store_true",
-        help="pin the gate to EMIT so sampling is exactly the backbone LM "
+        help="pin the gate to EMIT so sampling uses only the belief renderer "
         "(no latent thinking)",
     )
     args = parser.parse_args()
-    modes = sum(value is not None for value in (args.prompt, args.aime_row, args.fineweb))
+    stream_steps = args.max_stream_steps or 4 * args.max_new_tokens
+    validate_posttraining_context_budget(args.prompt_tokens, stream_steps)
+    modes = sum(
+        value is not None
+        for value in (args.prompt, args.aime_row, args.fineweb, args.math_rows)
+    )
     if modes != 1:
-        parser.error("exactly one of --prompt, --aime-row, or --fineweb is required")
+        parser.error(
+            "exactly one of --prompt, --aime-row, --fineweb, or --math-rows "
+            "is required"
+        )
     if args.checkpoint is None:
         if args.wrapper_checkpoint is None:
             parser.error("--checkpoint is required without --wrapper-checkpoint")
@@ -149,18 +190,18 @@ def main() -> None:
         payload = torch.load(
             args.wrapper_checkpoint, map_location="cpu", weights_only=False
         )
+        validate_renderer_checkpoint(payload, args.wrapper_checkpoint)
         wrapper.load_state_dict(payload["model"], strict=True)
         print(f"policy: {args.wrapper_checkpoint} (step {payload.get('step')})")
     else:
         print("policy: untrained heads over the pretraining checkpoint")
     wrapper.eval()
     if args.emit_only:
-        # Zero gate weight + saturated bias: EMIT with probability ~1, which
-        # is step-identical to backbone generation (pinned by tests).
+        # Zero gate weight + saturated bias: EMIT with probability ~1.
         with torch.no_grad():
             wrapper.gate.head.weight.zero_()
             wrapper.gate.head.bias.fill_(30.0)
-        print("gate pinned to EMIT: sampling the backbone LM directly")
+        print("gate pinned to EMIT: sampling the belief renderer directly")
 
     import sentencepiece as spm
 
@@ -175,7 +216,7 @@ def main() -> None:
             FreshHyperparameters.train_files, 0, 1, device
         )
         prompt_ids, reference_ids = sample_prompt_batch(
-            loader, args.prompt_tokens, args.continuation_tokens,
+            loader, args.fineweb_prompt_tokens, args.continuation_tokens,
             args.fineweb, args.samples, FreshHyperparameters.train_seq_len,
         )
         with torch.no_grad():
@@ -205,6 +246,100 @@ def main() -> None:
             print()
         return
 
+    if args.math_rows is not None:
+        import random
+
+        rows = load_unique_math_rows(args.math_data)
+        picked = random.Random(args.seed).sample(range(len(rows)), args.math_rows)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+        stop_ids = tuple(
+            t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+        )
+        records = []
+        for row_index in picked:
+            row = rows[row_index]
+            text = prompt_text(row)
+            truth = row["reward_model"]["ground_truth"]
+            prompt_ids = torch.tensor(
+                encode_prompt(tokenizer, text, args.prompt_tokens),
+                dtype=torch.long,
+                device=device,
+            )
+            with torch.no_grad():
+                batch = trim_stream(
+                    rollout_continuations(
+                        wrapper,
+                        prompt_ids[None].expand(args.samples, -1),
+                        args.max_new_tokens,
+                        stream_steps,
+                        args.temperature,
+                        args.top_p,
+                        stop_ids=stop_ids or None,
+                    )
+                )
+            samples = []
+            for index, emitted in enumerate(emitted_token_rows(batch)):
+                cut = next(
+                    (i for i, t in enumerate(emitted) if t in stop_ids), None
+                )
+                if cut is not None:
+                    emitted = emitted[: cut + 1]
+                decoded = tokenizer.decode(emitted)
+                is_correct, prediction = verify_answer(decoded, truth)
+                trace = gate_trace(batch.kind[index], batch.prompt_length)
+                samples.append(
+                    {
+                        "text": decode_with_think_markers(
+                            tokenizer, batch.kind[index], batch.token_ids[index],
+                            batch.prompt_length, stop_ids=stop_ids,
+                        ),
+                        "trace": trace,
+                        "thinks": trace.count("t"),
+                        "emits": trace.count("E"),
+                        "correct": is_correct,
+                        "prediction": prediction,
+                    }
+                )
+            correct = sum(sample["correct"] for sample in samples)
+            print(
+                f"=== row {row_index}: {correct}/{len(samples)} correct "
+                f"(truth: {truth})"
+            )
+            print(textwrap.shorten(text, 200))
+            for index, sample in enumerate(samples):
+                print(
+                    f"--- sample {index}  "
+                    f"{'CORRECT' if sample['correct'] else 'wrong'} "
+                    f"(extracted: {sample['prediction']}, "
+                    f"thinks: {sample['thinks']})"
+                )
+                print(sample["text"])
+            print()
+            records.append(
+                {
+                    "row_index": row_index,
+                    "problem": text,
+                    "ground_truth": truth,
+                    "samples": samples,
+                }
+            )
+        if args.json_out:
+            payload = {
+                "wrapper_checkpoint": args.wrapper_checkpoint,
+                "math_data": args.math_data,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "samples_per_problem": args.samples,
+                "max_new_tokens": args.max_new_tokens,
+                "seed": args.seed,
+                "records": records,
+            }
+            Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.json_out).write_text(json.dumps(payload, indent=1))
+            print(f"wrote {args.json_out}")
+        return
+
     truth = None
     if args.aime_row is not None:
         rows = load_unique_math_rows(args.aime_data)
@@ -218,30 +353,35 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    eos = tokenizer.eos_id()
-    prompt_ids = torch.tensor(tokenizer.encode(text), dtype=torch.long, device=device)
+    stop_ids = tuple(t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0)
+    prompt_ids = torch.tensor(
+        encode_prompt(tokenizer, text, args.prompt_tokens),
+        dtype=torch.long,
+        device=device,
+    )
     with torch.no_grad():
         batch = trim_stream(
             rollout_continuations(
                 wrapper,
                 prompt_ids[None].expand(args.samples, -1),
                 args.max_new_tokens,
-                args.max_stream_steps or 4 * args.max_new_tokens,
+                stream_steps,
                 args.temperature,
                 args.top_p,
-                eos_id=eos if eos >= 0 else None,
+                stop_ids=stop_ids or None,
             )
         )
 
     for index, emitted in enumerate(emitted_token_rows(batch)):
-        if eos >= 0 and eos in emitted:
-            emitted = emitted[: emitted.index(eos) + 1]
+        cut = next((i for i, t in enumerate(emitted) if t in stop_ids), None)
+        if cut is not None:
+            emitted = emitted[: cut + 1]
         trace = gate_trace(batch.kind[index], batch.prompt_length)
         thinks = trace.count("t")
         decoded = tokenizer.decode(emitted)
         marked = decode_with_think_markers(
             tokenizer, batch.kind[index], batch.token_ids[index],
-            batch.prompt_length, eos=eos,
+            batch.prompt_length, stop_ids=stop_ids,
         )
         print(f"--- sample {index}  (thinks: {thinks}, emits: {trace.count('E')})")
         print(f"trace: {trace}")

@@ -50,7 +50,7 @@ def test_all_grounded_matches_teacher_forced_eval_loss():
     wrapper = _wrapper()
     x, y = _batch(batch=2, length=12)
     with torch.no_grad():
-        reference = wrapper.backbone(x, y)
+        reference = wrapper(x, y)
         metrics = open_loop_depth_metrics(wrapper, x, y, 4, 0, *_luts())
     assert [m["depth"] for m in metrics] == [0]
     assert metrics[0]["tokens"] == x.numel()

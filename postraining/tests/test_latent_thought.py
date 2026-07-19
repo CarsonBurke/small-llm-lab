@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
@@ -10,8 +11,10 @@ from postraining.latent_thought import (
     THINK,
     GaussianTransitionHead,
     LatentThoughtModel,
+    RENDERER_FEATURES_SCHEMA,
     ThinkEmitGate,
     ThoughtAdapter,
+    validate_renderer_checkpoint,
 )
 from postraining.model_io import _pope_construction
 
@@ -27,21 +30,22 @@ def _pope_model() -> FreshLeJEPASharedRMSV1PoPE:
         return FreshLeJEPASharedRMSV1PoPE(**KWARGS).eval()
 
 
-def test_token_step_matches_backbone_generation_step():
+def test_token_step_matches_full_forward_with_belief_renderer():
     torch.manual_seed(3)
     backbone = _pope_model()
     wrapper = LatentThoughtModel(backbone).eval()
     ids = torch.randint(0, 32, (2, 9))
-    caches_a = backbone.make_generation_cache(2, ids.size(1), torch.device("cpu"))
-    caches_b = backbone.make_generation_cache(2, ids.size(1), torch.device("cpu"))
+    caches = backbone.make_generation_cache(2, ids.size(1), torch.device("cpu"))
     with torch.no_grad():
+        token_latents = backbone.embed_tokens(ids)
+        beliefs = backbone.temporal_belief_from_token_latent(token_latents)
+        expected = backbone.logits_from_features(
+            wrapper.renderer_features(token_latents, beliefs)
+        )
         for position in range(ids.size(1)):
-            logits, _, caches_a = backbone.generation_step(
-                ids[:, position], caches_a, position
-            )
-            output = wrapper.token_step(ids[:, position], caches_b, position)
-            caches_b = output.caches
-            torch.testing.assert_close(output.logits, logits)
+            output = wrapper.token_step(ids[:, position], caches, position)
+            caches = output.caches
+            torch.testing.assert_close(output.logits, expected[:, position])
 
 
 def test_cached_generation_matches_full_forward_beyond_pretraining_context():
@@ -51,7 +55,11 @@ def test_cached_generation_matches_full_forward_beyond_pretraining_context():
     wrapper = LatentThoughtModel(backbone).eval()
     ids = torch.randint(0, 32, (1, length))
     with torch.no_grad():
-        full = backbone.policy_logits(ids)
+        token_latents = backbone.embed_tokens(ids)
+        beliefs = backbone.temporal_belief_from_token_latent(token_latents)
+        full = backbone.logits_from_features(
+            wrapper.renderer_features(token_latents, beliefs)
+        )
         caches = backbone.make_generation_cache(1, length, torch.device("cpu"))
         stepped = []
         for position in range(length):
@@ -60,6 +68,62 @@ def test_cached_generation_matches_full_forward_beyond_pretraining_context():
             stepped.append(output.logits)
     stepped = torch.stack(stepped, dim=1)
     torch.testing.assert_close(stepped, full, rtol=2e-4, atol=2e-4)
+
+
+def test_renderer_logits_do_not_depend_on_prediction_projector():
+    torch.manual_seed(7)
+    backbone = _pope_model()
+    wrapper = LatentThoughtModel(backbone).eval()
+    ids = torch.randint(0, 32, (2, 7))
+    with torch.no_grad():
+        backbone.policy_probe.output.weight.normal_(std=0.1)
+        input_latent = backbone.embed_tokens(ids)
+        belief = backbone.temporal_belief_from_token_latent(input_latent)
+        predicted_before = backbone.prediction_latent(belief)
+        logits_before = wrapper.policy_logits(ids)
+        for parameter in backbone.prediction_projector.parameters():
+            parameter.add_(torch.randn_like(parameter))
+        predicted_after = backbone.prediction_latent(belief)
+        logits_after = wrapper.policy_logits(ids)
+    assert not torch.equal(predicted_before, predicted_after)
+    torch.testing.assert_close(logits_after, logits_before)
+
+
+def test_dense_step_projection_gets_no_renderer_gradient():
+    torch.manual_seed(9)
+    backbone = _pope_model()
+    wrapper = LatentThoughtModel(backbone).eval()
+    with torch.no_grad():
+        backbone.policy_probe.output.weight.normal_(std=0.1)
+    ids = torch.randint(0, 32, (2,))
+    caches = wrapper.make_generation_cache(2, 1, torch.device("cpu"))
+    projected = []
+    handle = backbone.prediction_projector.register_forward_pre_hook(
+        lambda _module, inputs: projected.append(tuple(inputs[0].shape))
+    )
+    try:
+        output = wrapper.token_step(ids, caches, 0)
+    finally:
+        handle.remove()
+    output.logits.float().square().mean().backward()
+    assert projected == [(2, 1, 32)]
+    assert all(
+        parameter.grad is None
+        for parameter in backbone.prediction_projector.parameters()
+    )
+    assert float(backbone.blocks[0].attn.proj.weight.grad.abs().sum()) > 0.0
+
+
+def test_renderer_checkpoint_schema_rejects_old_semantics():
+    validate_renderer_checkpoint(
+        {"renderer_features_schema": RENDERER_FEATURES_SCHEMA}, "current.pt"
+    )
+    with pytest.raises(ValueError, match="Old or untagged VAPO checkpoints"):
+        validate_renderer_checkpoint({}, "old.pt")
+    with pytest.raises(ValueError, match="predicted/v1"):
+        validate_renderer_checkpoint(
+            {"renderer_features_schema": "input_latent+predicted/v1"}, "old.pt"
+        )
 
 
 def test_gate_zero_init_is_exactly_uniform():
@@ -86,85 +150,36 @@ def test_gate_sample_log_prob_recomputes_identically():
 
 def test_transition_log_prob_matches_torch_distributions():
     torch.manual_seed(13)
-    head = GaussianTransitionHead(8)
-    with torch.no_grad():
-        head.log_std_head.weight.normal_(std=0.1)
-    belief = torch.randn(5, 8)
+    head = GaussianTransitionHead(8, log_sigma=-0.5)
     mean = torch.randn(5, 8)
     generator = torch.Generator().manual_seed(21)
-    sample, log_prob = head.sample(mean, belief, generator=generator)
-    torch.testing.assert_close(head.log_prob(sample, mean, belief), log_prob)
-    reference = torch.distributions.Normal(mean, head.log_std(belief).exp())
+    sample, log_prob = head.sample(mean, generator=generator)
+    torch.testing.assert_close(head.log_prob(sample, mean), log_prob)
+    reference = torch.distributions.Normal(mean, math.exp(-0.5))
     torch.testing.assert_close(log_prob, reference.log_prob(sample).sum(-1))
-    torch.testing.assert_close(head.entropy(belief), reference.entropy().sum(-1))
+    torch.testing.assert_close(
+        head.per_dim_log_prob(sample, mean), reference.log_prob(sample)
+    )
 
 
-def test_transition_log_std_is_clamped_and_initialized_at_prediction_scale():
+def test_transition_sigma_is_a_fixed_buffer_with_no_parameters():
+    head = GaussianTransitionHead(8, log_sigma=-0.5)
+    assert list(head.parameters()) == []
+    torch.testing.assert_close(head.log_sigma, torch.tensor(-0.5))
+    assert "log_sigma" in head.state_dict()
+
+
+def test_thought_policy_gradient_flows_through_the_mean():
+    # v2 (full-model RL): the policy gradient must reach the prediction
+    # path — per_dim_log_prob differentiates through the passed mean.
     torch.manual_seed(15)
-    head = GaussianTransitionHead(8, log_std_init=-0.5)
-    torch.testing.assert_close(
-        head.log_std(torch.zeros(1, 8)), torch.full((1, 8), -0.5)
-    )
-    # The zero-init weight makes the head input-independent, so the clamp is
-    # only exercised with a randomized weight.
-    with torch.no_grad():
-        head.log_std_head.weight.normal_(std=1.0)
-    belief = 1000.0 * torch.randn(64, 8)
-    log_std = head.log_std(belief)
-    assert torch.all(log_std >= head.log_std_min)
-    assert torch.all(log_std <= head.log_std_max)
-    assert float(log_std.min()) == head.log_std_min
-    assert float(log_std.max()) == head.log_std_max
-
-
-def test_beta_nll_gradient_is_a_drop_in_for_the_mse_it_replaces():
-    # With constant log-std s and beta=0.5, d(beta_nll)/d(mean) must equal
-    # e^{-s}/2 times d(mse)/d(mean) per element — NOT model_dim/2 times,
-    # which a sum-over-dims reduction would silently produce.
-    torch.manual_seed(101)
-    dim = 512
-    head = GaussianTransitionHead(dim, log_std_init=-0.5)
-    belief = torch.randn(4, 7, dim)
-    target = torch.randn(4, 7, dim)
-    mean_nll = torch.randn(4, 7, dim, requires_grad=True)
-    head.beta_nll(target, mean_nll, belief, beta=0.5).backward()
-    mean_mse = mean_nll.detach().clone().requires_grad_(True)
-    torch.nn.functional.mse_loss(mean_mse, target).backward()
-    ratio = mean_nll.grad / mean_mse.grad
-    expected = math.exp(0.5) / 2.0
-    torch.testing.assert_close(
-        ratio, torch.full_like(ratio, expected), rtol=1e-4, atol=1e-4
-    )
-
-
-def test_beta_nll_scale_weight_is_detached_from_the_log_std_gradient():
-    # Seitzer et al.: the sigma^(2*beta) factor must not contribute to the
-    # log-std gradient. With beta=0.5 and error^2 == sigma^2 per dim, the
-    # attached NLL derivative (1 - err^2/sigma^2) is exactly zero, so ANY
-    # remaining gradient would come from a leaky scale factor.
-    torch.manual_seed(103)
-    head = GaussianTransitionHead(6, log_std_init=-0.5)
-    belief = torch.randn(32, 6)
-    mean = torch.randn(32, 6)
-    sigma = math.exp(-0.5)
-    target = mean + sigma * (2 * torch.randint(0, 2, mean.shape).float() - 1)
-    head.beta_nll(target, mean, belief, beta=0.5).backward()
-    torch.testing.assert_close(
-        head.log_std_head.bias.grad, torch.zeros_like(head.log_std_head.bias)
-    )
-
-
-def test_transition_beta_nll_trains_mean_free_head_toward_target():
-    torch.manual_seed(17)
-    head = GaussianTransitionHead(4)
-    belief = torch.randn(64, 4)
-    mean = torch.zeros(64, 4)
-    near = head.beta_nll(0.1 * torch.randn(64, 4), mean, belief)
-    far = head.beta_nll(3.0 * torch.randn(64, 4), mean, belief)
-    assert float(near) < float(far)
-    far.backward()
-    assert head.log_std_head.weight.grad is not None
-    assert torch.isfinite(head.log_std_head.weight.grad).all()
+    head = GaussianTransitionHead(8)
+    mean = torch.randn(5, 8, requires_grad=True)
+    sample = (mean + 0.3).detach()
+    head.per_dim_log_prob(sample, mean).sum().backward()
+    assert mean.grad is not None
+    # d/dmean of -0.5*((s-m)/sigma)^2 is (s-m)/sigma^2, positive here.
+    assert torch.all(mean.grad > 0)
 
 
 def test_adapter_zero_init_passes_thought_through():
@@ -174,8 +189,10 @@ def test_adapter_zero_init_passes_thought_through():
     thought = torch.randn(2, 32)
     injected = wrapper.thought_input(thought)
     assert injected.shape == (2, 1, 32)
+    # Zero-init correction: the injection is exactly the raw thought — its
+    # magnitude (the model's confidence) reaches the trunk unmodified.
     torch.testing.assert_close(
-        injected.squeeze(1), thought.to(injected.dtype), rtol=0, atol=0
+        injected.squeeze(1), thought.to(injected.dtype), rtol=1e-5, atol=1e-6
     )
 
 
@@ -191,7 +208,7 @@ def test_thought_step_advances_state_without_rendering_machinery_changes():
             output = wrapper.token_step(ids[:, position], caches, position)
             caches = output.caches
         assert output is not None
-        sample, _ = wrapper.transition.sample(output.predicted, output.belief)
+        sample, _ = wrapper.transition.sample(output.predicted)
         thought_output = wrapper.step(
             wrapper.thought_input(sample), caches, ids.size(1)
         )

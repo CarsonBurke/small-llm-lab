@@ -13,6 +13,31 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+# Latent-policy inference budget. The backbone was pretrained on 1024-token
+# sequences, while PoPE can execute beyond that window. Posttraining keeps a
+# full pretrained window available to the prompt and gives generation four
+# stream slots (THINK or EMIT) per permitted emitted answer token.
+POSTTRAIN_CONTEXT_TOKENS = 5 * 1024
+POSTTRAIN_PROMPT_TOKENS = 1024
+POSTTRAIN_RESPONSE_TOKENS = 1024
+POSTTRAIN_STREAM_TOKENS = POSTTRAIN_CONTEXT_TOKENS - POSTTRAIN_PROMPT_TOKENS
+
+
+def validate_posttraining_context_budget(
+    prompt_tokens: int,
+    stream_tokens: int,
+    context_tokens: int = POSTTRAIN_CONTEXT_TOKENS,
+) -> None:
+    """Reject configured prompt/stream caps that exceed the RL context."""
+    if prompt_tokens < 1 or stream_tokens < 1:
+        raise ValueError("prompt and stream token budgets must be positive")
+    if prompt_tokens + stream_tokens > context_tokens:
+        raise ValueError(
+            f"prompt ({prompt_tokens}) + stream ({stream_tokens}) exceeds "
+            f"the posttraining context ({context_tokens})"
+        )
+
+
 SUBSTITUTIONS = [
     ("an ", ""), ("a ", ""), (".$", "$"), ("\\$", ""), (r"\ ", ""),
     (" ", ""), ("mbox", "text"), (",\\text{and}", ","), ("\\text{and}", ","),
@@ -68,9 +93,42 @@ def load_unique_math_rows(path: str | Path) -> list[dict]:
     return list(unique.values())
 
 
+def encode_prompt(tokenizer, text: str, max_tokens: int | None = None) -> list[int]:
+    """Encode a prompt the way pretraining framed documents: BOS-first.
+
+    Every pretraining document was sharded as ``[BOS] tokens`` — no EOS is
+    ever appended (``APPEND_EOS`` is off in the shard writer) — so BOS is the
+    model's only learned document-boundary cue.  Prompting without it frames
+    the problem as a mid-document continuation.  Truncation (``max_tokens``)
+    keeps the BOS plus the LAST ``max_tokens - 1`` content tokens.
+    """
+    ids = list(tokenizer.encode(text))
+    bos = tokenizer.bos_id()
+    if bos < 0:
+        return ids if max_tokens is None else ids[-max_tokens:]
+    if max_tokens is not None:
+        # ids[-0:] would be the whole list, not the empty tail.
+        ids = ids[-(max_tokens - 1):] if max_tokens > 1 else []
+    return [bos] + ids
+
+
 def length_adaptive_lambda(lengths: Tensor, alpha: float = 0.05) -> Tensor:
+    """VAPO's length-adaptive GAE lambda with a floored credit horizon.
+
+    VAPO sets the credit horizon 1/(1 - lambda) = alpha*l, calibrated for
+    thousand-token responses; below l = 1/alpha the raw formula prescribes a
+    sub-one-step horizon (lambda <= 0 — TD(0)), which severs direct reward
+    credit exactly when trajectories are short enough for full-length credit
+    to be cheap.  The horizon is therefore floored at min(l, 1/alpha): short
+    responses get whole-trajectory credit, mid lengths get the fixed
+    lambda = 1 - alpha baseline VAPO generalized (0.95 at alpha = 0.05), and
+    long responses recover VAPO's alpha*l exactly.
+    """
     lengths = lengths.to(torch.float32).clamp_min(1)
-    return (1.0 - 1.0 / (alpha * lengths)).clamp(0.0, 1.0)
+    horizon = torch.maximum(
+        alpha * lengths, torch.minimum(lengths, torch.full_like(lengths, 1.0 / alpha))
+    )
+    return (1.0 - 1.0 / horizon).clamp(0.0, 1.0)
 
 
 def generalized_advantage_estimate(
@@ -110,6 +168,35 @@ def clipped_policy_loss(
     return loss, clip_fraction
 
 
+def per_dim_clipped_policy_loss(
+    new_logprobs: Tensor,
+    old_logprobs: Tensor,
+    advantages: Tensor,
+    mask: Tensor,
+    epsilon_low: float = 0.20,
+    epsilon_high: float = 0.28,
+) -> tuple[Tensor, Tensor]:
+    """Elementwise-clipped PPO over a factored (batch, stream, dim) action.
+
+    Each coordinate's ratio is clipped to the trust region independently and
+    the surrogate is averaged over dims; at dim=1 this reduces exactly to
+    ``clipped_policy_loss``.  A joint high-dim ratio is unusable here: with
+    512 Gaussian dims the summed log-ratio saturates the clip after a single
+    Adam step (every coordinate's drift adds), silently zeroing the gradient.
+    """
+    ratio = (new_logprobs - old_logprobs).exp()
+    clipped = ratio.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
+    advantages = advantages[..., None]
+    objective = torch.minimum(ratio * advantages, clipped * advantages).mean(-1)
+    denom = mask.sum().clamp_min(1)
+    loss = -(objective * mask).sum() / denom
+    clip_fraction = (
+        ((ratio < 1.0 - epsilon_low) | (ratio > 1.0 + epsilon_high)).float().mean(-1)
+        * mask
+    ).sum() / denom
+    return loss, clip_fraction
+
+
 def masked_token_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
@@ -124,6 +211,12 @@ def positive_example_lm_loss(logprobs: Tensor, mask: Tensor, correct: Tensor) ->
 
 def top_p_sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:
     logits = logits.float() / temperature
+    if top_p >= 1.0:
+        # Nucleus truncation is a no-op at top_p >= 1 (cumsum - probs never
+        # exceeds 1), and the same distribution needs no full-vocab sort —
+        # which otherwise runs at EVERY rollout step of the top-p-1 training
+        # configuration.
+        return torch.multinomial(logits.softmax(dim=-1), 1).squeeze(-1)
     sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
     probs = sorted_logits.softmax(dim=-1)
     remove = probs.cumsum(dim=-1) - probs > top_p

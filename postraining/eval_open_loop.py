@@ -29,7 +29,10 @@ from torch import Tensor
 
 import train_gpt as baseline
 from fresh_lejepa_train import FreshHyperparameters
-from postraining.latent_thought import LatentThoughtModel
+from postraining.latent_thought import (
+    LatentThoughtModel,
+    validate_renderer_checkpoint,
+)
 from postraining.model_io import load_model
 
 
@@ -90,7 +93,7 @@ def open_loop_depth_metrics(
             depth += 1
             if mode == "sample":
                 thought, _ = wrapper.transition.sample(
-                    output.predicted, output.belief, generator=generator
+                    output.predicted, generator=generator
                 )
             else:
                 thought = output.predicted.float()
@@ -133,6 +136,7 @@ def main() -> None:
     wrapper = LatentThoughtModel(backbone).to(device)
     if args.wrapper_checkpoint:
         payload = torch.load(args.wrapper_checkpoint, map_location="cpu", weights_only=False)
+        validate_renderer_checkpoint(payload, args.wrapper_checkpoint)
         wrapper.load_state_dict(payload["model"], strict=True)
     wrapper.eval()
 

@@ -20,7 +20,15 @@ import torch
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
 import sentencepiece as spm
 from fresh_lejepa_train import FreshHyperparameters
-from postraining.core import load_unique_math_rows, verify_answer
+from postraining.core import (
+    POSTTRAIN_PROMPT_TOKENS,
+    POSTTRAIN_RESPONSE_TOKENS,
+    POSTTRAIN_STREAM_TOKENS,
+    encode_prompt,
+    load_unique_math_rows,
+    validate_posttraining_context_budget,
+    verify_answer,
+)
 from postraining.latent_rollout import (
     emitted_token_rows,
     rollout_continuations,
@@ -37,27 +45,35 @@ def main() -> None:
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument("--prompts", type=int, default=64)
     parser.add_argument("--samples", type=int, default=16)
-    parser.add_argument("--prompt-tokens", type=int, default=384)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=POSTTRAIN_PROMPT_TOKENS
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
+    )
+    parser.add_argument(
+        "--max-stream-steps", type=int, default=POSTTRAIN_STREAM_TOKENS
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    validate_posttraining_context_budget(args.prompt_tokens, args.max_stream_steps)
 
     device = torch.device("cuda")
     backbone = load_model(args.checkpoint, device)
     backbone.eval()
     wrapper = LatentThoughtModel(backbone).to(device).eval()
     with torch.no_grad():
-        # Zero gate weight + saturated bias: EMIT with probability ~1, which
-        # is step-identical to backbone generation (pinned by tests).
+        # Zero gate weight + saturated bias: EMIT with probability ~1, so
+        # this measures the belief renderer without latent-thought noise.
         wrapper.gate.head.weight.zero_()
         wrapper.gate.head.bias.fill_(30.0)
 
     tokenizer = spm.SentencePieceProcessor(
         model_file=FreshHyperparameters.tokenizer_path
     )
-    eos = tokenizer.eos_id()
+    stop_ids = tuple(t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0)
     rows = load_unique_math_rows(args.math_data)[: args.prompts]
 
     torch.manual_seed(args.seed)
@@ -68,8 +84,10 @@ def main() -> None:
     extractions: collections.Counter[str] = collections.Counter()
     for index, row in enumerate(rows):
         prompt_ids = torch.tensor(
-            tokenizer.encode(prompt_text(row)), dtype=torch.long, device=device
-        )[-args.prompt_tokens:][None]
+            encode_prompt(tokenizer, prompt_text(row), args.prompt_tokens),
+            dtype=torch.long,
+            device=device,
+        )[None]
         truth = row["reward_model"]["ground_truth"]
         with torch.no_grad():
             batch = trim_stream(
@@ -77,16 +95,17 @@ def main() -> None:
                     wrapper,
                     prompt_ids.expand(args.samples, -1),
                     args.max_new_tokens,
-                    args.max_new_tokens,
+                    args.max_stream_steps,
                     args.temperature,
                     args.top_p,
-                    eos_id=eos if eos >= 0 else None,
+                    stop_ids=stop_ids or None,
                 )
             )
         group_hits = 0
         for emitted in emitted_token_rows(batch):
-            if eos >= 0 and eos in emitted:
-                emitted = emitted[: emitted.index(eos) + 1]
+            cut = next((i for i, t in enumerate(emitted) if t in stop_ids), None)
+            if cut is not None:
+                emitted = emitted[: cut + 1]
             correct, prediction = verify_answer(tokenizer.decode(emitted), truth)
             extractions[str(prediction)] += 1
             answer_lines += int(str(prediction) != "[INVALID]")

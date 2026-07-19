@@ -14,7 +14,11 @@ from fresh_lejepa_train_v9_belief_transition_jedi import (
     ARCHITECTURE as V9_ARCHITECTURE,
     FreshLeJEPAV9BeliefTransition,
 )
-from postraining.model_io import DEFAULT_MODEL_CONFIG, load_model
+from fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
+    ARCHITECTURE as BELIEF_ATTACHED_ARCHITECTURE,
+    FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
+)
+from postraining.model_io import DEFAULT_MODEL_CONFIG, _pope_construction, load_model
 from postraining.core import TrajectoryBatch
 from postraining.train_vapo import update_step, update_step_accumulated
 
@@ -89,6 +93,24 @@ def test_v2_pretraining_and_rl_checkpoints_reconstruct_architecture(tmp_path):
     )
     resumed = load_model(rl, torch.device("cpu"))
     assert isinstance(resumed, FreshLeJEPAGPTV2)
+
+
+def test_belief_attached_checkpoint_reconstructs_exact_architecture(tmp_path):
+    with _pope_construction():
+        model = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE(**DEFAULT_MODEL_CONFIG)
+    checkpoint = tmp_path / "belief_attached.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "metadata": {
+                "architecture": BELIEF_ATTACHED_ARCHITECTURE,
+                "model": DEFAULT_MODEL_CONFIG,
+            },
+        },
+        checkpoint,
+    )
+    loaded = load_model(checkpoint, torch.device("cpu"))
+    assert isinstance(loaded, FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE)
 
 
 def test_load_model_keeps_fp32_masters_and_reproduces_outputs(tmp_path):

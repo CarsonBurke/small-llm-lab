@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import fresh_lejepa_train as v1_module
+import fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached as belief_attached_module
 import fresh_lejepa_train_v4_predicted_only as v4_predicted_module
 import fresh_lejepa_train_v4_predictor_dropout as v4_dropout_module
 from fresh_lejepa_train_v2_sigreg_projector import FreshLeJEPAV2SIGRegProjector
@@ -15,6 +16,15 @@ from fresh_lejepa_train import ResidualProbe
 from fresh_lejepa_train_v1_probe_shared_rms_projector import (
     FreshLeJEPASharedRMSProjectorV1Probes,
     RMSTokenProjector,
+)
+from fresh_lejepa_train_v1_probe_shared_rms_pope import (
+    FreshLeJEPASharedRMSV1PoPE,
+)
+from fresh_lejepa_train_v1_probe_shared_rms_pope_attached import (
+    FreshLeJEPASharedRMSV1PoPEAttachedCE,
+)
+from fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
+    FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
 )
 from fresh_lejepa_train_v4 import (
     FreshLeJEPAV4,
@@ -159,6 +169,168 @@ def test_v1_probe_logits_survive_training_entrypoint_class_rebind():
         assert model.policy_logits(ids).shape == (2, 5, 32)
     finally:
         v1_module.FreshLeJEPAGPT = original
+
+
+def test_attached_ce_changes_no_initial_state_or_rng_stream():
+    torch.manual_seed(789)
+    control = FreshLeJEPASharedRMSV1PoPE(**KWARGS)
+    control_next_random = torch.randn(8)
+    torch.manual_seed(789)
+    attached = FreshLeJEPASharedRMSV1PoPEAttachedCE(**KWARGS)
+    attached_next_random = torch.randn(8)
+    for name, value in control.state_dict().items():
+        torch.testing.assert_close(attached.state_dict()[name], value)
+    torch.testing.assert_close(attached_next_random, control_next_random)
+
+
+def test_attached_ce_updates_both_latent_paths_but_not_critic_path():
+    model = FreshLeJEPASharedRMSV1PoPEAttachedCE(**KWARGS)
+    token = torch.randn(2, 5, 32, requires_grad=True)
+    predicted = torch.randn(2, 5, 32, requires_grad=True)
+    model.policy_loss_features(token, predicted).sum().backward()
+    assert token.grad is not None and torch.count_nonzero(token.grad).item() > 0
+    assert predicted.grad is not None and torch.count_nonzero(predicted.grad).item() > 0
+
+    with torch.no_grad():
+        torch.nn.init.normal_(model.policy_probe.output.weight, std=0.05)
+    model.eval()
+    ids = torch.randint(0, 32, (2, 5))
+    targets = torch.randint(0, 32, ids.shape)
+    loss = model(ids, targets)
+    loss.backward()
+    assert model.tok_emb.weight.grad is not None
+    assert torch.count_nonzero(model.tok_emb.weight.grad).item() > 0
+    assert model.latent_projector.input.weight.grad is not None
+    assert torch.count_nonzero(model.latent_projector.input.weight.grad).item() > 0
+    assert model.prediction_projector.input.weight.grad is not None
+    assert torch.count_nonzero(model.prediction_projector.input.weight.grad).item() > 0
+
+    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        torch.nn.init.normal_(model.critic_probe.output.weight, std=0.05)
+    model.values(ids).sum().backward()
+    assert model.tok_emb.weight.grad is None
+    assert model.latent_projector.input.weight.grad is None
+    assert model.prediction_projector.input.weight.grad is None
+
+
+def test_belief_attached_ce_changes_no_initial_state_or_rng_stream():
+    torch.manual_seed(790)
+    control = FreshLeJEPASharedRMSV1PoPE(**KWARGS)
+    control_next_random = torch.randn(8)
+    torch.manual_seed(790)
+    belief_attached = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE(**KWARGS)
+    belief_attached_next_random = torch.randn(8)
+    for name, value in control.state_dict().items():
+        torch.testing.assert_close(belief_attached.state_dict()[name], value)
+    torch.testing.assert_close(belief_attached_next_random, control_next_random)
+
+
+def test_belief_attached_entrypoint_disables_data_reusing_warmup(monkeypatch):
+    delegated = []
+    original_class = belief_attached_module.pope.FreshLeJEPASharedRMSV1PoPE
+    original_architecture = belief_attached_module.pope.POPE_ARCHITECTURE
+    original_file = belief_attached_module.pope.__file__
+    monkeypatch.setattr(
+        belief_attached_module.pope.v1.FreshHyperparameters,
+        "warmup_steps",
+        20,
+    )
+    monkeypatch.setattr(
+        belief_attached_module.pope,
+        "main",
+        lambda: delegated.append(True),
+    )
+    try:
+        belief_attached_module.main()
+        assert delegated == [True]
+        assert belief_attached_module.pope.v1.FreshHyperparameters.warmup_steps == 0
+        assert (
+            belief_attached_module.pope.FreshLeJEPASharedRMSV1PoPE
+            is FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE
+        )
+    finally:
+        belief_attached_module.pope.FreshLeJEPASharedRMSV1PoPE = original_class
+        belief_attached_module.pope.POPE_ARCHITECTURE = original_architecture
+        belief_attached_module.pope.__file__ = original_file
+
+
+def test_belief_attached_ce_bypasses_prediction_projector_gradients():
+    model = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE(**KWARGS).eval()
+    with torch.no_grad():
+        for block in model.blocks:
+            torch.nn.init.normal_(block.attn.proj.weight, std=0.05)
+            torch.nn.init.normal_(block.mlp.proj.weight, std=0.05)
+        torch.nn.init.normal_(model.policy_probe.output.weight, std=0.05)
+    ids = torch.randint(0, 32, (2, 5))
+    targets = torch.randint(0, 32, ids.shape)
+    model(ids, targets).backward()
+
+    assert model.tok_emb.weight.grad is not None
+    assert torch.count_nonzero(model.tok_emb.weight.grad).item() > 0
+    assert model.latent_projector.input.weight.grad is not None
+    assert torch.count_nonzero(model.latent_projector.input.weight.grad).item() > 0
+    assert model.blocks[0].attn.c_qkv.weight.grad is not None
+    assert torch.count_nonzero(model.blocks[0].attn.c_qkv.weight.grad).item() > 0
+    assert all(
+        parameter.grad is None
+        for parameter in model.prediction_projector.parameters()
+    )
+
+
+def test_belief_attached_latent_loss_still_trains_prediction_projector():
+    model = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE(**KWARGS).train()
+    ids = torch.randint(0, 32, (2, 6))
+    token, _, predicted, target = model.training_latents_with_belief(
+        ids[:, :-1], ids[:, 1:]
+    )
+    torch.testing.assert_close(token[:, 1:], target[:, :-1])
+    torch.nn.functional.mse_loss(predicted, target).backward()
+    assert any(
+        parameter.grad is not None
+        and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.prediction_projector.parameters()
+    )
+
+
+def test_belief_renderer_is_independent_of_prediction_projector():
+    model = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE(**KWARGS).eval()
+    with torch.no_grad():
+        torch.nn.init.normal_(model.policy_probe.output.weight, std=0.05)
+    ids = torch.randint(0, 32, (2, 6))
+    with torch.no_grad():
+        before = model.policy_logits(ids)
+        for parameter in model.prediction_projector.parameters():
+            parameter.add_(torch.randn_like(parameter) * 10)
+        after = model.policy_logits(ids)
+    torch.testing.assert_close(after, before)
+
+
+def test_belief_renderer_incremental_matches_full_sequence():
+    model = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE(**KWARGS).eval()
+    with torch.no_grad():
+        for block in model.blocks:
+            torch.nn.init.normal_(block.attn.proj.weight, std=0.05)
+            torch.nn.init.normal_(block.mlp.proj.weight, std=0.05)
+        torch.nn.init.normal_(model.policy_probe.output.weight, std=0.05)
+        torch.nn.init.normal_(model.critic_probe.output.weight, std=0.05)
+    ids = torch.randint(0, 32, (2, 6))
+    with torch.no_grad():
+        full_logits, full_values = model.policy_logits(ids), model.values(ids)
+        caches = model.make_generation_cache(2, 6, ids.device)
+        logits_steps, value_steps = [], []
+        for position in range(6):
+            logits, values, caches = model.generation_step(
+                ids[:, position], caches, position
+            )
+            logits_steps.append(logits)
+            value_steps.append(values)
+    torch.testing.assert_close(
+        torch.stack(logits_steps, 1), full_logits, rtol=2e-4, atol=2e-4
+    )
+    torch.testing.assert_close(
+        torch.stack(value_steps, 1), full_values, rtol=2e-4, atol=2e-4
+    )
 
 
 def test_rms_ablation_changes_only_projector_norms_and_preserves_rng():
