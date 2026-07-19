@@ -1,0 +1,51 @@
+{
+  "source_repository": "math-ai/aime26",
+  "source_revision": "04e80cb40b681c93511a913a6ba30529e6323832",
+  "source_url": "https://huggingface.co/datasets/math-ai/aime26/resolve/04e80cb40b681c93511a913a6ba30529e6323832/aime2026.jsonl",
+  "source_sha256": "52822957957a3f577d1e9706c36a66a8108a3f99b6aff424cfb72dff0094a9ee",
+  "upstream_declared_license": "Apache-2.0",
+  "copyright_note": "Contest questions are MAA-copyrighted; the authorized references state that they reproduce the problems with MAA permission. Resolve redistribution rights before publishing these local files.",
+  "raw_file": "aime-2026-source.jsonl",
+  "corrected_source_file": "aime-2026-corrected.jsonl",
+  "corrected_source_sha256": "5941adf7d3f02c03413198a23ef512a443de33c5a32a8fa326bbc8a57e0c688c",
+  "combined_file": "aime-2026.parquet",
+  "form_i_file": "aime-2026-i.parquet",
+  "form_ii_file": "aime-2026-ii.parquet",
+  "problems": 30,
+  "form_i_problems": 15,
+  "form_ii_problems": 15,
+  "source_id_mapping": "1-15 = AIME I; 16-30 = AIME II",
+  "template": "verbatim DAPO-Math-17K prompt wrapper",
+  "upstream_corrections": [
+    {
+      "source_id": 10,
+      "form_problem": "AIME I #10",
+      "change": "AC -> A'C' and restored missing 'to' in perpendicular clause",
+      "answer_changed": false
+    },
+    {
+      "source_id": 13,
+      "form_problem": "AIME I #13",
+      "change": "positive -> nonnegative r; 502n+r -> 502m+r",
+      "answer_changed": false
+    },
+    {
+      "source_id": 25,
+      "form_problem": "AIME II #10",
+      "change": "sum of all possible values -> greatest possible value",
+      "answer_changed": "850 -> 340"
+    }
+  ],
+  "authorized_references": {
+    "aime_i": "https://live.poshenloh.com/past-contests/aime/2026I",
+    "aime_ii": "https://live.poshenloh.com/past-contests/aime/2026II",
+    "aime_i_problem_10": "https://live.poshenloh.com/past-contests/aime/2026I/problem/10",
+    "aime_i_problem_13": "https://live.poshenloh.com/past-contests/aime/2026I/problem/13",
+    "aime_ii_problem_10": "https://live.poshenloh.com/past-contests/aime/2026II/problem/10"
+  },
+  "answer_key_validated_against_authorized_references": true,
+  "evaluation_limitations": [
+    "AIME I #15's grid is represented as source text, not its original rendering.",
+    "AIME II #2 embeds Asymptote source rather than a rendered figure."
+  ]
+}

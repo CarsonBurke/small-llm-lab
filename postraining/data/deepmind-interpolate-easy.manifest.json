@@ -1,0 +1,27 @@
+{
+  "problems": 144,
+  "per_module": 8,
+  "modules": [
+    "arithmetic__add_or_sub",
+    "arithmetic__add_sub_multiple",
+    "arithmetic__mul",
+    "arithmetic__div",
+    "arithmetic__mul_div_multiple",
+    "arithmetic__mixed",
+    "comparison__closest",
+    "comparison__kth_biggest",
+    "comparison__pair",
+    "comparison__sort",
+    "numbers__place_value",
+    "numbers__div_remainder",
+    "numbers__gcd",
+    "numbers__lcm",
+    "numbers__round_number",
+    "algebra__linear_1d",
+    "algebra__linear_2d",
+    "algebra__sequence_next_term"
+  ],
+  "source": "mathematics_dataset-v1.0 interpolate (held out from training)",
+  "template": "verbatim DAPO-Math-17K prompt wrapper",
+  "seed": 1337
+}
