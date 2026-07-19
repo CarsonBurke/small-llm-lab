@@ -1,4 +1,0 @@
-{"step": 0, "step_avg_ms": 0.01, "train_time_ms": 0.0, "type": "val", "val_bpb": 4.1052, "val_loss": 6.9315}
-{"latent_loss": 0.2834, "policy_loss": 6.9315, "sigreg_loss": 35.942, "step": 1, "step_avg_ms": 1773.58, "train_loss": 10.4497, "train_time_ms": 1774.0, "type": "train"}
-{"latent_loss": 0.2802, "policy_loss": 6.8909, "sigreg_loss": 27.0149, "step": 2, "step_avg_ms": 1773.26, "train_loss": 9.6025, "train_time_ms": 3547.0, "type": "train"}
-{"step": 2, "step_avg_ms": 1773.59, "train_time_ms": 3547.0, "type": "val", "val_bpb": 4.006, "val_loss": 6.764}

@@ -1,5 +1,0 @@
-{"step": 0, "step_avg_ms": 0.01, "train_time_ms": 0.0, "type": "val", "val_bpb": 4.1052, "val_loss": 6.9315}
-{"latent_loss": 0.2834, "policy_loss": 6.9315, "sigreg_loss": 36.0876, "step": 1, "step_avg_ms": 1893.21, "train_loss": 10.5628, "train_time_ms": 1893.0, "transition_action_gain": 0.0, "transition_belief_gain": 0.0, "transition_loss": 1.0, "type": "train"}
-{"step": 1, "step_avg_ms": 1893.38, "train_time_ms": 1893.0, "type": "val", "val_bpb": 4.0799, "val_loss": 6.8888}
-{"latent_loss": 0.281, "policy_loss": 6.8889, "sigreg_loss": 27.1252, "step": 2, "step_avg_ms": 1897.42, "train_loss": 9.7101, "train_time_ms": 3795.0, "transition_action_gain": 0.0043, "transition_belief_gain": 0.0001, "transition_loss": 0.9897, "type": "train"}
-{"step": 2, "step_avg_ms": 1897.55, "train_time_ms": 3795.0, "type": "val", "val_bpb": 4.0049, "val_loss": 6.7621}
