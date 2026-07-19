@@ -9,6 +9,10 @@ Usage:
     python3 ablation.py --sweep lr                   # Sweep learning rates
     python3 ablation.py --compare                    # Compare past runs
     python3 ablation.py --script sota_train_gpt.py --name sota_2k
+
+Runs of at least 2,000 steps use the trusted 1,200-step warmdown by default;
+short checkpoint runs stay at a flat learning rate. Override either behavior
+explicitly with ``--env WARMDOWN_ITERS=...``.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = REPO_ROOT / "ablation_results"
 TB_DIR = REPO_ROOT / "tb_logs"
 SANITIZED_ENV_PREFIXES = ("PURE_LEJEPA_", "LEJEPA_")
+REFERENCE_ABLATION_STEPS = 2000
+REFERENCE_WARMDOWN_ITERS = 1200
 
 
 def parse_extra_metrics(extras: str) -> dict[str, float]:
@@ -245,6 +251,39 @@ def read_metrics_jsonl(metrics_path: Path) -> list[dict]:
     return entries
 
 
+def build_run_env(
+    env_overrides: dict[str, str],
+    steps: int,
+    val_every: int,
+    name: str,
+) -> dict[str, str]:
+    """Build a reproducible training environment for one ablation."""
+    env = os.environ.copy()
+    for key in list(env):
+        if any(key.startswith(prefix) for prefix in SANITIZED_ENV_PREFIXES):
+            env.pop(key)
+    env.update(
+        {
+            "ITERATIONS": str(steps),
+            "VAL_LOSS_EVERY": str(val_every),
+            "TRAIN_LOG_EVERY": "10",
+            "MAX_WALLCLOCK_SECONDS": "0",
+            "PYTHONUNBUFFERED": "1",
+            "RUN_ID": name,
+        }
+    )
+    env.update(env_overrides)
+    if "WARMDOWN_ITERS" not in env_overrides:
+        effective_steps = int(env["ITERATIONS"])
+        default_warmdown_iters = (
+            REFERENCE_WARMDOWN_ITERS
+            if effective_steps >= REFERENCE_ABLATION_STEPS
+            else 0
+        )
+        env["WARMDOWN_ITERS"] = str(default_warmdown_iters)
+    return env
+
+
 def run_config(
     name: str,
     env_overrides: dict[str, str],
@@ -270,24 +309,17 @@ def run_config(
     if metrics_path.exists():
         metrics_path.unlink()
 
-    env = os.environ.copy()
-    for key in list(env):
-        if any(key.startswith(prefix) for prefix in SANITIZED_ENV_PREFIXES):
-            env.pop(key)
-    env.update({
-        "ITERATIONS": str(steps),
-        "VAL_LOSS_EVERY": str(val_every),
-        "TRAIN_LOG_EVERY": "10",
-        "MAX_WALLCLOCK_SECONDS": "0",
-        "WARMDOWN_ITERS": "0",  # flat LR; warmdown is same for all archs so skip it
-        "PYTHONUNBUFFERED": "1",
-        "RUN_ID": name,
-    })
-    env.update(env_overrides)
+    env = build_run_env(env_overrides, steps, val_every, name)
+    effective_steps = int(env["ITERATIONS"])
+    effective_val_every = int(env["VAL_LOSS_EVERY"])
+    warmdown_iters_env = int(env["WARMDOWN_ITERS"])
 
     print(f"\n{'='*60}")
     print(f"  ABLATION: {name}")
-    print(f"  steps={steps}, val_every={val_every}")
+    print(
+        f"  steps={effective_steps}, val_every={effective_val_every}, "
+        f"warmdown_iters_env={warmdown_iters_env}"
+    )
     print(f"  script: {script}")
     if env_overrides:
         print(f"  overrides: {env_overrides}")
@@ -340,8 +372,11 @@ def run_config(
         "name": name,
         "script": script,
         "overrides": env_overrides,
-        "steps": steps,
-        "val_every": val_every,
+        "steps": effective_steps,
+        "val_every": effective_val_every,
+        # This records the runner environment. Custom scripts may implement a
+        # different schedule variable, so their own logs remain authoritative.
+        "warmdown_iters_env": warmdown_iters_env,
         "elapsed_seconds": elapsed,
         "final_val_bpb": final_bpb,
         "final_val_loss": final_loss,
@@ -391,14 +426,22 @@ def compare_results(results_dir: Path) -> None:
             seen.add(r["name"])
             unique.append(r)
 
-    print(f"\n{'Name':<40} {'Steps':>6} {'BPB':>8} {'Probe':>8} {'Loss':>8} {'Time':>8}")
-    print("-" * 83)
+    print(
+        f"\n{'Name':<40} {'Steps':>6} {'WD env':>7} "
+        f"{'BPB':>8} {'Probe':>8} {'Loss':>8} {'Time':>8}"
+    )
+    print("-" * 91)
     for r in sorted(unique, key=lambda x: x.get("final_val_bpb") or 99):
+        warmdown = r.get("warmdown_iters_env", r.get("warmdown_iters"))
+        warmdown_text = str(warmdown) if warmdown is not None else "?"
         bpb = f"{r['final_val_bpb']:.4f}" if r.get("final_val_bpb") else "FAIL"
         probe = f"{r['final_probe_val_bpb']:.4f}" if r.get("final_probe_val_bpb") else "-"
         loss = f"{r['final_val_loss']:.4f}" if r.get("final_val_loss") else "-"
         time_s = f"{r['elapsed_seconds']:.0f}s" if r.get("elapsed_seconds") else "-"
-        print(f"{r['name']:<40} {r['steps']:>6} {bpb:>8} {probe:>8} {loss:>8} {time_s:>8}")
+        print(
+            f"{r['name']:<40} {r['steps']:>6} {warmdown_text:>7} "
+            f"{bpb:>8} {probe:>8} {loss:>8} {time_s:>8}"
+        )
 
 
 def build_sweep(sweep_type: str, steps: int, val_every: int) -> list[tuple[str, dict]]:

@@ -24,7 +24,8 @@ Post-quantization submission score: **1.2244 BPB**
 
 ## Ablation Setup
 - Default ablation: **2000 steps** (~20 min on 5090)
-- Expected BPB at 2000 steps: ~1.32
+- Default warmdown: **1200 steps** (starts at step 800 in a 2000-step run)
+- Expected BPB at 2000 steps: ~1.30 (`baseline_2k`: 1.2967)
 - Val every 20 steps by default for ablations
 - Metrics JSONL: `ablation_results/<run>/metrics.jsonl`
 - Tensorboard: `http://localhost:6006` (logs in `tb_logs/`)
