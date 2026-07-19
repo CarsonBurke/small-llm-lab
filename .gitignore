@@ -1,4 +1,9 @@
-data/
+# Large / regenerated local artifacts
+data/datasets/
+data/tokenizers/
+data/manifest.json
+data/docs_selected.jsonl
+data/docs_selected.source_manifest.json
 ablation_results/
 reports/
 
