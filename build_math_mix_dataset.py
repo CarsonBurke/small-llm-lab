@@ -1,6 +1,6 @@
 """Build the mixed FineWeb + FineMath-4+ + math-QA pretraining corpus.
 
-Doc-level weighted interleave into the challenge shard format used by
+Deterministic doc-level interleave into the challenge shard format used by
 ``train_gpt.py`` (256-int32 header ``[20240520, 1, num_tokens]`` followed by
 uint16 tokens; each document is ``[BOS] + pieces`` with no EOS), matching
 ``data/download_hf_docs_and_tokenize.py``.  The validation shard is copied
@@ -14,19 +14,19 @@ Sources (all open, none homemade):
   stop signal; FineWeb/FineMath docs keep the corpus convention of no EOS):
   - DeepMind mathematics_dataset v1.0 train-easy (Apache-2.0), worksheet
     documents of many short QA pairs from verifier-compatible modules;
-  - OpenMathInstruct-2 (CC-BY-4.0) gsm8k/augmented_gsm8k word problems,
-    one problem + short solution + ``Answer: <x>`` per document.
+  - OpenMathInstruct-2 (CC-BY-4.0), all published problem sources, one
+    problem + generated solution + ``Answer: <x>`` per document.
 
-    python3 build_math_mix_dataset.py --total-tokens 500_000_000
+    python3 build_math_mix_dataset.py
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
 import shutil
 from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +63,12 @@ DEEPMIND_EASY_MODULES = [
     "algebra__linear_2d",
     "algebra__sequence_next_term",
 ]
-OPENMATH_EASY_SOURCES = {"gsm8k", "augmented_gsm8k"}
+OPENMATH_SOURCES = {
+    "augmented_math",
+    "augmented_gsm8k",
+    "gsm8k",
+    "math",
+}
 
 # The verbatim DAPO-Math-17K prompt wrapper.  RL prompts arrive in exactly
 # this template, and v2 showed the model treats template-wrapped problems as
@@ -80,6 +85,97 @@ DAPO_REMINDER = 'Remember to put your answer on its own line after "Answer:".'
 def dapo_wrapped(problem: str, response: str) -> str:
     """One DAPO-templated document: the RL prompt followed by its response."""
     return f"{DAPO_PREAMBLE}\n\n{problem}\n\n{DAPO_REMINDER}\n{response}"
+
+
+def deterministic_fraction(index: int, fraction: float) -> bool:
+    """Select exactly ``fraction`` of a deterministic sequence over time."""
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(f"fraction must be in [0, 1], got {fraction}")
+    exact = Fraction(str(fraction))
+    return ((index + 1) * exact.numerator) // exact.denominator > (
+        index * exact.numerator
+    ) // exact.denominator
+
+
+def allocate_token_budgets(
+    total_tokens: int, fractions: dict[str, float]
+) -> dict[str, int]:
+    """Largest-remainder allocation whose integer budgets sum exactly."""
+    if total_tokens < 0:
+        raise ValueError(f"total_tokens must be nonnegative, got {total_tokens}")
+    rational_fractions = {
+        name: Fraction(str(fraction)) for name, fraction in fractions.items()
+    }
+    if sum(rational_fractions.values()) != 1:
+        raise ValueError("source fractions must sum exactly to 1")
+    if any(fraction <= 0 for fraction in rational_fractions.values()):
+        raise ValueError("every source fraction must be positive")
+    exact = {
+        name: total_tokens * fraction
+        for name, fraction in rational_fractions.items()
+    }
+    budgets = {
+        name: value.numerator // value.denominator
+        for name, value in exact.items()
+    }
+    remainder = total_tokens - sum(budgets.values())
+    order = sorted(
+        fractions,
+        key=lambda name: (
+            exact[name] - budgets[name],
+            rational_fractions[name],
+        ),
+        reverse=True,
+    )
+    for name in order[:remainder]:
+        budgets[name] += 1
+    zero_budgets = [name for name, budget in budgets.items() if budget == 0]
+    if zero_budgets:
+        raise ValueError(
+            "total_tokens is too small to allocate every positive source: "
+            f"{zero_budgets}"
+        )
+    return budgets
+
+
+def least_complete_source(
+    names: list[str], budgets: dict[str, int], written: dict[str, int]
+) -> str:
+    """Deterministically interleave sources by completed budget fraction.
+
+    Unlike sampling documents with token budgets as probabilities, this is
+    insensitive to the sources' very different document lengths.  Each
+    source iterator is consumed once and no random order is introduced.
+    """
+    return min(names, key=lambda name: Fraction(written[name], budgets[name]))
+
+
+def exact_document_stream(
+    sources: dict[str, Iterator[np.ndarray]],
+    budgets: dict[str, int],
+    total_tokens: int,
+) -> Iterator[tuple[str, np.ndarray, int]]:
+    """Yield each source document once, truncating only the final document."""
+    if set(sources) != set(budgets):
+        raise ValueError("source and budget names must match")
+    if sum(budgets.values()) != total_tokens:
+        raise ValueError("source budgets must sum to total_tokens")
+    written = {name: 0 for name in sources}
+    while sum(written.values()) < total_tokens:
+        name = least_complete_source(list(sources), budgets, written)
+        document = next(sources[name], None)
+        if document is None:
+            raise RuntimeError(
+                f"source {name!r} exhausted before the exact one-pass corpus "
+                f"reached {total_tokens:,} tokens"
+            )
+        if document.size == 0:
+            raise ValueError(f"source {name!r} yielded an empty document")
+        remaining = total_tokens - sum(written.values())
+        kept_document = document[:remaining]
+        truncated_tokens = document.size - kept_document.size
+        written[name] += kept_document.size
+        yield name, kept_document, truncated_tokens
 
 
 def write_shard(path: Path, tokens: np.ndarray) -> None:
@@ -178,24 +274,28 @@ def finemath_texts(parquet_files: list[Path]) -> Iterator[str]:
             yield from batch["text"].to_pylist()
 
 
-def deepmind_qa_pairs(easy_dir: Path, rng: random.Random) -> Iterator[tuple[str, str]]:
-    """QA pairs interleaved across module files (each file: Q line, A line)."""
+def deepmind_qa_pairs(easy_dir: Path) -> Iterator[tuple[str, str]]:
+    """QA pairs round-robined across module files without random ordering."""
     handles = [
         (easy_dir / f"{module}.txt").open(encoding="utf-8")
         for module in DEEPMIND_EASY_MODULES
     ]
     try:
+        cursor = 0
         while handles:
-            handle = rng.choice(handles)
+            handle = handles[cursor]
             question = handle.readline()
             answer = handle.readline()
             if not answer:
                 if question.strip():
                     print(f"warning: dropping unpaired trailing question {question!r}")
-                handles.remove(handle)
+                handles.pop(cursor)
                 handle.close()
+                if handles:
+                    cursor %= len(handles)
                 continue
             yield question.strip(), answer.strip()
+            cursor = (cursor + 1) % len(handles)
     finally:
         for handle in handles:
             handle.close()
@@ -203,7 +303,6 @@ def deepmind_qa_pairs(easy_dir: Path, rng: random.Random) -> Iterator[tuple[str,
 
 def deepmind_worksheets(
     easy_dir: Path,
-    rng: random.Random,
     template_fraction: float = 0.0,
     min_problems: int = 8,
     max_problems: int = 24,
@@ -213,9 +312,13 @@ def deepmind_worksheets(
     A ``template_fraction`` share of documents is instead a single problem
     wrapped in the verbatim DAPO template, matching the RL prompt shape.
     """
-    pairs = deepmind_qa_pairs(easy_dir, rng)
+    pairs = deepmind_qa_pairs(easy_dir)
+    document_index = 0
     while True:
-        if rng.random() < template_fraction:
+        templated = deterministic_fraction(document_index, template_fraction)
+        problem_count = min_problems + document_index % (max_problems - min_problems + 1)
+        document_index += 1
+        if templated:
             pair = next(pairs, None)
             if pair is None:
                 return
@@ -223,7 +326,7 @@ def deepmind_worksheets(
             yield [dapo_wrapped(question, f"Answer: {answer}")]
             continue
         worksheet = []
-        for _ in range(rng.randint(min_problems, max_problems)):
+        for _ in range(problem_count):
             pair = next(pairs, None)
             if pair is None:
                 break
@@ -235,20 +338,21 @@ def deepmind_worksheets(
 
 
 def openmath_documents(
-    parquet_files: list[Path], rng: random.Random, template_fraction: float = 0.0
+    parquet_files: list[Path], template_fraction: float = 0.0
 ) -> Iterator[list[str]]:
-    """One EOS-closed problem + short solution + Answer line per document.
+    """One EOS-closed problem + generated solution + Answer per document.
 
     A ``template_fraction`` share of documents wraps the problem in the
     verbatim DAPO template, teaching step-by-step then ``Answer:`` under the
     exact instruction the RL prompts use.
     """
     columns = ["problem", "generated_solution", "expected_answer", "problem_source"]
+    document_index = 0
     for parquet_path in sorted(parquet_files):
         parquet = pq.ParquetFile(parquet_path)
         for batch in parquet.iter_batches(batch_size=ENCODE_BATCH, columns=columns):
             for row in batch.to_pylist():
-                if row["problem_source"] not in OPENMATH_EASY_SOURCES:
+                if row["problem_source"] not in OPENMATH_SOURCES:
                     continue
                 fields = (row["problem"], row["generated_solution"], row["expected_answer"])
                 if any(field is None for field in fields):
@@ -256,15 +360,16 @@ def openmath_documents(
                     continue
                 problem, solution, answer = (field.strip() for field in fields)
                 response = f"{solution}\nAnswer: {answer}"
-                if rng.random() < template_fraction:
+                if deterministic_fraction(document_index, template_fraction):
                     yield [dapo_wrapped(problem, response)]
                 else:
                     yield [f"{problem}\n{response}"]
+                document_index += 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="data/datasets/mathmix_v3_sp1024")
+    parser.add_argument("--output", default="data/datasets/mathmix_v4_sp1024")
     parser.add_argument("--fineweb-dataset", default="data/datasets/fineweb10B_sp1024")
     parser.add_argument("--finemath-dir", default="postraining/data/finemath")
     parser.add_argument(
@@ -273,24 +378,54 @@ def main() -> None:
     )
     parser.add_argument("--openmath-dir", default="postraining/data/openmathinstruct2")
     parser.add_argument("--tokenizer", default="data/tokenizers/fineweb_1024_bpe.model")
-    parser.add_argument("--total-tokens", type=int, default=500_000_000)
+    parser.add_argument("--total-tokens", type=int, default=None)
+    parser.add_argument("--training-steps", type=int, default=2000)
+    parser.add_argument("--train-batch-tokens", type=int, default=524_288)
+    # train_gpt fixes world_size * grad_accum_steps at 8. Each loader span
+    # consumes one extra next-token target, hence +8 stream tokens per step.
+    parser.add_argument("--loader-spans-per-step", type=int, default=8)
     parser.add_argument("--fineweb-fraction", type=float, default=0.45)
     parser.add_argument("--finemath-fraction", type=float, default=0.25)
     parser.add_argument("--deepmind-fraction", type=float, default=0.21)
     parser.add_argument("--openmath-fraction", type=float, default=0.09)
     parser.add_argument("--shard-size", type=int, default=100_000_000)
     parser.add_argument("--template-fraction", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
     fractions = {
         "fineweb": args.fineweb_fraction,
         "finemath": args.finemath_fraction,
         "deepmind_easy": args.deepmind_fraction,
-        "openmath_gsm": args.openmath_fraction,
+        "openmath": args.openmath_fraction,
     }
-    if abs(sum(fractions.values()) - 1.0) > 1e-6:
-        parser.error("source fractions must sum to 1")
+    positive_counts = {
+        "training_steps": args.training_steps,
+        "train_batch_tokens": args.train_batch_tokens,
+        "loader_spans_per_step": args.loader_spans_per_step,
+        "shard_size": args.shard_size,
+    }
+    invalid_counts = {
+        name: value for name, value in positive_counts.items() if value <= 0
+    }
+    if invalid_counts:
+        parser.error(f"counts must be positive: {invalid_counts}")
+    rational_fraction_sum = sum(Fraction(str(value)) for value in fractions.values())
+    if rational_fraction_sum != 1:
+        parser.error("source fractions must sum exactly to 1")
+    if any(fraction <= 0.0 for fraction in fractions.values()):
+        parser.error("every source fraction must be positive")
+    if not 0.0 <= args.template_fraction <= 1.0:
+        parser.error("--template-fraction must be in [0, 1]")
+    required_stream_tokens = args.training_steps * (
+        args.train_batch_tokens + args.loader_spans_per_step
+    )
+    total_tokens = required_stream_tokens
+    if args.total_tokens is not None and args.total_tokens != required_stream_tokens:
+        parser.error(
+            "an exact one-pass corpus must match the loader geometry: "
+            f"--total-tokens must be {required_stream_tokens:,}, got "
+            f"{args.total_tokens:,}"
+        )
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -312,8 +447,6 @@ def main() -> None:
     if missing:
         parser.error(f"missing DeepMind module files: {missing}")
     tokenizer = spm.SentencePieceProcessor(model_file=args.tokenizer)
-    rng = random.Random(args.seed)
-
     sources: dict[str, Iterator[np.ndarray]] = {
         "fineweb": fineweb_documents(Path(args.fineweb_dataset)),
         "finemath": encoded_documents(
@@ -321,80 +454,101 @@ def main() -> None:
             tokenizer,
         ),
         "deepmind_easy": encoded_qa_documents(
-            deepmind_worksheets(easy_dir, rng, args.template_fraction), tokenizer
+            deepmind_worksheets(easy_dir, args.template_fraction), tokenizer
         ),
-        "openmath_gsm": encoded_qa_documents(
+        "openmath": encoded_qa_documents(
             openmath_documents(
                 sorted(Path(args.openmath_dir).rglob("*.parquet")),
-                rng,
                 args.template_fraction,
             ),
             tokenizer,
         ),
     }
-    remaining = {
-        name: int(round(fraction * args.total_tokens))
-        for name, fraction in fractions.items()
-    }
+    budgets = allocate_token_budgets(total_tokens, fractions)
     written_tokens = {name: 0 for name in sources}
     written_docs = {name: 0 for name in sources}
 
     buffer = np.empty(args.shard_size, dtype=np.uint16)
     fill = 0
     shard_index = 0
+    shard_source_tokens = {name: 0 for name in sources}
+    shard_stats: list[dict[str, object]] = []
 
     def flush() -> None:
-        nonlocal fill, shard_index
+        nonlocal fill, shard_index, shard_source_tokens
         if fill:
+            if sum(shard_source_tokens.values()) != fill:
+                raise AssertionError("per-source shard counts do not match payload")
             write_shard(
                 output_dir / f"fineweb_train_{shard_index:06d}.bin", buffer[:fill]
             )
+            shard_stats.append(
+                {
+                    "index": shard_index,
+                    "tokens": fill,
+                    "source_tokens": dict(shard_source_tokens),
+                }
+            )
             shard_index += 1
             fill = 0
+            shard_source_tokens = {name: 0 for name in sources}
 
-    unmet_tokens: dict[str, int] = {}
-    # Documents are packed atomically, so each source can overshoot its
-    # budget by at most one document; --total-tokens is a floor, not exact.
-    while any(budget > 0 for budget in remaining.values()):
-        names = [name for name, budget in remaining.items() if budget > 0]
-        name = rng.choices(names, weights=[remaining[n] for n in names], k=1)[0]
-        document = next(sources[name], None)
-        if document is None:
-            print(f"{name}: exhausted with {remaining[name]:,} tokens unmet")
-            unmet_tokens[name] = remaining[name]
-            remaining[name] = 0
-            continue
-        remaining[name] -= document.size
-        written_tokens[name] += document.size
+    final_document_truncated_tokens = 0
+    for name, kept_document, truncated_tokens in exact_document_stream(
+        sources, budgets, total_tokens
+    ):
+        final_document_truncated_tokens = truncated_tokens
+        written_tokens[name] += kept_document.size
         written_docs[name] += 1
         position = 0
-        while position < document.size:
-            take = min(args.shard_size - fill, document.size - position)
-            buffer[fill : fill + take] = document[position : position + take]
+        while position < kept_document.size:
+            take = min(args.shard_size - fill, kept_document.size - position)
+            buffer[fill : fill + take] = kept_document[position : position + take]
             fill += take
+            shard_source_tokens[name] += take
             position += take
             if fill == args.shard_size:
                 flush()
     flush()
+
+    if sum(written_tokens.values()) != total_tokens:
+        raise AssertionError("global source counts do not match exact corpus size")
+    shard_totals = {name: 0 for name in sources}
+    for shard in shard_stats:
+        for name, count in shard["source_tokens"].items():
+            shard_totals[name] += count
+    if shard_totals != written_tokens:
+        raise AssertionError("per-shard source counts do not match global counts")
 
     for val_shard in sorted(Path(args.fineweb_dataset).glob("fineweb_val_*.bin")):
         shutil.copy2(val_shard, output_dir / val_shard.name)
 
     manifest = {
         "total_tokens": sum(written_tokens.values()),
+        "requested_total_tokens": total_tokens,
+        "required_stream_tokens": required_stream_tokens,
+        "training_steps": args.training_steps,
+        "train_batch_tokens": args.train_batch_tokens,
+        "loader_spans_per_step": args.loader_spans_per_step,
+        "one_pass": True,
         "train_shards": shard_index,
         "shard_size": args.shard_size,
         "fractions": fractions,
         "tokens": written_tokens,
         "documents": written_docs,
-        "unmet_tokens": unmet_tokens,
+        "achieved_fractions": {
+            name: count / total_tokens for name, count in written_tokens.items()
+        },
+        "shards": shard_stats,
+        "final_document_truncated_tokens": final_document_truncated_tokens,
         "deepmind_modules": DEEPMIND_EASY_MODULES,
-        "openmath_sources": sorted(OPENMATH_EASY_SOURCES),
+        "openmath_sources": sorted(OPENMATH_SOURCES),
         "qa_eos": "EOS appended after every Answer segment in QA sources",
         "template_fraction": args.template_fraction,
         "template": "verbatim DAPO-Math-17K prompt wrapper on a share of QA docs",
         "tokenizer": args.tokenizer,
-        "seed": args.seed,
+        "ordering": "deterministic_least_completed_token_budget_no_rng",
+        "rng": "none",
         "val": "copied unchanged from FineWeb (BPB comparability)",
     }
     (output_dir / "mix_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

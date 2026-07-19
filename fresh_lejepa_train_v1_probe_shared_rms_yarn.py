@@ -150,9 +150,10 @@ class FreshLeJEPASharedRMSV1FixedYarn(FreshLeJEPASharedRMSProjectorV1Probes):
         x: Tensor,
         cache: tuple[Tensor, Tensor],
         position: int | Tensor,
+        key_mask: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         if not isinstance(attention.rotary, FixedTargetYarnRotary):
-            return super()._attention_step(attention, x, cache, position)
+            return super()._attention_step(attention, x, cache, position, key_mask)
         batch, _, dim = x.shape
         q_dim = attention.num_heads * attention.head_dim
         kv_dim = attention.num_kv_heads * attention.head_dim
@@ -169,7 +170,26 @@ class FreshLeJEPASharedRMSV1FixedYarn(FreshLeJEPASharedRMSProjectorV1Probes):
         q = baseline.apply_rotary_emb(q, cos, sin)
         k = baseline.apply_rotary_emb(k, cos, sin)
         q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
-        if torch.is_tensor(position):
+        attn_mask = None
+        if key_mask is not None and key_mask.dim() == 2:
+            # Per-row (batch, keys) validity for left-padded batched rollouts
+            # (see FreshLeJEPAGPT._attention_step).
+            position_length = int(position) + 1
+            cache[0][:, :, position : position_length].copy_(k)
+            cache[1][:, :, position : position_length].copy_(value)
+            prefix_k = cache[0][:, :, :position_length]
+            prefix_v = cache[1][:, :, :position_length]
+            attn_mask = key_mask[:, None, None, :position_length]
+        elif key_mask is not None:
+            # Static full-cache path (see FreshLeJEPAGPT._attention_step).
+            if not torch.is_tensor(position):
+                raise ValueError("key_mask stepping requires a 0-dim tensor position")
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, value)
+            prefix_k, prefix_v = cache
+            attn_mask = key_mask[None, None, None, :]
+        elif torch.is_tensor(position):
             index = position.reshape(1)
             cache[0].index_copy_(2, index, k)
             cache[1].index_copy_(2, index, value)
@@ -184,6 +204,7 @@ class FreshLeJEPASharedRMSV1FixedYarn(FreshLeJEPASharedRMSProjectorV1Probes):
             q,
             prefix_k,
             prefix_v,
+            attn_mask=attn_mask,
             is_causal=False,
             enable_gqa=attention.num_kv_heads != attention.num_heads,
         )

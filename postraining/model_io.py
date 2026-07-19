@@ -157,11 +157,24 @@ def load_model(
         model_class = FreshLeJEPAV2PredictedOnly
     construction = nullcontext()
     if "_pope_" in architecture:
-        from fresh_lejepa_train_v1_probe_shared_rms_pope import (
-            FreshLeJEPASharedRMSV1PoPE,
-        )
+        if architecture.endswith("probes_pope_belief_attached_ce_onepass_2k"):
+            from fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
+                FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
+            )
 
-        model_class = FreshLeJEPASharedRMSV1PoPE
+            model_class = FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE
+        elif architecture.endswith("probes_pope_attached_ce_scratch_2k"):
+            from fresh_lejepa_train_v1_probe_shared_rms_pope_attached import (
+                FreshLeJEPASharedRMSV1PoPEAttachedCE,
+            )
+
+            model_class = FreshLeJEPASharedRMSV1PoPEAttachedCE
+        else:
+            from fresh_lejepa_train_v1_probe_shared_rms_pope import (
+                FreshLeJEPASharedRMSV1PoPE,
+            )
+
+            model_class = FreshLeJEPASharedRMSV1PoPE
         construction = _pope_construction()
     elif architecture.endswith("rope_scratch_1k_control"):
         from fresh_lejepa_train_v1_probe_shared_rms_projector import (

@@ -1,5 +1,5 @@
 {
-  "architecture": "fresh_lejepa_shared_rms_v1_probes_pope_zero_scratch_2k",
+  "architecture": "fresh_lejepa_shared_rms_v1_probes_pope_belief_attached_ce_onepass_2k",
   "model": {
     "vocab_size": 1024,
     "num_layers": 9,
@@ -37,7 +37,7 @@
     "beta1": 0.9,
     "beta2": 0.95,
     "adam_eps": 1e-08,
-    "warmup_steps": 20,
+    "warmup_steps": 0,
     "warmdown_iters": 0,
     "iterations": 2000,
     "train_batch_tokens": 524288,
@@ -48,11 +48,15 @@
   "experiment": {
     "position_encoding": "pope",
     "training_context": 1024,
-    "pope_theta_bias": "zero",
+    "pope_theta_bias": "two_pi",
     "pope_gqa_phase": "equivalent_per_query_phase_shift",
     "pope_qk_normalization": "raw_projection_softplus_no_rms",
     "pope_attention_scale": "head_dim^-0.5",
     "q_gain": "retained_after_polar_projection",
-    "initial_checkpoint": "none_from_scratch"
+    "initial_checkpoint": "none_from_scratch",
+    "ce_probe_gradient": "attached_token_latent_and_raw_belief",
+    "policy_probe_features": "token_latent_plus_raw_belief",
+    "prediction_projector_role": "latent_loss_and_thought_policy_only",
+    "data_order": "deterministic_one_pass_no_rng"
   }
 }

@@ -9,9 +9,10 @@ adds experiment hyperparameters.
 
 from __future__ import annotations
 
+import glob
+import hashlib
 import inspect
 import json
-import hashlib
 import os
 import random
 import shutil
@@ -26,6 +27,137 @@ import train_gpt as baseline
 
 EXPERIMENT_ARCHITECTURE = "fresh_lejepa_attached_target_detached_probes_v1"
 EXPERIMENT_SOURCE = Path(__file__)
+LOADER_SPANS_PER_STEP = 8
+
+
+def dataset_stream_tokens(pattern: str) -> int:
+    """Count payload tokens from validated challenge-format shard sizes."""
+    files = [Path(path) for path in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    total = 0
+    for path in files:
+        payload_bytes = path.stat().st_size - 256 * 4
+        if payload_bytes < 0 or payload_bytes % 2:
+            raise ValueError(f"invalid token shard size: {path}")
+        total += payload_bytes // 2
+    return total
+
+
+def configured_loader_spans_per_step() -> int:
+    """Total loader spans per step across ranks and local accumulation."""
+    spans = int(os.environ.get("GRAD_ACCUM_STEPS", str(LOADER_SPANS_PER_STEP)))
+    if spans <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {spans}")
+    return spans
+
+
+def cumulative_training_step(completed_steps: int, local_steps: int) -> int:
+    if completed_steps < 0 or local_steps < 0:
+        raise ValueError("completed and local steps must be nonnegative")
+    return completed_steps + local_steps
+
+
+def required_stream_tokens(
+    steps: int,
+    train_batch_tokens: int,
+    loader_spans_per_step: int | None = None,
+) -> int:
+    """Tokens consumed by shifted next-token batches over ``steps``."""
+    spans = (
+        configured_loader_spans_per_step()
+        if loader_spans_per_step is None
+        else loader_spans_per_step
+    )
+    if steps < 0 or train_batch_tokens <= 0 or spans <= 0:
+        raise ValueError(
+            "steps must be nonnegative and batch tokens/spans must be positive"
+        )
+    return steps * (train_batch_tokens + spans)
+
+
+def validate_one_pass_capacity(
+    pattern: str,
+    steps: int,
+    train_batch_tokens: int,
+    *,
+    exact: bool = False,
+    loader_spans_per_step: int | None = None,
+) -> tuple[int, int]:
+    available = dataset_stream_tokens(pattern)
+    required = required_stream_tokens(
+        steps, train_batch_tokens, loader_spans_per_step
+    )
+    if available < required:
+        raise ValueError(
+            f"one-pass training requires {required:,} stream tokens for "
+            f"{steps:,} steps, but {pattern!r} contains only {available:,}; "
+            "refusing to wrap and reuse training data"
+        )
+    if exact and available != required:
+        raise ValueError(
+            f"exact one-pass training requires a dataset of {required:,} "
+            f"stream tokens, but {pattern!r} contains {available:,}"
+        )
+    return available, required
+
+
+def validate_deterministic_dataset_manifest(
+    data_path: str | Path,
+    *,
+    required_tokens: int,
+    training_steps: int,
+    train_batch_tokens: int,
+    loader_spans_per_step: int,
+) -> dict:
+    """Verify the strict construction contract for one-pass pretraining."""
+    manifest_path = Path(data_path) / "mix_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"strict one-pass training requires {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("total_tokens") != required_tokens:
+        raise ValueError(
+            f"{manifest_path} records {manifest.get('total_tokens')!r} tokens; "
+            f"expected {required_tokens:,}"
+        )
+    if manifest.get("one_pass") is not True:
+        raise ValueError(f"{manifest_path} does not declare one_pass=true")
+    if manifest.get("rng") != "none":
+        raise ValueError(f"{manifest_path} does not declare rng=none")
+    expected_ordering = "deterministic_least_completed_token_budget_no_rng"
+    if manifest.get("ordering") != expected_ordering:
+        raise ValueError(f"{manifest_path} does not declare deterministic ordering")
+    expected_geometry = {
+        "training_steps": training_steps,
+        "train_batch_tokens": train_batch_tokens,
+        "loader_spans_per_step": loader_spans_per_step,
+        "required_stream_tokens": required_tokens,
+    }
+    mismatches = {
+        key: (manifest.get(key), expected)
+        for key, expected in expected_geometry.items()
+        if manifest.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            f"{manifest_path} loader geometry does not match training: {mismatches}"
+        )
+    return manifest
+
+
+class OnePassTokenStream(baseline.TokenStream):
+    """Sequential token stream that fails instead of cycling the dataset."""
+
+    def _advance_file(self) -> None:
+        next_index = self.file_idx + 1
+        if next_index >= len(self.files):
+            raise RuntimeError(
+                "training exhausted the one-pass dataset; refusing to wrap "
+                "and reuse examples"
+            )
+        self.file_idx = next_index
+        self.tokens = baseline.load_data_shard(self.files[self.file_idx])
+        self.pos = 0
 
 
 class FreshHyperparameters(baseline.Hyperparameters):
@@ -234,6 +366,15 @@ class FreshLeJEPAGPT(baseline.GPT):
         token_latent, predicted = self.latent_features(input_ids)
         return token_latent, predicted, self.target_latent(target_ids)
 
+    def training_latents_with_belief(
+        self, input_ids: Tensor, target_ids: Tensor
+    ) -> tuple[Tensor, Tensor | None, Tensor, Tensor]:
+        """Compatibility hook for architectures whose CE needs raw belief."""
+        token_latent, predicted, target_latent = self.training_latents(
+            input_ids, target_ids
+        )
+        return token_latent, None, predicted, target_latent
+
     def embed_tokens(self, input_ids: Tensor) -> Tensor:
         return F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
 
@@ -243,6 +384,19 @@ class FreshLeJEPAGPT(baseline.GPT):
 
     def probe_features(self, token_latent: Tensor, predicted: Tensor) -> Tensor:
         return torch.cat((token_latent.detach(), predicted.detach()), dim=-1)
+
+    def policy_loss_features(
+        self, token_latent: Tensor, predicted: Tensor
+    ) -> Tensor:
+        """Features used by the pretraining CE objective."""
+        return self.probe_features(token_latent, predicted)
+
+    def training_policy_features(
+        self, token_latent: Tensor, belief: Tensor | None, predicted: Tensor
+    ) -> Tensor:
+        """Architecture hook for attached CE features available in training."""
+        del belief
+        return self.policy_loss_features(token_latent, predicted)
 
     def sigreg_features(self, token_latent: Tensor) -> Tensor:
         return token_latent
@@ -277,8 +431,19 @@ class FreshLeJEPAGPT(baseline.GPT):
         x: Tensor,
         cache: tuple[Tensor, Tensor],
         position: int | Tensor,
+        key_mask: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        """One-token GQA attention step used by post-training rollouts."""
+        """One-token GQA attention step used by post-training rollouts.
+
+        With ``key_mask`` (bool, (cache_length,), True = attend) the step
+        attends over the WHOLE preallocated cache under the mask instead of
+        narrowing to ``:position + 1`` — every shape is then independent of
+        ``position``, which is what lets torch.compile capture one CUDA graph
+        for the entire rollout.  ``position`` must be a 0-dim tensor in this
+        mode, and masked cache slots must hold finite values (zero-fill the
+        cache once at allocation: masked garbage would still reach the
+        softmax as NaN scores).
+        """
         batch, _, dim = x.shape
         q_dim = attention.num_heads * attention.head_dim
         kv_dim = attention.num_kv_heads * attention.head_dim
@@ -294,7 +459,26 @@ class FreshLeJEPAGPT(baseline.GPT):
         q = baseline.apply_rotary_emb(q, cos, sin)
         k = baseline.apply_rotary_emb(k, cos, sin)
         q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
-        if torch.is_tensor(position):
+        attn_mask = None
+        if key_mask is not None and key_mask.dim() == 2:
+            # Per-row (batch, keys) validity for left-padded batched rollouts:
+            # keeps the narrow position-sliced shapes but masks each row's
+            # padded prefix slots out of attention.
+            position_length = int(position) + 1
+            cache[0][:, :, position : position_length].copy_(k)
+            cache[1][:, :, position : position_length].copy_(v)
+            prefix_k = cache[0][:, :, :position_length]
+            prefix_v = cache[1][:, :, :position_length]
+            attn_mask = key_mask[:, None, None, :position_length]
+        elif key_mask is not None:
+            if not torch.is_tensor(position):
+                raise ValueError("key_mask stepping requires a 0-dim tensor position")
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, v)
+            prefix_k, prefix_v = cache[0], cache[1]
+            attn_mask = key_mask[None, None, None, :]
+        elif torch.is_tensor(position):
             index = position.reshape(1)
             cache[0].index_copy_(2, index, k)
             cache[1].index_copy_(2, index, v)
@@ -306,7 +490,7 @@ class FreshLeJEPAGPT(baseline.GPT):
             prefix_k = cache[0][:, :, : position + 1]
             prefix_v = cache[1][:, :, : position + 1]
         y = F.scaled_dot_product_attention(
-            q, prefix_k, prefix_v, is_causal=False,
+            q, prefix_k, prefix_v, attn_mask=attn_mask, is_causal=False,
             enable_gqa=attention.num_kv_heads != attention.num_heads,
         )
         y = y.transpose(1, 2).contiguous().view(batch, 1, dim)
@@ -319,10 +503,13 @@ class FreshLeJEPAGPT(baseline.GPT):
         x0: Tensor,
         cache: tuple[Tensor, Tensor],
         position: int | Tensor,
+        key_mask: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         mix = block.resid_mix.to(x.dtype)
         x = mix[0][None, None] * x + mix[1][None, None] * x0
-        attn, cache = self._attention_step(block.attn, block.attn_norm(x), cache, position)
+        attn, cache = self._attention_step(
+            block.attn, block.attn_norm(x), cache, position, key_mask
+        )
         x = x + block.attn_scale.to(x.dtype)[None, None] * attn
         x = x + block.mlp_scale.to(x.dtype)[None, None] * block.mlp(block.mlp_norm(x))
         return x, cache
@@ -378,9 +565,13 @@ class FreshLeJEPAGPT(baseline.GPT):
         return caches
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        token_latent, predicted, target_latent = self.training_latents(input_ids, target_ids)
-        detached = self.probe_features(token_latent, predicted)
-        logits = self.logits_from_features(detached)
+        token_latent, belief, predicted, target_latent = (
+            self.training_latents_with_belief(input_ids, target_ids)
+        )
+        policy_features = self.training_policy_features(
+            token_latent, belief, predicted
+        )
+        logits = self.logits_from_features(policy_features)
         policy_loss = F.cross_entropy(logits.float().flatten(0, 1), target_ids.flatten())
         if not self.training:
             return policy_loss
@@ -480,10 +671,44 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path = str(tokenizer_path)
         Path(work_dir).mkdir(parents=True, exist_ok=True)
         os.chdir(work_dir)
+    resume_from = os.environ.get("FRESH_RESUME_FROM")
+    completed_steps = 0
+    if resume_from:
+        resume_header = torch.load(
+            resume_from, map_location="cpu", weights_only=False
+        )
+        completed_steps = int(resume_header["step"])
+        del resume_header
+    total_training_steps = cumulative_training_step(
+        completed_steps, FreshHyperparameters.iterations
+    )
+    loader_spans_per_step = configured_loader_spans_per_step()
+    available_tokens, needed_tokens = validate_one_pass_capacity(
+        FreshHyperparameters.train_files,
+        total_training_steps,
+        FreshHyperparameters.train_batch_tokens,
+        exact=getattr(FreshLeJEPAGPT, "requires_exact_one_pass_data", False),
+        loader_spans_per_step=loader_spans_per_step,
+    )
+    if getattr(FreshLeJEPAGPT, "requires_deterministic_data", False):
+        validate_deterministic_dataset_manifest(
+            FreshHyperparameters.data_path,
+            required_tokens=needed_tokens,
+            training_steps=total_training_steps,
+            train_batch_tokens=FreshHyperparameters.train_batch_tokens,
+            loader_spans_per_step=loader_spans_per_step,
+        )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(
+            f"one_pass_dataset:available={available_tokens} "
+            f"required={needed_tokens} reused=0",
+            flush=True,
+        )
     tracked_optimizers = []
     original_adam = baseline.torch.optim.Adam
     original_muon = baseline.Muon
     original_compile = baseline.torch.compile
+    original_token_stream = baseline.TokenStream
 
     def tracked_adam(*args, **kwargs):
         optimizer = original_adam(*args, **kwargs)
@@ -512,8 +737,8 @@ def main() -> None:
         return model
 
     checkpoint_every = int(os.environ.get("FRESH_CHECKPOINT_EVERY", "0"))
-    resume_from = os.environ.get("FRESH_RESUME_FROM")
     resume_pending = bool(resume_from)
+    last_completed_local_step = 0
     original_eval_val = baseline.eval_val
 
     def restore_checkpoint(caller: dict) -> None:
@@ -549,7 +774,7 @@ def main() -> None:
         )
 
     def checkpointing_eval_val(*args, **kwargs):
-        nonlocal resume_pending
+        nonlocal last_completed_local_step, resume_pending
         caller_locals = inspect.currentframe().f_back.f_locals
         if (
             resume_pending
@@ -572,10 +797,21 @@ def main() -> None:
         caller = inspect.currentframe().f_back.f_locals
         step = caller.get("step")
         if (
+            isinstance(step, int)
+            and 0 <= step <= FreshHyperparameters.iterations
+            and "quant_state" not in caller
+        ):
+            last_completed_local_step = step
+        cumulative_step = (
+            cumulative_training_step(completed_steps, step)
+            if isinstance(step, int)
+            else None
+        )
+        if (
             checkpoint_every > 0
             and isinstance(step, int)
             and 0 < step <= FreshHyperparameters.iterations
-            and step % checkpoint_every == 0
+            and cumulative_step % checkpoint_every == 0
             and "quant_state" not in caller
             and int(os.environ.get("RANK", "0")) == 0
             and "RUN_ID" in os.environ
@@ -587,13 +823,16 @@ def main() -> None:
                 key: value.detach().to("cpu", copy=True)
                 for key, value in tracked_models[0].state_dict().items()
             }
-            save_pretraining_checkpoint(run_dir, step, model_state, tracked_optimizers)
+            save_pretraining_checkpoint(
+                run_dir, cumulative_step, model_state, tracked_optimizers
+            )
         return result
 
     baseline.Hyperparameters = FreshHyperparameters
     baseline.GPT = tracked_model_factory
     baseline.torch.optim.Adam = tracked_adam
     baseline.Muon = TrackedMuon
+    baseline.TokenStream = OnePassTokenStream
     baseline.torch.compile = experiment_compile
     baseline.eval_val = checkpointing_eval_val
     try:
@@ -601,6 +840,7 @@ def main() -> None:
     finally:
         baseline.torch.optim.Adam = original_adam
         baseline.Muon = original_muon
+        baseline.TokenStream = original_token_stream
         baseline.torch.compile = original_compile
         baseline.eval_val = original_eval_val
     if int(os.environ.get("RANK", "0")) == 0:
@@ -617,7 +857,9 @@ def main() -> None:
             shutil.copy2(EXPERIMENT_SOURCE, run_dir / EXPERIMENT_SOURCE.name)
             save_pretraining_checkpoint(
                 run_dir,
-                FreshHyperparameters.iterations,
+                cumulative_training_step(
+                    completed_steps, last_completed_local_step
+                ),
                 torch.load("final_model.pt", map_location="cpu", weights_only=True),
                 tracked_optimizers,
             )
