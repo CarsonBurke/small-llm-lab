@@ -1,17 +1,20 @@
 """Baseline NorMuon ablation.
 
-This is a direct fork of ``train_gpt.py``. The only algorithmic change is that
-matrix parameters use NorMuon's post-orthogonalization neuron-wise adaptive
-scaling instead of Muon. Auxiliary token, head, and scalar Adam paths and all
-model/training hyperparameters remain unchanged.
+This is a direct fork of ``train_gpt.py``. Matrix parameters use NorMuon's
+post-orthogonalization neuron-wise adaptive scaling instead of Muon, with fused
+attention projections logically partitioned for the optimizer. Auxiliary token,
+head, and scalar Adam paths and all model/training hyperparameters remain
+unchanged.
 
 The optimizer ports the optimized single-matrix NorMuon kernels from
 ``../trading_bot_0``: reference EMA momentum/Nesterov, three-matmul
 Newton--Schulz iterations, fp32 neuron statistics, and bounded per-matrix
-working memory. Distributed runs owner-shard the complete transform and use one
-packed all-reduce. Hypothesis: NorMuon's row adaptivity improves BPB at 2,000
-steps by balancing neuron update magnitudes without sacrificing Muon's
-conditioning.
+working memory. The forward pass retains fused QKV projections, while the
+optimizer transforms the logical Q, K, and V row slices independently so their
+nonlinear optimizer geometry matches separate projections. Distributed runs
+owner-shard the complete transform and use one packed all-reduce. Hypothesis:
+NorMuon's row adaptivity improves BPB at 2,000 steps by balancing neuron update
+magnitudes without sacrificing Muon's conditioning.
 """
 
 from __future__ import annotations
@@ -150,18 +153,29 @@ def normuon_rescale(
     return update * scale, second_momentum
 
 
-def _ns_cost(param: Tensor) -> int:
-    short, long = sorted(param.shape)
+def _matrix_ns_cost(rows: int, cols: int) -> int:
+    short, long = sorted((rows, cols))
     return 2 * short * short * long + short**3
 
 
-def _balanced_owners(params: list[Tensor], world_size: int) -> list[int]:
+def _ns_cost(param: Tensor, row_splits: tuple[int, ...] | None = None) -> int:
+    if row_splits is None:
+        return _matrix_ns_cost(param.size(0), param.size(1))
+    return sum(_matrix_ns_cost(rows, param.size(1)) for rows in row_splits)
+
+
+def _balanced_owners(
+    params: list[Tensor],
+    world_size: int,
+    row_splits: dict[int, tuple[int, ...]],
+) -> list[int]:
     owners = [0] * len(params)
     loads = [0] * world_size
-    for index in sorted(range(len(params)), key=lambda i: _ns_cost(params[i]), reverse=True):
+    costs = [_ns_cost(param, row_splits.get(id(param))) for param in params]
+    for index in sorted(range(len(params)), key=costs.__getitem__, reverse=True):
         owner = min(range(world_size), key=loads.__getitem__)
         owners[index] = owner
-        loads[owner] += _ns_cost(params[index])
+        loads[owner] += costs[index]
     return owners
 
 
@@ -174,7 +188,24 @@ class NorMuon(torch.optim.Optimizer):
         beta2: float,
         backend_steps: int,
         nesterov: bool = True,
+        row_splits: dict[Tensor, tuple[int, ...]] | None = None,
     ):
+        params = list(params)
+        param_ids = {id(param) for param in params}
+        self._row_splits: dict[int, tuple[int, ...]] = {}
+        for param, splits in (row_splits or {}).items():
+            if id(param) not in param_ids:
+                raise ValueError("row_splits contains a parameter not owned by this optimizer")
+            normalized = tuple(int(rows) for rows in splits)
+            if param.ndim != 2:
+                raise ValueError("row_splits is only supported for matrix parameters")
+            if not normalized or any(rows <= 0 for rows in normalized):
+                raise ValueError(f"row_splits must contain positive sizes, got {normalized}")
+            if sum(normalized) != param.size(0):
+                raise ValueError(
+                    f"row_splits {normalized} do not cover the parameter's {param.size(0)} rows"
+                )
+            self._row_splits[id(param)] = normalized
         super().__init__(
             params,
             dict(
@@ -198,7 +229,7 @@ class NorMuon(torch.optim.Optimizer):
         key = (id(params[0]), world_size)
         layout = self._layouts.get(key)
         if layout is None:
-            owners = _balanced_owners(params, world_size)
+            owners = _balanced_owners(params, world_size, self._row_splits)
             offsets = [0]
             for param in params:
                 offsets.append(offsets[-1] + param.numel())
@@ -241,15 +272,36 @@ class NorMuon(torch.optim.Optimizer):
         updates: list[Tensor] = []
         for param, direction in zip(params, directions, strict=True):
             state_buffer = self.state[param]["second_momentum_buffer"]
-            update = zeropower_via_newtonschulz5(direction, steps=backend_steps)
-            update, new_state = normuon_rescale(
-                update,
-                state_buffer,
-                beta2,
+            row_splits = self._row_splits.get(id(param))
+            direction_parts = (
+                (direction,)
+                if row_splits is None
+                else direction.split(row_splits, dim=0)
             )
-            state_buffer.copy_(new_state)
-            aspect_scale = max(1.0, param.size(0) / param.size(1)) ** 0.5
-            updates.append(update.mul(aspect_scale))
+            state_parts = (
+                (state_buffer,)
+                if row_splits is None
+                else state_buffer.split(row_splits, dim=0)
+            )
+            update_parts: list[Tensor] = []
+            for direction_part, state_part in zip(direction_parts, state_parts, strict=True):
+                update = zeropower_via_newtonschulz5(direction_part, steps=backend_steps)
+                update, new_state = normuon_rescale(
+                    update,
+                    state_part,
+                    beta2,
+                )
+                state_part.copy_(new_state)
+                aspect_scale = max(
+                    1.0,
+                    direction_part.size(0) / direction_part.size(1),
+                ) ** 0.5
+                update_parts.append(update.mul(aspect_scale))
+            updates.append(
+                update_parts[0]
+                if row_splits is None
+                else torch.cat(update_parts, dim=0)
+            )
         return updates
 
     @torch.no_grad()
@@ -886,6 +938,21 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
+def build_qkv_row_splits(
+    model: GPT,
+    model_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+) -> dict[Tensor, tuple[int, int, int]]:
+    """Map each fused QKV weight to its logical output-projection row sizes."""
+    head_dim = model_dim // num_heads
+    kv_dim = num_kv_heads * head_dim
+    return {
+        block.attn.c_qkv.weight: (model_dim, kv_dim, kv_dim)
+        for block in model.blocks
+    }
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -1025,6 +1092,12 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    qkv_row_splits = build_qkv_row_splits(
+        base_model,
+        args.model_dim,
+        args.num_heads,
+        args.num_kv_heads,
+    )
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1045,6 +1118,7 @@ def main() -> None:
         momentum=args.muon_momentum,
         beta2=args.normuon_beta2,
         backend_steps=args.muon_backend_steps,
+        row_splits=qkv_row_splits,
     )
     for group in optimizer_normuon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1073,7 +1147,8 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"matrix_optimizer:normuon normuon_beta2:{args.normuon_beta2}"
+        f"matrix_optimizer:normuon normuon_beta2:{args.normuon_beta2} "
+        "qkv_optimizer_layout:logical_q_k_v"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 import normuon_train_gpt as normuon
@@ -177,3 +178,103 @@ def test_empty_state_restore_clears_warmup_moments() -> None:
     optimizer.step()
     assert optimizer.state[param]["momentum_buffer"].count_nonzero() > 0
     assert optimizer.state[param]["second_momentum_buffer"].count_nonzero() > 0
+
+
+def test_logical_row_splits_match_independent_parameters_across_steps() -> None:
+    generator = torch.Generator().manual_seed(29)
+    splits = (8, 4, 4)
+    initial = torch.randn(sum(splits), 8, generator=generator)
+    fused = torch.nn.Parameter(initial.clone())
+    independent = [torch.nn.Parameter(part.clone()) for part in initial.split(splits, dim=0)]
+    fused_optimizer = normuon.NorMuon(
+        [fused],
+        lr=0.04,
+        momentum=0.85,
+        beta2=0.95,
+        backend_steps=5,
+        row_splits={fused: splits},
+    )
+    independent_optimizer = normuon.NorMuon(
+        independent,
+        lr=0.04,
+        momentum=0.85,
+        beta2=0.95,
+        backend_steps=5,
+    )
+
+    for momentum in (0.85, 0.90):
+        gradient = torch.randn(fused.shape, generator=generator)
+        fused.grad = gradient.clone()
+        for param, grad_part in zip(independent, gradient.split(splits, dim=0), strict=True):
+            param.grad = grad_part.clone()
+        fused_optimizer.param_groups[0]["momentum"] = momentum
+        independent_optimizer.param_groups[0]["momentum"] = momentum
+
+        fused_optimizer.step()
+        independent_optimizer.step()
+
+    torch.testing.assert_close(fused, torch.cat(independent, dim=0))
+    fused_state = fused_optimizer.state[fused]
+    torch.testing.assert_close(
+        fused_state["momentum_buffer"],
+        torch.cat(
+            [independent_optimizer.state[param]["momentum_buffer"] for param in independent],
+            dim=0,
+        ),
+    )
+    torch.testing.assert_close(
+        fused_state["second_momentum_buffer"],
+        torch.cat(
+            [
+                independent_optimizer.state[param]["second_momentum_buffer"]
+                for param in independent
+            ],
+            dim=0,
+        ),
+    )
+
+
+def test_logical_row_splits_validate_parameter_and_partition() -> None:
+    param = torch.nn.Parameter(torch.randn(16, 8))
+    other = torch.nn.Parameter(torch.randn(16, 8))
+    kwargs = dict(lr=0.04, momentum=0.85, beta2=0.95, backend_steps=5)
+
+    with pytest.raises(ValueError, match="not owned"):
+        normuon.NorMuon([param], row_splits={other: (8, 8)}, **kwargs)
+    with pytest.raises(ValueError, match="positive sizes"):
+        normuon.NorMuon([param], row_splits={param: (8, 0, 8)}, **kwargs)
+    with pytest.raises(ValueError, match="do not cover"):
+        normuon.NorMuon([param], row_splits={param: (8, 4)}, **kwargs)
+
+
+def test_logical_row_split_cost_is_sum_of_independent_transforms() -> None:
+    param = torch.nn.Parameter(torch.randn(16, 8))
+    splits = (8, 4, 4)
+
+    expected = sum(normuon._matrix_ns_cost(rows, param.size(1)) for rows in splits)
+
+    assert normuon._ns_cost(param, splits) == expected
+
+
+def test_model_qkv_partitions_match_fused_projection_layout() -> None:
+    model = normuon.GPT(
+        vocab_size=32,
+        num_layers=2,
+        model_dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        mlp_mult=2,
+        tie_embeddings=True,
+        tied_embed_init_std=0.005,
+        logit_softcap=30.0,
+        rope_base=10_000.0,
+        qk_gain_init=1.5,
+    )
+
+    row_splits = normuon.build_qkv_row_splits(model, 16, 4, 2)
+
+    assert len(row_splits) == len(model.blocks)
+    for block in model.blocks:
+        weight = block.attn.c_qkv.weight
+        assert row_splits[weight] == (16, 8, 8)
+        assert sum(row_splits[weight]) == weight.size(0)
