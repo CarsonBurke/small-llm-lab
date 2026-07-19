@@ -33,10 +33,11 @@ from torch import Tensor, nn
 
 THINK, EMIT = 0, 1
 RENDERER_FEATURES_SCHEMA = "input_latent+belief/v1"
+ROLLOUT_POLICY_SCHEMA = "half_group_members_forced_initial_latent_think/v1"
 
 
 def validate_renderer_checkpoint(payload: dict, checkpoint: str) -> None:
-    """Reject wrapper checkpoints trained with different renderer semantics."""
+    """Reject wrapper checkpoints trained with incompatible policy semantics."""
     actual = payload.get("renderer_features_schema")
     if actual != RENDERER_FEATURES_SCHEMA:
         raise ValueError(
@@ -44,6 +45,14 @@ def validate_renderer_checkpoint(payload: dict, checkpoint: str) -> None:
             f"schema is {actual!r}, expected {RENDERER_FEATURES_SCHEMA!r}. "
             "Old or untagged VAPO checkpoints used predicted-latent renderer "
             "features and cannot be resumed or evaluated as this policy."
+        )
+    rollout_policy = payload.get("rollout_policy_schema")
+    if rollout_policy != ROLLOUT_POLICY_SCHEMA:
+        raise ValueError(
+            f"incompatible latent-policy checkpoint {checkpoint!r}: rollout "
+            f"schema is {rollout_policy!r}, expected {ROLLOUT_POLICY_SCHEMA!r}. "
+            "Old or untagged VAPO checkpoints used a different forced-initial "
+            "assignment and cannot be resumed or evaluated as this policy."
         )
 
 
@@ -70,6 +79,13 @@ class GaussianTransitionHead(nn.Module):
         self, mean: Tensor, generator: torch.Generator | None = None
     ) -> tuple[Tensor, Tensor]:
         """Draw one latent and return it with its (summed) log-probability."""
+        sample = self.sample_latent(mean, generator)
+        return sample, self.log_prob(sample, mean.float())
+
+    def sample_latent(
+        self, mean: Tensor, generator: torch.Generator | None = None
+    ) -> Tensor:
+        """Draw one latent without computing a likelihood (evaluation)."""
         # Distribution statistics are FP32 even under an autocast region,
         # matching the SIGReg module's convention.
         mean = mean.float()
@@ -77,7 +93,7 @@ class GaussianTransitionHead(nn.Module):
             mean.shape, device=mean.device, dtype=torch.float32, generator=generator
         )
         sample = mean + self.log_sigma.exp() * noise
-        return sample, self.log_prob(sample, mean)
+        return sample
 
     def log_prob(self, sample: Tensor, mean: Tensor) -> Tensor:
         return self.per_dim_log_prob(sample, mean).sum(-1)
@@ -122,7 +138,23 @@ class ThinkEmitGate(nn.Module):
             generator=generator,
         )
         action = (uniform < probability).long()
-        return action, self.log_prob(action, belief)
+        log_probability = -F.binary_cross_entropy_with_logits(
+            logit, action.float(), reduction="none"
+        )
+        return action, log_probability
+
+    def sample_action(
+        self, belief: Tensor, generator: torch.Generator | None = None
+    ) -> Tensor:
+        """Sample an action without computing its likelihood (evaluation)."""
+        probability = self.emit_logit(belief).sigmoid()
+        uniform = torch.rand(
+            probability.shape,
+            device=probability.device,
+            dtype=probability.dtype,
+            generator=generator,
+        )
+        return (uniform < probability).long()
 
     def log_prob(self, action: Tensor, belief: Tensor) -> Tensor:
         logit = self.emit_logit(belief)
@@ -192,8 +224,16 @@ class LatentThoughtModel(nn.Module):
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.backbone.embed_tokens(token_ids)
 
-    def make_generation_cache(self, batch_size: int, max_length: int, device: torch.device):
-        return self.backbone.make_generation_cache(batch_size, max_length, device)
+    def make_generation_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ):
+        return self.backbone.make_generation_cache(
+            batch_size, max_length, device, dtype=dtype
+        )
 
     @staticmethod
     def renderer_features(input_latent: Tensor, belief: Tensor) -> Tensor:
@@ -223,7 +263,11 @@ class LatentThoughtModel(nn.Module):
         return F.cross_entropy(logits.float().flatten(0, 1), target_ids.flatten())
 
     def make_static_generation_cache(
-        self, batch_size: int, cache_length: int, device: torch.device
+        self,
+        batch_size: int,
+        cache_length: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
     ):
         """Preallocated caches for the fixed-shape (``key_mask``) step path.
 
@@ -233,7 +277,9 @@ class LatentThoughtModel(nn.Module):
         place across replays.  Reuse one cache set across rollouts of the
         same shape: a fresh allocation forces a graph re-record.
         """
-        caches = self.make_generation_cache(batch_size, cache_length, device)
+        caches = self.make_generation_cache(
+            batch_size, cache_length, device, dtype=dtype
+        )
         # Cache tuples are architecture-defined (RoPE stores K/V pairs, PoPE
         # stores k_real/k_imag/value triples) — treat them generically.
         for cache in caches:

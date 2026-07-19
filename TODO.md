@@ -1,5 +1,37 @@
 # TODO
 
+## Posttraining wall-clock (measured Jul 19, v6 run TB wall times)
+67 min through step ~1760: BPB guard 28.4 min (42%, 22 full-val runs at ~77 s,
+value flat 1.402x throughout), collect 20.9 min (median 16.5 s/iteration,
+p90 52 s — heavy tail unexplained, now instrumented), value warmup 7.8 min
+(one-time), updates 5.7 min, bench only ~4 min. Fixes: `--bpb-every` default
+80 -> 320 (guard cadence, not an optimization target), optional
+`--bpb-val-tokens` cap, and first-class timing (`perf/collect_seconds`,
+`perf/bpb_eval_seconds`, `perf/bench_eval_seconds`, `perf/aime_eval_seconds`,
+`perf/checkpoint_seconds` + `seconds` in the JSONL records). Next candidates,
+decide from the new telemetry: checkpoint save cost (593 MB every 32 steps)
+and the collect p90 tail (suspect stray inductor recompiles or
+non-terminating rollouts).
+
+## Reward grading v2 (user-approved Jul 19)
+Reward/eval verdict review: the Minerva matcher is verl `math_dapo`-standard for
+DAPO/AIME data, but on mathematics_dataset rows its rewrites only widen the match
+(leading-"a " strip collapses letter candidates, `split("=")` grabs the RHS,
+first-$...$-pair extraction, comma-digit concatenation) and several modules have
+small enough answer spaces that per-module accuracy must be read against each
+module's modal-answer share, not zero. Changes (REWARD_SCHEMA
+`terminated_bos_or_eos_style_by_row/v2`; resume from v1 checkpoints is refused):
+grading style now follows each row's `reward_model.style` — `rule` (mathematics
+_dataset) = official exact string match over the whole emission, lighteval =
+Minerva unchanged; AIME evals additionally require an integer in [0, 999]; bench
+logs per-module accuracy + data-derived modal-share baselines (`bench_module/`,
+`bench_module_baseline/` in TB); `--exclude-modules` can drop RL modules (default
+keeps all — mix changes need ablation evidence, and guessable ≠ unlearnable:
+comparison modules are real easy math whose progress is now measurable against
+their baselines). DAPO-ability probe on the v6 checkpoint queued as job 180
+(sample_latent --math-rows 32 --samples 16 on dapo-math-17k; history: job 129
+gate 0/128, job 131 probe 0/512+ pre-RL).
+
 ## Latent RL — attached-CE lineage (user, Jul 18; see LATENT_RL_PLAN.md "Attached-CE lineage")
 mlq chain, each stage `--after-success` the previous:
 CHAIN HISTORY: job 97 cancelled by request @1540 (no ckpt). Rerun job 111 lost @~1860
@@ -72,8 +104,16 @@ action trajectories -> GAE = TD(0) -> terminal reward credits nothing >1 step
 back (lambda^m = 0) -> THINK decisions structurally never receive reward
 credit; decline direction likely genuine (zero-init adapter thoughts noisy;
 bench rose 4.8->15.2% while think fell) but irreversibility is mechanical.
-FIX: --gae-lambda-alpha (default 1.0: lambda = 1 - 1/L, credit horizon =
-trajectory length; L=15 -> 0.93). Ruled out: budget confound (thinks don't
+FIX (shipped, commit 9931036 Jul 19): floored horizon inside
+core.length_adaptive_lambda — max(alpha*l, min(l, 1/alpha)); alpha stays 0.05.
+Short trajectories get lambda = 1 - 1/l (12-23 actions -> 0.92-0.95, credit at
+first action of l=20 now 0.38 vs 0.00), mid lengths the 0.95 baseline, long ones
+VAPO's alpha*l unchanged; continuous at both boundaries, tested in
+test_core.py::test_length_adaptive_lambda_floors_the_credit_horizon. Live in
+belief v3+ runs (launched after 10:38); the Jul-18 v1 lineage incl. the gate
+audit ran starved. (Earlier prescription here — "--gae-lambda-alpha default
+1.0" — superseded: it fixes short lengths identically but degrades long ones
+toward Monte Carlo.) Ruled out: budget confound (thinks don't
 consume emit cap; 13-24 of 512 slots), BCE signs, position alignment,
 positive-LM leak, warmup bias, refresh divergence (gate clip exactly 0).
 Job 142 = step microbenchmark (eager narrow vs reduce-overhead vs MANUAL

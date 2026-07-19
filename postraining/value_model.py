@@ -53,9 +53,16 @@ class SeparateCritic(nn.Module):
         so it must map the stored stream into its own representation.
         """
         token_latent = self.trunk.embed_tokens(batch.token_ids)
-        thought_latent = self.adapter(batch.thoughts.float()).to(token_latent.dtype)
+        think_mask = batch.kind == THOUGHT_SLOT
+        # The adapter is biasless and stored non-thought slots are zero.
+        # Dense masked routing is therefore exactly equivalent to compact
+        # boolean assignment, while avoiding its dynamic-shape nonzero graph
+        # break inside torch.compile.
+        thought_latent = self.adapter(batch.thoughts.float()).to(
+            token_latent.dtype
+        )
         inputs = torch.where(
-            (batch.kind == THOUGHT_SLOT)[..., None], thought_latent, token_latent
+            think_mask[..., None], thought_latent, token_latent
         )
         return inputs * (batch.kind != PAD_SLOT)[..., None].to(inputs.dtype)
 

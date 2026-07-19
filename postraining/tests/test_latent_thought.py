@@ -12,6 +12,7 @@ from postraining.latent_thought import (
     GaussianTransitionHead,
     LatentThoughtModel,
     RENDERER_FEATURES_SCHEMA,
+    ROLLOUT_POLICY_SCHEMA,
     ThinkEmitGate,
     ThoughtAdapter,
     validate_renderer_checkpoint,
@@ -116,13 +117,22 @@ def test_dense_step_projection_gets_no_renderer_gradient():
 
 def test_renderer_checkpoint_schema_rejects_old_semantics():
     validate_renderer_checkpoint(
-        {"renderer_features_schema": RENDERER_FEATURES_SCHEMA}, "current.pt"
+        {
+            "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
+            "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+        },
+        "current.pt",
     )
     with pytest.raises(ValueError, match="Old or untagged VAPO checkpoints"):
         validate_renderer_checkpoint({}, "old.pt")
     with pytest.raises(ValueError, match="predicted/v1"):
         validate_renderer_checkpoint(
             {"renderer_features_schema": "input_latent+predicted/v1"}, "old.pt"
+        )
+    with pytest.raises(ValueError, match="different forced-initial assignment"):
+        validate_renderer_checkpoint(
+            {"renderer_features_schema": RENDERER_FEATURES_SCHEMA},
+            "old-policy.pt",
         )
 
 

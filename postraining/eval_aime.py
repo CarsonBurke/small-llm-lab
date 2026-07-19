@@ -59,7 +59,7 @@ def main() -> None:
             if eos >= 0 and (response == eos).any():
                 response = response[: int((response == eos).nonzero()[0]) + 1]
             text = tokenizer.decode(response.tolist())
-            correct, prediction = verify_answer(text, ground_truth)
+            correct, prediction = verify_answer(text, ground_truth, "aime")
             results.append({"correct": correct, "prediction": prediction})
             transcripts.append({
                 "step": args.step,

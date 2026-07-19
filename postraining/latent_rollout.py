@@ -1,14 +1,16 @@
 """Hierarchical THINK/EMIT rollouts and their parallel replay for latent VAPO.
 
-A rollout interleaves two action types at every generated stream position:
-the gate decides THINK or EMIT from the belief; EMIT samples a token from the
-renderer and feeds it back through the embedding (the pretrained closed loop),
-THINK samples a latent from the transition head and feeds it back through the
-adapter (it occupies a stream position but renders nothing).  Thinking is
+A rollout may force the first action after the prompt to be a latent THINK,
+then interleaves two gate-selected action types at every subsequent generated
+stream position. EMIT samples a token from the renderer and feeds it back
+through the embedding (the pretrained closed loop); THINK samples a latent
+from the transition head and feeds it back through the adapter (it occupies a
+stream position but renders nothing). A forced thought is a continuous policy
+action, but not a Bernoulli action: it receives critic/GAE and thought PPO
+credit while ``gate_mask`` excludes it from gate PPO. Further thinking is
 unlimited: the only bound is ``max_stream_steps`` generated slots (thinks and
 emits combined), so a row that thinks too much simply runs out of budget and
-finishes with fewer emitted tokens — a cost the policy pays through reward,
-not through forced actions.
+finishes with fewer emitted tokens.
 
 Everything PPO needs later is stored as replayable *data* (token ids, sampled
 thoughts, actions), not activations: ``replay_beliefs`` reassembles the exact
@@ -40,10 +42,12 @@ class LatentRolloutBatch:
     """Row-aligned stream storage; every tensor is (batch, stream) unless noted.
 
     The stream starts with ``prompt_length`` teacher-forced prompt tokens.
-    Positions from ``prompt_length - 1`` onward carry gate decisions: the
-    action taken after consuming that position's input.  ``token_ids`` holds
-    prompt and emitted tokens at TOKEN slots; ``thoughts`` (batch, stream,
-    dim, fp32) holds the raw transition samples at THOUGHT slots.
+    Positions from ``prompt_length - 1`` onward carry temporal actions: the
+    action taken after consuming that position's input. The first may be a
+    forced THINK; every non-forced position is a Bernoulli gate decision
+    selected by ``gate_mask``. ``token_ids`` holds prompt and emitted tokens
+    at TOKEN slots; ``thoughts`` (batch, stream, dim, fp32) holds the raw
+    transition samples at THOUGHT slots.
     """
 
     kind: Tensor
@@ -51,6 +55,9 @@ class LatentRolloutBatch:
     thoughts: Tensor
     gate_actions: Tensor
     action_mask: Tensor
+    # Subset of action_mask where THINK/EMIT was actually sampled from the
+    # Bernoulli. A forced initial THINK is deliberately absent.
+    gate_mask: Tensor
     emit_mask: Tensor
     old_gate_logprobs: Tensor
     old_token_logprobs: Tensor
@@ -72,6 +79,23 @@ class LatentRolloutBatch:
     @property
     def stream_length(self) -> int:
         return self.kind.size(1)
+
+
+def half_forced_group_members(
+    groups: int, members_per_group: int, device: torch.device
+) -> Tensor:
+    """Exactly half of every prompt group's contiguous members, no RNG.
+
+    Alternating logical member indices avoids confounding the intervention
+    with contiguous RNG draws or replay microbatch boundaries while
+    guaranteeing a same-prompt unforced control population in every group.
+    """
+    if groups < 1:
+        raise ValueError("groups must be positive")
+    if members_per_group < 2 or members_per_group % 2:
+        raise ValueError("members_per_group must be a positive even number")
+    pattern = torch.arange(members_per_group, device=device).remainder(2) == 0
+    return pattern.repeat(groups)
 
 
 def continuation_reward(generated: str, reference: str) -> float:
@@ -113,13 +137,22 @@ def rollout_continuations(
     stop_ids: int | Sequence[int] | None = None,
     caches: list[tuple[Tensor, ...]] | None = None,
     prompt_lengths: Tensor | None = None,
+    force_initial_think: bool | Tensor = False,
+    tensor_positions: bool = False,
+    replay_storage: bool = True,
+    record_likelihoods: bool = True,
+    compact_finished: bool = True,
+    cache_dtype: torch.dtype | None = None,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
-    ``max_stream_steps`` is the total generated-slot budget per row (thinks
-    plus emits); ``max_new_tokens`` caps emitted tokens within it.  Thinking
-    is never forcibly interrupted — a row that spends its whole budget
-    thinking just emits fewer tokens.  With ``stop_ids`` set, a row finishes
+    ``force_initial_think`` selects rows whose first action after the prompt
+    is a mandatory latent THINK. Other rows sample the ordinary Bernoulli at
+    that same boundary. ``max_stream_steps`` is the total generated-slot
+    budget per row (forced/optional thoughts and emits);
+    ``max_new_tokens`` caps emitted tokens within it.  Optional thinking is
+    never forcibly interrupted — a row that spends its whole budget thinking
+    just emits fewer tokens.  With ``stop_ids`` set, a row finishes
     the moment it emits any of those tokens (the stop token itself is
     recorded), matching the stop-truncated decode the verifier scores.  BOS
     belongs in ``stop_ids`` alongside EOS: pretraining shards never append
@@ -139,7 +172,23 @@ def rollout_continuations(
     and each row's padded prefix slots are masked out of attention.  The
     positional shift this introduces is exact — PoPE and RoPE scores depend
     only on position differences — and ``split_rollout_groups`` undoes the
-    padding afterwards.  Eager-only (mutually exclusive with ``caches``).
+    padding afterwards. It is mutually exclusive with preallocated static
+    ``caches``; the ordinary narrow-cache step may be eager or dynamically
+    compiled.
+
+    Evaluation sets ``replay_storage=False`` because it never replays PPO
+    actions. Its full-stream thought tensor then has a zero-width final
+    dimension; old thought likelihood storage is always allocated lazily by
+    refresh after trimming. This avoids multiple GiB of dead storage at large
+    batches while the current sampled thought is still fed into the next step.
+
+    ``record_likelihoods=False`` skips rollout-time gate/token likelihoods
+    when the caller will immediately recompute them through parallel replay.
+    ``compact_finished`` removes completed rows and their KV cache entries at
+    the existing 16-position synchronization points once at least 25% of the
+    current rows have finished. Original row indices remain attached to all
+    trajectory records, so compaction changes compute and RNG consumption,
+    not the sampled policy distribution or output attribution.
     """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
@@ -147,6 +196,19 @@ def rollout_continuations(
         raise ValueError("max_stream_steps must be at least max_new_tokens")
     device = prompt_ids.device
     batch, prompt_length = prompt_ids.shape
+    if isinstance(force_initial_think, bool):
+        force_initial_think = torch.full(
+            (batch,), force_initial_think, dtype=torch.bool, device=device
+        )
+    else:
+        if force_initial_think.shape != (batch,):
+            raise ValueError("force_initial_think must have one value per row")
+        force_initial_think = force_initial_think.to(device=device, dtype=torch.bool)
+    if bool(force_initial_think.any()) and max_stream_steps < max_new_tokens + 1:
+        raise ValueError(
+            "max_stream_steps must fit a forced initial thought plus "
+            "max_new_tokens"
+        )
     model_dim = wrapper.backbone.tok_emb.embedding_dim
     max_stream = prompt_length + max_stream_steps
     stop_tensor = None
@@ -174,9 +236,16 @@ def rollout_continuations(
         valid_slots = (
             torch.arange(max_stream, device=device)[None, :] >= pad_lengths[:, None]
         )
+    preallocated_caches = caches is not None
     if caches is None:
-        caches = wrapper.make_generation_cache(batch, max_stream, device)
-        position_index = None
+        caches = wrapper.make_generation_cache(
+            batch, max_stream, device, dtype=cache_dtype
+        )
+        position_index = (
+            torch.zeros((), dtype=torch.long, device=device)
+            if tensor_positions
+            else None
+        )
         key_masks = None
     else:
         cache_length = caches[0][0].size(2)
@@ -195,9 +264,13 @@ def rollout_continuations(
     def step_position(position: int) -> tuple[int | Tensor, Tensor | None]:
         if position_index is not None:
             position_index.fill_(position)
-            return position_index, key_masks[position]
+            step_position_value: int | Tensor = position_index
+            if key_masks is not None:
+                return step_position_value, key_masks[position]
+        else:
+            step_position_value = position
         if valid_slots is None:
-            return position, None
+            return step_position_value, None
         mask = valid_slots[:, : position + 1]
         if position < prompt_length:
             # Rows whose query at ``position`` is still inside their own pad
@@ -208,20 +281,28 @@ def rollout_continuations(
             # output is discarded, and the slot itself stays masked for all
             # real queries via ``valid_slots``.
             mask = mask | (pad_lengths[:, None] > position)
-        return position, mask
+        return step_position_value, mask
 
     kind = torch.full((batch, max_stream), PAD_SLOT, dtype=torch.long, device=device)
     token_ids = torch.zeros((batch, max_stream), dtype=torch.long, device=device)
-    thoughts = torch.zeros((batch, max_stream, model_dim), dtype=torch.float32, device=device)
+    stored_thought_dim = model_dim if replay_storage else 0
+    thoughts = torch.zeros(
+        (batch, max_stream, stored_thought_dim),
+        dtype=torch.float32,
+        device=device,
+    )
     gate_actions = torch.zeros((batch, max_stream), dtype=torch.long, device=device)
     action_mask = torch.zeros((batch, max_stream), dtype=torch.float32, device=device)
+    gate_mask = torch.zeros_like(action_mask)
     emit_mask = torch.zeros_like(action_mask)
     old_gate_logprobs = torch.zeros_like(action_mask)
     old_token_logprobs = torch.zeros_like(action_mask)
     # Both stay zero through the rollout; refresh_old_statistics fills them
     # (values from the separate critic, per-dim thought log-probs through
     # the exact replay path) before anything consumes them.
-    old_thought_logprobs = torch.zeros_like(thoughts)
+    old_thought_logprobs = thoughts.new_zeros(
+        (batch, max_stream, 0)
+    )
     old_values = torch.zeros_like(action_mask)
 
     if valid_slots is None:
@@ -241,6 +322,7 @@ def rollout_continuations(
 
     emitted = torch.zeros(batch, dtype=torch.long, device=device)
     ended = torch.zeros(batch, dtype=torch.bool, device=device)
+    live_rows = torch.arange(batch, device=device)
     position = prompt_length - 1
     # ``bool(any())`` is a device-to-host sync that serializes this
     # launch-bound loop (the CPU cannot run ahead of the GPU), so the finish
@@ -250,31 +332,105 @@ def rollout_continuations(
     SYNC_EVERY = 16
     first_position = position
     while position < max_stream - 1:
-        active = ~ended & (emitted < max_new_tokens)
-        if (position - first_position) % SYNC_EVERY == 0 and not bool(active.any()):
-            break
+        initial = position == first_position
+        # A forced prefix remains a real action even in the max_new_tokens=0
+        # diagnostic case; unforced rows have nothing to do in that case.
+        active = ~ended & (
+            (emitted < max_new_tokens)
+            | (force_initial_think if initial else False)
+        )
+        if (position - first_position) % SYNC_EVERY == 0:
+            active_count = int(active.sum())
+            if active_count == 0:
+                break
+            current_count = active.numel()
+            should_compact = (
+                compact_finished
+                and not preallocated_caches
+                and active_count < current_count
+                and current_count - active_count >= max(1, current_count // 4)
+            )
+            if should_compact:
+                keep = active.nonzero().squeeze(-1)
+                live_rows = live_rows.index_select(0, keep)
+                emitted = emitted.index_select(0, keep)
+                ended = ended.index_select(0, keep)
+                force_initial_think = force_initial_think.index_select(0, keep)
+                if valid_slots is not None:
+                    valid_slots = valid_slots.index_select(0, keep)
+                    pad_lengths = pad_lengths.index_select(0, keep)
+                live_prefix = position + 1
+                for layer, cache in enumerate(caches):
+                    compacted = []
+                    for tensor in cache:
+                        target = torch.empty(
+                            (active_count, *tensor.shape[1:]),
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        )
+                        target[:, :, :live_prefix].copy_(
+                            tensor[:, :, :live_prefix].index_select(0, keep)
+                        )
+                        compacted.append(target)
+                    # Replace one layer at a time so old+new full-capacity
+                    # caches do not coexist across all layers at peak memory.
+                    caches[layer] = tuple(compacted)
+                output = output.__class__(
+                    belief=output.belief.index_select(0, keep),
+                    predicted=output.predicted.index_select(0, keep),
+                    input_latent=output.input_latent.index_select(0, keep),
+                    logits=output.logits.index_select(0, keep),
+                    caches=caches,
+                )
+                active = active.index_select(0, keep)
         belief = output.belief
-        action, gate_logprob = wrapper.gate.sample(belief, generator=generator)
+        if record_likelihoods:
+            action, gate_logprob = wrapper.gate.sample(
+                belief, generator=generator
+            )
+        else:
+            action = wrapper.gate.sample_action(belief, generator=generator)
+            gate_logprob = None
+        if initial:
+            action = action.masked_fill(force_initial_think, THINK)
 
         token = top_p_sample(output.logits, temperature, top_p)
-        token_logprob = (
-            output.logits.float().log_softmax(-1).gather(-1, token[:, None]).squeeze(-1)
+        token_logprob = None
+        if record_likelihoods:
+            token_logprob = (
+                output.logits.float()
+                .log_softmax(-1)
+                .gather(-1, token[:, None])
+                .squeeze(-1)
+            )
+        thought = wrapper.transition.sample_latent(
+            output.predicted, generator=generator
         )
-        thought, _ = wrapper.transition.sample(output.predicted, generator=generator)
 
         record = active
-        action_mask[record, position] = 1.0
-        gate_actions[record, position] = action[record]
-        old_gate_logprobs[record, position] = gate_logprob[record].float()
+        record_rows = live_rows[record]
+        action_mask[record_rows, position] = 1.0
+        sampled_gate = record & (~force_initial_think if initial else True)
+        sampled_gate_rows = live_rows[sampled_gate]
+        gate_mask[sampled_gate_rows, position] = 1.0
+        gate_actions[record_rows, position] = action[record]
+        if gate_logprob is not None:
+            old_gate_logprobs[sampled_gate_rows, position] = gate_logprob[
+                sampled_gate
+            ].float()
         emits = record & (action == EMIT)
         thinks = record & (action == THINK)
-        old_token_logprobs[emits, position] = token_logprob[emits]
+        emit_rows = live_rows[emits]
+        think_rows = live_rows[thinks]
+        if token_logprob is not None:
+            old_token_logprobs[emit_rows, position] = token_logprob[emits]
 
         next_position = position + 1
-        kind[emits, next_position] = TOKEN_SLOT
-        token_ids[emits, next_position] = token[emits]
-        kind[thinks, next_position] = THOUGHT_SLOT
-        thoughts[thinks, next_position] = thought[thinks]
+        kind[emit_rows, next_position] = TOKEN_SLOT
+        token_ids[emit_rows, next_position] = token[emits]
+        kind[think_rows, next_position] = THOUGHT_SLOT
+        if replay_storage:
+            thoughts[think_rows, next_position] = thought[thinks]
         emitted += emits.long()
         if stop_tensor is not None:
             ended |= emits & torch.isin(token, stop_tensor)
@@ -282,10 +438,12 @@ def rollout_continuations(
         # Finished rows keep stepping on token 0 (their next slot stays PAD,
         # so the zero-initialized token_ids row feeds the embedding; every
         # loss masks it); batched caches make per-row early exit impractical.
+        next_kinds = kind[live_rows, next_position]
+        next_token_ids = token_ids[live_rows, next_position]
         next_input = torch.where(
-            (kind[:, next_position] == THOUGHT_SLOT)[:, None, None],
+            (next_kinds == THOUGHT_SLOT)[:, None, None],
             wrapper.thought_input(thought),
-            wrapper.embed_tokens(token_ids[:, next_position][:, None]),
+            wrapper.embed_tokens(next_token_ids[:, None]),
         )
         step_pos, key_mask = step_position(next_position)
         # Under reduce-overhead the step outputs live in the CUDA graph's
@@ -302,6 +460,7 @@ def rollout_continuations(
         thoughts=thoughts,
         gate_actions=gate_actions,
         action_mask=action_mask,
+        gate_mask=gate_mask,
         emit_mask=(gate_actions == EMIT).float() * action_mask,
         old_gate_logprobs=old_gate_logprobs,
         old_token_logprobs=old_token_logprobs,
@@ -333,6 +492,8 @@ def split_rollout_groups(
         if bool((prompt_lengths[rows] != group_prompt).any()):
             raise ValueError("rows within a group must share one prompt length")
         pad = batch.prompt_length - group_prompt
+        group_kind = batch.kind[rows, pad:]
+        used = int((group_kind != PAD_SLOT).any(0).nonzero().max()) + 1
         sliced = {}
         for field in fields(batch):
             value = getattr(batch, field.name)
@@ -343,10 +504,11 @@ def split_rollout_groups(
                 and value.dim() >= 2
                 and value.size(1) == batch.stream_length
             ):
-                # clone(): a view here would keep the whole multi-group
-                # rollout storage (including both fp32 (rows, stream, dim)
-                # recorders) alive through the entire PPO update phase.
-                value = value[rows, pad:].clone()
+                # Slice to this group's ACTUAL used tail before cloning. A
+                # full-capacity clone retained ~8 GiB across sixteen groups
+                # in the 5K-context run even though typical streams used
+                # only ~140 positions.
+                value = value[rows, pad : pad + used].clone()
             elif isinstance(value, Tensor) and value.dim() == 1:
                 value = value[rows].clone()
             sliced[field.name] = value
@@ -355,7 +517,7 @@ def split_rollout_groups(
 
 
 def trim_stream(batch: LatentRolloutBatch, multiple: int = 1) -> LatentRolloutBatch:
-    """Drop all-PAD tail columns so replay never pays for the worst case.
+    """Drop all-PAD tail columns into owning storage for compact replay.
 
     ``multiple`` rounds the kept length up to a bucket boundary, PADDING
     BEYOND the original stream when the content reaches into the last
@@ -375,7 +537,10 @@ def trim_stream(batch: LatentRolloutBatch, multiple: int = 1) -> LatentRolloutBa
         value = getattr(batch, field.name)
         if isinstance(value, Tensor) and value.dim() >= 2 and value.size(1) == batch.stream_length:
             if used <= batch.stream_length:
-                value = value[:, :used]
+                if used < batch.stream_length:
+                    # A narrow view would retain the full worst-case backing
+                    # allocation and defeats the memory purpose of trimming.
+                    value = value[:, :used].clone()
             else:
                 padding = value.new_full(
                     (value.size(0), used - batch.stream_length, *value.shape[2:]),
@@ -388,12 +553,42 @@ def trim_stream(batch: LatentRolloutBatch, multiple: int = 1) -> LatentRolloutBa
 
 def emitted_token_rows(batch: LatentRolloutBatch) -> list[list[int]]:
     """Emitted token ids per row, in stream order (excludes the prompt)."""
-    rows = []
-    generated = batch.kind[:, batch.prompt_length:] == TOKEN_SLOT
-    tokens = batch.token_ids[:, batch.prompt_length:]
-    for row in range(batch.kind.size(0)):
-        rows.append(tokens[row][generated[row]].tolist())
-    return rows
+    # Bulk device transfers avoid a GPU synchronization for every trajectory.
+    # Decoding/verifying is CPU work anyway, and this helper is called once
+    # per rollout by both training and evaluation.
+    generated = (
+        batch.kind[:, batch.prompt_length:] == TOKEN_SLOT
+    ).to(device="cpu")
+    tokens = batch.token_ids[:, batch.prompt_length:].to(device="cpu")
+    return [
+        tokens[row][generated[row]].tolist()
+        for row in range(batch.kind.size(0))
+    ]
+
+
+def emitted_token_and_kind_rows(
+    batch: LatentRolloutBatch,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Bulk-copy continuation tokens and kinds for human-readable capture.
+
+    Evaluation needs both arrays to reconstruct latent-action traces. Packing
+    them before the transfer produces one synchronization and avoids first
+    copying a token mask and then synchronizing again for selected kind rows.
+    The ordinary scorer keeps using :func:`emitted_token_rows`, whose compact
+    boolean mask transfers less data when no traces are requested.
+    """
+    packed = torch.stack(
+        (
+            batch.kind[:, batch.prompt_length :],
+            batch.token_ids[:, batch.prompt_length :],
+        )
+    ).to(device="cpu")
+    kinds, tokens = packed[0], packed[1]
+    emitted = [
+        tokens[row][kinds[row] == TOKEN_SLOT].tolist()
+        for row in range(batch.kind.size(0))
+    ]
+    return emitted, kinds.tolist()
 
 
 def assign_terminal_rewards(batch: LatentRolloutBatch, scores: Tensor) -> None:
@@ -413,10 +608,13 @@ def assemble_stream_latents(
 ) -> Tensor:
     """Rebuild the exact (batch, stream, dim) inputs the rollout consumed."""
     token_latent = wrapper.embed_tokens(batch.token_ids)
+    think_mask = batch.kind == THOUGHT_SLOT
+    # Stored non-thought slots are exactly zero and ThoughtAdapter is
+    # biasless, so dense projection plus where is value/gradient-equivalent
+    # to boolean-index assignment. Unlike the latter, it has static output
+    # shapes and keeps the full replay trunk inside one Inductor graph.
     thought_latent = wrapper.adapter(batch.thoughts).to(token_latent.dtype)
-    inputs = torch.where(
-        (batch.kind == THOUGHT_SLOT)[..., None], thought_latent, token_latent
-    )
+    inputs = torch.where(think_mask[..., None], thought_latent, token_latent)
     return inputs * (batch.kind != PAD_SLOT)[..., None].to(inputs.dtype)
 
 
@@ -439,17 +637,19 @@ def replay_head_inputs(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Replay the stream and derive everything the PPO heads consume.
 
-    Returns (beliefs, predicted, features, token_targets).  Both
+    Returns (beliefs, predicted, stream_inputs, token_targets).  Renderer
+    features are deliberately formed only at EMIT positions by consumers;
+    its four-layer wide probe and vocabulary projection are positionwise, so
+    dense prompt/thought/pad evaluation was pure waste. Both
     ``refresh_old_statistics`` and the trainer's update step go through this
     single code path; that is what makes the recomputed "old" statistics
     exact — epoch-0 PPO ratios are one by construction.
     """
     stream_inputs, beliefs = replay_beliefs(wrapper, batch)
     predicted = wrapper.thought_mean(beliefs)
-    features = wrapper.renderer_features(stream_inputs, beliefs)
     token_targets = torch.zeros_like(batch.token_ids)
     token_targets[:, :-1] = batch.token_ids[:, 1:]
-    return beliefs, predicted, features, token_targets
+    return beliefs, predicted, stream_inputs, token_targets
 
 
 def select_thought_actions(
@@ -467,8 +667,106 @@ def select_thought_actions(
     return predicted[think_mask], thought_targets[think_mask], think_mask
 
 
+def trajectory_used_lengths(batch: LatentRolloutBatch) -> Tensor:
+    """Last non-padding column plus one for every independent trajectory."""
+    positions = torch.arange(
+        1, batch.stream_length + 1, device=batch.kind.device
+    )
+    return ((batch.kind != PAD_SLOT) * positions).amax(1)
+
+
+def select_trajectory_rows(
+    batch: LatentRolloutBatch, rows: Tensor, stream_length: int
+) -> LatentRolloutBatch:
+    """Materialize selected rows at a compact, shared stream length."""
+    if stream_length < batch.prompt_length or stream_length > batch.stream_length:
+        raise ValueError("invalid replay stream length")
+    selected = {}
+    for field in fields(batch):
+        value = getattr(batch, field.name)
+        if (
+            isinstance(value, Tensor)
+            and value.dim() >= 2
+            and value.size(1) == batch.stream_length
+        ):
+            value = value[rows, :stream_length]
+        elif isinstance(value, Tensor) and value.dim() >= 1:
+            value = value[rows]
+        selected[field.name] = value
+    return LatentRolloutBatch(**selected)
+
+
+def iter_length_aware_microbatches(
+    batch: LatentRolloutBatch,
+    max_trajectories: int,
+    attention_budget: int,
+    bucket_multiple: int = 1,
+):
+    """Yield stable length-sorted replay shards under a B*L^2 budget.
+
+    Causal full-stream replay is governed by attention area, not row count.
+    Stable sorting groups similarly sized independent trajectories; normal
+    ~150-position groups fit all 32 rows, while rare 1K-4K outliers
+    automatically receive smaller shards. ``rows`` maps each compact shard
+    back into the parent batch for refresh-stat writes.
+    """
+    if max_trajectories < 1:
+        raise ValueError("replay max trajectories must be positive")
+    if attention_budget < 1:
+        raise ValueError("replay attention budget must be positive")
+    if bucket_multiple < 1:
+        raise ValueError("replay bucket multiple must be positive")
+    lengths = trajectory_used_lengths(batch).to(device="cpu").tolist()
+    order = sorted(range(len(lengths)), key=lambda row: (-lengths[row], row))
+
+    shard: list[int] = []
+    shard_length = 0
+
+    def bucketed(length: int) -> int:
+        return min(
+            batch.stream_length,
+            -(-length // bucket_multiple) * bucket_multiple,
+        )
+
+    for row in order:
+        candidate_length = max(shard_length, bucketed(lengths[row]))
+        candidate_rows = len(shard) + 1
+        exceeds = (
+            candidate_rows > max_trajectories
+            or candidate_rows * candidate_length * candidate_length
+            > attention_budget
+        )
+        if shard and exceeds:
+            row_tensor = torch.tensor(
+                shard, dtype=torch.long, device=batch.kind.device
+            )
+            yield (
+                select_trajectory_rows(batch, row_tensor, shard_length),
+                row_tensor,
+                shard_length,
+            )
+            shard = []
+            shard_length = 0
+        shard.append(row)
+        shard_length = max(shard_length, bucketed(lengths[row]))
+    if shard:
+        row_tensor = torch.tensor(
+            shard, dtype=torch.long, device=batch.kind.device
+        )
+        yield (
+            select_trajectory_rows(batch, row_tensor, shard_length),
+            row_tensor,
+            shard_length,
+        )
+
+
 def refresh_old_statistics(
-    wrapper: LatentThoughtModel, critic, batch: LatentRolloutBatch
+    wrapper: LatentThoughtModel,
+    critic,
+    batch: LatentRolloutBatch,
+    max_trajectories: int = 32,
+    attention_budget: int = 4 * 1024 * 1024,
+    bucket_multiple: int = 1,
 ) -> None:
     """Overwrite the stored PPO statistics with parallel-replay recomputations.
 
@@ -489,27 +787,56 @@ def refresh_old_statistics(
 
     ``old_values`` come from the separate critic model — the rollout itself
     never computes values, so this is where GAE's baseline is filled in.
+    Replay is stably length-sorted and split only across independent
+    trajectories under a B*L^2 budget, bounding quadratic attention memory
+    without changing any consumed statistic. The update path uses the same
+    deterministic planner so compiled refresh/update forwards remain
+    numerically identical at epoch zero.
     """
     backbone = wrapper.backbone
-    beliefs, predicted, features, token_targets = replay_head_inputs(wrapper, batch)
-    values = critic.values(batch).float()
-    gate_logprobs = wrapper.gate.log_prob(batch.gate_actions.float(), beliefs).float()
-    logits = backbone.logits_from_features(features)
-    token_logprobs = (
-        logits.float().log_softmax(-1).gather(-1, token_targets[..., None]).squeeze(-1)
-    )
-    # The thought decided at gate position p is stored at p+1 — the same
-    # shift as token targets — so per-dim log-probs align with think_mask.
-    thought_means, thought_targets, think_mask = select_thought_actions(
-        batch, predicted
-    )
-    compact_thought_logprobs = wrapper.transition.per_dim_log_prob(
-        thought_targets, thought_means
-    ).float()
-    thought_logprobs = torch.zeros_like(batch.old_thought_logprobs)
-    thought_logprobs[think_mask] = compact_thought_logprobs
-    with torch.no_grad():
-        batch.old_values.copy_(values)
-        batch.old_gate_logprobs.copy_(gate_logprobs)
-        batch.old_token_logprobs.copy_(token_logprobs)
-        batch.old_thought_logprobs.copy_(thought_logprobs)
+    if batch.old_thought_logprobs.shape[-1] == 0:
+        batch.old_thought_logprobs = torch.zeros_like(batch.thoughts)
+    for microbatch, rows, stream_length in iter_length_aware_microbatches(
+        batch, max_trajectories, attention_budget, bucket_multiple
+    ):
+        beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
+            wrapper, microbatch
+        )
+        values = critic.values(microbatch).float()
+        gate_logprobs = (
+            wrapper.gate.log_prob(
+                microbatch.gate_actions.float(), beliefs
+            ).float()
+            * microbatch.gate_mask
+        )
+        emit_mask = microbatch.emit_mask.bool()
+        emit_features = wrapper.renderer_features(
+            stream_inputs[emit_mask], beliefs[emit_mask]
+        )
+        emit_logits = backbone.logits_from_features(emit_features)
+        compact_token_logprobs = (
+            emit_logits.float()
+            .log_softmax(-1)
+            .gather(-1, token_targets[emit_mask][..., None])
+            .squeeze(-1)
+        )
+        token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
+        token_logprobs[emit_mask] = compact_token_logprobs
+        # The thought decided at gate position p is stored at p+1 — the same
+        # shift as token targets — so per-dim log-probs align with think_mask.
+        thought_means, thought_targets, think_mask = select_thought_actions(
+            microbatch, predicted
+        )
+        compact_thought_logprobs = wrapper.transition.per_dim_log_prob(
+            thought_targets, thought_means
+        ).float()
+        thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
+        thought_logprobs[think_mask] = compact_thought_logprobs
+        with torch.no_grad():
+            # Advanced row indexing materializes a copy, so assignment must
+            # target the parent explicitly (``view.copy_`` would update only
+            # the temporary).
+            batch.old_values[rows, :stream_length] = values
+            batch.old_gate_logprobs[rows, :stream_length] = gate_logprobs
+            batch.old_token_logprobs[rows, :stream_length] = token_logprobs
+            batch.old_thought_logprobs[rows, :stream_length] = thought_logprobs

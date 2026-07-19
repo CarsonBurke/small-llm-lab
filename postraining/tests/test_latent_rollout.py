@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import copy
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import train_gpt as baseline
+from fresh_lejepa_train import FreshLeJEPAGPT
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.core import (
     generalized_advantage_estimate,
@@ -17,6 +21,8 @@ from postraining.latent_rollout import (
     assign_terminal_rewards,
     continuation_reward,
     emitted_token_rows,
+    half_forced_group_members,
+    iter_length_aware_microbatches,
     refresh_old_statistics,
     replay_beliefs,
     replay_head_inputs,
@@ -28,13 +34,18 @@ from postraining.latent_rollout import (
 from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
 from postraining.model_io import _pope_construction
 from postraining.train_latent_vapo import (
+    EXECUTION_SCHEMA,
     MathPromptSampler,
+    REWARD_SCHEMA,
     build_optimizers,
     evaluate_aime_latent,
     sample_prompt_batch,
     score_math_rollout,
     think_run_lengths,
+    rollout_diagnostics,
+    save_checkpoint,
     update_minibatch,
+    verify_terminated_answer,
 )
 from postraining.value_model import SeparateCritic
 
@@ -103,6 +114,7 @@ def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, stream_steps=None, seed=7
     result = rollout_continuations(
         wrapper, prompt_ids, new_tokens, stream_steps or 8 * new_tokens,
         1.0, 1.0, generator=generator,
+        force_initial_think=torch.arange(batch).remainder(2) == 0,
     )
     return trim_stream(result)
 
@@ -125,6 +137,14 @@ def test_continuation_reward_bounds_and_ordering():
     assert 0.0 < partial < 1.0
     # A longer matching prefix scores strictly higher at equal overlap.
     assert continuation_reward("ab__", "abcd") > continuation_reward("__ab", "abcd")
+
+
+def test_half_forced_group_members_is_exact_and_alternating_per_group():
+    mask = half_forced_group_members(3, 4, torch.device("cpu"))
+    assert mask.tolist() == [True, False, True, False] * 3
+    assert torch.equal(mask.reshape(3, 4).sum(1), torch.full((3,), 2))
+    with pytest.raises(ValueError, match="even"):
+        half_forced_group_members(1, 3, torch.device("cpu"))
 
 
 def test_rollout_emits_exactly_the_requested_tokens():
@@ -187,11 +207,49 @@ def test_stream_budget_smaller_than_emit_cap_is_rejected():
         rollout_continuations(wrapper, torch.randint(0, 32, (1, 4)), 8, 4, 1.0, 1.0)
 
 
+def test_emit_only_policy_needs_and_uses_one_extra_stream_slot():
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(0, 32, (2, 4))
+    unforced = rollout_continuations(
+        wrapper, prompt_ids, 4, 4, 1.0, 1e-6,
+        force_initial_think=False,
+    )
+    assert all(len(row) == 4 for row in emitted_token_rows(unforced))
+    with pytest.raises(ValueError, match="forced initial thought"):
+        rollout_continuations(
+            wrapper, prompt_ids, 4, 4, 1.0, 1e-6,
+            force_initial_think=True,
+        )
+    batch = rollout_continuations(
+        wrapper, prompt_ids, 4, 5, 1.0, 1e-6,
+        force_initial_think=True,
+    )
+    assert all(len(row) == 4 for row in emitted_token_rows(batch))
+    assert torch.all(batch.action_mask.sum(1) == 5)
+    assert torch.all(batch.gate_mask.sum(1) == 4)
+
+
 def test_stream_storage_is_internally_consistent():
     wrapper = _wrapper()
-    batch = _rollout(wrapper)
+    batch = _rollout(wrapper, batch=4)
     prompt = batch.prompt_length
+    forced = torch.tensor([True, False, True, False])
     assert torch.all(batch.kind[:, :prompt] == TOKEN_SLOT)
+    # The full-prompt belief always produces one latent action.  It is a
+    # temporal/thought action but not a Bernoulli gate decision.
+    assert torch.all(batch.action_mask[:, prompt - 1] == 1)
+    assert torch.all(batch.gate_actions[forced, prompt - 1] == THINK)
+    assert torch.all(batch.gate_mask[forced, prompt - 1] == 0)
+    assert torch.all(batch.kind[forced, prompt] == THOUGHT_SLOT)
+    assert torch.all(batch.gate_mask[~forced, prompt - 1] == 1)
+    assert torch.all(batch.gate_mask <= batch.action_mask)
+    assert torch.equal(
+        batch.action_mask - batch.gate_mask,
+        forced[:, None].float()
+        * torch.nn.functional.one_hot(
+            torch.tensor(prompt - 1), num_classes=batch.stream_length
+        ).float(),
+    )
     # Every recorded action produced a next input slot of a matching kind.
     action_positions = batch.action_mask.nonzero()
     for row, position in action_positions.tolist():
@@ -201,7 +259,34 @@ def test_stream_storage_is_internally_consistent():
     # PAD slots carry no thoughts, no actions, no rewards.
     pads = batch.kind == PAD_SLOT
     assert float(batch.action_mask[pads].sum()) == 0.0
+    assert float(batch.gate_mask[pads].sum()) == 0.0
     assert float(batch.thoughts[pads].abs().sum()) == 0.0
+
+
+@pytest.mark.parametrize(("gate_bias", "unforced_action"), ((100.0, EMIT), (-100.0, THINK)))
+def test_forced_half_overrides_only_its_members_first_gate(
+    gate_bias: float, unforced_action: int
+):
+    wrapper = _wrapper()
+    with torch.no_grad():
+        wrapper.gate.head.weight.zero_()
+        wrapper.gate.head.bias.fill_(gate_bias)
+    prompt_ids = torch.randint(0, 32, (4, 5))
+    forced = half_forced_group_members(1, 4, torch.device("cpu"))
+    batch = rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=1,
+        max_stream_steps=2,
+        temperature=1.0,
+        top_p=1.0,
+        force_initial_think=forced,
+    )
+    boundary = batch.prompt_length - 1
+    assert torch.all(batch.gate_actions[forced, boundary] == THINK)
+    assert torch.all(batch.gate_actions[~forced, boundary] == unforced_action)
+    assert torch.all(batch.gate_mask[forced, boundary] == 0)
+    assert torch.all(batch.gate_mask[~forced, boundary] == 1)
 
 
 def test_replay_reproduces_rollout_logprobs():
@@ -218,7 +303,7 @@ def test_replay_reproduces_rollout_logprobs():
         token_logprobs = logits.log_softmax(-1).gather(
             -1, token_targets[..., None]
         ).squeeze(-1)
-    mask = batch.action_mask.bool()
+    mask = batch.gate_mask.bool()
     # The rollout never values: old_values stay zero until the separate
     # critic fills them in refresh_old_statistics.
     assert float(batch.old_values.abs().sum()) == 0.0
@@ -242,6 +327,9 @@ def test_assembled_latents_zero_pads_and_route_thoughts_through_adapter():
     if thought_slots.any():
         expected = wrapper.adapter(batch.thoughts).to(latents.dtype)
         torch.testing.assert_close(latents[thought_slots], expected[thought_slots])
+    token_slots = batch.kind == TOKEN_SLOT
+    expected_tokens = wrapper.embed_tokens(batch.token_ids)
+    torch.testing.assert_close(latents[token_slots], expected_tokens[token_slots])
 
 
 def test_terminal_reward_lands_on_the_last_action():
@@ -254,6 +342,94 @@ def test_terminal_reward_lands_on_the_last_action():
         position = int(batch.rewards[row].nonzero()[0])
         assert float(batch.action_mask[row, position]) == 1.0
         assert float(batch.action_mask[row, position + 1 :].sum()) == 0.0
+
+
+def test_forced_initial_think_and_first_emit_both_receive_terminal_credit():
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(0, 32, (2, 4))
+    batch = trim_stream(
+        rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=1,
+            max_stream_steps=2,
+            temperature=1.0,
+            top_p=1e-6,
+            stop_ids=tuple(range(32)),
+            force_initial_think=True,
+        )
+    )
+    assert torch.all(batch.action_mask.sum(1) == 2)
+    assert torch.all(batch.gate_mask.sum(1) == 1)
+    scores = torch.tensor([0.25, 0.75])
+    assign_terminal_rewards(batch, scores)
+    advantages, _ = generalized_advantage_estimate(
+        batch.rewards,
+        batch.old_values,
+        batch.action_mask,
+        torch.ones(2),
+    )
+    for row, score in enumerate(scores):
+        torch.testing.assert_close(
+            advantages[row][batch.action_mask[row].bool()],
+            torch.full((2,), float(score)),
+        )
+
+
+def test_forced_initial_think_trains_content_but_not_the_gate():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = rollout_continuations(
+        wrapper,
+        torch.randint(0, 32, (4, 5)),
+        max_new_tokens=0,
+        max_stream_steps=1,
+        temperature=1.0,
+        top_p=1.0,
+        generator=torch.Generator().manual_seed(17),
+        force_initial_think=True,
+    )
+    assert batch.gate_mask.sum() == 0
+    assign_terminal_rewards(batch, torch.tensor([0.1, 0.3, 0.6, 0.9]))
+    refresh_old_statistics(wrapper, critic, batch)
+    gate_before = [parameter.detach().clone() for parameter in wrapper.gate.parameters()]
+    projector_before = [
+        parameter.detach().clone()
+        for parameter in wrapper.backbone.prediction_projector.parameters()
+    ]
+    metrics = update_minibatch(
+        wrapper, critic, batch, _optimizers(wrapper, critic)
+    )
+    assert metrics["gate_loss"] == 0.0
+    assert metrics["think_action_count"] == 0.0
+    assert metrics["forced_initial_think_action_count"] == 4.0
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(gate_before, wrapper.gate.parameters(), strict=True)
+    )
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(
+            projector_before,
+            wrapper.backbone.prediction_projector.parameters(),
+            strict=True,
+        )
+    )
+
+
+def test_diagnostics_separate_forced_initial_and_optional_thinking():
+    wrapper = _deterministic_wrapper()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    batch.reward_scalar.copy_(torch.tensor([0.0, 0.25, 0.5, 1.0]))
+    metrics = rollout_diagnostics(batch, samples_per_prompt=4)
+    assert metrics["think_fraction"] == 0.0
+    assert metrics["forced_initial_thinks_per_trajectory"] == 0.5
+    assert metrics["thoughts_per_trajectory"] == 0.5
+    assert metrics["forced_initial_trajectory_fraction"] == 0.5
+    assert metrics["reward_mean_forced_initial"] == pytest.approx(0.25)
+    assert metrics["reward_mean_unforced_initial"] == pytest.approx(0.625)
+    assert metrics["optional_thinking_trajectory_fraction"] == 0.0
+    assert metrics["reward_mean_no_optional_thinking"] == pytest.approx(0.4375)
 
 
 def test_gate_pg_coef_zero_freezes_the_gate_but_not_the_rest():
@@ -320,18 +496,29 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
     refresh_old_statistics(wrapper, critic, batch)
     backbone = wrapper.backbone
     with torch.no_grad():
-        beliefs, predicted, features, token_targets = replay_head_inputs(wrapper, batch)
+        beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
+            wrapper, batch
+        )
         values = critic.values(batch).float()
         gate_logprobs = wrapper.gate.log_prob(batch.gate_actions.float(), beliefs)
-        token_logprobs = (
-            backbone.logits_from_features(features)
+        emit_mask = batch.emit_mask.bool()
+        emit_features = wrapper.renderer_features(
+            stream_inputs[emit_mask], beliefs[emit_mask]
+        )
+        compact_token_logprobs = (
+            backbone.logits_from_features(emit_features)
             .float()
             .log_softmax(-1)
-            .gather(-1, token_targets[..., None])
+            .gather(-1, token_targets[emit_mask][..., None])
             .squeeze(-1)
         )
+        token_logprobs = torch.zeros_like(batch.old_token_logprobs)
+        token_logprobs[emit_mask] = compact_token_logprobs
     assert torch.equal(batch.old_values, values)
-    assert torch.equal(batch.old_gate_logprobs, gate_logprobs.float())
+    assert torch.equal(
+        batch.old_gate_logprobs,
+        gate_logprobs.float() * batch.gate_mask,
+    )
     assert torch.equal(batch.old_token_logprobs, token_logprobs)
     with torch.no_grad():
         thought_means, thought_targets, think_mask = select_thought_actions(
@@ -344,6 +531,230 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
         thought_logprobs[think_mask] = compact_logprobs
     # Epoch-0 per-dim thought ratios are exactly one by construction.
     assert torch.equal(batch.old_thought_logprobs, thought_logprobs.float())
+
+
+def test_microbatched_refresh_matches_full_group_refresh():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=5, prompt=6, new_tokens=4)
+    full = copy.deepcopy(batch)
+    microbatched = copy.deepcopy(batch)
+
+    refresh_old_statistics(
+        wrapper, critic, full, max_trajectories=5,
+        attention_budget=10**9,
+    )
+    refresh_old_statistics(
+        wrapper, critic, microbatched, max_trajectories=2,
+        attention_budget=10**9,
+    )
+
+    masks = {
+        "old_values": batch.action_mask.bool(),
+        "old_gate_logprobs": batch.gate_mask.bool(),
+        "old_token_logprobs": batch.emit_mask.bool(),
+        "old_thought_logprobs": (
+            (batch.gate_actions == THINK) & batch.action_mask.bool()
+        ),
+    }
+    for name, mask in masks.items():
+        torch.testing.assert_close(
+            getattr(microbatched, name)[mask],
+            getattr(full, name)[mask],
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+
+def test_length_aware_replay_planner_sorts_and_respects_attention_area():
+    wrapper = _wrapper()
+    batch = rollout_continuations(
+        wrapper,
+        torch.randint(0, 32, (5, 4)),
+        max_new_tokens=4,
+        max_stream_steps=20,
+        temperature=1.0,
+        top_p=1.0,
+        force_initial_think=torch.tensor([True, False, True, False, False]),
+    )
+    # Give rows deliberately non-monotonic used lengths without changing the
+    # parent row order. Replay sorting must be stable and local to the plan.
+    lengths = [9, 17, 12, 20, 10]
+    for row, length in enumerate(lengths):
+        batch.kind[row, :length] = TOKEN_SLOT
+        batch.kind[row, length:] = PAD_SLOT
+    budget = 2 * 16 * 16
+    shards = list(
+        iter_length_aware_microbatches(
+            batch,
+            max_trajectories=5,
+            attention_budget=budget,
+            bucket_multiple=4,
+        )
+    )
+    planned_rows = [row for _, rows, _ in shards for row in rows.tolist()]
+    assert planned_rows == [3, 1, 2, 4, 0]
+    for microbatch, rows, stream_length in shards:
+        assert microbatch.kind.shape == (rows.numel(), stream_length)
+        assert rows.numel() == 1 or rows.numel() * stream_length**2 <= budget
+
+
+def test_length_aware_refresh_writes_noncontiguous_parent_rows():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=6, prompt=6, new_tokens=4)
+    batch.old_values.fill_(float("nan"))
+    batch.old_gate_logprobs.fill_(float("nan"))
+    batch.old_token_logprobs.fill_(float("nan"))
+    refresh_old_statistics(
+        wrapper,
+        critic,
+        batch,
+        max_trajectories=2,
+        attention_budget=10**9,
+    )
+    assert torch.isfinite(batch.old_values[batch.action_mask.bool()]).all()
+    assert torch.isfinite(batch.old_gate_logprobs[batch.gate_mask.bool()]).all()
+    assert torch.isfinite(batch.old_token_logprobs[batch.emit_mask.bool()]).all()
+    think_mask = (batch.gate_actions == THINK) & batch.action_mask.bool()
+    assert torch.isfinite(batch.old_thought_logprobs[think_mask]).all()
+
+
+def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
+    base_wrapper = _wrapper()
+    with torch.no_grad():
+        # Ensure optional THINK actions as well as the forced action are
+        # represented on both sides of the trajectory-microbatch boundary.
+        base_wrapper.gate.head.bias.fill_(-0.5)
+    base_critic = _critic()
+    batch = _rollout(
+        base_wrapper, batch=6, prompt=5, new_tokens=4, stream_steps=20, seed=19
+    )
+    scores = torch.tensor([0.9, 0.1, 0.7, 0.2, 0.8, 0.3])
+    assign_terminal_rewards(batch, scores)
+    refresh_old_statistics(
+        base_wrapper, base_critic, batch,
+        max_trajectories=batch.kind.size(0), attention_budget=10**9,
+    )
+    assert bool(((batch.gate_actions == THINK) & batch.gate_mask.bool()).any())
+    # The stored behavior statistics stay frozen while all three actor
+    # factors move. This makes the shard-invariance check exercise nonzero
+    # KL accumulation rather than the trivial refresh-equals-current case.
+    with torch.no_grad():
+        base_wrapper.gate.head.bias.add_(0.01)
+        renderer_output = base_wrapper.backbone.policy_probe.output.weight
+        renderer_output.add_(
+            torch.linspace(
+                -0.01, 0.01, renderer_output.numel()
+            ).reshape_as(renderer_output)
+        )
+        thought_bias = (
+            base_wrapper.backbone.prediction_projector.output.bias
+        )
+        thought_bias.add_(
+            torch.linspace(-0.01, 0.01, thought_bias.numel())
+        )
+
+    full_wrapper = copy.deepcopy(base_wrapper)
+    micro_wrapper = copy.deepcopy(base_wrapper)
+    full_critic = copy.deepcopy(base_critic)
+    micro_critic = copy.deepcopy(base_critic)
+    full_optimizers = _optimizers(full_wrapper, full_critic)
+    micro_optimizers = _optimizers(micro_wrapper, micro_critic)
+
+    kwargs = dict(
+        positive_lm_weight=0.1,
+        positive_reward_threshold=0.5,
+        thought_pg_coef=0.7,
+        gate_pg_coef=0.8,
+    )
+    full_metrics = update_minibatch(
+        full_wrapper,
+        full_critic,
+        copy.deepcopy(batch),
+        full_optimizers,
+        replay_max_trajectories=6,
+        replay_attention_budget=10**9,
+        **kwargs,
+    )
+    micro_metrics = update_minibatch(
+        micro_wrapper,
+        micro_critic,
+        copy.deepcopy(batch),
+        micro_optimizers,
+        replay_max_trajectories=2,
+        replay_attention_budget=10**9,
+        **kwargs,
+    )
+
+    for key in (
+        "value_loss",
+        "gate_loss",
+        "renderer_loss",
+        "positive_lm_loss",
+        "thought_loss",
+        "advantage_mean",
+        "advantage_std",
+        "gate_behavior_kl",
+        "renderer_behavior_kl",
+        "thought_behavior_kl_joint",
+        "thought_behavior_kl_per_dim",
+        "policy_behavior_kl_per_action",
+    ):
+        torch.testing.assert_close(
+            torch.tensor(micro_metrics[key]),
+            torch.tensor(full_metrics[key]),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+    for micro_parameter, full_parameter in zip(
+        micro_wrapper.parameters(), full_wrapper.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            # Adam amplifies near-zero gradient reduction noise into a
+            # learning-rate-sized sign difference; the objectives above are
+            # the exactness assertion, while parameters remain numerically
+            # equivalent at optimizer precision.
+            micro_parameter, full_parameter, rtol=3e-4, atol=2e-5
+        )
+    for micro_parameter, full_parameter in zip(
+        micro_critic.parameters(), full_critic.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            micro_parameter, full_parameter, rtol=3e-4, atol=2e-5
+        )
+
+    assert full_metrics["gate_behavior_kl"] > 0
+    assert full_metrics["renderer_behavior_kl"] > 0
+    assert full_metrics["thought_behavior_kl_joint"] > 0
+    torch.testing.assert_close(
+        torch.tensor(full_metrics["thought_behavior_kl_joint"]),
+        torch.tensor(full_metrics["thought_behavior_kl_per_dim"])
+        * batch.old_thought_logprobs.size(-1),
+    )
+    gate_count = batch.gate_mask.sum()
+    emit_count = batch.emit_mask.sum()
+    thought_count = (
+        (batch.gate_actions == THINK).float() * batch.action_mask
+    ).sum()
+    expected_policy_kl = (
+        full_metrics["gate_behavior_kl"] * gate_count
+        + full_metrics["renderer_behavior_kl"] * emit_count
+        + full_metrics["thought_behavior_kl_joint"] * thought_count
+    ) / batch.action_mask.sum()
+    torch.testing.assert_close(
+        torch.tensor(full_metrics["policy_behavior_kl_per_action"]),
+        expected_policy_kl,
+    )
+
+    # Adam must see one full-group update, not one update per replay shard.
+    for optimizer in micro_optimizers.values():
+        steps = {
+            int(state["step"])
+            for state in optimizer.state.values()
+            if "step" in state
+        }
+        assert steps == {1}
 
 
 def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
@@ -371,7 +782,7 @@ def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
     advantages, _ = generalized_advantage_estimate(
         batch.rewards, batch.old_values, batch.action_mask, torch.ones(4)
     )
-    loss, _ = per_dim_clipped_policy_loss(
+    loss, _, _ = per_dim_clipped_policy_loss(
         new_logprobs,
         batch.old_thought_logprobs[think_mask],
         advantages.detach()[think_mask],
@@ -389,12 +800,7 @@ def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
     assert projector_grad > 0.0
 
 
-@pytest.mark.parametrize(
-    ("gate_bias", "thought_pg_coef"),
-    ((100.0, 1.0), (-2.0, 0.0)),
-)
 def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
-    gate_bias: float, thought_pg_coef: float
 ):
     wrapper = _wrapper()
     critic = _critic()
@@ -407,27 +813,27 @@ def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
     projector_parameters[0].grad = torch.ones_like(projector_parameters[0])
     optimizers["actor"].step()
     optimizers["actor"].zero_grad(set_to_none=True)
-    before = [parameter.detach().clone() for parameter in projector_parameters]
 
     with torch.no_grad():
         wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(gate_bias)
+        wrapper.gate.head.bias.fill_(-2.0)
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
     think_mask = (batch.gate_actions == THINK) & batch.action_mask.bool()
-    if thought_pg_coef:
-        assert not bool(think_mask.any())
-    else:
-        assert bool(think_mask.any())
+    assert bool(think_mask.any())
     assign_terminal_rewards(batch, torch.rand(4))
     refresh_old_statistics(wrapper, critic, batch)
-    update_minibatch(
+    with torch.no_grad():
+        wrapper.backbone.prediction_projector.output.bias.add_(0.01)
+    before = [parameter.detach().clone() for parameter in projector_parameters]
+    metrics = update_minibatch(
         wrapper,
         critic,
         batch,
         optimizers,
-        thought_pg_coef=thought_pg_coef,
+        thought_pg_coef=0.0,
     )
 
+    assert metrics["thought_behavior_kl_joint"] > 0
     assert all(parameter.grad is None for parameter in projector_parameters)
     for parameter, reference in zip(projector_parameters, before, strict=True):
         torch.testing.assert_close(parameter, reference)
@@ -537,6 +943,11 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     # so nothing clipped on the first update.
     assert metrics["gate_clip_fraction"] == 0.0
     assert metrics["renderer_clip_fraction"] == 0.0
+    assert metrics["gate_behavior_kl"] == 0.0
+    assert metrics["renderer_behavior_kl"] == 0.0
+    assert metrics["thought_behavior_kl_joint"] == 0.0
+    assert metrics["thought_behavior_kl_per_dim"] == 0.0
+    assert metrics["policy_behavior_kl_per_action"] == 0.0
 
 
 def test_lambda_one_value_targets_equal_the_terminal_reward_everywhere():
@@ -580,12 +991,12 @@ def test_sample_prompt_batch_groups_and_aligns_references():
     assert not torch.equal(prompt_ids[0], prompt_ids[2])
 
 
-def test_evaluate_aime_latent_scores_through_the_gate_policy():
+def test_evaluate_aime_latent_scores_through_the_gate_policy(monkeypatch):
     wrapper = _wrapper()
 
     class _Tokenizer:
         def eos_id(self) -> int:
-            return -1
+            return 5
 
         def bos_id(self) -> int:
             return -1
@@ -600,6 +1011,15 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy():
         {"prompt": [{"content": "question"}], "reward_model": {"ground_truth": "42"}},
         {"prompt": [{"content": "other"}], "reward_model": {"ground_truth": "7"}},
     ]
+    import postraining.latent_eval as evaluator
+
+    # Isolate counting/verification from random rollout termination while
+    # satisfying the production scorer's explicit-termination contract.
+    monkeypatch.setattr(
+        evaluator,
+        "emitted_token_rows",
+        lambda batch: [[5] for _ in range(batch.kind.size(0))],
+    )
     metrics = evaluate_aime_latent(
         wrapper, _Tokenizer(), rows, samples=4, max_new_tokens=3,
         max_stream_steps=12, chunk=3, seed=5, device=torch.device("cpu"),
@@ -609,6 +1029,9 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy():
     # always wrong, so accuracy pins both counting and verification.
     assert metrics["samples"] == 8
     assert metrics["accuracy"] == 0.5
+    assert metrics["forced_initial_fraction"] == 0.5
+    assert metrics["forced_initial_accuracy"] == 0.5
+    assert metrics["unforced_initial_accuracy"] == 0.5
     assert 0.0 <= metrics["think_fraction"] <= 1.0
     # The eval must not perturb training RNG state.
     before = torch.get_rng_state()
@@ -620,6 +1043,411 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy():
     assert torch.equal(before, torch.get_rng_state())
 
 
+def test_evaluate_aime_latent_captures_first_four_problems_in_dataset_order(
+    monkeypatch,
+):
+    wrapper = _wrapper()
+
+    class _Tokenizer:
+        def eos_id(self) -> int:
+            return 5
+
+        def bos_id(self) -> int:
+            return -1
+
+        def encode(self, text: str) -> list[int]:
+            # Deliberately reverse length versus dataset order to exercise
+            # evaluation's stable length bucketing.
+            return list(range(1, len(text) + 1))
+
+        def decode(self, ids: list[int]) -> str:
+            return "work\nAnswer: 42"
+
+    rows = [
+        {
+            "prompt": [{"content": text}],
+            "reward_model": {"ground_truth": "42"},
+            "extra_info": {"index": 100 + index},
+        }
+        for index, text in enumerate(("longest", "x", "medium", "xx", "ignored"))
+    ]
+    import postraining.latent_eval as evaluator
+
+    monkeypatch.setattr(
+        evaluator,
+        "emitted_token_rows",
+        lambda batch: [[5] for _ in range(batch.kind.size(0))],
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "emitted_token_and_kind_rows",
+        lambda batch: (
+            [[5] for _ in range(batch.kind.size(0))],
+            batch.kind[:, batch.prompt_length :].tolist(),
+        ),
+    )
+    attempts: list[dict[str, object]] = []
+    metrics = evaluate_aime_latent(
+        wrapper,
+        _Tokenizer(),
+        rows,
+        samples=4,
+        max_new_tokens=2,
+        max_stream_steps=8,
+        chunk=4,
+        seed=5,
+        device=torch.device("cpu"),
+        prompt_tokens=16,
+        batch_trajectories=20,
+        captured_attempts=attempts,
+    )
+
+    assert metrics["samples"] == 20
+    assert len(attempts) == 16
+    assert [
+        (attempt["problem_index"], attempt["sample_index"])
+        for attempt in attempts
+    ] == [(problem, sample) for problem in range(4) for sample in range(4)]
+    assert [attempts[problem * 4]["prompt"] for problem in range(4)] == [
+        "longest",
+        "x",
+        "medium",
+        "xx",
+    ]
+    assert [attempts[problem * 4]["dataset_index"] for problem in range(4)] == [
+        "100",
+        "101",
+        "102",
+        "103",
+    ]
+    for problem in range(4):
+        group = attempts[problem * 4 : (problem + 1) * 4]
+        assert [attempt["forced_initial_think"] for attempt in group] == [
+            True,
+            False,
+            True,
+            False,
+        ]
+    for attempt in attempts:
+        trace = str(attempt["action_trace"])
+        assert attempt["terminated"] is True
+        assert attempt["correct"] is True
+        assert attempt["parsed_answer"] == "42"
+        assert attempt["total_thought_count"] == trace.count("T")
+        assert attempt["optional_thought_count"] == (
+            trace.count("T") - int(bool(attempt["forced_initial_think"]))
+        )
+        assert sum(attempt["think_run_lengths"]) == trace.count("T")
+        assert attempt["emitted_token_ids"] == [5]
+
+    full_capture: list[dict[str, object]] = []
+    evaluate_aime_latent(
+        wrapper,
+        _Tokenizer(),
+        rows,
+        samples=4,
+        max_new_tokens=2,
+        max_stream_steps=8,
+        chunk=3,
+        seed=5,
+        device=torch.device("cpu"),
+        prompt_tokens=16,
+        batch_trajectories=12,
+        captured_attempts=full_capture,
+        capture_problem_count=5,
+        capture_samples_per_problem=4,
+    )
+    assert [
+        (attempt["problem_index"], attempt["sample_index"])
+        for attempt in full_capture
+    ] == [(problem, sample) for problem in range(5) for sample in range(4)]
+
+
+def test_evaluate_aime_latent_preserves_half_member_assignment_across_chunks(
+    monkeypatch,
+):
+    wrapper = _wrapper()
+
+    class _Tokenizer:
+        def eos_id(self) -> int:
+            return 5
+
+        def bos_id(self) -> int:
+            return -1
+
+        def encode(self, text: str) -> list[int]:
+            return [1, 2, 3]
+
+        def decode(self, ids: list[int]) -> str:
+            return "Answer: 42"
+
+    import postraining.latent_eval as evaluator
+
+    seen = []
+    original = evaluator.rollout_continuations
+
+    def _spy(*args, **kwargs):
+        seen.append(kwargs["force_initial_think"].tolist())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(evaluator, "rollout_continuations", _spy)
+    evaluate_aime_latent(
+        wrapper,
+        _Tokenizer(),
+        [{"prompt": [{"content": "q"}], "reward_model": {"ground_truth": "42"}}],
+        samples=4,
+        max_new_tokens=2,
+        max_stream_steps=8,
+        chunk=3,
+        seed=5,
+        device=torch.device("cpu"),
+        prompt_tokens=8,
+    )
+    assert seen == [[True, False, True], [False]]
+
+
+def test_finished_row_compaction_preserves_original_row_attribution():
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(0, 32, (8, 4))
+    forced = torch.arange(8).remainder(2) == 0
+
+    def run(compact_finished: bool):
+        torch.manual_seed(31)
+        return rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=0,
+            max_stream_steps=1,
+            temperature=1.0,
+            top_p=1e-6,
+            force_initial_think=forced,
+            compact_finished=compact_finished,
+        )
+
+    compact = run(True)
+    reference = run(False)
+    for field in (
+        "kind",
+        "token_ids",
+        "thoughts",
+        "gate_actions",
+        "action_mask",
+        "gate_mask",
+    ):
+        torch.testing.assert_close(getattr(compact, field), getattr(reference, field))
+    boundary = compact.prompt_length - 1
+    assert compact.action_mask[:, boundary].bool().tolist() == forced.tolist()
+
+
+def test_evaluate_aime_latent_batches_unequal_prompt_groups_without_replay_storage(
+    monkeypatch,
+):
+    wrapper = _wrapper()
+
+    class _Tokenizer:
+        def eos_id(self) -> int:
+            return 5
+
+        def bos_id(self) -> int:
+            return -1
+
+        def encode(self, text: str) -> list[int]:
+            return list(range(1, len(text) + 1))
+
+        def decode(self, ids: list[int]) -> str:
+            return "Answer: 42"
+
+    rows = [
+        {
+            "prompt": [{"content": text}],
+            "reward_model": {"ground_truth": "42"},
+        }
+        for text in ("a", "abcd", "ab")
+    ]
+    import postraining.latent_eval as evaluator
+
+    seen = []
+    original = evaluator.rollout_continuations
+
+    def _spy(wrapper_arg, prompt_ids, *args, **kwargs):
+        seen.append(
+            (
+                prompt_ids.clone(),
+                kwargs["prompt_lengths"].clone(),
+                kwargs["force_initial_think"].clone(),
+                kwargs["replay_storage"],
+                kwargs["record_likelihoods"],
+                args[2],
+                args[3],
+            )
+        )
+        return original(wrapper_arg, prompt_ids, *args, **kwargs)
+
+    monkeypatch.setattr(evaluator, "rollout_continuations", _spy)
+    metrics = evaluate_aime_latent(
+        wrapper, _Tokenizer(), rows, samples=4, max_new_tokens=2,
+        max_stream_steps=8, chunk=4, seed=5, device=torch.device("cpu"),
+        prompt_tokens=8, batch_trajectories=12,
+        temperature=0.8, top_p=0.6,
+    )
+    assert metrics["samples"] == 12
+    assert len(seen) == 1
+    (
+        prompt_ids,
+        prompt_lengths,
+        forced,
+        replay_storage,
+        record_likelihoods,
+        temperature,
+        top_p,
+    ) = seen[0]
+    assert prompt_ids.shape == (12, 4)
+    assert prompt_lengths.tolist() == [1] * 4 + [2] * 4 + [4] * 4
+    assert prompt_ids[0].tolist() == [0, 0, 0, 1]
+    assert prompt_ids[4].tolist() == [0, 0, 1, 2]
+    assert prompt_ids[8].tolist() == [1, 2, 3, 4]
+    assert forced.tolist() == [True, False, True, False] * 3
+    assert replay_storage is False
+    assert record_likelihoods is False
+    assert temperature == 0.8
+    assert top_p == 0.6
+
+
+def test_dynamic_compiled_step_accepts_tensor_positions_and_prompt_masks():
+    wrapper = _wrapper()
+    original = wrapper.step_core
+    wrapper.step_core = torch.compile(
+        wrapper.step_core, backend="eager", fullgraph=True, dynamic=True
+    )
+    prompt_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    batch = rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=2,
+        max_stream_steps=8,
+        temperature=1.0,
+        top_p=1.0,
+        prompt_lengths=torch.tensor([2, 3]),
+        force_initial_think=torch.tensor([True, False]),
+        tensor_positions=True,
+        replay_storage=False,
+    )
+    assert batch.thoughts.shape == (2, 11, 0)
+    assert batch.old_thought_logprobs.shape == (2, 11, 0)
+    assert batch.action_mask.sum() >= 2
+    wrapper.step_core = original
+
+
+def test_eval_only_sampling_is_policy_identical_to_replay_rollout():
+    wrapper = _wrapper()
+    prompt_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    forced = torch.tensor([True, False])
+
+    def run(replay_storage: bool):
+        torch.manual_seed(23)
+        return rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=4,
+            max_stream_steps=16,
+            temperature=1.0,
+            top_p=0.7,
+            generator=torch.Generator().manual_seed(29),
+            force_initial_think=forced,
+            replay_storage=replay_storage,
+        )
+
+    replay = run(True)
+    evaluation = run(False)
+    for field in (
+        "kind",
+        "token_ids",
+        "gate_actions",
+        "action_mask",
+        "gate_mask",
+        "emit_mask",
+    ):
+        assert torch.equal(getattr(evaluation, field), getattr(replay, field))
+    assert evaluation.thoughts.shape[-1] == 0
+    assert replay.thoughts.shape[-1] == KWARGS["model_dim"]
+
+
+def test_evaluation_compile_failure_restarts_eager_and_restores_capture(monkeypatch):
+    wrapper = _wrapper()
+    original = wrapper.step_core
+
+    class _Tokenizer:
+        def eos_id(self) -> int:
+            return 5
+
+        def bos_id(self) -> int:
+            return -1
+
+        def encode(self, text: str) -> list[int]:
+            return [1, 2, 3]
+
+        def decode(self, ids: list[int]) -> str:
+            return "Answer: 42"
+
+    def compiled_proxy(*args, **kwargs):
+        return original(*args, **kwargs)
+
+    rows = [
+        {
+            "prompt": [{"content": f"q-{index}"}],
+            "reward_model": {"ground_truth": "42"},
+        }
+        for index in range(4)
+    ]
+    import postraining.latent_eval as evaluator
+
+    rollout = evaluator.rollout_continuations
+    compiled_calls = 0
+    compaction_modes: list[bool] = []
+
+    def fail_after_partial_capture(wrapper_arg, *args, **kwargs):
+        nonlocal compiled_calls
+        compaction_modes.append(kwargs["compact_finished"])
+        if wrapper_arg.step_core is compiled_proxy:
+            compiled_calls += 1
+            if compiled_calls == 2:
+                raise torch._dynamo.exc.Unsupported("test-only compile failure")
+        return rollout(wrapper_arg, *args, **kwargs)
+
+    monkeypatch.setattr(
+        evaluator, "rollout_continuations", fail_after_partial_capture
+    )
+    attempts: list[dict[str, object]] = []
+    with pytest.warns(RuntimeWarning, match="rerunning this evaluation eager"):
+        metrics = evaluate_aime_latent(
+            wrapper, _Tokenizer(), rows, samples=4, max_new_tokens=2,
+            max_stream_steps=8, chunk=4, seed=5, device=torch.device("cpu"),
+            prompt_tokens=8, batch_trajectories=4,
+            compiled_step_core=compiled_proxy, captured_attempts=attempts,
+        )
+    assert metrics["samples"] == 16
+    assert len(attempts) == 16
+    assert [
+        (attempt["problem_index"], attempt["sample_index"])
+        for attempt in attempts
+    ] == [(problem, sample) for problem in range(4) for sample in range(4)]
+    assert wrapper.step_core == original
+    assert compaction_modes and not any(compaction_modes)
+    assert metrics["compiled"] is False
+    assert metrics["compile_fallback"] is True
+    calls_after_failure = compiled_calls
+
+    second_metrics = evaluate_aime_latent(
+        wrapper, _Tokenizer(), rows, samples=4, max_new_tokens=2,
+        max_stream_steps=8, chunk=4, seed=5, device=torch.device("cpu"),
+        prompt_tokens=8, batch_trajectories=4,
+        compiled_step_core=compiled_proxy,
+    )
+    assert compiled_calls == calls_after_failure
+    assert second_metrics["compiled"] is False
+    assert second_metrics["compile_fallback"] is False
+
+
 def test_positive_lm_loss_applies_only_above_the_reward_threshold():
     wrapper = _wrapper()
     critic = _critic()
@@ -629,6 +1457,7 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
         wrapper, critic, actor_lr=1e-4, head_lr=1e-3, critic_lr=1e-4
     )
     assign_terminal_rewards(batch, torch.tensor([0.9, 0.1, 0.6, 0.2]))
+    refresh_old_statistics(wrapper, critic, batch)
     metrics = update_minibatch(
         wrapper, critic, batch, optimizers, positive_lm_weight=0.1
     )
@@ -638,6 +1467,7 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
     assert metrics["positive_lm_loss"] > 0.0
     # No qualifying trajectory: the loss term is exactly zero.
     assign_terminal_rewards(batch, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+    refresh_old_statistics(wrapper, critic, batch)
     metrics = update_minibatch(
         wrapper, critic, batch, optimizers, positive_lm_weight=0.1
     )
@@ -728,7 +1558,32 @@ def test_math_prompt_sampler_resumes_deterministically_across_epochs():
     assert MathPromptSampler(rows, seed=4).next_rows(10) != full
 
 
-def test_score_math_rollout_scores_the_verifier_on_truncated_decodes():
+def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
+    wrapper = _wrapper()
+    critic = _critic()
+    optimizers = _optimizers(wrapper, critic)
+    sampler = MathPromptSampler([{"id": index} for index in range(4)], seed=3)
+    sampler.next_rows(3)
+    checkpoint = tmp_path / "warmup.pt"
+    save_checkpoint(
+        checkpoint,
+        wrapper,
+        critic,
+        optimizers,
+        step=0,
+        args=SimpleNamespace(value_warmup_steps=50),
+        sampler=sampler,
+        warmup_step=20,
+    )
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert payload["step"] == 0
+    assert payload["value_warmup_step"] == 20
+    assert payload["sampler_cursor"] == 3
+    assert payload["execution_schema"] == EXECUTION_SCHEMA
+    assert payload["reward_schema"] == REWARD_SCHEMA
+
+
+def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):
     wrapper = _wrapper()
     eos = 5
     batch = _rollout(wrapper, batch=4, prompt=4, new_tokens=8)
@@ -742,10 +1597,18 @@ def test_score_math_rollout_scores_the_verifier_on_truncated_decodes():
             return "Answer: 42"
 
     tokenizer = _Tokenizer()
+    import postraining.train_latent_vapo as trainer
+
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [[1, eos, 9], [1, 2, 3], [eos], [4, eos]],
+    )
     score_math_rollout(batch, "42", tokenizer, (eos,))
-    assert batch.reward_scalar.tolist() == [1.0, 1.0, 1.0, 1.0]
-    # One decode per row, each EOS-truncated: EOS may only appear last.
-    assert len(tokenizer.calls) == 4
+    assert batch.reward_scalar.tolist() == [1.0, 0.0, 1.0, 1.0]
+    # Unterminated rows are rejected without calling the answer verifier;
+    # terminated rows are decoded only through the first stop token.
+    assert len(tokenizer.calls) == 3
     for ids in tokenizer.calls:
         assert eos not in ids[:-1]
     # Rewards land once per row, on the final gate-decision position.
@@ -757,6 +1620,20 @@ def test_score_math_rollout_scores_the_verifier_on_truncated_decodes():
     )
     score_math_rollout(batch, "7", tokenizer, (eos,))
     assert batch.reward_scalar.tolist() == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_verify_terminated_answer_rejects_cap_truncation():
+    class _Tokenizer:
+        def decode(self, ids: list[int]) -> str:
+            return "Answer: 42"
+
+    tokenizer = _Tokenizer()
+    assert verify_terminated_answer([1, 2, 3], "42", tokenizer, (5, 4)) == (
+        False,
+        "[UNTERMINATED]",
+    )
+    assert verify_terminated_answer([1, 5, 3], "42", tokenizer, (5, 4))[0]
+    assert verify_terminated_answer([1, 4, 3], "42", tokenizer, (5, 4))[0]
 
 
 def test_evaluate_aime_latent_threads_stop_ids_into_the_rollout(monkeypatch):
@@ -786,19 +1663,24 @@ def test_evaluate_aime_latent_threads_stop_ids_into_the_rollout(monkeypatch):
         seen.append(kwargs.get("stop_ids"))
         return rollout_continuations(*args, **kwargs)
 
-    import postraining.train_latent_vapo as trainer
+    import postraining.latent_eval as evaluator
 
-    monkeypatch.setattr(trainer, "rollout_continuations", _spy)
+    monkeypatch.setattr(evaluator, "rollout_continuations", _spy)
     # Both boundary tokens must reach the rollout so eval rows stop exactly
-    # like training rollouts; -1 sentinels must drop out, and no tokens at
-    # all must map to None (no stop handling).
-    for eos, bos, expected in ((5, 4, (5, 4)), (5, -1, (5,)), (-1, -1, None)):
+    # like training rollouts; -1 sentinels drop out.
+    for eos, bos, expected in ((5, 4, (5, 4)), (5, -1, (5,))):
         evaluate_aime_latent(
             wrapper, _Tokenizer(eos, bos), rows, samples=2, max_new_tokens=2,
             max_stream_steps=8, chunk=2, seed=5, device=torch.device("cpu"),
             prompt_tokens=8,
         )
         assert seen and seen[-1] == expected
+    with pytest.raises(RuntimeError, match="requires a valid BOS or EOS"):
+        evaluate_aime_latent(
+            wrapper, _Tokenizer(-1, -1), rows, samples=2, max_new_tokens=2,
+            max_stream_steps=8, chunk=2, seed=5, device=torch.device("cpu"),
+            prompt_tokens=8,
+        )
 
 
 def test_evaluate_aime_latent_keeps_the_prompt_tail(monkeypatch):
@@ -824,9 +1706,9 @@ def test_evaluate_aime_latent_keeps_the_prompt_tail(monkeypatch):
         seen.append(prompt_ids.clone())
         return rollout_continuations(wrapper_arg, prompt_ids, *args, **kwargs)
 
-    import postraining.train_latent_vapo as trainer
+    import postraining.latent_eval as evaluator
 
-    monkeypatch.setattr(trainer, "rollout_continuations", _spy)
+    monkeypatch.setattr(evaluator, "rollout_continuations", _spy)
     # The question and answer-format instruction sit at the END of DAPO/AIME
     # prompts, so truncation must keep the tail — behind the BOS that frames
     # the prompt as a document start, matching the training path.
@@ -860,6 +1742,57 @@ def test_key_mask_step_matches_the_narrow_step_over_a_padded_cache():
         torch.testing.assert_close(masked.belief, reference.belief)
         torch.testing.assert_close(masked.predicted, reference.predicted)
         torch.testing.assert_close(masked.logits, reference.logits)
+
+
+def test_generation_cache_dtype_does_not_cast_base_model_master_weights():
+    model = FreshLeJEPAGPT(**KWARGS).eval()
+    assert {parameter.dtype for parameter in model.parameters()} == {
+        torch.float32
+    }
+
+    caches = model.make_generation_cache(
+        batch_size=2,
+        max_length=7,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    assert all(
+        tensor.dtype == torch.bfloat16 for cache in caches for tensor in cache
+    )
+    assert {parameter.dtype for parameter in model.parameters()} == {
+        torch.float32
+    }
+
+
+def test_generation_cache_dtype_flows_through_pope_wrapper_and_static_cache():
+    wrapper = _wrapper()
+    assert {parameter.dtype for parameter in wrapper.parameters()} == {
+        torch.float32
+    }
+
+    dynamic = wrapper.make_generation_cache(
+        batch_size=2,
+        max_length=7,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    static = wrapper.make_static_generation_cache(
+        batch_size=2,
+        cache_length=7,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    for caches in (dynamic, static):
+        assert all(
+            tensor.dtype == torch.bfloat16
+            for cache in caches
+            for tensor in cache
+        )
+    assert {parameter.dtype for parameter in wrapper.parameters()} == {
+        torch.float32
+    }
 
 
 def test_key_mask_stepping_requires_a_tensor_position():
@@ -900,6 +1833,8 @@ def test_static_cache_rollout_matches_the_dynamic_rollout_and_is_reusable():
         assert torch.equal(static.kind, dynamic.kind)
         assert torch.equal(static.token_ids, dynamic.token_ids)
         assert torch.equal(static.gate_actions, dynamic.gate_actions)
+        assert torch.equal(static.action_mask, dynamic.action_mask)
+        assert torch.equal(static.gate_mask, dynamic.gate_mask)
         torch.testing.assert_close(static.thoughts, dynamic.thoughts)
         torch.testing.assert_close(
             static.old_gate_logprobs, dynamic.old_gate_logprobs
@@ -956,6 +1891,29 @@ def test_bucketed_trim_pads_to_the_multiple_without_changing_the_update():
             assert bucketed[key] == pytest.approx(value, rel=1e-5, abs=1e-6), key
 
 
+def test_trim_stream_releases_the_full_capacity_backing_storage():
+    wrapper = _wrapper()
+    prompt_ids = torch.randint(0, 32, (2, 5))
+    full = rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=1,
+        max_stream_steps=128,
+        temperature=1.0,
+        top_p=1.0,
+        generator=torch.Generator().manual_seed(7),
+    )
+    assert full.stream_length == prompt_ids.size(1) + 128
+
+    trimmed = trim_stream(full)
+    assert trimmed.stream_length < full.stream_length
+    for name in ("kind", "token_ids", "thoughts", "old_values"):
+        original = getattr(full, name)
+        compact = getattr(trimmed, name)
+        assert compact.untyped_storage().data_ptr() != original.untyped_storage().data_ptr(), name
+        assert compact.untyped_storage().nbytes() < original.untyped_storage().nbytes(), name
+
+
 def test_refresh_runs_grad_enabled_but_stores_detached_statistics():
     wrapper = _wrapper()
     critic = _critic()
@@ -977,6 +1935,10 @@ def _deterministic_wrapper() -> LatentThoughtModel:
     wrapper = _wrapper()
     with torch.no_grad():
         wrapper.gate.head.bias.fill_(40.0)
+        # Forced latents still sample when every optional gate emits.
+        # Underflow sigma so batched and sequential rows can consume different
+        # RNG shapes without changing the actual thought.
+        wrapper.transition.log_sigma.fill_(-100.0)
     return wrapper
 
 
@@ -999,14 +1961,23 @@ def test_left_padded_batched_rollout_matches_the_sequential_rollouts():
 
     torch.manual_seed(29)
     batched = rollout_continuations(
-        wrapper, prompt_ids, 4, 8, 1.0, 1e-6, prompt_lengths=prompt_lengths
+        wrapper, prompt_ids, 4, 8, 1.0, 1e-6,
+        prompt_lengths=prompt_lengths,
+        force_initial_think=half_forced_group_members(
+            len(prompts), samples, torch.device("cpu")
+        ),
     )
     groups = split_rollout_groups(batched, samples, prompt_lengths)
 
     for group, prompt in zip(groups, prompts, strict=True):
         torch.manual_seed(29)
-        expected = rollout_continuations(
-            wrapper, prompt[None].expand(samples, -1), 4, 8, 1.0, 1e-6
+        expected = trim_stream(
+            rollout_continuations(
+                wrapper, prompt[None].expand(samples, -1), 4, 8, 1.0, 1e-6,
+                force_initial_think=half_forced_group_members(
+                    1, samples, torch.device("cpu")
+                ),
+            )
         )
         # The padded rows shift every position by a constant, and PoPE
         # scores depend only on position differences — after undoing the
@@ -1017,7 +1988,9 @@ def test_left_padded_batched_rollout_matches_the_sequential_rollouts():
         assert torch.equal(group.token_ids, expected.token_ids)
         assert torch.equal(group.gate_actions, expected.gate_actions)
         assert torch.equal(group.action_mask, expected.action_mask)
+        assert torch.equal(group.gate_mask, expected.gate_mask)
         assert torch.equal(group.emit_mask, expected.emit_mask)
+        torch.testing.assert_close(group.thoughts, expected.thoughts)
         torch.testing.assert_close(
             group.old_token_logprobs,
             expected.old_token_logprobs,

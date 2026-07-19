@@ -13,6 +13,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+POSTTRAIN_REWARD_SCHEMA = "terminated_bos_or_eos_style_by_row/v2"
+
+
 # Latent-policy inference budget. The backbone was pretrained on 1024-token
 # sequences, while PoPE can execute beyond that window. Posttraining keeps a
 # full pretrained window available to the prompt and gives generation four
@@ -74,10 +77,93 @@ def normalize_final_answer(answer: str) -> str:
     return answer.strip()
 
 
-def verify_answer(solution: str, ground_truth: str) -> tuple[bool, str]:
-    matches = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", solution[-300:])
-    prediction = normalize_final_answer(matches[-1] if matches else "[INVALID]")
-    return prediction == normalize_final_answer(ground_truth), prediction
+# ``reward_model.style`` -> grading style.  The DAPO and AIME parquets tag
+# "rule-lighteval/MATH_v2" (Minerva normalization IS lighteval-MATH's grader);
+# the DeepMind mathematics_dataset conversions tag plain "rule" and are graded
+# the dataset's official way — exact match on the canonical answer string.
+_ANSWER_STYLE_BY_RULE = {
+    "rule": "exact",
+    "rule-lighteval/MATH_v2": "minerva",
+}
+
+
+def answer_style(row: dict) -> str:
+    """Grading style for one data row, resolved from its reward_model.style."""
+    rule = (row.get("reward_model") or {}).get("style")
+    return _ANSWER_STYLE_BY_RULE.get(rule, "minerva")
+
+
+def extract_final_answer(solution: str, window: int | None = 300) -> str | None:
+    """The last ``Answer: ...`` line, per the shared DAPO prompt contract."""
+    text = solution if window is None else solution[-window:]
+    matches = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", text)
+    return matches[-1] if matches else None
+
+
+def verify_answer(
+    solution: str, ground_truth: str, style: str = "minerva"
+) -> tuple[bool, str]:
+    if style == "minerva":
+        extracted = extract_final_answer(solution)
+        prediction = normalize_final_answer(
+            "[INVALID]" if extracted is None else extracted
+        )
+        return prediction == normalize_final_answer(ground_truth), prediction
+    if style == "exact":
+        # Official mathematics_dataset grading: the canonical answer string,
+        # matched exactly (modulo surrounding whitespace).  Ground truths are
+        # already canonical, so Minerva's rewrites could only widen the match
+        # — every widening collapses a multi-candidate or hedged answer line
+        # onto a single graded token — and the whole emission is searched
+        # because a fixed tail window turns a verbose-but-correct final line
+        # into [INVALID].
+        extracted = extract_final_answer(solution, window=None)
+        prediction = "[INVALID]" if extracted is None else extracted.strip()
+        return prediction == ground_truth.strip(), prediction
+    if style == "aime":
+        # AIME answers are integers in [0, 999]; standard graders reject any
+        # response whose final answer does not parse as one.
+        extracted = extract_final_answer(solution)
+        prediction = "[INVALID]" if extracted is None else extracted.strip()
+        cleaned = prediction.rstrip(".").strip("$ ")
+        try:
+            value = int(cleaned)
+            truth_value = int(ground_truth.strip())
+        except ValueError:
+            # A non-integer ground truth means the row is not actually AIME;
+            # score it wrong rather than crash the eval mid-run.
+            return False, prediction
+        return 0 <= value <= 999 and value == truth_value, prediction
+    raise ValueError(f"unknown answer style {style!r}")
+
+
+def module_answer_baselines(rows: list[dict]) -> dict[str, dict[str, float]]:
+    """Per-module modal-answer share of a row set's ground truths.
+
+    This is the accuracy of a policy that answers every prompt in a module
+    with the module's single most common ground truth — the strongest
+    zero-reasoning constant strategy the verifier cannot distinguish from
+    solving.  Module accuracy is evidence of solving only where it clears
+    this baseline, so it is computed from the data at load time and logged
+    next to the accuracies it calibrates.
+    """
+    by_module: dict[str, list[str]] = {}
+    for row in rows:
+        module = (row.get("extra_info") or {}).get("module")
+        if module:
+            by_module.setdefault(str(module), []).append(
+                row["reward_model"]["ground_truth"]
+            )
+    baselines: dict[str, dict[str, float]] = {}
+    for module, truths in sorted(by_module.items()):
+        counts: dict[str, int] = {}
+        for truth in truths:
+            counts[truth] = counts.get(truth, 0) + 1
+        baselines[module] = {
+            "rows": float(len(truths)),
+            "modal_share": max(counts.values()) / len(truths),
+        }
+    return baselines
 
 
 def load_unique_math_rows(path: str | Path) -> list[dict]:
@@ -158,14 +244,24 @@ def clipped_policy_loss(
     mask: Tensor,
     epsilon_low: float = 0.20,
     epsilon_high: float = 0.28,
-) -> tuple[Tensor, Tensor]:
-    ratio = (new_logprobs - old_logprobs).exp()
+) -> tuple[Tensor, Tensor, Tensor]:
+    log_ratio = torch.where(
+        mask.bool(), new_logprobs - old_logprobs, torch.zeros_like(new_logprobs)
+    )
+    ratio = log_ratio.exp()
     clipped = ratio.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
     objective = torch.minimum(ratio * advantages, clipped * advantages)
     denom = mask.sum().clamp_min(1)
     loss = -(objective * mask).sum() / denom
     clip_fraction = (((ratio < 1.0 - epsilon_low) | (ratio > 1.0 + epsilon_high)) * mask.bool()).sum() / denom
-    return loss, clip_fraction
+    # Schulman's non-negative k3 estimator. Actions come from the frozen
+    # behavior policy, so its expectation is KL(old || new). Reusing the PPO
+    # ratio makes the diagnostic effectively free compared with actor replay.
+    with torch.no_grad():
+        approximate_kl = (
+            (torch.expm1(log_ratio) - log_ratio) * mask
+        ).sum() / denom
+    return loss, clip_fraction, approximate_kl
 
 
 def per_dim_clipped_policy_loss(
@@ -175,7 +271,7 @@ def per_dim_clipped_policy_loss(
     mask: Tensor,
     epsilon_low: float = 0.20,
     epsilon_high: float = 0.28,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """Elementwise-clipped PPO over a factored (batch, stream, dim) action.
 
     Each coordinate's ratio is clipped to the trust region independently and
@@ -184,7 +280,11 @@ def per_dim_clipped_policy_loss(
     512 Gaussian dims the summed log-ratio saturates the clip after a single
     Adam step (every coordinate's drift adds), silently zeroing the gradient.
     """
-    ratio = (new_logprobs - old_logprobs).exp()
+    active = mask.bool()[..., None]
+    log_ratio = torch.where(
+        active, new_logprobs - old_logprobs, torch.zeros_like(new_logprobs)
+    )
+    ratio = log_ratio.exp()
     clipped = ratio.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
     advantages = advantages[..., None]
     objective = torch.minimum(ratio * advantages, clipped * advantages).mean(-1)
@@ -194,7 +294,13 @@ def per_dim_clipped_policy_loss(
         ((ratio < 1.0 - epsilon_low) | (ratio > 1.0 + epsilon_high)).float().mean(-1)
         * mask
     ).sum() / denom
-    return loss, clip_fraction
+    # Sum coordinatewise k3 estimates rather than exponentiating the summed
+    # 512-D log-ratio. This is the joint diagonal-Gaussian behavior KL in
+    # expectation without the numerical failure of a joint importance ratio.
+    with torch.no_grad():
+        per_dim_kl = torch.expm1(log_ratio) - log_ratio
+        approximate_joint_kl = (per_dim_kl.sum(-1) * mask).sum() / denom
+    return loss, clip_fraction, approximate_joint_kl
 
 
 def masked_token_mean(values: Tensor, mask: Tensor) -> Tensor:
@@ -253,3 +359,27 @@ class JsonlLogger:
     def log(self, **values) -> None:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(values, sort_keys=True) + "\n")
+
+    def purge_value_warmup_after(self, warmup_step: int) -> int:
+        """Atomically drop warmup telemetry newer than a resume checkpoint."""
+        if not self.path.exists():
+            return 0
+        retained: list[str] = []
+        removed = 0
+        with self.path.open(encoding="utf-8") as handle:
+            for line in handle:
+                record = json.loads(line)
+                stale = (
+                    record.get("type") == "value_warmup"
+                    and int(record["step"]) > warmup_step
+                )
+                if stale:
+                    removed += 1
+                else:
+                    retained.append(line)
+        if removed:
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.writelines(retained)
+            temporary.replace(self.path)
+        return removed

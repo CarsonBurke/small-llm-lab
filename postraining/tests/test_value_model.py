@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
-from postraining.latent_rollout import rollout_continuations, trim_stream
+from postraining.latent_rollout import (
+    PAD_SLOT,
+    THOUGHT_SLOT,
+    rollout_continuations,
+    trim_stream,
+)
 from postraining.latent_thought import LatentThoughtModel
 from postraining.model_io import _pope_construction
 from postraining.value_model import SeparateCritic
@@ -61,6 +66,20 @@ def test_thoughts_reach_the_critic_through_its_own_adapter():
         batch.thoughts.add_(torch.randn_like(batch.thoughts))
         perturbed_values = critic.values(batch)
     assert not torch.equal(baseline_values, perturbed_values)
+
+
+def test_critic_dense_masked_inputs_match_compact_routing():
+    critic = _critic()
+    batch = _batch()
+    token_latent = critic.trunk.embed_tokens(batch.token_ids)
+    thought_mask = batch.kind == THOUGHT_SLOT
+    expected = token_latent.clone()
+    expected[thought_mask] = critic.adapter(
+        batch.thoughts[thought_mask].float()
+    ).to(token_latent.dtype)
+    expected *= (batch.kind != PAD_SLOT)[..., None].to(expected.dtype)
+
+    torch.testing.assert_close(critic.assemble_inputs(batch), expected)
 
 
 def test_all_critic_parameters_receive_value_gradients():
