@@ -54,6 +54,11 @@ def parse_time_ms(text: str) -> float | None:
 
 def parse_log_line(line: str) -> dict | None:
     """Parse a single log line into a metric dict."""
+    graph_match = re.match(r"graph_stats\s+(.*)", line)
+    if graph_match:
+        metrics = parse_extra_metrics(graph_match.group(1))
+        return {"type": "graph_stats", **metrics} if metrics else None
+
     churn_match = re.match(r"churn_stats\s+(.*)", line)
     if churn_match:
         metrics = parse_extra_metrics(churn_match.group(1))
@@ -119,6 +124,7 @@ class MetricsWriter:
         self._prev_train_loss = None
         self._last_train_time_ms = None
         self._pending_churn: dict | None = None
+        self._pending_graph: dict | None = None
 
     @staticmethod
     def _extra_scalar_tag(key: str) -> str:
@@ -162,6 +168,8 @@ class MetricsWriter:
             return f"probe/{key.removeprefix('probe_')}"
         if re.match(r"(?:rewire|support|hnorm)_l\d+$", key):
             return f"churn/{key}"
+        if re.match(r"graph_(?:rewire|utility|support|null|xsrc|xmass|coverage|changed)_l\d+$", key):
+            return f"graph/{key.removeprefix('graph_')}"
         if key.startswith("codebook_"):
             return f"probe/{key}"
         return f"train/{key}"
@@ -169,6 +177,9 @@ class MetricsWriter:
     def write_entry(self, entry: dict) -> None:
         if entry["type"] == "churn_stats":
             self._pending_churn = {k: v for k, v in entry.items() if k != "type"}
+            return
+        if entry["type"] == "graph_stats":
+            self._pending_graph = {k: v for k, v in entry.items() if k != "type"}
             return
         if entry["type"] == "train":
             self._last_train_time_ms = entry["train_time_ms"]
@@ -178,6 +189,9 @@ class MetricsWriter:
             if self._pending_churn:
                 entry = {**entry, **self._pending_churn}
                 self._pending_churn = None
+            if self._pending_graph:
+                entry = {**entry, **self._pending_graph}
+                self._pending_graph = None
         self.metrics_file.write(json.dumps(entry, sort_keys=True) + "\n")
         self.metrics_file.flush()
         if entry["type"] == "val":

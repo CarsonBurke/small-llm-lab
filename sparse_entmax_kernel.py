@@ -71,6 +71,8 @@ def _sparse_entmax_fwd_kernel(
     sk_b, sk_h, sk_t, sk_d,
     sv_b, sv_h, sv_t, sv_d,
     sy_b, sy_h, sy_t, sy_d,
+    si_b, si_h, si_t, si_k,
+    sm_b, sm_h, sm_t, sm_k,
     H, T,
     GROUP: tl.constexpr,
     D: tl.constexpr,
@@ -87,8 +89,8 @@ def _sparse_entmax_fwd_kernel(
     offs_d = tl.arange(0, D)
 
     row = ((b * H + h) * T + t) * KB
-    idx = tl.load(IDX + row + offs_k)
-    val = tl.load(VALID + row + offs_k) != 0
+    idx = tl.load(IDX + b * si_b + h * si_h + t * si_t + offs_k * si_k)
+    val = tl.load(VALID + b * sm_b + h * sm_h + t * sm_t + offs_k * sm_k) != 0
     idx = tl.where(val, idx, 0)  # masked lanes never dereference, keep in-range
 
     q = tl.load(Q + b * sq_b + h * sq_h + t * sq_t + offs_d * sq_d).to(tl.float32)
@@ -140,6 +142,8 @@ def _sparse_entmax_bwd_kernel(
     sk_b, sk_h, sk_t, sk_d,
     sv_b, sv_h, sv_t, sv_d,
     sy_b, sy_h, sy_t, sy_d,
+    si_b, si_h, si_t, si_k,
+    sm_b, sm_h, sm_t, sm_k,
     H, T,
     GROUP: tl.constexpr,
     D: tl.constexpr,
@@ -155,8 +159,8 @@ def _sparse_entmax_bwd_kernel(
     offs_d = tl.arange(0, D)
 
     row = ((b * H + h) * T + t) * KB
-    idx = tl.load(IDX + row + offs_k)
-    val = tl.load(VALID + row + offs_k) != 0
+    idx = tl.load(IDX + b * si_b + h * si_h + t * si_t + offs_k * si_k)
+    val = tl.load(VALID + b * sm_b + h * sm_h + t * sm_t + offs_k * sm_k) != 0
     idx = tl.where(val, idx, 0)
     p = tl.load(P + row + offs_k)
     pn = tl.load(PN + (b * H + h) * T + t)
@@ -212,7 +216,9 @@ def _sparse_entmax_bwd_kernel(
 def _check_layout(q: Tensor, k: Tensor, v: Tensor, idx: Tensor, valid: Tensor) -> None:
     bsz, num_heads, seqlen, head_dim = q.shape
     kb = idx.size(-1)
-    assert k.shape == v.shape and k.shape[0] == bsz and k.shape[2:] == (seqlen, head_dim)
+    # k/v may hold MORE rows than the query length (cross-layer arms gather
+    # from a [B, Hkv, n_layers*T, D] stack); wiring guarantees idx stays in range
+    assert k.ndim == 4 and k.shape == v.shape and k.shape[0] == bsz and k.shape[3] == head_dim
     assert num_heads % k.shape[1] == 0
     assert idx.shape == (bsz, num_heads, seqlen, kb) and valid.shape == idx.shape
     assert idx.dtype == torch.int32 and valid.dtype == torch.bool
@@ -228,11 +234,11 @@ def _sparse_entmax_attn_fwd(
     _check_layout(q, k, v, idx, valid)
     bsz, num_heads, seqlen, head_dim = q.shape
     kb = idx.size(-1)
-    # Contiguous layouts everywhere: the backward indexes its grad buffers
-    # with these same strides, so view-strided inputs must not leak through.
+    # Q/K/V stay contiguous because the backward indexes their contiguous
+    # grad buffers with the same strides. IDX/VALID may be batch-broadcast
+    # views: persistent graphs are shared across examples, and retaining a
+    # batch copy per layer wastes gigabytes at production shape.
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    idx = idx.contiguous()
-    valid = valid.contiguous()
     y = torch.empty_like(q)
     p = torch.empty(bsz, num_heads, seqlen, kb, device=q.device, dtype=torch.float32)
     pn = torch.empty(bsz, num_heads, seqlen, device=q.device, dtype=torch.float32)
@@ -241,6 +247,7 @@ def _sparse_entmax_attn_fwd(
         q, k, v, idx, valid, null_bias.float(), y, p, pn,
         scale,
         *q.stride(), *k.stride(), *v.stride(), *y.stride(),
+        *idx.stride(), *valid.stride(),
         num_heads, seqlen,
         GROUP=num_heads // k.shape[1], D=head_dim, KB=kb, BITER=BISECT_ITERS,
         num_warps=2,
@@ -276,10 +283,11 @@ def _sparse_entmax_attn_bwd(
     dn = torch.empty(bsz, num_heads, seqlen, device=q.device, dtype=torch.float32)
     grid = (bsz * num_heads * seqlen,)
     _sparse_entmax_bwd_kernel[grid](
-        dy, q, k, v, idx.contiguous(), valid.contiguous(), p, pn,
+        dy, q, k, v, idx, valid, p, pn,
         dq, dk, dv, dn,
         scale,
         *q.stride(), *k.stride(), *v.stride(), *dy.stride(),
+        *idx.stride(), *valid.stride(),
         num_heads, seqlen,
         GROUP=num_heads // k.shape[1], D=head_dim, KB=idx.size(-1),
         num_warps=8,  # measured best for bwd (fwd stays at 2): atomic-heavy,
@@ -327,7 +335,7 @@ def sparse_entmax_attention(
     # for backward are already in kernel layout - no second copy at bwd time.
     y, _, _ = _sparse_entmax_attn_fwd(
         q.contiguous(), k.contiguous(), v.contiguous(),
-        idx.contiguous(), valid.contiguous(), null_bias, scale,
+        idx, valid, null_bias, scale,
     )
     return y
 
@@ -346,6 +354,6 @@ def sparse_entmax_attention_stats(
     """
     y, p, pn = _sparse_entmax_attn_fwd(
         q.contiguous(), k.contiguous(), v.contiguous(),
-        idx.contiguous(), valid.contiguous(), null_bias, scale,
+        idx, valid, null_bias, scale,
     )
     return y, p, pn
