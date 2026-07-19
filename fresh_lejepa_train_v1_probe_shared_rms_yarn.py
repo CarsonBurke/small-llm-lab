@@ -174,12 +174,23 @@ class FreshLeJEPASharedRMSV1FixedYarn(FreshLeJEPASharedRMSProjectorV1Probes):
         if key_mask is not None and key_mask.dim() == 2:
             # Per-row (batch, keys) validity for left-padded batched rollouts
             # (see FreshLeJEPAGPT._attention_step).
-            position_length = int(position) + 1
-            cache[0][:, :, position : position_length].copy_(k)
-            cache[1][:, :, position : position_length].copy_(value)
-            prefix_k = cache[0][:, :, :position_length]
-            prefix_v = cache[1][:, :, :position_length]
-            attn_mask = key_mask[:, None, None, :position_length]
+            if torch.is_tensor(position):
+                index = position.reshape(1)
+                position_length = key_mask.shape[-1]
+                cache[0].index_copy_(2, index, k)
+                cache[1].index_copy_(2, index, value)
+                prefix_k = torch.narrow(cache[0], 2, 0, position_length)
+                prefix_v = torch.narrow(cache[1], 2, 0, position_length)
+                attn_mask = torch.narrow(
+                    key_mask, 1, 0, position_length
+                )[:, None, None, :]
+            else:
+                position_length = position + 1
+                cache[0][:, :, position:position_length].copy_(k)
+                cache[1][:, :, position:position_length].copy_(value)
+                prefix_k = cache[0][:, :, :position_length]
+                prefix_v = cache[1][:, :, :position_length]
+                attn_mask = key_mask[:, None, None, :position_length]
         elif key_mask is not None:
             # Static full-cache path (see FreshLeJEPAGPT._attention_step).
             if not torch.is_tensor(position):

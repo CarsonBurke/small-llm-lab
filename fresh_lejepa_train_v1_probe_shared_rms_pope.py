@@ -166,11 +166,17 @@ class PolarCausalSelfAttention(baseline.CausalSelfAttention):
             # Per-row (batch, keys) validity for left-padded batched rollouts:
             # narrow position-sliced shapes, each row's padded prefix slots
             # masked out of attention.
-            prefix_length = index[0] + 1
+            # The mask already has exactly the live prefix width. Deriving
+            # the narrow length from its shape keeps this dimension symbolic
+            # under dynamic torch.compile; deriving it from the position
+            # tensor would make it a data-dependent output shape.
+            prefix_length = key_mask.shape[-1]
             prefix_k_real = torch.narrow(cache[0], 2, 0, prefix_length)
             prefix_k_imag = torch.narrow(cache[1], 2, 0, prefix_length)
             prefix_value = torch.narrow(cache[2], 2, 0, prefix_length)
-            attn_mask = key_mask[:, None, None, :prefix_length]
+            attn_mask = torch.narrow(
+                key_mask, 1, 0, prefix_length
+            )[:, None, None, :]
         elif key_mask is not None:
             # Static full-cache path (see FreshLeJEPAGPT._attention_step):
             # constant shapes for CUDA-graph capture; masked slots must be
@@ -234,10 +240,17 @@ class FreshLeJEPASharedRMSV1PoPE(FreshLeJEPASharedRMSProjectorV1Probes):
         return super()._attention_step(attention, x, cache, position, key_mask)
 
     def make_generation_cache(
-        self, batch_size: int, max_length: int, device: torch.device
+        self,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
     ) -> list[tuple[Tensor, ...]]:
         if PolarCausalSelfAttention.position_mode == "rope":
-            return super().make_generation_cache(batch_size, max_length, device)
+            return super().make_generation_cache(
+                batch_size, max_length, device, dtype=dtype
+            )
+        cache_dtype = self.tok_emb.weight.dtype if dtype is None else dtype
         caches = []
         for block in self.blocks:
             attention = block.attn
@@ -250,7 +263,7 @@ class FreshLeJEPASharedRMSV1PoPE(FreshLeJEPASharedRMSProjectorV1Probes):
             caches.append(
                 tuple(
                     torch.empty(
-                        shape, device=device, dtype=self.tok_emb.weight.dtype
+                        shape, device=device, dtype=cache_dtype
                     )
                     for _ in range(3)
                 )

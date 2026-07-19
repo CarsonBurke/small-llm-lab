@@ -464,12 +464,23 @@ class FreshLeJEPAGPT(baseline.GPT):
             # Per-row (batch, keys) validity for left-padded batched rollouts:
             # keeps the narrow position-sliced shapes but masks each row's
             # padded prefix slots out of attention.
-            position_length = int(position) + 1
-            cache[0][:, :, position : position_length].copy_(k)
-            cache[1][:, :, position : position_length].copy_(v)
-            prefix_k = cache[0][:, :, :position_length]
-            prefix_v = cache[1][:, :, :position_length]
-            attn_mask = key_mask[:, None, None, :position_length]
+            if torch.is_tensor(position):
+                index = position.reshape(1)
+                position_length = key_mask.shape[-1]
+                cache[0].index_copy_(2, index, k)
+                cache[1].index_copy_(2, index, v)
+                prefix_k = torch.narrow(cache[0], 2, 0, position_length)
+                prefix_v = torch.narrow(cache[1], 2, 0, position_length)
+                attn_mask = torch.narrow(
+                    key_mask, 1, 0, position_length
+                )[:, None, None, :]
+            else:
+                position_length = position + 1
+                cache[0][:, :, position:position_length].copy_(k)
+                cache[1][:, :, position:position_length].copy_(v)
+                prefix_k = cache[0][:, :, :position_length]
+                prefix_v = cache[1][:, :, :position_length]
+                attn_mask = key_mask[:, None, None, :position_length]
         elif key_mask is not None:
             if not torch.is_tensor(position):
                 raise ValueError("key_mask stepping requires a 0-dim tensor position")
@@ -550,16 +561,22 @@ class FreshLeJEPAGPT(baseline.GPT):
         return self.probe_features(token_latent, predicted)
 
     def make_generation_cache(
-        self, batch_size: int, max_length: int, device: torch.device
+        self,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
     ) -> list[tuple[Tensor, Tensor]]:
+        """Allocate KV storage independently of the master-weight dtype."""
+        cache_dtype = self.tok_emb.weight.dtype if dtype is None else dtype
         caches = []
         for block in self.blocks:
             attention = block.attn
             shape = (batch_size, attention.num_kv_heads, max_length, attention.head_dim)
             caches.append(
                 (
-                    torch.empty(shape, device=device, dtype=self.tok_emb.weight.dtype),
-                    torch.empty(shape, device=device, dtype=self.tok_emb.weight.dtype),
+                    torch.empty(shape, device=device, dtype=cache_dtype),
+                    torch.empty(shape, device=device, dtype=cache_dtype),
                 )
             )
         return caches
