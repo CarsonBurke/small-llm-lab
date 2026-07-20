@@ -44,6 +44,29 @@ def test_jsonl_logger_purges_only_stale_value_warmup(tmp_path):
     ]
 
 
+def test_jsonl_logger_purges_stale_actor_resume_records(tmp_path):
+    logger = JsonlLogger(tmp_path / "metrics.jsonl")
+    logger.log(type="value_warmup", step=50)
+    logger.log(type="train", step=31)
+    logger.log(type="checkpoint", step=32)
+    logger.log(type="rollout", step=33)
+    logger.log(type="train", step=33)
+    logger.log(type="bench", step=40)
+    logger.log(type="bench_guess_baseline", baselines={})
+
+    assert logger.purge_after(step=32, warmup_step=50) == 3
+    records = [
+        json.loads(line)
+        for line in logger.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records == [
+        {"step": 50, "type": "value_warmup"},
+        {"step": 31, "type": "train"},
+        {"step": 32, "type": "checkpoint"},
+        {"baselines": {}, "type": "bench_guess_baseline"},
+    ]
+
+
 class _Tokenizer:
     def __init__(self, bos: int):
         self.bos = bos

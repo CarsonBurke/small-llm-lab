@@ -376,3 +376,37 @@ class JsonlLogger:
                 handle.writelines(retained)
             temporary.replace(self.path)
         return removed
+
+    def purge_after(self, step: int, warmup_step: int) -> int:
+        """Drop telemetry newer than a resumable checkpoint atomically.
+
+        Rollout rows are indexed by the final optimizer step their behavior
+        pool feeds, so all actor/eval records newer than ``step`` are stale.
+        Warmup has its own independent counter.
+        """
+        if not self.path.exists():
+            return 0
+        retained: list[str] = []
+        removed = 0
+        with self.path.open(encoding="utf-8") as handle:
+            for line in handle:
+                record = json.loads(line)
+                record_type = record.get("type")
+                record_step = record.get("step")
+                stale = False
+                if record_step is not None:
+                    numeric_step = int(record_step)
+                    if record_type == "value_warmup":
+                        stale = numeric_step > warmup_step
+                    else:
+                        stale = numeric_step > step
+                if stale:
+                    removed += 1
+                else:
+                    retained.append(line)
+        if removed:
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.writelines(retained)
+            temporary.replace(self.path)
+        return removed
