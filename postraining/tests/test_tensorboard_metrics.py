@@ -6,19 +6,44 @@ import torch
 from postraining.train_latent_vapo import (
     aggregate_actor_tensorboard_metrics,
     aggregate_value_diagnostics,
-    bounded_epoch_order,
+    actor_minibatch_denominators,
+    optimizer_minibatch_orders,
     rollout_tensorboard_metrics,
     write_actor_tensorboard_metrics,
 )
 
 
-def test_bounded_epoch_order_stops_exactly_at_training_step_cap() -> None:
+def test_optimizer_minibatch_orders_are_disjoint_and_complete() -> None:
     torch.manual_seed(7)
-    assert len(bounded_epoch_order(16, 100)) == 16
-    partial = bounded_epoch_order(16, 7)
-    assert len(partial) == 7
-    assert len(set(partial)) == 7
-    assert bounded_epoch_order(16, 0) == []
+    minibatches = optimizer_minibatch_orders(64, 16)
+    assert len(minibatches) == 4
+    assert all(len(minibatch) == 16 for minibatch in minibatches)
+    assert sorted(index for minibatch in minibatches for index in minibatch) == list(
+        range(64)
+    )
+    with pytest.raises(ValueError, match="complete minibatches"):
+        optimizer_minibatch_orders(63, 16)
+
+
+def test_actor_denominators_cover_only_selected_groups_and_positive_tokens() -> None:
+    class Group:
+        def __init__(self, actions, emits, rewards):
+            self.action_mask = torch.tensor(actions, dtype=torch.float32)
+            self.gate_mask = torch.tensor(actions, dtype=torch.float32)
+            self.emit_mask = torch.tensor(emits, dtype=torch.float32)
+            self.reward_scalar = torch.tensor(rewards, dtype=torch.float32)
+
+    groups = [
+        Group([[1, 1], [1, 0]], [[1, 1], [1, 0]], [1.0, 0.0]),
+        Group([[1, 1]], [[1, 0]], [1.0]),
+        Group([[1, 1]], [[1, 1]], [1.0]),
+    ]
+    actions, gate_actions, positive_tokens = actor_minibatch_denominators(
+        groups, [0, 2], positive_reward_threshold=0.5
+    )
+    assert actions == 5
+    assert gate_actions == 5
+    assert positive_tokens == 4
 
 
 def _actor_metrics(**overrides: float) -> dict[str, float]:
@@ -41,22 +66,22 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "forced_initial_think_advantage_mean": 0.4,
         "thought_advantage_mean": 0.325,
         "emit_advantage_mean": -0.1,
-        "gate_loss": 1.0,
-        "renderer_loss": 2.0,
-        "thought_loss": 3.0,
+        "policy_loss": 1.0,
         "positive_lm_loss": 4.0,
+        "gate_entropy_bonus": 0.25,
         "gate_pg_coef": 1.0,
         "thought_pg_coef": 1.0,
         "positive_lm_weight": 0.1,
+        "gate_entropy_coef": 0.5,
         "emit_probability": 0.8,
         "gate_entropy": 0.5,
         "gate_behavior_kl": 0.01,
         "renderer_behavior_kl": 0.02,
         "thought_behavior_kl_joint": 0.03,
         "policy_behavior_kl_per_action": 0.04,
-        "gate_clip_fraction": 0.1,
-        "renderer_clip_fraction": 0.2,
-        "thought_clip_fraction": 0.3,
+        "policy_clip_fraction": 0.1,
+        "joint_abs_log_ratio_max": 0.7,
+        "harmful_positive_log_ratio_max": 0.4,
         "trunk_grad_norm": 1.0,
         "renderer_grad_norm": 2.0,
         "adapter_grad_norm": 3.0,
@@ -95,22 +120,32 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         action_count=10.0,
         gate_action_count=2.0,
         gate_behavior_kl=1.0,
-        gate_loss=2.0,
+        policy_loss=2.0,
+        joint_abs_log_ratio_max=0.5,
+        harmful_positive_log_ratio_max=0.2,
         trunk_grad_norm=10.0,
+        critic_grad_norm=11.0,
     )
     last = _actor_metrics(
         action_count=30.0,
         gate_action_count=6.0,
         gate_behavior_kl=3.0,
-        gate_loss=4.0,
+        policy_loss=4.0,
+        joint_abs_log_ratio_max=0.9,
+        harmful_positive_log_ratio_max=0.6,
         trunk_grad_norm=20.0,
+        critic_grad_norm=21.0,
     )
     dashboard = aggregate_actor_tensorboard_metrics([first, last])
 
-    assert dashboard["loss/gate_weighted"] == pytest.approx(3.0)
+    assert dashboard["loss/policy"] == pytest.approx(6.0)
     assert dashboard["kl/gate_behavior"] == pytest.approx(2.5)
     assert dashboard["grad/trunk"] == pytest.approx(20.0)
-    assert dashboard["loss/positive_lm_weighted"] == pytest.approx(0.4)
+    assert dashboard["grad/critic"] == pytest.approx(21.0)
+    assert dashboard["ratio/joint_abs_log_max"] == pytest.approx(0.9)
+    assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
+    assert "grad/critic_mean" not in dashboard
+    assert dashboard["loss/positive_lm_weighted"] == pytest.approx(0.8)
     assert "thought_behavior_kl_per_dim" not in dashboard
     assert all(
         not tag.startswith("train/") and not tag.startswith("rollout/")
@@ -118,12 +153,15 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     )
 
 
-def test_actor_dashboard_losses_respect_disabled_policy_components() -> None:
-    metrics = _actor_metrics(gate_pg_coef=0.0, thought_pg_coef=0.0)
+def test_actor_dashboard_has_only_the_authoritative_joint_policy_loss() -> None:
+    metrics = _actor_metrics()
     dashboard = aggregate_actor_tensorboard_metrics([metrics])
-    assert dashboard["loss/gate_weighted"] == 0.0
-    assert dashboard["loss/thought_weighted"] == 0.0
-    assert dashboard["loss/actor_total"] == pytest.approx(2.4)
+    assert dashboard["loss/policy"] == 1.0
+    assert dashboard["bonus/gate_entropy_weighted"] == pytest.approx(0.25)
+    assert dashboard["loss/actor_total"] == pytest.approx(1.15)
+    assert "loss/gate_weighted" not in dashboard
+    assert "loss/renderer" not in dashboard
+    assert "loss/thought_weighted" not in dashboard
 
 
 def test_actor_dashboard_ignores_empty_conditional_components() -> None:
@@ -185,17 +223,23 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
 
     dashboard = aggregate_actor_tensorboard_metrics([_actor_metrics()])
     epoch_zero = Writer()
-    write_actor_tensorboard_metrics(epoch_zero, dashboard, epoch=0, step=16)
+    write_actor_tensorboard_metrics(
+        epoch_zero, dashboard, behavior_age=0, step=16
+    )
     epoch_zero_tags = {tag for tag, _, _ in epoch_zero.calls}
     assert "debug/behavior_refresh_max_drift" in epoch_zero_tags
     assert not any(tag.startswith("kl/") for tag in epoch_zero_tags)
     assert not any(tag.startswith("clip/") for tag in epoch_zero_tags)
+    assert not any(tag.startswith("ratio/") for tag in epoch_zero_tags)
     assert "advantage/mean" in epoch_zero_tags
 
     epoch_one = Writer()
-    write_actor_tensorboard_metrics(epoch_one, dashboard, epoch=1, step=32)
+    write_actor_tensorboard_metrics(
+        epoch_one, dashboard, behavior_age=1, step=32
+    )
     epoch_one_tags = {tag for tag, _, _ in epoch_one.calls}
     assert "debug/behavior_refresh_max_drift" not in epoch_one_tags
     assert "kl/gate_behavior" in epoch_one_tags
-    assert "clip/gate" in epoch_one_tags
-    assert not any(tag.startswith("advantage/") for tag in epoch_one_tags)
+    assert "clip/policy" in epoch_one_tags
+    assert "ratio/harmful_positive_log_max" in epoch_one_tags
+    assert "advantage/mean" in epoch_one_tags

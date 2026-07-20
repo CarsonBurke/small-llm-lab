@@ -61,8 +61,8 @@ class LatentRolloutBatch:
     emit_mask: Tensor
     old_gate_logprobs: Tensor
     old_token_logprobs: Tensor
-    # (batch, stream, dim): per-dimension old log-probs of the thought
-    # decided at each gate position, for the factored per-dim PPO ratio.
+    # (batch, stream, dim): factors of the old Gaussian-vector log-probability
+    # decided at each gate position. Replay sums them into one action ratio.
     old_thought_logprobs: Tensor
     old_values: Tensor
     rewards: Tensor

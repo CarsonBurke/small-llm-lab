@@ -244,75 +244,68 @@ def clipped_policy_loss(
     mask: Tensor,
     epsilon_low: float = 0.20,
     epsilon_high: float = 0.28,
+    denominator: Tensor | None = None,
+    estimate_kl: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    """VAPO's token-level clipped surrogate for one action per position.
+
+    ``new_logprobs`` and ``old_logprobs`` are the log probabilities of the
+    complete action.  A factorized action must therefore be combined in log
+    space before calling this function.  ``denominator`` may cover a larger
+    optimizer minibatch than this memory shard; summing shard losses then
+    reproduces VAPO Eq. 7 exactly.
+    """
     log_ratio = torch.where(
         mask.bool(), new_logprobs - old_logprobs, torch.zeros_like(new_logprobs)
     )
-    ratio = log_ratio.exp()
-    clipped = ratio.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
-    objective = torch.minimum(ratio * advantages, clipped * advantages)
-    denom = mask.sum().clamp_min(1)
+    log_lower = torch.log(log_ratio.new_tensor(1.0 - epsilon_low))
+    log_upper = torch.log(log_ratio.new_tensor(1.0 + epsilon_high))
+    # This is algebraically the standard min(r*A, clip(r)*A), expressed in
+    # log space so a favorable but extremely large joint ratio is clipped
+    # before exp. PPO deliberately leaves the harmful direction unclipped.
+    effective_log_ratio = torch.where(
+        advantages >= 0,
+        torch.minimum(log_ratio, log_upper),
+        torch.maximum(log_ratio, log_lower),
+    )
+    objective = effective_log_ratio.exp() * advantages
+    denom = (
+        mask.sum() if denominator is None else denominator.to(mask.device)
+    ).clamp_min(1)
     loss = -(objective * mask).sum() / denom
-    clip_fraction = (((ratio < 1.0 - epsilon_low) | (ratio > 1.0 + epsilon_high)) * mask.bool()).sum() / denom
+    clip_fraction = (
+        ((log_ratio < log_lower) | (log_ratio > log_upper)) * mask.bool()
+    ).sum() / denom
     # Schulman's non-negative k3 estimator. Actions come from the frozen
     # behavior policy, so its expectation is KL(old || new). Reusing the PPO
     # ratio makes the diagnostic effectively free compared with actor replay.
     with torch.no_grad():
         approximate_kl = (
-            (torch.expm1(log_ratio) - log_ratio) * mask
-        ).sum() / denom
+            ((torch.expm1(log_ratio) - log_ratio) * mask).sum() / denom
+            if estimate_kl
+            else loss.detach().new_zeros(())
+        )
     return loss, clip_fraction, approximate_kl
-
-
-def per_dim_clipped_policy_loss(
-    new_logprobs: Tensor,
-    old_logprobs: Tensor,
-    advantages: Tensor,
-    mask: Tensor,
-    epsilon_low: float = 0.20,
-    epsilon_high: float = 0.28,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Elementwise-clipped PPO over a factored (batch, stream, dim) action.
-
-    Each coordinate's ratio is clipped to the trust region independently and
-    the surrogate is averaged over dims; at dim=1 this reduces exactly to
-    ``clipped_policy_loss``.  A joint high-dim ratio is unusable here: with
-    512 Gaussian dims the summed log-ratio saturates the clip after a single
-    Adam step (every coordinate's drift adds), silently zeroing the gradient.
-    """
-    active = mask.bool()[..., None]
-    log_ratio = torch.where(
-        active, new_logprobs - old_logprobs, torch.zeros_like(new_logprobs)
-    )
-    ratio = log_ratio.exp()
-    clipped = ratio.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
-    advantages = advantages[..., None]
-    objective = torch.minimum(ratio * advantages, clipped * advantages).mean(-1)
-    denom = mask.sum().clamp_min(1)
-    loss = -(objective * mask).sum() / denom
-    clip_fraction = (
-        ((ratio < 1.0 - epsilon_low) | (ratio > 1.0 + epsilon_high)).float().mean(-1)
-        * mask
-    ).sum() / denom
-    # Sum coordinatewise k3 estimates rather than exponentiating the summed
-    # 512-D log-ratio. This is the joint diagonal-Gaussian behavior KL in
-    # expectation without the numerical failure of a joint importance ratio.
-    with torch.no_grad():
-        per_dim_kl = torch.expm1(log_ratio) - log_ratio
-        approximate_joint_kl = (per_dim_kl.sum(-1) * mask).sum() / denom
-    return loss, clip_fraction, approximate_joint_kl
 
 
 def masked_token_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
 
-def positive_example_lm_loss(logprobs: Tensor, mask: Tensor, correct: Tensor) -> Tensor:
-    if not correct.any():
-        return logprobs.sum() * 0
-    lengths = mask.sum(1).clamp_min(1)
-    per_trajectory = -(logprobs * mask).sum(1) / lengths
-    return per_trajectory[correct].mean()
+def positive_example_lm_loss(
+    logprobs: Tensor,
+    mask: Tensor,
+    correct: Tensor,
+    denominator: Tensor | None = None,
+) -> Tensor:
+    """VAPO Eq. 9: NLL averaged over every token in correct responses."""
+    positive_mask = mask * correct[:, None]
+    denom = (
+        positive_mask.sum()
+        if denominator is None
+        else denominator.to(mask.device)
+    ).clamp_min(1)
+    return -(logprobs * positive_mask).sum() / denom
 
 
 def top_p_sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:

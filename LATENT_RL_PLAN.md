@@ -74,17 +74,17 @@ WHOLE policy model trains.** Freezing the world model was rejected
 ("it should always be learning"). At RL time the world model's objective
 changes from predicting what the next token/latent WILL be to predicting
 what it SHOULD be: the thought policy's mean is the model's own predicted
-latent, and the per-dim clipped PPO surrogate on thought log-probs
-backprops through the prediction path into the entire trunk. (Per-dim,
-because a joint 512-dim Gaussian ratio saturates the PPO clip after a
-single Adam step — red-teamed, analytic.) Emitted tokens carry the
-standard VAPO clipped surrogate (reaching the belief/trunk but not directly
-the prediction projector), the gate its scalar surrogate. Sigma is a FIXED
+latent, and the Gaussian-vector score backprops through the prediction path
+into the entire trunk. Gate and content factors form one action probability:
+gate+token for EMIT, gate+summed Gaussian density for optional THINK, and the
+Gaussian density alone for a forced THINK. VAPO's clipped surrogate is then
+applied once per joint action. Sigma is a FIXED
 constant (log-sigma -1.5, σ ≈ 0.22 —
 red-teamed down from the error-matched -0.5, whose per-step offset norm
 ~13.7 against thought norms ~22.6 corrupts long think runs with no way to
-self-shrink): no beta-NLL, no learned uncertainty, no entropy bonus
-anywhere, no KL penalty — the trust region is the only policy constraint.
+self-shrink): no beta-NLL, no learned uncertainty, no continuous-policy
+entropy bonus, and no KL penalty — the trust region is the continuous-policy
+constraint. The separate optional gate-entropy ablation is documented below.
 The v1 delta/log-std heads and the frozen-trunk adaptation trainer
 (`train_adaptation.py`, `adaptation_core.py`) were deleted.
 `--thought-pg-coef 0` now disables only the thought-content surrogate
@@ -189,25 +189,42 @@ single knob — including annealing it externally across runs.
 
 ### Training (train_latent_vapo.py)
 
-- VAPO-aligned: length-adaptive GAE (λ from |trajectory|), clip-higher PPO
-  (0.20/0.28 on gate, tokens, and per-dim thoughts), 50-iteration value
-  warmup (MC returns) before any policy update, positive-example LM loss
-  on correct trajectories.
-- v2 optimizer layout: one actor AdamW with param groups — pretrained
-  trunk at `--actor-lr` (1e-5), fresh zero-init heads (gate, adapter) at
-  `--head-lr` (1e-4), the renderer probe at `--renderer-lr` (1e-6; it
-  drives token-PPO ratios directly and cannot ride the 10x-hotter trunk
-  rate) — plus the critic AdamW (3e-4, from-scratch scale). Old v1
+- VAPO-aligned objective: length-adaptive GAE (λ from |trajectory|), one
+  clip-higher PPO ratio (0.20/0.28) per joint action, and positive-example
+  LM loss token-normalized across correct trajectories.
+- v6 optimizer layout: one actor AdamW with param groups — pretrained
+  trunk at the VAPO paper's `--actor-lr` (1e-6), scalar gate at `--gate-lr`
+  (1e-4), recurrent thought adapter at `--adapter-lr` (1e-6), and renderer
+  probe at `--renderer-lr` (1e-6) — plus the critic AdamW (3e-4,
+  from-scratch scale). The adapter is not treated as an isolated fresh head:
+  it changes every later belief and therefore every factor of the recurrent
+  512-D thought policy. Old v1
   checkpoints cannot `--resume` across this change (optimizer keys and
   head shapes differ); none are worth keeping. Likewise, VAPO checkpoints
   from before the `input_latent+belief/v1` renderer schema are rejected on
   resume/eval even though tensor shapes happen to match.
-- Actor accumulation (red-teamed): stepping the full trunk per minibatch
-  would take ppo_epochs × groups (32) trust-region steps against one
-  frozen behavior policy and saturate the clip — so actor gradients
-  accumulate across an epoch (`loss_scale = 1/len(groups)`) and the actor
-  steps once per epoch. The critic is supervised (no trust region) and
-  still steps per minibatch.
+- Actor and critic gradients accumulate across length-varying prompt groups
+  and each optimizer steps once on the same effective trajectory minibatch.
+  Actor policy/NLL and critic value CE use their global token denominators;
+  replay groups and length-aware shards are memory partitions only. PPO is
+  restricted to one pass so generated trajectories are never reused. The
+  default behavior pool is one fresh 16-prompt × 32-sample B512 minibatch per
+  actor+critic update. The tested 2048-pool/four-disjoint-B512 variant was
+  rejected: with an exact 512-D Gaussian joint ratio, rare negative-advantage
+  tails overflowed stale updates at both 1e-5 and VAPO's 1e-6 actor LR. Fresh
+  B512 completed 500 updates at 1e-6 and improved held-out avg@8 from 17.53%
+  to a 20.49% peak (20.23% at the final scheduled step-480 evaluation), with
+  only +0.00013 BPB drift at step 320. A 1e-7 frozen-pool diagnostic did not
+  rescue the design: it still developed catastrophic joint-ratio tails before
+  cancellation. Fresh B512 has behavior age zero on every update, so the
+  formal clipped objective is preserved but ratios are one and PPO clipping/KL
+  are inactive (on-policy policy gradient). Optional thinking collapsed from
+  2.39% to 0.068% on the held-out bench; at step 480, forced-initial accuracy
+  was 19.97% versus 20.49% unforced. The gain therefore demonstrates stable
+  policy/renderer post-training, not learned useful optional thinking.
+  This run initialized from the requested post-trained critic checkpoint,
+  whose optimizer provenance is `legacy_per_prompt_group`; new warmups use
+  aligned B512 critic updates instead.
 - Diagnostics: think-run length stats, per-loss grad norms (gate, renderer,
   transition, critic), emit probability, emits/actions per trajectory,
   teacher-forced belief-renderer val BPB guard, AIME24 avg@k eval through
@@ -290,11 +307,13 @@ rewards, no synthetic RL tasks:
 - Paper alignment kept: value warmup, length-adaptive GAE, clip-higher,
   positive-example LM loss, token-level (here: action-level) loss; critic is
   HL-Gauss instead of MSE (deliberate deviation, documented above).
-- **No entropy bonus anywhere** (user call, Jul 18): VAPO's objective has
-  no entropy term — the paper only monitors entropy, with clip-higher as
-  the exploration mechanism. The gate entropy term and its flag were
-  removed outright in v2 ("we don't need entropy"); `gate_entropy` stays
-  logged as a pure diagnostic for detecting never-think collapse.
+- **Gate-entropy ablation** (user call, Jul 19): VAPO's objective has no
+  entropy term — the paper only monitors entropy, with clip-higher as the
+  exploration mechanism — but the optional THINK gate collapsed before its
+  much slower 512-D content policy could learn. `--gate-entropy-coef` now
+  enables an explicit, head-only Bernoulli entropy bonus, globally averaged
+  over optional gate actions. The paper-faithful default remains zero; the
+  intervention is logged separately as `bonus/gate_entropy_weighted`.
   No KL penalty either, confirmed against the
   full paper (Jul 18 full-text read): KL appears only in VAPO's Sec. 2.2
   theoretical preliminaries (Eq. 1); the loss actually optimized is
@@ -397,7 +416,7 @@ Pipeline (mlq chain, each stage gated on the previous one's success):
 Belief-attached CE note for RL, updated for v2: the replay pass is now the
 differentiable forward — `update_minibatch` no longer detaches anything on
 the policy side. Gate and token surrogates backprop through raw beliefs into
-the trunk; only the per-dim THINK-masked thought surrogate consumes projected
+the trunk; only THINK-masked joint-action factors consume projected
 thought means and trains the prediction projector. The projector executes
 dense batched work in rollout and replay, avoiding a per-step GPU-to-CPU
 branch; unused EMIT positions contribute exactly zero projector gradient.

@@ -18,7 +18,6 @@ from postraining.core import (
     length_adaptive_lambda,
     module_answer_baselines,
     normalize_final_answer,
-    per_dim_clipped_policy_loss,
     positive_example_lm_loss,
     validate_posttraining_context_budget,
     verify_answer,
@@ -184,11 +183,41 @@ def test_negative_padded_monte_carlo_returns():
     torch.testing.assert_close(returns, torch.tensor([[-1.0, -1.0, 9.0]]))
 
 
-def test_positive_lm_loss_weights_correct_trajectories_equally():
+def test_positive_lm_loss_weights_correct_tokens_equally():
     logprobs = torch.tensor([[-2.0, -2.0, 0.0], [-1.0, -3.0, -5.0]])
     mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
     loss = positive_example_lm_loss(logprobs, mask, torch.tensor([True, True]))
-    torch.testing.assert_close(loss, torch.tensor(2.5))
+    torch.testing.assert_close(loss, torch.tensor(2.6))
+
+
+def test_positive_lm_loss_shards_use_the_global_token_denominator():
+    logprobs = torch.tensor([[-2.0, -2.0, 0.0], [-1.0, -3.0, -5.0]])
+    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    correct = torch.tensor([True, True])
+    denominator = (mask * correct[:, None]).sum()
+    sharded = sum(
+        positive_example_lm_loss(
+            logprobs[index : index + 1],
+            mask[index : index + 1],
+            correct[index : index + 1],
+            denominator=denominator,
+        )
+        for index in range(2)
+    )
+    torch.testing.assert_close(sharded, torch.tensor(2.6))
+
+
+def test_positive_lm_loss_is_differentiable_zero_without_positive_tokens():
+    logprobs = torch.tensor([[-2.0, -3.0]], requires_grad=True)
+    loss = positive_example_lm_loss(
+        logprobs,
+        torch.zeros_like(logprobs),
+        torch.tensor([True]),
+        denominator=torch.tensor(0.0),
+    )
+    assert loss == 0
+    loss.backward()
+    torch.testing.assert_close(logprobs.grad, torch.zeros_like(logprobs))
 
 
 def test_official_verifier_edge_normalization():
@@ -211,37 +240,87 @@ def test_asymmetric_clipping_uses_token_mean():
     torch.testing.assert_close(approximate_kl, expected_kl)
 
 
-def test_per_dim_clip_reduces_to_the_scalar_clip_at_one_dimension():
-    old = torch.zeros(1, 2, 1)
-    new = torch.log(torch.tensor([[[1.5], [0.5]]]))
-    advantages = torch.tensor([[1.0, -1.0]])
-    mask = torch.ones(1, 2)
-    loss, fraction, approximate_kl = per_dim_clipped_policy_loss(
-        new, old, advantages, mask
+def test_factorized_action_is_clipped_once_using_its_joint_ratio():
+    # Both factors are individually inside the upper clip, but their product
+    # is not. One composite action must therefore be clipped as a whole.
+    old_factors = torch.zeros(1, 1, 2)
+    new_factors = torch.log(torch.tensor([[[1.2, 1.2]]]))
+    old = old_factors.sum(-1)
+    new = new_factors.sum(-1)
+    loss, fraction, approximate_kl = clipped_policy_loss(
+        new, old, torch.ones_like(new), torch.ones_like(new)
     )
-    torch.testing.assert_close(loss, torch.tensor(-0.24))
+    torch.testing.assert_close(loss, torch.tensor(-1.28))
     torch.testing.assert_close(fraction, torch.tensor(1.0))
     log_ratio = new - old
-    expected_kl = (torch.expm1(log_ratio) - log_ratio).sum(-1).mean()
-    torch.testing.assert_close(approximate_kl, expected_kl)
-
-
-def test_per_dim_clip_bounds_each_coordinate_independently():
-    # One position, two dims: one inside the trust region, one clipped high.
-    # A joint ratio would clip (or not) both together; the factored form
-    # must clip exactly the offending coordinate.
-    old = torch.zeros(1, 1, 2)
-    new = torch.log(torch.tensor([[[1.1, 2.0]]]))
-    advantages = torch.tensor([[1.0]])
-    mask = torch.ones(1, 1)
-    loss, fraction, approximate_kl = per_dim_clipped_policy_loss(
-        new, old, advantages, mask
+    torch.testing.assert_close(
+        approximate_kl, (torch.expm1(log_ratio) - log_ratio).mean()
     )
-    torch.testing.assert_close(loss, torch.tensor(-(1.1 + 1.28) / 2))
-    torch.testing.assert_close(fraction, torch.tensor(0.5))
-    log_ratio = new - old
-    expected_kl = (torch.expm1(log_ratio) - log_ratio).sum(-1).mean()
-    torch.testing.assert_close(approximate_kl, expected_kl)
+
+
+def test_negative_advantage_high_ratio_remains_unclipped():
+    # This is PPO's deliberately harmful, corrective branch: when a sampled
+    # action has negative advantage but the new policy made it more likely,
+    # min(r*A, clip(r)*A) uses r*A without an upper clip. Do not silently
+    # clamp this to make high-dimensional joint ratios numerically convenient.
+    new = torch.tensor([[2.0]], requires_grad=True)
+    loss, fraction, _ = clipped_policy_loss(
+        new,
+        torch.zeros_like(new),
+        -torch.ones_like(new),
+        torch.ones_like(new),
+    )
+    expected = new.exp().squeeze()
+    torch.testing.assert_close(loss, expected)
+    assert fraction == 1
+    loss.backward()
+    torch.testing.assert_close(new.grad, new.detach().exp())
+
+
+def test_joint_action_score_sums_factor_gradients_without_dimensional_mean():
+    factors = torch.zeros(1, 1, 2, requires_grad=True)
+    joint = factors.sum(-1)
+    loss = clipped_policy_loss(
+        joint,
+        torch.zeros_like(joint),
+        torch.ones_like(joint),
+        torch.ones_like(joint),
+    )[0]
+    loss.backward()
+    torch.testing.assert_close(factors.grad, -torch.ones_like(factors))
+
+
+def test_joint_action_ratio_allows_factor_drift_to_cancel():
+    new_factors = torch.log(torch.tensor([[[1.2, 1.0 / 1.2]]]))
+    new = new_factors.sum(-1)
+    loss, fraction, _ = clipped_policy_loss(
+        new,
+        torch.zeros_like(new),
+        torch.ones_like(new),
+        torch.ones_like(new),
+    )
+    torch.testing.assert_close(loss, torch.tensor(-1.0))
+    assert fraction == 0
+
+
+def test_policy_loss_shards_use_the_global_action_denominator():
+    old = torch.zeros(1, 2)
+    new = torch.log(torch.tensor([[1.1, 0.9]]))
+    advantages = torch.tensor([[2.0, -1.0]])
+    mask = torch.ones_like(old)
+    full = clipped_policy_loss(new, old, advantages, mask)[0]
+    denominator = mask.sum()
+    sharded = sum(
+        clipped_policy_loss(
+            new[:, index : index + 1],
+            old[:, index : index + 1],
+            advantages[:, index : index + 1],
+            mask[:, index : index + 1],
+            denominator=denominator,
+        )[0]
+        for index in range(2)
+    )
+    torch.testing.assert_close(sharded, full)
 
 
 def test_behavior_kl_is_stable_and_nonnegative_near_zero_drift():

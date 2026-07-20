@@ -67,7 +67,7 @@ class GaussianTransitionHead(nn.Module):
     exploration noise scaled to the backbone's pretraining prediction
     error (latent MSE ~0.36 => log-sigma ~ -0.5).  There is no learned
     uncertainty, no entropy bonus, and no likelihood objective on this
-    head — the trust region (per-dim clipped PPO) is the only constraint.
+    head — the joint-action PPO trust region is the only constraint.
     """
 
     def __init__(self, model_dim: int, log_sigma: float = -0.5):
@@ -101,11 +101,10 @@ class GaussianTransitionHead(nn.Module):
     def per_dim_log_prob(self, sample: Tensor, mean: Tensor) -> Tensor:
         """Per-dimension log-density of the thought policy, (…, dim).
 
-        The factored form the per-dim clipped PPO surrogate consumes: a
-        512-dim summed ratio saturates the clip after a single Adam step
-        (each coordinate's drift adds to the log-ratio), so the trust
-        region must bound coordinates individually.  With sigma constant
-        the ratio is driven purely by mean movement — i.e. by the trunk.
+        Replay stores these factors individually, then sums them into the
+        complete Gaussian-vector log probability before applying one joint
+        action PPO ratio. With sigma constant, the ratio is driven purely by
+        mean movement — i.e. by the trunk.
         """
         log_sigma = self.log_sigma
         normalized = (sample.float() - mean.float()) * (-log_sigma).exp()

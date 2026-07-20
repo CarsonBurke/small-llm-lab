@@ -5,21 +5,19 @@ frozen trunk.  The world model's objective changes here: pretraining taught
 it to predict what the next latent WILL be; the policy gradient retrains the
 same prediction path toward what the next latent SHOULD be.
 
-- PPO trains everything through one differentiable teacher-forced replay:
-  the gate (Bernoulli THINK/EMIT, scalar clipped surrogate), emitted tokens
-  (clipped surrogate from a belief-reading renderer — the standard VAPO actor
-  loss),
-  and thought CONTENT (per-dim clipped surrogate on the fixed-sigma Gaussian
-  around the model's own predicted latent; a joint 512-dim ratio saturates
-  the clip after one Adam step, so coordinates are bounded individually).
+- PPO trains everything through one differentiable teacher-forced replay.
+  Gate and content log probabilities form one joint action probability at
+  each stream position, with one VAPO clipped surrogate: gate+token for EMIT,
+  gate+Gaussian-vector for optional THINK, and Gaussian-vector alone for a
+  forced initial THINK.
 - The critic is a SEPARATE from-scratch model (same architecture class,
   fresh weights, fully trainable, no SIGReg or latent prediction) trained
   purely by HL-Gauss cross-entropy on [0, 1] value targets.  It values
   every stream position — vocab AND latent — which is what gives thinking
   its training signal.
-- No entropy bonus, no KL penalty, no beta-NLL: sigma is a fixed constant,
-  the trust region is the only policy constraint (paper-faithful — VAPO's
-  optimized loss is L_PPO + mu*L_NLL and nothing else).
+- An optional Bernoulli gate-entropy bonus can preserve THINK exploration;
+  there is no continuous-policy entropy bonus, KL penalty, or beta-NLL.
+  Sigma remains fixed and the VAPO trust region constrains policy updates.
 - No pretraining anchor (user prescription, Jul 18): SIGReg and the latent
   target-prediction objective are dropped at RL time — keeping them would
   pit "predict what the next latent WILL be" against the policy gradient's
@@ -30,9 +28,9 @@ same prediction path toward what the next latent SHOULD be.
 Data and rewards follow the VAPO paper exactly: prompts are DAPO-Math-17K,
 the terminal reward is the binary Minerva-style verifier on the EOS-truncated
 generation, positives for the auxiliary LM loss are verifier-correct
-trajectories, and AIME 2024 avg@k is the eval.  Each prompt group rolls out
-as its own batch (prompts vary in length), and each group is one PPO
-minibatch.  ``--rollout-only`` is the learnability gate: it reports whether
+trajectories, and AIME 2024 avg@k is the eval. Prompt groups roll out and
+replay separately because their lengths differ, then accumulate into the
+shared actor/critic optimizer minibatch. ``--rollout-only`` reports whether
 rewards vary within prompt groups at the initial 50/50 gate before any
 update is attempted.
 
@@ -80,8 +78,6 @@ from postraining.core import (
     generalized_advantage_estimate,
     length_adaptive_lambda,
     load_unique_math_rows,
-    masked_token_mean,
-    per_dim_clipped_policy_loss,
     positive_example_lm_loss,
     validate_posttraining_context_budget,
 )
@@ -112,12 +108,39 @@ from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
 
-EXECUTION_SCHEMA = "bf16_compiled_rollout_default_dynamic_replay/v3"
+EXECUTION_SCHEMA = "configurable_disjoint_b512_behavior_pool/v7"
+LEGACY_POOL_EXECUTION_SCHEMA = "frozen_pool_2048_four_disjoint_b512_stable_actor_lrs/v6"
 DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
 # v2: the grading style follows each row's reward_model.style (Minerva for
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
 # instead of Minerva-normalizing everything.
 REWARD_SCHEMA = POSTTRAIN_REWARD_SCHEMA
+
+
+def resume_execution_schema_compatible(payload: dict) -> bool:
+    """Accept current checkpoints and the one proven-safe legacy migration.
+
+    The v6 label covered both the rejected frozen-2048/four-update runs and
+    the completed fresh-B512 run. Only saved arguments can disambiguate them;
+    migrate the latter and keep rejecting stale-pool optimizer states.
+    """
+    schema = payload.get("execution_schema")
+    if schema == EXECUTION_SCHEMA:
+        return True
+    if schema != LEGACY_POOL_EXECUTION_SCHEMA:
+        return False
+    source_args = payload.get("args", {})
+    if hasattr(source_args, "__dict__"):
+        source_args = vars(source_args)
+    try:
+        return (
+            int(source_args.get("prompts_per_rollout", -1)) == 16
+            and int(source_args.get("prompts_per_minibatch", -1)) == 16
+            and int(source_args.get("samples_per_prompt", -1)) == 32
+            and int(source_args.get("ppo_epochs", -1)) == 1
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def sample_prompt_batch(
@@ -416,14 +439,6 @@ def aggregate_actor_tensorboard_metrics(
     if not metrics:
         raise ValueError("at least one actor metric group is required")
 
-    def mean(key: str) -> float:
-        return sum(metric[key] for metric in metrics) / len(metrics)
-
-    def mean_product(left: str, right: str) -> float:
-        return sum(
-            metric[left] * metric[right] for metric in metrics
-        ) / len(metrics)
-
     value = aggregate_value_diagnostics(metrics)
     advantage_mean = _weighted_metric_mean(
         metrics, "advantage_mean", "action_count"
@@ -446,22 +461,25 @@ def aggregate_actor_tensorboard_metrics(
         max(0.0, advantage_second_moment - advantage_mean**2)
     )
     last = metrics[-1]
-    gate_contribution = mean_product("gate_loss", "gate_pg_coef")
-    renderer_contribution = mean("renderer_loss")
-    thought_contribution = mean_product("thought_loss", "thought_pg_coef")
-    positive_lm_contribution = mean_product(
-        "positive_lm_loss", "positive_lm_weight"
+    # Each group is already divided by the denominator of the complete actor
+    # optimizer minibatch, so its loss is a contribution to be summed rather
+    # than another independently normalized minibatch mean.
+    policy_contribution = sum(metric["policy_loss"] for metric in metrics)
+    positive_lm_contribution = sum(
+        metric["positive_lm_loss"] * metric["positive_lm_weight"]
+        for metric in metrics
+    )
+    gate_entropy_bonus = sum(
+        metric["gate_entropy_bonus"] for metric in metrics
     )
     return {
-        "loss/gate_weighted": gate_contribution,
-        "loss/renderer": renderer_contribution,
-        "loss/thought_weighted": thought_contribution,
+        "loss/policy": policy_contribution,
         "loss/positive_lm_weighted": positive_lm_contribution,
+        "bonus/gate_entropy_weighted": gate_entropy_bonus,
         "loss/actor_total": (
-            gate_contribution
-            + renderer_contribution
-            + thought_contribution
+            policy_contribution
             + positive_lm_contribution
+            - gate_entropy_bonus
         ),
         "value/token_weighted_excess_ce": value["excess_ce"],
         "value/prediction_mean": value["prediction_mean"],
@@ -499,25 +517,25 @@ def aggregate_actor_tensorboard_metrics(
         "kl/thought_behavior_joint": _weighted_metric_mean(
             metrics, "thought_behavior_kl_joint", "thought_action_count"
         ),
-        "kl/policy_behavior_per_action": _weighted_metric_mean(
-            metrics, "policy_behavior_kl_per_action", "action_count"
+        "kl/policy_behavior_per_action": sum(
+            metric["policy_behavior_kl_per_action"] for metric in metrics
         ),
-        "clip/gate": _weighted_metric_mean(
-            metrics, "gate_clip_fraction", "gate_action_count"
+        "clip/policy": sum(
+            metric["policy_clip_fraction"] for metric in metrics
         ),
-        "clip/renderer": _weighted_metric_mean(
-            metrics, "renderer_clip_fraction", "emit_action_count"
+        "ratio/joint_abs_log_max": max(
+            metric["joint_abs_log_ratio_max"] for metric in metrics
         ),
-        "clip/thought_coordinate_fraction": _weighted_metric_mean(
-            metrics, "thought_clip_fraction", "thought_action_count"
+        "ratio/harmful_positive_log_max": max(
+            metric["harmful_positive_log_ratio_max"] for metric in metrics
         ),
-        # Actor gradients accumulate across groups; only the final group has
-        # the actual full pre-step norm. The critic steps per group instead.
+        # Both optimizers accumulate across groups; only the final group has
+        # the complete pre-step gradient norm.
         "grad/trunk": last["trunk_grad_norm"],
         "grad/renderer": last["renderer_grad_norm"],
         "grad/adapter": last["adapter_grad_norm"],
         "grad/gate": last["gate_grad_norm"],
-        "grad/critic_mean": mean("critic_grad_norm"),
+        "grad/critic": last["critic_grad_norm"],
     }
 
 
@@ -549,41 +567,77 @@ def rollout_tensorboard_metrics(metrics: dict[str, float | int]) -> dict[str, fl
     }
 
 
-def bounded_epoch_order(group_count: int, remaining_steps: int) -> list[int]:
-    """Shuffle one PPO epoch without advancing past the requested step cap."""
+def optimizer_minibatch_orders(
+    group_count: int, groups_per_minibatch: int
+) -> list[list[int]]:
+    """Shuffle a frozen-policy pool into disjoint optimizer minibatches."""
     if group_count < 1:
         raise ValueError("group_count must be positive")
-    update_count = min(group_count, max(remaining_steps, 0))
-    return torch.randperm(group_count).tolist()[:update_count]
+    if groups_per_minibatch < 1:
+        raise ValueError("groups_per_minibatch must be positive")
+    if group_count % groups_per_minibatch:
+        raise ValueError("group_count must divide into complete minibatches")
+    order = torch.randperm(group_count).tolist()
+    return [
+        order[start : start + groups_per_minibatch]
+        for start in range(0, group_count, groups_per_minibatch)
+    ]
+
+
+def actor_minibatch_denominators(
+    groups: list[LatentRolloutBatch],
+    indices: list[int],
+    positive_reward_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Global action/gate/positive-token denominators for one actor step."""
+    if not indices:
+        raise ValueError("at least one prompt group is required")
+    action_count = torch.stack(
+        [groups[index].action_mask.sum() for index in indices]
+    ).sum()
+    gate_action_count = torch.stack(
+        [groups[index].gate_mask.sum() for index in indices]
+    ).sum()
+    positive_token_count = torch.stack(
+        [
+            (
+                groups[index].emit_mask
+                * (
+                    groups[index].reward_scalar >= positive_reward_threshold
+                )[:, None]
+            ).sum()
+            for index in indices
+        ]
+    ).sum()
+    return action_count, gate_action_count, positive_token_count
 
 
 def write_actor_tensorboard_metrics(
-    tensorboard, dashboard: dict[str, float], epoch: int, step: int
+    tensorboard, dashboard: dict[str, float], behavior_age: int, step: int
 ) -> None:
-    """Write one actor-step row without deterministic epoch-zero clutter."""
-    if epoch == 0:
+    """Write one actor-step row, eliding exact fresh-behavior zeros."""
+    if behavior_age == 0:
         refresh_drift = max(
             dashboard[tag]
             for tag in (
                 "kl/gate_behavior",
                 "kl/renderer_behavior",
                 "kl/thought_behavior_joint",
-                "clip/gate",
-                "clip/renderer",
-                "clip/thought_coordinate_fraction",
+                "kl/policy_behavior_per_action",
+                "clip/policy",
+                "ratio/joint_abs_log_max",
+                "ratio/harmful_positive_log_max",
             )
         )
         tensorboard.add_scalar(
             "debug/behavior_refresh_max_drift", refresh_drift, step
         )
     for tag, value in dashboard.items():
-        if epoch == 0 and (
-            tag.startswith("kl/") or tag.startswith("clip/")
+        if behavior_age == 0 and (
+            tag.startswith("kl/")
+            or tag.startswith("clip/")
+            or tag.startswith("ratio/")
         ):
-            continue
-        # Advantages are frozen with the behavior rollout and are identical
-        # across PPO epochs; chart them once.
-        if epoch > 0 and tag.startswith("advantage/"):
             continue
         tensorboard.add_scalar(tag, value, step)
 
@@ -628,17 +682,21 @@ def build_optimizers(
     wrapper: LatentThoughtModel,
     critic: SeparateCritic,
     actor_lr: float,
-    head_lr: float,
+    gate_lr: float,
+    adapter_lr: float,
     renderer_lr: float,
     critic_lr: float,
     fused: bool = True,
 ) -> dict[str, torch.optim.Optimizer]:
     """The actor/critic optimizer layout.
 
-    One actor AdamW in three groups: the pretrained trunk at ``actor_lr``,
-    the fresh zero-init heads (gate, adapter) at ``head_lr``, and the
-    renderer probe at ``renderer_lr`` (it drives token-PPO ratios directly
-    and cannot ride the hotter trunk rate).  The probes live under
+    One actor AdamW in four groups: the pretrained trunk at ``actor_lr``,
+    the Bernoulli gate at ``gate_lr``, the recurrent thought adapter at
+    ``adapter_lr``, and the renderer probe at ``renderer_lr``.  The gate can
+    learn at a fresh-head rate because it changes one scalar factor per action.
+    The adapter cannot: one update changes the beliefs underlying every later
+    factor in a 512-D joint Gaussian action, so it shares the paper-scale actor
+    rate.  The probes live under
     ``blocks[-1]`` (so pretraining's optimizer saw them), which makes
     name-prefix filtering wrong — exclude them from the trunk by identity.
     """
@@ -653,14 +711,12 @@ def build_optimizers(
         for parameter in backbone.parameters()
         if id(parameter) not in probe_parameter_ids
     ]
-    head_parameters = list(wrapper.gate.parameters()) + list(
-        wrapper.adapter.parameters()
-    )
     return {
         "actor": torch.optim.AdamW(
             [
                 {"params": trunk_parameters, "lr": actor_lr},
-                {"params": head_parameters, "lr": head_lr},
+                {"params": list(wrapper.gate.parameters()), "lr": gate_lr},
+                {"params": list(wrapper.adapter.parameters()), "lr": adapter_lr},
                 {"params": list(backbone.policy_probe.parameters()), "lr": renderer_lr},
             ],
             weight_decay=0.0,
@@ -670,6 +726,27 @@ def build_optimizers(
             critic.parameters(), lr=critic_lr, weight_decay=0.0, fused=fused,
         ),
     }
+
+
+def joint_action_logprobs(
+    new_gate_logprobs: torch.Tensor,
+    old_gate_logprobs: torch.Tensor,
+    new_token_logprobs: torch.Tensor,
+    old_token_logprobs: torch.Tensor,
+    new_thought_logprobs: torch.Tensor,
+    old_thought_logprobs: torch.Tensor,
+    gate_mask: torch.Tensor,
+    emit_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine conditional policy factors into one log-probability/action."""
+    return (
+        new_gate_logprobs * gate_mask
+        + new_token_logprobs * emit_mask
+        + new_thought_logprobs,
+        old_gate_logprobs * gate_mask
+        + old_token_logprobs * emit_mask
+        + old_thought_logprobs,
+    )
 
 
 def update_minibatch(
@@ -682,8 +759,13 @@ def update_minibatch(
     positive_reward_threshold: float = 0.5,
     thought_pg_coef: float = 1.0,
     gate_pg_coef: float = 1.0,
+    gate_entropy_coef: float = 0.0,
     actor_step: bool = True,
-    loss_scale: float = 1.0,
+    critic_step: bool = True,
+    policy_action_denominator: torch.Tensor | None = None,
+    gate_action_denominator: torch.Tensor | None = None,
+    positive_token_denominator: torch.Tensor | None = None,
+    value_action_denominator: torch.Tensor | None = None,
     gae_lambda_alpha: float = 0.05,
     replay_max_trajectories: int = 32,
     replay_attention_budget: int = 4 * 1024 * 1024,
@@ -691,23 +773,20 @@ def update_minibatch(
 ) -> dict[str, float]:
     """One minibatch update.
 
-    The critic is a per-call supervised regression (no trust region) and
-    always steps here.  The actor is trust-region-bound: with 16 groups x 2
-    epochs, stepping it per minibatch would take 32 full-trunk steps against
-    one frozen behavior policy and drive every ratio outside the clip
-    (red-teamed) — so the trainer accumulates actor gradients across a whole
-    epoch (``actor_step=False``, ``loss_scale=1/len(groups)``) and steps the
-    actor once per epoch at the call site.  Standalone callers (tests) keep
-    ``actor_step=True`` for the self-contained single-step behavior.
+    Actor and critic gradients can be accumulated across prompt groups with
+    ``actor_step=False`` and ``critic_step=False``. The trainer uses the same
+    effective trajectory minibatch and one optimizer step for both; standalone
+    callers keep the self-contained single-step defaults.
 
     The group is replayed in stable length-sorted shards because causal
     attention is quadratic in stream length. The planner bounds B*L^2 and
-    trims every shard independently. Every objective keeps its denominator
-    from the FULL prompt group, so sharding changes only the floating-point
-    reduction order, not the loss or optimizer cadence.
+    trims every shard independently. The actor objectives keep denominators
+    from the COMPLETE optimizer minibatch, which can span prompt groups, so
+    sharding changes only floating-point reduction order.
     """
     backbone = wrapper.backbone
-    optimizers["critic"].zero_grad(set_to_none=True)
+    if critic_step:
+        optimizers["critic"].zero_grad(set_to_none=True)
     if actor_step and "actor" in optimizers:
         optimizers["actor"].zero_grad(set_to_none=True)
     if replay_max_trajectories < 1:
@@ -731,21 +810,31 @@ def update_minibatch(
         "gate": batch.gate_mask.sum().clamp_min(1),
         "emit": batch.emit_mask.sum().clamp_min(1),
         "thought": thought_actions.sum().clamp_min(1),
-        "positive": positive.sum().clamp_min(1),
     }
+    if policy_action_denominator is None:
+        policy_action_denominator = batch.action_mask.sum()
+    if gate_action_denominator is None:
+        gate_action_denominator = batch.gate_mask.sum()
+    if value_action_denominator is None:
+        value_action_denominator = batch.action_mask.sum()
+    if positive_token_denominator is None:
+        positive_token_denominator = (
+            batch.emit_mask * positive[:, None]
+        ).sum()
     zero = batch.action_mask.new_zeros(())
     totals = {
         key: zero.clone()
         for key in (
             "value_loss", "value_sum", "value_target_sum", "target_entropy_sum",
-            "gate_loss", "gate_clip", "gate_kl_sum", "gate_entropy_sum",
+            "policy_loss", "policy_clip", "gate_kl_sum",
+            "gate_entropy_sum", "gate_entropy_bonus",
             "emit_probability_sum",
-            "renderer_loss", "renderer_clip", "positive_lm", "thought_loss",
-            "renderer_kl_sum", "thought_clip", "thought_kl_sum",
+            "positive_lm", "renderer_kl_sum", "thought_kl_sum",
             "advantage_sum", "advantage_square_sum",
             "optional_think_advantage_sum", "forced_initial_think_advantage_sum",
             "thought_advantage_sum", "emit_advantage_sum", "target_square_sum",
             "residual_sum", "residual_square_sum",
+            "joint_abs_log_ratio_max", "harmful_positive_log_ratio_max",
         )
     }
 
@@ -778,14 +867,12 @@ def update_minibatch(
         advantages = advantages.detach()
         value_targets = value_targets.detach()
         local_action_count = microbatch.action_mask.sum()
-        value_weight = local_action_count / denominators["action"]
-
-        # The critic has no trust region, but it still takes exactly one step
-        # per prompt group. Backward each weighted shard now and step below.
         value_logits = critic.value_logits(microbatch)
         value_ce = critic.support.cross_entropy(value_logits, value_targets)
-        local_value_loss = masked_token_mean(value_ce, microbatch.action_mask)
-        weighted_value_loss = value_weight * local_value_loss
+        local_value_numerator = (value_ce * microbatch.action_mask).sum()
+        weighted_value_loss = (
+            local_value_numerator / value_action_denominator.clamp_min(1)
+        )
         if not torch.isfinite(weighted_value_loss):
             raise RuntimeError(
                 f"non-finite value loss: {float(weighted_value_loss)}"
@@ -820,7 +907,7 @@ def update_minibatch(
                 (microbatch.gate_actions == EMIT).float()
                 * microbatch.action_mask
             )
-            totals["value_loss"] += weighted_value_loss.detach()
+            totals["value_loss"] += local_value_numerator.detach()
             totals["value_sum"] += (values * microbatch.action_mask).sum()
             totals["value_target_sum"] += (
                 value_targets * microbatch.action_mask
@@ -859,25 +946,15 @@ def update_minibatch(
         if value_only:
             continue
 
-        # The differentiable actor replay is separate from the critic graph,
-        # lowering peak memory further. Gate/renderer losses backprop through
-        # beliefs into the trunk; only the THINK-masked term consumes the
-        # densely computed prediction projector.
+        # A stream position is one MDP action, even when that action factors
+        # into a Bernoulli gate and token/Gaussian content. Combine factors in
+        # log space before applying VAPO's single clipped surrogate.
         beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
             wrapper, microbatch
         )
-        local_gate_count = microbatch.gate_mask.sum()
-        gate_weight = local_gate_count / denominators["gate"]
         new_gate_logprobs = wrapper.gate.log_prob(
             microbatch.gate_actions.float(), beliefs
         )
-        local_gate_loss, local_gate_clip, local_gate_kl = clipped_policy_loss(
-            new_gate_logprobs,
-            microbatch.old_gate_logprobs,
-            advantages,
-            microbatch.gate_mask,
-        )
-        weighted_gate_loss = gate_weight * local_gate_loss
 
         emit_mask = microbatch.emit_mask.bool()
         emit_features = wrapper.renderer_features(
@@ -892,99 +969,148 @@ def update_minibatch(
         )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         new_token_logprobs[emit_mask] = compact_token_logprobs
-        local_emit_count = microbatch.emit_mask.sum()
-        renderer_weight = local_emit_count / denominators["emit"]
-        (
-            local_renderer_loss,
-            local_renderer_clip,
-            local_renderer_kl,
-        ) = clipped_policy_loss(
-            new_token_logprobs,
-            microbatch.old_token_logprobs,
-            advantages,
-            microbatch.emit_mask,
-        )
-        weighted_renderer_loss = renderer_weight * local_renderer_loss
 
         micro_positive = microbatch.reward_scalar >= positive_reward_threshold
-        positive_weight = micro_positive.sum() / denominators["positive"]
-        local_positive_lm = positive_example_lm_loss(
-            new_token_logprobs, microbatch.emit_mask, micro_positive
+        weighted_positive_lm = positive_example_lm_loss(
+            new_token_logprobs,
+            microbatch.emit_mask,
+            micro_positive,
+            denominator=positive_token_denominator,
         )
-        weighted_positive_lm = positive_weight * local_positive_lm
 
         think_mask = (
             (microbatch.gate_actions == THINK)
             & microbatch.action_mask.bool()
         )
-        local_thought_count = think_mask.sum()
-        thought_weight = local_thought_count / denominators["thought"]
+        new_thought_joint = torch.zeros_like(new_token_logprobs)
+        old_thought_joint = torch.zeros_like(new_token_logprobs)
         if bool(think_mask.any()):
             thought_means, thought_targets, _ = select_thought_actions(
                 microbatch, predicted
             )
-            compact_advantages = advantages[think_mask]
             if thought_pg_coef != 0.0:
                 new_thought_logprobs = wrapper.transition.per_dim_log_prob(
                     thought_targets, thought_means
                 )
-                (
-                    local_thought_loss,
-                    local_thought_clip,
-                    local_thought_joint_kl,
-                ) = per_dim_clipped_policy_loss(
-                    new_thought_logprobs,
-                    microbatch.old_thought_logprobs[think_mask],
-                    compact_advantages,
-                    torch.ones_like(compact_advantages),
-                )
-                weighted_thought_loss = thought_weight * local_thought_loss
             else:
-                # The renderer/trunk objectives can move the predicted
-                # thought mean even when thought policy gradients are off.
-                # Measure that drift without creating projector gradients.
                 with torch.no_grad():
                     new_thought_logprobs = wrapper.transition.per_dim_log_prob(
                         thought_targets, thought_means.detach()
                     )
-                    (
-                        _,
-                        local_thought_clip,
-                        local_thought_joint_kl,
-                    ) = per_dim_clipped_policy_loss(
-                        new_thought_logprobs,
-                        microbatch.old_thought_logprobs[think_mask],
-                        torch.zeros_like(compact_advantages),
-                        torch.ones_like(compact_advantages),
+            compact_new_thought_joint = new_thought_logprobs.float().sum(-1)
+            compact_old_thought_joint = (
+                microbatch.old_thought_logprobs[think_mask].float().sum(-1)
+            )
+            if thought_pg_coef == 0.0:
+                policy_thought_joint = compact_new_thought_joint.detach()
+            else:
+                policy_thought_joint = (
+                    compact_new_thought_joint.detach()
+                    + thought_pg_coef
+                    * (
+                        compact_new_thought_joint
+                        - compact_new_thought_joint.detach()
                     )
-                weighted_thought_loss = predicted.detach().new_zeros(())
+                )
+            new_thought_joint = new_thought_joint.masked_scatter(
+                think_mask, policy_thought_joint
+            )
+            old_thought_joint = old_thought_joint.masked_scatter(
+                think_mask, compact_old_thought_joint
+            )
+
+        if gate_pg_coef == 0.0:
+            policy_gate_logprobs = new_gate_logprobs.detach()
         else:
-            # Preserve grad=None on the prediction projector when its policy
-            # objective is disabled; a zero grad would let Adam apply stale
-            # momentum despite there being no thought-content signal.
-            weighted_thought_loss = predicted.detach().new_zeros(())
-            local_thought_clip = predicted.detach().new_zeros(())
-            local_thought_joint_kl = predicted.detach().new_zeros(())
+            policy_gate_logprobs = (
+                new_gate_logprobs.detach()
+                + gate_pg_coef
+                * (new_gate_logprobs - new_gate_logprobs.detach())
+            )
+        new_joint_logprobs, old_joint_logprobs = joint_action_logprobs(
+            policy_gate_logprobs,
+            microbatch.old_gate_logprobs,
+            new_token_logprobs,
+            microbatch.old_token_logprobs,
+            new_thought_joint,
+            old_thought_joint,
+            microbatch.gate_mask,
+            microbatch.emit_mask,
+        )
+        with torch.no_grad():
+            joint_log_ratio = new_joint_logprobs - old_joint_logprobs
+            active_joint_log_ratio = joint_log_ratio * microbatch.action_mask
+            totals["joint_abs_log_ratio_max"] = torch.maximum(
+                totals["joint_abs_log_ratio_max"],
+                active_joint_log_ratio.abs().max(),
+            )
+            # PPO intentionally leaves A<0, ratio>1+epsilon unclipped. This
+            # tail statistic directly exposes the branch that overflowed in
+            # the first frozen-pool run without changing the objective.
+            harmful_positive_log_ratio = torch.where(
+                (advantages < 0) & microbatch.action_mask.bool(),
+                joint_log_ratio.clamp_min(0),
+                torch.zeros_like(joint_log_ratio),
+            )
+            totals["harmful_positive_log_ratio_max"] = torch.maximum(
+                totals["harmful_positive_log_ratio_max"],
+                harmful_positive_log_ratio.max(),
+            )
+        weighted_policy_loss, weighted_policy_clip, _ = (
+            clipped_policy_loss(
+                new_joint_logprobs,
+                old_joint_logprobs,
+                advantages,
+                microbatch.action_mask,
+                denominator=policy_action_denominator,
+                estimate_kl=False,
+            )
+        )
+
+        # Normalize over every optional gate decision in the complete
+        # optimizer minibatch, matching the policy surrogate's global
+        # normalization. The auxiliary objective deliberately updates only
+        # the Bernoulli head. Sending a high-coefficient entropy gradient into
+        # the shared belief trunk could erase useful state features instead of
+        # making the gate use those features less deterministically.
+        # gate_pg_coef=0 remains a true gate freeze, including this term.
+        weighted_gate_entropy_bonus = (
+            gate_entropy_coef
+            * gate_pg_coef
+            * (
+                wrapper.gate.entropy(beliefs.detach())
+                * microbatch.gate_mask
+            ).sum()
+            / gate_action_denominator.clamp_min(1)
+        )
 
         actor_total = (
-            gate_pg_coef * weighted_gate_loss
-            + weighted_renderer_loss
+            weighted_policy_loss
             + positive_lm_weight * weighted_positive_lm
-            + thought_pg_coef * weighted_thought_loss
+            - weighted_gate_entropy_bonus
         )
         if not torch.isfinite(actor_total):
             raise RuntimeError(
                 "non-finite actor loss before optimizer step: "
-                f"gate={float(weighted_gate_loss)} "
-                f"renderer={float(weighted_renderer_loss)} "
+                f"policy={float(weighted_policy_loss)} "
                 f"positive_lm={float(weighted_positive_lm)} "
-                f"thought={float(weighted_thought_loss)}"
+                f"gate_entropy_bonus={float(weighted_gate_entropy_bonus)} "
             )
-        (loss_scale * actor_total).backward()
+        actor_total.backward()
         with torch.no_grad():
-            totals["gate_loss"] += weighted_gate_loss.detach()
-            totals["gate_clip"] += gate_weight * local_gate_clip
-            totals["gate_kl_sum"] += local_gate_kl * local_gate_count
+            gate_log_ratio = (
+                new_gate_logprobs - microbatch.old_gate_logprobs
+            )
+            renderer_log_ratio = (
+                new_token_logprobs - microbatch.old_token_logprobs
+            )
+            totals["policy_loss"] += weighted_policy_loss.detach()
+            totals["policy_clip"] += weighted_policy_clip
+            totals["gate_entropy_bonus"] += weighted_gate_entropy_bonus.detach()
+            totals["gate_kl_sum"] += (
+                (torch.expm1(gate_log_ratio) - gate_log_ratio)
+                * microbatch.gate_mask
+            ).sum()
             totals["gate_entropy_sum"] += (
                 wrapper.gate.entropy(beliefs) * microbatch.gate_mask
             ).sum()
@@ -992,17 +1118,19 @@ def update_minibatch(
                 wrapper.gate.emit_logit(beliefs).sigmoid()
                 * microbatch.gate_mask
             ).sum()
-            totals["renderer_loss"] += weighted_renderer_loss.detach()
-            totals["renderer_clip"] += (
-                renderer_weight * local_renderer_clip
-            )
-            totals["renderer_kl_sum"] += local_renderer_kl * local_emit_count
+            totals["renderer_kl_sum"] += (
+                (torch.expm1(renderer_log_ratio) - renderer_log_ratio)
+                * microbatch.emit_mask
+            ).sum()
             totals["positive_lm"] += weighted_positive_lm.detach()
-            totals["thought_loss"] += weighted_thought_loss.detach()
-            totals["thought_clip"] += thought_weight * local_thought_clip
-            totals["thought_kl_sum"] += (
-                local_thought_joint_kl * local_thought_count
-            )
+            if bool(think_mask.any()):
+                thought_log_ratio = (
+                    new_thought_logprobs
+                    - microbatch.old_thought_logprobs[think_mask]
+                )
+                totals["thought_kl_sum"] += (
+                    torch.expm1(thought_log_ratio) - thought_log_ratio
+                ).sum()
 
     action_denom = denominators["action"]
     advantage_mean = totals["advantage_sum"] / action_denom
@@ -1026,7 +1154,7 @@ def update_minibatch(
         torch.zeros_like(target_variance),
     )
     metric_tensors = {
-        "value_loss": totals["value_loss"],
+        "value_loss": totals["value_loss"] / action_denom,
         "value_mean": totals["value_sum"] / action_denom,
         "value_target_mean": value_target_mean,
         "value_target_variance": target_variance,
@@ -1034,7 +1162,7 @@ def update_minibatch(
         "value_residual_variance": residual_variance,
         "explained_variance": explained_variance,
         "value_excess_ce": (
-            totals["value_loss"]
+            totals["value_loss"] / action_denom
             - totals["target_entropy_sum"] / action_denom
         ),
         "think_advantage_mean": (
@@ -1062,11 +1190,12 @@ def update_minibatch(
         metric_tensors["critic_grad_norm"] = gradient_norm_tensor(
             critic.parameters()
         )
-        optimizers["critic"].step()
+        if critic_step:
+            optimizers["critic"].step()
         return scalar_tensors_to_floats(metric_tensors)
 
-    # Norms are cumulative across an accumulation epoch; the last minibatch
-    # of an epoch reports the full pre-step norm.  Probes are registered
+    # Norms are cumulative across prompt groups; the final group reports the
+    # complete pre-step norm. Probes are registered
     # under blocks[-1], so exclude them from the trunk norm by identity.
     probe_parameter_ids = {
         id(parameter)
@@ -1086,20 +1215,18 @@ def update_minibatch(
         "critic_grad_norm": gradient_norm_tensor(critic.parameters()),
         "gate_grad_norm": gradient_norm_tensor(wrapper.gate.parameters()),
     }
-    optimizers["critic"].step()
+    if critic_step:
+        optimizers["critic"].step()
     if actor_step and "actor" in optimizers:
         optimizers["actor"].step()
     metric_tensors.update(
-        gate_loss=totals["gate_loss"],
-        gate_clip_fraction=totals["gate_clip"],
+        policy_loss=totals["policy_loss"],
+        policy_clip_fraction=totals["policy_clip"],
         gate_entropy=totals["gate_entropy_sum"] / denominators["gate"],
+        gate_entropy_bonus=totals["gate_entropy_bonus"],
         emit_probability=totals["emit_probability_sum"] / denominators["gate"],
-        renderer_loss=totals["renderer_loss"],
-        renderer_clip_fraction=totals["renderer_clip"],
         positive_lm_loss=totals["positive_lm"],
         positive_fraction=positive.float().mean(),
-        thought_loss=totals["thought_loss"],
-        thought_clip_fraction=totals["thought_clip"],
         gate_behavior_kl=totals["gate_kl_sum"] / denominators["gate"],
         renderer_behavior_kl=totals["renderer_kl_sum"] / denominators["emit"],
         thought_behavior_kl_joint=(
@@ -1110,12 +1237,13 @@ def update_minibatch(
             / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
         ),
         policy_behavior_kl_per_action=(
-            (
-                totals["gate_kl_sum"]
-                + totals["renderer_kl_sum"]
-                + totals["thought_kl_sum"]
-            )
-            / denominators["action"]
+            totals["gate_kl_sum"]
+            + totals["renderer_kl_sum"]
+            + totals["thought_kl_sum"]
+        ) / policy_action_denominator.clamp_min(1),
+        joint_abs_log_ratio_max=totals["joint_abs_log_ratio_max"],
+        harmful_positive_log_ratio_max=(
+            totals["harmful_positive_log_ratio_max"]
         ),
         advantage_mean=advantage_mean,
         advantage_std=advantage_variance.sqrt(),
@@ -1127,6 +1255,7 @@ def update_minibatch(
         gate_pg_coef=float(gate_pg_coef),
         thought_pg_coef=float(thought_pg_coef),
         positive_lm_weight=float(positive_lm_weight),
+        gate_entropy_coef=float(gate_entropy_coef),
     )
     return metrics
 
@@ -1184,11 +1313,16 @@ def main() -> None:
     parser.add_argument(
         "--continuation-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
     )
+    # Default to one fresh B512 behavior pool per actor+critic update:
+    # 16 prompts x 32 samples. A 2048 pool split into four stale B512 updates
+    # is supported explicitly, but exact 512-D Gaussian joint ratios produced
+    # rare harmful-direction overflows even at VAPO's 1e-6 actor LR. Fresh
+    # behavior keeps the exact objective without discarding or reusing data.
     parser.add_argument("--prompts-per-rollout", type=int, default=16)
-    # Each prompt group is one PPO minibatch (prompts vary in length, so
-    # groups are separate batches end to end).
+    parser.add_argument("--prompts-per-minibatch", type=int, default=16)
     parser.add_argument("--samples-per-prompt", type=int, default=32)
-    parser.add_argument("--ppo-epochs", type=int, default=2)
+    # One pass only: repeated PPO epochs reuse the same generated trajectories.
+    parser.add_argument("--ppo-epochs", type=int, default=1)
     # Total generated-slot budget per trajectory (thinks + emits).  Thinking
     # is never forcibly interrupted; overthinking costs emitted tokens and
     # therefore reward. 0 means 4x the emit cap; the default is the explicit
@@ -1198,14 +1332,18 @@ def main() -> None:
     )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    # Pretrained trunk (embeddings, blocks, projector): a conservative RL
-    # fine-tuning rate — pretraining ran Muon at 0.04, but AdamW at equal lr
-    # is far hotter in spectral norm, and PPO ratios must stay inside the
-    # trust region across an accumulation epoch.
-    parser.add_argument("--actor-lr", type=float, default=1e-5)
-    # Fresh zero-init heads (gate, thought adapter) start from nothing and
-    # tolerate a hotter rate.
-    parser.add_argument("--head-lr", type=float, default=1e-4)
+    # VAPO's paper actor rate. It is retained exactly; the 2048-pool failures
+    # came from applying later stale updates to a 512-D recurrent Gaussian,
+    # and are addressed by the fresh-B512 default rather than by changing the
+    # paper LR, clipping gradients, or distorting the joint likelihood ratio.
+    parser.add_argument("--actor-lr", type=float, default=1e-6)
+    # The scalar Bernoulli gate is a genuinely fresh head and can use a hotter
+    # rate without shifting the continuous thought distribution itself.
+    parser.add_argument("--gate-lr", type=float, default=1e-4)
+    # Although zero-initialized, the adapter is recurrent policy state, not an
+    # isolated classifier head. Keep it at the actor rate so one update cannot
+    # perturb every later belief in a trajectory.
+    parser.add_argument("--adapter-lr", type=float, default=1e-6)
     # The renderer probe drives token-PPO ratios directly; keep it at the
     # v1 rate rather than folding it into the 10x-hotter trunk group.
     parser.add_argument("--renderer-lr", type=float, default=1e-6)
@@ -1229,11 +1367,14 @@ def main() -> None:
     # signal.  Smaller sigma also tightens the effective trust region on
     # the mean (ratio ~ delta-mean/sigma), pairing with the low actor lr.
     parser.add_argument("--thought-log-sigma", type=float, default=-1.5)
-    # Weight of the per-dim clipped PPO term on thought content.  The
-    # gradient flows through the prediction path into the whole trunk; 0
-    # disables reward-training of thought content (control arm — the trunk
-    # still trains through the token PPO term).
+    # Gradient multiplier for the thought factor inside the joint action log
+    # probability. The forward ratio stays exact; 0 detaches only that factor
+    # as a control arm while token/gate gradients still train the trunk.
     parser.add_argument("--thought-pg-coef", type=float, default=1.0)
+    # Optional exploration ablation. This is a head-only Bernoulli entropy
+    # bonus, averaged over optional gate decisions. The default remains
+    # paper-faithful; experiments must set the coefficient explicitly.
+    parser.add_argument("--gate-entropy-coef", type=float, default=0.0)
     # Freeze the gate for the first N steps: the gate learns "don't think"
     # from a clean binary signal far faster than the 512-dim thought content
     # can learn to be useful, so exploration dies before content training
@@ -1318,9 +1459,7 @@ def main() -> None:
     parser.add_argument(
         "--rollout-compile", action=argparse.BooleanOptionalAction, default=True
     )
-    # One PPO outer rollout advances 32 logical group updates by default;
-    # checkpoint every completed rollout so a later collect cannot erase the
-    # previous one. Warmup checkpoints are smaller (actor Adam has no state).
+    # Checkpoint in true actor/critic optimizer-update units.
     parser.add_argument("--save-every", type=int, default=32)
     parser.add_argument("--warmup-save-every", type=int, default=10)
     # Compile the compute-bound parallel replay surfaces independently of the
@@ -1348,12 +1487,19 @@ def main() -> None:
         help="initialize only the actor from a latent-VAPO checkpoint, while "
         "resetting critic/optimizers and continuing its unused prompt stream",
     )
+    parser.add_argument(
+        "--actor-critic-init", default=None,
+        help="initialize actor and pretrained critic weights from a warmup "
+        "checkpoint, preserve optimizer state, and continue its unused prompt stream",
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
     if args.replay_max_trajectories < 1:
         parser.error("--replay-max-trajectories must be positive")
+    if not math.isfinite(args.gate_entropy_coef) or args.gate_entropy_coef < 0.0:
+        parser.error("--gate-entropy-coef must be finite and nonnegative")
     if args.replay_attention_budget < 1:
         parser.error("--replay-attention-budget must be positive")
     if args.replay_bucket < 1:
@@ -1362,12 +1508,32 @@ def main() -> None:
         parser.error("--warmup-save-every must be positive")
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
+    if args.prompts_per_rollout < 1:
+        parser.error("--prompts-per-rollout must be positive")
+    if args.prompts_per_minibatch < 1:
+        parser.error("--prompts-per-minibatch must be positive")
+    if args.prompts_per_rollout % args.prompts_per_minibatch:
+        parser.error(
+            "--prompts-per-rollout must be divisible by --prompts-per-minibatch"
+        )
+    if args.ppo_epochs != 1:
+        parser.error("--ppo-epochs must be 1; trajectory reuse is disabled")
     if args.bpb_val_tokens < 0:
         parser.error("--bpb-val-tokens must be nonnegative")
-    if args.actor_init and args.resume:
-        parser.error("--actor-init and --resume are mutually exclusive")
+    initialization_modes = sum(
+        option is not None
+        for option in (args.actor_init, args.actor_critic_init, args.resume)
+    )
+    if initialization_modes > 1:
+        parser.error(
+            "--actor-init, --actor-critic-init, and --resume are mutually exclusive"
+        )
     if args.samples_per_prompt < 2 or args.samples_per_prompt % 2:
         parser.error("--samples-per-prompt must be even for the 50/50 forced split")
+    if args.prompts_per_minibatch * args.samples_per_prompt != 512:
+        parser.error(
+            "optimizer minibatches must contain exactly 512 trajectories"
+        )
     for name, samples in (
         ("--aime-samples", args.aime_samples),
         ("--bench-samples", args.bench_samples),
@@ -1427,19 +1593,41 @@ def main() -> None:
         )
     actor_init_payload = None
     actor_init_provenance = None
-    if args.actor_init:
+    initialization_path = args.actor_critic_init or args.actor_init
+    if initialization_path:
         actor_init_payload = torch.load(
-            args.actor_init, map_location="cpu", weights_only=False
+            initialization_path, map_location="cpu", weights_only=False
         )
-        validate_renderer_checkpoint(actor_init_payload, args.actor_init)
+        validate_renderer_checkpoint(actor_init_payload, initialization_path)
+        if args.actor_critic_init:
+            if int(actor_init_payload.get("step", -1)) != 0:
+                raise ValueError(
+                    "--actor-critic-init requires a pre-policy critic-warmup checkpoint"
+                )
+            if (
+                int(actor_init_payload.get("value_warmup_step", -1))
+                < args.value_warmup_steps
+            ):
+                raise ValueError(
+                    "--actor-critic-init checkpoint has incomplete critic warmup"
+                )
+            if actor_init_payload.get("reward_schema") != REWARD_SCHEMA:
+                raise ValueError(
+                    "--actor-critic-init checkpoint uses an incompatible reward schema"
+                )
         wrapper.load_state_dict(actor_init_payload["model"], strict=True)
         # The run controls exploration noise even when actor weights are
         # initialized from an earlier reward schema.
         wrapper.transition.log_sigma.fill_(args.thought_log_sigma)
         actor_init_provenance = {
-            "checkpoint": str(args.actor_init),
+            "checkpoint": str(initialization_path),
+            "critic_initialized": bool(args.actor_critic_init),
             "source_step": actor_init_payload.get("step"),
             "source_reward_schema": actor_init_payload.get("reward_schema"),
+            "source_execution_schema": actor_init_payload.get("execution_schema"),
+            "source_value_warmup_step": actor_init_payload.get(
+                "value_warmup_step"
+            ),
             "sampler_cursor": int(actor_init_payload["sampler_cursor"]),
         }
     for parameter in wrapper.parameters():
@@ -1454,12 +1642,32 @@ def main() -> None:
         prior_value=args.value_prior,
     ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
+    if args.actor_critic_init:
+        critic.load_state_dict(actor_init_payload["critic"], strict=True)
 
     optimizers = build_optimizers(
         wrapper, critic,
-        actor_lr=args.actor_lr, head_lr=args.head_lr,
+        actor_lr=args.actor_lr, gate_lr=args.gate_lr,
+        adapter_lr=args.adapter_lr,
         renderer_lr=args.renderer_lr, critic_lr=args.critic_lr,
     )
+    if args.actor_critic_init:
+        # A step-0 critic-warm checkpoint has never stepped its actor. Its
+        # optimizer state is therefore empty and carries no momentum to
+        # preserve; loading its obsolete three-group layout would only couple
+        # the gate and recurrent adapter again. Preserve the trained critic's
+        # optimizer state and start the untouched actor optimizer in the
+        # current four-group layout.
+        source_actor_optimizer = actor_init_payload["optimizers"]["actor"]
+        if source_actor_optimizer["state"]:
+            raise ValueError(
+                "--actor-critic-init requires a pristine actor optimizer"
+            )
+        optimizers["critic"].load_state_dict(
+            actor_init_payload["optimizers"]["critic"]
+        )
+        for group in optimizers["critic"].param_groups:
+            group["lr"] = args.critic_lr
 
     tokenizer = spm.SentencePieceProcessor(model_file=FreshHyperparameters.tokenizer_path)
     stop_ids = tuple(
@@ -1515,46 +1723,29 @@ def main() -> None:
             or Path(source_math_data).resolve() != Path(args.math_data).resolve()
         ):
             raise ValueError(
-                "--actor-init must use the same math dataset so its sampler "
+                "initialization checkpoint must use the same math dataset so its sampler "
                 "cursor denotes the remaining unused prompts"
             )
         if int(source_args.get("seed", -1)) != args.seed:
             raise ValueError(
-                "--actor-init must use the source seed so its deterministic "
+                "initialization checkpoint must use the source seed so its deterministic "
                 "prompt order can continue without reuse"
             )
         source_exclusions = source_args.get("exclude_modules") or ""
         if source_exclusions != args.exclude_modules:
             raise ValueError(
-                "--actor-init must use the same --exclude-modules setting"
+                "initialization checkpoint must use the same --exclude-modules setting"
             )
         actor_cursor = int(actor_init_payload.get("sampler_cursor", -1))
         if not 0 <= actor_cursor < len(math_rows):
             raise ValueError(
-                "--actor-init source has no valid unused first-epoch prompt "
+                "initialization source has no valid unused first-epoch prompt "
                 f"cursor: {actor_cursor} for {len(math_rows)} rows"
             )
         sampler.cursor = actor_cursor
-        if args.bpb_only:
-            planned_prompt_count = 0
-        elif args.rollout_only:
-            planned_prompt_count = args.prompts_per_rollout
-        else:
-            actor_collections = math.ceil(
-                args.steps / (args.ppo_epochs * args.prompts_per_rollout)
-            )
-            planned_prompt_count = args.prompts_per_rollout * (
-                args.value_warmup_steps + actor_collections
-            )
-        if actor_cursor + planned_prompt_count > len(math_rows):
-            raise ValueError(
-                "--actor-init run would cross the source dataset's first "
-                "epoch and reuse prompts: cursor "
-                f"{actor_cursor} + planned {planned_prompt_count} > "
-                f"{len(math_rows)} rows"
-            )
         print(
-            f"actor initialized from {args.actor_init} at source step "
+            f"actor{' and critic' if args.actor_critic_init else ''} initialized "
+            f"from {initialization_path} at source step "
             f"{actor_init_payload.get('step')} and sampler cursor {actor_cursor}",
             flush=True,
         )
@@ -1573,10 +1764,18 @@ def main() -> None:
         )
 
     start_step = 0
-    warmup_step = 0
+    warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
     if args.resume:
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         validate_renderer_checkpoint(payload, args.resume)
+        if not resume_execution_schema_compatible(payload):
+            raise ValueError(
+                f"resume checkpoint execution schema must be {EXECUTION_SCHEMA!r}; "
+                f"got {payload.get('execution_schema')!r}. Use --actor-init or "
+                "--actor-critic-init for an explicit initialization restart. "
+                "Legacy v6 migration is restricted to saved fresh-B512 "
+                "16x32, one-pass runs."
+            )
         if payload.get("reward_schema") != REWARD_SCHEMA:
             raise ValueError(
                 f"resume checkpoint reward schema must be {REWARD_SCHEMA!r}; "
@@ -1593,7 +1792,7 @@ def main() -> None:
         wrapper.transition.log_sigma.fill_(args.thought_log_sigma)
         for group, lr in zip(
             optimizers["actor"].param_groups,
-            (args.actor_lr, args.head_lr, args.renderer_lr),
+            (args.actor_lr, args.gate_lr, args.adapter_lr, args.renderer_lr),
             strict=True,
         ):
             group["lr"] = lr
@@ -1611,6 +1810,31 @@ def main() -> None:
         random.setstate(payload["python_rng"])
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
+
+    if args.actor_critic_init:
+        torch.set_rng_state(actor_init_payload["cpu_rng"])
+        torch.cuda.set_rng_state_all(actor_init_payload["cuda_rng"])
+        random.setstate(actor_init_payload["python_rng"])
+
+    if args.bpb_only:
+        planned_prompt_count = 0
+    elif args.rollout_only:
+        planned_prompt_count = args.prompts_per_rollout
+    else:
+        warmup_updates = (
+            max(args.value_warmup_steps - warmup_step, 0) if start_step == 0 else 0
+        )
+        remaining_actor_steps = max(args.steps - start_step, 0)
+        planned_prompt_count = args.prompts_per_minibatch * (
+            warmup_updates + remaining_actor_steps
+        )
+    if sampler.cursor + planned_prompt_count > len(math_rows):
+        raise ValueError(
+            "posttraining run would cross the dataset's first epoch and "
+            "reuse prompts: cursor "
+            f"{sampler.cursor} + planned {planned_prompt_count} > "
+            f"{len(math_rows)} rows"
+        )
 
     # Rollout and evaluation both keep narrow prefix attention while making
     # prefix and batch dimensions symbolic. They use separate compiled bound
@@ -1663,7 +1887,7 @@ def main() -> None:
         # update_minibatch through this module's global,
         # refresh_old_statistics through latent_rollout's.  Rebinding both
         # to the SAME compiled object keeps refresh and update on one
-        # compiled artifact — the property that makes epoch-0 PPO ratios
+        # compiled artifact — the property that makes behavior-age-0 PPO ratios
         # exactly one (see refresh_old_statistics on why it also runs
         # grad-enabled).
         globals()["replay_head_inputs"] = compiled_replay
@@ -1700,7 +1924,26 @@ def main() -> None:
                 },
                 "actor_init": actor_init_provenance,
                 "critic": {
-                    "init": "scratch",
+                    "init": (
+                        "warm_checkpoint"
+                        if args.actor_critic_init
+                        else "scratch"
+                    ),
+                    "checkpoint": (
+                        str(args.actor_critic_init)
+                        if args.actor_critic_init
+                        else None
+                    ),
+                    "source_execution_schema": (
+                        actor_init_payload.get("execution_schema")
+                        if args.actor_critic_init
+                        else None
+                    ),
+                    "source_warmup_optimizer_semantics": (
+                        "legacy_per_prompt_group"
+                        if args.actor_critic_init
+                        else None
+                    ),
                     "architecture": backbone.architecture,
                     "value_bins": args.value_bins,
                     "value_sigma_ratio": args.value_sigma_ratio,
@@ -1736,7 +1979,7 @@ def main() -> None:
         )
         # Stepwise rollout and parallel replay disagree numerically at
         # bf16 scale; recompute the stored PPO statistics through the
-        # update-step replay path so epoch-0 ratios are exactly one.
+        # update-step replay path so fresh-behavior ratios are exactly one.
         # This also fills old_values from the separate critic (the
         # rollout never values).
         if refresh_statistics:
@@ -1750,9 +1993,11 @@ def main() -> None:
             )
         return batch
 
-    def _collect(refresh_statistics: bool) -> list[LatentRolloutBatch]:
+    def _collect(
+        refresh_statistics: bool, prompt_count: int
+    ) -> list[LatentRolloutBatch]:
         """One rollout: a scored prompt group per sampled DAPO problem."""
-        rollout_rows = sampler.next_rows(args.prompts_per_rollout)
+        rollout_rows = sampler.next_rows(prompt_count)
         groups = []
         if args.rollout_groups <= 1:
             for row in rollout_rows:
@@ -1823,6 +2068,7 @@ def main() -> None:
 
     def collect(
         refresh_statistics: bool = True,
+        prompt_count: int | None = None,
     ) -> list[LatentRolloutBatch]:
         original_step_core = wrapper.step_core
         if rollout_step_core is not None:
@@ -1832,7 +2078,12 @@ def main() -> None:
             # refresh below must remain grad-enabled so refresh/update share
             # one compiled replay specialization and identical PPO numerics.
             with training_autocast():
-                return _collect(refresh_statistics)
+                return _collect(
+                    refresh_statistics,
+                    args.prompts_per_rollout
+                    if prompt_count is None
+                    else prompt_count,
+                )
         finally:
             wrapper.step_core = original_step_core
 
@@ -1945,7 +2196,7 @@ def main() -> None:
         tensorboard.close()
         raise SystemExit(0 if passed else 2)
 
-    if start_step == 0 and warmup_step == 0:
+    if start_step == 0 and (warmup_step == 0 or args.actor_critic_init):
         bpb = teacher_forced_bpb()
         logger.log(type="bpb", step=0, val_bpb=bpb)
         tensorboard.add_scalar("guard/val_bpb", bpb, 0)
@@ -1958,10 +2209,17 @@ def main() -> None:
         for warmup in range(warmup_step + 1, args.value_warmup_steps + 1):
             warmup_started = time.perf_counter()
             collect_started = warmup_started
-            groups = collect(refresh_statistics=False)
+            groups = collect(
+                refresh_statistics=False,
+                prompt_count=args.prompts_per_minibatch,
+            )
             torch.cuda.synchronize()
             collect_seconds = time.perf_counter() - collect_started
             update_started = time.perf_counter()
+            value_action_denominator = torch.stack(
+                [group.action_mask.sum() for group in groups]
+            ).sum()
+            optimizers["critic"].zero_grad(set_to_none=True)
             group_metrics = [
                 training_update(
                     wrapper,
@@ -1969,12 +2227,15 @@ def main() -> None:
                     group,
                     optimizers,
                     value_only=True,
+                    critic_step=False,
+                    value_action_denominator=value_action_denominator,
                     replay_max_trajectories=args.replay_max_trajectories,
                     replay_attention_budget=args.replay_attention_budget,
                     replay_bucket=args.replay_bucket,
                 )
                 for group in groups
             ]
+            optimizers["critic"].step()
             del groups
             update_seconds = time.perf_counter() - update_started
             metrics = {
@@ -1997,6 +2258,7 @@ def main() -> None:
                 value_loss=_weighted_metric_mean(
                     group_metrics, "value_loss", "action_count"
                 ),
+                critic_grad_norm=group_metrics[-1]["critic_grad_norm"],
                 think_advantage_mean=_weighted_metric_mean(
                     group_metrics, "think_advantage_mean", "think_action_count"
                 ),
@@ -2037,14 +2299,14 @@ def main() -> None:
                 "value_warmup/residual/emit_mean": metrics[
                     "emit_advantage_mean"
                 ],
-                "value_warmup/critic_grad_norm_mean": metrics[
+                "value_warmup/critic_grad_norm": metrics[
                     "critic_grad_norm"
                 ],
             }
             for tag, value in warmup_dashboard.items():
                 tensorboard.add_scalar(tag, value, warmup)
             # The optimizer state is sufficient for the next update and for
-            # checkpoints. Keeping the last group's gradient buffers alive
+            # checkpoints. Keeping the accumulated gradient buffers alive
             # overlaps them with the next rollout's KV cache for no benefit.
             optimizers["critic"].zero_grad(set_to_none=True)
             warmup_step = warmup
@@ -2080,77 +2342,128 @@ def main() -> None:
         previous_step = step
         started = time.perf_counter()
         collect_started = started
-        groups = collect()
+        pool_updates = min(
+            args.prompts_per_rollout // args.prompts_per_minibatch,
+            args.steps - step,
+        )
+        pool_prompt_count = pool_updates * args.prompts_per_minibatch
+        torch.cuda.reset_peak_memory_stats()
+        groups = collect(prompt_count=pool_prompt_count)
         torch.cuda.synchronize()
         collect_seconds = time.perf_counter() - collect_started
+        rollout_peak_vram_bytes = torch.cuda.max_memory_allocated()
         rollout_metrics = aggregate_diagnostics(
             groups, args.samples_per_prompt, stop_ids
         )
         logger.log(
             type="rollout", step=step,
             collect_seconds=collect_seconds,
+            pool_updates=pool_updates,
+            pool_trajectories=pool_prompt_count * args.samples_per_prompt,
+            peak_vram_bytes=rollout_peak_vram_bytes,
             **rollout_metrics,
         )
         tensorboard.add_scalar("perf/collect_seconds", collect_seconds, step)
+        tensorboard.add_scalar(
+            "perf/rollout_peak_vram_gib",
+            rollout_peak_vram_bytes / 2**30,
+            step,
+        )
         rollout_dashboard = rollout_tensorboard_metrics(rollout_metrics)
         for tag, value in rollout_dashboard.items():
             tensorboard.add_scalar(tag, value, step)
 
-        for epoch in range(args.ppo_epochs):
-            # One accumulated actor step per epoch: stepping the full trunk
-            # per minibatch would take ppo_epochs x len(groups) trust-region
-            # steps against a single frozen behavior policy and saturate the
-            # clip (red-teamed).  The critic has no trust region and still
-            # steps per minibatch inside update_minibatch.
-            epoch_order = bounded_epoch_order(len(groups), args.steps - step)
-            if not epoch_order:
-                break
+        minibatch_orders = optimizer_minibatch_orders(
+            len(groups), args.prompts_per_minibatch
+        )
+        if len(minibatch_orders) != pool_updates:
+            raise RuntimeError("rollout pool did not produce the planned updates")
+        for behavior_age, minibatch_order in enumerate(minibatch_orders):
+            # Actor and critic each take one optimizer step over the same
+            # effective trajectory minibatch. Prompt groups and replay shards
+            # are memory partitions, not optimizer minibatches.
+            update_started = time.perf_counter()
+            next_step = step + 1
             optimizers["actor"].zero_grad(set_to_none=True)
-            epoch_metrics: list[dict[str, float]] = []
-            for index in epoch_order:
-                step += 1
+            optimizers["critic"].zero_grad(set_to_none=True)
+            (
+                policy_action_denominator,
+                gate_action_denominator,
+                positive_token_denominator,
+            ) = actor_minibatch_denominators(
+                groups, minibatch_order, args.positive_reward_threshold
+            )
+            minibatch_metrics: list[dict[str, float]] = []
+            for index in minibatch_order:
                 metrics = training_update(
                     wrapper, critic, groups[index], optimizers,
                     positive_lm_weight=args.positive_lm_weight,
                     positive_reward_threshold=args.positive_reward_threshold,
                     thought_pg_coef=args.thought_pg_coef,
-                    gate_pg_coef=0.0 if step <= args.gate_freeze_steps else 1.0,
+                    gate_entropy_coef=args.gate_entropy_coef,
+                    gate_pg_coef=(
+                        0.0 if next_step <= args.gate_freeze_steps else 1.0
+                    ),
                     actor_step=False,
-                    loss_scale=1.0 / len(epoch_order),
+                    critic_step=False,
+                    policy_action_denominator=policy_action_denominator,
+                    gate_action_denominator=gate_action_denominator,
+                    positive_token_denominator=positive_token_denominator,
+                    value_action_denominator=policy_action_denominator,
                     gae_lambda_alpha=args.gae_lambda_alpha,
                     replay_max_trajectories=args.replay_max_trajectories,
                     replay_attention_budget=args.replay_attention_budget,
                     replay_bucket=args.replay_bucket,
                 )
-                # Epoch 0 runs against the refresh-computed statistics with
-                # the actor untouched, so every PPO ratio is exactly one and
-                # every clip fraction exactly zero.  A nonzero here means the
-                # refresh and update forwards diverged (e.g. compiled
-                # artifacts split) — the drift refresh exists to remove.
-                if epoch == 0:
-                    for guard in (
-                        "gate_clip_fraction",
-                        "renderer_clip_fraction",
-                        "thought_clip_fraction",
-                    ):
-                        if metrics[guard] > 1e-6:
-                            print(
-                                f"WARNING step {step}: epoch-0 {guard}="
-                                f"{metrics[guard]:.3e} (expected exactly 0; "
-                                "refresh/update code paths diverged)",
-                                flush=True,
-                            )
-                logger.log(
-                    type="train", step=step,
-                    seconds=time.perf_counter() - started,
-                    peak_vram_bytes=torch.cuda.max_memory_allocated(),
-                    **metrics,
+                # The first minibatch runs against refresh-computed behavior
+                # statistics with the actor untouched. Later disjoint
+                # minibatches intentionally have behavior age 1..N.
+                if behavior_age == 0:
+                    guard = "policy_clip_fraction"
+                    if metrics[guard] > 1e-6:
+                        print(
+                            f"WARNING step {next_step}: behavior-age-0 {guard}="
+                            f"{metrics[guard]:.3e} (expected exactly 0; "
+                            "refresh/update code paths diverged)",
+                            flush=True,
+                        )
+                minibatch_metrics.append(metrics)
+            actor_dashboard = aggregate_actor_tensorboard_metrics(
+                minibatch_metrics
+            )
+            nonfinite_gradients = {
+                name: actor_dashboard[name]
+                for name in (
+                    "grad/trunk", "grad/gate", "grad/adapter", "grad/renderer",
+                    "grad/critic",
                 )
-                epoch_metrics.append(metrics)
-            actor_dashboard = aggregate_actor_tensorboard_metrics(epoch_metrics)
+                if not math.isfinite(actor_dashboard[name])
+            }
+            if nonfinite_gradients:
+                raise RuntimeError(
+                    "non-finite gradients before optimizer step: "
+                    f"{nonfinite_gradients}"
+                )
             optimizers["actor"].step()
+            optimizers["critic"].step()
+            step = next_step
+            update_seconds = time.perf_counter() - update_started
+            logger.log(
+                type="train",
+                step=step,
+                behavior_age=behavior_age,
+                trajectories=(
+                    len(minibatch_order) * args.samples_per_prompt
+                ),
+                seconds=update_seconds,
+                pool_seconds=time.perf_counter() - started,
+                peak_vram_bytes=torch.cuda.max_memory_allocated(),
+                dashboard=actor_dashboard,
+                group_metrics=minibatch_metrics,
+            )
+            tensorboard.add_scalar("perf/update_seconds", update_seconds, step)
             write_actor_tensorboard_metrics(
-                tensorboard, actor_dashboard, epoch, step
+                tensorboard, actor_dashboard, behavior_age, step
             )
 
         # No operation below consumes rollout tensors. Release them before

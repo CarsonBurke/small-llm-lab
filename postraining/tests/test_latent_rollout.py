@@ -10,8 +10,8 @@ import train_gpt as baseline
 from fresh_lejepa_train import FreshLeJEPAGPT
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.core import (
+    clipped_policy_loss,
     generalized_advantage_estimate,
-    per_dim_clipped_policy_loss,
 )
 from postraining.latent_rollout import (
     PAD_SLOT,
@@ -26,6 +26,7 @@ from postraining.latent_rollout import (
     refresh_old_statistics,
     replay_beliefs,
     replay_head_inputs,
+    select_trajectory_rows,
     select_thought_actions,
     rollout_continuations,
     split_rollout_groups,
@@ -39,6 +40,8 @@ from postraining.train_latent_vapo import (
     REWARD_SCHEMA,
     build_optimizers,
     evaluate_aime_latent,
+    joint_action_logprobs,
+    resume_execution_schema_compatible,
     sample_prompt_batch,
     score_math_rollout,
     think_run_lengths,
@@ -120,11 +123,13 @@ def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, stream_steps=None, seed=7
 
 
 def _optimizers(
-    wrapper, critic, actor_lr=1e-3, head_lr=1e-2, critic_lr=1e-3, renderer_lr=1e-3
+    wrapper, critic, actor_lr=1e-3, gate_lr=1e-2, adapter_lr=1e-3,
+    critic_lr=1e-3, renderer_lr=1e-3,
 ):
     """The trainer's actual optimizer layout, at test-scale rates (CPU: unfused)."""
     return build_optimizers(
-        wrapper, critic, actor_lr=actor_lr, head_lr=head_lr,
+        wrapper, critic, actor_lr=actor_lr, gate_lr=gate_lr,
+        adapter_lr=adapter_lr,
         renderer_lr=renderer_lr, critic_lr=critic_lr, fused=False,
     )
 
@@ -376,6 +381,22 @@ def test_forced_initial_think_and_first_emit_both_receive_terminal_credit():
         )
 
 
+def test_joint_action_logprobs_match_emit_optional_and_forced_think() -> None:
+    new, old = joint_action_logprobs(
+        new_gate_logprobs=torch.tensor([[10.0, 20.0, 30.0]]),
+        old_gate_logprobs=torch.tensor([[1.0, 2.0, 3.0]]),
+        new_token_logprobs=torch.tensor([[100.0, 200.0, 300.0]]),
+        old_token_logprobs=torch.tensor([[4.0, 5.0, 6.0]]),
+        new_thought_logprobs=torch.tensor([[0.0, 2_000.0, 3_000.0]]),
+        old_thought_logprobs=torch.tensor([[0.0, 7.0, 8.0]]),
+        gate_mask=torch.tensor([[1.0, 1.0, 0.0]]),
+        emit_mask=torch.tensor([[1.0, 0.0, 0.0]]),
+    )
+    # EMIT=gate+token; optional THINK=gate+thought; forced THINK=thought only.
+    torch.testing.assert_close(new, torch.tensor([[110.0, 2_020.0, 3_000.0]]))
+    torch.testing.assert_close(old, torch.tensor([[5.0, 9.0, 8.0]]))
+
+
 def test_forced_initial_think_trains_content_but_not_the_gate():
     wrapper = _wrapper()
     critic = _critic()
@@ -400,7 +421,7 @@ def test_forced_initial_think_trains_content_but_not_the_gate():
     metrics = update_minibatch(
         wrapper, critic, batch, _optimizers(wrapper, critic)
     )
-    assert metrics["gate_loss"] == 0.0
+    assert torch.isfinite(torch.tensor(metrics["policy_loss"]))
     assert metrics["think_action_count"] == 0.0
     assert metrics["forced_initial_think_action_count"] == 4.0
     assert all(
@@ -446,14 +467,41 @@ def test_gate_pg_coef_zero_freezes_the_gate_but_not_the_rest():
     gate_bias = wrapper.gate.head.bias.clone()
     trunk_before = wrapper.backbone.blocks[0].attn.proj.weight.clone()
     metrics = update_minibatch(
-        wrapper, critic, batch, _optimizers(wrapper, critic), gate_pg_coef=0.0
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        gate_pg_coef=0.0,
+        gate_entropy_coef=0.2,
     )
     assert torch.equal(wrapper.gate.head.weight, gate_weight)
     assert torch.equal(wrapper.gate.head.bias, gate_bias)
     # Freezing the gate must not freeze the actor: the trunk still trains
     # through the renderer/thought terms.
     assert not torch.equal(wrapper.backbone.blocks[0].attn.proj.weight, trunk_before)
-    assert torch.isfinite(torch.tensor(metrics["gate_loss"]))
+    assert torch.isfinite(torch.tensor(metrics["policy_loss"]))
+    assert metrics["gate_entropy_bonus"] == 0.0
+
+
+def test_gate_entropy_bonus_has_the_right_normalization():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assign_terminal_rewards(batch, torch.rand(4))
+    refresh_old_statistics(wrapper, critic, batch)
+
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        gate_entropy_coef=0.2,
+    )
+
+    assert metrics["gate_entropy_coef"] == 0.2
+    assert metrics["gate_entropy_bonus"] == pytest.approx(
+        0.2 * metrics["gate_entropy"]
+    )
 
 
 def test_update_minibatch_trains_the_full_policy_model():
@@ -529,7 +577,7 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
         )
         thought_logprobs = torch.zeros_like(batch.old_thought_logprobs)
         thought_logprobs[think_mask] = compact_logprobs
-    # Epoch-0 per-dim thought ratios are exactly one by construction.
+    # Epoch-0 thought log-probability factors are identical by construction.
     assert torch.equal(batch.old_thought_logprobs, thought_logprobs.float())
 
 
@@ -667,6 +715,7 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         positive_reward_threshold=0.5,
         thought_pg_coef=0.7,
         gate_pg_coef=0.8,
+        gate_entropy_coef=0.02,
     )
     full_metrics = update_minibatch(
         full_wrapper,
@@ -689,10 +738,9 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
 
     for key in (
         "value_loss",
-        "gate_loss",
-        "renderer_loss",
+        "policy_loss",
         "positive_lm_loss",
-        "thought_loss",
+        "gate_entropy_bonus",
         "advantage_mean",
         "advantage_std",
         "gate_behavior_kl",
@@ -782,9 +830,9 @@ def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
     advantages, _ = generalized_advantage_estimate(
         batch.rewards, batch.old_values, batch.action_mask, torch.ones(4)
     )
-    loss, _, _ = per_dim_clipped_policy_loss(
-        new_logprobs,
-        batch.old_thought_logprobs[think_mask],
+    loss, _, _ = clipped_policy_loss(
+        new_logprobs.sum(-1),
+        batch.old_thought_logprobs[think_mask].sum(-1),
         advantages.detach()[think_mask],
         torch.ones_like(advantages[think_mask]),
     )
@@ -881,10 +929,18 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     critic_probe_ids = {id(p) for p in wrapper.backbone.critic_probe.parameters()}
     assert critic_probe_ids
     assert critic_probe_ids.isdisjoint({id(p) for p in actor_params})
-    # Three groups: trunk, fresh heads, renderer probe at its own rate.
+    # Four groups: trunk, scalar gate, recurrent adapter, renderer probe.
     lrs = [group["lr"] for group in optimizers["actor"].param_groups]
-    assert lrs == [1e-3, 1e-2, 1e-3]
-    renderer_group = optimizers["actor"].param_groups[2]["params"]
+    assert lrs == [1e-3, 1e-2, 1e-3, 1e-3]
+    gate_group = optimizers["actor"].param_groups[1]["params"]
+    assert {id(p) for p in gate_group} == {
+        id(p) for p in wrapper.gate.parameters()
+    }
+    adapter_group = optimizers["actor"].param_groups[2]["params"]
+    assert {id(p) for p in adapter_group} == {
+        id(p) for p in wrapper.adapter.parameters()
+    }
+    renderer_group = optimizers["actor"].param_groups[3]["params"]
     assert {id(p) for p in renderer_group} == {
         id(p) for p in wrapper.backbone.policy_probe.parameters()
     }
@@ -905,7 +961,7 @@ def test_actor_accumulation_defers_the_trunk_step_to_the_caller():
     before = trunk_weight.detach().clone()
     optimizers["actor"].zero_grad(set_to_none=True)
     metrics = update_minibatch(
-        wrapper, critic, batch, optimizers, actor_step=False, loss_scale=0.5
+        wrapper, critic, batch, optimizers, actor_step=False
     )
     # The actor did not step, but its gradient is banked for the caller.
     torch.testing.assert_close(trunk_weight.detach(), before)
@@ -913,6 +969,84 @@ def test_actor_accumulation_defers_the_trunk_step_to_the_caller():
     assert trunk_weight.grad is not None
     optimizers["actor"].step()
     assert not torch.equal(trunk_weight.detach(), before)
+
+
+def test_critic_accumulation_matches_one_full_effective_minibatch_step():
+    torch.manual_seed(43)
+    wrapper = _wrapper()
+    base_critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assign_terminal_rewards(batch, torch.tensor([0.1, 0.4, 0.7, 1.0]))
+
+    full_critic = copy.deepcopy(base_critic)
+    accumulated_critic = copy.deepcopy(base_critic)
+    full_optimizers = _optimizers(wrapper, full_critic)
+    accumulated_optimizers = _optimizers(wrapper, accumulated_critic)
+    full_optimizers["critic"].zero_grad(set_to_none=True)
+    full_metrics = update_minibatch(
+        wrapper,
+        full_critic,
+        copy.deepcopy(batch),
+        full_optimizers,
+        value_only=True,
+        critic_step=False,
+    )
+
+    groups = [
+        select_trajectory_rows(batch, rows, batch.stream_length)
+        for rows in (torch.tensor([0]), torch.tensor([1, 2, 3]))
+    ]
+    denominator = batch.action_mask.sum()
+    accumulated_optimizers["critic"].zero_grad(set_to_none=True)
+    before = [
+        parameter.detach().clone()
+        for parameter in accumulated_critic.parameters()
+    ]
+    group_metrics = [
+        update_minibatch(
+            wrapper,
+            accumulated_critic,
+            group,
+            accumulated_optimizers,
+            value_only=True,
+            critic_step=False,
+            value_action_denominator=denominator,
+        )
+        for group in groups
+    ]
+    assert all(
+        torch.equal(parameter, initial)
+        for parameter, initial in zip(
+            accumulated_critic.parameters(), before, strict=True
+        )
+    )
+    for accumulated, full in zip(
+        accumulated_critic.parameters(), full_critic.parameters(), strict=True
+    ):
+        if full.grad is None:
+            assert accumulated.grad is None
+        else:
+            torch.testing.assert_close(
+                accumulated.grad, full.grad, rtol=2e-5, atol=2e-6
+            )
+    full_optimizers["critic"].step()
+    accumulated_optimizers["critic"].step()
+
+    accumulated_loss = sum(
+        metric["value_loss"] * metric["action_count"]
+        for metric in group_metrics
+    ) / sum(metric["action_count"] for metric in group_metrics)
+    assert accumulated_loss == pytest.approx(full_metrics["value_loss"], rel=1e-6)
+    for accumulated, full in zip(
+        accumulated_critic.parameters(), full_critic.parameters(), strict=True
+    ):
+        torch.testing.assert_close(accumulated, full, rtol=3e-4, atol=2e-5)
+    for optimizer in (full_optimizers["critic"], accumulated_optimizers["critic"]):
+        assert {
+            int(state["step"])
+            for state in optimizer.state.values()
+            if "step" in state
+        } == {1}
 
 
 def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
@@ -934,20 +1068,22 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     assign_terminal_rewards(batch, torch.rand(2))
     metrics = update_minibatch(
         wrapper, critic, batch,
-        _optimizers(wrapper, critic, actor_lr=1e-4, head_lr=1e-3, critic_lr=1e-4),
+        _optimizers(wrapper, critic, actor_lr=1e-4, gate_lr=1e-3,
+                    adapter_lr=1e-4, critic_lr=1e-4),
     )
     assert all(
         torch.isfinite(torch.tensor(value)) for value in metrics.values()
     ), metrics
     # With refreshed old statistics, epoch-0 ratios started at exactly one,
     # so nothing clipped on the first update.
-    assert metrics["gate_clip_fraction"] == 0.0
-    assert metrics["renderer_clip_fraction"] == 0.0
+    assert metrics["policy_clip_fraction"] == 0.0
     assert metrics["gate_behavior_kl"] == 0.0
     assert metrics["renderer_behavior_kl"] == 0.0
     assert metrics["thought_behavior_kl_joint"] == 0.0
     assert metrics["thought_behavior_kl_per_dim"] == 0.0
     assert metrics["policy_behavior_kl_per_action"] == 0.0
+    assert metrics["joint_abs_log_ratio_max"] == 0.0
+    assert metrics["harmful_positive_log_ratio_max"] == 0.0
 
 
 def test_lambda_one_value_targets_equal_the_terminal_reward_everywhere():
@@ -1454,7 +1590,8 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
     backbone = wrapper.backbone
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
     optimizers = _optimizers(
-        wrapper, critic, actor_lr=1e-4, head_lr=1e-3, critic_lr=1e-4
+        wrapper, critic, actor_lr=1e-4, gate_lr=1e-3,
+        adapter_lr=1e-4, critic_lr=1e-4
     )
     assign_terminal_rewards(batch, torch.tensor([0.9, 0.1, 0.6, 0.2]))
     refresh_old_statistics(wrapper, critic, batch)
@@ -1581,6 +1718,26 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["sampler_cursor"] == 3
     assert payload["execution_schema"] == EXECUTION_SCHEMA
     assert payload["reward_schema"] == REWARD_SCHEMA
+
+
+def test_resume_schema_migrates_only_legacy_fresh_b512() -> None:
+    current = {"execution_schema": EXECUTION_SCHEMA}
+    assert resume_execution_schema_compatible(current)
+
+    legacy = {
+        "execution_schema": "frozen_pool_2048_four_disjoint_b512_stable_actor_lrs/v6",
+        "args": {
+            "prompts_per_rollout": 16,
+            "prompts_per_minibatch": 16,
+            "samples_per_prompt": 32,
+            "ppo_epochs": 1,
+        },
+    }
+    assert resume_execution_schema_compatible(legacy)
+    legacy["args"]["prompts_per_rollout"] = 64
+    assert not resume_execution_schema_compatible(legacy)
+    legacy["execution_schema"] = "older/v5"
+    assert not resume_execution_schema_compatible(legacy)
 
 
 def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):
