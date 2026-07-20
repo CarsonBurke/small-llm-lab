@@ -1,3 +1,7 @@
 data/*.parquet
+data/finemath/
+data/openmathinstruct2/
+data/mathematics_dataset-v1.0/
+data/mathematics_dataset-v1.0.tar.gz
 runs/
 
