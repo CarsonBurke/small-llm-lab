@@ -1566,7 +1566,7 @@ def main() -> None:
     # ~75s for all 62M validation tokens, while still giving the guard ample
     # precision to detect renderer drift. Use 0 explicitly for a final,
     # challenge-comparable full-validation measurement.
-    parser.add_argument("--bpb-every", type=int, default=320)
+    parser.add_argument("--bpb-every", type=int, default=100)
     parser.add_argument(
         "--bpb-val-tokens", type=int, default=DEFAULT_BPB_GUARD_TOKENS,
         help="deterministic validation-prefix size for the BPB guard "
