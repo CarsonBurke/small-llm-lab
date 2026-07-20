@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import warnings
 
@@ -139,6 +140,10 @@ def evaluate_latent_math(
     module_total: dict[str, int] = {}
     think_actions = torch.zeros((), dtype=torch.float32, device=device)
     actions = torch.zeros((), dtype=torch.float32, device=device)
+    emitted_counts: list[int] = []
+    stream_action_counts: list[int] = []
+    recurrent_steps_per_rollout: list[int] = []
+    terminated_total = 0
     if compiled_step_core is not None and getattr(
         compiled_step_core, "_latent_eval_disabled", False
     ):
@@ -219,6 +224,13 @@ def evaluate_latent_math(
                             ),
                         )
                     )
+                recurrent_steps_per_rollout.append(
+                    batch.stream_length - batch.prompt_length
+                )
+                stream_action_counts.extend(
+                    int(count)
+                    for count in batch.action_mask.sum(-1).cpu().tolist()
+                )
                 think_actions += (
                     (
                         (batch.gate_actions == THINK).float()
@@ -250,6 +262,10 @@ def evaluate_latent_math(
                 else:
                     emitted_rows = emitted_token_rows(batch)
                 for flat_member, emitted in enumerate(emitted_rows):
+                    emitted_counts.append(len(emitted))
+                    terminated_total += int(
+                        any(token in stop_ids for token in emitted)
+                    )
                     group = flat_member // width
                     truth = row_chunk[group][1]
                     style = row_chunk[group][5]
@@ -383,6 +399,22 @@ def evaluate_latent_math(
                 int(attempt["sample_index"]),
             )
         )
+
+    def summarize(values: list[int], prefix: str) -> dict[str, float | int]:
+        if not values:
+            return {
+                f"{prefix}_mean": 0.0,
+                f"{prefix}_p95": 0,
+                f"{prefix}_max": 0,
+            }
+        ordered = sorted(values)
+        p95_index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+        return {
+            f"{prefix}_mean": sum(ordered) / len(ordered),
+            f"{prefix}_p95": ordered[p95_index],
+            f"{prefix}_max": ordered[-1],
+        }
+
     metrics: dict[str, float | int | dict[str, float]] = {
         "accuracy": correct / max(total, 1),
         "samples": total,
@@ -390,6 +422,10 @@ def evaluate_latent_math(
         "forced_initial_accuracy": forced_correct / max(forced_total, 1),
         "unforced_initial_accuracy": unforced_correct / max(unforced_total, 1),
         "forced_initial_fraction": forced_total / max(total, 1),
+        "ended_fraction": terminated_total / max(total, 1),
+        **summarize(emitted_counts, "emitted_tokens"),
+        **summarize(stream_action_counts, "stream_actions"),
+        **summarize(recurrent_steps_per_rollout, "recurrent_steps_per_rollout"),
         "compiled": compiled_step_core is not None,
         "compile_fallback": False,
     }
