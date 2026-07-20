@@ -36,6 +36,7 @@ from postraining.latent_thought import (
     EMIT,
     THINK,
     THOUGHT_DISTRIBUTION_SCHEMA,
+    THOUGHT_MEAN_SCHEMA,
     LatentThoughtModel,
 )
 from postraining.model_io import _pope_construction
@@ -47,6 +48,7 @@ from postraining.train_latent_vapo import (
     evaluate_aime_latent,
     joint_action_logprobs,
     math_dataset_identity,
+    measure_post_update_policy_drift,
     resume_execution_schema_compatible,
     sample_prompt_batch,
     score_math_rollout,
@@ -128,15 +130,10 @@ def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, stream_steps=None, seed=7
     return trim_stream(result)
 
 
-def _optimizers(
-    wrapper, critic, actor_lr=1e-3, gate_lr=1e-2, adapter_lr=1e-3,
-    critic_lr=1e-3, renderer_lr=1e-3,
-):
+def _optimizers(wrapper, critic, learning_rate=1e-3):
     """The trainer's actual optimizer layout, at test-scale rates (CPU: unfused)."""
     return build_optimizers(
-        wrapper, critic, actor_lr=actor_lr, gate_lr=gate_lr,
-        adapter_lr=adapter_lr,
-        renderer_lr=renderer_lr, critic_lr=critic_lr,
+        wrapper, critic, learning_rate=learning_rate,
         fused=False,
     )
 
@@ -166,13 +163,13 @@ def test_rollout_emits_exactly_the_requested_tokens():
         assert len(row) == 5
 
 
-def test_emit_only_rollout_still_runs_the_thought_projector_densely():
+def test_emit_only_rollout_still_runs_the_thought_mean_densely():
     wrapper = _wrapper()
     with torch.no_grad():
         wrapper.gate.head.weight.zero_()
         wrapper.gate.head.bias.fill_(100.0)
     projected_shapes = []
-    handle = wrapper.backbone.prediction_projector.register_forward_pre_hook(
+    handle = wrapper.transition.mean_head.register_forward_pre_hook(
         lambda _module, inputs: projected_shapes.append(tuple(inputs[0].shape))
     )
     try:
@@ -421,9 +418,9 @@ def test_forced_initial_think_trains_content_but_not_the_gate():
     assign_terminal_rewards(batch, torch.tensor([0.1, 0.3, 0.6, 0.9]))
     refresh_old_statistics(wrapper, critic, batch)
     gate_before = [parameter.detach().clone() for parameter in wrapper.gate.parameters()]
-    projector_before = [
+    mean_before = [
         parameter.detach().clone()
-        for parameter in wrapper.backbone.prediction_projector.parameters()
+        for parameter in wrapper.transition.mean_head.parameters()
     ]
     metrics = update_minibatch(
         wrapper, critic, batch, _optimizers(wrapper, critic)
@@ -438,8 +435,8 @@ def test_forced_initial_think_trains_content_but_not_the_gate():
     assert any(
         not torch.equal(before, after)
         for before, after in zip(
-            projector_before,
-            wrapper.backbone.prediction_projector.parameters(),
+            mean_before,
+            wrapper.transition.mean_head.parameters(),
             strict=True,
         )
     )
@@ -712,9 +709,7 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
                 -0.01, 0.01, renderer_output.numel()
             ).reshape_as(renderer_output)
         )
-        thought_bias = (
-            base_wrapper.backbone.prediction_projector.output.bias
-        )
+        thought_bias = base_wrapper.transition.mean_head.bias
         thought_bias.add_(
             torch.linspace(-0.01, 0.01, thought_bias.numel())
         )
@@ -821,10 +816,9 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         assert steps == {1}
 
 
-def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
-    # v2 (full-model RL): the thought surrogate alone must backprop through
-    # projected thought mean into the trunk — this is the term that retrains the world
-    # model from "what WILL come next" toward "what SHOULD come next".
+def test_thought_pg_gradient_reaches_the_trunk_and_fresh_mean_head():
+    # The thought surrogate alone must backprop through the fresh thought mean
+    # into both that head and its belief-producing trunk.
     wrapper = _wrapper()
     critic = _critic()
     with torch.no_grad():
@@ -858,26 +852,30 @@ def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
     proj_grad = wrapper.backbone.blocks[0].attn.proj.weight.grad
     assert proj_grad is not None
     assert float(proj_grad.abs().sum()) > 0.0
-    projector_grad = sum(
+    mean_head_grad = sum(
         float(parameter.grad.abs().sum())
-        for parameter in wrapper.backbone.prediction_projector.parameters()
+        for parameter in wrapper.transition.mean_head.parameters()
         if parameter.grad is not None
     )
-    assert projector_grad > 0.0
+    assert mean_head_grad > 0.0
+    assert all(
+        parameter.grad is None
+        for parameter in wrapper.backbone.prediction_projector.parameters()
+    )
 
 
-def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
+def test_absent_thought_objective_leaves_mean_and_sigma_grad_none_despite_momentum(
 ):
     wrapper = _wrapper()
     critic = _critic()
     optimizers = _optimizers(wrapper, critic)
-    projector_parameters = list(wrapper.backbone.prediction_projector.parameters())
-    sigma_parameters = list(wrapper.transition.parameters())
+    mean_parameters = list(wrapper.transition.mean_head.parameters())
+    sigma_parameters = list(wrapper.transition.log_sigma_head.parameters())
 
-    # Seed Adam state so a spurious zero gradient would move the projector
+    # Seed Adam state so a spurious zero gradient would move either head
     # through stale momentum even with weight decay disabled.
     optimizers["actor"].zero_grad(set_to_none=True)
-    projector_parameters[0].grad = torch.ones_like(projector_parameters[0])
+    mean_parameters[0].grad = torch.ones_like(mean_parameters[0])
     sigma_parameters[0].grad = torch.ones_like(sigma_parameters[0])
     optimizers["actor"].step()
     optimizers["actor"].zero_grad(set_to_none=True)
@@ -891,8 +889,8 @@ def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
     assign_terminal_rewards(batch, torch.rand(4))
     refresh_old_statistics(wrapper, critic, batch)
     with torch.no_grad():
-        wrapper.backbone.prediction_projector.output.bias.add_(0.01)
-    before = [parameter.detach().clone() for parameter in projector_parameters]
+        wrapper.transition.mean_head.bias.add_(0.01)
+    before = [parameter.detach().clone() for parameter in mean_parameters]
     sigma_before = [parameter.detach().clone() for parameter in sigma_parameters]
     metrics = update_minibatch(
         wrapper,
@@ -903,22 +901,22 @@ def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
     )
 
     assert metrics["thought_behavior_kl_joint"] > 0
-    assert all(parameter.grad is None for parameter in projector_parameters)
+    assert all(parameter.grad is None for parameter in mean_parameters)
     assert all(parameter.grad is None for parameter in sigma_parameters)
-    for parameter, reference in zip(projector_parameters, before, strict=True):
+    for parameter, reference in zip(mean_parameters, before, strict=True):
         torch.testing.assert_close(parameter, reference)
     for parameter, reference in zip(sigma_parameters, sigma_before, strict=True):
         torch.testing.assert_close(parameter, reference)
 
 
-def test_renderer_reads_belief_without_training_the_thought_projector():
+def test_renderer_reads_belief_without_training_the_thought_mean():
     wrapper = _wrapper()
     backbone = wrapper.backbone
     with torch.no_grad():
         backbone.policy_probe.output.weight.normal_(std=0.02)
     batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
     stream_inputs, beliefs = replay_beliefs(wrapper, batch)
-    predicted = backbone.prediction_latent(beliefs)
+    predicted = wrapper.thought_mean(beliefs)
     features = wrapper.renderer_features(stream_inputs, beliefs)
 
     torch.testing.assert_close(features[..., : beliefs.size(-1)], stream_inputs)
@@ -931,7 +929,8 @@ def test_renderer_reads_belief_without_training_the_thought_projector():
     assert trunk_grad is not None
     assert float(trunk_grad.abs().sum()) > 0.0
     assert all(
-        parameter.grad is None for parameter in backbone.prediction_projector.parameters()
+        parameter.grad is None
+        for parameter in wrapper.transition.mean_head.parameters()
     )
 
 
@@ -953,12 +952,12 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     critic_probe_ids = {id(p) for p in wrapper.backbone.critic_probe.parameters()}
     assert critic_probe_ids
     assert critic_probe_ids.isdisjoint({id(p) for p in actor_params})
-    # Five groups: trunk/mean, scalar gate, recurrent adapter, renderer probe,
-    # and learned thought log-sigma. The paired mean/log-sigma policy rates
-    # must remain equal.
+    # Six groups: trunk, scalar gate, recurrent adapter, renderer probe,
+    # learned log-sigma, and fresh thought mean. Every actor component uses
+    # the same general learning rate as the critic.
     lrs = [group["lr"] for group in optimizers["actor"].param_groups]
-    assert lrs == [1e-3, 1e-2, 1e-3, 1e-3, 1e-3]
-    assert lrs[0] == lrs[4]
+    assert lrs == [1e-3] * 6
+    assert optimizers["critic"].param_groups[0]["lr"] == 1e-3
     gate_group = optimizers["actor"].param_groups[1]["params"]
     assert {id(p) for p in gate_group} == {
         id(p) for p in wrapper.gate.parameters()
@@ -973,9 +972,57 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     }
     sigma_group = optimizers["actor"].param_groups[4]["params"]
     assert {id(p) for p in sigma_group} == {
-        id(p) for p in wrapper.transition.parameters()
+        id(p) for p in wrapper.transition.log_sigma_head.parameters()
+    }
+    mean_group = optimizers["actor"].param_groups[5]["params"]
+    assert {id(p) for p in mean_group} == {
+        id(p) for p in wrapper.transition.mean_head.parameters()
     }
 
+
+def test_post_update_drift_measures_the_deployed_policy_move():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    refresh_old_statistics(wrapper, critic, batch)
+    grad_modes = []
+    output_requires_grad = []
+
+    def record_grad_mode(_module, _inputs, output):
+        grad_modes.append(torch.is_grad_enabled())
+        output_requires_grad.append(output.requires_grad)
+
+    handle = wrapper.transition.mean_head.register_forward_hook(
+        record_grad_mode
+    )
+    try:
+        unchanged = measure_post_update_policy_drift(
+            wrapper,
+            [batch],
+            replay_max_trajectories=32,
+            replay_attention_budget=4 * 1024 * 1024,
+            replay_bucket=1,
+        )
+        assert max(abs(value) for value in unchanged.values()) < 1e-7
+
+        with torch.no_grad():
+            wrapper.gate.head.bias.add_(0.2)
+
+        drift = measure_post_update_policy_drift(
+            wrapper,
+            [batch],
+            replay_max_trajectories=32,
+            replay_attention_budget=4 * 1024 * 1024,
+            replay_bucket=1,
+        )
+    finally:
+        handle.remove()
+
+    assert grad_modes and not any(grad_modes)
+    assert output_requires_grad and not any(output_requires_grad)
+    assert drift["kl/post_update_gate_behavior"] > 0.0
+    assert drift["kl/post_update_policy_behavior_per_action"] > 0.0
+    assert drift["ratio/post_update_joint_abs_log_max"] > 0.0
 
 def test_actor_accumulation_defers_the_trunk_step_to_the_caller():
     # The trainer takes one accumulated actor step per PPO epoch: minibatch
@@ -1099,8 +1146,7 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     assign_terminal_rewards(batch, torch.rand(2))
     metrics = update_minibatch(
         wrapper, critic, batch,
-        _optimizers(wrapper, critic, actor_lr=1e-4, gate_lr=1e-3,
-                    adapter_lr=1e-4, critic_lr=1e-4),
+        _optimizers(wrapper, critic, learning_rate=1e-4),
     )
     assert all(
         torch.isfinite(torch.tensor(value)) for value in metrics.values()
@@ -1199,6 +1245,17 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy(monkeypatch):
     assert metrics["forced_initial_fraction"] == 0.5
     assert metrics["forced_initial_accuracy"] == 0.5
     assert metrics["unforced_initial_accuracy"] == 0.5
+    assert metrics["ended_fraction"] == 1.0
+    assert metrics["emitted_tokens_mean"] == 1.0
+    assert metrics["emitted_tokens_p95"] == 1
+    assert metrics["emitted_tokens_max"] == 1
+    assert (
+        metrics["stream_actions_max"]
+        >= metrics["stream_actions_p95"]
+        >= metrics["stream_actions_mean"]
+        > 0
+    )
+    assert metrics["recurrent_steps_per_rollout_max"] > 0
     assert 0.0 <= metrics["think_fraction"] <= 1.0
     # The eval must not perturb training RNG state.
     before = torch.get_rng_state()
@@ -1620,10 +1677,7 @@ def test_positive_lm_loss_applies_only_above_the_reward_threshold():
     critic = _critic()
     backbone = wrapper.backbone
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    optimizers = _optimizers(
-        wrapper, critic, actor_lr=1e-4, gate_lr=1e-3,
-        adapter_lr=1e-4, critic_lr=1e-4
-    )
+    optimizers = _optimizers(wrapper, critic, learning_rate=1e-4)
     assign_terminal_rewards(batch, torch.tensor([0.9, 0.1, 0.6, 0.2]))
     refresh_old_statistics(wrapper, critic, batch)
     metrics = update_minibatch(
@@ -1760,16 +1814,15 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["execution_schema"] == EXECUTION_SCHEMA
     assert payload["reward_schema"] == REWARD_SCHEMA
     assert payload["thought_distribution_schema"] == THOUGHT_DISTRIBUTION_SCHEMA
+    assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
 
 
 def test_resume_schema_accepts_current_checkpoints_only() -> None:
     current = {"execution_schema": EXECUTION_SCHEMA}
     assert resume_execution_schema_compatible(current)
 
-    # The once-whitelisted v6 fresh-B512 migration is retired: its four-group
-    # actor optimizer and scalar log-sigma cannot load into the five-group
-    # sigma-head layout, so it must fail at the schema guard, not deep inside
-    # optimizer loading.
+    # Older actor optimizers and policy semantics must fail at the schema
+    # guard, not deep inside optimizer loading.
     legacy = {
         "execution_schema": "frozen_pool_2048_four_disjoint_b512_stable_actor_lrs/v6",
         "args": {

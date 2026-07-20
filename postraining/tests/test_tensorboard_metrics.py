@@ -74,6 +74,7 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "positive_lm_weight": 0.1,
         "gate_entropy_coef": 0.5,
         "emit_probability": 0.8,
+        "thought_interpolation_strength": 1e-4,
         "gate_entropy": 0.5,
         "gate_behavior_kl": 0.01,
         "renderer_behavior_kl": 0.02,
@@ -87,6 +88,7 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "adapter_grad_norm": 3.0,
         "gate_grad_norm": 4.0,
         "sigma_grad_norm": 4.5,
+        "thought_mean_grad_norm": 4.75,
         "critic_grad_norm": 5.0,
         "thought_log_sigma_mean": -2.0,
         "thought_log_sigma_std": 0.2,
@@ -98,6 +100,11 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_normalized_noise_rms": 1.0,
         "thought_log_sigma_raw_bias_mean": -2.0,
         "thought_log_sigma_weight_rms": 0.01,
+        "thought_log_sigma_residual_gain": 0.01,
+        "thought_mean_norm": 0.2,
+        "thought_mean_weight_rms": 0.00044,
+        "thought_mean_bias_rms": 0.0,
+        "thought_mean_output_gain": 0.01,
     }
     metrics.update(overrides)
     return metrics
@@ -157,6 +164,12 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["sigma/log_std_std"] == pytest.approx(0.2)
     assert dashboard["sigma/expected_noise_norm"] == pytest.approx(3.1)
     assert dashboard["grad/sigma"] == pytest.approx(4.5)
+    assert dashboard["grad/thought_mean"] == pytest.approx(4.75)
+    assert dashboard["sigma/mean_norm"] == pytest.approx(0.2)
+    assert dashboard["sigma/noise_mean_norm_ratio"] == pytest.approx(0.2 / 3.1)
+    assert dashboard["sigma/state_residual_gain"] == pytest.approx(0.01)
+    assert dashboard["sigma/mean_output_gain"] == pytest.approx(0.01)
+    assert dashboard["behavior/thought_interpolation_strength"] == pytest.approx(1e-4)
     assert dashboard["ratio/joint_abs_log_max"] == pytest.approx(0.9)
     assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
     assert "grad/critic_mean" not in dashboard
@@ -237,15 +250,23 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
             self.calls.append((tag, value, step))
 
     dashboard = aggregate_actor_tensorboard_metrics([_actor_metrics()])
+    dashboard.update(
+        {
+            "kl/post_update_policy_behavior_per_action": 0.2,
+            "ratio/post_update_joint_abs_log_max": 0.4,
+        }
+    )
     epoch_zero = Writer()
     write_actor_tensorboard_metrics(
         epoch_zero, dashboard, behavior_age=0, step=16
     )
     epoch_zero_tags = {tag for tag, _, _ in epoch_zero.calls}
     assert "debug/behavior_refresh_max_drift" in epoch_zero_tags
-    assert not any(tag.startswith("kl/") for tag in epoch_zero_tags)
+    assert "kl/gate_behavior" not in epoch_zero_tags
     assert not any(tag.startswith("clip/") for tag in epoch_zero_tags)
-    assert not any(tag.startswith("ratio/") for tag in epoch_zero_tags)
+    assert "ratio/joint_abs_log_max" not in epoch_zero_tags
+    assert "kl/post_update_policy_behavior_per_action" in epoch_zero_tags
+    assert "ratio/post_update_joint_abs_log_max" in epoch_zero_tags
     assert "advantage/mean" in epoch_zero_tags
 
     epoch_one = Writer()

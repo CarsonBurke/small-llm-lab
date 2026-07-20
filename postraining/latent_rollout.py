@@ -657,9 +657,9 @@ def replay_head_inputs(
 def select_thought_actions(
     batch: LatentRolloutBatch, predicted: Tensor
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Select projected means and sampled actions at actual THINK positions.
+    """Select fresh-head means and sampled actions at actual THINK positions.
 
-    The projector has already run densely. Compacting only its consumers
+    The mean head has already run densely. Compacting only its consumers
     ensures EMIT/prompt/pad outputs have no gradient edge and prevents unused
     PPO ratios from overflowing before a zero mask is applied.
     """

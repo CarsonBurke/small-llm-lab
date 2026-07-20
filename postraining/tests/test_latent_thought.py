@@ -11,12 +11,13 @@ from postraining.latent_thought import (
     THINK,
     GaussianTransitionHead,
     LatentThoughtModel,
-    migrate_residual_thought_adapter_state,
+    migrate_legacy_wrapper_checkpoint,
     migrate_scalar_log_sigma_state,
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
     THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
+    THOUGHT_MEAN_SCHEMA,
     THOUGHT_LOG_SIGMA_MAX,
     THOUGHT_LOG_SIGMA_MIN,
     ThinkEmitGate,
@@ -96,7 +97,7 @@ def test_renderer_logits_do_not_depend_on_prediction_projector():
     torch.testing.assert_close(logits_after, logits_before)
 
 
-def test_dense_step_projection_gets_no_renderer_gradient():
+def test_dense_step_thought_mean_gets_no_renderer_gradient():
     torch.manual_seed(9)
     backbone = _pope_model()
     wrapper = LatentThoughtModel(backbone).eval()
@@ -105,7 +106,7 @@ def test_dense_step_projection_gets_no_renderer_gradient():
     ids = torch.randint(0, 32, (2,))
     caches = wrapper.make_generation_cache(2, 1, torch.device("cpu"))
     projected = []
-    handle = backbone.prediction_projector.register_forward_pre_hook(
+    handle = wrapper.transition.mean_head.register_forward_pre_hook(
         lambda _module, inputs: projected.append(tuple(inputs[0].shape))
     )
     try:
@@ -116,7 +117,7 @@ def test_dense_step_projection_gets_no_renderer_gradient():
     assert projected == [(2, 1, 32)]
     assert all(
         parameter.grad is None
-        for parameter in backbone.prediction_projector.parameters()
+        for parameter in wrapper.transition.mean_head.parameters()
     )
     assert float(backbone.blocks[0].attn.proj.weight.grad.abs().sum()) > 0.0
 
@@ -128,6 +129,7 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
             "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
             "thought_input_schema": THOUGHT_INPUT_SCHEMA,
             "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
+            "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
         },
         "current.pt",
     )
@@ -164,6 +166,7 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
             "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
             "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
             "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+            "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
         },
         "critic-warmup.pt",
         allow_transition_reset=True,
@@ -209,12 +212,34 @@ def test_transition_log_prob_matches_torch_distributions():
     )
 
 
+def test_transition_mean_head_starts_small_orthogonal_and_zero_bias():
+    torch.manual_seed(12)
+    head = GaussianTransitionHead(8)
+    gram = head.mean_head.weight @ head.mean_head.weight.T
+    expected = torch.eye(8)
+    torch.testing.assert_close(gram, expected, rtol=1e-5, atol=2e-7)
+    assert torch.count_nonzero(head.mean_head.bias) == 0
+    assert head.mean_head.output_gain.item() == pytest.approx(
+        head.MEAN_INIT_GAIN
+    )
+    belief = torch.randn(5, 8)
+    belief = torch.nn.functional.rms_norm(belief, (8,))
+    mean = head.predict_mean(belief)
+    torch.testing.assert_close(
+        mean.norm(dim=-1),
+        belief.norm(dim=-1) * head.MEAN_INIT_GAIN,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 def test_transition_sigma_head_starts_state_independent():
     head = GaussianTransitionHead(8, log_sigma=-0.5)
-    # Two parameters: the sigma head's zero-init weight and its bias.
-    parameters = list(head.parameters())
-    assert len(parameters) == 2
+    # Three parameters: zero-init weight, raw bias, and residual output gain.
+    parameters = list(head.log_sigma_head.parameters())
+    assert len(parameters) == 3
     assert torch.all(head.log_sigma_head.weight == 0.0)
+    assert head.log_sigma_head.residual_gain.item() == pytest.approx(0.01)
     expected_raw_bias = head.raw_from_log_sigma(-0.5)
     torch.testing.assert_close(
         head.log_sigma_head.bias.detach(), torch.full((8,), expected_raw_bias)
@@ -245,9 +270,10 @@ def test_transition_sigma_preserves_small_residuals_under_bf16_autocast():
     assert log_sigma.dtype == torch.float32
     # A bf16 affine output centered at -2 would round this residual away.
     assert float(log_sigma[0, 0].detach()) != -2.0
-    expected = head.bound_raw_log_sigma(
-        torch.tensor(head.raw_from_log_sigma(-2.0) + 1e-3)
-    )
+    expected = head.bound_raw_log_sigma(torch.tensor(
+        head.raw_from_log_sigma(-2.0)
+        + head.log_sigma_head.residual_gain.item() * 1e-3
+    ))
     assert float(log_sigma[0, 0].detach()) == pytest.approx(
         float(expected), abs=2e-5
     )
@@ -285,11 +311,18 @@ def test_scalar_log_sigma_state_migrates_to_the_head():
         torch.full((8,), head.raw_from_log_sigma(-1.5)),
     )
     assert torch.all(legacy["transition.log_sigma_head.weight"] == 0.0)
+    torch.testing.assert_close(
+        legacy["transition.log_sigma_head.residual_gain"],
+        head.log_sigma_head.residual_gain,
+    )
     # The migrated policy is the retired scalar policy exactly.
     head.log_sigma_head.load_state_dict(
         {
             "weight": legacy["transition.log_sigma_head.weight"],
             "bias": legacy["transition.log_sigma_head.bias"],
+            "residual_gain": legacy[
+                "transition.log_sigma_head.residual_gain"
+            ],
         }
     )
     torch.testing.assert_close(
@@ -297,6 +330,70 @@ def test_scalar_log_sigma_state_migrates_to_the_head():
     )
     # New-format states pass through untouched.
     assert not migrate_scalar_log_sigma_state(legacy, head)
+
+
+def test_fresh_mean_requires_explicit_legacy_branch_migration():
+    torch.manual_seed(14)
+    wrapper = LatentThoughtModel(_pope_model())
+    state = {
+        key: value.detach().clone()
+        for key, value in wrapper.state_dict().items()
+        if not key.startswith("transition.mean_head.")
+    }
+    payload = {"model": state}
+    assert migrate_legacy_wrapper_checkpoint(payload, wrapper) == (
+        False,
+        False,
+        False,
+    )
+    assert "transition.mean_head.weight" not in state
+    _, migrated, _ = migrate_legacy_wrapper_checkpoint(
+        payload, wrapper, initialize_fresh_mean=True
+    )
+    assert migrated
+    assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
+    torch.testing.assert_close(
+        state["transition.mean_head.weight"],
+        wrapper.transition.mean_head.weight,
+    )
+    torch.testing.assert_close(
+        state["transition.mean_head.bias"],
+        wrapper.transition.mean_head.bias,
+    )
+    torch.testing.assert_close(
+        state["transition.mean_head.output_gain"],
+        wrapper.transition.mean_head.output_gain,
+    )
+
+
+def test_fresh_adapter_explicitly_replaces_critic_warm_identity_state():
+    wrapper = LatentThoughtModel(_pope_model())
+    state = {
+        key: value.detach().clone()
+        for key, value in wrapper.state_dict().items()
+    }
+    state["adapter.projection.weight"] = torch.eye(32)
+    state["adapter.projection.bias"] = torch.full((32,), 0.5)
+    payload = {
+        "model": state,
+        "thought_input_schema": "identity_init_affine/v1",
+    }
+
+    _, _, reset = migrate_legacy_wrapper_checkpoint(
+        payload, wrapper, initialize_fresh_adapter=True
+    )
+
+    assert reset
+    assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
+    torch.testing.assert_close(
+        state["adapter.projection.weight"],
+        torch.eye(32),
+    )
+    assert torch.count_nonzero(state["adapter.projection.bias"]) == 0
+    torch.testing.assert_close(
+        state["adapter.interpolation_strength"],
+        wrapper.adapter.interpolation_strength,
+    )
 
 
 def test_thought_policy_gradient_flows_through_the_mean():
@@ -332,20 +429,48 @@ def test_thought_policy_gradient_reaches_the_sigma_head():
     assert head.log_sigma_head.weight.grad.abs().sum().item() > 0.0
 
 
-def test_adapter_identity_init_passes_thought_through():
+def test_adapter_strength_init_weakens_thought_without_rotating_it():
     torch.manual_seed(19)
     backbone = _pope_model()
     wrapper = LatentThoughtModel(backbone)
     thought = torch.randn(2, 32)
     injected = wrapper.thought_input(thought)
     assert injected.shape == (2, 1, 32)
-    # Identity initialization: the injection is exactly the raw thought — its
-    # magnitude (the model's confidence) reaches the trunk unmodified.
+    # The fresh adapter preserves direction while making the initial recurrent
+    # intervention 10,000x weaker than the sampled Gaussian action.
     torch.testing.assert_close(
-        injected.squeeze(1), thought.to(injected.dtype), rtol=1e-5, atol=1e-6
+        injected.squeeze(1),
+        (ThoughtAdapter.INIT_STRENGTH * thought).to(injected.dtype),
+        rtol=1e-5,
+        atol=1e-6,
     )
     torch.testing.assert_close(wrapper.adapter.projection.weight, torch.eye(32))
     assert torch.count_nonzero(wrapper.adapter.projection.bias) == 0
+    assert wrapper.adapter.strength().item() == pytest.approx(
+        ThoughtAdapter.INIT_STRENGTH
+    )
+
+    # Pin the actual normalization boundary that invalidated a 0.01 affine
+    # gain: the fresh stochastic action must remain weak after RMSNorm, not
+    # merely before entering the trunk.
+    typical_action = torch.randn(128, 1, 32) * math.exp(-2)
+    normalized = backbone.blocks[0].attn_norm(
+        wrapper.adapter(typical_action.float()).to(backbone.tok_emb.weight.dtype)
+    )
+    assert normalized.float().square().mean().sqrt().item() < 0.05
+
+
+def test_adapter_strength_has_an_unattenuated_learning_signal():
+    adapter = ThoughtAdapter(4)
+    thought = torch.randn(3, 4)
+    projected = adapter.projection(thought).detach()
+
+    adapter(thought).sum().backward()
+
+    torch.testing.assert_close(
+        adapter.interpolation_strength.grad,
+        projected.sum(),
+    )
 
 
 def test_adapter_bias_is_a_shared_thought_type_offset():
@@ -354,27 +479,12 @@ def test_adapter_bias_is_a_shared_thought_type_offset():
     with torch.no_grad():
         adapter.projection.bias.copy_(marker)
     thoughts = torch.randn(3, 4)
+    strength = adapter.strength().detach()
 
-    torch.testing.assert_close(adapter(thoughts) - thoughts, marker.expand_as(thoughts))
-
-
-def test_residual_adapter_checkpoint_migrates_exactly():
-    torch.manual_seed(20)
-    adapter = ThoughtAdapter(4)
-    correction = torch.randn(4, 4)
-    state = {"adapter.correction.weight": correction.clone()}
-    thoughts = torch.randn(3, 4)
-    expected = thoughts + thoughts @ correction.T
-
-    assert migrate_residual_thought_adapter_state(state, adapter)
-    adapter.load_state_dict(
-        {
-            "projection.weight": state["adapter.projection.weight"],
-            "projection.bias": state["adapter.projection.bias"],
-        }
+    torch.testing.assert_close(
+        adapter(thoughts) - strength * thoughts,
+        strength * marker.expand_as(thoughts),
     )
-    torch.testing.assert_close(adapter(thoughts), expected)
-    assert not migrate_residual_thought_adapter_state(state, adapter)
 
 
 def test_thought_step_advances_state_without_rendering_machinery_changes():
