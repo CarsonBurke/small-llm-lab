@@ -11,9 +11,14 @@ from postraining.latent_thought import (
     THINK,
     GaussianTransitionHead,
     LatentThoughtModel,
+    migrate_residual_thought_adapter_state,
+    migrate_scalar_log_sigma_state,
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
+    THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
+    THOUGHT_LOG_SIGMA_MAX,
+    THOUGHT_LOG_SIGMA_MIN,
     ThinkEmitGate,
     ThoughtAdapter,
     validate_renderer_checkpoint,
@@ -122,6 +127,7 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
             "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
             "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
             "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+            "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
         },
         "current.pt",
     )
@@ -144,6 +150,24 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
             },
             "old-adapter.pt",
         )
+    with pytest.raises(ValueError, match="unbounded log-sigma"):
+        validate_renderer_checkpoint(
+            {
+                "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
+                "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+                "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+            },
+            "old-sigma.pt",
+        )
+    validate_renderer_checkpoint(
+        {
+            "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
+            "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+            "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+        },
+        "critic-warmup.pt",
+        allow_transition_reset=True,
+    )
 
 
 def test_gate_zero_init_is_exactly_uniform():
@@ -172,21 +196,107 @@ def test_transition_log_prob_matches_torch_distributions():
     torch.manual_seed(13)
     head = GaussianTransitionHead(8, log_sigma=-0.5)
     mean = torch.randn(5, 8)
+    belief = torch.randn(5, 8)
+    log_sigma = head.predict_log_sigma(belief)
     generator = torch.Generator().manual_seed(21)
-    sample, log_prob = head.sample(mean, generator=generator)
-    torch.testing.assert_close(head.log_prob(sample, mean), log_prob)
+    sample, log_prob = head.sample(mean, log_sigma, generator=generator)
+    torch.testing.assert_close(head.log_prob(sample, mean, log_sigma), log_prob)
+    # Zero-init weights: sigma is exp(bias) = exp(-0.5) for every state.
     reference = torch.distributions.Normal(mean, math.exp(-0.5))
     torch.testing.assert_close(log_prob, reference.log_prob(sample).sum(-1))
     torch.testing.assert_close(
-        head.per_dim_log_prob(sample, mean), reference.log_prob(sample)
+        head.per_dim_log_prob(sample, mean, log_sigma), reference.log_prob(sample)
     )
 
 
-def test_transition_sigma_is_a_fixed_buffer_with_no_parameters():
+def test_transition_sigma_head_starts_state_independent():
     head = GaussianTransitionHead(8, log_sigma=-0.5)
-    assert list(head.parameters()) == []
-    torch.testing.assert_close(head.log_sigma, torch.tensor(-0.5))
-    assert "log_sigma" in head.state_dict()
+    # Two parameters: the sigma head's zero-init weight and its bias.
+    parameters = list(head.parameters())
+    assert len(parameters) == 2
+    assert torch.all(head.log_sigma_head.weight == 0.0)
+    expected_raw_bias = head.raw_from_log_sigma(-0.5)
+    torch.testing.assert_close(
+        head.log_sigma_head.bias.detach(), torch.full((8,), expected_raw_bias)
+    )
+    # At init every state gets the same per-dim log-sigma: the bias.
+    beliefs = torch.randn(6, 8)
+    log_sigma = head.predict_log_sigma(beliefs)
+    torch.testing.assert_close(log_sigma, torch.full((6, 8), -0.5))
+    # Non-zero weights make it state-dependent.
+    with torch.no_grad():
+        head.log_sigma_head.weight.normal_(std=0.5)
+    varied = head.predict_log_sigma(beliefs)
+    assert not torch.allclose(varied[0], varied[1])
+    # reset_noise restores the state-independent CLI level.
+    head.reset_noise(-2.5)
+    torch.testing.assert_close(
+        head.predict_log_sigma(beliefs), torch.full((6, 8), -2.5)
+    )
+
+
+def test_transition_sigma_preserves_small_residuals_under_bf16_autocast():
+    head = GaussianTransitionHead(8, log_sigma=-2.0)
+    belief = torch.ones(2, 8)
+    with torch.no_grad():
+        head.log_sigma_head.weight[0, 0] = 1e-3
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        log_sigma = head.predict_log_sigma(belief)
+    assert log_sigma.dtype == torch.float32
+    # A bf16 affine output centered at -2 would round this residual away.
+    assert float(log_sigma[0, 0].detach()) != -2.0
+    expected = head.bound_raw_log_sigma(
+        torch.tensor(head.raw_from_log_sigma(-2.0) + 1e-3)
+    )
+    assert float(log_sigma[0, 0].detach()) == pytest.approx(
+        float(expected), abs=2e-5
+    )
+
+
+def test_transition_sigma_is_smoothly_bounded_and_finite():
+    head = GaussianTransitionHead(8, log_sigma=-2.0)
+    beliefs = torch.ones(2, 8)
+    with torch.no_grad():
+        head.log_sigma_head.weight.fill_(1e6)
+    upper = head.predict_log_sigma(beliefs)
+    lower = head.predict_log_sigma(-beliefs)
+    assert torch.isfinite(upper).all()
+    assert torch.isfinite(lower).all()
+    assert torch.all(upper <= THOUGHT_LOG_SIGMA_MAX)
+    assert torch.all(lower >= THOUGHT_LOG_SIGMA_MIN)
+    torch.testing.assert_close(upper, torch.full_like(upper, THOUGHT_LOG_SIGMA_MAX))
+    torch.testing.assert_close(lower, torch.full_like(lower, THOUGHT_LOG_SIGMA_MIN))
+
+
+def test_transition_sigma_init_must_be_strictly_inside_bounds():
+    with pytest.raises(ValueError, match="strictly inside"):
+        GaussianTransitionHead(8, log_sigma=THOUGHT_LOG_SIGMA_MIN)
+    with pytest.raises(ValueError, match="strictly inside"):
+        GaussianTransitionHead(8, log_sigma=THOUGHT_LOG_SIGMA_MAX)
+
+
+def test_scalar_log_sigma_state_migrates_to_the_head():
+    head = GaussianTransitionHead(8, log_sigma=-0.5)
+    legacy = {"transition.log_sigma": torch.tensor(-1.5)}
+    assert migrate_scalar_log_sigma_state(legacy, head)
+    assert "transition.log_sigma" not in legacy
+    torch.testing.assert_close(
+        legacy["transition.log_sigma_head.bias"],
+        torch.full((8,), head.raw_from_log_sigma(-1.5)),
+    )
+    assert torch.all(legacy["transition.log_sigma_head.weight"] == 0.0)
+    # The migrated policy is the retired scalar policy exactly.
+    head.log_sigma_head.load_state_dict(
+        {
+            "weight": legacy["transition.log_sigma_head.weight"],
+            "bias": legacy["transition.log_sigma_head.bias"],
+        }
+    )
+    torch.testing.assert_close(
+        head.predict_log_sigma(torch.randn(4, 8)), torch.full((4, 8), -1.5)
+    )
+    # New-format states pass through untouched.
+    assert not migrate_scalar_log_sigma_state(legacy, head)
 
 
 def test_thought_policy_gradient_flows_through_the_mean():
@@ -196,10 +306,30 @@ def test_thought_policy_gradient_flows_through_the_mean():
     head = GaussianTransitionHead(8)
     mean = torch.randn(5, 8, requires_grad=True)
     sample = (mean + 0.3).detach()
-    head.per_dim_log_prob(sample, mean).sum().backward()
+    log_sigma = torch.full((5, 8), -0.5)
+    head.per_dim_log_prob(sample, mean, log_sigma).sum().backward()
     assert mean.grad is not None
     # d/dmean of -0.5*((s-m)/sigma)^2 is (s-m)/sigma^2, positive here.
     assert torch.all(mean.grad > 0)
+
+
+def test_thought_policy_gradient_reaches_the_sigma_head():
+    # State-dependent sigma: the log-prob path must differentiate through
+    # predict_log_sigma so the joint-action PPO objective can move the head
+    # — including its zero-init weight, via the belief.
+    torch.manual_seed(16)
+    head = GaussianTransitionHead(8)
+    belief = torch.randn(5, 8)
+    mean = torch.randn(5, 8)
+    sample = mean + 0.3 * torch.randn(5, 8)
+    log_sigma = head.predict_log_sigma(belief)
+    head.log_prob(sample, mean, log_sigma).sum().backward()
+    assert head.log_sigma_head.bias.grad is not None
+    # d/dlog_sigma of the log-density is ((s-m)/sigma)^2 - 1 per dim,
+    # generically nonzero for off-mean samples.
+    assert head.log_sigma_head.bias.grad.abs().sum().item() > 0.0
+    assert head.log_sigma_head.weight.grad is not None
+    assert head.log_sigma_head.weight.grad.abs().sum().item() > 0.0
 
 
 def test_adapter_identity_init_passes_thought_through():
@@ -228,6 +358,25 @@ def test_adapter_bias_is_a_shared_thought_type_offset():
     torch.testing.assert_close(adapter(thoughts) - thoughts, marker.expand_as(thoughts))
 
 
+def test_residual_adapter_checkpoint_migrates_exactly():
+    torch.manual_seed(20)
+    adapter = ThoughtAdapter(4)
+    correction = torch.randn(4, 4)
+    state = {"adapter.correction.weight": correction.clone()}
+    thoughts = torch.randn(3, 4)
+    expected = thoughts + thoughts @ correction.T
+
+    assert migrate_residual_thought_adapter_state(state, adapter)
+    adapter.load_state_dict(
+        {
+            "projection.weight": state["adapter.projection.weight"],
+            "projection.bias": state["adapter.projection.bias"],
+        }
+    )
+    torch.testing.assert_close(adapter(thoughts), expected)
+    assert not migrate_residual_thought_adapter_state(state, adapter)
+
+
 def test_thought_step_advances_state_without_rendering_machinery_changes():
     torch.manual_seed(23)
     backbone = _pope_model()
@@ -240,7 +389,10 @@ def test_thought_step_advances_state_without_rendering_machinery_changes():
             output = wrapper.token_step(ids[:, position], caches, position)
             caches = output.caches
         assert output is not None
-        sample, _ = wrapper.transition.sample(output.predicted)
+        sample, _ = wrapper.transition.sample(
+            output.predicted,
+            wrapper.transition.predict_log_sigma(output.belief),
+        )
         thought_output = wrapper.step(
             wrapper.thought_input(sample), caches, ids.size(1)
         )

@@ -21,8 +21,10 @@ kept only as a do-no-harm regression guard.
   and `model_io.load_model` reconstructs that exact class.
 - `LatentThoughtModel` (latent_thought.py) wraps the backbone with:
   - `GaussianTransitionHead`: diagonal Gaussian over the next projected
-    token latent with **fixed sigma** (log-sigma -0.5, matched to the
-    backbone's pretraining prediction error; a buffer, not a parameter).
+    token latent with a belief-conditioned per-dimension log-sigma head.
+    Its weights start at zero and its bias starts at -2 (std 0.135; expected
+    512-D noise norm 3.06), so the initial policy is state-independent while
+    RL can learn selective uncertainty in every latent coordinate.
     The mean IS the backbone's prediction path — at RL time the policy
     gradient flows through it into the whole trunk. (The earlier JEDI/EDM
     diffusion-transition design was dropped: a Gaussian around the
@@ -79,13 +81,11 @@ latent, and the Gaussian-vector score backprops through the prediction path
 into the entire trunk. Gate and content factors form one action probability:
 gate+token for EMIT, gate+summed Gaussian density for optional THINK, and the
 Gaussian density alone for a forced THINK. VAPO's clipped surrogate is then
-applied once per joint action. Sigma is a FIXED
-constant (log-sigma -1.5, σ ≈ 0.22 —
-red-teamed down from the error-matched -0.5, whose per-step offset norm
-~13.7 against thought norms ~22.6 corrupts long think runs with no way to
-self-shrink): no beta-NLL, no learned uncertainty, no continuous-policy
-entropy bonus, and no KL penalty — the trust region is the continuous-policy
-constraint. The separate optional gate-entropy ablation is documented below.
+applied once per joint action. Sigma is a learned diagonal function of the
+current belief, initialized at log-sigma -2, smoothly bounded to [-5, 2],
+and trained only by the joint policy objective: no beta-NLL,
+continuous-policy entropy bonus, or KL penalty.
+The separate optional gate-entropy ablation is documented below.
 The v1 delta/log-std heads and the frozen-trunk adaptation trainer
 (`train_adaptation.py`, `adaptation_core.py`) were deleted.
 `--thought-pg-coef 0` now disables only the thought-content surrogate
@@ -165,12 +165,9 @@ also taking its training mechanism. The ledger:
   own thoughts as both train).
 
 **Empirical adjudication (open).** Whether noise accumulation hurts long
-think runs is answerable from existing diagnostics: think-run length stats
-vs reward, thought clip fractions and `trunk_grad_norm` (whether thought
-reward actually moves the prediction path), the `--thought-pg-coef 0`
-control arm, and `sample_latent.py` stream inspection. If fixed noise
-proves too blunt (long runs degrading), `--thought-log-sigma` is the
-single knob — including annealing it externally across runs.
+think runs is answerable from think-run/reward diagnostics, the `sigma/`
+TensorBoard family, `trunk_grad_norm`, the `--thought-pg-coef 0` control arm,
+and `sample_latent.py` stream inspection.
 
 ### Critic (value_model.py, hl_gauss.py)
 
@@ -196,7 +193,8 @@ single knob — including annealing it externally across runs.
 - v6 optimizer layout: one actor AdamW with param groups — pretrained
   trunk at the VAPO paper's `--actor-lr` (1e-6), scalar gate at `--gate-lr`
   (1e-4), recurrent thought adapter at `--adapter-lr` (1e-6), and renderer
-  probe at `--renderer-lr` (1e-6) — plus the critic AdamW (3e-4,
+  probe at `--renderer-lr` (1e-6), with the paired continuous-policy
+  log-sigma head also fixed to `--actor-lr` (1e-6) — plus the critic AdamW (3e-4,
   from-scratch scale). The adapter is not treated as an isolated fresh head:
   it changes every later belief and therefore every factor of the recurrent
   512-D thought policy. Old v1
@@ -313,8 +311,8 @@ rewards, no synthetic RL tasks:
   exploration mechanism — but the optional THINK gate collapsed before its
   much slower 512-D content policy could learn. `--gate-entropy-coef` now
   enables an explicit, head-only Bernoulli entropy bonus, globally averaged
-  over optional gate actions. Its standard coefficient is 0.003, one tenth
-  of the overly strong 0.03 v13 intervention; zero remains available as the
+  over optional gate actions. Its standard coefficient is 0.004, well below
+  the overly strong 0.03 v13 intervention; zero remains available as the
   paper-faithful control. The intervention is logged separately as
   `bonus/gate_entropy_weighted`.
   No KL penalty either, confirmed against the

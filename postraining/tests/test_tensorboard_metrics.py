@@ -86,7 +86,18 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "renderer_grad_norm": 2.0,
         "adapter_grad_norm": 3.0,
         "gate_grad_norm": 4.0,
+        "sigma_grad_norm": 4.5,
         "critic_grad_norm": 5.0,
+        "thought_log_sigma_mean": -2.0,
+        "thought_log_sigma_std": 0.2,
+        "thought_log_sigma_min": -2.5,
+        "thought_log_sigma_max": -1.5,
+        "thought_sigma_mean": 0.14,
+        "thought_expected_noise_norm": 3.1,
+        "thought_realized_noise_norm": 3.0,
+        "thought_normalized_noise_rms": 1.0,
+        "thought_log_sigma_raw_bias_mean": -2.0,
+        "thought_log_sigma_weight_rms": 0.01,
     }
     metrics.update(overrides)
     return metrics
@@ -142,6 +153,10 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["kl/gate_behavior"] == pytest.approx(2.5)
     assert dashboard["grad/trunk"] == pytest.approx(20.0)
     assert dashboard["grad/critic"] == pytest.approx(21.0)
+    assert dashboard["sigma/log_std_mean"] == pytest.approx(-2.0)
+    assert dashboard["sigma/log_std_std"] == pytest.approx(0.2)
+    assert dashboard["sigma/expected_noise_norm"] == pytest.approx(3.1)
+    assert dashboard["grad/sigma"] == pytest.approx(4.5)
     assert dashboard["ratio/joint_abs_log_max"] == pytest.approx(0.9)
     assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
     assert "grad/critic_mean" not in dashboard

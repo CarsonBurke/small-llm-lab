@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -32,7 +32,12 @@ from postraining.latent_rollout import (
     split_rollout_groups,
     trim_stream,
 )
-from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
+from postraining.latent_thought import (
+    EMIT,
+    THINK,
+    THOUGHT_DISTRIBUTION_SCHEMA,
+    LatentThoughtModel,
+)
 from postraining.model_io import _pope_construction
 from postraining.train_latent_vapo import (
     EXECUTION_SCHEMA,
@@ -41,6 +46,7 @@ from postraining.train_latent_vapo import (
     build_optimizers,
     evaluate_aime_latent,
     joint_action_logprobs,
+    math_dataset_identity,
     resume_execution_schema_compatible,
     sample_prompt_batch,
     score_math_rollout,
@@ -130,7 +136,8 @@ def _optimizers(
     return build_optimizers(
         wrapper, critic, actor_lr=actor_lr, gate_lr=gate_lr,
         adapter_lr=adapter_lr,
-        renderer_lr=renderer_lr, critic_lr=critic_lr, fused=False,
+        renderer_lr=renderer_lr, critic_lr=critic_lr,
+        fused=False,
     )
 
 
@@ -540,6 +547,13 @@ def test_update_minibatch_trains_the_full_policy_model():
 def test_refresh_old_statistics_matches_the_update_code_path_exactly():
     wrapper = _wrapper()
     critic = _critic()
+    with torch.no_grad():
+        # Exercise actual state- and dimension-dependent noise. Zero-init
+        # would let this test pass even if refresh priced the wrong belief.
+        wrapper.transition.log_sigma_head.weight.normal_(std=0.02)
+        wrapper.transition.log_sigma_head.bias.copy_(
+            torch.linspace(-2.4, -1.6, wrapper.backbone.tok_emb.embedding_dim)
+        )
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
     refresh_old_statistics(wrapper, critic, batch)
     backbone = wrapper.backbone
@@ -573,7 +587,9 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
             batch, predicted
         )
         compact_logprobs = wrapper.transition.per_dim_log_prob(
-            thought_targets, thought_means
+            thought_targets,
+            thought_means,
+            wrapper.transition.predict_log_sigma(beliefs[think_mask]),
         )
         thought_logprobs = torch.zeros_like(batch.old_thought_logprobs)
         thought_logprobs[think_mask] = compact_logprobs
@@ -820,12 +836,14 @@ def test_thought_pg_gradient_reaches_the_trunk_through_the_prediction_path():
     assign_terminal_rewards(batch, torch.rand(4))
     refresh_old_statistics(wrapper, critic, batch)
 
-    _, predicted, _, _ = replay_head_inputs(wrapper, batch)
+    beliefs, predicted, _, _ = replay_head_inputs(wrapper, batch)
     thought_means, thought_targets, think_mask = select_thought_actions(
         batch, predicted
     )
     new_logprobs = wrapper.transition.per_dim_log_prob(
-        thought_targets, thought_means
+        thought_targets,
+        thought_means,
+        wrapper.transition.predict_log_sigma(beliefs[think_mask]),
     )
     advantages, _ = generalized_advantage_estimate(
         batch.rewards, batch.old_values, batch.action_mask, torch.ones(4)
@@ -854,11 +872,13 @@ def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
     critic = _critic()
     optimizers = _optimizers(wrapper, critic)
     projector_parameters = list(wrapper.backbone.prediction_projector.parameters())
+    sigma_parameters = list(wrapper.transition.parameters())
 
     # Seed Adam state so a spurious zero gradient would move the projector
     # through stale momentum even with weight decay disabled.
     optimizers["actor"].zero_grad(set_to_none=True)
     projector_parameters[0].grad = torch.ones_like(projector_parameters[0])
+    sigma_parameters[0].grad = torch.ones_like(sigma_parameters[0])
     optimizers["actor"].step()
     optimizers["actor"].zero_grad(set_to_none=True)
 
@@ -873,6 +893,7 @@ def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
     with torch.no_grad():
         wrapper.backbone.prediction_projector.output.bias.add_(0.01)
     before = [parameter.detach().clone() for parameter in projector_parameters]
+    sigma_before = [parameter.detach().clone() for parameter in sigma_parameters]
     metrics = update_minibatch(
         wrapper,
         critic,
@@ -883,7 +904,10 @@ def test_absent_thought_objective_leaves_projector_grad_none_despite_momentum(
 
     assert metrics["thought_behavior_kl_joint"] > 0
     assert all(parameter.grad is None for parameter in projector_parameters)
+    assert all(parameter.grad is None for parameter in sigma_parameters)
     for parameter, reference in zip(projector_parameters, before, strict=True):
+        torch.testing.assert_close(parameter, reference)
+    for parameter, reference in zip(sigma_parameters, sigma_before, strict=True):
         torch.testing.assert_close(parameter, reference)
 
 
@@ -929,9 +953,12 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     critic_probe_ids = {id(p) for p in wrapper.backbone.critic_probe.parameters()}
     assert critic_probe_ids
     assert critic_probe_ids.isdisjoint({id(p) for p in actor_params})
-    # Four groups: trunk, scalar gate, recurrent adapter, renderer probe.
+    # Five groups: trunk/mean, scalar gate, recurrent adapter, renderer probe,
+    # and learned thought log-sigma. The paired mean/log-sigma policy rates
+    # must remain equal.
     lrs = [group["lr"] for group in optimizers["actor"].param_groups]
-    assert lrs == [1e-3, 1e-2, 1e-3, 1e-3]
+    assert lrs == [1e-3, 1e-2, 1e-3, 1e-3, 1e-3]
+    assert lrs[0] == lrs[4]
     gate_group = optimizers["actor"].param_groups[1]["params"]
     assert {id(p) for p in gate_group} == {
         id(p) for p in wrapper.gate.parameters()
@@ -943,6 +970,10 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     renderer_group = optimizers["actor"].param_groups[3]["params"]
     assert {id(p) for p in renderer_group} == {
         id(p) for p in wrapper.backbone.policy_probe.parameters()
+    }
+    sigma_group = optimizers["actor"].param_groups[4]["params"]
+    assert {id(p) for p in sigma_group} == {
+        id(p) for p in wrapper.transition.parameters()
     }
 
 
@@ -1682,17 +1713,27 @@ def test_rollout_stops_rows_at_any_stop_token_and_records_nothing_after():
         assert not batch.action_mask[index, last + 1:].any()
 
 
-def test_math_prompt_sampler_resumes_deterministically_across_epochs():
+def test_math_prompt_sampler_is_sequential_resumable_and_never_reuses():
     rows = [{"id": index} for index in range(7)]
-    full = MathPromptSampler(rows, seed=3).next_rows(10)
-    # Ten draws from seven rows crosses an epoch boundary; the first epoch
-    # must be a permutation of the corpus, not a with-replacement sample.
-    assert sorted(row["id"] for row in full[:7]) == list(range(7))
+    full = MathPromptSampler(rows, seed=3).next_rows(7)
+    assert [row["id"] for row in full] == list(range(7))
     resumed = MathPromptSampler(rows, seed=3)
     resumed.cursor = 4
-    assert resumed.next_rows(6) == full[4:]
-    # A different seed reorders the stream.
-    assert MathPromptSampler(rows, seed=4).next_rows(10) != full
+    assert resumed.next_rows(3) == full[4:]
+    # Data order has no RNG dependence, and exhaustion never wraps epochs.
+    assert MathPromptSampler(rows, seed=4).next_rows(7) == full
+    with pytest.raises(RuntimeError, match="one-pass rows"):
+        resumed.next_rows(1)
+
+
+def test_math_dataset_identity_binds_bytes_exclusions_and_order(tmp_path):
+    dataset = tmp_path / "math.parquet"
+    dataset.write_bytes(b"first")
+    original = math_dataset_identity(dataset, "")
+    assert math_dataset_identity(dataset, "") == original
+    assert math_dataset_identity(dataset, "algebra") != original
+    dataset.write_bytes(b"second")
+    assert math_dataset_identity(dataset, "") != original
 
 
 def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
@@ -1718,12 +1759,17 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["sampler_cursor"] == 3
     assert payload["execution_schema"] == EXECUTION_SCHEMA
     assert payload["reward_schema"] == REWARD_SCHEMA
+    assert payload["thought_distribution_schema"] == THOUGHT_DISTRIBUTION_SCHEMA
 
 
-def test_resume_schema_migrates_only_legacy_fresh_b512() -> None:
+def test_resume_schema_accepts_current_checkpoints_only() -> None:
     current = {"execution_schema": EXECUTION_SCHEMA}
     assert resume_execution_schema_compatible(current)
 
+    # The once-whitelisted v6 fresh-B512 migration is retired: its four-group
+    # actor optimizer and scalar log-sigma cannot load into the five-group
+    # sigma-head layout, so it must fail at the schema guard, not deep inside
+    # optimizer loading.
     legacy = {
         "execution_schema": "frozen_pool_2048_four_disjoint_b512_stable_actor_lrs/v6",
         "args": {
@@ -1733,11 +1779,11 @@ def test_resume_schema_migrates_only_legacy_fresh_b512() -> None:
             "ppo_epochs": 1,
         },
     }
-    assert resume_execution_schema_compatible(legacy)
-    legacy["args"]["prompts_per_rollout"] = 64
     assert not resume_execution_schema_compatible(legacy)
-    legacy["execution_schema"] = "older/v5"
-    assert not resume_execution_schema_compatible(legacy)
+    assert not resume_execution_schema_compatible(
+        {"execution_schema": "configurable_disjoint_b512_behavior_pool/v7"}
+    )
+    assert not resume_execution_schema_compatible({"execution_schema": "older/v5"})
 
 
 def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):
@@ -2092,10 +2138,14 @@ def _deterministic_wrapper() -> LatentThoughtModel:
     wrapper = _wrapper()
     with torch.no_grad():
         wrapper.gate.head.bias.fill_(40.0)
-        # Forced latents still sample when every optional gate emits.
-        # Underflow sigma so batched and sequential rows can consume different
-        # RNG shapes without changing the actual thought.
-        wrapper.transition.log_sigma.fill_(-100.0)
+    # Forced latents still sample when every optional gate emits. Bypass only
+    # the test draw so batched and sequential rows can consume different RNG
+    # shapes without changing the actual thought; production sigma is bounded
+    # away from zero by design.
+    wrapper.transition.sample_latent = MethodType(
+        lambda _self, mean, _log_sigma, generator=None: mean.float(),
+        wrapper.transition,
+    )
     return wrapper
 
 

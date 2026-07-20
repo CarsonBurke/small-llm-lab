@@ -378,6 +378,7 @@ def rollout_continuations(
                 output = output.__class__(
                     belief=output.belief.index_select(0, keep),
                     predicted=output.predicted.index_select(0, keep),
+                    thought_log_sigma=output.thought_log_sigma.index_select(0, keep),
                     input_latent=output.input_latent.index_select(0, keep),
                     logits=output.logits.index_select(0, keep),
                     caches=caches,
@@ -404,7 +405,9 @@ def rollout_continuations(
                 .squeeze(-1)
             )
         thought = wrapper.transition.sample_latent(
-            output.predicted, generator=generator
+            output.predicted,
+            output.thought_log_sigma,
+            generator=generator,
         )
 
         record = active
@@ -827,7 +830,9 @@ def refresh_old_statistics(
             microbatch, predicted
         )
         compact_thought_logprobs = wrapper.transition.per_dim_log_prob(
-            thought_targets, thought_means
+            thought_targets,
+            thought_means,
+            wrapper.transition.predict_log_sigma(beliefs[think_mask]),
         ).float()
         thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
         thought_logprobs[think_mask] = compact_thought_logprobs

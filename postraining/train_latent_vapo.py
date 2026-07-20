@@ -17,7 +17,8 @@ same prediction path toward what the next latent SHOULD be.
   its training signal.
 - An optional Bernoulli gate-entropy bonus can preserve THINK exploration;
   there is no continuous-policy entropy bonus, KL penalty, or beta-NLL.
-  Sigma remains fixed and the VAPO trust region constrains policy updates.
+  A zero-initialized belief-conditioned head learns diagonal per-dimension
+  thought log-sigma, starting at -2 in every dimension.
 - No pretraining anchor (user prescription, Jul 18): SIGReg and the latent
   target-prediction objective are dropped at RL time — keeping them would
   pit "predict what the next latent WILL be" against the policy gradient's
@@ -42,6 +43,7 @@ update is attempted.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -100,8 +102,10 @@ from postraining.latent_thought import (
     THINK,
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
+    THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
     LatentThoughtModel,
+    migrate_legacy_wrapper_checkpoint,
     validate_renderer_checkpoint,
 )
 from postraining.model_io import fresh_trunk, load_model
@@ -109,8 +113,8 @@ from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
 
-EXECUTION_SCHEMA = "configurable_disjoint_b512_behavior_pool/v7"
-LEGACY_POOL_EXECUTION_SCHEMA = "frozen_pool_2048_four_disjoint_b512_stable_actor_lrs/v6"
+EXECUTION_SCHEMA = "disjoint_b512_bounded_state_sigma_actor_lr_sequential_data/v11"
+PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
 # v2: the grading style follows each row's reward_model.style (Minerva for
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
@@ -118,30 +122,30 @@ DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
 REWARD_SCHEMA = POSTTRAIN_REWARD_SCHEMA
 
 
-def resume_execution_schema_compatible(payload: dict) -> bool:
-    """Accept current checkpoints and the one proven-safe legacy migration.
+def math_dataset_identity(path: str | Path, exclude_modules: str) -> str:
+    """Content identity that makes a sequential cursor safe to resume."""
+    digest = hashlib.sha256()
+    digest.update(PROMPT_ORDER_SCHEMA.encode())
+    digest.update(b"\0")
+    digest.update(exclude_modules.encode())
+    digest.update(b"\0")
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
 
-    The v6 label covered both the rejected frozen-2048/four-update runs and
-    the completed fresh-B512 run. Only saved arguments can disambiguate them;
-    migrate the latter and keep rejecting stale-pool optimizer states.
+
+def resume_execution_schema_compatible(payload: dict) -> bool:
+    """Accept current checkpoints only.
+
+    The v6 fresh-B512 migration this once whitelisted is structurally
+    impossible since the state-sigma layout: v6 actors carry a four-group
+    optimizer state and a scalar log-sigma buffer, neither of which can load
+    into the five-group / sigma-head layout. Reject here so stale checkpoints
+    fail with the schema error instead of deep inside optimizer loading; use
+    --actor-init / --actor-critic-init for explicit restarts.
     """
-    schema = payload.get("execution_schema")
-    if schema == EXECUTION_SCHEMA:
-        return True
-    if schema != LEGACY_POOL_EXECUTION_SCHEMA:
-        return False
-    source_args = payload.get("args", {})
-    if hasattr(source_args, "__dict__"):
-        source_args = vars(source_args)
-    try:
-        return (
-            int(source_args.get("prompts_per_rollout", -1)) == 16
-            and int(source_args.get("prompts_per_minibatch", -1)) == 16
-            and int(source_args.get("samples_per_prompt", -1)) == 32
-            and int(source_args.get("ppo_epochs", -1)) == 1
-        )
-    except (TypeError, ValueError):
-        return False
+    return payload.get("execution_schema") == EXECUTION_SCHEMA
 
 
 def sample_prompt_batch(
@@ -172,27 +176,32 @@ def sample_prompt_batch(
 
 
 class MathPromptSampler:
-    """Epoch-shuffled DAPO prompt stream with a resumable cursor."""
+    """Strictly sequential, one-pass prompt stream with a resumable cursor."""
 
-    def __init__(self, rows: list[dict], seed: int):
+    def __init__(
+        self,
+        rows: list[dict],
+        seed: int,
+        dataset_identity: str | None = None,
+    ):
         if not rows:
             raise ValueError("no math prompts loaded")
         self.rows = rows
-        self.seed = seed
+        del seed  # retained in the API for checkpoint/CLI compatibility only
         self.cursor = 0
-        self._epoch = -1
-        self._order: list[int] = []
+        self.dataset_identity = dataset_identity
 
     def next_rows(self, count: int) -> list[dict]:
-        picked = []
-        while len(picked) < count:
-            epoch, offset = divmod(self.cursor, len(self.rows))
-            if epoch != self._epoch:
-                self._epoch = epoch
-                self._order = list(range(len(self.rows)))
-                random.Random(self.seed * 1_000_003 + epoch).shuffle(self._order)
-            picked.append(self.rows[self._order[offset]])
-            self.cursor += 1
+        if count < 0:
+            raise ValueError("prompt count must be nonnegative")
+        end = self.cursor + count
+        if end > len(self.rows):
+            raise RuntimeError(
+                f"prompt stream exhausted at {self.cursor}; requested {count} "
+                f"from {len(self.rows)} one-pass rows"
+            )
+        picked = self.rows[self.cursor:end]
+        self.cursor = end
         return picked
 
 
@@ -461,6 +470,23 @@ def aggregate_actor_tensorboard_metrics(
     advantage_std = math.sqrt(
         max(0.0, advantage_second_moment - advantage_mean**2)
     )
+    log_sigma_mean = _weighted_metric_mean(
+        metrics, "thought_log_sigma_mean", "thought_action_count"
+    )
+    log_sigma_second_moment = _weighted_metric_mean(
+        [
+            {
+                **metric,
+                "thought_log_sigma_second_moment": (
+                    metric["thought_log_sigma_std"] ** 2
+                    + metric["thought_log_sigma_mean"] ** 2
+                ),
+            }
+            for metric in metrics
+        ],
+        "thought_log_sigma_second_moment",
+        "thought_action_count",
+    )
     last = metrics[-1]
     # Each group is already divided by the denominator of the complete actor
     # optimizer minibatch, so its loss is a contribution to be summed rather
@@ -509,6 +535,30 @@ def aggregate_actor_tensorboard_metrics(
         "behavior/gate_entropy": _weighted_metric_mean(
             metrics, "gate_entropy", "gate_action_count"
         ),
+        "sigma/log_std_mean": log_sigma_mean,
+        "sigma/log_std_std": math.sqrt(
+            max(0.0, log_sigma_second_moment - log_sigma_mean**2)
+        ),
+        "sigma/log_std_min": min(
+            metric["thought_log_sigma_min"] for metric in metrics
+        ),
+        "sigma/log_std_max": max(
+            metric["thought_log_sigma_max"] for metric in metrics
+        ),
+        "sigma/std_mean": _weighted_metric_mean(
+            metrics, "thought_sigma_mean", "thought_action_count"
+        ),
+        "sigma/expected_noise_norm": _weighted_metric_mean(
+            metrics, "thought_expected_noise_norm", "thought_action_count"
+        ),
+        "sigma/realized_noise_norm": _weighted_metric_mean(
+            metrics, "thought_realized_noise_norm", "thought_action_count"
+        ),
+        "sigma/normalized_noise_rms": _weighted_metric_mean(
+            metrics, "thought_normalized_noise_rms", "thought_action_count"
+        ),
+        "sigma/head_raw_bias_mean": last["thought_log_sigma_raw_bias_mean"],
+        "sigma/head_weight_rms": last["thought_log_sigma_weight_rms"],
         "kl/gate_behavior": _weighted_metric_mean(
             metrics, "gate_behavior_kl", "gate_action_count"
         ),
@@ -536,6 +586,7 @@ def aggregate_actor_tensorboard_metrics(
         "grad/renderer": last["renderer_grad_norm"],
         "grad/adapter": last["adapter_grad_norm"],
         "grad/gate": last["gate_grad_norm"],
+        "grad/sigma": last["sigma_grad_norm"],
         "grad/critic": last["critic_grad_norm"],
     }
 
@@ -571,14 +622,14 @@ def rollout_tensorboard_metrics(metrics: dict[str, float | int]) -> dict[str, fl
 def optimizer_minibatch_orders(
     group_count: int, groups_per_minibatch: int
 ) -> list[list[int]]:
-    """Shuffle a frozen-policy pool into disjoint optimizer minibatches."""
+    """Partition a frozen-policy pool deterministically without reuse."""
     if group_count < 1:
         raise ValueError("group_count must be positive")
     if groups_per_minibatch < 1:
         raise ValueError("groups_per_minibatch must be positive")
     if group_count % groups_per_minibatch:
         raise ValueError("group_count must divide into complete minibatches")
-    order = torch.randperm(group_count).tolist()
+    order = list(range(group_count))
     return [
         order[start : start + groups_per_minibatch]
         for start in range(0, group_count, groups_per_minibatch)
@@ -691,13 +742,17 @@ def build_optimizers(
 ) -> dict[str, torch.optim.Optimizer]:
     """The actor/critic optimizer layout.
 
-    One actor AdamW in four groups: the pretrained trunk at ``actor_lr``,
+    One actor AdamW in five groups: the pretrained trunk at ``actor_lr``,
     the Bernoulli gate at ``gate_lr``, the recurrent thought adapter at
-    ``adapter_lr``, and the renderer probe at ``renderer_lr``.  The gate can
+    ``adapter_lr``, the renderer probe at ``renderer_lr``, and the
+    state-dependent thought log-sigma head at ``actor_lr``. Mean and log-sigma
+    are paired parameters of one continuous policy and deliberately share the
+    actor rate, as in standard continuous-control actors. The gate can
     learn at a fresh-head rate because it changes one scalar factor per action.
     The adapter cannot: one update changes the beliefs underlying every later
     factor in a 512-D joint Gaussian action, so it shares the paper-scale actor
-    rate.  The probes live under
+    rate.
+    The probes live under
     ``blocks[-1]`` (so pretraining's optimizer saw them), which makes
     name-prefix filtering wrong — exclude them from the trunk by identity.
     """
@@ -719,6 +774,7 @@ def build_optimizers(
                 {"params": list(wrapper.gate.parameters()), "lr": gate_lr},
                 {"params": list(wrapper.adapter.parameters()), "lr": adapter_lr},
                 {"params": list(backbone.policy_probe.parameters()), "lr": renderer_lr},
+                {"params": list(wrapper.transition.parameters()), "lr": actor_lr},
             ],
             weight_decay=0.0,
             fused=fused,
@@ -836,8 +892,13 @@ def update_minibatch(
             "thought_advantage_sum", "emit_advantage_sum", "target_square_sum",
             "residual_sum", "residual_square_sum",
             "joint_abs_log_ratio_max", "harmful_positive_log_ratio_max",
+            "thought_log_sigma_sum", "thought_log_sigma_square_sum",
+            "thought_sigma_sum", "thought_expected_noise_norm_sum",
+            "thought_realized_noise_norm_sum", "thought_normalized_noise_square_sum",
         )
     }
+    totals["thought_log_sigma_min"] = zero.new_full((), float("inf"))
+    totals["thought_log_sigma_max"] = zero.new_full((), float("-inf"))
 
     for microbatch, _, _ in iter_length_aware_microbatches(
         batch,
@@ -989,14 +1050,21 @@ def update_minibatch(
             thought_means, thought_targets, _ = select_thought_actions(
                 microbatch, predicted
             )
+            thought_log_sigma = wrapper.transition.predict_log_sigma(
+                beliefs[think_mask]
+            )
             if thought_pg_coef != 0.0:
                 new_thought_logprobs = wrapper.transition.per_dim_log_prob(
-                    thought_targets, thought_means
+                    thought_targets,
+                    thought_means,
+                    thought_log_sigma,
                 )
             else:
                 with torch.no_grad():
                     new_thought_logprobs = wrapper.transition.per_dim_log_prob(
-                        thought_targets, thought_means.detach()
+                        thought_targets,
+                        thought_means.detach(),
+                        thought_log_sigma.detach(),
                     )
             compact_new_thought_joint = new_thought_logprobs.float().sum(-1)
             compact_old_thought_joint = (
@@ -1125,6 +1193,29 @@ def update_minibatch(
             ).sum()
             totals["positive_lm"] += weighted_positive_lm.detach()
             if bool(think_mask.any()):
+                detached_log_sigma = thought_log_sigma.detach().float()
+                residual = thought_targets.float() - thought_means.detach().float()
+                normalized_residual = residual * (-detached_log_sigma).exp()
+                totals["thought_log_sigma_sum"] += detached_log_sigma.sum()
+                totals["thought_log_sigma_square_sum"] += (
+                    detached_log_sigma.square().sum()
+                )
+                totals["thought_log_sigma_min"] = torch.minimum(
+                    totals["thought_log_sigma_min"], detached_log_sigma.min()
+                )
+                totals["thought_log_sigma_max"] = torch.maximum(
+                    totals["thought_log_sigma_max"], detached_log_sigma.max()
+                )
+                totals["thought_sigma_sum"] += detached_log_sigma.exp().sum()
+                totals["thought_expected_noise_norm_sum"] += (
+                    (2.0 * detached_log_sigma).exp().sum(-1).sqrt().sum()
+                )
+                totals["thought_realized_noise_norm_sum"] += (
+                    residual.square().sum(-1).sqrt().sum()
+                )
+                totals["thought_normalized_noise_square_sum"] += (
+                    normalized_residual.square().sum()
+                )
                 thought_log_ratio = (
                     new_thought_logprobs
                     - microbatch.old_thought_logprobs[think_mask]
@@ -1215,6 +1306,7 @@ def update_minibatch(
         "adapter_grad_norm": gradient_norm_tensor(wrapper.adapter.parameters()),
         "critic_grad_norm": gradient_norm_tensor(critic.parameters()),
         "gate_grad_norm": gradient_norm_tensor(wrapper.gate.parameters()),
+        "sigma_grad_norm": gradient_norm_tensor(wrapper.transition.parameters()),
     }
     if critic_step:
         optimizers["critic"].step()
@@ -1249,6 +1341,40 @@ def update_minibatch(
         advantage_mean=advantage_mean,
         advantage_std=advantage_variance.sqrt(),
         reward=batch.reward_scalar.mean(),
+        thought_log_sigma_mean=(
+            totals["thought_log_sigma_sum"]
+            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+        ),
+        thought_log_sigma_std=(
+            totals["thought_log_sigma_square_sum"]
+            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            - (
+                totals["thought_log_sigma_sum"]
+                / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            ).square()
+        ).clamp_min(0).sqrt(),
+        thought_log_sigma_min=totals["thought_log_sigma_min"],
+        thought_log_sigma_max=totals["thought_log_sigma_max"],
+        thought_sigma_mean=(
+            totals["thought_sigma_sum"]
+            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+        ),
+        thought_expected_noise_norm=(
+            totals["thought_expected_noise_norm_sum"] / denominators["thought"]
+        ),
+        thought_realized_noise_norm=(
+            totals["thought_realized_noise_norm_sum"] / denominators["thought"]
+        ),
+        thought_normalized_noise_rms=(
+            totals["thought_normalized_noise_square_sum"]
+            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+        ).sqrt(),
+        thought_log_sigma_raw_bias_mean=(
+            wrapper.transition.log_sigma_head.bias.detach().mean()
+        ),
+        thought_log_sigma_weight_rms=(
+            wrapper.transition.log_sigma_head.weight.detach().square().mean().sqrt()
+        ),
         **grad_norms,
     )
     metrics = scalar_tensors_to_floats(metric_tensors)
@@ -1276,10 +1402,13 @@ def save_checkpoint(
         "step": step,
         "value_warmup_step": warmup_step,
         "execution_schema": EXECUTION_SCHEMA,
+        "prompt_order_schema": PROMPT_ORDER_SCHEMA,
+        "math_data_identity": sampler.dataset_identity,
         "reward_schema": REWARD_SCHEMA,
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
         "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+        "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
         "model": wrapper.state_dict(),
         "critic": critic.state_dict(),
         "optimizers": {name: opt.state_dict() for name, opt in optimizers.items()},
@@ -1294,6 +1423,36 @@ def save_checkpoint(
     tmp_path = path.with_suffix(".tmp")
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+
+
+def purge_benchmark_reports_after(output: Path, step: int) -> int:
+    """Remove stale answer histories and restore latest to checkpoint time."""
+    history_dir = output / "bench_answers"
+    removed = 0
+    if history_dir.exists():
+        for path in history_dir.glob("step_*.json"):
+            try:
+                history_step = int(path.stem.removeprefix("step_"))
+            except ValueError:
+                continue
+            if history_step > step:
+                path.unlink()
+                removed += 1
+    remaining = sorted(history_dir.glob("step_*.json")) if history_dir.exists() else []
+    if remaining:
+        payload = json.loads(remaining[-1].read_text())
+        write_benchmark_report(
+            output,
+            int(payload["step"]),
+            payload["metrics"],
+            payload["attempts"],
+            reward_schema=str(payload.get("reward_schema", REWARD_SCHEMA)),
+        )
+    else:
+        for path in (history_dir / "latest.json", output / "bench_answers.html"):
+            if path.exists():
+                path.unlink()
+    return removed
 
 
 def main() -> None:
@@ -1360,23 +1519,19 @@ def main() -> None:
     # near-zero for a small model, and a prior near the expected reward mean
     # removes the early decode transient a far-off prior causes.
     parser.add_argument("--value-prior", type=float, default=0.05)
-    # Fixed thought-noise scale (log-sigma).  Never trained — no beta-NLL,
-    # no entropy; the trust region is the only constraint on the thought
-    # policy.  The prediction-error-matched -0.5 (sigma 0.61) gives a
-    # 512-dim offset of norm ~13.7 against thought norms ~22.6 — hot enough
-    # to corrupt long think runs and (red-teamed) turn the gate against
-    # thinking; -1.5 (sigma 0.22) keeps exploration without drowning the
-    # signal.  Smaller sigma also tightens the effective trust region on
-    # the mean (ratio ~ delta-mean/sigma), pairing with the low actor lr.
-    parser.add_argument("--thought-log-sigma", type=float, default=-1.5)
+    # Initialization only: the bounded output of the state-dependent
+    # log-sigma head. Zero-init weights make noise state-independent at step 0;
+    # -2 gives std 0.135 and expected 512-D noise norm 3.06, enough to explore
+    # without overwhelming the pretrained latent mean.
+    parser.add_argument("--thought-log-sigma-init", type=float, default=-2.0)
     # Gradient multiplier for the thought factor inside the joint action log
     # probability. The forward ratio stays exact; 0 detaches only that factor
     # as a control arm while token/gate gradients still train the trunk.
     parser.add_argument("--thought-pg-coef", type=float, default=1.0)
     # Head-only Bernoulli entropy bonus, averaged over optional gate
-    # decisions. The 3e-3 default is one tenth of v13's 3e-2 intervention,
+    # decisions. The 4e-3 default remains far below v13's 3e-2 intervention,
     # which overwhelmed the learned gate despite falling reward.
-    parser.add_argument("--gate-entropy-coef", type=float, default=3e-3)
+    parser.add_argument("--gate-entropy-coef", type=float, default=4e-3)
     # Freeze the gate for the first N steps: the gate learns "don't think"
     # from a clean binary signal far faster than the 512-dim thought content
     # can learn to be useful, so exploration dies before content training
@@ -1502,6 +1657,8 @@ def main() -> None:
         parser.error("--replay-max-trajectories must be positive")
     if not math.isfinite(args.gate_entropy_coef) or args.gate_entropy_coef < 0.0:
         parser.error("--gate-entropy-coef must be finite and nonnegative")
+    if not -5.0 < args.thought_log_sigma_init < 2.0:
+        parser.error("--thought-log-sigma-init must be strictly inside (-5, 2)")
     if args.replay_attention_budget < 1:
         parser.error("--replay-attention-budget must be positive")
     if args.replay_bucket < 1:
@@ -1585,9 +1742,11 @@ def main() -> None:
     # the training flag (a dynamo guard) never flips between the step-0 evals
     # and the training loop and re-specializes the compiled step.
     wrapper.eval()
-    wrapper.transition.log_sigma.fill_(args.thought_log_sigma)
     if not 0.0 < args.init_think_probability < 1.0:
         raise SystemExit("--init-think-probability must be strictly inside (0, 1)")
+    # The CLI owns the starting exploration noise: state-independent (zero
+    # head weights) at the requested level.  Learned from there — no schedule.
+    wrapper.transition.reset_noise(args.thought_log_sigma_init)
     with torch.no_grad():
         # P(EMIT) = sigmoid(bias) while the zero-init weights ignore the belief.
         wrapper.gate.head.bias.fill_(
@@ -1600,7 +1759,11 @@ def main() -> None:
         actor_init_payload = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        validate_renderer_checkpoint(actor_init_payload, initialization_path)
+        if actor_init_payload.get("prompt_order_schema") != PROMPT_ORDER_SCHEMA:
+            raise ValueError(
+                "initialization checkpoint predates deterministic sequential "
+                "prompt traversal; its cursor cannot prove no prompt reuse"
+            )
         if args.actor_critic_init:
             if int(actor_init_payload.get("step", -1)) != 0:
                 raise ValueError(
@@ -1617,10 +1780,20 @@ def main() -> None:
                 raise ValueError(
                     "--actor-critic-init checkpoint uses an incompatible reward schema"
                 )
+        migrate_legacy_wrapper_checkpoint(actor_init_payload, wrapper)
+        validate_renderer_checkpoint(
+            actor_init_payload,
+            initialization_path,
+            # A critic-warmup checkpoint has not updated the actor, and its
+            # transition head is reset below before the policy is ever used.
+            allow_transition_reset=bool(args.actor_critic_init),
+        )
         wrapper.load_state_dict(actor_init_payload["model"], strict=True)
-        # The run controls exploration noise even when actor weights are
-        # initialized from an earlier reward schema.
-        wrapper.transition.log_sigma.fill_(args.thought_log_sigma)
+        if args.actor_critic_init:
+            # A critic-warmup checkpoint has never trained its actor, so this
+            # run owns the initial exploration level. A trained --actor-init
+            # source instead preserves its learned state-dependent noise.
+            wrapper.transition.reset_noise(args.thought_log_sigma_init)
         actor_init_provenance = {
             "checkpoint": str(initialization_path),
             "critic_initialized": bool(args.actor_critic_init),
@@ -1659,7 +1832,7 @@ def main() -> None:
         # preserve; loading its obsolete three-group layout would only couple
         # the gate and recurrent adapter again. Preserve the trained critic's
         # optimizer state and start the untouched actor optimizer in the
-        # current four-group layout.
+        # current five-group layout.
         source_actor_optimizer = actor_init_payload["optimizers"]["actor"]
         if source_actor_optimizer["state"]:
             raise ValueError(
@@ -1714,8 +1887,16 @@ def main() -> None:
             flush=True,
         )
         math_rows = kept_rows
-    sampler = MathPromptSampler(math_rows, args.seed)
+    data_identity = math_dataset_identity(args.math_data, args.exclude_modules)
+    sampler = MathPromptSampler(
+        math_rows, args.seed, dataset_identity=data_identity
+    )
     if actor_init_payload is not None:
+        if actor_init_payload.get("math_data_identity") != data_identity:
+            raise ValueError(
+                "initialization checkpoint's prompt cursor belongs to different "
+                "dataset bytes, exclusions, or ordering"
+            )
         source_args = actor_init_payload.get("args", {})
         if hasattr(source_args, "__dict__"):
             source_args = vars(source_args)
@@ -1775,26 +1956,35 @@ def main() -> None:
                 f"resume checkpoint execution schema must be {EXECUTION_SCHEMA!r}; "
                 f"got {payload.get('execution_schema')!r}. Use --actor-init or "
                 "--actor-critic-init for an explicit initialization restart. "
-                "Legacy v6 migration is restricted to saved fresh-B512 "
-                "16x32, one-pass runs."
+                "Pre-state-sigma checkpoints (v7 and older, including the "
+                "retired v6 migration) cannot resume into the five-group "
+                "sigma-head layout."
             )
         if payload.get("reward_schema") != REWARD_SCHEMA:
             raise ValueError(
                 f"resume checkpoint reward schema must be {REWARD_SCHEMA!r}; "
                 f"got {payload.get('reward_schema')!r}"
             )
+        if payload.get("math_data_identity") != data_identity:
+            raise ValueError(
+                "resume checkpoint's prompt cursor belongs to different dataset "
+                "bytes, exclusions, or ordering"
+            )
         wrapper.load_state_dict(payload["model"], strict=True)
         critic.load_state_dict(payload["critic"], strict=True)
         for name, optimizer in optimizers.items():
             optimizer.load_state_dict(payload["optimizers"][name])
-        # log_sigma is a buffer (inside "model") and per-group lr rides along
-        # in the optimizer states, so the loads above just clobbered both with
-        # the checkpoint's values.  Reassert the CLI: these are the documented
-        # cross-run knobs (external sigma annealing, lr changes on resume).
-        wrapper.transition.log_sigma.fill_(args.thought_log_sigma)
+        # The sigma head is learned: the model load above restored it, and
+        # (unlike the old fixed-buffer scheme) the CLI must NOT reassert it on
+        # resume — --thought-log-sigma-init is an initialization, not a
+        # schedule.  Learning rates remain the documented cross-run knobs and
+        # are reasserted below.
         for group, lr in zip(
             optimizers["actor"].param_groups,
-            (args.actor_lr, args.gate_lr, args.adapter_lr, args.renderer_lr),
+            (
+                args.actor_lr, args.gate_lr, args.adapter_lr,
+                args.renderer_lr, args.actor_lr,
+            ),
             strict=True,
         ):
             group["lr"] = lr
@@ -1898,28 +2088,39 @@ def main() -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     logger = JsonlLogger(output / "metrics.jsonl")
-    warmup_purge_step = None
-    if args.resume and start_step == 0 and warmup_step > 0:
-        removed = logger.purge_value_warmup_after(warmup_step)
+    tensorboard_purge_step = None
+    if args.resume:
+        removed = logger.purge_after(start_step, warmup_step)
+        removed_reports = purge_benchmark_reports_after(output, start_step)
         if removed:
             print(
-                f"purged {removed} stale warmup metrics after step "
-                f"{warmup_step}",
+                f"purged {removed} stale metrics after actor step {start_step} "
+                f"and warmup step {warmup_step}",
                 flush=True,
             )
-        warmup_purge_step = warmup_step + 1
+        if removed_reports:
+            print(
+                f"purged {removed_reports} stale benchmark answer reports",
+                flush=True,
+            )
+        tensorboard_purge_step = (
+            warmup_step + 1 if start_step == 0 else start_step + 1
+        )
     tensorboard = SummaryWriter(
-        output / "tensorboard", purge_step=warmup_purge_step
+        output / "tensorboard", purge_step=tensorboard_purge_step
     )
     (output / "manifest.json").write_text(
         json.dumps(
             {
                 "phase": "latent_vapo_dapo",
                 "execution_schema": EXECUTION_SCHEMA,
+                "prompt_order_schema": PROMPT_ORDER_SCHEMA,
+                "math_data_identity": data_identity,
                 "reward_schema": REWARD_SCHEMA,
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
                 "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
                 "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+                "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
                 "args": vars(args),
                 "base": {
                     "checkpoint": str(args.checkpoint),
@@ -2358,23 +2559,26 @@ def main() -> None:
         rollout_metrics = aggregate_diagnostics(
             groups, args.samples_per_prompt, stop_ids
         )
+        rollout_step = step + pool_updates
         logger.log(
-            type="rollout", step=step,
+            type="rollout", step=rollout_step,
             collect_seconds=collect_seconds,
             pool_updates=pool_updates,
             pool_trajectories=pool_prompt_count * args.samples_per_prompt,
             peak_vram_bytes=rollout_peak_vram_bytes,
             **rollout_metrics,
         )
-        tensorboard.add_scalar("perf/collect_seconds", collect_seconds, step)
+        tensorboard.add_scalar(
+            "perf/collect_seconds", collect_seconds, rollout_step
+        )
         tensorboard.add_scalar(
             "perf/rollout_peak_vram_gib",
             rollout_peak_vram_bytes / 2**30,
-            step,
+            rollout_step,
         )
         rollout_dashboard = rollout_tensorboard_metrics(rollout_metrics)
         for tag, value in rollout_dashboard.items():
-            tensorboard.add_scalar(tag, value, step)
+            tensorboard.add_scalar(tag, value, rollout_step)
 
         minibatch_orders = optimizer_minibatch_orders(
             len(groups), args.prompts_per_minibatch
@@ -2389,6 +2593,10 @@ def main() -> None:
             next_step = step + 1
             optimizers["actor"].zero_grad(set_to_none=True)
             optimizers["critic"].zero_grad(set_to_none=True)
+            sigma_parameters = list(wrapper.transition.parameters())
+            sigma_before = [
+                parameter.detach().clone() for parameter in sigma_parameters
+            ]
             (
                 policy_action_denominator,
                 gate_action_denominator,
@@ -2438,7 +2646,7 @@ def main() -> None:
                 name: actor_dashboard[name]
                 for name in (
                     "grad/trunk", "grad/gate", "grad/adapter", "grad/renderer",
-                    "grad/critic",
+                    "grad/sigma", "grad/critic",
                 )
                 if not math.isfinite(actor_dashboard[name])
             }
@@ -2449,6 +2657,32 @@ def main() -> None:
                 )
             optimizers["actor"].step()
             optimizers["critic"].step()
+            with torch.no_grad():
+                sigma_deltas = [
+                    parameter.detach() - before
+                    for parameter, before in zip(
+                        sigma_parameters, sigma_before, strict=True
+                    )
+                ]
+                sigma_update = scalar_tensors_to_floats(
+                    {
+                        "sigma/head_update_rms": (
+                            torch.stack(
+                                [delta.square().sum() for delta in sigma_deltas]
+                            ).sum()
+                            / sum(delta.numel() for delta in sigma_deltas)
+                        ).sqrt(),
+                        "sigma/head_update_abs_max": torch.stack(
+                            [delta.abs().max() for delta in sigma_deltas]
+                        ).max(),
+                    }
+                )
+            if not all(math.isfinite(value) for value in sigma_update.values()):
+                raise RuntimeError(
+                    f"non-finite sigma head after optimizer step {next_step}: "
+                    f"{sigma_update}"
+                )
+            actor_dashboard.update(sigma_update)
             step = next_step
             update_seconds = time.perf_counter() - update_started
             logger.log(

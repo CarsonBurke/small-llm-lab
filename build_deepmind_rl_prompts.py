@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -47,9 +46,13 @@ def main() -> None:
     parser.add_argument(
         "--output", default="postraining/data/deepmind-interpolate-rl.parquet"
     )
-    parser.add_argument("--per-module", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--per-module", type=int, default=1000,
+        help="take the first N non-eval rows per module; 0 takes every row",
+    )
     args = parser.parse_args()
+    if args.per_module < 0:
+        parser.error("--per-module must be nonnegative")
 
     eval_questions = set()
     for row in pq.read_table(args.eval_file).to_pylist():
@@ -58,8 +61,7 @@ def main() -> None:
         eval_questions.add(question.strip())
 
     interpolate_dir = Path(args.interpolate_dir)
-    rng = random.Random(args.seed)
-    rows = []
+    rows_by_module = []
     for module in DEEPMIND_EASY_MODULES:
         pairs = [
             (question, answer)
@@ -68,10 +70,12 @@ def main() -> None:
             )
             if question not in eval_questions
         ]
-        if len(pairs) < args.per_module:
+        if args.per_module and len(pairs) < args.per_module:
             parser.error(f"{module}: only {len(pairs)} non-eval pairs available")
-        for question, answer in rng.sample(pairs, args.per_module):
-            rows.append(
+        selected = pairs if args.per_module == 0 else pairs[: args.per_module]
+        module_rows = []
+        for source_index, (question, answer) in enumerate(selected):
+            module_rows.append(
                 {
                     "prompt": [
                         {
@@ -82,20 +86,33 @@ def main() -> None:
                         }
                     ],
                     "reward_model": {"ground_truth": answer, "style": "rule"},
-                    "extra_info": {"index": f"{module}/{len(rows)}", "module": module},
+                    "extra_info": {
+                        "index": f"{module}/{source_index}",
+                        "module": module,
+                    },
                 }
             )
+        rows_by_module.append(module_rows)
+
+    # Deterministic round-robin keeps every contiguous training window mixed
+    # across modules without sampling, shuffling, or omitting any source row.
+    rows = [
+        module_rows[index]
+        for index in range(max(map(len, rows_by_module)))
+        for module_rows in rows_by_module
+        if index < len(module_rows)
+    ]
 
     output = Path(args.output)
     pq.write_table(pa.Table.from_pylist(rows), output)
     manifest = {
         "problems": len(rows),
-        "per_module": args.per_module,
+        "per_module": args.per_module or "all",
         "modules": DEEPMIND_EASY_MODULES,
         "source": "mathematics_dataset-v1.0 interpolate, eval-set problems excluded",
         "excluded_eval_problems": len(eval_questions),
         "template": "verbatim DAPO-Math-17K prompt wrapper",
-        "seed": args.seed,
+        "order": "deterministic module round-robin in source-file order; no RNG",
     }
     output.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))

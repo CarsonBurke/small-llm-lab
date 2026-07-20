@@ -50,6 +50,7 @@ from postraining.latent_rollout import (
 from postraining.latent_eval import evaluate_latent_math, verify_terminated_answer
 from postraining.latent_thought import (
     LatentThoughtModel,
+    migrate_legacy_wrapper_checkpoint,
     validate_renderer_checkpoint,
 )
 from postraining.model_io import load_model
@@ -228,6 +229,7 @@ def main() -> None:
         payload = torch.load(
             args.wrapper_checkpoint, map_location="cpu", weights_only=False
         )
+        migrate_legacy_wrapper_checkpoint(payload, wrapper)
         validate_renderer_checkpoint(payload, args.wrapper_checkpoint)
         wrapper.load_state_dict(payload["model"], strict=True)
         wrapper_step = payload.get("step")
