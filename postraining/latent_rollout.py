@@ -609,8 +609,7 @@ def assemble_stream_latents(
     """Rebuild the exact (batch, stream, dim) inputs the rollout consumed."""
     token_latent = wrapper.embed_tokens(batch.token_ids)
     think_mask = batch.kind == THOUGHT_SLOT
-    # Stored non-thought slots are exactly zero and ThoughtAdapter is
-    # biasless, so dense projection plus where is value/gradient-equivalent
+    # The kind-select makes dense adapter evaluation value/gradient-equivalent
     # to boolean-index assignment. Unlike the latter, it has static output
     # shapes and keeps the full replay trunk inside one Inductor graph.
     thought_latent = wrapper.adapter(batch.thoughts).to(token_latent.dtype)

@@ -99,6 +99,7 @@ def test_all_critic_parameters_receive_value_gradients():
     # Trunk, adapter, and head must all train; the trunk's unused output
     # heads (probes, lm head paths) legitimately get no gradient.
     assert any(name.startswith("trunk.blocks.0") for name in with_grad)
-    assert "adapter.correction.weight" in with_grad
+    assert "adapter.projection.weight" in with_grad
+    assert "adapter.projection.bias" in with_grad
     assert "head.weight" in with_grad and "head.bias" in with_grad
     assert "trunk.tok_emb.weight" in with_grad

@@ -13,6 +13,7 @@ from postraining.latent_thought import (
     LatentThoughtModel,
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
+    THOUGHT_INPUT_SCHEMA,
     ThinkEmitGate,
     ThoughtAdapter,
     validate_renderer_checkpoint,
@@ -120,6 +121,7 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
         {
             "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
             "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+            "thought_input_schema": THOUGHT_INPUT_SCHEMA,
         },
         "current.pt",
     )
@@ -133,6 +135,14 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
         validate_renderer_checkpoint(
             {"renderer_features_schema": RENDERER_FEATURES_SCHEMA},
             "old-policy.pt",
+        )
+    with pytest.raises(ValueError, match="different thought embedder"):
+        validate_renderer_checkpoint(
+            {
+                "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
+                "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+            },
+            "old-adapter.pt",
         )
 
 
@@ -192,18 +202,30 @@ def test_thought_policy_gradient_flows_through_the_mean():
     assert torch.all(mean.grad > 0)
 
 
-def test_adapter_zero_init_passes_thought_through():
+def test_adapter_identity_init_passes_thought_through():
     torch.manual_seed(19)
     backbone = _pope_model()
     wrapper = LatentThoughtModel(backbone)
     thought = torch.randn(2, 32)
     injected = wrapper.thought_input(thought)
     assert injected.shape == (2, 1, 32)
-    # Zero-init correction: the injection is exactly the raw thought — its
+    # Identity initialization: the injection is exactly the raw thought — its
     # magnitude (the model's confidence) reaches the trunk unmodified.
     torch.testing.assert_close(
         injected.squeeze(1), thought.to(injected.dtype), rtol=1e-5, atol=1e-6
     )
+    torch.testing.assert_close(wrapper.adapter.projection.weight, torch.eye(32))
+    assert torch.count_nonzero(wrapper.adapter.projection.bias) == 0
+
+
+def test_adapter_bias_is_a_shared_thought_type_offset():
+    adapter = ThoughtAdapter(4)
+    marker = torch.tensor([0.25, -0.5, 1.0, 0.75])
+    with torch.no_grad():
+        adapter.projection.bias.copy_(marker)
+    thoughts = torch.randn(3, 4)
+
+    torch.testing.assert_close(adapter(thoughts) - thoughts, marker.expand_as(thoughts))
 
 
 def test_thought_step_advances_state_without_rendering_machinery_changes():

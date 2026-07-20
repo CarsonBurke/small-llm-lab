@@ -100,6 +100,7 @@ from postraining.latent_thought import (
     THINK,
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
+    THOUGHT_INPUT_SCHEMA,
     LatentThoughtModel,
     validate_renderer_checkpoint,
 )
@@ -1278,6 +1279,7 @@ def save_checkpoint(
         "reward_schema": REWARD_SCHEMA,
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+        "thought_input_schema": THOUGHT_INPUT_SCHEMA,
         "model": wrapper.state_dict(),
         "critic": critic.state_dict(),
         "optimizers": {name: opt.state_dict() for name, opt in optimizers.items()},
@@ -1340,9 +1342,9 @@ def main() -> None:
     # The scalar Bernoulli gate is a genuinely fresh head and can use a hotter
     # rate without shifting the continuous thought distribution itself.
     parser.add_argument("--gate-lr", type=float, default=1e-4)
-    # Although zero-initialized, the adapter is recurrent policy state, not an
-    # isolated classifier head. Keep it at the actor rate so one update cannot
-    # perturb every later belief in a trajectory.
+    # Although identity-initialized, the adapter is recurrent policy state,
+    # not an isolated classifier head. Keep it at the actor rate so one update
+    # cannot perturb every later belief in a trajectory.
     parser.add_argument("--adapter-lr", type=float, default=1e-6)
     # The renderer probe drives token-PPO ratios directly; keep it at the
     # v1 rate rather than folding it into the 10x-hotter trunk group.
@@ -1371,10 +1373,10 @@ def main() -> None:
     # probability. The forward ratio stays exact; 0 detaches only that factor
     # as a control arm while token/gate gradients still train the trunk.
     parser.add_argument("--thought-pg-coef", type=float, default=1.0)
-    # Optional exploration ablation. This is a head-only Bernoulli entropy
-    # bonus, averaged over optional gate decisions. The default remains
-    # paper-faithful; experiments must set the coefficient explicitly.
-    parser.add_argument("--gate-entropy-coef", type=float, default=0.0)
+    # Head-only Bernoulli entropy bonus, averaged over optional gate
+    # decisions. The 3e-3 default is one tenth of v13's 3e-2 intervention,
+    # which overwhelmed the learned gate despite falling reward.
+    parser.add_argument("--gate-entropy-coef", type=float, default=3e-3)
     # Freeze the gate for the first N steps: the gate learns "don't think"
     # from a clean binary signal far faster than the 512-dim thought content
     # can learn to be useful, so exploration dies before content training
@@ -1917,6 +1919,7 @@ def main() -> None:
                 "reward_schema": REWARD_SCHEMA,
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
                 "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+                "thought_input_schema": THOUGHT_INPUT_SCHEMA,
                 "args": vars(args),
                 "base": {
                     "checkpoint": str(args.checkpoint),

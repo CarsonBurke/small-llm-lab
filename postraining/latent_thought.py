@@ -9,11 +9,11 @@ The transition policy is a diagonal Gaussian with FIXED sigma whose mean IS
 the backbone's prediction path (``prediction_latent`` applied to the belief).
 The whole trunk trains by policy gradient at RL time, shifting the prediction
 objective from "what the next latent WILL be" (pretraining likelihood) to
-"what it SHOULD be" (reward).  Thoughts are injected as ``z + adapter(z)``
-with a zero-initialized adapter, so an untrained thought is exactly the
-sampled imagined next-token latent — in-distribution for a trunk trained on
-projected token latents, and the trunk keeps adapting to its own thoughts as
-both train.
+"what it SHOULD be" (reward).  Thoughts pass through an identity-initialized
+affine embedder, so an untrained thought is exactly the sampled imagined
+next-token latent.  During post-training, its bias can become a shared
+thought-type marker while its weight translates thought content into the
+trunk's learned thought representation.
 
 The renderer is deliberately separated from that thought path: it consumes
 the current stream input and the raw belief, while ``prediction_latent`` is
@@ -34,6 +34,7 @@ from torch import Tensor, nn
 THINK, EMIT = 0, 1
 RENDERER_FEATURES_SCHEMA = "input_latent+belief/v1"
 ROLLOUT_POLICY_SCHEMA = "half_group_members_forced_initial_latent_think/v1"
+THOUGHT_INPUT_SCHEMA = "identity_init_affine/v1"
 
 
 def validate_renderer_checkpoint(payload: dict, checkpoint: str) -> None:
@@ -53,6 +54,15 @@ def validate_renderer_checkpoint(payload: dict, checkpoint: str) -> None:
             f"schema is {rollout_policy!r}, expected {ROLLOUT_POLICY_SCHEMA!r}. "
             "Old or untagged VAPO checkpoints used a different forced-initial "
             "assignment and cannot be resumed or evaluated as this policy."
+        )
+    thought_input = payload.get("thought_input_schema")
+    if thought_input != THOUGHT_INPUT_SCHEMA:
+        raise ValueError(
+            f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
+            f"input schema is {thought_input!r}, expected "
+            f"{THOUGHT_INPUT_SCHEMA!r}. Old or untagged VAPO checkpoints "
+            "used a different thought embedder and cannot be resumed or "
+            "evaluated as this policy."
         )
 
 
@@ -168,7 +178,7 @@ class ThinkEmitGate(nn.Module):
 
 
 class ThoughtAdapter(nn.Module):
-    """Residual correction for thought injection; zero-init passes z through.
+    """Affine thought embedder initialized to the identity transformation.
 
     Deliberately un-normalized (LeWM feeds raw predictions back the same
     way): the prediction's magnitude carries the model's confidence, the
@@ -181,11 +191,12 @@ class ThoughtAdapter(nn.Module):
 
     def __init__(self, model_dim: int):
         super().__init__()
-        self.correction = nn.Linear(model_dim, model_dim, bias=False)
-        nn.init.zeros_(self.correction.weight)
+        self.projection = nn.Linear(model_dim, model_dim, bias=True)
+        nn.init.eye_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
 
     def forward(self, thought: Tensor) -> Tensor:
-        return thought + self.correction(thought)
+        return self.projection(thought)
 
 
 @dataclass

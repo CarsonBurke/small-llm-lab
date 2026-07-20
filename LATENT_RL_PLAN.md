@@ -30,8 +30,9 @@ kept only as a do-no-harm regression guard.
     reverse-chain ratio machinery. The v1 delta-offset/learned-log-std
     heads were removed with the frozen-trunk design, Jul 18.)
   - `ThinkEmitGate`: zero-init Bernoulli head — exactly 50/50 at start.
-  - `ThoughtAdapter`: zero-init residual correction for injected thoughts, so
-    an untrained thought is exactly the sampled imagined next-token latent.
+  - `ThoughtAdapter`: identity-initialized affine embedding for injected
+    thoughts, so an untrained thought is exactly the sampled imagined
+    next-token latent. Its bias can learn a shared thought-type marker.
   - Renderer: `[current input latent, raw belief] -> policy_probe -> vocab`.
     It deliberately bypasses `prediction_latent`, which is reserved for the
     continuous thought policy. Cached and parallel belief-renderer paths are
@@ -312,8 +313,10 @@ rewards, no synthetic RL tasks:
   exploration mechanism — but the optional THINK gate collapsed before its
   much slower 512-D content policy could learn. `--gate-entropy-coef` now
   enables an explicit, head-only Bernoulli entropy bonus, globally averaged
-  over optional gate actions. The paper-faithful default remains zero; the
-  intervention is logged separately as `bonus/gate_entropy_weighted`.
+  over optional gate actions. Its standard coefficient is 0.003, one tenth
+  of the overly strong 0.03 v13 intervention; zero remains available as the
+  paper-faithful control. The intervention is logged separately as
+  `bonus/gate_entropy_weighted`.
   No KL penalty either, confirmed against the
   full paper (Jul 18 full-text read): KL appears only in VAPO's Sec. 2.2
   theoretical preliminaries (Eq. 1); the loss actually optimized is

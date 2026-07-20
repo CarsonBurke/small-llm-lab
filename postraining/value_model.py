@@ -2,8 +2,9 @@
 
 A fresh trunk (same architecture class as the policy backbone, random init,
 fully trainable) that reads the identical rollout stream — prompt and emitted
-tokens through its own embeddings, thought latents through its own zero-init
-residual adapter — and predicts value alone.  No SIGReg, no next-latent
+tokens through its own embeddings, thought latents through its own
+identity-initialized affine embedder — and predicts value alone.  No SIGReg,
+no next-latent
 prediction, no shared parameters with the policy: its only loss is HL-Gauss
 cross-entropy on [0, 1] value targets (cleanrl iterthink v215 critic recipe:
 softmax-CE to a Gaussian-smoothed two-hot, expected-scalar decode, zero-weight
@@ -54,10 +55,9 @@ class SeparateCritic(nn.Module):
         """
         token_latent = self.trunk.embed_tokens(batch.token_ids)
         think_mask = batch.kind == THOUGHT_SLOT
-        # The adapter is biasless and stored non-thought slots are zero.
-        # Dense masked routing is therefore exactly equivalent to compact
-        # boolean assignment, while avoiding its dynamic-shape nonzero graph
-        # break inside torch.compile.
+        # The kind-select makes dense adapter evaluation exactly equivalent
+        # to compact boolean assignment, while avoiding the latter's
+        # dynamic-shape nonzero graph break inside torch.compile.
         thought_latent = self.adapter(batch.thoughts.float()).to(
             token_latent.dtype
         )
