@@ -142,6 +142,7 @@ def rollout_continuations(
     replay_storage: bool = True,
     record_likelihoods: bool = True,
     compact_finished: bool = True,
+    finished_batch_size: int | None = None,
     cache_dtype: torch.dtype | None = None,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
@@ -186,9 +187,13 @@ def rollout_continuations(
     when the caller will immediately recompute them through parallel replay.
     ``compact_finished`` removes completed rows and their KV cache entries at
     the existing 16-position synchronization points once at least 25% of the
-    current rows have finished. Original row indices remain attached to all
-    trajectory records, so compaction changes compute and RNG consumption,
-    not the sampled policy distribution or output attribution.
+    current rows have finished. With ``finished_batch_size``, compaction waits
+    until the live count fits that one fixed tail size and retains ended filler
+    rows to fill it. Compiled evaluation uses this to expose exactly one
+    bounded tail specialization instead of arbitrary survivor shapes. Original
+    row indices remain attached to all trajectory records, so compaction changes
+    compute and RNG consumption, not the sampled policy distribution or output
+    attribution.
     """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
@@ -196,6 +201,8 @@ def rollout_continuations(
         raise ValueError("max_stream_steps must be at least max_new_tokens")
     device = prompt_ids.device
     batch, prompt_length = prompt_ids.shape
+    if finished_batch_size is not None and finished_batch_size < 1:
+        raise ValueError("finished_batch_size must be positive")
     if isinstance(force_initial_think, bool):
         force_initial_think = torch.full(
             (batch,), force_initial_think, dtype=torch.bool, device=device
@@ -344,14 +351,30 @@ def rollout_continuations(
             if active_count == 0:
                 break
             current_count = active.numel()
+            compacted_count = active_count
+            if finished_batch_size is not None:
+                compacted_count = (
+                    finished_batch_size
+                    if active_count <= finished_batch_size
+                    else current_count
+                )
             should_compact = (
                 compact_finished
                 and not preallocated_caches
-                and active_count < current_count
-                and current_count - active_count >= max(1, current_count // 4)
+                and compacted_count < current_count
+                and (
+                    finished_batch_size is not None
+                    or current_count - active_count
+                    >= max(1, current_count // 4)
+                )
             )
             if should_compact:
                 keep = active.nonzero().squeeze(-1)
+                if compacted_count > active_count:
+                    fillers = (~active).nonzero().squeeze(-1)[
+                        : compacted_count - active_count
+                    ]
+                    keep = torch.cat((keep, fillers))
                 live_rows = live_rows.index_select(0, keep)
                 emitted = emitted.index_select(0, keep)
                 ended = ended.index_select(0, keep)
@@ -364,7 +387,7 @@ def rollout_continuations(
                     compacted = []
                     for tensor in cache:
                         target = torch.empty(
-                            (active_count, *tensor.shape[1:]),
+                            (compacted_count, *tensor.shape[1:]),
                             dtype=tensor.dtype,
                             device=tensor.device,
                         )

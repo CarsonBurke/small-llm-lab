@@ -41,6 +41,7 @@ update is attempted.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import hashlib
 import json
 import math
@@ -113,10 +114,17 @@ from postraining.value_model import SeparateCritic
 
 
 EXECUTION_SCHEMA = (
+    "disjoint_b512_zero_affine_gaussian_adapter_general_lr_sequential_data/v16"
+)
+GAIN_SCALED_EXECUTION_SCHEMA = (
     "disjoint_b512_gain_scaled_gaussian_adapter_general_lr_sequential_data/v15"
+)
+GAIN_SCALED_THOUGHT_INPUT_SCHEMA = (
+    "fresh_learned_scalar_identity_affine_s1e-4/v4"
 )
 PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
+DEFAULT_PERIODIC_EVAL_EVERY = 150
 # v2: the grading style follows each row's reward_model.style (Minerva for
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
 # instead of Minerva-normalizing everything.
@@ -139,6 +147,91 @@ def math_dataset_identity(path: str | Path, exclude_modules: str) -> str:
 def resume_execution_schema_compatible(payload: dict) -> bool:
     """Resume only an exact current-policy checkpoint."""
     return payload.get("execution_schema") == EXECUTION_SCHEMA
+
+
+def migrate_zero_adapter_resume(
+    payload: dict,
+    wrapper: LatentThoughtModel,
+) -> dict[str, object]:
+    """Explicitly replace v15's gain-scaled adapter while preserving resume.
+
+    The recurrent policy semantics change, so this migration is never silent:
+    the caller must opt in. All actor state and Adam moments are retained
+    except the three old adapter parameters. The new weight/bias start at exact
+    zero with fresh optimizer state; the removed scalar has no successor.
+    """
+    actual_execution = payload.get("execution_schema")
+    actual_input = payload.get("thought_input_schema")
+    if actual_execution != GAIN_SCALED_EXECUTION_SCHEMA:
+        raise ValueError(
+            "zero-adapter migration requires execution schema "
+            f"{GAIN_SCALED_EXECUTION_SCHEMA!r}; got {actual_execution!r}"
+        )
+    if actual_input != GAIN_SCALED_THOUGHT_INPUT_SCHEMA:
+        raise ValueError(
+            "zero-adapter migration requires thought-input schema "
+            f"{GAIN_SCALED_THOUGHT_INPUT_SCHEMA!r}; got {actual_input!r}"
+        )
+
+    state = payload["model"]
+    scalar_key = "adapter.interpolation_strength"
+    if scalar_key not in state:
+        raise ValueError("gain-scaled checkpoint is missing its adapter scalar")
+    scalar = state[scalar_key]
+    weight_key = "adapter.projection.weight"
+    bias_key = "adapter.projection.bias"
+    expected_shapes = {
+        weight_key: tuple(wrapper.adapter.projection.weight.shape),
+        bias_key: tuple(wrapper.adapter.projection.bias.shape),
+    }
+    for key, expected_shape in expected_shapes.items():
+        if key not in state or tuple(state[key].shape) != expected_shape:
+            actual_shape = tuple(state[key].shape) if key in state else None
+            raise ValueError(
+                f"gain-scaled checkpoint {key} shape must be "
+                f"{expected_shape}; got {actual_shape}"
+            )
+    if scalar.numel() != 1 or not torch.isfinite(scalar).all():
+        raise ValueError("gain-scaled checkpoint adapter scalar must be finite")
+
+    actor_optimizer = payload["optimizers"]["actor"]
+    groups = actor_optimizer["param_groups"]
+    if len(groups) != 6 or len(groups[2]["params"]) != 3:
+        raise ValueError(
+            "gain-scaled actor optimizer does not have the expected six-group "
+            "layout with scalar/weight/bias adapter parameters"
+        )
+
+    source_strength = float(scalar)
+    scalar_id, weight_id, bias_id = groups[2]["params"]
+    if len({scalar_id, weight_id, bias_id}) != 3:
+        raise ValueError(
+            "gain-scaled actor optimizer adapter parameter IDs must be distinct"
+        )
+
+    state.pop(scalar_key)
+    state[weight_key] = torch.zeros_like(state[weight_key])
+    state[bias_key] = torch.zeros_like(state[bias_key])
+    old_state = actor_optimizer["state"]
+    for parameter_id in (scalar_id, weight_id, bias_id):
+        old_state.pop(parameter_id, None)
+    # Optimizer state_dict loading maps saved parameter IDs to live parameters
+    # positionally. Retain the old weight/bias IDs in their original order so
+    # later groups and every unrelated moment remain aligned.
+    groups[2]["params"] = [weight_id, bias_id]
+
+    payload["execution_schema"] = EXECUTION_SCHEMA
+    payload["thought_input_schema"] = THOUGHT_INPUT_SCHEMA
+    return {
+        "source_execution_schema": actual_execution,
+        "source_thought_input_schema": actual_input,
+        "source_adapter_strength": source_strength,
+        "reset_parameters": [
+            "adapter.projection.weight",
+            "adapter.projection.bias",
+        ],
+        "reset_optimizer_state": True,
+    }
 
 
 def sample_prompt_batch(
@@ -525,8 +618,11 @@ def aggregate_actor_tensorboard_metrics(
         "behavior/optional_think_probability": 1.0 - _weighted_metric_mean(
             metrics, "emit_probability", "gate_action_count"
         ),
-        "behavior/thought_interpolation_strength": last[
-            "thought_interpolation_strength"
+        "behavior/thought_adapter_weight_rms": last[
+            "thought_adapter_weight_rms"
+        ],
+        "behavior/thought_adapter_bias_rms": last[
+            "thought_adapter_bias_rms"
         ],
         "behavior/gate_entropy": _weighted_metric_mean(
             metrics, "gate_entropy", "gate_action_count"
@@ -1408,7 +1504,12 @@ def update_minibatch(
         thought_mean_output_gain=(
             wrapper.transition.mean_head.output_gain.detach()
         ),
-        thought_interpolation_strength=wrapper.adapter.strength().detach(),
+        thought_adapter_weight_rms=(
+            wrapper.adapter.projection.weight.detach().square().mean().sqrt()
+        ),
+        thought_adapter_bias_rms=(
+            wrapper.adapter.projection.bias.detach().square().mean().sqrt()
+        ),
         thought_log_sigma_raw_bias_mean=(
             wrapper.transition.log_sigma_head.bias.detach().mean()
         ),
@@ -1439,6 +1540,7 @@ def measure_post_update_policy_drift(
     replay_max_trajectories: int,
     replay_attention_budget: int,
     replay_bucket: int,
+    replay_function: Callable = replay_head_inputs,
 ) -> dict[str, float]:
     """Evaluate the just-updated policy on its behavior trajectories.
 
@@ -1447,6 +1549,10 @@ def measure_post_update_policy_drift(
     deployed policy. This read-only replay measures the actual post-step drift
     without reusing trajectories for a gradient. It runs only at the explicit
     diagnostic cadence because it costs one additional policy forward.
+    ``replay_function`` deliberately stays eager in the trainer: invoking the
+    grad-enabled training artifact under this function's no-grad context would
+    force Dynamo/AOTAutograd to compile a second guarded graph, while enabling
+    gradients here retains a full replay graph and can exceed peak memory.
     """
     if not batches:
         raise ValueError("post-update drift requires at least one rollout batch")
@@ -1470,7 +1576,7 @@ def measure_post_update_policy_drift(
             replay_attention_budget,
             replay_bucket,
         ):
-            beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
+            beliefs, predicted, stream_inputs, token_targets = replay_function(
                 wrapper, microbatch
             )
             gate_logprobs = wrapper.gate.log_prob(
@@ -1701,8 +1807,8 @@ def main() -> None:
     # Initialization only: the bounded output of the state-dependent
     # log-sigma head. Zero-init weights make noise state-independent at step 0;
     # -2 gives std 0.135 and expected 512-D noise norm 3.06. The fresh
-    # adapter's learned interpolation strength initially suppresses both this
-    # exploration and the small fresh mean before they enter the recurrent trunk.
+    # adapter starts at exact zero, so neither exploration nor the small fresh
+    # mean enters the recurrent trunk until replay gradients open its affine map.
     parser.add_argument("--thought-log-sigma-init", type=float, default=-2.0)
     # Gradient multiplier for the thought factor inside the joint action log
     # probability. The forward ratio stays exact; 0 detaches only that factor
@@ -1746,7 +1852,9 @@ def main() -> None:
     # ~75s for all 62M validation tokens, while still giving the guard ample
     # precision to detect renderer drift. Use 0 explicitly for a final,
     # challenge-comparable full-validation measurement.
-    parser.add_argument("--bpb-every", type=int, default=100)
+    parser.add_argument(
+        "--bpb-every", type=int, default=DEFAULT_PERIODIC_EVAL_EVERY
+    )
     parser.add_argument(
         "--bpb-val-tokens", type=int, default=DEFAULT_BPB_GUARD_TOKENS,
         help="deterministic validation-prefix size for the BPB guard "
@@ -1757,6 +1865,12 @@ def main() -> None:
         "--bpb-only", action="store_true",
         help="evaluate the BPB guard once and exit (for timing/config checks)",
     )
+    parser.add_argument(
+        "--bench-only", action="store_true",
+        help="evaluate the full held-out benchmark and exit; requires a "
+        "dedicated --output when used with --resume",
+    )
+    parser.add_argument("--bench-only-repeats", type=int, default=1)
     # The full 1024-answer / 4096-stream AIME eval is intentionally final-only
     # by default; periodic copies would dominate the posttraining workload.
     parser.add_argument("--aime-every", type=int, default=0)
@@ -1775,7 +1889,9 @@ def main() -> None:
     parser.add_argument(
         "--bench-data", default="postraining/data/deepmind-interpolate-easy.parquet"
     )
-    parser.add_argument("--bench-every", type=int, default=80)
+    parser.add_argument(
+        "--bench-every", type=int, default=DEFAULT_PERIODIC_EVAL_EVERY
+    )
     parser.add_argument("--bench-samples", type=int, default=8)
     parser.add_argument(
         "--bench-max-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
@@ -1784,6 +1900,10 @@ def main() -> None:
     # This is a trajectory rather than prompt count so avg@8 and avg@32 use
     # comparable memory; replay-free eval storage makes 128 rows practical.
     parser.add_argument("--eval-batch-trajectories", type=int, default=128)
+    parser.add_argument(
+        "--eval-tail-batch", type=int, default=16,
+        help="single compiled survivor-batch size (0 disables compaction)",
+    )
     # Compile the dynamic-prefix one-token model step used only by eval.
     # Static full-cache CUDA graphs are intentionally avoided: measured
     # attention over all 5K cache slots was 2.6x slower than eager narrowing.
@@ -1837,6 +1957,13 @@ def main() -> None:
         "checkpoint, preserve optimizer state, and continue its unused prompt stream",
     )
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--migrate-zero-adapter-resume",
+        action="store_true",
+        help="explicitly resume a v15 gain-scaled checkpoint while replacing "
+        "only its adapter with the v16 zero-initialized affine and fresh "
+        "adapter Adam state",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
@@ -1858,6 +1985,12 @@ def main() -> None:
         parser.error("--warmup-save-every must be positive")
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
+    if args.eval_tail_batch < 0:
+        parser.error("--eval-tail-batch must be nonnegative")
+    if args.bench_only_repeats < 1:
+        parser.error("--bench-only-repeats must be positive")
+    if args.migrate_zero_adapter_resume and not args.resume:
+        parser.error("--migrate-zero-adapter-resume requires --resume")
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
     if args.prompts_per_minibatch < 1:
@@ -1870,6 +2003,22 @@ def main() -> None:
         parser.error("--ppo-epochs must be 1; trajectory reuse is disabled")
     if args.bpb_val_tokens < 0:
         parser.error("--bpb-val-tokens must be nonnegative")
+    exclusive_modes = sum(
+        (args.bpb_only, args.bench_only, args.rollout_only)
+    )
+    if exclusive_modes > 1:
+        parser.error(
+            "--bpb-only, --bench-only, and --rollout-only are mutually exclusive"
+        )
+    if (
+        args.bench_only
+        and args.resume
+        and Path(args.output).resolve() == Path(args.resume).resolve().parent
+    ):
+        parser.error(
+            "--bench-only with --resume requires a dedicated --output so "
+            "evaluation cannot purge or overwrite the training run"
+        )
     initialization_modes = sum(
         option is not None
         for option in (args.actor_init, args.actor_critic_init, args.resume)
@@ -1891,7 +2040,7 @@ def main() -> None:
         if samples < 2 or samples % 2:
             parser.error(f"{name} must be even for the 50/50 forced split")
     if (
-        args.bench_every > 0
+        (args.bench_every > 0 or args.bench_only)
         and args.bench_samples < CAPTURE_SAMPLES_PER_PROBLEM
     ):
         parser.error(
@@ -2003,9 +2152,7 @@ def main() -> None:
             "sampler_cursor": int(actor_init_payload["sampler_cursor"]),
             "fresh_mean_initialized": bool(args.actor_critic_init),
             "fresh_adapter_initialized": bool(args.actor_critic_init),
-            "fresh_adapter_strength": (
-                wrapper.adapter.INIT_STRENGTH if args.actor_critic_init else None
-            ),
+            "fresh_adapter_zero_initialized": bool(args.actor_critic_init),
         }
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
@@ -2059,7 +2206,7 @@ def main() -> None:
     )
     bench_rows = (
         load_unique_math_rows(args.bench_data)
-        if args.bench_every > 0 and not args.rollout_only
+        if (args.bench_every > 0 or args.bench_only) and not args.rollout_only
         else []
     )
     math_rows = load_unique_math_rows(args.math_data)
@@ -2143,6 +2290,9 @@ def main() -> None:
     warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
     if args.resume:
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        adapter_migration = None
+        if args.migrate_zero_adapter_resume:
+            adapter_migration = migrate_zero_adapter_resume(payload, wrapper)
         migrate_legacy_wrapper_checkpoint(payload, wrapper)
         validate_renderer_checkpoint(payload, args.resume)
         if not resume_execution_schema_compatible(payload):
@@ -2188,13 +2338,18 @@ def main() -> None:
         random.setstate(payload["python_rng"])
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
+        if adapter_migration is not None:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["zero_adapter_resume_migration"] = (
+                adapter_migration
+            )
 
     if args.actor_critic_init:
         torch.set_rng_state(actor_init_payload["cpu_rng"])
         torch.cuda.set_rng_state_all(actor_init_payload["cuda_rng"])
         random.setstate(actor_init_payload["python_rng"])
 
-    if args.bpb_only:
+    if args.bpb_only or args.bench_only:
         planned_prompt_count = 0
     elif args.rollout_only:
         planned_prompt_count = args.prompts_per_rollout
@@ -2234,6 +2389,11 @@ def main() -> None:
         compiled_generation_step if args.rollout_compile else None
     )
     eval_step_core = compiled_generation_step if args.eval_compile else None
+
+    # Preserve the eager function for infrequent no-grad diagnostics. Calling
+    # the compiled training artifact under no-grad would create a distinct
+    # AOTAutograd specialization solely because grad mode is a Dynamo guard.
+    diagnostic_replay_head_inputs = replay_head_inputs
 
     # Replay compilation is independent of rollout. Dynamic B/L plus bounded
     # 64-token buckets lets one artifact cover the length-aware shard plan;
@@ -2496,6 +2656,7 @@ def main() -> None:
             prompt_tokens=args.prompt_tokens,
             batch_trajectories=args.eval_batch_trajectories,
             compiled_step_core=eval_step_core,
+            compiled_tail_batch=args.eval_tail_batch or None,
             answer_style_override="aime",
         )
         if metrics["compile_fallback"] and eval_step_core is rollout_step_core:
@@ -2519,17 +2680,25 @@ def main() -> None:
         )
         print(f"step:{step} aime_avg@{args.aime_samples}:{metrics['accuracy']:.4f}", flush=True)
 
-    def bench_eval(step: int) -> None:
+    def bench_eval(
+        step: int,
+        *,
+        eval_seed: int | None = None,
+        repeat: int | None = None,
+    ) -> None:
         nonlocal rollout_step_core
         wrapper.eval()
+        if eval_seed is None:
+            eval_seed = args.seed
         captured_attempts: list[dict[str, object]] = []
         eval_started = time.perf_counter()
         metrics = evaluate_aime_latent(
             wrapper, tokenizer, bench_rows, args.bench_samples,
             args.bench_max_tokens, bench_stream_steps, args.bench_samples,
-            args.seed, device, prompt_tokens=args.prompt_tokens,
+            eval_seed, device, prompt_tokens=args.prompt_tokens,
             batch_trajectories=args.eval_batch_trajectories,
             compiled_step_core=eval_step_core,
+            compiled_tail_batch=args.eval_tail_batch or None,
             captured_attempts=captured_attempts,
         )
         if metrics["compile_fallback"] and eval_step_core is rollout_step_core:
@@ -2543,7 +2712,14 @@ def main() -> None:
             captured_attempts,
             reward_schema=REWARD_SCHEMA,
         )
-        logger.log(type="bench", step=step, seconds=eval_seconds, **metrics)
+        logger.log(
+            type="bench",
+            step=step,
+            seconds=eval_seconds,
+            eval_seed=eval_seed,
+            repeat=repeat,
+            **metrics,
+        )
         tensorboard.add_scalar("bench/accuracy", metrics["accuracy"], step)
         tensorboard.add_scalar(
             "bench/forced_initial_accuracy",
@@ -2559,6 +2735,19 @@ def main() -> None:
             "bench/optional_think_fraction", metrics["think_fraction"], step
         )
         print(f"step:{step} bench_avg@{args.bench_samples}:{metrics['accuracy']:.4f}", flush=True)
+
+    if args.bench_only:
+        for repeat in range(args.bench_only_repeats):
+            # Repeat zero warms the compiled decoder. Subsequent repeats use
+            # matched but distinct workloads across evaluator modes, avoiding
+            # a single stochastic tail being mistaken for expected speed.
+            bench_eval(
+                start_step,
+                eval_seed=args.seed + repeat,
+                repeat=repeat,
+            )
+        tensorboard.close()
+        return
 
     if args.bpb_only:
         eval_started = time.perf_counter()
@@ -2898,9 +3087,14 @@ def main() -> None:
                             ]
                         ).max(),
                         # Overwrite the pre-update minibatch snapshot with the
-                        # scalar the next rollout will actually deploy.
-                        "behavior/thought_interpolation_strength": (
-                            wrapper.adapter.strength().detach()
+                        # adapter magnitude the next rollout will deploy.
+                        "behavior/thought_adapter_weight_rms": (
+                            wrapper.adapter.projection.weight.detach()
+                            .square().mean().sqrt()
+                        ),
+                        "behavior/thought_adapter_bias_rms": (
+                            wrapper.adapter.projection.bias.detach()
+                            .square().mean().sqrt()
                         ),
                         "sigma/mean_output_gain": (
                             wrapper.transition.mean_head.output_gain.detach()
@@ -2912,7 +3106,7 @@ def main() -> None:
                 )
             if not all(math.isfinite(value) for value in head_updates.values()):
                 raise RuntimeError(
-                    f"non-finite Gaussian head after optimizer step {next_step}: "
+                    f"non-finite policy head after optimizer step {next_step}: "
                     f"{head_updates}"
                 )
             actor_dashboard.update(head_updates)
@@ -2928,6 +3122,7 @@ def main() -> None:
                         replay_max_trajectories=args.replay_max_trajectories,
                         replay_attention_budget=args.replay_attention_budget,
                         replay_bucket=args.replay_bucket,
+                        replay_function=diagnostic_replay_head_inputs,
                     )
                 if not all(
                     math.isfinite(value) for value in post_update_drift.values()

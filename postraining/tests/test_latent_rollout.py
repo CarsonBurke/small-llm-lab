@@ -36,12 +36,15 @@ from postraining.latent_thought import (
     EMIT,
     THINK,
     THOUGHT_DISTRIBUTION_SCHEMA,
+    THOUGHT_INPUT_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
     LatentThoughtModel,
 )
 from postraining.model_io import _pope_construction
 from postraining.train_latent_vapo import (
     EXECUTION_SCHEMA,
+    GAIN_SCALED_EXECUTION_SCHEMA,
+    GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
     MathPromptSampler,
     REWARD_SCHEMA,
     build_optimizers,
@@ -49,6 +52,7 @@ from postraining.train_latent_vapo import (
     joint_action_logprobs,
     math_dataset_identity,
     measure_post_update_policy_drift,
+    migrate_zero_adapter_resume,
     resume_execution_schema_compatible,
     sample_prompt_batch,
     score_math_rollout,
@@ -952,7 +956,7 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     critic_probe_ids = {id(p) for p in wrapper.backbone.critic_probe.parameters()}
     assert critic_probe_ids
     assert critic_probe_ids.isdisjoint({id(p) for p in actor_params})
-    # Six groups: trunk, scalar gate, recurrent adapter, renderer probe,
+    # Six groups: trunk, Bernoulli gate, recurrent adapter, renderer probe,
     # learned log-sigma, and fresh thought mean. Every actor component uses
     # the same general learning rate as the critic.
     lrs = [group["lr"] for group in optimizers["actor"].param_groups]
@@ -987,6 +991,13 @@ def test_post_update_drift_measures_the_deployed_policy_move():
     refresh_old_statistics(wrapper, critic, batch)
     grad_modes = []
     output_requires_grad = []
+    diagnostic_replay_calls = 0
+
+    def diagnostic_replay(*args, **kwargs):
+        nonlocal diagnostic_replay_calls
+        diagnostic_replay_calls += 1
+        assert not torch.is_grad_enabled()
+        return replay_head_inputs(*args, **kwargs)
 
     def record_grad_mode(_module, _inputs, output):
         grad_modes.append(torch.is_grad_enabled())
@@ -1002,6 +1013,7 @@ def test_post_update_drift_measures_the_deployed_policy_move():
             replay_max_trajectories=32,
             replay_attention_budget=4 * 1024 * 1024,
             replay_bucket=1,
+            replay_function=diagnostic_replay,
         )
         assert max(abs(value) for value in unchanged.values()) < 1e-7
 
@@ -1014,12 +1026,14 @@ def test_post_update_drift_measures_the_deployed_policy_move():
             replay_max_trajectories=32,
             replay_attention_budget=4 * 1024 * 1024,
             replay_bucket=1,
+            replay_function=diagnostic_replay,
         )
     finally:
         handle.remove()
 
     assert grad_modes and not any(grad_modes)
     assert output_requires_grad and not any(output_requires_grad)
+    assert diagnostic_replay_calls == 2
     assert drift["kl/post_update_gate_behavior"] > 0.0
     assert drift["kl/post_update_policy_behavior_per_action"] > 0.0
     assert drift["ratio/post_update_joint_abs_log_max"] > 0.0
@@ -1463,6 +1477,104 @@ def test_finished_row_compaction_preserves_original_row_attribution():
     assert compact.action_mask[:, boundary].bool().tolist() == forced.tolist()
 
 
+def test_compiled_full_batch_uses_one_fixed_finished_tail_shape(
+    monkeypatch,
+):
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(0, 32, (128, 4))
+    original_step_core = wrapper.step_core
+    compiled_batch_sizes: list[int] = []
+
+    def compiled_step_core(next_input, *args, **kwargs):
+        compiled_batch_sizes.append(next_input.size(0))
+        return original_step_core(next_input, *args, **kwargs)
+
+    wrapper.step_core = compiled_step_core
+    calls = 0
+
+    def staged_tokens(logits, _temperature, _top_p):
+        nonlocal calls
+        tokens = torch.full(
+            (logits.size(0),), 6, dtype=torch.long, device=logits.device
+        )
+        if calls == 0:
+            # Leave 12 live rows so the fixed B16 tail has to retain four
+            # inert fillers, not merely compact to exactly 16 survivors.
+            tokens[:116] = 5
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", staged_tokens)
+    batch = rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=32,
+        max_stream_steps=32,
+        temperature=1.0,
+        top_p=0.7,
+        stop_ids=(5,),
+        compact_finished=True,
+        finished_batch_size=16,
+        record_likelihoods=False,
+    )
+
+    emitted = emitted_token_rows(batch)
+    assert emitted[:116] == [[5]] * 116
+    assert all(row == [6] * 32 for row in emitted[116:])
+    assert compiled_batch_sizes
+    assert set(compiled_batch_sizes) == {16, 128}
+    assert wrapper.step_core is compiled_step_core
+
+
+def test_finished_row_compaction_preserves_model_dependent_survivor_tokens(
+    monkeypatch,
+):
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(1, 32, (128, 4))
+    prompt_ids[:64, 0] = 0
+    prompt_lengths = torch.tensor([3] * 64 + [4] * 64)
+    calls = 0
+
+    def terminate_then_argmax(logits, _temperature, _top_p):
+        nonlocal calls
+        if calls == 0:
+            tokens = logits.argmax(-1)
+            tokens[:80] = 5
+        else:
+            tokens = logits.argmax(-1)
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(
+        latent_rollout, "top_p_sample", terminate_then_argmax
+    )
+
+    def run(compact_finished: bool):
+        nonlocal calls
+        calls = 0
+        return rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=32,
+            max_stream_steps=32,
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            compact_finished=compact_finished,
+            record_likelihoods=False,
+        )
+
+    fixed = emitted_token_rows(run(False))
+    compacted = emitted_token_rows(run(True))
+    assert compacted[:80] == [[5]] * 80
+    assert compacted[80:] == fixed[80:]
+
+
 def test_evaluate_aime_latent_batches_unequal_prompt_groups_without_replay_storage(
     monkeypatch,
 ):
@@ -1627,11 +1739,16 @@ def test_evaluation_compile_failure_restarts_eager_and_restores_capture(monkeypa
 
     rollout = evaluator.rollout_continuations
     compiled_calls = 0
-    compaction_modes: list[bool] = []
+    compaction_modes: list[tuple[bool, bool]] = []
 
     def fail_after_partial_capture(wrapper_arg, *args, **kwargs):
         nonlocal compiled_calls
-        compaction_modes.append(kwargs["compact_finished"])
+        compaction_modes.append(
+            (
+                kwargs["compact_finished"],
+                kwargs["finished_batch_size"] == 16,
+            )
+        )
         if wrapper_arg.step_core is compiled_proxy:
             compiled_calls += 1
             if compiled_calls == 2:
@@ -1656,9 +1773,11 @@ def test_evaluation_compile_failure_restarts_eager_and_restores_capture(monkeypa
         for attempt in attempts
     ] == [(problem, sample) for problem in range(4) for sample in range(4)]
     assert wrapper.step_core == original
-    assert compaction_modes and not any(compaction_modes)
+    assert compaction_modes[:2] == [(True, True), (True, True)]
+    assert compaction_modes[-1] == (False, False)
     assert metrics["compiled"] is False
     assert metrics["compile_fallback"] is True
+    assert metrics["finished_compaction"] == "none"
     calls_after_failure = compiled_calls
 
     second_metrics = evaluate_aime_latent(
@@ -1836,7 +1955,169 @@ def test_resume_schema_accepts_current_checkpoints_only() -> None:
     assert not resume_execution_schema_compatible(
         {"execution_schema": "configurable_disjoint_b512_behavior_pool/v7"}
     )
+    assert not resume_execution_schema_compatible(
+        {"execution_schema": GAIN_SCALED_EXECUTION_SCHEMA}
+    )
     assert not resume_execution_schema_compatible({"execution_schema": "older/v5"})
+
+
+def test_zero_adapter_resume_migration_preserves_unrelated_adam_state() -> None:
+    wrapper = _wrapper()
+    critic = _critic()
+    optimizer = _optimizers(wrapper, critic)["actor"]
+    # Materialize a distinct moment tensor for every current actor parameter.
+    for index, parameter in enumerate(
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ):
+        parameter.grad = torch.full_like(parameter, (index + 1) / 1000)
+    optimizer.step()
+    current_optimizer = copy.deepcopy(optimizer.state_dict())
+    weight_id, bias_id = current_optimizer["param_groups"][2]["params"]
+    scalar_id = max(
+        parameter_id
+        for group in current_optimizer["param_groups"]
+        for parameter_id in group["params"]
+    ) + 1
+    current_optimizer["param_groups"][2]["params"] = [
+        scalar_id, weight_id, bias_id
+    ]
+    current_optimizer["state"][scalar_id] = {
+        "step": torch.tensor(7.0),
+        "exp_avg": torch.tensor(0.25),
+        "exp_avg_sq": torch.tensor(0.5),
+    }
+    unaffected_ids = {
+        parameter_id
+        for group_index, group in enumerate(current_optimizer["param_groups"])
+        if group_index != 2
+        for parameter_id in group["params"]
+    }
+    unaffected_before = {
+        parameter_id: copy.deepcopy(current_optimizer["state"][parameter_id])
+        for parameter_id in unaffected_ids
+    }
+
+    model = copy.deepcopy(wrapper.state_dict())
+    model["adapter.projection.weight"].fill_(1.0)
+    model["adapter.projection.bias"].fill_(2.0)
+    model["adapter.interpolation_strength"] = torch.tensor(-4.5e-4)
+    critic_state = {"sentinel": torch.arange(4)}
+    critic_optimizer_state = {"sentinel": torch.arange(3)}
+    cpu_rng_state = torch.random.get_rng_state().clone()
+    payload = {
+        "execution_schema": GAIN_SCALED_EXECUTION_SCHEMA,
+        "thought_input_schema": GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
+        "model": model,
+        "critic": critic_state,
+        "optimizers": {
+            "actor": current_optimizer,
+            "critic": critic_optimizer_state,
+        },
+        "step": 640,
+        "sampler_cursor": 11040,
+        "cpu_rng": cpu_rng_state,
+        "cuda_rng": [torch.arange(2, dtype=torch.uint8)],
+        "python_rng": (3, (1, 2, 3), None),
+    }
+
+    provenance = migrate_zero_adapter_resume(payload, wrapper)
+
+    assert payload["execution_schema"] == EXECUTION_SCHEMA
+    assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
+    assert provenance["source_adapter_strength"] == pytest.approx(-4.5e-4)
+    assert payload["step"] == 640
+    assert payload["sampler_cursor"] == 11040
+    assert payload["critic"] is critic_state
+    assert payload["optimizers"]["critic"] is critic_optimizer_state
+    torch.testing.assert_close(payload["cpu_rng"], cpu_rng_state)
+    torch.testing.assert_close(payload["cuda_rng"][0], torch.arange(2, dtype=torch.uint8))
+    assert payload["python_rng"] == (3, (1, 2, 3), None)
+    assert "adapter.interpolation_strength" not in model
+    assert torch.count_nonzero(model["adapter.projection.weight"]) == 0
+    assert torch.count_nonzero(model["adapter.projection.bias"]) == 0
+    assert current_optimizer["param_groups"][2]["params"] == [
+        weight_id, bias_id
+    ]
+    assert all(
+        parameter_id not in current_optimizer["state"]
+        for parameter_id in (scalar_id, weight_id, bias_id)
+    )
+    for parameter_id, expected in unaffected_before.items():
+        for key, value in expected.items():
+            torch.testing.assert_close(
+                current_optimizer["state"][parameter_id][key], value
+            )
+
+    migrated_wrapper = _wrapper(seed=99)
+    migrated_wrapper.load_state_dict(model, strict=True)
+    migrated_optimizer = _optimizers(migrated_wrapper, _critic(), 1e-3)["actor"]
+    migrated_optimizer.load_state_dict(current_optimizer)
+    assert not migrated_optimizer.state[
+        migrated_wrapper.adapter.projection.weight
+    ]
+    assert not migrated_optimizer.state[
+        migrated_wrapper.adapter.projection.bias
+    ]
+
+
+def test_zero_adapter_resume_migration_rejects_wrong_source_schema() -> None:
+    wrapper = _wrapper()
+    with pytest.raises(ValueError, match="requires execution schema"):
+        migrate_zero_adapter_resume(
+            {
+                "execution_schema": EXECUTION_SCHEMA,
+                "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+            },
+            wrapper,
+        )
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing_scalar", "bad_weight", "bad_groups", "duplicate_ids"],
+)
+def test_zero_adapter_resume_migration_rejects_malformed_layout_before_mutation(
+    malformation: str,
+) -> None:
+    wrapper = _wrapper()
+    critic = _critic()
+    optimizer = _optimizers(wrapper, critic)["actor"].state_dict()
+    weight_id, bias_id = optimizer["param_groups"][2]["params"]
+    scalar_id = max(
+        parameter_id
+        for group in optimizer["param_groups"]
+        for parameter_id in group["params"]
+    ) + 1
+    optimizer["param_groups"][2]["params"] = [scalar_id, weight_id, bias_id]
+    model = copy.deepcopy(wrapper.state_dict())
+    model["adapter.interpolation_strength"] = torch.tensor(1e-4)
+    payload = {
+        "execution_schema": GAIN_SCALED_EXECUTION_SCHEMA,
+        "thought_input_schema": GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
+        "model": model,
+        "optimizers": {"actor": optimizer},
+    }
+    if malformation == "missing_scalar":
+        del model["adapter.interpolation_strength"]
+    elif malformation == "bad_weight":
+        model["adapter.projection.weight"] = torch.zeros(1)
+    elif malformation == "bad_groups":
+        optimizer["param_groups"][2]["params"] = [weight_id, bias_id]
+    else:
+        optimizer["param_groups"][2]["params"] = [scalar_id, weight_id, weight_id]
+    before = copy.deepcopy(payload)
+
+    with pytest.raises(ValueError):
+        migrate_zero_adapter_resume(payload, wrapper)
+
+    assert payload.keys() == before.keys()
+    assert payload["execution_schema"] == before["execution_schema"]
+    assert payload["thought_input_schema"] == before["thought_input_schema"]
+    assert payload["model"].keys() == before["model"].keys()
+    for key, value in payload["model"].items():
+        torch.testing.assert_close(value, before["model"][key])
 
 
 def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):

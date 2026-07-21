@@ -217,7 +217,7 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
     <div><span>Optional think fraction</span><strong>{_percent(metrics['think_fraction'])}</strong></div>
   </section>
   {''.join(sections)}
-  <footer>Correctness requires explicit BOS/EOS termination · reward schema: {html.escape(str(payload.get('reward_schema', 'unspecified')))} · the action trace excludes prompt tokens.</footer>
+  <footer>Correctness requires explicit BOS/EOS termination · reward schema: {html.escape(str(payload.get('reward_schema', 'unspecified')))} · sampling: {html.escape(str(metrics.get('sampling_schema', 'legacy')))} · finished-row compaction: {html.escape(str(metrics.get('finished_compaction', 'legacy')))} · the action trace excludes prompt tokens.</footer>
 </main>
 </body>
 </html>
@@ -227,7 +227,7 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
 def write_benchmark_report(
     output: str | Path,
     step: int,
-    metrics: Mapping[str, float | int | Mapping[str, float]],
+    metrics: Mapping[str, Any],
     attempts: Sequence[Mapping[str, Any]],
     reward_schema: str = "unspecified",
 ) -> dict[str, Path]:

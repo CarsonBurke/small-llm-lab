@@ -385,15 +385,9 @@ def test_fresh_adapter_explicitly_replaces_critic_warm_identity_state():
 
     assert reset
     assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
-    torch.testing.assert_close(
-        state["adapter.projection.weight"],
-        torch.eye(32),
-    )
+    assert torch.count_nonzero(state["adapter.projection.weight"]) == 0
     assert torch.count_nonzero(state["adapter.projection.bias"]) == 0
-    torch.testing.assert_close(
-        state["adapter.interpolation_strength"],
-        wrapper.adapter.interpolation_strength,
-    )
+    assert "adapter.interpolation_strength" not in state
 
 
 def test_thought_policy_gradient_flows_through_the_mean():
@@ -429,48 +423,43 @@ def test_thought_policy_gradient_reaches_the_sigma_head():
     assert head.log_sigma_head.weight.grad.abs().sum().item() > 0.0
 
 
-def test_adapter_strength_init_weakens_thought_without_rotating_it():
+def test_adapter_starts_as_an_exact_zero_payload():
     torch.manual_seed(19)
     backbone = _pope_model()
     wrapper = LatentThoughtModel(backbone)
     thought = torch.randn(2, 32)
     injected = wrapper.thought_input(thought)
     assert injected.shape == (2, 1, 32)
-    # The fresh adapter preserves direction while making the initial recurrent
-    # intervention 10,000x weaker than the sampled Gaussian action.
-    torch.testing.assert_close(
-        injected.squeeze(1),
-        (ThoughtAdapter.INIT_STRENGTH * thought).to(injected.dtype),
-        rtol=1e-5,
-        atol=1e-6,
-    )
-    torch.testing.assert_close(wrapper.adapter.projection.weight, torch.eye(32))
+    assert torch.count_nonzero(injected) == 0
+    assert torch.count_nonzero(wrapper.adapter.projection.weight) == 0
     assert torch.count_nonzero(wrapper.adapter.projection.bias) == 0
-    assert wrapper.adapter.strength().item() == pytest.approx(
-        ThoughtAdapter.INIT_STRENGTH
-    )
 
-    # Pin the actual normalization boundary that invalidated a 0.01 affine
-    # gain: the fresh stochastic action must remain weak after RMSNorm, not
-    # merely before entering the trunk.
+    # Exact zero remains zero across the normalization boundary; unlike a
+    # merely small random direction, RMSNorm cannot amplify it.
     typical_action = torch.randn(128, 1, 32) * math.exp(-2)
     normalized = backbone.blocks[0].attn_norm(
         wrapper.adapter(typical_action.float()).to(backbone.tok_emb.weight.dtype)
     )
-    assert normalized.float().square().mean().sqrt().item() < 0.05
+    assert torch.count_nonzero(normalized) == 0
 
 
-def test_adapter_strength_has_an_unattenuated_learning_signal():
+def test_zero_adapter_affine_learns_on_its_first_backward_pass():
     adapter = ThoughtAdapter(4)
-    thought = torch.randn(3, 4)
-    projected = adapter.projection(thought).detach()
+    thought = torch.randn(3, 4, requires_grad=True)
 
     adapter(thought).sum().backward()
 
     torch.testing.assert_close(
-        adapter.interpolation_strength.grad,
-        projected.sum(),
+        adapter.projection.weight.grad,
+        thought.detach().sum(0).expand(4, 4),
     )
+    torch.testing.assert_close(
+        adapter.projection.bias.grad,
+        torch.full((4,), 3.0),
+    )
+    # The content path opens after the first affine update; only its first
+    # input gradient is zero because W itself starts at zero.
+    assert torch.count_nonzero(thought.grad) == 0
 
 
 def test_adapter_bias_is_a_shared_thought_type_offset():
@@ -479,11 +468,10 @@ def test_adapter_bias_is_a_shared_thought_type_offset():
     with torch.no_grad():
         adapter.projection.bias.copy_(marker)
     thoughts = torch.randn(3, 4)
-    strength = adapter.strength().detach()
 
     torch.testing.assert_close(
-        adapter(thoughts) - strength * thoughts,
-        strength * marker.expand_as(thoughts),
+        adapter(thoughts),
+        marker.expand_as(thoughts),
     )
 
 

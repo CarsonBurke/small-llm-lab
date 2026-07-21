@@ -48,6 +48,8 @@ def _payload() -> dict[str, object]:
             "unforced_initial_accuracy": 0.375,
             "think_fraction": 0.2,
             "samples": 1152,
+            "sampling_schema": "global_rng_compacted_tail/v1",
+            "finished_compaction": "compiled_tail_b16",
         },
         "attempts": [
             _attempt(problem, sample)
@@ -63,6 +65,8 @@ def test_render_benchmark_report_is_self_contained_and_escapes_model_text():
     assert "What the model answered" in report
     assert "Overall accuracy</span><strong>25.00%" in report
     assert "test_reward/v1" in report
+    assert "global_rng_compacted_tail/v1" in report
+    assert "compiled_tail_b16" in report
     assert "exact" in report
     assert report.count('class="attempt ') == 16
     assert "&lt;script&gt;alert" in report

@@ -74,7 +74,8 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "positive_lm_weight": 0.1,
         "gate_entropy_coef": 0.5,
         "emit_probability": 0.8,
-        "thought_interpolation_strength": 1e-4,
+        "thought_adapter_weight_rms": 1e-4,
+        "thought_adapter_bias_rms": 2e-4,
         "gate_entropy": 0.5,
         "gate_behavior_kl": 0.01,
         "renderer_behavior_kl": 0.02,
@@ -169,7 +170,8 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["sigma/noise_mean_norm_ratio"] == pytest.approx(0.2 / 3.1)
     assert dashboard["sigma/state_residual_gain"] == pytest.approx(0.01)
     assert dashboard["sigma/mean_output_gain"] == pytest.approx(0.01)
-    assert dashboard["behavior/thought_interpolation_strength"] == pytest.approx(1e-4)
+    assert dashboard["behavior/thought_adapter_weight_rms"] == pytest.approx(1e-4)
+    assert dashboard["behavior/thought_adapter_bias_rms"] == pytest.approx(2e-4)
     assert dashboard["ratio/joint_abs_log_max"] == pytest.approx(0.9)
     assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
     assert "grad/critic_mean" not in dashboard

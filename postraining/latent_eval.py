@@ -26,6 +26,9 @@ from postraining.latent_thought import THINK, LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
 
+COMPILED_EVAL_TAIL_BATCH = 16
+
+
 def verify_terminated_answer(
     emitted: list[int],
     truth: str,
@@ -62,7 +65,8 @@ def evaluate_latent_math(
     temperature: float = 1.0,
     top_p: float = 0.7,
     compact_finished: bool = False,
-) -> dict[str, float | int | dict[str, float]]:
+    compiled_tail_batch: int | None = COMPILED_EVAL_TAIL_BATCH,
+) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
 
     Generation runs the gate-conditioned rollout, so the evaluated policy is
@@ -101,6 +105,8 @@ def evaluate_latent_math(
         raise ValueError("chunk must be positive")
     if batch_trajectories < 1:
         raise ValueError("batch_trajectories must be positive")
+    if compiled_tail_batch is not None and compiled_tail_batch < 1:
+        raise ValueError("compiled_tail_batch must be positive or None")
     if captured_attempts is not None:
         if capture_problem_count < 1 or len(rows) < capture_problem_count:
             raise ValueError(
@@ -215,12 +221,21 @@ def evaluate_latent_math(
                             cache_dtype=(
                                 torch.bfloat16 if device.type == "cuda" else None
                             ),
-                            # Compaction changes cache batch shapes and makes
-                            # Inductor specialize/autotune a new graph at each
-                            # finish boundary. Keep compiled batches stable;
-                            # eager evaluation can still reclaim finished rows.
+                            # Keep the full batch compiled until the survivors
+                            # fit one fixed B16 tail. Padding that tail with
+                            # inert finished rows bounds Inductor to one extra
+                            # specialization instead of arbitrary live counts.
                             compact_finished=(
-                                compact_finished and compiled_step_core is None
+                                compact_finished
+                                or (
+                                    compiled_step_core is not None
+                                    and compiled_tail_batch is not None
+                                )
+                            ),
+                            finished_batch_size=(
+                                compiled_tail_batch
+                                if compiled_step_core is not None
+                                else None
                             ),
                         )
                     )
@@ -389,6 +404,7 @@ def evaluate_latent_math(
             temperature=temperature,
             top_p=top_p,
             compact_finished=compact_finished,
+            compiled_tail_batch=compiled_tail_batch,
         )
         metrics["compile_fallback"] = True
         return metrics
@@ -415,7 +431,7 @@ def evaluate_latent_math(
             f"{prefix}_max": ordered[-1],
         }
 
-    metrics: dict[str, float | int | dict[str, float]] = {
+    metrics: dict[str, object] = {
         "accuracy": correct / max(total, 1),
         "samples": total,
         "think_fraction": float(think_actions / actions.clamp_min(1.0)),
@@ -428,6 +444,22 @@ def evaluate_latent_math(
         **summarize(recurrent_steps_per_rollout, "recurrent_steps_per_rollout"),
         "compiled": compiled_step_core is not None,
         "compile_fallback": False,
+        "finished_compaction": (
+            f"compiled_tail_b{compiled_tail_batch}"
+            if compiled_step_core is not None and compiled_tail_batch is not None
+            else ("exact" if compact_finished else "none")
+        ),
+        "sampling_schema": (
+            "global_rng_compacted_tail/v1"
+            if (
+                compact_finished
+                or (
+                    compiled_step_core is not None
+                    and compiled_tail_batch is not None
+                )
+            )
+            else "global_rng_fixed_batch/v1"
+        ),
     }
     if module_total:
         metrics["module_accuracy"] = {

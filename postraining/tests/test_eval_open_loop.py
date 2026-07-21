@@ -105,6 +105,12 @@ def test_negative_imagine_is_rejected():
 
 def test_sampled_imagination_is_finite_and_reproducible():
     wrapper = _wrapper()
+    # The production adapter is exactly neutral at initialization, in which
+    # case sampled and mean thoughts correctly have identical recurrent
+    # effects. Open it here because this test targets sampling, not adapter
+    # initialization (covered separately by test_latent_thought.py).
+    with torch.no_grad():
+        wrapper.adapter.projection.weight.copy_(torch.eye(KWARGS["model_dim"]))
     x, y = _batch(batch=2, length=8)
     first = open_loop_depth_metrics(
         wrapper, x, y, 2, 2, *_luts(), mode="sample",

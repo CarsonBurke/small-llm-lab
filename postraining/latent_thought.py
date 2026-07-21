@@ -9,14 +9,12 @@ The transition policy is a diagonal Gaussian whose mean comes from a fresh
 linear head over the belief and whose per-dimension log-sigma is predicted
 from that same belief. The mean starts as a zero-bias orthogonal map at gain
 0.01, with no initial obligation to imitate a discrete-token embedding.
-Thoughts pass through a separate fresh identity affine embedder after sampling,
-then through a learned scalar interpolation strength initialized at 1e-4.
-The scalar keeps a fresh Gaussian action from immediately becoming a
-full-strength recurrent input—even after RMSNorm—and lets training coherently
-strengthen the channel while the affine map learns its geometry. The adapter
-is recurrent policy state, not part of the Gaussian likelihood: its bias can
-become a shared thought-type marker while its weight translates sampled
-thought content into the trunk's learned representation.
+Thoughts pass through a separate fresh affine embedder after sampling. Its
+weight and bias start at exact zero: the first thought payload is therefore a
+neutral recurrent input, while the single affine layer still receives a
+nonzero first-step gradient. The adapter is recurrent policy state, not part
+of the Gaussian likelihood: its bias can become a shared thought-type marker
+while its weight learns how sampled thought content should enter the trunk.
 
 The renderer is deliberately separated from that thought path: it consumes
 the current stream input and the raw belief, while the fresh mean head is
@@ -36,7 +34,7 @@ from torch import Tensor, nn
 THINK, EMIT = 0, 1
 RENDERER_FEATURES_SCHEMA = "input_latent+belief/v1"
 ROLLOUT_POLICY_SCHEMA = "half_group_members_forced_initial_latent_think/v1"
-THOUGHT_INPUT_SCHEMA = "fresh_learned_scalar_identity_affine_s1e-4/v4"
+THOUGHT_INPUT_SCHEMA = "fresh_zero_affine/v5"
 THOUGHT_DISTRIBUTION_SCHEMA = (
     "state_dependent_diag_tanh_log_sigma_scaled_residual_-5_2/v2"
 )
@@ -145,10 +143,10 @@ class StateDependentLogSigmaHead(nn.Linear):
 class GaussianTransitionHead(nn.Module):
     """Fresh diagonal-Gaussian thought policy over the current belief.
 
-    A unit-orthogonal mean map sits behind a learned scalar initialized at
-    0.01. For an RMS-normalized D-wide belief this gives a mean RMS of exactly
-    0.01 while preserving every input direction and avoiding the retired
-    next-token latent prior. A separate zero-init linear head predicts
+    A unit-orthogonal mean map sits behind a learned output gain initialized
+    at 0.01. For an RMS-normalized D-wide belief this gives a mean RMS of
+    exactly 0.01 while preserving every input direction and avoiding the
+    retired next-token latent prior. A separate zero-init linear head predicts
     per-dimension log-sigma residuals behind the same kind of 0.01 output
     gain around a CLI-initialized bias, so exploration starts state-independent
     and neither D-wide matrix can make an O(D * lr) first functional jump.
@@ -389,43 +387,38 @@ class AffineThoughtAdapter(nn.Module):
 
 
 class ThoughtAdapter(AffineThoughtAdapter):
-    """Policy affine thought embedder behind learned interpolation strength.
+    """Exactly-zero-initialized policy thought embedder.
 
     A fresh thought action at log-sigma -2 has RMS about 0.135. Feeding it
     through an identity adapter made v17's random initialization a
-    full-strength recurrent intervention and collapsed termination. Merely
-    scaling the affine weights by 0.01 does not fix this: RMSNorm raises the
-    resulting 0.00135-RMS vector back to about 0.97 RMS. A learned scalar
-    initialized at 1e-4 instead puts the normalized random direction near 0.04
-    RMS while leaving the identity affine map free to learn geometry behind
-    that coherent scalar gate. The scalar is direct rather than sigmoid-
-    parameterized: a sigmoid at 1e-4 would attenuate its own gradient by
-    roughly 1e-4 and prevent the channel from opening on this run's horizon.
+    full-strength recurrent intervention and collapsed termination. A
+    separate tiny scalar avoided that initial collapse, but made the affine
+    map poorly identified and attenuated every gradient into its geometry.
+
+    Zeroing this single final affine is not gradient-dead: for output
+    ``W @ thought + b``, the first backward pass has ``dW = dout outer
+    thought`` and ``db = dout`` even when W and b are zero. Only the gradient
+    into the thought is zero on that first pass; it opens as soon as W learns.
 
     This is not claimed to be an exact no-op: THINK still advances PoPE and
     writes a KV position, and PoPE's softplus Q/K geometry gives even a zero
-    input a contextual read. It does, however, suppress the random value and
-    residual direction that caused the measured v17 failure.
+    input a contextual read. It does suppress the random payload direction
+    that caused the measured v17 failure without a saturating or redundant
+    gate.
     """
-
-    INIT_STRENGTH = 1e-4
 
     def __init__(self, model_dim: int):
         super().__init__(model_dim)
-        self.interpolation_strength = nn.Parameter(torch.empty(()))
         self.reset_fresh()
 
     def reset_fresh(self) -> None:
         """Restore the deterministic post-critic fresh initialization."""
         with torch.no_grad():
-            self.reset_affine()
-            self.interpolation_strength.fill_(self.INIT_STRENGTH)
-
-    def strength(self) -> Tensor:
-        return self.interpolation_strength
+            nn.init.zeros_(self.projection.weight)
+            nn.init.zeros_(self.projection.bias)
 
     def forward(self, thought: Tensor) -> Tensor:
-        return self.strength() * self.projection(thought)
+        return self.projection(thought)
 
 
 def migrate_legacy_wrapper_checkpoint(
@@ -450,16 +443,14 @@ def migrate_legacy_wrapper_checkpoint(
         state_dict["adapter.projection.bias"] = (
             wrapper.adapter.projection.bias.detach().clone()
         )
-        state_dict["adapter.interpolation_strength"] = (
-            wrapper.adapter.interpolation_strength.detach().clone()
-        )
+        state_dict.pop("adapter.interpolation_strength", None)
         payload["thought_input_schema"] = THOUGHT_INPUT_SCHEMA
         adapter_reset = True
     else:
         if "adapter.correction.weight" in state_dict:
             raise ValueError(
                 "legacy residual thought adapters cannot be resumed into the "
-                "fresh scaled policy; use an explicit actor restart"
+                "fresh zero-affine policy; use an explicit actor restart"
             )
     sigma_migrated = migrate_scalar_log_sigma_state(
         state_dict, wrapper.transition
