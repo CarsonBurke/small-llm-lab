@@ -126,10 +126,12 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_advantage_mean": 0.325,
         "emit_advantage_mean": -0.1,
         "policy_loss": 1.0,
+        "thought_reverse_kl_penalty": 0.06,
         "positive_lm_loss": 4.0,
         "gate_entropy_bonus": 0.25,
         "gate_pg_coef": 1.0,
         "thought_pg_coef": 1.0,
+        "thought_reverse_kl_coef": 0.3,
         "positive_lm_weight": 0.1,
         "gate_entropy_coef": 0.5,
         "emit_probability": 0.8,
@@ -146,6 +148,7 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_gate_policy_clip_fraction": 0.1,
         "joint_abs_log_ratio_max": 0.7,
         "thought_dim_abs_log_ratio_max": 0.08,
+        "thought_joint_abs_log_ratio_max": 0.3,
         "harmful_positive_log_ratio_max": 0.4,
         "trunk_grad_norm": 1.0,
         "renderer_grad_norm": 2.0,
@@ -205,6 +208,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         policy_loss=2.0,
         joint_abs_log_ratio_max=0.5,
         thought_dim_abs_log_ratio_max=0.05,
+        thought_joint_abs_log_ratio_max=0.25,
         harmful_positive_log_ratio_max=0.2,
         trunk_grad_norm=10.0,
         critic_grad_norm=11.0,
@@ -216,6 +220,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         policy_loss=4.0,
         joint_abs_log_ratio_max=0.9,
         thought_dim_abs_log_ratio_max=0.09,
+        thought_joint_abs_log_ratio_max=0.45,
         harmful_positive_log_ratio_max=0.6,
         trunk_grad_norm=20.0,
         critic_grad_norm=21.0,
@@ -223,6 +228,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     dashboard = aggregate_actor_tensorboard_metrics([first, last])
 
     assert dashboard["loss/policy"] == pytest.approx(6.0)
+    assert dashboard["kl/thought_reverse_weighted"] == pytest.approx(0.12)
     assert dashboard["kl/gate_behavior"] == pytest.approx(2.5)
     assert dashboard["grad/trunk"] == pytest.approx(20.0)
     assert dashboard["grad/critic"] == pytest.approx(21.0)
@@ -239,6 +245,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["behavior/thought_adapter_bias_rms"] == pytest.approx(2e-4)
     assert dashboard["ratio/joint_abs_log_max"] == pytest.approx(0.9)
     assert dashboard["ratio/thought_dim_abs_log_max"] == pytest.approx(0.09)
+    assert dashboard["ratio/thought_joint_abs_log_max"] == pytest.approx(0.45)
     assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
     assert "grad/critic_mean" not in dashboard
     assert dashboard["loss/positive_lm_weighted"] == pytest.approx(0.8)
@@ -253,8 +260,9 @@ def test_actor_dashboard_has_only_the_authoritative_joint_policy_loss() -> None:
     metrics = _actor_metrics()
     dashboard = aggregate_actor_tensorboard_metrics([metrics])
     assert dashboard["loss/policy"] == 1.0
+    assert dashboard["kl/thought_reverse_weighted"] == pytest.approx(0.06)
     assert dashboard["bonus/gate_entropy_weighted"] == pytest.approx(0.25)
-    assert dashboard["loss/actor_total"] == pytest.approx(1.15)
+    assert dashboard["loss/actor_total"] == pytest.approx(1.21)
     assert "loss/gate_weighted" not in dashboard
     assert "loss/renderer" not in dashboard
     assert "loss/thought_weighted" not in dashboard
@@ -328,6 +336,7 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
         {
             "kl/post_update_policy_behavior_per_action": 0.2,
             "ratio/post_update_joint_abs_log_max": 0.4,
+            "ratio/post_update_thought_joint_abs_log_max": 0.3,
         }
     )
     behavior_age_zero = Writer()
@@ -337,10 +346,16 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
     behavior_age_zero_tags = {tag for tag, _, _ in behavior_age_zero.calls}
     assert "debug/behavior_refresh_max_drift" in behavior_age_zero_tags
     assert "kl/gate_behavior" not in behavior_age_zero_tags
+    assert "kl/thought_reverse_weighted" not in behavior_age_zero_tags
     assert not any(tag.startswith("clip/") for tag in behavior_age_zero_tags)
     assert "ratio/joint_abs_log_max" not in behavior_age_zero_tags
+    assert "ratio/thought_joint_abs_log_max" not in behavior_age_zero_tags
     assert "kl/post_update_policy_behavior_per_action" in behavior_age_zero_tags
     assert "ratio/post_update_joint_abs_log_max" in behavior_age_zero_tags
+    assert (
+        "ratio/post_update_thought_joint_abs_log_max"
+        in behavior_age_zero_tags
+    )
     assert "advantage/mean" in behavior_age_zero_tags
 
     behavior_age_one = Writer()
@@ -349,7 +364,9 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
     )
     behavior_age_one_tags = {tag for tag, _, _ in behavior_age_one.calls}
     assert "debug/behavior_refresh_max_drift" not in behavior_age_one_tags
+    assert "ratio/thought_joint_abs_log_max" in behavior_age_one_tags
     assert "kl/gate_behavior" in behavior_age_one_tags
+    assert "kl/thought_reverse_weighted" in behavior_age_one_tags
     assert "clip/policy" in behavior_age_one_tags
     assert "ratio/harmful_positive_log_max" in behavior_age_one_tags
     assert "advantage/mean" in behavior_age_one_tags

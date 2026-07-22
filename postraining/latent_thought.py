@@ -8,7 +8,7 @@ head is fed back directly; it occupies a stream position but renders nothing).
 The transition policy is a diagonal Gaussian whose mean comes from a fresh
 linear head over the belief and whose per-dimension log-sigma is predicted
 from that same belief. The mean starts as a zero-bias orthogonal map at gain
-0.01, with no initial obligation to imitate a discrete-token embedding.
+0.1, with no initial obligation to imitate a discrete-token embedding.
 Thoughts pass through a separate fresh affine embedder after sampling. Its
 weight and bias start at exact zero: the first thought payload is therefore a
 neutral recurrent input, while the single affine layer still receives a
@@ -38,7 +38,17 @@ THOUGHT_INPUT_SCHEMA = "fresh_zero_affine/v5"
 THOUGHT_DISTRIBUTION_SCHEMA = (
     "state_dependent_diag_tanh_log_sigma_scaled_residual_-5_2/v2"
 )
-THOUGHT_MEAN_SCHEMA = "fresh_linear_learned_output_gain_0.01_zero_bias/v2"
+THOUGHT_MEAN_SCHEMA = "fresh_linear_learned_output_gain_zero_bias/v3"
+# The initial gain is not part of a trained policy's runtime semantics: its
+# checkpointed scalar completely determines the function. Keep v2 resumable
+# so the currently running policy remains recoverable, while every explicit
+# fresh actor restart is relabeled with the initialization-agnostic schema.
+COMPATIBLE_THOUGHT_MEAN_SCHEMAS = frozenset(
+    {
+        THOUGHT_MEAN_SCHEMA,
+        "fresh_linear_learned_output_gain_0.01_zero_bias/v2",
+    }
+)
 THOUGHT_LOG_SIGMA_MIN = -5.0
 THOUGHT_LOG_SIGMA_MAX = 2.0
 
@@ -88,11 +98,12 @@ def validate_renderer_checkpoint(
             "loaded without changing their policy."
         )
     thought_mean = payload.get("thought_mean_schema")
-    if thought_mean != THOUGHT_MEAN_SCHEMA:
+    if thought_mean not in COMPATIBLE_THOUGHT_MEAN_SCHEMAS:
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"mean schema is {thought_mean!r}, expected "
-            f"{THOUGHT_MEAN_SCHEMA!r}. Use the explicit fresh-mean branch "
+            f"mean schema is {thought_mean!r}, expected one of "
+            f"{sorted(COMPATIBLE_THOUGHT_MEAN_SCHEMAS)!r}. Use the explicit "
+            "fresh-mean branch "
             "migration to replace a legacy pretrained-projector mean; normal "
             "resume and evaluation cannot change policy semantics."
         )
@@ -101,15 +112,15 @@ def validate_renderer_checkpoint(
 class FreshThoughtMeanHead(nn.Linear):
     """Orthogonal belief-to-mean map behind a learned small output gain.
 
-    Storing the initial 0.01 gain directly in every matrix element is
+    Storing the initial 0.1 gain directly in every matrix element is
     functionally equivalent only before optimization. Adam's first 3e-4 step
     can move each element by an amount comparable to the initialized weight,
     coherently changing a D-wide output by O(D * lr). Keeping a unit-scale
-    orthogonal map behind one learned 0.01 gain preserves the exact initial
+    orthogonal map behind one learned 0.1 gain preserves the exact initial
     function while scaling the functional effect of matrix updates.
     """
 
-    INIT_OUTPUT_GAIN = 0.01
+    INIT_OUTPUT_GAIN = 0.1
 
     def __init__(self, model_dim: int):
         super().__init__(model_dim, model_dim, bias=True)
@@ -126,6 +137,14 @@ class FreshThoughtMeanHead(nn.Linear):
         ):
             projected = F.linear(belief, self.weight, bias=None)
         return self.output_gain.float() * projected.float() + self.bias.float()
+
+    def reset_output_gain(self, output_gain: float) -> None:
+        """Set the fresh-policy gain without changing its orthogonal map."""
+        output_gain = float(output_gain)
+        if not math.isfinite(output_gain) or output_gain <= 0.0:
+            raise ValueError("thought mean output gain must be finite and positive")
+        with torch.no_grad():
+            self.output_gain.fill_(output_gain)
 
 
 class StateDependentLogSigmaHead(nn.Linear):
@@ -144,8 +163,8 @@ class GaussianTransitionHead(nn.Module):
     """Fresh diagonal-Gaussian thought policy over the current belief.
 
     A unit-orthogonal mean map sits behind a learned output gain initialized
-    at 0.01. For an RMS-normalized D-wide belief this gives a mean RMS of
-    exactly 0.01 while preserving every input direction and avoiding the
+    at 0.1. For an RMS-normalized D-wide belief this gives a mean RMS of
+    exactly 0.1 while preserving every input direction and avoiding the
     retired next-token latent prior. A separate zero-init linear head predicts
     per-dimension log-sigma residuals behind the same kind of 0.01 output
     gain around a CLI-initialized bias, so exploration starts state-independent
@@ -158,7 +177,7 @@ class GaussianTransitionHead(nn.Module):
 
     MEAN_INIT_GAIN = FreshThoughtMeanHead.INIT_OUTPUT_GAIN
 
-    def __init__(self, model_dim: int, log_sigma: float = -2.0):
+    def __init__(self, model_dim: int, log_sigma: float = -3.0):
         super().__init__()
         # Keep log-sigma registered first. Legacy v11 actor optimizers stored
         # this pair as their fifth group; the fresh mean becomes a sixth group
@@ -390,7 +409,8 @@ class AffineThoughtAdapter(nn.Module):
 class ThoughtAdapter(AffineThoughtAdapter):
     """Exactly-zero-initialized policy thought embedder.
 
-    A fresh thought action at log-sigma -2 has RMS about 0.135. Feeding it
+    A fresh thought action at log-sigma -3 has noise RMS about 0.050 per
+    dimension. Feeding the earlier, noisier initialization
     through an identity adapter made v17's random initialization a
     full-strength recurrent intervention and collapsed termination. A
     separate tiny scalar avoided that initial collapse, but made the affine
@@ -477,7 +497,11 @@ def migrate_legacy_wrapper_checkpoint(
             f"{sorted(present_mean_keys)}"
         )
     mean_migrated = False
-    if not present_mean_keys and initialize_fresh_mean:
+    if initialize_fresh_mean:
+        # An explicit actor restart owns the complete fresh thought policy.
+        # Critic-warm checkpoints can already contain an older untouched mean
+        # head, so checking only for missing keys would silently retain that
+        # experiment's initialization instead of the requested one.
         state_dict[mean_weight_key] = (
             wrapper.transition.mean_head.weight.detach().clone()
         )

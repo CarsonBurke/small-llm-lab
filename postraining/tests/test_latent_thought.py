@@ -133,6 +133,20 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
         },
         "current.pt",
     )
+    # Initial gain is fully represented by the learned scalar, so the v2
+    # origin label remains functionally resumable for the live policy.
+    validate_renderer_checkpoint(
+        {
+            "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
+            "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+            "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+            "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
+            "thought_mean_schema": (
+                "fresh_linear_learned_output_gain_0.01_zero_bias/v2"
+            ),
+        },
+        "live-v2.pt",
+    )
     with pytest.raises(ValueError, match="Old or untagged VAPO checkpoints"):
         validate_renderer_checkpoint({}, "old.pt")
     with pytest.raises(ValueError, match="predicted/v1"):
@@ -221,6 +235,11 @@ def test_transition_mean_head_starts_small_orthogonal_and_zero_bias():
     assert torch.count_nonzero(head.mean_head.bias) == 0
     assert head.mean_head.output_gain.item() == pytest.approx(
         head.MEAN_INIT_GAIN
+    )
+    assert head.MEAN_INIT_GAIN == pytest.approx(0.1)
+    torch.testing.assert_close(
+        head.predict_log_sigma(torch.randn(3, 8)),
+        torch.full((3, 8), -3.0),
     )
     belief = torch.randn(5, 8)
     belief = torch.nn.functional.rms_norm(belief, (8,))
@@ -364,6 +383,34 @@ def test_fresh_mean_requires_explicit_legacy_branch_migration():
         state["transition.mean_head.output_gain"],
         wrapper.transition.mean_head.output_gain,
     )
+
+
+def test_explicit_actor_restart_replaces_an_existing_untouched_mean_head():
+    wrapper = LatentThoughtModel(_pope_model())
+    wrapper.transition.mean_head.reset_output_gain(0.1)
+    state = {
+        key: value.detach().clone()
+        for key, value in wrapper.state_dict().items()
+    }
+    state["transition.mean_head.weight"].zero_()
+    state["transition.mean_head.bias"].fill_(2.0)
+    state["transition.mean_head.output_gain"].fill_(0.01)
+    payload = {"model": state}
+
+    _, migrated, _ = migrate_legacy_wrapper_checkpoint(
+        payload, wrapper, initialize_fresh_mean=True
+    )
+
+    assert migrated
+    torch.testing.assert_close(
+        state["transition.mean_head.weight"],
+        wrapper.transition.mean_head.weight,
+    )
+    torch.testing.assert_close(
+        state["transition.mean_head.bias"],
+        wrapper.transition.mean_head.bias,
+    )
+    assert state["transition.mean_head.output_gain"].item() == pytest.approx(0.1)
 
 
 def test_fresh_adapter_explicitly_replaces_critic_warm_identity_state():

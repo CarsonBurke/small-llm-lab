@@ -17,9 +17,11 @@ without inheriting that discrete-token target.
   every stream position — vocab AND latent — which is what gives thinking
   its training signal.
 - An optional Bernoulli gate-entropy bonus can preserve THINK exploration;
-  there is no continuous-policy entropy bonus, KL penalty, or beta-NLL.
+  there is no continuous-policy entropy bonus or beta-NLL. A sampled reverse
+  KL constrains aggregate drift of the 512-D Gaussian against the frozen
+  rollout behavior policy, complementing factorwise PPO clipping.
   A zero-initialized belief-conditioned head learns diagonal per-dimension
-  thought log-sigma, starting at -2 in every dimension.
+  thought log-sigma, starting at -3 in every dimension.
 - No pretraining anchor: SIGReg and the latent target-prediction objective are
   dropped at RL time. The fresh mean and recurrent policy train purely on
   their ability to think; the teacher-forced val-BPB guard is the drift
@@ -126,10 +128,10 @@ from postraining.value_model import SeparateCritic
 
 
 EXECUTION_SCHEMA = (
-    "shuffled_pool1024_disjoint_b256_per_dim_thought_clip_zero_affine_general_lr_sequential_data/v18"
+    "shuffled_pool1024_disjoint_b256_per_dim_clip_reverse_kl_zero_affine_general_lr_sequential_data/v19"
 )
 PREVIOUS_EXECUTION_SCHEMA = (
-    "shuffled_pool1024_disjoint_b256_zero_affine_general_lr_sequential_data/v17"
+    "shuffled_pool1024_disjoint_b256_per_dim_thought_clip_zero_affine_general_lr_sequential_data/v18"
 )
 GAIN_SCALED_EXECUTION_SCHEMA = (
     "disjoint_b512_gain_scaled_gaussian_adapter_general_lr_sequential_data/v15"
@@ -159,19 +161,21 @@ def math_dataset_identity(path: str | Path, exclude_modules: str) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def resume_execution_schema_compatible(payload: dict) -> bool:
+def resume_execution_schema_compatible(
+    payload: dict,
+    *,
+    allow_reverse_kl_migration: bool = False,
+) -> bool:
     """Resume compatible policy state at a complete rollout-pool boundary."""
     execution_schema = payload.get("execution_schema")
     if execution_schema == EXECUTION_SCHEMA:
-        return True
-    if execution_schema != PREVIOUS_EXECUTION_SCHEMA:
-        return False
-    # v17 used a joint Gaussian-vector PPO ratio. Only its actor-untouched
-    # critic-warmup checkpoint can safely enter v18's per-dimension objective.
-    actor_optimizer = payload.get("optimizers", {}).get("actor", {})
+        return not allow_reverse_kl_migration
+    # v18 has identical model/optimizer/replay state, but adding reverse KL is
+    # a real objective change. Require an explicit migration so a plain resume
+    # can never silently alter the live policy's training semantics.
     return (
-        int(payload.get("step", -1)) == 0
-        and not actor_optimizer.get("state", {})
+        allow_reverse_kl_migration
+        and execution_schema == PREVIOUS_EXECUTION_SCHEMA
     )
 
 
@@ -246,7 +250,10 @@ def migrate_zero_adapter_resume(
     # later groups and every unrelated moment remain aligned.
     groups[2]["params"] = [weight_id, bias_id]
 
-    payload["execution_schema"] = EXECUTION_SCHEMA
+    # Adapter migration changes only v15's recurrent input semantics. Land on
+    # the last no-KL schema so entering v19's objective remains a second,
+    # explicit migration rather than an accidental side effect of this flag.
+    payload["execution_schema"] = PREVIOUS_EXECUTION_SCHEMA
     payload["thought_input_schema"] = THOUGHT_INPUT_SCHEMA
     return {
         "source_execution_schema": actual_execution,
@@ -642,16 +649,21 @@ def aggregate_actor_tensorboard_metrics(
         metric["positive_lm_loss"] * metric["positive_lm_weight"]
         for metric in metrics
     )
+    thought_reverse_kl_contribution = sum(
+        metric["thought_reverse_kl_penalty"] for metric in metrics
+    )
     gate_entropy_bonus = sum(
         metric["gate_entropy_bonus"] for metric in metrics
     )
     return {
         "loss/policy": policy_contribution,
         "loss/positive_lm_weighted": positive_lm_contribution,
+        "kl/thought_reverse_weighted": thought_reverse_kl_contribution,
         "bonus/gate_entropy_weighted": gate_entropy_bonus,
         "loss/actor_total": (
             policy_contribution
             + positive_lm_contribution
+            + thought_reverse_kl_contribution
             - gate_entropy_bonus
         ),
         "value/token_weighted_excess_ce": value["excess_ce"],
@@ -749,6 +761,9 @@ def aggregate_actor_tensorboard_metrics(
         ),
         "ratio/thought_dim_abs_log_max": max(
             metric["thought_dim_abs_log_ratio_max"] for metric in metrics
+        ),
+        "ratio/thought_joint_abs_log_max": max(
+            metric["thought_joint_abs_log_ratio_max"] for metric in metrics
         ),
         "ratio/harmful_positive_log_max": max(
             metric["harmful_positive_log_ratio_max"] for metric in metrics
@@ -905,9 +920,11 @@ def write_actor_tensorboard_metrics(
                 "kl/renderer_behavior",
                 "kl/thought_behavior_joint",
                 "kl/policy_behavior_per_action",
+                "kl/thought_reverse_weighted",
                 "clip/policy",
                 "ratio/joint_abs_log_max",
                 "ratio/thought_dim_abs_log_max",
+                "ratio/thought_joint_abs_log_max",
                 "ratio/harmful_positive_log_max",
             )
         )
@@ -920,9 +937,11 @@ def write_actor_tensorboard_metrics(
             "kl/renderer_behavior",
             "kl/thought_behavior_joint",
             "kl/policy_behavior_per_action",
+            "kl/thought_reverse_weighted",
             "clip/policy",
             "ratio/joint_abs_log_max",
             "ratio/thought_dim_abs_log_max",
+            "ratio/thought_joint_abs_log_max",
             "ratio/harmful_positive_log_max",
         }:
             continue
@@ -1131,6 +1150,24 @@ def per_dimension_thought_policy_loss(
     )
 
 
+def sampled_reverse_kl(
+    new_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """Per-factor k3 estimate of ``KL(old behavior || current policy)``.
+
+    Rollout actions are sampled from the old policy. For
+    ``log_ratio = log(new) - log(old)``, the expectation under those actions
+    of ``exp(log_ratio) - 1 - log_ratio`` is the reverse KL. Keeping the
+    factors separate until after k3 avoids exponentiating the potentially
+    enormous joint ratio of the 512-D diagonal Gaussian.
+    """
+    if new_logprobs.shape != old_logprobs.shape:
+        raise ValueError("new and old log-probabilities must match")
+    log_ratio = new_logprobs - old_logprobs
+    return torch.expm1(log_ratio) - log_ratio
+
+
 def update_minibatch(
     wrapper: LatentThoughtModel,
     critic: SeparateCritic,
@@ -1140,6 +1177,7 @@ def update_minibatch(
     positive_lm_weight: float = 0.0,
     positive_reward_threshold: float = 0.5,
     thought_pg_coef: float = 1.0,
+    thought_reverse_kl_coef: float = 0.0,
     gate_pg_coef: float = 1.0,
     gate_entropy_coef: float = 0.0,
     actor_step: bool = True,
@@ -1175,6 +1213,13 @@ def update_minibatch(
         raise ValueError("replay max trajectories must be positive")
     if replay_attention_budget < 1:
         raise ValueError("replay attention budget must be positive")
+    if (
+        not math.isfinite(thought_reverse_kl_coef)
+        or thought_reverse_kl_coef < 0
+    ):
+        raise ValueError(
+            "thought reverse KL coefficient must be finite and nonnegative"
+        )
     if not value_only and batch.old_thought_logprobs.shape[-1] == 0:
         raise RuntimeError(
             "actor update requires refresh_old_statistics after rollout"
@@ -1208,7 +1253,8 @@ def update_minibatch(
         key: zero.clone()
         for key in (
             "value_loss", "value_sum", "value_target_sum", "target_entropy_sum",
-            "policy_loss", "policy_clip", "emit_policy_clip",
+            "policy_loss", "thought_reverse_kl_penalty",
+            "policy_clip", "emit_policy_clip",
             "thought_policy_clip", "thought_gate_policy_clip", "gate_kl_sum",
             "gate_entropy_sum", "gate_entropy_bonus",
             "emit_probability_sum",
@@ -1218,6 +1264,7 @@ def update_minibatch(
             "thought_advantage_sum", "emit_advantage_sum", "target_square_sum",
             "residual_sum", "residual_square_sum",
             "joint_abs_log_ratio_max", "thought_dim_abs_log_ratio_max",
+            "thought_joint_abs_log_ratio_max",
             "harmful_positive_log_ratio_max",
             "thought_log_sigma_sum", "thought_log_sigma_square_sum",
             "thought_sigma_sum", "thought_expected_noise_norm_sum",
@@ -1376,6 +1423,8 @@ def update_minibatch(
         old_thought_joint = torch.zeros_like(new_token_logprobs)
         policy_thought_logprobs = None
         compact_old_thought_logprobs = None
+        thought_reverse_kl_factors = None
+        weighted_thought_reverse_kl = zero
         if bool(think_mask.any()):
             thought_means, thought_targets, _ = select_thought_actions(
                 microbatch, predicted
@@ -1383,7 +1432,7 @@ def update_minibatch(
             thought_log_sigma = wrapper.transition.predict_log_sigma(
                 beliefs[think_mask]
             )
-            if thought_pg_coef != 0.0:
+            if thought_pg_coef != 0.0 or thought_reverse_kl_coef != 0.0:
                 new_thought_logprobs = wrapper.transition.per_dim_log_prob(
                     thought_targets,
                     thought_means,
@@ -1400,6 +1449,25 @@ def update_minibatch(
             compact_old_thought_logprobs = (
                 microbatch.old_thought_logprobs[think_mask].float()
             )
+            if thought_reverse_kl_coef != 0.0:
+                thought_reverse_kl_factors = sampled_reverse_kl(
+                    new_thought_logprobs,
+                    compact_old_thought_logprobs,
+                )
+                weighted_thought_reverse_kl = (
+                    thought_reverse_kl_coef
+                    * thought_reverse_kl_factors.sum()
+                    / policy_action_denominator.clamp_min(1)
+                )
+            else:
+                # Preserve behavior-KL telemetry for the coefficient-zero
+                # ablation without retaining k3 activations or traversing its
+                # backward graph.
+                with torch.no_grad():
+                    thought_reverse_kl_factors = sampled_reverse_kl(
+                        new_thought_logprobs.detach(),
+                        compact_old_thought_logprobs,
+                    )
             if thought_pg_coef == 0.0:
                 policy_thought_logprobs = new_thought_logprobs.detach()
             else:
@@ -1513,6 +1581,7 @@ def update_minibatch(
 
         actor_total = (
             weighted_policy_loss
+            + weighted_thought_reverse_kl
             + positive_lm_weight * weighted_positive_lm
             - weighted_gate_entropy_bonus
         )
@@ -1520,6 +1589,7 @@ def update_minibatch(
             raise RuntimeError(
                 "non-finite actor loss before optimizer step: "
                 f"policy={float(weighted_policy_loss)} "
+                f"thought_reverse_kl={float(weighted_thought_reverse_kl)} "
                 f"positive_lm={float(weighted_positive_lm)} "
                 f"gate_entropy_bonus={float(weighted_gate_entropy_bonus)} "
             )
@@ -1532,6 +1602,9 @@ def update_minibatch(
                 new_token_logprobs - microbatch.old_token_logprobs
             )
             totals["policy_loss"] += weighted_policy_loss.detach()
+            totals["thought_reverse_kl_penalty"] += (
+                weighted_thought_reverse_kl.detach()
+            )
             totals["policy_clip"] += weighted_policy_clip
             totals["gate_entropy_bonus"] += weighted_gate_entropy_bonus.detach()
             totals["gate_kl_sum"] += (
@@ -1585,9 +1658,13 @@ def update_minibatch(
                     totals["thought_dim_abs_log_ratio_max"],
                     thought_log_ratio.abs().max(),
                 )
+                totals["thought_joint_abs_log_ratio_max"] = torch.maximum(
+                    totals["thought_joint_abs_log_ratio_max"],
+                    thought_log_ratio.sum(-1).abs().max(),
+                )
                 totals["thought_kl_sum"] += (
-                    torch.expm1(thought_log_ratio) - thought_log_ratio
-                ).sum()
+                    thought_reverse_kl_factors.detach().sum()
+                )
 
     action_denom = denominators["action"]
     advantage_mean = totals["advantage_sum"] / action_denom
@@ -1684,6 +1761,7 @@ def update_minibatch(
         optimizers["actor"].step()
     metric_tensors.update(
         policy_loss=totals["policy_loss"],
+        thought_reverse_kl_penalty=totals["thought_reverse_kl_penalty"],
         policy_clip_fraction=(
             totals["policy_clip"]
             * policy_action_denominator.clamp_min(1)
@@ -1729,6 +1807,9 @@ def update_minibatch(
         joint_abs_log_ratio_max=totals["joint_abs_log_ratio_max"],
         thought_dim_abs_log_ratio_max=(
             totals["thought_dim_abs_log_ratio_max"]
+        ),
+        thought_joint_abs_log_ratio_max=(
+            totals["thought_joint_abs_log_ratio_max"]
         ),
         harmful_positive_log_ratio_max=(
             totals["harmful_positive_log_ratio_max"]
@@ -1799,6 +1880,7 @@ def update_minibatch(
     metrics.update(
         gate_pg_coef=float(gate_pg_coef),
         thought_pg_coef=float(thought_pg_coef),
+        thought_reverse_kl_coef=float(thought_reverse_kl_coef),
         positive_lm_weight=float(positive_lm_weight),
         gate_entropy_coef=float(gate_entropy_coef),
     )
@@ -1836,6 +1918,7 @@ def measure_post_update_policy_drift(
         "renderer_kl": zero.clone(),
         "thought_kl": zero.clone(),
         "joint_abs_log_ratio_max": zero.clone(),
+        "thought_joint_abs_log_ratio_max": zero.clone(),
         "gate_count": zero.clone(),
         "emit_count": zero.clone(),
         "thought_count": zero.clone(),
@@ -1937,6 +2020,10 @@ def measure_post_update_policy_drift(
                 totals["thought_kl"] += (
                     torch.expm1(thought_log_ratio) - thought_log_ratio
                 ).sum()
+                totals["thought_joint_abs_log_ratio_max"] = torch.maximum(
+                    totals["thought_joint_abs_log_ratio_max"],
+                    thought_log_ratio.sum(-1).abs().max(),
+                )
             totals["gate_count"] += microbatch.gate_mask.sum()
             totals["emit_count"] += microbatch.emit_mask.sum()
             totals["thought_count"] += think_mask.sum()
@@ -1964,6 +2051,9 @@ def measure_post_update_policy_drift(
             ),
             "ratio/post_update_joint_abs_log_max": totals[
                 "joint_abs_log_ratio_max"
+            ],
+            "ratio/post_update_thought_joint_abs_log_max": totals[
+                "thought_joint_abs_log_ratio_max"
             ],
         }
     )
@@ -2091,14 +2181,22 @@ def main() -> None:
     parser.add_argument("--value-prior", type=float, default=0.05)
     # Initialization only: the bounded output of the state-dependent
     # log-sigma head. Zero-init weights make noise state-independent at step 0;
-    # -2 gives std 0.135 and expected 512-D noise norm 3.06. The fresh
-    # adapter starts at exact zero, so neither exploration nor the small fresh
-    # mean enters the recurrent trunk until replay gradients open its affine map.
-    parser.add_argument("--thought-log-sigma-init", type=float, default=-2.0)
+    # -3 gives std 0.050 and expected 512-D noise norm 1.13. The fresh
+    # adapter starts at exact zero, so neither exploration nor the fresh mean
+    # enters the recurrent trunk until replay gradients open its affine map.
+    parser.add_argument("--thought-log-sigma-init", type=float, default=-3.0)
+    # Initialization only. The orthogonal map gives an RMS-normalized belief
+    # an exactly controlled mean RMS without weakening matrix optimization.
+    parser.add_argument("--thought-mean-gain-init", type=float, default=0.1)
     # Gradient multiplier for the thought factor inside the joint action log
     # probability. The forward ratio stays exact; 0 detaches only that factor
     # as a control arm while token/gate gradients still train the trunk.
     parser.add_argument("--thought-pg-coef", type=float, default=1.0)
+    # Dreamer4-style reverse KL from the frozen rollout behavior policy to the
+    # current diagonal-Gaussian thought policy. The factorwise k3 estimator is
+    # summed over latent dimensions but divided by ALL policy actions, so 0.3
+    # has action-level scale and directly complements per-dimension PPO clip.
+    parser.add_argument("--thought-reverse-kl-coef", type=float, default=0.3)
     # Head-only Bernoulli entropy bonus, averaged over optional gate
     # decisions. The 4e-3 default remains far below v13's 3e-2 intervention,
     # which overwhelmed the learned gate despite falling reward.
@@ -2267,11 +2365,18 @@ def main() -> None:
     )
     parser.add_argument("--resume", default=None)
     parser.add_argument(
+        "--migrate-reverse-kl-resume",
+        action="store_true",
+        help="explicitly resume a v18 per-dimension-clip checkpoint under "
+        "v19's reverse-KL objective while preserving all training state",
+    )
+    parser.add_argument(
         "--migrate-zero-adapter-resume",
         action="store_true",
         help="explicitly resume a v15 gain-scaled checkpoint while replacing "
-        "only its adapter with the v16 zero-initialized affine and fresh "
-        "adapter Adam state",
+        "only its adapter with the zero-initialized affine and fresh adapter "
+        "Adam state; entering v19 also requires "
+        "--migrate-reverse-kl-resume",
     )
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
@@ -2280,6 +2385,13 @@ def main() -> None:
         parser.error("--replay-max-trajectories must be positive")
     if not math.isfinite(args.gate_entropy_coef) or args.gate_entropy_coef < 0.0:
         parser.error("--gate-entropy-coef must be finite and nonnegative")
+    if (
+        not math.isfinite(args.thought_reverse_kl_coef)
+        or args.thought_reverse_kl_coef < 0.0
+    ):
+        parser.error(
+            "--thought-reverse-kl-coef must be finite and nonnegative"
+        )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         parser.error("--learning-rate must be finite and positive")
     if (
@@ -2311,6 +2423,8 @@ def main() -> None:
         parser.error("--bench-max-rows must be nonnegative")
     if args.migrate_zero_adapter_resume and not args.resume:
         parser.error("--migrate-zero-adapter-resume requires --resume")
+    if args.migrate_reverse_kl_resume and not args.resume:
+        parser.error("--migrate-reverse-kl-resume requires --resume")
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
     if args.prompts_per_minibatch < 1:
@@ -2411,8 +2525,16 @@ def main() -> None:
     wrapper.eval()
     if not 0.0 < args.init_think_probability < 1.0:
         raise SystemExit("--init-think-probability must be strictly inside (0, 1)")
-    # The CLI owns the starting exploration noise: state-independent (zero
-    # head weights) at the requested level.  Learned from there — no schedule.
+    if not math.isfinite(args.thought_mean_gain_init) or (
+        args.thought_mean_gain_init <= 0.0
+    ):
+        raise SystemExit("--thought-mean-gain-init must be finite and positive")
+    # The CLI owns both fresh continuous-policy scales. Ordinary resume loads
+    # learned values over these; explicit actor restart copies them into the
+    # critic-warm payload before loading it.
+    wrapper.transition.mean_head.reset_output_gain(
+        args.thought_mean_gain_init
+    )
     wrapper.transition.reset_noise(args.thought_log_sigma_init)
     with torch.no_grad():
         # P(EMIT) = sigmoid(bias) while the zero-init weights ignore the belief.
@@ -2483,6 +2605,12 @@ def main() -> None:
                 actor_init_payload["sampler_cursor"]
             ),
             "fresh_mean_initialized": bool(args.actor_critic_init),
+            "fresh_mean_output_gain": (
+                args.thought_mean_gain_init if args.actor_critic_init else None
+            ),
+            "fresh_log_sigma": (
+                args.thought_log_sigma_init if args.actor_critic_init else None
+            ),
             "fresh_adapter_initialized": bool(args.actor_critic_init),
             "fresh_adapter_zero_initialized": bool(args.actor_critic_init),
         }
@@ -2662,12 +2790,17 @@ def main() -> None:
             adapter_migration = migrate_zero_adapter_resume(payload, wrapper)
         migrate_legacy_wrapper_checkpoint(payload, wrapper)
         validate_renderer_checkpoint(payload, args.resume)
-        if not resume_execution_schema_compatible(payload):
+        if not resume_execution_schema_compatible(
+            payload,
+            allow_reverse_kl_migration=args.migrate_reverse_kl_resume,
+        ):
             raise ValueError(
-                "resume checkpoint execution schema must be one of "
-                f"{sorted((EXECUTION_SCHEMA, PREVIOUS_EXECUTION_SCHEMA))!r}; "
+                "resume checkpoint execution schema must be "
+                f"{EXECUTION_SCHEMA!r}; "
                 f"got {payload.get('execution_schema')!r}. Use --actor-init or "
-                "--actor-critic-init for an explicit initialization restart."
+                "--actor-critic-init for an initialization restart, or "
+                "--migrate-reverse-kl-resume for an explicit v18 objective "
+                "migration."
             )
         if payload.get("reward_schema") != REWARD_SCHEMA:
             raise ValueError(
@@ -2706,6 +2839,12 @@ def main() -> None:
         random.setstate(payload["python_rng"])
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
+        if payload.get("execution_schema") == PREVIOUS_EXECUTION_SCHEMA:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["reverse_kl_resume_migration"] = {
+                "source_execution_schema": PREVIOUS_EXECUTION_SCHEMA,
+                "thought_reverse_kl_coef": args.thought_reverse_kl_coef,
+            }
         if adapter_migration is not None:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["zero_adapter_resume_migration"] = (
@@ -3564,6 +3703,7 @@ def main() -> None:
                 positive_lm_weight=args.positive_lm_weight,
                 positive_reward_threshold=args.positive_reward_threshold,
                 thought_pg_coef=args.thought_pg_coef,
+                thought_reverse_kl_coef=args.thought_reverse_kl_coef,
                 gate_entropy_coef=args.gate_entropy_coef,
                 gate_pg_coef=(
                     0.0 if next_step <= args.gate_freeze_steps else 1.0

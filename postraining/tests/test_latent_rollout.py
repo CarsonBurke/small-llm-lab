@@ -60,6 +60,7 @@ from postraining.train_latent_vapo import (
     measure_post_update_policy_drift,
     migrate_zero_adapter_resume,
     resume_execution_schema_compatible,
+    sampled_reverse_kl,
     sample_prompt_batch,
     score_math_rollout,
     think_run_lengths,
@@ -409,6 +410,23 @@ def test_joint_action_logprobs_match_emit_optional_and_forced_think() -> None:
     # EMIT=gate+token; optional THINK=gate+thought; forced THINK=thought only.
     torch.testing.assert_close(new, torch.tensor([[110.0, 2_020.0, 3_000.0]]))
     torch.testing.assert_close(old, torch.tensor([[5.0, 9.0, 8.0]]))
+
+
+def test_sampled_reverse_kl_matches_k3_value_and_gradient() -> None:
+    new = torch.tensor([[0.2, -0.4], [0.0, 0.1]], requires_grad=True)
+    old = torch.zeros_like(new)
+    factors = sampled_reverse_kl(new, old)
+    expected = torch.expm1(new.detach()) - new.detach()
+    torch.testing.assert_close(factors, expected)
+
+    coefficient = 0.3
+    action_denominator = 5.0
+    penalty = coefficient * factors.sum() / action_denominator
+    penalty.backward()
+    torch.testing.assert_close(
+        new.grad,
+        coefficient * torch.expm1(new.detach()) / action_denominator,
+    )
 
 
 def test_thought_policy_clips_dimensions_without_joint_ratio_coupling() -> None:
@@ -813,6 +831,7 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         positive_lm_weight=0.1,
         positive_reward_threshold=0.5,
         thought_pg_coef=0.7,
+        thought_reverse_kl_coef=0.3,
         gate_pg_coef=0.8,
         gate_entropy_coef=0.02,
     )
@@ -838,6 +857,7 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
     for key in (
         "value_loss",
         "policy_loss",
+        "thought_reverse_kl_penalty",
         "positive_lm_loss",
         "gate_entropy_bonus",
         "advantage_mean",
@@ -874,6 +894,19 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
     assert full_metrics["gate_behavior_kl"] > 0
     assert full_metrics["renderer_behavior_kl"] > 0
     assert full_metrics["thought_behavior_kl_joint"] > 0
+    thought_count = (
+        (batch.gate_actions == THINK).float() * batch.action_mask
+    ).sum()
+    expected_reverse_kl_penalty = (
+        0.3
+        * full_metrics["thought_behavior_kl_joint"]
+        * thought_count
+        / batch.action_mask.sum()
+    )
+    torch.testing.assert_close(
+        torch.tensor(full_metrics["thought_reverse_kl_penalty"]),
+        expected_reverse_kl_penalty,
+    )
     torch.testing.assert_close(
         torch.tensor(full_metrics["thought_behavior_kl_joint"]),
         torch.tensor(full_metrics["thought_behavior_kl_per_dim"])
@@ -881,9 +914,6 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
     )
     gate_count = batch.gate_mask.sum()
     emit_count = batch.emit_mask.sum()
-    thought_count = (
-        (batch.gate_actions == THINK).float() * batch.action_mask
-    ).sum()
     expected_policy_kl = (
         full_metrics["gate_behavior_kl"] * gate_count
         + full_metrics["renderer_behavior_kl"] * emit_count
@@ -995,6 +1025,42 @@ def test_absent_thought_objective_leaves_mean_and_sigma_grad_none_despite_moment
         torch.testing.assert_close(parameter, reference)
     for parameter, reference in zip(sigma_parameters, sigma_before, strict=True):
         torch.testing.assert_close(parameter, reference)
+
+
+def test_reverse_kl_alone_anchors_the_continuous_thought_policy():
+    wrapper = _wrapper()
+    critic = _critic()
+    with torch.no_grad():
+        wrapper.gate.head.weight.zero_()
+        wrapper.gate.head.bias.fill_(-2.0)
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assert bool(((batch.gate_actions == THINK) & batch.action_mask.bool()).any())
+    assign_terminal_rewards(batch, torch.rand(4))
+    refresh_old_statistics(wrapper, critic, batch)
+    with torch.no_grad():
+        wrapper.transition.mean_head.bias.add_(0.02)
+    before = [
+        parameter.detach().clone()
+        for parameter in wrapper.transition.mean_head.parameters()
+    ]
+
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        thought_pg_coef=0.0,
+        thought_reverse_kl_coef=0.3,
+        gate_pg_coef=0.0,
+    )
+
+    assert metrics["thought_reverse_kl_penalty"] > 0.0
+    assert any(
+        not torch.equal(parameter, reference)
+        for parameter, reference in zip(
+            wrapper.transition.mean_head.parameters(), before, strict=True
+        )
+    )
 
 
 def test_renderer_reads_belief_without_training_the_thought_mean():
@@ -1148,6 +1214,8 @@ def test_post_update_kl_stays_finite_when_joint_thought_ratio_is_huge():
     assert math.isfinite(drift["kl/post_update_policy_behavior_per_action"])
     assert drift["kl/post_update_policy_behavior_per_action"] > 0.0
     assert drift["ratio/post_update_joint_abs_log_max"] >= 99.0
+    assert drift["ratio/post_update_thought_joint_abs_log_max"] >= 99.0
+
 
 def test_actor_accumulation_defers_the_trunk_step_to_the_caller():
     # The trainer takes one accumulated actor step per PPO epoch: minibatch
@@ -1332,6 +1400,7 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
         critic_step=False,
     )
     assert later_metrics["joint_abs_log_ratio_max"] > 0.0
+    assert later_metrics["thought_joint_abs_log_ratio_max"] > 0.0
     for name, behavior_tensor in frozen_later.items():
         assert torch.equal(getattr(later, name), behavior_tensor)
 
@@ -2101,24 +2170,35 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
 
 
-def test_resume_schema_accepts_current_and_safe_topology_predecessor() -> None:
+def test_resume_schema_requires_explicit_reverse_kl_objective_migration() -> None:
     current = {"execution_schema": EXECUTION_SCHEMA}
     assert resume_execution_schema_compatible(current)
-    # v17 differs only in the actor objective. A critic-warmup checkpoint has
-    # no actor update or actor optimizer state, so it migrates safely to v18.
-    assert resume_execution_schema_compatible(
-        {
-            "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
-            "step": 0,
-            "optimizers": {"actor": {"state": {}}},
-        }
+    assert not resume_execution_schema_compatible(
+        current,
+        allow_reverse_kl_migration=True,
     )
+    previous = {"execution_schema": PREVIOUS_EXECUTION_SCHEMA}
+    assert not resume_execution_schema_compatible(previous)
+    assert resume_execution_schema_compatible(
+        previous,
+        allow_reverse_kl_migration=True,
+    )
+    # Even trained v18 state is structurally resumable because v19 changes
+    # only the objective; the explicit flag prevents an accidental change.
     assert not resume_execution_schema_compatible(
         {
             "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
             "step": 1,
             "optimizers": {"actor": {"state": {1: {"step": 1}}}},
         }
+    )
+    assert resume_execution_schema_compatible(
+        {
+            "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
+            "step": 1,
+            "optimizers": {"actor": {"state": {1: {"step": 1}}}},
+        },
+        allow_reverse_kl_migration=True,
     )
 
     # Older actor optimizers and policy semantics must fail at the schema
@@ -2205,7 +2285,7 @@ def test_zero_adapter_resume_migration_preserves_unrelated_adam_state() -> None:
 
     provenance = migrate_zero_adapter_resume(payload, wrapper)
 
-    assert payload["execution_schema"] == EXECUTION_SCHEMA
+    assert payload["execution_schema"] == PREVIOUS_EXECUTION_SCHEMA
     assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
     assert provenance["source_adapter_strength"] == pytest.approx(-4.5e-4)
     assert payload["step"] == 640
