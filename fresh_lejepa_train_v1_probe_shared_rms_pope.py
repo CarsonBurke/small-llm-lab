@@ -239,6 +239,53 @@ class FreshLeJEPASharedRMSV1PoPE(FreshLeJEPASharedRMSProjectorV1Probes):
             return attention.forward_step(x, cache, position, key_mask)
         return super()._attention_step(attention, x, cache, position, key_mask)
 
+    def _attention_prefill(
+        self,
+        attention: baseline.CausalSelfAttention,
+        x: Tensor,
+        cache: tuple[Tensor, ...],
+        attention_mask: Tensor | None,
+    ) -> Tensor:
+        if not isinstance(attention, PolarCausalSelfAttention) or (
+            attention.position_mode != "pope"
+        ):
+            return super()._attention_prefill(
+                attention, x, cache, attention_mask
+            )
+        batch, length, dim = x.shape
+        q_dim = attention.num_heads * attention.head_dim
+        kv_dim = attention.num_kv_heads * attention.head_dim
+        q, k, value = attention.c_qkv(x).split(
+            [q_dim, kv_dim, kv_dim], dim=-1
+        )
+        q = q.view(
+            batch, length, attention.num_heads, attention.head_dim
+        ).transpose(1, 2)
+        k = k.view(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        ).transpose(1, 2)
+        value = value.view(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        ).transpose(1, 2)
+        positions = torch.arange(length, device=x.device)
+        q_real, q_imag, k_real, k_imag = attention._polar_components(
+            q, k, positions
+        )
+        cache[0][:, :, :length].copy_(k_real.to(cache[0].dtype))
+        cache[1][:, :, :length].copy_(k_imag.to(cache[1].dtype))
+        cache[2][:, :, :length].copy_(value.to(cache[2].dtype))
+        output = attention._complex_attention(
+            q_real,
+            q_imag,
+            k_real,
+            k_imag,
+            value,
+            is_causal=attention_mask is None,
+            attn_mask=attention_mask,
+        )
+        output = output.transpose(1, 2).contiguous().view(batch, length, dim)
+        return attention.proj(output)
+
     def make_generation_cache(
         self,
         batch_size: int,

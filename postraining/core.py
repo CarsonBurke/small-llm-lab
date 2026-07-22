@@ -373,6 +373,45 @@ def generalized_advantage_estimate(
     return advantage, advantage + values
 
 
+def generalized_advantage_and_return_targets(
+    rewards: Tensor,
+    values: Tensor,
+    mask: Tensor,
+    lambdas: Tensor,
+    gamma: float = 1.0,
+) -> tuple[Tensor, Tensor]:
+    """Compute lambda-GAE and lambda-one return targets in one reverse pass.
+
+    The two recurrences share the same temporal-difference residual. Keeping
+    both running accumulators in one loop halves eager launch overhead while
+    remaining exactly row-separable, so callers can compute the complete
+    optimizer minibatch once and slice the results for replay shards.
+    """
+    advantages = torch.zeros_like(values)
+    return_advantages = torch.zeros_like(values)
+    running_advantage = torch.zeros(
+        values.size(0), device=values.device, dtype=values.dtype
+    )
+    running_return = torch.zeros_like(running_advantage)
+    for t in range(values.size(1) - 1, -1, -1):
+        if t + 1 < values.size(1):
+            next_value = values[:, t + 1]
+            next_valid = mask[:, t + 1]
+        else:
+            next_value = torch.zeros_like(running_advantage)
+            next_valid = torch.zeros_like(mask[:, t])
+        delta = rewards[:, t] + gamma * next_value * next_valid - values[:, t]
+        running_advantage = (
+            delta + gamma * lambdas * running_advantage * next_valid
+        ) * mask[:, t]
+        running_return = (
+            delta + gamma * running_return * next_valid
+        ) * mask[:, t]
+        advantages[:, t] = running_advantage
+        return_advantages[:, t] = running_return
+    return advantages, return_advantages + values
+
+
 def clipped_policy_loss(
     new_logprobs: Tensor,
     old_logprobs: Tensor,

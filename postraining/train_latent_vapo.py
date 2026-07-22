@@ -82,7 +82,7 @@ from postraining.core import (
     encode_prompt,
     extract_final_answer,
     deterministic_math_subset,
-    generalized_advantage_estimate,
+    generalized_advantage_and_return_targets,
     length_adaptive_lambda,
     load_unique_math_rows,
     modal_answer_baseline,
@@ -98,6 +98,7 @@ from postraining.latent_rollout import (
     THOUGHT_SLOT,
     LatentRolloutBatch,
     assign_terminal_rewards,
+    compact_stream_to_device,
     pack_rollout_groups_for_replay,
     emitted_token_rows,
     half_forced_group_members,
@@ -128,6 +129,9 @@ from postraining.value_model import SeparateCritic
 
 
 EXECUTION_SCHEMA = (
+    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_per_dim_clip_reverse_kl_zero_affine_general_lr_sequential_data/v20"
+)
+PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA = (
     "shuffled_pool1024_disjoint_b256_per_dim_clip_reverse_kl_zero_affine_general_lr_sequential_data/v19"
 )
 PREVIOUS_EXECUTION_SCHEMA = (
@@ -165,16 +169,26 @@ def resume_execution_schema_compatible(
     payload: dict,
     *,
     allow_reverse_kl_migration: bool = False,
+    allow_performance_migration: bool = False,
 ) -> bool:
     """Resume compatible policy state at a complete rollout-pool boundary."""
     execution_schema = payload.get("execution_schema")
     if execution_schema == EXECUTION_SCHEMA:
-        return not allow_reverse_kl_migration
-    # v18 has identical model/optimizer/replay state, but adding reverse KL is
-    # a real objective change. Require an explicit migration so a plain resume
-    # can never silently alter the live policy's training semantics.
+        return not allow_reverse_kl_migration and not allow_performance_migration
+    # v20 changes only execution: identical prompts and policies are sampled,
+    # but deterministic prefixes are shared and finished rows are compacted.
+    # A pool-boundary v19 checkpoint therefore resumes without an objective or
+    # state migration, but only by explicit opt-in because future RNG-to-row
+    # attribution and floating-point execution are not preserved.
+    if execution_schema == PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA:
+        return allow_performance_migration and not allow_reverse_kl_migration
+    # v18 needs both independent acknowledgements: reverse KL changes the
+    # objective and v20 changes stochastic execution. A direct v18 -> v20
+    # resume preserves learning/cursor state but is neither objective- nor
+    # bit-execution-identical.
     return (
         allow_reverse_kl_migration
+        and allow_performance_migration
         and execution_schema == PREVIOUS_EXECUTION_SCHEMA
     )
 
@@ -1275,37 +1289,32 @@ def update_minibatch(
     totals["thought_log_sigma_min"] = zero.new_full((), float("inf"))
     totals["thought_log_sigma_max"] = zero.new_full((), float("-inf"))
 
-    for microbatch, _, _ in iter_length_aware_microbatches(
+    action_counts = batch.action_mask.sum(1)
+    lambdas = (
+        torch.ones_like(action_counts)
+        if value_only
+        else length_adaptive_lambda(action_counts, gae_lambda_alpha)
+    )
+    advantages, value_targets = generalized_advantage_and_return_targets(
+        batch.rewards,
+        batch.old_values,
+        batch.action_mask,
+        lambdas,
+    )
+    advantages = advantages.detach()
+    value_targets = value_targets.detach()
+
+    for microbatch, rows, stream_length in iter_length_aware_microbatches(
         batch,
         replay_max_trajectories,
         replay_attention_budget,
         replay_bucket,
     ):
-        action_counts = microbatch.action_mask.sum(1)
-        # GAE is row-separable. Computing it after slicing avoids retaining a
-        # full-group tensor while preserving each trajectory exactly.
-        lambdas = (
-            torch.ones_like(action_counts)
-            if value_only
-            else length_adaptive_lambda(action_counts, gae_lambda_alpha)
-        )
-        advantages, _ = generalized_advantage_estimate(
-            microbatch.rewards,
-            microbatch.old_values,
-            microbatch.action_mask,
-            lambdas,
-        )
-        _, value_targets = generalized_advantage_estimate(
-            microbatch.rewards,
-            microbatch.old_values,
-            microbatch.action_mask,
-            torch.ones_like(action_counts),
-        )
-        advantages = advantages.detach()
-        value_targets = value_targets.detach()
+        micro_advantages = advantages[rows, :stream_length]
+        micro_value_targets = value_targets[rows, :stream_length]
         local_action_count = microbatch.action_mask.sum()
         value_logits = critic.value_logits(microbatch)
-        value_ce = critic.support.cross_entropy(value_logits, value_targets)
+        value_ce = critic.support.cross_entropy(value_logits, micro_value_targets)
         local_value_numerator = (value_ce * microbatch.action_mask).sum()
         weighted_value_loss = (
             local_value_numerator / value_action_denominator.clamp_min(1)
@@ -1323,9 +1332,9 @@ def update_minibatch(
             # at lambda=1; reporting the earlier zero-baseline GAE made every
             # successful action look positively advantageous by construction.
             diagnostic_advantages = (
-                value_targets - values if value_only else advantages
+                micro_value_targets - values if value_only else micro_advantages
             )
-            target_probs = critic.support.project(value_targets)
+            target_probs = critic.support.project(micro_value_targets)
             target_entropy = -(
                 target_probs * target_probs.clamp_min(1e-20).log()
             ).sum(-1)
@@ -1347,12 +1356,12 @@ def update_minibatch(
             totals["value_loss"] += local_value_numerator.detach()
             totals["value_sum"] += (values * microbatch.action_mask).sum()
             totals["value_target_sum"] += (
-                value_targets * microbatch.action_mask
+                micro_value_targets * microbatch.action_mask
             ).sum()
             totals["target_square_sum"] += (
-                value_targets.square() * microbatch.action_mask
+                micro_value_targets.square() * microbatch.action_mask
             ).sum()
-            residuals = value_targets - values
+            residuals = micro_value_targets - values
             totals["residual_sum"] += (
                 residuals * microbatch.action_mask
             ).sum()
@@ -1512,7 +1521,7 @@ def update_minibatch(
             # tail statistic directly exposes the branch that overflowed in
             # the first frozen-pool run without changing the objective.
             harmful_positive_log_ratio = torch.where(
-                (advantages < 0) & microbatch.action_mask.bool(),
+                (micro_advantages < 0) & microbatch.action_mask.bool(),
                 joint_log_ratio.clamp_min(0),
                 torch.zeros_like(joint_log_ratio),
             )
@@ -1526,7 +1535,7 @@ def update_minibatch(
                 + new_token_logprobs,
                 microbatch.old_gate_logprobs * microbatch.gate_mask
                 + microbatch.old_token_logprobs,
-                advantages,
+                micro_advantages,
                 microbatch.emit_mask,
                 denominator=policy_action_denominator,
                 estimate_kl=False,
@@ -1545,7 +1554,7 @@ def update_minibatch(
                     microbatch.old_gate_logprobs[think_mask],
                     policy_thought_logprobs,
                     compact_old_thought_logprobs,
-                    advantages[think_mask],
+                    micro_advantages[think_mask],
                     microbatch.gate_mask[think_mask],
                     policy_action_denominator,
                 )
@@ -2299,6 +2308,11 @@ def main() -> None:
         "--eval-tail-batch", type=int, default=16,
         help="single compiled survivor-batch size (0 disables compaction)",
     )
+    parser.add_argument(
+        "--rollout-tail-batch", type=int, default=16,
+        help="single compiled training survivor-batch size "
+        "(0 disables compaction)",
+    )
     # Compile the dynamic-prefix one-token model step used only by eval.
     # Static full-cache CUDA graphs are intentionally avoided: measured
     # attention over all 5K cache slots was 2.6x slower than eager narrowing.
@@ -2368,15 +2382,22 @@ def main() -> None:
         "--migrate-reverse-kl-resume",
         action="store_true",
         help="explicitly resume a v18 per-dimension-clip checkpoint under "
-        "v19's reverse-KL objective while preserving all training state",
+        "the reverse-KL objective while preserving all training state; a "
+        "direct v18-to-v20 resume also requires the v20 execution flag",
+    )
+    parser.add_argument(
+        "--migrate-v20-execution-resume",
+        action="store_true",
+        help="explicitly resume v19 learning state/cursor under v20 dense "
+        "prefill and survivor-compaction execution; future RNG attribution "
+        "is intentionally not bit-exact",
     )
     parser.add_argument(
         "--migrate-zero-adapter-resume",
         action="store_true",
         help="explicitly resume a v15 gain-scaled checkpoint while replacing "
         "only its adapter with the zero-initialized affine and fresh adapter "
-        "Adam state; entering v19 also requires "
-        "--migrate-reverse-kl-resume",
+        "Adam state; entering v20 also requires both migration flags",
     )
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
@@ -2417,6 +2438,8 @@ def main() -> None:
         parser.error("--eval-batch-trajectories must be positive")
     if args.eval_tail_batch < 0:
         parser.error("--eval-tail-batch must be nonnegative")
+    if args.rollout_tail_batch < 0:
+        parser.error("--rollout-tail-batch must be nonnegative")
     if args.bench_only_repeats < 1:
         parser.error("--bench-only-repeats must be positive")
     if args.bench_max_rows < 0:
@@ -2425,6 +2448,8 @@ def main() -> None:
         parser.error("--migrate-zero-adapter-resume requires --resume")
     if args.migrate_reverse_kl_resume and not args.resume:
         parser.error("--migrate-reverse-kl-resume requires --resume")
+    if args.migrate_v20_execution_resume and not args.resume:
+        parser.error("--migrate-v20-execution-resume requires --resume")
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
     if args.prompts_per_minibatch < 1:
@@ -2793,14 +2818,16 @@ def main() -> None:
         if not resume_execution_schema_compatible(
             payload,
             allow_reverse_kl_migration=args.migrate_reverse_kl_resume,
+            allow_performance_migration=args.migrate_v20_execution_resume,
         ):
             raise ValueError(
                 "resume checkpoint execution schema must be "
                 f"{EXECUTION_SCHEMA!r}; "
                 f"got {payload.get('execution_schema')!r}. Use --actor-init or "
                 "--actor-critic-init for an initialization restart, or "
-                "--migrate-reverse-kl-resume for an explicit v18 objective "
-                "migration."
+                "the migration flags matching the source: v19 requires "
+                "--migrate-v20-execution-resume; v18 requires that plus "
+                "--migrate-reverse-kl-resume."
             )
         if payload.get("reward_schema") != REWARD_SCHEMA:
             raise ValueError(
@@ -2839,11 +2866,21 @@ def main() -> None:
         random.setstate(payload["python_rng"])
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
-        if payload.get("execution_schema") == PREVIOUS_EXECUTION_SCHEMA:
+        source_execution_schema = payload.get("execution_schema")
+        if source_execution_schema == PREVIOUS_EXECUTION_SCHEMA:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["reverse_kl_resume_migration"] = {
                 "source_execution_schema": PREVIOUS_EXECUTION_SCHEMA,
                 "thought_reverse_kl_coef": args.thought_reverse_kl_coef,
+            }
+        if source_execution_schema in {
+            PREVIOUS_EXECUTION_SCHEMA,
+            PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
+        }:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["performance_resume_migration"] = {
+                "source_execution_schema": source_execution_schema,
+                "target_execution_schema": EXECUTION_SCHEMA,
             }
         if adapter_migration is not None:
             actor_init_provenance = dict(actor_init_provenance or {})
@@ -3067,6 +3104,19 @@ def main() -> None:
     ) -> list[LatentRolloutBatch]:
         """One rollout: a scored prompt group per sampled DAPO problem."""
         rollout_rows = sampler.next_rows(prompt_count)
+        encoded_rows = [
+            (
+                row,
+                encode_prompt(
+                    tokenizer, prompt_text(row), args.prompt_tokens
+                ),
+            )
+            for row in rollout_rows
+        ]
+        # The sequential sampler has already consumed these rows. Stable
+        # length sorting only reduces left-padding inside this pool; it does
+        # not alter dataset coverage, reuse, or use RNG to order data.
+        encoded_rows.sort(key=lambda item: len(item[1]))
         groups = []
         cpu = torch.device("cpu")
 
@@ -3077,13 +3127,13 @@ def main() -> None:
             return finish_group(batch, row, refresh_statistics)
 
         if args.rollout_groups <= 1:
-            for row in rollout_rows:
+            for row, encoded in encoded_rows:
                 prompt_ids = torch.tensor(
-                    encode_prompt(tokenizer, prompt_text(row), args.prompt_tokens),
+                    encoded,
                     dtype=torch.long, device=device,
                 )
                 batch = rollout_continuations(
-                    wrapper, prompt_ids[None].expand(args.samples_per_prompt, -1),
+                    wrapper, prompt_ids[None],
                     args.continuation_tokens, max_stream_steps,
                     args.temperature, args.top_p, stop_ids=stop_ids or None,
                     force_initial_think=half_forced_group_members(
@@ -3092,10 +3142,20 @@ def main() -> None:
                     record_likelihoods=False,
                     cache_dtype=torch.bfloat16,
                     tensor_positions=rollout_step_core is not None,
-                    compact_finished=rollout_step_core is None,
+                    compact_finished=(
+                        rollout_step_core is None
+                        or args.rollout_tail_batch > 0
+                    ),
+                    finished_batch_size=(
+                        args.rollout_tail_batch
+                        if rollout_step_core is not None
+                        and args.rollout_tail_batch > 0
+                        else None
+                    ),
+                    prompt_repeats=args.samples_per_prompt,
                 )
                 if offload_to_cpu:
-                    batch = batch.to(cpu)
+                    batch = compact_stream_to_device(batch, cpu)
                 groups.append(retain_group(batch, row))
                 del batch
             return groups
@@ -3103,24 +3163,24 @@ def main() -> None:
         # each launch carries chunk*samples rows instead of samples — the
         # sequential per-group loop is launch-bound, not compute-bound.
         samples = args.samples_per_prompt
-        for chunk_start in range(0, len(rollout_rows), args.rollout_groups):
-            chunk = rollout_rows[chunk_start : chunk_start + args.rollout_groups]
-            encoded = [
-                encode_prompt(tokenizer, prompt_text(row), args.prompt_tokens)
-                for row in chunk
+        for chunk_start in range(0, len(encoded_rows), args.rollout_groups):
+            encoded_chunk = encoded_rows[
+                chunk_start : chunk_start + args.rollout_groups
             ]
+            chunk = [row for row, _ in encoded_chunk]
+            encoded = [ids for _, ids in encoded_chunk]
             width = max(len(ids) for ids in encoded)
             prompt_ids = torch.zeros(
-                (len(chunk) * samples, width), dtype=torch.long, device=device
+                (len(chunk), width), dtype=torch.long, device=device
             )
             for index, ids in enumerate(encoded):
-                rows = slice(index * samples, (index + 1) * samples)
-                prompt_ids[rows, width - len(ids):] = torch.tensor(
+                prompt_ids[index, width - len(ids):] = torch.tensor(
                     ids, dtype=torch.long, device=device
                 )
-            prompt_lengths = torch.tensor(
-                [len(ids) for ids in encoded], dtype=torch.long, device=device
-            ).repeat_interleave(samples)
+            prompt_lengths_cpu = torch.tensor(
+                [len(ids) for ids in encoded], dtype=torch.long
+            )
+            prompt_lengths = prompt_lengths_cpu.to(device)
             batched = rollout_continuations(
                 wrapper, prompt_ids, args.continuation_tokens, max_stream_steps,
                 args.temperature, args.top_p, stop_ids=stop_ids or None,
@@ -3131,15 +3191,31 @@ def main() -> None:
                 record_likelihoods=False,
                 cache_dtype=torch.bfloat16,
                 tensor_positions=rollout_step_core is not None,
-                compact_finished=rollout_step_core is None,
+                compact_finished=(
+                    rollout_step_core is None
+                    or args.rollout_tail_batch > 0
+                ),
+                finished_batch_size=(
+                    args.rollout_tail_batch
+                    if rollout_step_core is not None
+                    and args.rollout_tail_batch > 0
+                    else None
+                ),
+                prompt_repeats=samples,
             )
             if offload_to_cpu:
                 # One chunk-level D2H transfer, then all variable-length
                 # splitting, trimming, decoding, and scoring stay on CPU.
                 # This avoids one synchronization/transfer per prompt group.
-                batched = batched.to(cpu)
-                prompt_lengths = prompt_lengths.to(cpu)
-            split_groups = split_rollout_groups(batched, samples, prompt_lengths)
+                batched = compact_stream_to_device(batched, cpu)
+            expanded_prompt_lengths = prompt_lengths_cpu.repeat_interleave(
+                samples
+            )
+            if not offload_to_cpu:
+                expanded_prompt_lengths = expanded_prompt_lengths.to(device)
+            split_groups = split_rollout_groups(
+                batched, samples, expanded_prompt_lengths
+            )
             # Every split owns cloned storage; drop the much larger
             # groups*samples rollout before the first full-stream replay.
             del batched

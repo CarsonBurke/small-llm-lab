@@ -49,6 +49,7 @@ from postraining.train_latent_vapo import (
     EXECUTION_SCHEMA,
     GAIN_SCALED_EXECUTION_SCHEMA,
     GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
+    PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
     PREVIOUS_EXECUTION_SCHEMA,
     MathPromptSampler,
     REWARD_SCHEMA,
@@ -1762,6 +1763,47 @@ def test_compiled_full_batch_uses_one_fixed_finished_tail_shape(
     assert wrapper.step_core is compiled_step_core
 
 
+def test_fixed_finished_tail_never_expands_a_smaller_batch(monkeypatch):
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(0, 32, (8, 4))
+    original_step_core = wrapper.step_core
+    observed_batch_sizes: list[int] = []
+
+    def observed_step_core(next_input, *args, **kwargs):
+        observed_batch_sizes.append(next_input.size(0))
+        return original_step_core(next_input, *args, **kwargs)
+
+    wrapper.step_core = observed_step_core
+    calls = 0
+
+    def staged_tokens(logits, _temperature, _top_p):
+        nonlocal calls
+        tokens = torch.full(
+            (logits.size(0),), 6, dtype=torch.long, device=logits.device
+        )
+        if calls == 0:
+            tokens[:6] = 5
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", staged_tokens)
+    rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=32,
+        max_stream_steps=32,
+        temperature=1.0,
+        top_p=0.7,
+        stop_ids=(5,),
+        compact_finished=True,
+        finished_batch_size=16,
+        record_likelihoods=False,
+    )
+    assert set(observed_batch_sizes) == {8}
+
+
 def test_finished_row_compaction_preserves_model_dependent_survivor_tokens(
     monkeypatch,
 ):
@@ -2170,18 +2212,40 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
 
 
-def test_resume_schema_requires_explicit_reverse_kl_objective_migration() -> None:
+def test_resume_schema_requires_matching_explicit_migration() -> None:
     current = {"execution_schema": EXECUTION_SCHEMA}
     assert resume_execution_schema_compatible(current)
     assert not resume_execution_schema_compatible(
         current,
         allow_reverse_kl_migration=True,
     )
+    assert not resume_execution_schema_compatible(
+        current,
+        allow_performance_migration=True,
+    )
+    performance_previous = {
+        "execution_schema": PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA
+    }
+    assert not resume_execution_schema_compatible(performance_previous)
+    assert resume_execution_schema_compatible(
+        performance_previous,
+        allow_performance_migration=True,
+    )
+    assert not resume_execution_schema_compatible(
+        performance_previous,
+        allow_reverse_kl_migration=True,
+        allow_performance_migration=True,
+    )
     previous = {"execution_schema": PREVIOUS_EXECUTION_SCHEMA}
     assert not resume_execution_schema_compatible(previous)
+    assert not resume_execution_schema_compatible(
+        previous,
+        allow_reverse_kl_migration=True,
+    )
     assert resume_execution_schema_compatible(
         previous,
         allow_reverse_kl_migration=True,
+        allow_performance_migration=True,
     )
     # Even trained v18 state is structurally resumable because v19 changes
     # only the objective; the explicit flag prevents an accidental change.
@@ -2192,6 +2256,14 @@ def test_resume_schema_requires_explicit_reverse_kl_objective_migration() -> Non
             "optimizers": {"actor": {"state": {1: {"step": 1}}}},
         }
     )
+    assert not resume_execution_schema_compatible(
+        {
+            "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
+            "step": 1,
+            "optimizers": {"actor": {"state": {1: {"step": 1}}}},
+        },
+        allow_reverse_kl_migration=True,
+    )
     assert resume_execution_schema_compatible(
         {
             "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
@@ -2199,6 +2271,7 @@ def test_resume_schema_requires_explicit_reverse_kl_objective_migration() -> Non
             "optimizers": {"actor": {"state": {1: {"step": 1}}}},
         },
         allow_reverse_kl_migration=True,
+        allow_performance_migration=True,
     )
 
     # Older actor optimizers and policy semantics must fail at the schema
@@ -2546,7 +2619,7 @@ def test_evaluate_aime_latent_keeps_the_prompt_tail(monkeypatch):
         max_stream_steps=8, chunk=2, seed=5, device=torch.device("cpu"),
         prompt_tokens=5,
     )
-    assert seen and seen[-1].shape == (2, 5)
+    assert seen and seen[-1].shape == (1, 5)
     assert seen[-1][0].tolist() == [21] + list(range(16, 20))
 
 
@@ -2963,7 +3036,7 @@ def test_pack_rollout_groups_rejects_empty_input():
 def test_batched_rollout_rejects_bad_prompt_lengths_and_static_caches():
     wrapper = _wrapper()
     prompt_ids = torch.randint(1, 32, (2, 5))
-    with pytest.raises(ValueError, match="one true length per row"):
+    with pytest.raises(ValueError, match="one true length per prompt"):
         rollout_continuations(
             wrapper, prompt_ids, 2, 4, 1.0, 1.0,
             prompt_lengths=torch.tensor([5]),
@@ -2979,6 +3052,27 @@ def test_batched_rollout_rejects_bad_prompt_lengths_and_static_caches():
             wrapper, prompt_ids, 2, 4, 1.0, 1.0,
             caches=caches, prompt_lengths=torch.tensor([5, 5]),
         )
+
+
+def test_prompt_repeats_expand_unique_prompt_storage():
+    wrapper = _wrapper()
+    prompt_ids = torch.tensor([[0, 0, 4, 5, 6], [7, 8, 9, 10, 11]])
+    prompt_lengths = torch.tensor([3, 5])
+    batch = rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=0,
+        max_stream_steps=0,
+        temperature=1.0,
+        top_p=1.0,
+        prompt_lengths=prompt_lengths,
+        prompt_repeats=3,
+    )
+    assert batch.kind.size(0) == 6
+    for prompt_index in range(2):
+        members = slice(prompt_index * 3, (prompt_index + 1) * 3)
+        expected = prompt_ids[prompt_index].expand(3, -1)
+        assert torch.equal(batch.token_ids[members], expected)
 
 
 def test_split_rollout_groups_rejects_mixed_lengths_within_a_group():

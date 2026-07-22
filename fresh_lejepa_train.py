@@ -355,6 +355,120 @@ class FreshLeJEPAGPT(baseline.GPT):
             predicted = self.blocks[self.num_encoder_layers + i](predicted, x0)
         return self.final_norm(predicted)
 
+    @staticmethod
+    def _prefill_attention_mask(key_valid: Tensor) -> Tensor:
+        """Causal mask that excludes left padding without NaN pad queries."""
+        length = key_valid.size(1)
+        causal = torch.ones(
+            (length, length), dtype=torch.bool, device=key_valid.device
+        ).tril_()
+        mask = causal[None, None] & key_valid[:, None, None, :]
+        # A left-pad query has no semantically meaningful output, but a fully
+        # masked SDPA row produces NaN that contaminates deeper-layer K/V.
+        # Match stepwise prefill by letting such queries attend their causal
+        # padded prefix; real queries still exclude every padded key.
+        return torch.where(
+            key_valid[:, None, :, None], mask, causal[None, None]
+        )
+
+    def _attention_prefill(
+        self,
+        attention: baseline.CausalSelfAttention,
+        x: Tensor,
+        cache: tuple[Tensor, ...],
+        attention_mask: Tensor | None,
+    ) -> Tensor:
+        """Evaluate a RoPE prefix densely and populate its generation cache."""
+        batch, length, dim = x.shape
+        q_dim = attention.num_heads * attention.head_dim
+        kv_dim = attention.num_kv_heads * attention.head_dim
+        q, k, value = attention.c_qkv(x).split(
+            [q_dim, kv_dim, kv_dim], dim=-1
+        )
+        q = q.view(
+            batch, length, attention.num_heads, attention.head_dim
+        ).transpose(1, 2)
+        k = k.view(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        ).transpose(1, 2)
+        value = value.view(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        ).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = attention.rotary(length, x.device, q.dtype)
+        q = baseline.apply_rotary_emb(q, cos, sin)
+        k = baseline.apply_rotary_emb(k, cos, sin)
+        q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
+        cache[0][:, :, :length].copy_(k.to(cache[0].dtype))
+        cache[1][:, :, :length].copy_(value.to(cache[1].dtype))
+        output = F.scaled_dot_product_attention(
+            q,
+            k,
+            value,
+            attn_mask=attention_mask,
+            is_causal=attention_mask is None,
+            enable_gqa=attention.num_kv_heads != attention.num_heads,
+        )
+        output = output.transpose(1, 2).contiguous().view(batch, length, dim)
+        return attention.proj(output)
+
+    def _block_prefill(
+        self,
+        block: baseline.Block,
+        x: Tensor,
+        x0: Tensor,
+        cache: tuple[Tensor, ...],
+        attention_mask: Tensor | None,
+    ) -> Tensor:
+        mix = block.resid_mix.to(x.dtype)
+        x = mix[0][None, None] * x + mix[1][None, None] * x0
+        attention = self._attention_prefill(
+            block.attn, block.attn_norm(x), cache, attention_mask
+        )
+        x = x + block.attn_scale.to(x.dtype)[None, None] * attention
+        return x + block.mlp_scale.to(x.dtype)[None, None] * block.mlp(
+            block.mlp_norm(x)
+        )
+
+    def prefill_belief(
+        self,
+        token_latent: Tensor,
+        caches: list[tuple[Tensor, ...]],
+        key_valid: Tensor | None = None,
+    ) -> Tensor:
+        """Compute a whole deterministic prefix and fill every layer cache."""
+        attention_mask = (
+            self._prefill_attention_mask(key_valid)
+            if key_valid is not None
+            else None
+        )
+        predicted = token_latent
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            predicted = self._block_prefill(
+                self.blocks[i],
+                predicted,
+                token_latent,
+                caches[i],
+                attention_mask,
+            )
+            skips.append(predicted)
+        for j in range(self.num_decoder_layers):
+            i = self.num_encoder_layers + j
+            if skips:
+                predicted = predicted + self.skip_weights[j].to(
+                    predicted.dtype
+                )[None, None] * skips.pop()
+            predicted = self._block_prefill(
+                self.blocks[i],
+                predicted,
+                token_latent,
+                caches[i],
+                attention_mask,
+            )
+        return self.final_norm(predicted)
+
     def predict_from_token_latent(self, token_latent: Tensor) -> Tensor:
         return self.prediction_latent(
             self.temporal_belief_from_token_latent(token_latent)

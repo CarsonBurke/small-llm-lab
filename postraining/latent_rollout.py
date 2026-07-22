@@ -82,6 +82,49 @@ class LatentRolloutBatch:
         return self.kind.size(1)
 
 
+def compact_stream_to_device(
+    batch: LatentRolloutBatch, device: torch.device
+) -> LatentRolloutBatch:
+    """Copy only the used stream prefix into owning storage on ``device``.
+
+    Rollout storage is provisioned for the full context, while ordinary
+    trajectories use only a small prefix. Slicing before a device transfer
+    avoids copying the unused tail and the destination copy already owns its
+    compact storage, unlike a same-device narrow view.
+    """
+    used = int((batch.kind != PAD_SLOT).any(0).nonzero().max()) + 1
+    compact = {}
+    async_cuda_to_cpu = (
+        batch.kind.device.type == "cuda" and device.type == "cpu"
+    )
+    for field in fields(batch):
+        value = getattr(batch, field.name)
+        if (
+            isinstance(value, Tensor)
+            and value.dim() >= 2
+            and value.size(1) == batch.stream_length
+        ):
+            value = value[:, :used]
+        if isinstance(value, Tensor):
+            if async_cuda_to_cpu:
+                target = torch.empty_like(
+                    value, device=device, pin_memory=True
+                )
+                target.copy_(value, non_blocking=True)
+                value = target
+            elif value.device == device:
+                value = value.clone()
+            else:
+                value = value.to(device)
+        compact[field.name] = value
+    if async_cuda_to_cpu:
+        # All pinned copies are enqueued on the current stream. One barrier
+        # makes the complete compact batch host-readable without serializing
+        # once per dataclass field.
+        torch.cuda.current_stream(batch.kind.device).synchronize()
+    return LatentRolloutBatch(**compact)
+
+
 def half_forced_group_members(
     groups: int, members_per_group: int, device: torch.device
 ) -> Tensor:
@@ -145,6 +188,7 @@ def rollout_continuations(
     compact_finished: bool = True,
     finished_batch_size: int | None = None,
     cache_dtype: torch.dtype | None = None,
+    prompt_repeats: int = 1,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
@@ -184,6 +228,12 @@ def rollout_continuations(
     refresh after trimming. This avoids multiple GiB of dead storage at large
     batches while the current sampled thought is still fed into the next step.
 
+    ``prompt_repeats`` declares how many output trajectories each UNIQUE input
+    prompt owns. Its deterministic prefix is evaluated once, then its final
+    policy output, prompt storage, and populated KV prefix are expanded across
+    members before stochastic actions consume RNG. This structural interface
+    makes accidentally supplying unequal repeated prompts impossible.
+
     ``record_likelihoods=False`` skips rollout-time gate/token likelihoods
     when the caller will immediately recompute them through parallel replay.
     ``compact_finished`` removes completed rows and their KV cache entries at
@@ -201,7 +251,12 @@ def rollout_continuations(
     if max_stream_steps < max_new_tokens:
         raise ValueError("max_stream_steps must be at least max_new_tokens")
     device = prompt_ids.device
-    batch, prompt_length = prompt_ids.shape
+    prefix_batch, prompt_length = prompt_ids.shape
+    if prompt_repeats < 1:
+        raise ValueError("prompt_repeats must be positive")
+    batch = prefix_batch * prompt_repeats
+    if caches is not None and prompt_repeats != 1:
+        raise ValueError("prompt_repeats cannot be used with preallocated caches")
     if finished_batch_size is not None and finished_batch_size < 1:
         raise ValueError("finished_batch_size must be positive")
     if isinstance(force_initial_think, bool):
@@ -232,22 +287,26 @@ def rollout_continuations(
                 "prompt_lengths (left-padded batching) is eager-only and "
                 "cannot be combined with preallocated caches"
             )
-        if prompt_lengths.shape != (batch,):
-            raise ValueError("prompt_lengths must be one true length per row")
+        if prompt_lengths.shape != (prefix_batch,):
+            raise ValueError("prompt_lengths must be one true length per prompt")
         prompt_lengths = prompt_lengths.to(device=device, dtype=torch.long)
         if bool((prompt_lengths < 1).any()) or bool(
             (prompt_lengths > prompt_length).any()
         ):
             raise ValueError("prompt_lengths must lie in [1, prompt_ids width]")
-        pad_lengths = prompt_length - prompt_lengths
+        pad_lengths = (
+            prompt_length - prompt_lengths
+        ).repeat_interleave(prompt_repeats)
         # Slot k is a real (attendable) slot for row b iff k >= pad_lengths[b].
         valid_slots = (
             torch.arange(max_stream, device=device)[None, :] >= pad_lengths[:, None]
         )
     preallocated_caches = caches is not None
     if caches is None:
+        cache_batch = prefix_batch if prompt_repeats > 1 else batch
+        cache_length = prompt_length if prompt_repeats > 1 else max_stream
         caches = wrapper.make_generation_cache(
-            batch, max_stream, device, dtype=cache_dtype
+            cache_batch, cache_length, device, dtype=cache_dtype
         )
         position_index = (
             torch.zeros((), dtype=torch.long, device=device)
@@ -315,18 +374,62 @@ def rollout_continuations(
 
     if valid_slots is None:
         kind[:, :prompt_length] = TOKEN_SLOT
-        token_ids[:, :prompt_length] = prompt_ids
+        token_ids[:, :prompt_length] = prompt_ids.repeat_interleave(
+            prompt_repeats, dim=0
+        )
     else:
         prompt_valid = valid_slots[:, :prompt_length]
         kind[:, :prompt_length] = torch.where(prompt_valid, TOKEN_SLOT, PAD_SLOT)
-        token_ids[:, :prompt_length] = prompt_ids * prompt_valid
+        token_ids[:, :prompt_length] = (
+            prompt_ids.repeat_interleave(prompt_repeats, dim=0)
+            * prompt_valid
+        )
 
-    output = None
-    for position in range(prompt_length):
-        step_pos, key_mask = step_position(position)
-        output = wrapper.token_step(prompt_ids[:, position], caches, step_pos, key_mask)
-        caches = output.caches
-    assert output is not None
+    prefix_prompt_ids = prompt_ids
+    prefix_valid_slots = (
+        valid_slots[::prompt_repeats] if valid_slots is not None else None
+    )
+    prefix_key_valid = (
+        prefix_valid_slots[:, :prompt_length]
+        if prefix_valid_slots is not None
+        else None
+    )
+    output = wrapper.prefill(prefix_prompt_ids, caches, prefix_key_valid)
+    caches = output.caches
+
+    if prompt_repeats > 1:
+        expanded_caches = wrapper.make_generation_cache(
+            batch, max_stream, device, dtype=cache_dtype
+        )
+        for source_layer, target_layer in zip(
+            caches, expanded_caches, strict=True
+        ):
+            for source, target in zip(source_layer, target_layer, strict=True):
+                grouped_target = target.view(
+                    prefix_batch,
+                    prompt_repeats,
+                    *target.shape[1:],
+                )
+                grouped_target[:, :, :, :prompt_length].copy_(
+                    source[:, None].expand(
+                        prefix_batch,
+                        prompt_repeats,
+                        *source.shape[1:],
+                    )
+                )
+        caches = expanded_caches
+
+        def expand_rows(value: Tensor) -> Tensor:
+            return value.repeat_interleave(prompt_repeats, dim=0)
+
+        output = output.__class__(
+            belief=expand_rows(output.belief),
+            predicted=expand_rows(output.predicted),
+            thought_log_sigma=expand_rows(output.thought_log_sigma),
+            input_latent=expand_rows(output.input_latent),
+            logits=expand_rows(output.logits),
+            caches=caches,
+        )
 
     emitted = torch.zeros(batch, dtype=torch.long, device=device)
     ended = torch.zeros(batch, dtype=torch.bool, device=device)
@@ -355,7 +458,7 @@ def rollout_continuations(
             compacted_count = active_count
             if finished_batch_size is not None:
                 compacted_count = (
-                    finished_batch_size
+                    min(current_count, finished_batch_size)
                     if active_count <= finished_batch_size
                     else current_count
                 )

@@ -187,20 +187,19 @@ def evaluate_latent_math(
                 prompt_width = max(len(item[0]) for item in row_chunk)
                 rollout_width = len(row_chunk) * width
                 prompt_ids = torch.zeros(
-                    (rollout_width, prompt_width),
+                    (len(row_chunk), prompt_width),
                     dtype=torch.long,
                     device=device,
                 )
                 prompt_lengths = torch.empty(
-                    rollout_width, dtype=torch.long, device=device
+                    len(row_chunk), dtype=torch.long, device=device
                 )
                 for group, (prompt, *_) in enumerate(row_chunk):
-                    group_rows = slice(group * width, (group + 1) * width)
                     prompt_tensor = torch.tensor(
                         prompt, dtype=torch.long, device=device
                     )
-                    prompt_ids[group_rows, -len(prompt) :] = prompt_tensor
-                    prompt_lengths[group_rows] = len(prompt)
+                    prompt_ids[group, -len(prompt) :] = prompt_tensor
+                    prompt_lengths[group] = len(prompt)
                 force_chunk = force_members[
                     member_start : member_start + width
                 ].repeat(len(row_chunk))
@@ -238,6 +237,7 @@ def evaluate_latent_math(
                                 if compiled_step_core is not None
                                 else None
                             ),
+                            prompt_repeats=width,
                         )
                     )
                 recurrent_steps_per_rollout.append(

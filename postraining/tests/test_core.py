@@ -17,6 +17,7 @@ from postraining.core import (
     clipped_policy_loss,
     deterministic_math_subset,
     encode_prompt,
+    generalized_advantage_and_return_targets,
     generalized_advantage_estimate,
     length_adaptive_lambda,
     modal_answer_baseline,
@@ -271,6 +272,36 @@ def test_negative_padded_monte_carlo_returns():
     mask = torch.tensor([[1.0, 1.0, 0.0]])
     _, returns = generalized_advantage_estimate(rewards, values, mask, torch.ones(1))
     torch.testing.assert_close(returns, torch.tensor([[-1.0, -1.0, 9.0]]))
+
+
+@pytest.mark.parametrize("gamma", [1.0, 0.97])
+def test_combined_advantage_and_return_targets_match_two_gaes(gamma):
+    torch.manual_seed(47)
+    rewards = torch.randn(4, 9)
+    values = torch.randn(4, 9)
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 0, 1, 1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    lambdas = torch.tensor([0.0, 0.65, 0.95, 1.0])
+    expected_advantages, _ = generalized_advantage_estimate(
+        rewards, values, mask, lambdas, gamma
+    )
+    _, expected_targets = generalized_advantage_estimate(
+        rewards, values, mask, torch.ones_like(lambdas), gamma
+    )
+    actual_advantages, actual_targets = (
+        generalized_advantage_and_return_targets(
+            rewards, values, mask, lambdas, gamma
+        )
+    )
+    torch.testing.assert_close(actual_advantages, expected_advantages)
+    torch.testing.assert_close(actual_targets, expected_targets)
 
 
 def test_positive_lm_loss_weights_correct_tokens_equally():

@@ -667,6 +667,51 @@ class LatentThoughtModel(nn.Module):
         logits = backbone.logits_from_features(features).squeeze(1)
         return belief.squeeze(1), predicted.squeeze(1), thought_log_sigma, logits
 
+    def prefill_core(
+        self,
+        input_latent: Tensor,
+        caches: list[tuple[Tensor, ...]],
+        key_valid: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Densely ingest a deterministic prefix and expose its final state."""
+        belief = self.backbone.prefill_belief(
+            input_latent, caches, key_valid
+        )[:, -1:]
+        final_input = input_latent[:, -1:]
+        predicted = self.thought_mean(belief)
+        thought_log_sigma = self.transition.predict_log_sigma(
+            belief.squeeze(1)
+        )
+        logits = self.backbone.logits_from_features(
+            self.renderer_features(final_input, belief)
+        ).squeeze(1)
+        return (
+            belief.squeeze(1),
+            predicted.squeeze(1),
+            thought_log_sigma,
+            logits,
+        )
+
+    def prefill(
+        self,
+        token_ids: Tensor,
+        caches: list[tuple[Tensor, ...]],
+        key_valid: Tensor | None = None,
+    ) -> StepOutput:
+        """Populate prefix caches without running policy heads per token."""
+        input_latent = self.embed_tokens(token_ids)
+        belief, predicted, thought_log_sigma, logits = self.prefill_core(
+            input_latent, caches, key_valid
+        )
+        return StepOutput(
+            belief=belief,
+            predicted=predicted,
+            thought_log_sigma=thought_log_sigma,
+            input_latent=input_latent[:, -1],
+            logits=logits,
+            caches=list(caches),
+        )
+
     def step(
         self,
         input_latent: Tensor,

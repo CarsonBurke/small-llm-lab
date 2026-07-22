@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from fresh_lejepa_train import FreshLeJEPAGPT
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.latent_thought import (
     EMIT,
@@ -54,6 +55,63 @@ def test_token_step_matches_full_forward_with_belief_renderer():
             output = wrapper.token_step(ids[:, position], caches, position)
             caches = output.caches
             torch.testing.assert_close(output.logits, expected[:, position])
+
+
+def _assert_prefill_matches_steps(
+    wrapper: LatentThoughtModel,
+    ids: torch.Tensor,
+    key_valid: torch.Tensor | None = None,
+) -> None:
+    length = ids.size(1)
+    dense_caches = wrapper.make_generation_cache(
+        ids.size(0), length, torch.device("cpu")
+    )
+    stepped_caches = wrapper.make_generation_cache(
+        ids.size(0), length, torch.device("cpu")
+    )
+    with torch.no_grad():
+        dense = wrapper.prefill(ids, dense_caches, key_valid)
+        stepped = None
+        pad_lengths = None if key_valid is None else length - key_valid.sum(1)
+        for position in range(length):
+            key_mask = None
+            if key_valid is not None:
+                key_mask = key_valid[:, : position + 1]
+                key_mask = key_mask | (pad_lengths[:, None] > position)
+            stepped = wrapper.token_step(
+                ids[:, position], stepped_caches, position, key_mask
+            )
+    assert stepped is not None
+    torch.testing.assert_close(dense.belief, stepped.belief)
+    torch.testing.assert_close(dense.predicted, stepped.predicted)
+    torch.testing.assert_close(
+        dense.thought_log_sigma, stepped.thought_log_sigma
+    )
+    torch.testing.assert_close(dense.logits, stepped.logits)
+    for dense_layer, stepped_layer in zip(
+        dense_caches, stepped_caches, strict=True
+    ):
+        for dense_tensor, stepped_tensor in zip(
+            dense_layer, stepped_layer, strict=True
+        ):
+            torch.testing.assert_close(dense_tensor, stepped_tensor)
+
+
+def test_dense_pope_prefill_matches_incremental_with_left_padding():
+    torch.manual_seed(41)
+    wrapper = LatentThoughtModel(_pope_model()).eval()
+    ids = torch.randint(1, 32, (3, 8))
+    lengths = torch.tensor([4, 6, 8])
+    key_valid = torch.arange(8)[None] >= (8 - lengths)[:, None]
+    ids = ids * key_valid
+    _assert_prefill_matches_steps(wrapper, ids, key_valid)
+
+
+def test_dense_rope_prefill_matches_incremental():
+    torch.manual_seed(43)
+    wrapper = LatentThoughtModel(FreshLeJEPAGPT(**KWARGS).eval())
+    ids = torch.randint(1, 32, (2, 7))
+    _assert_prefill_matches_steps(wrapper, ids)
 
 
 def test_cached_generation_matches_full_forward_beyond_pretraining_context():
