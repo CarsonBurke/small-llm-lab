@@ -274,11 +274,12 @@ class GaussianTransitionHead(nn.Module):
     ) -> Tensor:
         """Per-dimension log-density of the thought policy, (…, dim).
 
-        Replay stores these factors individually, then sums them into the
-        complete Gaussian-vector log probability before applying one joint
-        action PPO ratio. The ratio moves with the mean (the trunk) and
-        with the state-dependent sigma; refresh_old_statistics recomputes
-        old factors under the current head, so epoch-0 ratios stay exactly 1.
+        Replay stores these factors individually and clips each dimension's
+        PPO ratio separately while retaining the diagonal Gaussian's summed
+        score gradient. The ratios move with the mean (the trunk) and with
+        the state-dependent sigma; refresh_old_statistics recomputes old
+        factors under the current head, so behavior-age-0 ratios stay exactly
+        1.
         """
         log_sigma = log_sigma.float()
         normalized = (sample.float() - mean.float()) * (-log_sigma).exp()

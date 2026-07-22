@@ -17,9 +17,10 @@ thoughts, actions), not activations: ``replay_beliefs`` reassembles the exact
 stream inputs and recomputes every belief in one parallel teacher-forced
 forward, which is where new log-probs and values come from — and, with the
 trunk trainable at RL time, where every policy gradient enters the model.  Rewards are terminal and task-defined by the
-caller (the DAPO trainer writes binary verifier scores through
-``assign_terminal_rewards``); ``continuation_reward`` survives only for the
-``sample_latent --fineweb`` inspection tool.
+caller (the DAPO trainer writes exact verifier reward plus bounded numeric
+distance shaping through ``assign_terminal_rewards``);
+``continuation_reward`` survives only for the ``sample_latent --fineweb``
+inspection tool.
 """
 
 from __future__ import annotations
@@ -61,8 +62,8 @@ class LatentRolloutBatch:
     emit_mask: Tensor
     old_gate_logprobs: Tensor
     old_token_logprobs: Tensor
-    # (batch, stream, dim): factors of the old Gaussian-vector log-probability
-    # decided at each gate position. Replay sums them into one action ratio.
+    # (batch, stream, dim): old diagonal-Gaussian factors retained so replay
+    # can clip every latent dimension against the frozen behavior policy.
     old_thought_logprobs: Tensor
     old_values: Tensor
     rewards: Tensor
@@ -542,6 +543,111 @@ def split_rollout_groups(
     return groups
 
 
+def pack_rollout_groups_for_replay(
+    groups: Sequence[LatentRolloutBatch],
+) -> LatentRolloutBatch:
+    """Right-pad independent prompt groups into one exact replay batch.
+
+    Every source stream keeps its original position zero and action boundary;
+    only unused tail columns are appended. This matters because full-sequence
+    replay is causal but has no left-padding key mask. A conventional
+    left-padded batch would therefore change attention normalization and break
+    behavior-policy log-probability equality.
+
+    The result is intended for replay/update, where action masks carry the
+    per-row boundaries. Its scalar ``prompt_length`` is the minimum source
+    prompt length solely so length-aware row selection remains valid; callers
+    must decode/score the individual groups before combining them.
+    """
+    if not groups:
+        raise ValueError("at least one rollout group is required")
+    devices = {group.kind.device for group in groups}
+    if len(devices) != 1:
+        raise ValueError("rollout groups must share one device")
+    max_stream = max(group.stream_length for group in groups)
+    total_rows = sum(group.kind.size(0) for group in groups)
+    combined: dict[str, Tensor | int] = {}
+    for field in fields(groups[0]):
+        if field.name == "prompt_length":
+            combined[field.name] = min(group.prompt_length for group in groups)
+            continue
+        values = [getattr(group, field.name) for group in groups]
+        if not all(isinstance(value, Tensor) for value in values):
+            raise TypeError(f"unexpected non-tensor rollout field {field.name}")
+        first = values[0]
+        if first.dim() >= 2:
+            if not all(
+                value.dim() == first.dim()
+                and value.shape[2:] == first.shape[2:]
+                and value.size(1) == group.stream_length
+                for value, group in zip(values, groups, strict=True)
+            ):
+                raise ValueError(
+                    f"rollout field {field.name} has incompatible stream shapes"
+                )
+            fill = PAD_SLOT if field.name == "kind" else 0
+            output = first.new_full(
+                (total_rows, max_stream, *first.shape[2:]), fill
+            )
+            row_start = 0
+            for value in values:
+                row_end = row_start + value.size(0)
+                output[row_start:row_end, : value.size(1)].copy_(value)
+                row_start = row_end
+            combined[field.name] = output
+        elif first.dim() == 1:
+            if not all(value.dim() == 1 for value in values):
+                raise ValueError(
+                    f"rollout field {field.name} has incompatible row shapes"
+                )
+            combined[field.name] = torch.cat(values)
+        else:
+            raise ValueError(f"unsupported scalar rollout field {field.name}")
+    return LatentRolloutBatch(**combined)
+
+
+def scatter_replay_statistics(
+    packed: LatentRolloutBatch,
+    groups: Sequence[LatentRolloutBatch],
+) -> None:
+    """Copy refreshed packed behavior/value statistics into compact groups.
+
+    This performs four minibatch-level device transfers rather than moving a
+    complete packed batch (including its duplicate sampled thoughts) back to
+    host memory. Compact groups remain the canonical frozen behavior pool and
+    can later be repacked in the identical order for exact PPO replay.
+    """
+    if not groups:
+        raise ValueError("at least one rollout group is required")
+    if packed.kind.size(0) != sum(group.kind.size(0) for group in groups):
+        raise ValueError("packed rows do not match rollout groups")
+    target_device = groups[0].kind.device
+    if any(group.kind.device != target_device for group in groups):
+        raise ValueError("rollout groups must share one device")
+    statistic_names = (
+        "old_gate_logprobs",
+        "old_token_logprobs",
+        "old_thought_logprobs",
+        "old_values",
+    )
+    statistics = {
+        name: getattr(packed, name).to(target_device)
+        for name in statistic_names
+    }
+    row_start = 0
+    for group in groups:
+        row_end = row_start + group.kind.size(0)
+        for name, packed_value in statistics.items():
+            setattr(
+                group,
+                name,
+                packed_value[
+                    row_start:row_end, : group.stream_length
+                ].clone(),
+            )
+        row_start = row_end
+
+
 def trim_stream(batch: LatentRolloutBatch, multiple: int = 1) -> LatentRolloutBatch:
     """Drop all-PAD tail columns into owning storage for compact replay.
 
@@ -668,7 +774,7 @@ def replay_head_inputs(
     dense prompt/thought/pad evaluation was pure waste. Both
     ``refresh_old_statistics`` and the trainer's update step go through this
     single code path; that is what makes the recomputed "old" statistics
-    exact — epoch-0 PPO ratios are one by construction.
+    exact — behavior-age-0 PPO ratios are one by construction.
     """
     stream_inputs, beliefs = replay_beliefs(wrapper, batch)
     predicted = wrapper.thought_mean(beliefs)
@@ -806,7 +912,7 @@ def refresh_old_statistics(
     discarded: under torch.compile the grad mode is a guard, and a no-grad
     trace would give this refresh a different compiled artifact (different
     kernel fusions, different bf16 reduction order) than the update step —
-    reintroducing exactly the epoch-0 ratio drift it exists to remove.
+    reintroducing exactly the behavior-age-0 ratio drift it exists to remove.
     Eagerly the numerics are identical either way; the cost is one
     forward's transient activation memory.
 
@@ -816,7 +922,7 @@ def refresh_old_statistics(
     trajectories under a B*L^2 budget, bounding quadratic attention memory
     without changing any consumed statistic. The update path uses the same
     deterministic planner so compiled refresh/update forwards remain
-    numerically identical at epoch zero.
+    numerically identical for the first behavior minibatch.
     """
     backbone = wrapper.backbone
     if batch.old_thought_logprobs.shape[-1] == 0:

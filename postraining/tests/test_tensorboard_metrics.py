@@ -8,21 +8,80 @@ from postraining.train_latent_vapo import (
     aggregate_value_diagnostics,
     actor_minibatch_denominators,
     optimizer_minibatch_orders,
+    plan_one_pass_training,
     rollout_tensorboard_metrics,
     write_actor_tensorboard_metrics,
 )
 
 
 def test_optimizer_minibatch_orders_are_disjoint_and_complete() -> None:
-    torch.manual_seed(7)
-    minibatches = optimizer_minibatch_orders(64, 16)
+    generator = torch.Generator().manual_seed(7)
+    minibatches = optimizer_minibatch_orders(64, 16, generator)
     assert len(minibatches) == 4
     assert all(len(minibatch) == 16 for minibatch in minibatches)
     assert sorted(index for minibatch in minibatches for index in minibatch) == list(
         range(64)
     )
+    assert minibatches[0] != list(range(16))
+    assert minibatches == optimizer_minibatch_orders(
+        64, 16, torch.Generator().manual_seed(7)
+    )
     with pytest.raises(ValueError, match="complete minibatches"):
         optimizer_minibatch_orders(63, 16)
+
+
+def test_optimizer_minibatch_orders_allow_one_shuffled_terminal_partial() -> None:
+    minibatches = optimizer_minibatch_orders(
+        29,
+        16,
+        torch.Generator().manual_seed(11),
+        allow_partial_final=True,
+    )
+    assert [len(minibatch) for minibatch in minibatches] == [16, 13]
+    assert sorted(index for batch in minibatches for index in batch) == list(
+        range(29)
+    )
+    assert minibatches == optimizer_minibatch_orders(
+        29,
+        16,
+        torch.Generator().manual_seed(11),
+        allow_partial_final=True,
+    )
+
+
+def test_one_pass_plan_consumes_all_dapo_rows_once_including_tail() -> None:
+    planned_prompts, actor_steps = plan_one_pass_training(
+        dataset_rows=17_917,
+        sampler_cursor=0,
+        warmup_updates=50,
+        remaining_actor_steps=1_070,
+        prompts_per_minibatch=16,
+    )
+    assert planned_prompts == 17_917
+    assert actor_steps == 1_070
+    assert 17_917 - 50 * 16 == 17_117
+    assert divmod(17_117, 16) == (1_069, 13)
+
+    # A checkpoint after 400 complete actor updates resumes with the same
+    # exact final cursor and one terminal partial minibatch.
+    resumed_prompts, resumed_steps = plan_one_pass_training(
+        dataset_rows=17_917,
+        sampler_cursor=50 * 16 + 400 * 16,
+        warmup_updates=0,
+        remaining_actor_steps=670,
+        prompts_per_minibatch=16,
+    )
+    assert resumed_prompts == 10_717
+    assert resumed_steps == 670
+
+    with pytest.raises(ValueError, match="requires exactly 1070"):
+        plan_one_pass_training(
+            dataset_rows=17_917,
+            sampler_cursor=0,
+            warmup_updates=50,
+            remaining_actor_steps=1_069,
+            prompts_per_minibatch=16,
+        )
 
 
 def test_actor_denominators_cover_only_selected_groups_and_positive_tokens() -> None:
@@ -82,7 +141,11 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_behavior_kl_joint": 0.03,
         "policy_behavior_kl_per_action": 0.04,
         "policy_clip_fraction": 0.1,
+        "emit_policy_clip_fraction": 0.05,
+        "thought_policy_clip_fraction": 0.15,
+        "thought_gate_policy_clip_fraction": 0.1,
         "joint_abs_log_ratio_max": 0.7,
+        "thought_dim_abs_log_ratio_max": 0.08,
         "harmful_positive_log_ratio_max": 0.4,
         "trunk_grad_norm": 1.0,
         "renderer_grad_norm": 2.0,
@@ -141,6 +204,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         gate_behavior_kl=1.0,
         policy_loss=2.0,
         joint_abs_log_ratio_max=0.5,
+        thought_dim_abs_log_ratio_max=0.05,
         harmful_positive_log_ratio_max=0.2,
         trunk_grad_norm=10.0,
         critic_grad_norm=11.0,
@@ -151,6 +215,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         gate_behavior_kl=3.0,
         policy_loss=4.0,
         joint_abs_log_ratio_max=0.9,
+        thought_dim_abs_log_ratio_max=0.09,
         harmful_positive_log_ratio_max=0.6,
         trunk_grad_norm=20.0,
         critic_grad_norm=21.0,
@@ -173,6 +238,7 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["behavior/thought_adapter_weight_rms"] == pytest.approx(1e-4)
     assert dashboard["behavior/thought_adapter_bias_rms"] == pytest.approx(2e-4)
     assert dashboard["ratio/joint_abs_log_max"] == pytest.approx(0.9)
+    assert dashboard["ratio/thought_dim_abs_log_max"] == pytest.approx(0.09)
     assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
     assert "grad/critic_mean" not in dashboard
     assert dashboard["loss/positive_lm_weighted"] == pytest.approx(0.8)
@@ -211,6 +277,9 @@ def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:
         "reward_mean": 0.2,
         "reward_std": 0.4,
         "within_group_reward_std": 0.4,
+        "exact_accuracy": 0.05,
+        "exact_within_group_reward_std": 0.1,
+        "partial_reward_fraction": 0.6,
         "reward_mean_forced_initial": 0.1,
         "reward_mean_unforced_initial": 0.3,
         "ended_fraction": 0.8,
@@ -231,6 +300,9 @@ def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:
     assert set(dashboard) == {
         "reward/mean",
         "reward/within_group_std",
+        "reward/exact_accuracy",
+        "reward/exact_within_group_std",
+        "reward/partial_fraction",
         "reward/forced_initial_mean",
         "reward/unforced_initial_mean",
         "reward/forced_initial_delta",
@@ -258,26 +330,26 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
             "ratio/post_update_joint_abs_log_max": 0.4,
         }
     )
-    epoch_zero = Writer()
+    behavior_age_zero = Writer()
     write_actor_tensorboard_metrics(
-        epoch_zero, dashboard, behavior_age=0, step=16
+        behavior_age_zero, dashboard, behavior_age=0, step=16
     )
-    epoch_zero_tags = {tag for tag, _, _ in epoch_zero.calls}
-    assert "debug/behavior_refresh_max_drift" in epoch_zero_tags
-    assert "kl/gate_behavior" not in epoch_zero_tags
-    assert not any(tag.startswith("clip/") for tag in epoch_zero_tags)
-    assert "ratio/joint_abs_log_max" not in epoch_zero_tags
-    assert "kl/post_update_policy_behavior_per_action" in epoch_zero_tags
-    assert "ratio/post_update_joint_abs_log_max" in epoch_zero_tags
-    assert "advantage/mean" in epoch_zero_tags
+    behavior_age_zero_tags = {tag for tag, _, _ in behavior_age_zero.calls}
+    assert "debug/behavior_refresh_max_drift" in behavior_age_zero_tags
+    assert "kl/gate_behavior" not in behavior_age_zero_tags
+    assert not any(tag.startswith("clip/") for tag in behavior_age_zero_tags)
+    assert "ratio/joint_abs_log_max" not in behavior_age_zero_tags
+    assert "kl/post_update_policy_behavior_per_action" in behavior_age_zero_tags
+    assert "ratio/post_update_joint_abs_log_max" in behavior_age_zero_tags
+    assert "advantage/mean" in behavior_age_zero_tags
 
-    epoch_one = Writer()
+    behavior_age_one = Writer()
     write_actor_tensorboard_metrics(
-        epoch_one, dashboard, behavior_age=1, step=32
+        behavior_age_one, dashboard, behavior_age=1, step=32
     )
-    epoch_one_tags = {tag for tag, _, _ in epoch_one.calls}
-    assert "debug/behavior_refresh_max_drift" not in epoch_one_tags
-    assert "kl/gate_behavior" in epoch_one_tags
-    assert "clip/policy" in epoch_one_tags
-    assert "ratio/harmful_positive_log_max" in epoch_one_tags
-    assert "advantage/mean" in epoch_one_tags
+    behavior_age_one_tags = {tag for tag, _, _ in behavior_age_one.calls}
+    assert "debug/behavior_refresh_max_drift" not in behavior_age_one_tags
+    assert "kl/gate_behavior" in behavior_age_one_tags
+    assert "clip/policy" in behavior_age_one_tags
+    assert "ratio/harmful_positive_log_max" in behavior_age_one_tags
+    assert "advantage/mean" in behavior_age_one_tags
