@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+from fractions import Fraction
 
 import pytest
 import torch
@@ -13,11 +15,15 @@ from postraining.core import (
     JsonlLogger,
     answer_style,
     clipped_policy_loss,
+    deterministic_math_subset,
     encode_prompt,
     generalized_advantage_estimate,
     length_adaptive_lambda,
+    modal_answer_baseline,
     module_answer_baselines,
+    nearby_numeric_reward,
     normalize_final_answer,
+    parse_numeric_answer,
     positive_example_lm_loss,
     validate_posttraining_context_budget,
     verify_answer,
@@ -87,6 +93,49 @@ def test_encode_prompt_frames_the_prompt_as_a_document_start():
     assert encode_prompt(_Tokenizer(bos=-1), "abcde") == [10, 11, 12, 13, 14]
 
 
+def test_deterministic_math_subset_is_fixed_and_preserves_dataset_order():
+    rows = [
+        {
+            "prompt": [{"content": f"question {index}"}],
+            "extra_info": {"index": index},
+        }
+        for index in range(20)
+    ]
+    first = deterministic_math_subset(rows, 7)
+    second = deterministic_math_subset(rows, 7)
+
+    assert first == second
+    assert len(first) == 7
+    selected_indices = [row["extra_info"]["index"] for row in first]
+    assert selected_indices == [3, 4, 8, 9, 10, 13, 17]
+    assert deterministic_math_subset(rows, 0) == rows
+    assert deterministic_math_subset(rows, len(rows) + 1) == rows
+    with pytest.raises(ValueError, match="nonnegative"):
+        deterministic_math_subset(rows, -1)
+
+
+def test_modal_answer_baseline_uses_the_rows_grading_normalization():
+    rows = [
+        {
+            "reward_model": {
+                "ground_truth": truth,
+                "style": "rule-lighteval/MATH_v2",
+            }
+        }
+        for truth in ("5", "$5$", "7")
+    ]
+    assert modal_answer_baseline(rows) == {
+        "answer": "5",
+        "style": "minerva",
+        "accuracy": 2 / 3,
+    }
+    assert modal_answer_baseline([]) == {
+        "answer": "",
+        "style": "",
+        "accuracy": 0.0,
+    }
+
+
 def test_posttraining_context_contract():
     assert POSTTRAIN_PROMPT_TOKENS == 1024
     assert POSTTRAIN_RESPONSE_TOKENS == 1024
@@ -109,6 +158,23 @@ def test_dapo_answer_normalization_and_extraction():
     assert verify_answer("540", "540")[0] is False
 
 
+def test_nearby_numeric_reward_supports_floats_fractions_and_large_distance():
+    assert parse_numeric_answer("5.25") == Fraction(21, 4)
+    assert parse_numeric_answer("1e3") == 1000
+    assert parse_numeric_answer(r"\frac{3}{2}") == Fraction(3, 2)
+    assert parse_numeric_answer("1, 2") is None
+    assert parse_numeric_answer("five") is None
+
+    assert nearby_numeric_reward("5.0", "5") == 0.1
+    assert nearby_numeric_reward("6", "5") == pytest.approx(
+        0.1 / (1.0 + math.log1p(1.0))
+    )
+    assert nearby_numeric_reward("1000000", "5") < 0.01
+    assert nearby_numeric_reward("not a number", "5") == 0.0
+    with pytest.raises(ValueError, match="nonnegative"):
+        nearby_numeric_reward("6", "5", -0.1)
+
+
 def test_answer_style_follows_the_row_grading_rule():
     assert answer_style({"reward_model": {"style": "rule"}}) == "exact"
     assert (
@@ -128,7 +194,7 @@ def test_exact_style_grades_the_canonical_answer_string_only():
     assert verify_answer("Answer: a b", "b", "exact")[0] is False
     assert verify_answer("Answer: a b", "b", "minerva")[0] is True
     assert verify_answer("Answer: x = 5", "5", "exact")[0] is False
-    assert verify_answer("Answer: x = 5", "5", "minerva")[0] is True
+    assert verify_answer("Answer: x = 5", "5", "minerva")[0] is False
     assert verify_answer("Answer: $2$ and $3$", "2", "exact")[0] is False
     assert verify_answer("Answer: 7, 6, 2, 2, 2, 1, 5", "762, 22, 15", "exact")[0] is False
     assert verify_answer("Answer: 7, 6, 2, 2, 2, 1, 5", "762, 22, 15", "minerva")[0] is True
@@ -151,7 +217,8 @@ def test_aime_style_requires_an_integer_in_range():
     # Rejected: non-integers, out-of-range values, and normalization
     # coincidences that the Minerva style would accept.
     assert verify_answer("Answer: 5,40", "540", "aime")[0] is False
-    assert verify_answer("Answer: 5,40", "540", "minerva")[0] is True
+    assert verify_answer("Answer: 5,40", "540", "minerva")[0] is False
+    assert verify_answer("Answer: 3, 4", "34", "minerva")[0] is False
     assert verify_answer("Answer: 1000", "1000", "aime")[0] is False
     assert verify_answer("Answer: x = 540", "540", "aime")[0] is False
     assert verify_answer("no final line", "540", "aime") == (False, "[INVALID]")

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -13,7 +16,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-POSTTRAIN_REWARD_SCHEMA = "terminated_bos_or_eos_style_by_row/v2"
+POSTTRAIN_REWARD_SCHEMA = (
+    "terminated_final_answer_exact1_numeric_log1p_max01/v3"
+)
 
 
 # Latent-policy inference budget. The backbone was pretrained on 1024-token
@@ -108,6 +113,19 @@ def verify_answer(
         prediction = normalize_final_answer(
             "[INVALID]" if extracted is None else extracted
         )
+        # DAPO's ground truths are numeric.  Require its raw final Answer:
+        # field to contain one number before applying Minerva's canonical
+        # formatting, otherwise comma-separated candidate lists can collapse
+        # into an apparently correct integer (for example ``3, 4`` -> ``34``).
+        # Preserve Minerva behavior for genuinely nonnumeric datasets.
+        if (
+            parse_numeric_answer(ground_truth) is not None
+            and (
+                extracted is None
+                or parse_numeric_answer(extracted) is None
+            )
+        ):
+            return False, prediction
         return prediction == normalize_final_answer(ground_truth), prediction
     if style == "exact":
         # Official mathematics_dataset grading: the canonical answer string,
@@ -135,6 +153,72 @@ def verify_answer(
             return False, prediction
         return 0 <= value <= 999 and value == truth_value, prediction
     raise ValueError(f"unknown answer style {style!r}")
+
+
+def parse_numeric_answer(answer: str) -> Fraction | None:
+    """Parse one raw final-answer field as an exact finite number.
+
+    This deliberately accepts decimals, scientific notation, and simple
+    fractions while rejecting candidate lists or surrounding prose. The
+    caller must first extract the final ``Answer:`` line; parsing the whole
+    response would let repeated candidates manufacture reward.
+    """
+    text = answer.strip()
+    if not text or len(text) > 128:
+        return None
+    if text.startswith("$") and text.endswith("$") and text.count("$") == 2:
+        text = text[1:-1].strip()
+    boxed = re.fullmatch(r"\\boxed\{(.+)\}", text)
+    if boxed:
+        text = boxed.group(1).strip()
+    latex_fraction = re.fullmatch(
+        r"\\?frac\{([+-]?(?:\d+(?:\.\d*)?|\.\d+))\}"
+        r"\{([+-]?(?:\d+(?:\.\d*)?|\.\d+))\}",
+        text,
+    )
+    number = r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    try:
+        if latex_fraction:
+            denominator = Fraction(latex_fraction.group(2))
+            return Fraction(latex_fraction.group(1)) / denominator
+        plain_fraction = re.fullmatch(rf"({number})/({number})", text)
+        if plain_fraction:
+            numerator = Fraction(plain_fraction.group(1).replace(",", ""))
+            denominator = Fraction(plain_fraction.group(2).replace(",", ""))
+            return numerator / denominator
+        if not re.fullmatch(number, text):
+            return None
+        return Fraction(text.replace(",", ""))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def nearby_numeric_reward(
+    prediction: str,
+    ground_truth: str,
+    maximum: float = 0.1,
+) -> float:
+    """Bounded partial credit for one wrong but numerically parseable answer.
+
+    Exact correctness remains the verifier's responsibility. This function is
+    called only on its wrong branch, where distance may still be zero (for
+    example ``5.0`` versus a strict canonical ``5``). ``log1p`` keeps floats
+    near the target bounded by ``maximum`` and decays asymptotically to zero.
+    """
+    if not math.isfinite(maximum) or maximum < 0.0:
+        raise ValueError("maximum nearby reward must be finite and nonnegative")
+    predicted_value = parse_numeric_answer(prediction)
+    truth_value = parse_numeric_answer(ground_truth)
+    if predicted_value is None or truth_value is None or maximum == 0.0:
+        return 0.0
+    distance = abs(predicted_value - truth_value)
+    try:
+        distance_float = float(distance)
+    except OverflowError:
+        return 0.0
+    if not math.isfinite(distance_float):
+        return 0.0
+    return maximum / (1.0 + math.log1p(distance_float))
 
 
 def module_answer_baselines(rows: list[dict]) -> dict[str, dict[str, float]]:
@@ -166,6 +250,27 @@ def module_answer_baselines(rows: list[dict]) -> dict[str, dict[str, float]]:
     return baselines
 
 
+def modal_answer_baseline(rows: list[dict]) -> dict[str, str | float]:
+    """Strongest constant-answer baseline under each row's grading style."""
+    counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        style = answer_style(row)
+        truth = str(row["reward_model"]["ground_truth"])
+        canonical = truth.strip() if style == "exact" else normalize_final_answer(truth)
+        key = (style, canonical)
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return {"answer": "", "style": "", "accuracy": 0.0}
+    (style, answer), count = max(
+        counts.items(), key=lambda item: (item[1], item[0])
+    )
+    return {
+        "answer": answer,
+        "style": style,
+        "accuracy": count / len(rows),
+    }
+
+
 def load_unique_math_rows(path: str | Path) -> list[dict]:
     """Load and deduplicate DAPO's physically repeated parquet rows."""
     columns = ["prompt", "reward_model", "extra_info"]
@@ -177,6 +282,37 @@ def load_unique_math_rows(path: str | Path) -> list[dict]:
             key = str(info.get("index", row["prompt"][0]["content"]))
             unique.setdefault(key, row)
     return list(unique.values())
+
+
+def deterministic_math_subset(rows: list[dict], max_rows: int) -> list[dict]:
+    """Select a fixed, order-preserving hash sample of unique math rows.
+
+    DAPO is ordered and physically repeats each logical prompt, so taking a
+    prefix is not a representative evaluation subset.  Ranking stable row
+    identities by SHA-256 provides a reproducible sample without mutable RNG
+    state; restoring dataset order afterward keeps answer-report attribution
+    intuitive and evaluation batching deterministic.
+
+    ``max_rows == 0`` means the full dataset.
+    """
+    if max_rows < 0:
+        raise ValueError("max_rows must be nonnegative")
+    if max_rows == 0 or max_rows >= len(rows):
+        return list(rows)
+
+    ranked: list[tuple[bytes, int]] = []
+    for position, row in enumerate(rows):
+        info = row.get("extra_info") or {}
+        identity = str(info.get("index", row["prompt"][0]["content"]))
+        digest = hashlib.sha256(identity.encode("utf-8")).digest()
+        ranked.append((digest, position))
+    selected = {
+        position
+        for _, position in sorted(ranked, key=lambda item: (item[0], item[1]))[
+            :max_rows
+        ]
+    }
+    return [row for position, row in enumerate(rows) if position in selected]
 
 
 def encode_prompt(tokenizer, text: str, max_tokens: int | None = None) -> list[int]:
