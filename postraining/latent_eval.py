@@ -142,6 +142,7 @@ def evaluate_latent_math(
     forced_total = 0
     unforced_correct = 0
     unforced_total = 0
+    prompt_correct = [0] * len(rows)
     module_correct: dict[str, int] = {}
     module_total: dict[str, int] = {}
     think_actions = torch.zeros((), dtype=torch.float32, device=device)
@@ -302,6 +303,7 @@ def evaluate_latent_math(
                     unforced_correct += int(is_correct and not forced)
                     unforced_total += int(not forced)
                     original_index = row_chunk[group][2]
+                    prompt_correct[original_index] += int(is_correct)
                     if (
                         captured_attempts is not None
                         and original_index < capture_problem_count
@@ -434,6 +436,23 @@ def evaluate_latent_math(
     metrics: dict[str, object] = {
         "accuracy": correct / max(total, 1),
         "samples": total,
+        "prompt_groups": len(prompt_correct),
+        "prompt_any_correct_fraction": sum(
+            count > 0 for count in prompt_correct
+        ) / max(len(prompt_correct), 1),
+        "prompt_mixed_reward_fraction": sum(
+            0 < count < samples for count in prompt_correct
+        ) / max(len(prompt_correct), 1),
+        "prompt_all_correct_fraction": sum(
+            count == samples for count in prompt_correct
+        ) / max(len(prompt_correct), 1),
+        "prompt_zero_correct_fraction": sum(
+            count == 0 for count in prompt_correct
+        ) / max(len(prompt_correct), 1),
+        "within_group_reward_std": sum(
+            math.sqrt((count / samples) * (1.0 - count / samples))
+            for count in prompt_correct
+        ) / max(len(prompt_correct), 1),
         "think_fraction": float(think_actions / actions.clamp_min(1.0)),
         "forced_initial_accuracy": forced_correct / max(forced_total, 1),
         "unforced_initial_accuracy": unforced_correct / max(unforced_total, 1),

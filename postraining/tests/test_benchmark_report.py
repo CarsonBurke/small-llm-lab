@@ -47,6 +47,11 @@ def _payload() -> dict[str, object]:
             "forced_initial_accuracy": 0.125,
             "unforced_initial_accuracy": 0.375,
             "think_fraction": 0.2,
+            "prompt_any_correct_fraction": 0.5,
+            "prompt_mixed_reward_fraction": 0.125,
+            "within_group_reward_std": 0.03125,
+            "dataset_modal_answer": "5",
+            "dataset_modal_answer_accuracy": 0.03594,
             "samples": 1152,
             "sampling_schema": "global_rng_compacted_tail/v1",
             "finished_compaction": "compiled_tail_b16",
@@ -64,6 +69,11 @@ def test_render_benchmark_report_is_self_contained_and_escapes_model_text():
 
     assert "What the model answered" in report
     assert "Overall accuracy</span><strong>25.00%" in report
+    assert "Prompts solved at least once</span><strong>50.00%" in report
+    assert "Mixed-reward prompt groups</span><strong>12.50%" in report
+    assert "Mean within-group reward std</span><strong>0.0312" in report
+    assert "Best constant-answer baseline</span><strong>3.59%" in report
+    assert "full-dataset modal answer: 5" in report
     assert "test_reward/v1" in report
     assert "global_rng_compacted_tail/v1" in report
     assert "compiled_tail_b16" in report

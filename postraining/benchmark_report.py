@@ -172,7 +172,7 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
     h1 {{ margin-bottom:.4rem; font-size:clamp(2rem,5vw,3.7rem); letter-spacing:-.04em; }}
     .subtitle,.eyebrow {{ color:var(--muted); }}
     .eyebrow {{ margin:0 0 .25rem; text-transform:uppercase; letter-spacing:.12em; font-size:.72rem; font-weight:700; }}
-    .summary {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.8rem; margin:2rem 0 3rem; }}
+    .summary {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.8rem; margin:2rem 0 3rem; }}
     .summary div,.problem,.attempt {{ border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 94%,transparent); border-radius:14px; }}
     .summary div {{ padding:1rem 1.1rem; }}
     .summary span {{ display:block; color:var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.08em; }}
@@ -215,9 +215,13 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
     <div><span>Forced accuracy</span><strong>{_percent(metrics['forced_initial_accuracy'])}</strong></div>
     <div><span>Unforced accuracy</span><strong>{_percent(metrics['unforced_initial_accuracy'])}</strong></div>
     <div><span>Optional think fraction</span><strong>{_percent(metrics['think_fraction'])}</strong></div>
+    <div><span>Prompts solved at least once</span><strong>{_percent(metrics.get('prompt_any_correct_fraction', 0.0))}</strong></div>
+    <div><span>Mixed-reward prompt groups</span><strong>{_percent(metrics.get('prompt_mixed_reward_fraction', 0.0))}</strong></div>
+    <div><span>Mean within-group reward std</span><strong>{float(metrics.get('within_group_reward_std', 0.0)):.4f}</strong></div>
+    <div><span>Best constant-answer baseline</span><strong>{_percent(metrics.get('dataset_modal_answer_accuracy', 0.0))}</strong></div>
   </section>
   {''.join(sections)}
-  <footer>Correctness requires explicit BOS/EOS termination · reward schema: {html.escape(str(payload.get('reward_schema', 'unspecified')))} · sampling: {html.escape(str(metrics.get('sampling_schema', 'legacy')))} · finished-row compaction: {html.escape(str(metrics.get('finished_compaction', 'legacy')))} · the action trace excludes prompt tokens.</footer>
+  <footer>Correctness requires explicit BOS/EOS termination · full-dataset modal answer: {html.escape(str(metrics.get('dataset_modal_answer', 'unavailable')))} · reward schema: {html.escape(str(payload.get('reward_schema', 'unspecified')))} · sampling: {html.escape(str(metrics.get('sampling_schema', 'legacy')))} · finished-row compaction: {html.escape(str(metrics.get('finished_compaction', 'legacy')))} · the action trace excludes prompt tokens.</footer>
 </main>
 </body>
 </html>
