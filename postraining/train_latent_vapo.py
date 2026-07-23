@@ -126,6 +126,7 @@ from postraining.latent_thought import (
     validate_renderer_checkpoint,
 )
 from postraining.model_io import fresh_trunk, load_model
+from postraining.muon import Muon
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
@@ -1094,10 +1095,71 @@ def non_trunk_parameter_ids(backbone) -> set[int]:
     return excluded
 
 
+def muon_matrix_parameters(
+    blocks: torch.nn.Module, excluded_parameter_ids: set[int]
+) -> list[torch.nn.Parameter]:
+    """The pretraining Muon partition: block matrices with ndim >= 2.
+
+    Mirrors ``nanogpt_mini_gpt2vocab_train.py`` exactly — embeddings, the
+    readout, biases, and norm gains stay under AdamW. Fresh-lineage probes
+    live under ``blocks[-1]``, so the exclusion set must be honored here too.
+    """
+    return [
+        parameter
+        for parameter in blocks.parameters()
+        if parameter.ndim >= 2 and id(parameter) not in excluded_parameter_ids
+    ]
+
+
+def step_optimizers(
+    optimizers: dict[str, torch.optim.Optimizer], role: str
+) -> None:
+    """Step every optimizer belonging to ``role`` ("actor" or "critic").
+
+    The Muon split registers trunk matrices under ``<role>_muon``; iterating
+    by role prefix keeps every step/zero seam covering both optimizers.
+    """
+    for name in sorted(optimizers):
+        if name == role or name.startswith(role + "_"):
+            optimizers[name].step()
+
+
+def zero_optimizers(
+    optimizers: dict[str, torch.optim.Optimizer], role: str
+) -> None:
+    """zero_grad(set_to_none=True) for every optimizer of ``role``."""
+    for name in sorted(optimizers):
+        if name == role or name.startswith(role + "_"):
+            optimizers[name].zero_grad(set_to_none=True)
+
+
+def optimizer_learning_rates(args) -> dict[str, float]:
+    """The per-optimizer learning rates the CLI owns across resumes."""
+    return {
+        "actor": args.learning_rate,
+        "critic": args.learning_rate,
+        "actor_muon": args.muon_learning_rate,
+        "critic_muon": args.critic_muon_learning_rate,
+    }
+
+
+def reassert_learning_rates(
+    optimizers: dict[str, torch.optim.Optimizer], args
+) -> None:
+    """Reapply the CLI learning rates after loading optimizer state."""
+    rates = optimizer_learning_rates(args)
+    for name, optimizer in optimizers.items():
+        for group in optimizer.param_groups:
+            group["lr"] = rates[name]
+
+
 def build_optimizers(
     wrapper: LatentThoughtModel,
     critic: SeparateCritic,
     learning_rate: float,
+    trunk_optimizer: str = "adamw",
+    muon_learning_rate: float | None = None,
+    critic_muon_learning_rate: float | None = None,
     fused: bool = True,
 ) -> dict[str, torch.optim.Optimizer]:
     """The actor/critic optimizer layout.
@@ -1112,15 +1174,41 @@ def build_optimizers(
     name-prefix filtering wrong — exclude them from the trunk by identity.
     Nano backbones keep the identical six-group layout with their native
     readout as the renderer group.
+
+    ``trunk_optimizer="muon"`` restores the pretraining update geometry:
+    block matrices (ndim >= 2) move from the AdamW trunk group into separate
+    ``actor_muon``/``critic_muon`` Muon optimizers — same NewtonSchulz5
+    orthogonalization, momentum, and rectangular scaling the trunk was
+    pretrained under — while embeddings, readout, gains, and every RL-only
+    head stay under AdamW. Weight decay stays 0 everywhere: pretraining's
+    Muon decay (0.05) regularizes a from-scratch run, but over a long RL
+    schedule it would only shrink the pretrained weights.
     """
+    if trunk_optimizer not in ("adamw", "muon"):
+        raise ValueError(f"unknown trunk optimizer {trunk_optimizer!r}")
     backbone = wrapper.backbone
     excluded_parameter_ids = non_trunk_parameter_ids(backbone)
+    actor_muon_parameters: list[torch.nn.Parameter] = []
+    critic_muon_parameters: list[torch.nn.Parameter] = []
+    if trunk_optimizer == "muon":
+        actor_muon_parameters = muon_matrix_parameters(
+            backbone.blocks, excluded_parameter_ids
+        )
+        critic_muon_parameters = muon_matrix_parameters(critic.trunk.blocks, set())
+    actor_muon_ids = {id(parameter) for parameter in actor_muon_parameters}
+    critic_muon_ids = {id(parameter) for parameter in critic_muon_parameters}
     trunk_parameters = [
         parameter
         for parameter in backbone.parameters()
         if id(parameter) not in excluded_parameter_ids
+        and id(parameter) not in actor_muon_ids
     ]
-    return {
+    critic_adamw_parameters = [
+        parameter
+        for parameter in critic.parameters()
+        if id(parameter) not in critic_muon_ids
+    ]
+    optimizers = {
         "actor": torch.optim.AdamW(
             [
                 {"params": trunk_parameters, "lr": learning_rate},
@@ -1140,9 +1228,56 @@ def build_optimizers(
             fused=fused,
         ),
         "critic": torch.optim.AdamW(
-            critic.parameters(), lr=learning_rate, weight_decay=0.0, fused=fused,
+            critic_adamw_parameters,
+            lr=learning_rate,
+            weight_decay=0.0,
+            fused=fused,
         ),
     }
+    if trunk_optimizer == "muon":
+        if muon_learning_rate is None or critic_muon_learning_rate is None:
+            raise ValueError("the muon trunk optimizer requires its learning rates")
+        optimizers["actor_muon"] = Muon(
+            actor_muon_parameters, lr=muon_learning_rate, weight_decay=0.0
+        )
+        optimizers["critic_muon"] = Muon(
+            critic_muon_parameters, lr=critic_muon_learning_rate, weight_decay=0.0
+        )
+    # Exact-partition guard (pretraining's optimizer assertion): every critic
+    # parameter in exactly one optimizer, and the Muon split disjoint from
+    # the actor's semantic groups.
+    actor_registered = [
+        parameter
+        for name, optimizer in optimizers.items()
+        if name.startswith("actor")
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if len(actor_registered) != len({id(p) for p in actor_registered}):
+        raise AssertionError("actor parameter registered in two optimizers")
+    trunk_coverage = {id(p) for p in trunk_parameters} | actor_muon_ids
+    trunk_expected = {
+        id(parameter)
+        for parameter in backbone.parameters()
+        if id(parameter) not in excluded_parameter_ids
+    }
+    if trunk_coverage != trunk_expected:
+        raise AssertionError(
+            "the Muon split must exactly cover the AdamW trunk group it "
+            "replaced"
+        )
+    critic_registered = [
+        parameter
+        for name, optimizer in optimizers.items()
+        if name.startswith("critic")
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if {id(p) for p in critic_registered} != {
+        id(p) for p in critic.parameters()
+    } or len(critic_registered) != len({id(p) for p in critic_registered}):
+        raise AssertionError("critic parameters must partition across optimizers")
+    return optimizers
 
 
 def joint_action_logprobs(
@@ -1314,9 +1449,9 @@ def update_minibatch(
     """
     backbone = wrapper.backbone
     if critic_step:
-        optimizers["critic"].zero_grad(set_to_none=True)
+        zero_optimizers(optimizers, "critic")
     if actor_step and "actor" in optimizers:
-        optimizers["actor"].zero_grad(set_to_none=True)
+        zero_optimizers(optimizers, "actor")
     if replay_max_trajectories < 1:
         raise ValueError("replay max trajectories must be positive")
     if replay_attention_budget < 1:
@@ -1841,7 +1976,7 @@ def update_minibatch(
             critic.parameters()
         )
         if critic_step:
-            optimizers["critic"].step()
+            step_optimizers(optimizers, "critic")
         return scalar_tensors_to_floats(metric_tensors)
 
     # Norms are cumulative across prompt groups; the final group reports the
@@ -1868,9 +2003,9 @@ def update_minibatch(
         ),
     }
     if critic_step:
-        optimizers["critic"].step()
+        step_optimizers(optimizers, "critic")
     if actor_step and "actor" in optimizers:
-        optimizers["actor"].step()
+        step_optimizers(optimizers, "actor")
     metric_tensors.update(
         policy_loss=totals["policy_loss"],
         thought_reverse_kl_penalty=totals["thought_reverse_kl_penalty"],
@@ -2298,6 +2433,28 @@ def main() -> None:
     # the old 3e-4 default (a pretraining-scale rate) caused behavior-KL
     # spikes and policy collapse when a job omitted --learning-rate.
     parser.add_argument("--learning-rate", type=float, default=5e-5)
+    # Trunk update geometry. "muon" mirrors pretraining: block matrices step
+    # under NewtonSchulz5-orthogonalized momentum while embeddings, readout,
+    # gains, and every RL-only head stay under AdamW. Old checkpoints
+    # (pre-Muon-split) resume with "adamw".
+    parser.add_argument(
+        "--trunk-optimizer", choices=("muon", "adamw"), default="muon"
+    )
+    # Default: --learning-rate scaled by pretraining's Muon:generic-Adam
+    # ratio (0.025 / 0.015). NOTE: at equal nominal LR a Muon step moves each
+    # element ~1/sqrt(model_dim) as far as AdamW, so this default under-moves
+    # the trunk relative to the AdamW baseline; it is the conservative anchor
+    # for the planned LR sweep, not a tuned optimum.
+    parser.add_argument("--muon-learning-rate", type=float, default=None)
+    # Defaults to --muon-learning-rate. The critic trunk is from-scratch
+    # (genuine pretraining regime), so it may tolerate a higher rate.
+    parser.add_argument("--critic-muon-learning-rate", type=float, default=None)
+    # Trunk-optimizer migration: resume model/critic/step/prompt-cursor from
+    # a checkpoint whose optimizer layout differs, starting all optimizer
+    # state empty instead of loading it.
+    parser.add_argument(
+        "--reset-optimizers-on-resume", action="store_true"
+    )
     parser.add_argument("--value-bins", type=int, default=101)
     # HL-Gauss projection sigma as a fraction of bin width (cleanrl v215 /
     # Dreamer4 default).
@@ -2325,9 +2482,11 @@ def main() -> None:
     # has action-level scale and directly complements per-dimension PPO clip.
     parser.add_argument("--thought-reverse-kl-coef", type=float, default=0.3)
     # Head-only Bernoulli entropy bonus, averaged over optional gate
-    # decisions. The 4e-3 default remains far below v13's 3e-2 intervention,
-    # which overwhelmed the learned gate despite falling reward.
-    parser.add_argument("--gate-entropy-coef", type=float, default=4e-3)
+    # decisions. Kept small enough that it cannot outweigh the gate's
+    # advantage signal: at 1e-2 (and even 4e-3-scale) the bonus dragged the
+    # gate toward 50/50 while think advantage stayed pinned negative on a
+    # zero-reward base policy, compounding THINK-step derailment.
+    parser.add_argument("--gate-entropy-coef", type=float, default=1e-4)
     # Freeze the gate for the first N steps: the gate learns "don't think"
     # from a clean binary signal far faster than the 512-dim thought content
     # can learn to be useful, so exploration dies before content training
@@ -2529,6 +2688,21 @@ def main() -> None:
         )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         parser.error("--learning-rate must be finite and positive")
+    if args.muon_learning_rate is None:
+        # Pretraining ran Muon at 0.025 beside the generic AdamW groups at
+        # 0.015; carrying that ratio onto the RL rate is the "proportionate"
+        # translation of the pretraining recipe.
+        args.muon_learning_rate = args.learning_rate * (0.025 / 0.015)
+    if args.critic_muon_learning_rate is None:
+        args.critic_muon_learning_rate = args.muon_learning_rate
+    for name, value in (
+        ("--muon-learning-rate", args.muon_learning_rate),
+        ("--critic-muon-learning-rate", args.critic_muon_learning_rate),
+    ):
+        if not math.isfinite(value) or value <= 0.0:
+            parser.error(f"{name} must be finite and positive")
+    if args.reset_optimizers_on_resume and not args.resume:
+        parser.error("--reset-optimizers-on-resume requires --resume")
     if (
         not math.isfinite(args.nearby_reward_max)
         or args.nearby_reward_max < 0.0
@@ -2844,7 +3018,12 @@ def main() -> None:
         critic.load_state_dict(actor_init_payload["critic"], strict=True)
 
     optimizers = build_optimizers(
-        wrapper, critic, learning_rate=args.learning_rate,
+        wrapper,
+        critic,
+        learning_rate=args.learning_rate,
+        trunk_optimizer=args.trunk_optimizer,
+        muon_learning_rate=args.muon_learning_rate,
+        critic_muon_learning_rate=args.critic_muon_learning_rate,
     )
     if args.actor_critic_init:
         # A step-0 critic-warm checkpoint has never stepped its actor. Its
@@ -2853,16 +3032,32 @@ def main() -> None:
         # the gate and recurrent adapter again. Preserve the trained critic's
         # optimizer state and start the untouched actor optimizer in the
         # current six-group layout.
-        source_actor_optimizer = actor_init_payload["optimizers"]["actor"]
-        if source_actor_optimizer["state"]:
+        source_optimizers = actor_init_payload["optimizers"]
+        for name, source in source_optimizers.items():
+            if name.startswith("actor") and source["state"]:
+                raise ValueError(
+                    "--actor-critic-init requires a pristine actor optimizer"
+                )
+        critic_names = [name for name in optimizers if name.startswith("critic")]
+        missing = [name for name in critic_names if name not in source_optimizers]
+        extra = [
+            name
+            for name in source_optimizers
+            if name.startswith("critic") and name not in optimizers
+        ]
+        if missing or extra:
             raise ValueError(
-                "--actor-critic-init requires a pristine actor optimizer"
+                "--actor-critic-init checkpoint optimizer layout "
+                f"{sorted(n for n in source_optimizers if n.startswith('critic'))} "
+                f"does not match the --trunk-optimizer {args.trunk_optimizer} "
+                f"layout {sorted(critic_names)}; rerun the critic warmup or "
+                "pass the matching --trunk-optimizer"
             )
-        optimizers["critic"].load_state_dict(
-            actor_init_payload["optimizers"]["critic"]
+        for name in critic_names:
+            optimizers[name].load_state_dict(source_optimizers[name])
+        reassert_learning_rates(
+            {name: optimizers[name] for name in critic_names}, args
         )
-        for group in optimizers["critic"].param_groups:
-            group["lr"] = args.learning_rate
 
     tokenizer = load_posttraining_tokenizer(
         backbone.architecture, FreshHyperparameters.tokenizer_path
@@ -3092,19 +3287,36 @@ def main() -> None:
             )
         wrapper.load_state_dict(payload["model"], strict=True)
         critic.load_state_dict(payload["critic"], strict=True)
-        optimizers["actor"].load_state_dict(payload["optimizers"]["actor"])
-        optimizers["critic"].load_state_dict(
-            payload["optimizers"]["critic"]
-        )
+        if args.reset_optimizers_on_resume:
+            # Trunk-optimizer migration: keep model, critic, step, and prompt
+            # cursor; every optimizer starts with empty state under the
+            # freshly built layout. Adam second moments rebuild over the next
+            # few hundred updates — a transient, not a schedule change.
+            print(
+                "resume with reset optimizers: discarding "
+                f"{sorted(payload['optimizers'])} state for the "
+                f"--trunk-optimizer {args.trunk_optimizer} layout "
+                f"{sorted(optimizers)}",
+                flush=True,
+            )
+        elif set(payload["optimizers"]) != set(optimizers):
+            raise ValueError(
+                "resume checkpoint optimizer layout "
+                f"{sorted(payload['optimizers'])} does not match the "
+                f"--trunk-optimizer {args.trunk_optimizer} layout "
+                f"{sorted(optimizers)}; checkpoints from before the Muon "
+                "trunk split resume with --trunk-optimizer adamw, or migrate "
+                "with --reset-optimizers-on-resume"
+            )
+        else:
+            for name, optimizer in optimizers.items():
+                optimizer.load_state_dict(payload["optimizers"][name])
         # The sigma head is learned: the model load above restored it, and
         # (unlike the old fixed-buffer scheme) the CLI must NOT reassert it on
         # resume — --thought-log-sigma-init is an initialization, not a
         # schedule.  Learning rates remain the documented cross-run knobs and
         # are reasserted below.
-        for group in optimizers["actor"].param_groups:
-            group["lr"] = args.learning_rate
-        for group in optimizers["critic"].param_groups:
-            group["lr"] = args.learning_rate
+        reassert_learning_rates(optimizers, args)
         start_step = int(payload["step"])
         warmup_step = int(
             payload.get(
@@ -3731,7 +3943,7 @@ def main() -> None:
             value_action_denominator = torch.stack(
                 [group.action_mask.sum() for group in groups]
             ).sum()
-            optimizers["critic"].zero_grad(set_to_none=True)
+            zero_optimizers(optimizers, "critic")
             group_metrics = [
                 training_update(
                     wrapper,
@@ -3747,7 +3959,7 @@ def main() -> None:
                 )
                 for group in groups
             ]
-            optimizers["critic"].step()
+            step_optimizers(optimizers, "critic")
             del groups
             update_seconds = time.perf_counter() - update_started
             metrics = {
@@ -3820,7 +4032,7 @@ def main() -> None:
             # The optimizer state is sufficient for the next update and for
             # checkpoints. Keeping the accumulated gradient buffers alive
             # overlaps them with the next rollout's KV cache for no benefit.
-            optimizers["critic"].zero_grad(set_to_none=True)
+            zero_optimizers(optimizers, "critic")
             warmup_step = warmup
             if (
                 warmup % args.warmup_save_every == 0
@@ -4021,8 +4233,8 @@ def main() -> None:
             # are memory partitions, not optimizer minibatches.
             update_started = time.perf_counter()
             next_step = step + 1
-            optimizers["actor"].zero_grad(set_to_none=True)
-            optimizers["critic"].zero_grad(set_to_none=True)
+            zero_optimizers(optimizers, "actor")
+            zero_optimizers(optimizers, "critic")
             sigma_parameters = list(
                 wrapper.transition.log_sigma_head.parameters()
             )
@@ -4101,14 +4313,14 @@ def main() -> None:
                     "non-finite gradients before optimizer step: "
                     f"{nonfinite_gradients}"
                 )
-            optimizers["actor"].step()
-            optimizers["critic"].step()
+            step_optimizers(optimizers, "actor")
+            step_optimizers(optimizers, "critic")
             # Gradient buffers have already been reduced to scalar telemetry.
             # Release them before the optional second replay so this read-only
             # diagnostic cannot stack an inference forward on top of the
             # training step's peak allocation.
-            optimizers["actor"].zero_grad(set_to_none=True)
-            optimizers["critic"].zero_grad(set_to_none=True)
+            zero_optimizers(optimizers, "actor")
+            zero_optimizers(optimizers, "critic")
             with torch.no_grad():
                 sigma_deltas = [
                     parameter.detach() - before
@@ -4235,8 +4447,8 @@ def main() -> None:
         # container before
         # BPB/evaluation allocates its own full-context activations and KV
         # caches, and before the next collect evaluates its RHS.
-        optimizers["actor"].zero_grad(set_to_none=True)
-        optimizers["critic"].zero_grad(set_to_none=True)
+        zero_optimizers(optimizers, "actor")
+        zero_optimizers(optimizers, "critic")
         del groups
 
         if crossed_interval(previous_step, step, args.bpb_every):
