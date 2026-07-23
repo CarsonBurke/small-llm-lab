@@ -703,6 +703,7 @@ print0("="*100)
 
 data_path = os.environ.get("DATA_PATH", "data/datasets/fineweb_onepass_sp1024")
 tokenizer_path = os.environ.get("TOKENIZER_PATH", "data/tokenizers/fineweb_1024_bpe.model")
+vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))  # must match tokenizer/data
 
 val_tokens = int(os.environ.get("VAL_TOKENS", 20 * 524288))
 batch_size = 8 * 64 * 1024
@@ -713,7 +714,7 @@ val_inputs, val_targets = next(distributed_data_generator(f"{data_path}/fineweb_
 # sentencepiece byte-LUT accounting used by train_gpt.py's eval.
 sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
 base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = train_gpt.build_sentencepiece_luts(
-    sp, vocab_size=1024, device=device
+    sp, vocab_size=vocab_size, device=device
 )
 with torch.no_grad():
     _prev = val_inputs.reshape(-1).to(torch.int64)
@@ -723,7 +724,7 @@ with torch.no_grad():
     val_byte_count = float(_bytes.sum())
     assert val_byte_count > 0
 
-model = GPT(vocab_size=1024, num_layers=6, model_dim=512).cuda()
+model = GPT(vocab_size=vocab_size, num_layers=6, model_dim=512).cuda()
 model.compile(dynamic=False)
 print0(f"parameters: {sum(p.numel() for p in model.parameters()):,}", console=True)
 

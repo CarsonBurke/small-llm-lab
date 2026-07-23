@@ -296,9 +296,14 @@ data_path = os.environ.get("DATA_PATH", "data/datasets/fineweb10B_gpt2")
 
 val_tokens = int(os.environ.get("VAL_TOKENS", 64 * 524288))
 batch_size = 8 * 64 * 1024
+# SEQ_LEN reshapes the same token budget into longer rows (RoPE positions seen
+# in pretraining bound the usable RL context). Halve MBS when doubling SEQ_LEN
+# to keep microbatch tokens (and the 50304-wide logit buffer) constant.
+seq_len = int(os.environ.get("SEQ_LEN", 1024))
 mbs = int(os.environ.get("MBS", 8))
-assert batch_size % (mbs * 1024) == 0 and val_tokens % (mbs * 1024) == 0
-val_inputs, val_targets = next(distributed_data_generator(f"{data_path}/fineweb_val_*.bin", val_tokens))
+assert batch_size % (mbs * seq_len) == 0 and val_tokens % (mbs * seq_len) == 0
+val_inputs, val_targets = next(distributed_data_generator(
+    f"{data_path}/fineweb_val_*.bin", val_tokens, seq_len=seq_len))
 
 # Challenge BPB metric with GPT-2 byte accounting: each GPT-2 BPE token maps
 # to a fixed byte string, so a per-token byte-length LUT is exact.
@@ -381,7 +386,8 @@ for trial in range(num_trials):
     #        Training and Validation       #
     ########################################
 
-    train_loader = distributed_data_generator(f"{data_path}/fineweb_train_*.bin", batch_size)
+    train_loader = distributed_data_generator(
+        f"{data_path}/fineweb_train_*.bin", batch_size, seq_len=seq_len)
     for p in model.parameters():
         dist.broadcast(p.detach(), 0)
     # start the clock
@@ -450,6 +456,9 @@ for trial in range(num_trials):
             "model": model.state_dict(),
             "model_config": dict(vocab_size=VOCAB_SIZE, num_layers=6, model_dim=512, mlp_hidden=2048),
             "architecture": "nanogpt_mini_gpt2vocab_v1",
+            # RoPE positions seen in pretraining bound the usable RL context
+            # (half-truncate rotary has no extrapolation).
+            "train_seq_len": seq_len,
         }, ckpt_path)
         print0(f"saved checkpoint: {ckpt_path}", console=True)
 
