@@ -122,3 +122,54 @@ build → 305 `nanomini_gpt2vocab_mathmix4k_2k` (SEQ_LEN=4096 MBS=2) → 307 cot
 `--rollout-only` variance gate (the single smoke run; exit 2 blocks the RL) →
 308 `rl_gpt2vocab_cot_20k` (DAPO-Math-17K, `--reasoning-mode cot --steps 20000
 --aime-every 250`, output `logs/rl_gpt2vocab_cot`).
+
+### Muon trunk optimizer for RL (2026-07-23)
+
+`postraining/muon.py` + `--trunk-optimizer {muon,adamw}` (default muon): block
+matrices (ndim>=2, both actor backbone and from-scratch critic trunk) step
+under the exact pretraining Muon (NS5 x12 bf16, nesterov mu 0.95,
+max(1,rows/cols)**0.5 scale); embed/readout/gains and all RL heads stay AdamW.
+Weight decay 0 everywhere (post-training rule). `--muon-learning-rate`
+defaults to lr*(0.025/0.015)=8.33e-5 at lr 5e-5 — the pretraining Muon rate
+scaled by the same ~300x factor as Adam 0.015→5e-5. Caveat: at equal nominal
+lr a Muon step moves each element ~sqrt(512)=23x less than AdamW, so the
+default under-moves the trunk; if learning does not speed up, sweep
+`--muon-learning-rate` {8.3e-5, 2.5e-4, 5e-4, 1.1e-3(RMS-match)}.
+`--critic-muon-learning-rate` defaults to the actor value. Optimizer
+checkpoint keys become {actor, actor_muon, critic, critic_muon}; pre-split
+checkpoints (job 316 lineage) resume with `--trunk-optimizer adamw` (clear
+error otherwise). Reviewed + red-teamed; tests in
+postraining/tests/test_muon.py.
+
+Bench/AIME diagnosis (job 316 run, cot 5e-5): NOT answer-format mismatch —
+step-0 model passed exact-match on letters/bools/lists/decimals (closest 0.78,
+sort 0.58, pair 0.55). DAPO's tiny-integer ground truths (median 2 chars)
+mode-collapsed the policy onto a ~12-token `boxedboxed{N Answer:N` small-int
+emitter: bench 24.5%→~2% (modal floor) by step 450, CoT gone, AIME pinned 0
+(single-digit guesses vs 3-digit answers). Same story in guard/val_bpb
+1.24→~1.9. User decision 2026-07-23: keep current run as-is.
+
+### Latent-from-base cold start diagnosis (2026-07-23)
+
+Latent RL from the same base checkpoint as the cot run (manifests confirm
+identical `logs/nanomini_gpt2vocab_mathmix4k_2k_final_model.pt`) started at
+exactly 0% accuracy / reward ~1e-4 vs cot's 1-2% / 0.023-0.044 at the same
+steps. Cause is NOT the 50/50 forced first-thought: `--init-think-probability`
+is a PER-DECISION gate probability, and at init-time DAPO stream lengths
+(mean ~1322 actions, smoke job 318) P(zero THINK slots) = 0.9^N ~ 1e-14, so
+every trajectory carried dozens of null-input slots the pretrained trunk has
+never seen (the zero adapter zeroes thought content, not the slot itself) →
+ended_fraction ~0.55, universal derailment, zero within-group reward
+variance, advantages ~0, positive-LM starved. The 0.1 default came from a
+Jul 18 measurement on the short-answer DeepMind task and does not transfer
+to long streams. Compounding: `--gate-entropy-coef 0.01` overpowered the
+(tiny, nearby-credit-only) negative think advantage — think fraction climbed
+0.100→0.125 in 60 steps while reward stayed flat (job 319, cancelled).
+
+Changes: `--gate-entropy-coef` default 4e-3 → 1e-4 (bonus must not outweigh
+gate advantage on a zero-reward policy). Job 321 (0.1 init-think) cancelled
+minutes in; job 322 `rl_gpt2vocab_latent_20k_ge1e4_itp01` relaunched with
+`--init-think-probability 0.01` (user choice; ~5% think-free free-half
+trajectories at N~300 — weak but nonzero signal; forced half still supplies
+gate contrast). Aborted run dirs staged: job 319 (60 steps) at
+postraining/runs/rl_gpt2vocab_latent_ge01_step60.
