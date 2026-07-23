@@ -97,3 +97,28 @@ Validation (2026-07-22, all via mlq 271-290; tests 280 passed / 5 skipped):
   checkpoints should start with none-mode or improve the base first.
 - 4-step training + save→resume roundtrip per mode: all finite, age-0
   clip/policy exactly 0.0 (also post-resume), peak VRAM ≤5.7 GiB.
+
+### Long-context + GPT-2 vocab extension (2026-07-22, later)
+
+Nano pretraining scripts take `SEQ_LEN` (and `MBS`; halve MBS when doubling
+SEQ_LEN) and record `train_seq_len` in the checkpoint; the trainer/probe derive
+budgets from it: prompt 512, response `min(1024, (ctx-512)//2)`, latent stream
+`min(4*response, ctx-512)`. At SEQ_LEN=4096 that is 512/1024 with a full-budget
+cot stream — jobs 296-302 rebuild the sp1024 mathmix bases at 4096 and re-gate.
+
+`nanogpt_mini_gpt2vocab_v1` is now a supported RL backbone:
+- `postraining.core.load_posttraining_tokenizer` returns a `GPT2BPETokenizer`
+  (transformers GPT2TokenizerFast) for `*gpt2vocab*` architectures; the single
+  `<|endoftext|>`=50256 is both BOS and EOS, so stop ids dedupe to (50256,).
+- BPB guard: `data/tokenizers/gpt2_byte_lut.pt` + zeroed correction tables fed
+  to `eval_val` = direct LUT byte sum; val default `data/datasets/fineweb10B_gpt2`.
+- `build_math_mix_dataset.py --tokenizer gpt2` builds the same mix under GPT-2
+  BPE (QA docs drop their final EOS: the next doc's leading token terminates
+  the last answer; keeping both would pretrain a doubled stop token).
+
+Active chain (2026-07-22, trimmed for compute — jobs 296-303 + 306 of the
+sp1024 4k track and extra probes cancelled as superseded): 304 `mathmix_v4_gpt2`
+build → 305 `nanomini_gpt2vocab_mathmix4k_2k` (SEQ_LEN=4096 MBS=2) → 307 cot
+`--rollout-only` variance gate (the single smoke run; exit 2 blocks the RL) →
+308 `rl_gpt2vocab_cot_20k` (DAPO-Math-17K, `--reasoning-mode cot --steps 20000
+--aime-every 250`, output `logs/rl_gpt2vocab_cot`).

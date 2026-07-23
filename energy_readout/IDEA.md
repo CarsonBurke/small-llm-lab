@@ -1048,6 +1048,85 @@ matched-bytes GPT-2 number (~1.23): prediction 1.24-1.27 raw @ 2000.
 If ≤1.26, the vocab axis dominates every recipe lever measured so far
 and param rebalancing for 8192 becomes the top design priority.
 
+**H34 VERDICT (job 295, 2026-07-22): CONFIRMED — STRONGER than
+predicted.** `nanogpt_mini_sp8192_2k` = **1.2209 @ 2000** (returncode
+0), below even the optimistic edge of the 1.24-1.27 band. −0.0647 vs
+the sp1024 mini (1.2856), −0.0483 vs the record PORT at sp1024
+(1.2692) — one vocab change beats the entire ported optimizer system's
+margin. Data-fairness check from the run's own numbers: val_loss
+3.15389 nats/tok ÷ ln2 ÷ 1.2209 bpb → **3.727 bytes/token** (vs sp1024
+2.4076); matched-bytes step = 2000·(2.4076/3.727) ≈ 1292, interpolated
+val there ≈ **1.266** — still −0.020 vs sp1024 mini with the data
+advantage removed. And the challenge scores WALLCLOCK, not bytes: the
+per-step cost was ~identical (585-611 ms/step vs mini's ~588), so the
+raw 1.2209 is the decision-relevant number. Curve still steep at the
+end (−0.010/200 steps), consistent with larger-vocab data hunger —
+more headroom at full scale. **The vocab axis dominates every recipe
+lever measured; 8192 param rebalancing is now the top design
+priority.** Untied head at 8192 ≈ 27.3M params (over budget) → tied
+head (H33's equal-BPB null, −4.2M at 8192) is the fit mechanism →
+composition run H35.
+
+## Mini-Lineage: sp8192 × Record Port + Tied Head (registered before results)
+
+`nanogpt_mini_cwd_tieddot_sp8192_2k`: the H35 composition — record
+port system (`nanogpt_mini_cwd_tieddot_train.py`, tied rms-normed dot
+head, job 294 = 1.2688 at sp1024) with new VOCAB_SIZE knob (default
+1024 preserves semantics) at vocab 8192, fineweb10B_sp8192 shards,
+VAL_TOKENS=40,501,248. Params ≈ 19.96M − 2·0.52M + 4.19M ≈ 23.1M —
+tied head saves the 4.2M untied head; remaining overage vs 16MB is
+trunk-side design work IF this wins. Interaction risks, registered
+up front: (1) embed lr 0.3 + EMA-Nesterov + tail-EMA-excluded embed
+were tuned at vocab 1024 — an 8× larger embedding table sees 8× fewer
+updates per row; (2) H33 showed the tied head adds nothing at 1024,
+but at 8192 the shared table gets 8× more readout gradient, so the
+attachment could interact differently in either direction.
+**H35:** the port's sp1024 margin (1.2856→1.2688, −0.017) transfers
+at least half to sp8192: prediction **1.195-1.215 raw @ 2000**. If
+≤1.21, the combined system is within striking distance of the 1.0810
+SOTA trajectory and the next work is budget-fitting (trunk rebalance +
+serialization) rather than recipe search. If it lands ≥1.221 (no gain
+vs plain mini at 8192), the port's levers don't transfer across vocab
+and per-vocab retuning (embed lr first) becomes the follow-up.
+
+**H35 VERDICT (job 309, 2026-07-22): CONFIRMED at the weak edge —
+partial transfer.** `nanogpt_mini_cwd_tieddot_sp8192_2k` = **1.2149 @
+2000** (returncode 0), top edge of the 1.195-1.215 band. −0.0060 vs
+plain mini at 8192 (1.2209): above the 0.005 bar, but only ~35% of the
+port's sp1024 margin (−0.017) transferred. New best on the board.
+CRITICAL CAVEAT: step time **796 ms vs the mini's ~600** at 8192 —
+SOAP's relative overhead GREW with vocab (+33% wallclock for −0.006
+BPB), and the challenge scores wallclock. At matched TIME the mini
+would get ~2620 steps, and its endgame slope (−0.010/200) suggests it
+could beat 1.2149 on time alone → H37 is now decision-critical, not a
+curiosity. Both curves still steep at 2000 (port −0.0038/200).
+
+## Mini-Lineage: sp8192 Follow-ups (registered before results)
+
+`nanogpt_mini_cwd_tieddot_sp8192_nosoap_2620`: H37, the matched-TIME
+test. Port@8192 with SOAP=0, ITERATIONS=2620 chosen to match job 309's
+~1,592s train wallclock (no-SOAP step est. 607 ms = 541 ms at 1024 +
+the 66 ms vocab growth). Schedule is fraction-of-ITERATIONS so it
+self-rescales. **H37:** cheap port levers (46% retention at 1024) +
+~31% more steps on a still-steep curve beat SOAP's quality-per-step:
+prediction **1.19-1.21**, i.e. BEATS job 309's 1.2149 at equal time.
+If confirmed, the submission design drops SOAP entirely (wallclock
+scoring); if refuted (≥1.215), SOAP survives matched-time at 8192 and
+stays in the design.
+
+`nanogpt_mini_cwd_tieddot_sp8192_embedlr07_2k`: H36, EMBED_LR=0.7 on
+the port@8192 (2000 steps, one lever). At sp1024 this was suggestive
+below bar (−0.0022, H32). At 8192 each embed row sees ~8× fewer
+updates, so a higher embed lr should matter MORE. **H36:** prediction
+**1.205-1.212** (−0.003 to −0.010 vs 1.2149). If ≥−0.005, EMBED_LR=0.7
+enters the 8192 config; if null, embed lr is vocab-insensitive and the
+H32 sp1024 result was noise.
+
+**H36/H37 CANCELLED BEFORE START (jobs 310/311, 2026-07-22): user
+directive ("not interesting").** No data collected; predictions above
+stand unresolved. The matched-TIME SOAP question and the 8192 embed-lr
+question remain open on paper only.
+
 ## Mini-Lineage: Machinery-Free Energy Head (registered before results)
 
 `nanogpt_mini_tiedenergy_fullval_2k`, script
@@ -1164,6 +1243,20 @@ mini 0.7) may weaken the attached codebook's adaptation). Keep if
 >0.005 vs 1.2692; even null is informative (head choice decouples from
 training system). Watch readout_scale telemetry for softcap saturation
 under the record's aux betas.
+
+**H33 VERDICT (job 294, 2026-07-22): NULL — no composition.**
+`nanogpt_mini_cwd_tieddot_2k` = **1.2688 @ 2000** (returncode 0):
+−0.0004 vs the port's 1.2692, far inside noise. The tieddot delta
+(+0.0039 on the mini recipe) does NOT carry under the record system —
+consistent with the registered counterargument that the record recipe
+already extracts what attachment was providing (its proj group gets a
+dedicated tuned LR + power tail). BUT the null has real value for the
+BUDGET: tieddot deletes the 0.53M-param untied head at equal BPB, and
+head params scale with vocab — at sp8192 the untied head alone is
+4.2M params, so IF H34 makes 8192 the direction, the tied head is how
+it fits in 16MB. Decision: keep the untied port (1.2692) as the sp1024
+reference base; carry `nanogpt_mini_cwd_tieddot_train.py` as the
+param-lean equal-performance variant for vocab rebalancing.
 
 ## Program Note: Attached-Target Line Continues (user direction, 2026-07-22)
 
