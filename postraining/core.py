@@ -315,6 +315,53 @@ def deterministic_math_subset(rows: list[dict], max_rows: int) -> list[dict]:
     return [row for position, row in enumerate(rows) if position in selected]
 
 
+class GPT2BPETokenizer:
+    """GPT-2 byte-level BPE behind the SentencePiece surface this stack uses.
+
+    The gpt2vocab nano variant pretrains on modded-nanogpt's GPT-2 shards,
+    where the single ``<|endoftext|>`` token (50256) is both the leading
+    document-boundary cue and the only stop signal — so it plays the roles
+    SentencePiece splits between BOS and EOS. ``decode`` skips special
+    tokens so a terminal ``<|endoftext|>`` never leaks into answer parsing.
+    """
+
+    EOT_ID = 50256
+
+    def __init__(self):
+        from transformers import GPT2TokenizerFast
+
+        self._tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        # Prompts are encoded in full and tail-truncated afterwards; the
+        # 1024-token warning threshold is pretraining trivia here.
+        self._tokenizer.model_max_length = 1 << 30
+
+    def encode(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text)
+
+    def decode(self, ids) -> str:
+        return self._tokenizer.decode(list(ids), skip_special_tokens=True)
+
+    def eos_id(self) -> int:
+        return self.EOT_ID
+
+    def bos_id(self) -> int:
+        return self.EOT_ID
+
+    def id_to_piece(self, token_id: int) -> str:
+        # GPT-2 pieces mark leading spaces with "Ġ", never SentencePiece's
+        # "▁", so piece-based display heuristics degrade to no-ops.
+        return self._tokenizer.convert_ids_to_tokens(int(token_id))
+
+
+def load_posttraining_tokenizer(architecture: str, sp_model_path: str):
+    """The tokenizer family the checkpoint's pretraining data was built with."""
+    if "gpt2vocab" in architecture:
+        return GPT2BPETokenizer()
+    import sentencepiece as spm
+
+    return spm.SentencePieceProcessor(model_file=sp_model_path)
+
+
 def encode_prompt(tokenizer, text: str, max_tokens: int | None = None) -> list[int]:
     """Encode a prompt the way pretraining framed documents: BOS-first.
 

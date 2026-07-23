@@ -34,6 +34,7 @@ from postraining.latent_thought import (
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
 )
+from postraining.core import GPT2BPETokenizer, load_posttraining_tokenizer
 from postraining.nano_backbone import NanoGPTBackbone
 from postraining.train_latent_vapo import (
     answer_prefix_token_ids,
@@ -350,6 +351,52 @@ def test_answer_prefix_token_ids_match_document_tokenization():
     assert tuple(document[len(question_ids):][: len(prefix)]) == prefix
     # The score path decodes prefix + emitted; the parser needs "Answer:".
     assert "Answer:" in tokenizer.decode(list(prefix))
+
+
+def test_load_posttraining_tokenizer_selects_gpt2_for_gpt2vocab_archs():
+    pytest.importorskip("transformers")
+    tokenizer = load_posttraining_tokenizer(
+        "nanogpt_mini_gpt2vocab_v1", FreshHyperparameters.tokenizer_path
+    )
+    assert isinstance(tokenizer, GPT2BPETokenizer)
+    # The single <|endoftext|> token reports as both EOS and BOS; the
+    # trainer's dict.fromkeys dedupe must collapse it to one stop id.
+    assert tokenizer.eos_id() == 50256
+    assert tokenizer.bos_id() == 50256
+    stop_ids = tuple(
+        dict.fromkeys(
+            t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+        )
+    )
+    assert stop_ids == (50256,)
+    text = "Solve 2+2.\nAnswer: 4"
+    ids = tokenizer.encode(text)
+    assert all(0 <= token < 50257 for token in ids)
+    assert tokenizer.decode(ids) == text
+    # The score path decodes emitted ids that may include the stop token.
+    assert tokenizer.decode(ids + [50256]) == text
+
+
+def test_answer_prefix_derivation_is_boundary_stable_under_gpt2():
+    pytest.importorskip("transformers")
+    tokenizer = GPT2BPETokenizer()
+    prefix = answer_prefix_token_ids(tokenizer)
+    # Byte-level BPE pre-splits on the regex boundary, so the in-context
+    # derivation must agree with the standalone encoding (unlike sp1024).
+    assert list(prefix) == tokenizer.encode("\nAnswer:")
+    assert "Answer:" in tokenizer.decode(list(prefix))
+
+
+@pytest.mark.skipif(
+    not os.path.exists(FreshHyperparameters.tokenizer_path),
+    reason="sp1024 tokenizer model not present",
+)
+def test_load_posttraining_tokenizer_keeps_sentencepiece_elsewhere():
+    for architecture in ("nanogpt_mini_v1", "nanogpt_mini_tieddot_v1", "fresh"):
+        tokenizer = load_posttraining_tokenizer(
+            architecture, FreshHyperparameters.tokenizer_path
+        )
+        assert isinstance(tokenizer, spm.SentencePieceProcessor)
 
 
 def test_nano_load_records_train_context_tokens(tmp_path):

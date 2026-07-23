@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -29,6 +30,7 @@ from torch import Tensor
 
 import train_gpt as baseline
 from fresh_lejepa_train import FreshHyperparameters
+from postraining.core import load_posttraining_tokenizer
 from postraining.latent_thought import (
     LatentThoughtModel,
     migrate_legacy_wrapper_checkpoint,
@@ -144,12 +146,43 @@ def main() -> None:
         wrapper.load_state_dict(payload["model"], strict=True)
     wrapper.eval()
 
-    import sentencepiece as spm
-
-    tokenizer = spm.SentencePieceProcessor(model_file=FreshHyperparameters.tokenizer_path)
-    luts = baseline.build_sentencepiece_luts(tokenizer, FreshHyperparameters.vocab_size, device)
-    seq_len = FreshHyperparameters.train_seq_len
-    val_tokens = baseline.load_validation_tokens(FreshHyperparameters.val_files, seq_len)
+    tokenizer = load_posttraining_tokenizer(
+        backbone.architecture, FreshHyperparameters.tokenizer_path
+    )
+    is_nano = backbone.architecture.startswith("nanogpt_mini")
+    is_gpt2_vocab = is_nano and "gpt2vocab" in backbone.architecture
+    if is_gpt2_vocab:
+        # GPT-2 tokens map to fixed byte strings: zeroed correction tables
+        # make eval_val's SentencePiece leading-space term vanish, leaving a
+        # direct LUT byte sum (same guard as train_latent_vapo).
+        gpt2_bytes = torch.load(
+            "data/tokenizers/gpt2_byte_lut.pt", weights_only=True
+        ).to(device)
+        no_correction = torch.zeros(
+            gpt2_bytes.size(0), dtype=torch.bool, device=device
+        )
+        luts = (gpt2_bytes, no_correction, no_correction)
+    else:
+        luts = baseline.build_sentencepiece_luts(
+            tokenizer, FreshHyperparameters.vocab_size, device
+        )
+    seq_len = (
+        getattr(backbone, "train_context_tokens", 1024)
+        if is_nano
+        else FreshHyperparameters.train_seq_len
+    )
+    val_files = FreshHyperparameters.val_files
+    if is_nano:
+        default_val_dataset = (
+            "data/datasets/fineweb10B_gpt2"
+            if is_gpt2_vocab
+            else "data/datasets/fineweb_onepass_sp1024"
+        )
+        val_files = os.path.join(
+            os.environ.get("DATA_PATH", default_val_dataset),
+            "fineweb_val_*.bin",
+        )
+    val_tokens = baseline.load_validation_tokens(val_files, seq_len)
     raw = val_tokens[: args.sequences * seq_len + 1].to(device=device, dtype=torch.int64)
     x = raw[:-1].reshape(-1, seq_len)
     y = raw[1:].reshape(-1, seq_len)

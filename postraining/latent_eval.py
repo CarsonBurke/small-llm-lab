@@ -148,8 +148,12 @@ def evaluate_latent_math(
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     random.seed(seed)
+    # dict.fromkeys dedupes while keeping order: GPT-2's single <|endoftext|>
+    # token reports as both EOS and BOS.
     stop_ids = tuple(
-        t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+        dict.fromkeys(
+            t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+        )
     )
     if not stop_ids:
         raise RuntimeError(

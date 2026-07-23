@@ -582,6 +582,25 @@ def test_adapter_bias_is_a_shared_thought_type_offset():
     )
 
 
+def test_chunked_teacher_forced_ce_matches_one_shot_cross_entropy():
+    torch.manual_seed(29)
+    backbone = _pope_model()
+    wrapper = LatentThoughtModel(backbone).eval()
+    ids = torch.randint(0, 32, (3, 10))
+    targets = torch.randint(0, 32, (3, 10))
+    with torch.no_grad():
+        one_shot = torch.nn.functional.cross_entropy(
+            wrapper.policy_logits(ids).float().flatten(0, 1), targets.flatten()
+        )
+        full = wrapper(ids, targets)
+        # Force several uneven chunks; the token-weighted sum must reduce to
+        # the identical mean.
+        wrapper.BPB_EVAL_CHUNK_TOKENS = 7
+        chunked = wrapper(ids, targets)
+    torch.testing.assert_close(full, one_shot)
+    torch.testing.assert_close(chunked, one_shot)
+
+
 def test_thought_step_advances_state_without_rendering_machinery_changes():
     torch.manual_seed(23)
     backbone = _pope_model()

@@ -610,10 +610,31 @@ class LatentThoughtModel(nn.Module):
             self.renderer_features(input_latent, belief)
         )
 
+    # Tokens rendered per chunk in the teacher-forced CE below. The full
+    # [batch, seq, vocab] logits tensor (plus the softcap temporaries) does
+    # not fit on one GPU for large vocabularies — at GPT-2's 50257 vocab a
+    # 64x1024 eval batch needs tens of GiB — while the trunk activations
+    # feeding it are small. 8192 tokens keeps each logits chunk under ~2 GiB.
+    BPB_EVAL_CHUNK_TOKENS = 8192
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Teacher-forced CE used by the policy-renderer BPB guard."""
-        logits = self.policy_logits(input_ids)
-        return F.cross_entropy(logits.float().flatten(0, 1), target_ids.flatten())
+        """Teacher-forced CE used by the policy-renderer BPB guard.
+
+        Renders logits in token chunks and reduces with a sum so the result
+        is the exact token mean one-shot ``cross_entropy`` would return.
+        """
+        input_latent = self.embed_tokens(input_ids)
+        belief = self.backbone.temporal_belief_from_token_latent(input_latent)
+        features = self.renderer_features(input_latent, belief).flatten(0, 1)
+        targets = target_ids.flatten()
+        loss_sum = torch.zeros((), device=features.device, dtype=torch.float32)
+        for start in range(0, targets.numel(), self.BPB_EVAL_CHUNK_TOKENS):
+            stop = start + self.BPB_EVAL_CHUNK_TOKENS
+            logits = self.backbone.logits_from_features(features[start:stop])
+            loss_sum += F.cross_entropy(
+                logits.float(), targets[start:stop], reduction="sum"
+            )
+        return loss_sum / targets.numel()
 
     def make_static_generation_cache(
         self,

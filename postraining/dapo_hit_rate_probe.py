@@ -19,7 +19,6 @@ import collections
 import torch
 
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
-import sentencepiece as spm
 from fresh_lejepa_train import FreshHyperparameters
 from postraining.core import (
     POSTTRAIN_CONTEXT_TOKENS,
@@ -28,6 +27,7 @@ from postraining.core import (
     POSTTRAIN_STREAM_TOKENS,
     answer_style,
     encode_prompt,
+    load_posttraining_tokenizer,
     load_unique_math_rows,
     validate_posttraining_context_budget,
 )
@@ -96,10 +96,14 @@ def main() -> None:
         wrapper.gate.head.weight.zero_()
         wrapper.gate.head.bias.fill_(30.0)
 
-    tokenizer = spm.SentencePieceProcessor(
-        model_file=FreshHyperparameters.tokenizer_path
+    tokenizer = load_posttraining_tokenizer(
+        backbone.architecture, FreshHyperparameters.tokenizer_path
     )
-    stop_ids = tuple(t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0)
+    # dict.fromkeys dedupes while keeping order: GPT-2's single <|endoftext|>
+    # token reports as both EOS and BOS.
+    stop_ids = tuple(dict.fromkeys(
+        t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+    ))
     rows = load_unique_math_rows(args.math_data)[: args.prompts]
 
     torch.manual_seed(args.seed)

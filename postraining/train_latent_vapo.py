@@ -85,6 +85,7 @@ from postraining.core import (
     deterministic_math_subset,
     generalized_advantage_and_return_targets,
     length_adaptive_lambda,
+    load_posttraining_tokenizer,
     load_unique_math_rows,
     modal_answer_baseline,
     module_answer_baselines,
@@ -2863,9 +2864,15 @@ def main() -> None:
         for group in optimizers["critic"].param_groups:
             group["lr"] = args.learning_rate
 
-    tokenizer = spm.SentencePieceProcessor(model_file=FreshHyperparameters.tokenizer_path)
+    tokenizer = load_posttraining_tokenizer(
+        backbone.architecture, FreshHyperparameters.tokenizer_path
+    )
+    # dict.fromkeys dedupes while keeping order: GPT-2's single
+    # <|endoftext|> token reports as both EOS and BOS.
     stop_ids = tuple(
-        t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+        dict.fromkeys(
+            t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
+        )
     )
     if not stop_ids:
         raise RuntimeError(
@@ -2997,14 +3004,34 @@ def main() -> None:
                 flush=True,
             )
     seq_len = FreshHyperparameters.train_seq_len
-    luts = baseline.build_sentencepiece_luts(tokenizer, FreshHyperparameters.vocab_size, device)
-    # The BPB guard shares the sp1024 tokenizer across backbones, but nano
-    # pretrains against the onepass shard family; keep the guard on the same
+    is_gpt2_vocab = is_nano and "gpt2vocab" in backbone.architecture
+    if is_gpt2_vocab:
+        # GPT-2 tokens map to fixed byte strings, so the guard reduces to a
+        # direct LUT sum: zero leading-space/boundary tables make eval_val's
+        # SentencePiece correction term vanish.
+        gpt2_bytes = torch.load(
+            "data/tokenizers/gpt2_byte_lut.pt", weights_only=True
+        ).to(device)
+        no_correction = torch.zeros(
+            gpt2_bytes.size(0), dtype=torch.bool, device=device
+        )
+        luts = (gpt2_bytes, no_correction, no_correction)
+    else:
+        luts = baseline.build_sentencepiece_luts(
+            tokenizer, FreshHyperparameters.vocab_size, device
+        )
+    # The BPB guard shares the checkpoint's own tokenizer family, and nano
+    # pretrains against its own shard family; keep the guard on the same
     # validation bytes as nano's own pretraining val_bpb (DATA_PATH overrides).
     bpb_val_files = FreshHyperparameters.val_files
     if is_nano:
+        default_val_dataset = (
+            "data/datasets/fineweb10B_gpt2"
+            if is_gpt2_vocab
+            else "data/datasets/fineweb_onepass_sp1024"
+        )
         bpb_val_files = os.path.join(
-            os.environ.get("DATA_PATH", "data/datasets/fineweb_onepass_sp1024"),
+            os.environ.get("DATA_PATH", default_val_dataset),
             "fineweb_val_*.bin",
         )
     val_tokens = baseline.load_validation_tokens(bpb_val_files, seq_len)

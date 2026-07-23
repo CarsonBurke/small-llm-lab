@@ -35,6 +35,7 @@ from postraining.core import (
     POSTTRAIN_STREAM_TOKENS,
     answer_style,
     encode_prompt,
+    load_posttraining_tokenizer,
     load_unique_math_rows,
     validate_posttraining_context_budget,
 )
@@ -244,9 +245,9 @@ def main() -> None:
             wrapper.gate.head.bias.fill_(30.0)
         print("gate pinned to EMIT except for the forced half of each group")
 
-    import sentencepiece as spm
-
-    tokenizer = spm.SentencePieceProcessor(model_file=FreshHyperparameters.tokenizer_path)
+    tokenizer = load_posttraining_tokenizer(
+        backbone.architecture, FreshHyperparameters.tokenizer_path
+    )
 
     if args.fineweb is not None:
         from postraining.train_latent_vapo import sample_prompt_batch
