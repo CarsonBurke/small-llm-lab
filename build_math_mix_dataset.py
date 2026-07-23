@@ -17,6 +17,11 @@ Sources (all open, none homemade):
   - OpenMathInstruct-2 (CC-BY-4.0), all published problem sources, one
     problem + generated solution + ``Answer: <x>`` per document.
 
+``--tokenizer gpt2`` builds the same mix under GPT-2 byte-level BPE for the
+gpt2vocab nano models: BOS and EOS are both the single ``<|endoftext|>``
+token, so QA documents drop their final EOS (the next document's leading
+token terminates the last answer).
+
     python3 build_math_mix_dataset.py
 """
 
@@ -35,10 +40,35 @@ import sentencepiece as spm
 
 BOS_ID = 1
 EOS_ID = 2
+# GPT-2 has a single special token; it serves as both the leading document
+# cue (modded-nanogpt shard convention) and the stop signal.
+GPT2_EOT_ID = 50256
 SHARD_MAGIC = 20240520
 SHARD_VERSION = 1
 ENCODE_BATCH = 2048
 ENCODE_THREADS = 16
+
+
+class GPT2BatchEncoder:
+    """GPT-2 byte-level BPE behind the SentencePiece batch-encode signature.
+
+    Byte-level BPE pre-splits on a regex, so segment boundaries never merge;
+    the fast tokenizer parallelizes batches internally, making
+    ``num_threads`` advisory only.
+    """
+
+    def __init__(self) -> None:
+        from transformers import GPT2TokenizerFast
+
+        self._tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        self._tokenizer.model_max_length = 1 << 30
+
+    def encode(
+        self, texts: list[str], out_type: type = int, num_threads: int | None = None
+    ) -> list[list[int]]:
+        if out_type is not int:
+            raise ValueError("GPT2BatchEncoder only encodes to int ids")
+        return self._tokenizer(texts)["input_ids"]
 
 # train-easy modules whose answers survive the Minerva-style verifier
 # normalization verbatim (integers, small fractions/decimals, sorted lists,
@@ -188,7 +218,9 @@ def write_shard(path: Path, tokens: np.ndarray) -> None:
         file.write(tokens.astype("<u2", copy=False).tobytes())
 
 
-def fineweb_documents(dataset_dir: Path) -> Iterator[np.ndarray]:
+def fineweb_documents(
+    dataset_dir: Path, bos_id: int = BOS_ID
+) -> Iterator[np.ndarray]:
     """Already-tokenized docs, recovered by splitting the stream at BOS.
 
     The source shards pack documents across file boundaries, so the segment
@@ -196,10 +228,20 @@ def fineweb_documents(dataset_dir: Path) -> Iterator[np.ndarray]:
     yielded as a truncated document.
     """
     carry = np.empty(0, dtype=np.int32)
+    first_shard = True
     for shard in sorted(dataset_dir.glob("fineweb_train_*.bin")):
         tokens = np.fromfile(shard, dtype="<u2", offset=256 * 4).astype(np.int32)
         stream = np.concatenate((carry, tokens)) if carry.size else tokens
-        starts = np.flatnonzero(stream == BOS_ID)
+        starts = np.flatnonzero(stream == bos_id)
+        if first_shard and starts.size == 0:
+            # A full shard without a single document boundary means the
+            # shards were tokenized under a different vocabulary than the
+            # requested --tokenizer implies.
+            raise ValueError(
+                f"{shard} contains no BOS id {bos_id}; --fineweb-dataset "
+                "and --tokenizer disagree on the vocabulary"
+            )
+        first_shard = False
         if starts.size == 0:
             carry = stream
             continue
@@ -215,7 +257,9 @@ def fineweb_documents(dataset_dir: Path) -> Iterator[np.ndarray]:
 
 
 def encoded_documents(
-    texts: Iterator[str], tokenizer: spm.SentencePieceProcessor
+    texts: Iterator[str],
+    tokenizer: spm.SentencePieceProcessor | GPT2BatchEncoder,
+    bos_id: int = BOS_ID,
 ) -> Iterator[np.ndarray]:
     """Batch-encode a text stream into BOS-prefixed token documents."""
     batch: list[str] = []
@@ -223,7 +267,7 @@ def encoded_documents(
     def encode(chunk: list[str]) -> Iterator[np.ndarray]:
         encoded = tokenizer.encode(chunk, out_type=int, num_threads=ENCODE_THREADS)
         for pieces in encoded:
-            yield np.asarray([BOS_ID] + pieces, dtype=np.int32)
+            yield np.asarray([bos_id] + pieces, dtype=np.int32)
 
     for text in texts:
         batch.append(text)
@@ -235,7 +279,10 @@ def encoded_documents(
 
 
 def encoded_qa_documents(
-    segmented: Iterator[list[str]], tokenizer: spm.SentencePieceProcessor
+    segmented: Iterator[list[str]],
+    tokenizer: spm.SentencePieceProcessor | GPT2BatchEncoder,
+    bos_id: int = BOS_ID,
+    eos_id: int = EOS_ID,
 ) -> Iterator[np.ndarray]:
     """Encode QA documents with EOS closing every answer segment.
 
@@ -243,6 +290,11 @@ def encoded_qa_documents(
     stop signal the model can learn; RL rollouts and the AIME eval truncate
     generations at the first EOS, which makes the verifier's ``Answer: <x>``
     extraction terminal instead of budget-bounded.
+
+    When BOS and EOS are the same token (GPT-2's single ``<|endoftext|>``),
+    the document's final EOS is dropped: the next document's leading token
+    already terminates the last answer, and keeping both would pretrain a
+    doubled stop token the RL rollouts never emit.
     """
     batch: list[list[str]] = []
 
@@ -251,11 +303,13 @@ def encoded_qa_documents(
         encoded = tokenizer.encode(flat, out_type=int, num_threads=ENCODE_THREADS)
         cursor = 0
         for document in chunk:
-            tokens: list[int] = [BOS_ID]
+            tokens: list[int] = [bos_id]
             for _ in document:
                 tokens.extend(encoded[cursor])
-                tokens.append(EOS_ID)
+                tokens.append(eos_id)
                 cursor += 1
+            if bos_id == eos_id:
+                tokens.pop()
             yield np.asarray(tokens, dtype=np.int32)
 
     for segments in segmented:
@@ -377,7 +431,12 @@ def main() -> None:
         default="postraining/data/mathematics_dataset-v1.0/train-easy",
     )
     parser.add_argument("--openmath-dir", default="postraining/data/openmathinstruct2")
-    parser.add_argument("--tokenizer", default="data/tokenizers/fineweb_1024_bpe.model")
+    parser.add_argument(
+        "--tokenizer",
+        default="data/tokenizers/fineweb_1024_bpe.model",
+        help="SentencePiece model path, or the sentinel 'gpt2' for GPT-2 BPE "
+        "(BOS and EOS both become <|endoftext|> = 50256)",
+    )
     parser.add_argument("--total-tokens", type=int, default=None)
     parser.add_argument("--training-steps", type=int, default=2000)
     parser.add_argument("--train-batch-tokens", type=int, default=524_288)
@@ -448,19 +507,29 @@ def main() -> None:
         ]
         if missing:
             parser.error(f"missing DeepMind module files: {missing}")
-    tokenizer = (
-        spm.SentencePieceProcessor(model_file=args.tokenizer)
-        if fractions.keys() - {"fineweb"}
-        else None
-    )
+    needs_encoder = bool(fractions.keys() - {"fineweb"})
+    if args.tokenizer == "gpt2":
+        bos_id = eos_id = GPT2_EOT_ID
+        tokenizer = GPT2BatchEncoder() if needs_encoder else None
+    else:
+        bos_id, eos_id = BOS_ID, EOS_ID
+        tokenizer = (
+            spm.SentencePieceProcessor(model_file=args.tokenizer)
+            if needs_encoder
+            else None
+        )
     source_builders: dict[str, Callable[[], Iterator[np.ndarray]]] = {
-        "fineweb": lambda: fineweb_documents(Path(args.fineweb_dataset)),
+        "fineweb": lambda: fineweb_documents(Path(args.fineweb_dataset), bos_id),
         "finemath": lambda: encoded_documents(
             finemath_texts(sorted(Path(args.finemath_dir).rglob("*.parquet"))),
             tokenizer,
+            bos_id,
         ),
         "deepmind_easy": lambda: encoded_qa_documents(
-            deepmind_worksheets(easy_dir, args.template_fraction), tokenizer
+            deepmind_worksheets(easy_dir, args.template_fraction),
+            tokenizer,
+            bos_id,
+            eos_id,
         ),
         "openmath": lambda: encoded_qa_documents(
             openmath_documents(
@@ -468,6 +537,8 @@ def main() -> None:
                 args.template_fraction,
             ),
             tokenizer,
+            bos_id,
+            eos_id,
         ),
     }
     sources: dict[str, Iterator[np.ndarray]] = {
@@ -552,7 +623,16 @@ def main() -> None:
         "final_document_truncated_tokens": final_document_truncated_tokens,
         "deepmind_modules": DEEPMIND_EASY_MODULES,
         "openmath_sources": sorted(OPENMATH_SOURCES),
-        "qa_eos": "EOS appended after every Answer segment in QA sources",
+        "bos_id": bos_id,
+        "eos_id": eos_id,
+        "qa_eos": (
+            "EOS appended after every Answer segment in QA sources"
+            + (
+                "; document-final EOS dropped (next document's BOS terminates it)"
+                if bos_id == eos_id
+                else ""
+            )
+        ),
         "template_fraction": args.template_fraction,
         "template": "verbatim DAPO-Math-17K prompt wrapper on a share of QA docs",
         "tokenizer": args.tokenizer,

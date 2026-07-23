@@ -173,6 +173,81 @@ def test_strict_manifest_requires_exact_size_one_pass_and_no_rng(tmp_path: Path)
         )
 
 
+class FakeBatchEncoder:
+    """Stands in for either tokenizer: one marker id per segment."""
+
+    def encode(self, texts, out_type=int, num_threads=None):
+        return [[100 + index] for index, _ in enumerate(texts)]
+
+
+def test_qa_documents_close_every_segment_with_eos():
+    documents = list(
+        builder.encoded_qa_documents(
+            iter([["a", "bb"], ["ccc"]]), FakeBatchEncoder()
+        )
+    )
+    assert [document.tolist() for document in documents] == [
+        [1, 100, 2, 101, 2],
+        [1, 102, 2],
+    ]
+
+
+def test_qa_documents_drop_final_eos_when_bos_equals_eos():
+    eot = builder.GPT2_EOT_ID
+    documents = list(
+        builder.encoded_qa_documents(
+            iter([["a", "bb"], ["ccc"]]), FakeBatchEncoder(), eot, eot
+        )
+    )
+    # Interior answers keep their stop token; the document-final one is
+    # dropped because the next document's leading <|endoftext|> supplies it.
+    assert [document.tolist() for document in documents] == [
+        [eot, 100, eot, 101],
+        [eot, 102],
+    ]
+
+
+def test_encoded_documents_use_requested_bos():
+    documents = list(
+        builder.encoded_documents(iter(["x", "y"]), FakeBatchEncoder(), 50256)
+    )
+    assert [document.tolist() for document in documents] == [
+        [50256, 100],
+        [50256, 101],
+    ]
+
+
+def test_fineweb_documents_split_on_custom_bos(tmp_path: Path):
+    eot = builder.GPT2_EOT_ID
+    stream = np.array([eot, 7, 8, eot, 9], dtype=np.uint16)
+    builder.write_shard(tmp_path / "fineweb_train_000000.bin", stream)
+    documents = list(builder.fineweb_documents(tmp_path, eot))
+    assert [document.tolist() for document in documents] == [
+        [eot, 7, 8],
+        [eot, 9],
+    ]
+
+
+def test_fineweb_documents_reject_vocabulary_mismatch(tmp_path: Path):
+    builder.write_shard(
+        tmp_path / "fineweb_train_000000.bin",
+        np.array([1, 7, 8, 1, 9], dtype=np.uint16),
+    )
+    with pytest.raises(ValueError, match="disagree on the vocabulary"):
+        list(builder.fineweb_documents(tmp_path, builder.GPT2_EOT_ID))
+
+
+def test_gpt2_batch_encoder_matches_per_item_encoding():
+    pytest.importorskip("transformers")
+    encoder = builder.GPT2BatchEncoder()
+    texts = ["?\nAnswer:", "Solve 2+2.", "Answer: 4"]
+    batched = encoder.encode(texts, out_type=int, num_threads=4)
+    assert batched == [encoder.encode([text])[0] for text in texts]
+    assert all(0 <= token < 50257 for ids in batched for token in ids)
+    with pytest.raises(ValueError, match="only encodes to int"):
+        encoder.encode(texts, out_type=str)
+
+
 def test_deepmind_pairs_are_module_round_robin(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(builder, "DEEPMIND_EASY_MODULES", ["first", "second"])
     (tmp_path / "first.txt").write_text("q1\na1\nq3\na3\n")
