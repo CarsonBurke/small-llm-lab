@@ -211,7 +211,9 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
         validate_renderer_checkpoint(
             {"renderer_features_schema": "input_latent+predicted/v1"}, "old.pt"
         )
-    with pytest.raises(ValueError, match="different forced-initial assignment"):
+    with pytest.raises(
+        ValueError, match="reasoning mode or forced-initial assignment"
+    ):
         validate_renderer_checkpoint(
             {"renderer_features_schema": RENDERER_FEATURES_SCHEMA},
             "old-policy.pt",

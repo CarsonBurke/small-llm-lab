@@ -74,6 +74,7 @@ from postraining.benchmark_report import (
 from postraining.core import (
     POSTTRAIN_REWARD_SCHEMA,
     JsonlLogger,
+    POSTTRAIN_CONTEXT_TOKENS,
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_RESPONSE_TOKENS,
     POSTTRAIN_STREAM_TOKENS,
@@ -115,12 +116,12 @@ from postraining.latent_thought import (
     EMIT,
     THINK,
     RENDERER_FEATURES_SCHEMA,
-    ROLLOUT_POLICY_SCHEMA,
     THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
     LatentThoughtModel,
     migrate_legacy_wrapper_checkpoint,
+    rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
 )
 from postraining.model_io import fresh_trunk, load_model
@@ -338,6 +339,36 @@ class MathPromptSampler:
         return picked
 
 
+def answer_prefix_token_ids(tokenizer) -> tuple[int, ...]:
+    """The ``"\\nAnswer:"`` ids as they tokenize inside a QA document.
+
+    SentencePiece is boundary-sensitive: the sp1024 model encodes standalone
+    ``"\\nAnswer:"`` as ``A n s w er :`` with the newline dropped, while the
+    same substring inside the mathmix documents the backbone pretrained on
+    (``"{question}\\nAnswer: {answer}"``) tokenizes as ``▁An s w er :``.
+    Teacher-forcing the standalone ids would place the policy in a prompt
+    state it never saw.  Deriving the ids from document-shaped encodings —
+    and requiring two different question endings to agree — keeps the forced
+    prefix on the pretraining distribution.
+    """
+    tails = []
+    for context_text in ("?", "."):
+        context = tokenizer.encode(context_text)
+        combined = tokenizer.encode(context_text + "\nAnswer:")
+        if combined[: len(context)] != context:
+            raise RuntimeError(
+                "tokenizer merged across the Answer: prefix boundary; "
+                "cannot derive stable in-context prefix ids"
+            )
+        tails.append(tuple(combined[len(context):]))
+    if tails[0] != tails[1]:
+        raise RuntimeError(
+            "the in-context Answer: prefix tokenizes differently after "
+            f"different question endings: {tails[0]} vs {tails[1]}"
+        )
+    return tails[0]
+
+
 def score_math_rollout(
     batch: LatentRolloutBatch,
     truth: str,
@@ -345,8 +376,15 @@ def score_math_rollout(
     stop_ids: tuple[int, ...],
     style: str = "minerva",
     nearby_reward_max: float = 0.1,
+    solution_prefix_ids: tuple[int, ...] = (),
 ) -> None:
-    """Exact verifier reward plus bounded final-answer numeric proximity."""
+    """Exact verifier reward plus bounded final-answer numeric proximity.
+
+    ``solution_prefix_ids`` are teacher-forced solution tokens that live at
+    the end of the prompt (the none-mode ``Answer:`` prefix): the emitted
+    continuation alone never contains them, so they rejoin the decode before
+    the verifier parses a final answer.
+    """
     scores = []
     for emitted in emitted_token_rows(batch):
         stop_cut = next(
@@ -356,7 +394,9 @@ def score_math_rollout(
         if stop_cut is None:
             scores.append(0.0)
             continue
-        solution = tokenizer.decode(emitted[: stop_cut + 1])
+        solution = tokenizer.decode(
+            list(solution_prefix_ids) + emitted[: stop_cut + 1]
+        )
         raw_final_answer = extract_final_answer(solution)
         strict_numeric = (
             parse_numeric_answer(raw_final_answer)
@@ -434,7 +474,13 @@ def rollout_diagnostics(
     think_counts = (
         (batch.gate_actions == THINK).float() * batch.gate_mask
     ).sum(1)
-    forced_initial = (batch.action_mask - batch.gate_mask).sum(1) > 0
+    # Forced actions are THINKs recorded without a gate decision. The THINK
+    # conjunction matters for pinned-EMIT modes, where NO action carries a
+    # gate decision yet nothing was forced.
+    forced_initial = (
+        (batch.gate_actions == THINK).float()
+        * (batch.action_mask - batch.gate_mask)
+    ).sum(1) > 0
     thinkers = think_counts > 0
 
     def think_reward_correlation(rows: torch.Tensor) -> float:
@@ -998,6 +1044,32 @@ def scalar_tensors_to_floats(
     return dict(zip(keys, packed, strict=True))
 
 
+def renderer_parameters(backbone) -> list[torch.nn.Parameter]:
+    """The trainable vocabulary-readout parameters, across backbone families.
+
+    The fresh lineage renders through its pretrained ``policy_probe``; the
+    nano backbones expose their native readout (untied projection, or the
+    tied-dot scale/bias) via their own ``renderer_parameters`` method.
+    """
+    if hasattr(backbone, "policy_probe"):
+        return list(backbone.policy_probe.parameters())
+    return list(backbone.renderer_parameters())
+
+
+def non_trunk_parameter_ids(backbone) -> set[int]:
+    """Backbone parameters excluded from the trunk optimizer group and norm.
+
+    The renderer readout is always its own semantic group. The fresh critic
+    probe additionally exists but stays frozen and unused; nano backbones
+    carry no probes at all.
+    """
+    excluded = {id(parameter) for parameter in renderer_parameters(backbone)}
+    critic_probe = getattr(backbone, "critic_probe", None)
+    if critic_probe is not None:
+        excluded |= {id(parameter) for parameter in critic_probe.parameters()}
+    return excluded
+
+
 def build_optimizers(
     wrapper: LatentThoughtModel,
     critic: SeparateCritic,
@@ -1011,20 +1083,18 @@ def build_optimizers(
     general learning rate as the critic: trunk, Bernoulli gate, recurrent
     adapter, renderer, state-dependent log-sigma, and fresh mean. This removes
     the previous hand-tuned head-specific rates from the fresh-policy test.
-    The probes live under
+    The fresh probes live under
     ``blocks[-1]`` (so pretraining's optimizer saw them), which makes
     name-prefix filtering wrong — exclude them from the trunk by identity.
+    Nano backbones keep the identical six-group layout with their native
+    readout as the renderer group.
     """
     backbone = wrapper.backbone
-    probe_parameter_ids = {
-        id(parameter)
-        for probe in (backbone.policy_probe, backbone.critic_probe)
-        for parameter in probe.parameters()
-    }
+    excluded_parameter_ids = non_trunk_parameter_ids(backbone)
     trunk_parameters = [
         parameter
         for parameter in backbone.parameters()
-        if id(parameter) not in probe_parameter_ids
+        if id(parameter) not in excluded_parameter_ids
     ]
     return {
         "actor": torch.optim.AdamW(
@@ -1032,7 +1102,7 @@ def build_optimizers(
                 {"params": trunk_parameters, "lr": learning_rate},
                 {"params": list(wrapper.gate.parameters()), "lr": learning_rate},
                 {"params": list(wrapper.adapter.parameters()), "lr": learning_rate},
-                {"params": list(backbone.policy_probe.parameters()), "lr": learning_rate},
+                {"params": renderer_parameters(backbone), "lr": learning_rate},
                 {
                     "params": list(wrapper.transition.log_sigma_head.parameters()),
                     "lr": learning_rate,
@@ -1234,7 +1304,10 @@ def update_minibatch(
         raise ValueError(
             "thought reverse KL coefficient must be finite and nonnegative"
         )
-    if not value_only and batch.old_thought_logprobs.shape[-1] == 0:
+    if not value_only and not batch.statistics_refreshed:
+        # The explicit flag also covers pinned-EMIT batches, whose zero-width
+        # thought tensors cannot express "not yet refreshed" as a width
+        # mismatch.
         raise RuntimeError(
             "actor update requires refresh_old_statistics after rollout"
         )
@@ -1676,6 +1749,16 @@ def update_minibatch(
                 )
 
     action_denom = denominators["action"]
+    # Pinned-EMIT batches store zero-width thoughts: keep the per-dimension
+    # thought telemetry finite (zero) instead of dividing by a zero width or
+    # reporting the untouched +/-inf extrema.
+    thought_dim = max(batch.old_thought_logprobs.size(-1), 1)
+    for extremum in ("thought_log_sigma_min", "thought_log_sigma_max"):
+        totals[extremum] = torch.where(
+            torch.isfinite(totals[extremum]),
+            totals[extremum],
+            torch.zeros_like(totals[extremum]),
+        )
     advantage_mean = totals["advantage_sum"] / action_denom
     advantage_variance = (
         totals["advantage_square_sum"] / action_denom
@@ -1738,21 +1821,17 @@ def update_minibatch(
         return scalar_tensors_to_floats(metric_tensors)
 
     # Norms are cumulative across prompt groups; the final group reports the
-    # complete pre-step norm. Probes are registered
+    # complete pre-step norm. Fresh probes are registered
     # under blocks[-1], so exclude them from the trunk norm by identity.
-    probe_parameter_ids = {
-        id(parameter)
-        for probe in (backbone.policy_probe, backbone.critic_probe)
-        for parameter in probe.parameters()
-    }
+    excluded_parameter_ids = non_trunk_parameter_ids(backbone)
     grad_norms = {
         "trunk_grad_norm": gradient_norm_tensor(
             parameter
             for parameter in backbone.parameters()
-            if id(parameter) not in probe_parameter_ids
+            if id(parameter) not in excluded_parameter_ids
         ),
         "renderer_grad_norm": gradient_norm_tensor(
-            backbone.policy_probe.parameters()
+            renderer_parameters(backbone)
         ),
         "adapter_grad_norm": gradient_norm_tensor(wrapper.adapter.parameters()),
         "critic_grad_norm": gradient_norm_tensor(critic.parameters()),
@@ -1806,7 +1885,7 @@ def update_minibatch(
         ),
         thought_behavior_kl_per_dim=(
             totals["thought_kl_sum"]
-            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            / (denominators["thought"] * thought_dim)
         ),
         policy_behavior_kl_per_action=(
             totals["gate_kl_sum"]
@@ -1828,21 +1907,21 @@ def update_minibatch(
         reward=batch.reward_scalar.mean(),
         thought_log_sigma_mean=(
             totals["thought_log_sigma_sum"]
-            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            / (denominators["thought"] * thought_dim)
         ),
         thought_log_sigma_std=(
             totals["thought_log_sigma_square_sum"]
-            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            / (denominators["thought"] * thought_dim)
             - (
                 totals["thought_log_sigma_sum"]
-                / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+                / (denominators["thought"] * thought_dim)
             ).square()
         ).clamp_min(0).sqrt(),
         thought_log_sigma_min=totals["thought_log_sigma_min"],
         thought_log_sigma_max=totals["thought_log_sigma_max"],
         thought_sigma_mean=(
             totals["thought_sigma_sum"]
-            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            / (denominators["thought"] * thought_dim)
         ),
         thought_expected_noise_norm=(
             totals["thought_expected_noise_norm_sum"] / denominators["thought"]
@@ -1852,7 +1931,7 @@ def update_minibatch(
         ),
         thought_normalized_noise_rms=(
             totals["thought_normalized_noise_square_sum"]
-            / (denominators["thought"] * batch.old_thought_logprobs.size(-1))
+            / (denominators["thought"] * thought_dim)
         ).sqrt(),
         thought_mean_norm=(
             totals["thought_mean_norm_sum"] / denominators["thought"]
@@ -2079,6 +2158,7 @@ def save_checkpoint(
     warmup_step: int,
     actor_init_provenance: dict | None = None,
 ) -> None:
+    reasoning_mode = getattr(args, "reasoning_mode", "latent")
     payload = {
         "step": step,
         "value_warmup_step": warmup_step,
@@ -2086,8 +2166,9 @@ def save_checkpoint(
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
         "math_data_identity": sampler.dataset_identity,
         "reward_schema": REWARD_SCHEMA,
+        "reasoning_mode": reasoning_mode,
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
-        "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+        "rollout_policy_schema": rollout_policy_schema_for_mode(reasoning_mode),
         "thought_input_schema": THOUGHT_INPUT_SCHEMA,
         "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
         "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
@@ -2148,14 +2229,23 @@ def main() -> None:
         help="comma-separated extra_info.module names to drop from --math-data "
         "(module-tagged datasets only); names absent from the data are an error",
     )
+    # The reasoning mode fixes the rollout policy family for the whole run:
+    # "latent" samples the THINK/EMIT gate and Gaussian thoughts (current
+    # behavior); "cot" pins every gate decision to EMIT with the full token
+    # budget (token chain of thought); "none" pins EMIT, teacher-forces an
+    # "Answer:" prefix onto the prompt, and budgets only the answer itself.
+    parser.add_argument(
+        "--reasoning-mode",
+        choices=("latent", "cot", "none"),
+        default="latent",
+    )
+    # none-mode emission budget: the final answer value plus its terminator.
+    parser.add_argument("--answer-tokens", type=int, default=24)
     # Prompt budget: DAPO prompts longer than this keep their TAIL (the
-    # question and answer-format instruction sit at the end).
-    parser.add_argument(
-        "--prompt-tokens", type=int, default=POSTTRAIN_PROMPT_TOKENS
-    )
-    parser.add_argument(
-        "--continuation-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
-    )
+    # question and answer-format instruction sit at the end). None derives a
+    # backbone default after the checkpoint loads: fresh PoPE 1024, nano 512.
+    parser.add_argument("--prompt-tokens", type=int, default=None)
+    parser.add_argument("--continuation-tokens", type=int, default=None)
     # Compute-scaled VAPO topology: sample n=16 responses for 64 prompts under
     # one frozen behavior policy, then shuffle prompt groups once and take four
     # disjoint B256 optimizer minibatches. This activates PPO's behavior-policy
@@ -2168,11 +2258,12 @@ def main() -> None:
     parser.add_argument("--ppo-epochs", type=int, default=1)
     # Total generated-slot budget per trajectory (thinks + emits).  Thinking
     # is never forcibly interrupted; overthinking costs emitted tokens and
-    # therefore reward. 0 means 4x the emit cap; the default is the explicit
-    # 4096-slot side of the 1024-prompt + 4096-stream context contract.
-    parser.add_argument(
-        "--max-stream-steps", type=int, default=POSTTRAIN_STREAM_TOKENS
-    )
+    # therefore reward. 0 means 4x the emit cap capped to the backbone
+    # context; None derives the backbone default (fresh: the explicit
+    # 4096-slot side of the 1024-prompt + 4096-stream contract; nano: 512).
+    # Pinned-EMIT modes ignore this — every slot is a token, so the stream
+    # budget equals the emit cap.
+    parser.add_argument("--max-stream-steps", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     # One general rate for actor and critic. The fresh-policy experiment starts
@@ -2274,9 +2365,7 @@ def main() -> None:
     parser.add_argument("--aime-every", type=int, default=0)
     parser.add_argument("--aime-data", default="postraining/data/aime-2024.parquet")
     parser.add_argument("--aime-samples", type=int, default=32)
-    parser.add_argument(
-        "--aime-max-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
-    )
+    parser.add_argument("--aime-max-tokens", type=int, default=None)
     # Rollout positions are sequential, so batching all samples of a problem
     # into one rollout is nearly free parallelism; lower this only if VRAM
     # becomes the constraint.
@@ -2297,9 +2386,7 @@ def main() -> None:
         default=0,
         help="fixed hash-selected benchmark prompt count (0 evaluates all)",
     )
-    parser.add_argument(
-        "--bench-max-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
-    )
+    parser.add_argument("--bench-max-tokens", type=int, default=None)
     # Batch multiple problem groups into the same left-padded GPU rollout.
     # This is a trajectory rather than prompt count so avg@8 and avg@32 use
     # comparable memory; replay-free eval storage makes 128 rows practical.
@@ -2520,24 +2607,95 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
-    max_stream_steps = args.max_stream_steps or 4 * args.continuation_tokens
-    # The eval budget always scales with its own emit cap; an explicit
-    # --max-stream-steps is a training-rollout knob.
-    aime_stream_steps = 4 * args.aime_max_tokens
-    bench_stream_steps = 4 * args.bench_max_tokens
-    validate_posttraining_context_budget(args.prompt_tokens, max_stream_steps)
-    validate_posttraining_context_budget(args.prompt_tokens, aime_stream_steps)
-    validate_posttraining_context_budget(args.prompt_tokens, bench_stream_steps)
 
     backbone = load_model(args.checkpoint, device)
-    if not backbone.architecture.endswith(
+    is_nano = backbone.architecture.startswith("nanogpt_mini")
+    if not is_nano and not backbone.architecture.endswith(
         "probes_pope_belief_attached_ce_onepass_2k"
     ):
         raise ValueError(
-            "belief-renderer VAPO requires a checkpoint pretrained with "
-            "[token_latent, raw_belief] CE; old predicted-latent probe "
+            "belief-renderer VAPO requires a nanogpt_mini checkpoint or one "
+            "pretrained with [token_latent, raw_belief] CE; old "
+            "predicted-latent probe "
             f"architecture {backbone.architecture!r} is incompatible"
         )
+
+    # Backbone-derived context contract: fresh PoPE executes 5x its pretrained
+    # window, so RL keeps the full 1024-token prompt plus a 4096-slot stream.
+    # Nano's half-truncate RoPE (base 1024) has no extrapolation story, so RL
+    # stays strictly inside the pretraining window the checkpoint records
+    # (train_seq_len; 1024 for checkpoints predating the field). The response
+    # budget targets the standard ~1k tokens for DAPO math as soon as the
+    # window affords it after the prompt.
+    if is_nano:
+        context_tokens = getattr(backbone, "train_context_tokens", 1024)
+        default_prompt_tokens = 512
+        default_response_tokens = min(
+            1024, (context_tokens - default_prompt_tokens) // 2
+        )
+    else:
+        context_tokens = POSTTRAIN_CONTEXT_TOKENS
+        default_prompt_tokens = POSTTRAIN_PROMPT_TOKENS
+        default_response_tokens = POSTTRAIN_RESPONSE_TOKENS
+    if args.prompt_tokens is None:
+        args.prompt_tokens = default_prompt_tokens
+    if args.continuation_tokens is None:
+        args.continuation_tokens = default_response_tokens
+    if args.aime_max_tokens is None:
+        args.aime_max_tokens = default_response_tokens
+    if args.bench_max_tokens is None:
+        args.bench_max_tokens = default_response_tokens
+    if args.answer_tokens < 2:
+        parser.error("--answer-tokens must fit an answer plus its terminator")
+
+    pin_emit = args.reasoning_mode != "latent"
+    rollout_policy_schema = rollout_policy_schema_for_mode(args.reasoning_mode)
+    if pin_emit and args.max_stream_steps is not None:
+        parser.error(
+            "--max-stream-steps is a latent-mode knob; pinned-EMIT modes "
+            "always use exactly one stream slot per emitted token"
+        )
+
+    def mode_budgets(max_tokens: int) -> tuple[int, int]:
+        """(max_new_tokens, max_stream_steps) for one rollout/eval budget."""
+        if args.reasoning_mode == "none":
+            return args.answer_tokens, args.answer_tokens
+        if args.reasoning_mode == "cot":
+            return max_tokens, max_tokens
+        return max_tokens, min(
+            4 * max_tokens, context_tokens - args.prompt_tokens
+        )
+
+    if args.reasoning_mode == "latent":
+        train_max_new_tokens = args.continuation_tokens
+        if args.max_stream_steps is None:
+            max_stream_steps = min(
+                POSTTRAIN_STREAM_TOKENS, context_tokens - args.prompt_tokens
+            )
+        elif args.max_stream_steps == 0:
+            _, max_stream_steps = mode_budgets(args.continuation_tokens)
+        else:
+            max_stream_steps = args.max_stream_steps
+    else:
+        train_max_new_tokens, max_stream_steps = mode_budgets(
+            args.continuation_tokens
+        )
+    # The eval budget always scales with its own emit cap; an explicit
+    # --max-stream-steps is a training-rollout knob.
+    aime_max_new_tokens, aime_stream_steps = mode_budgets(args.aime_max_tokens)
+    bench_max_new_tokens, bench_stream_steps = mode_budgets(
+        args.bench_max_tokens
+    )
+    validate_posttraining_context_budget(
+        args.prompt_tokens, max_stream_steps, context_tokens
+    )
+    validate_posttraining_context_budget(
+        args.prompt_tokens, aime_stream_steps, context_tokens
+    )
+    validate_posttraining_context_budget(
+        args.prompt_tokens, bench_stream_steps, context_tokens
+    )
+
     backbone.eval()
     # Full-model RL: every parameter on a deployed policy path trains — trunk,
     # embeddings, fresh thought mean/sigma, renderer, gate, and adapter. The
@@ -2608,6 +2766,7 @@ def main() -> None:
             # A critic-warmup checkpoint has not updated the actor, and its
             # transition head is reset below before the policy is ever used.
             allow_transition_reset=bool(args.actor_critic_init),
+            expected_rollout_policy_schema=rollout_policy_schema,
         )
         wrapper.load_state_dict(actor_init_payload["model"], strict=True)
         if args.actor_critic_init:
@@ -2641,8 +2800,11 @@ def main() -> None:
         }
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
-    for parameter in backbone.critic_probe.parameters():
-        parameter.requires_grad_(False)
+    if hasattr(backbone, "critic_probe"):
+        # Fresh lineage only: the pretrained critic probe stays checkpointed
+        # but has no graph edge. Nano backbones carry no probes.
+        for parameter in backbone.critic_probe.parameters():
+            parameter.requires_grad_(False)
 
     critic = SeparateCritic(
         fresh_trunk(backbone, device),
@@ -2684,6 +2846,22 @@ def main() -> None:
             "posttraining requires a valid BOS or EOS token for explicit "
             "trajectory termination"
         )
+    answer_prefix_ids: tuple[int, ...] = ()
+    if args.reasoning_mode == "none":
+        # Mathmix QA documents close with "\nAnswer: <x>" before EOS.
+        # Teacher-forcing the prefix onto the prompt leaves the policy only
+        # the answer value and its terminator to emit; scoring and decoding
+        # prepend the same ids before parsing.
+        answer_prefix_ids = answer_prefix_token_ids(tokenizer)
+        if not answer_prefix_ids:
+            raise RuntimeError(
+                "the none-mode Answer: prefix encoded to zero tokens"
+            )
+        if len(answer_prefix_ids) >= args.prompt_tokens:
+            raise RuntimeError(
+                "the encoded Answer: prefix must leave room in the prompt "
+                "budget"
+            )
     aime_rows = (
         load_unique_math_rows(args.aime_data)
         if args.aime_every > 0 and not args.rollout_only
@@ -2794,7 +2972,16 @@ def main() -> None:
             )
     seq_len = FreshHyperparameters.train_seq_len
     luts = baseline.build_sentencepiece_luts(tokenizer, FreshHyperparameters.vocab_size, device)
-    val_tokens = baseline.load_validation_tokens(FreshHyperparameters.val_files, seq_len)
+    # The BPB guard shares the sp1024 tokenizer across backbones, but nano
+    # pretrains against the onepass shard family; keep the guard on the same
+    # validation bytes as nano's own pretraining val_bpb (DATA_PATH overrides).
+    bpb_val_files = FreshHyperparameters.val_files
+    if is_nano:
+        bpb_val_files = os.path.join(
+            os.environ.get("DATA_PATH", "data/datasets/fineweb_onepass_sp1024"),
+            "fineweb_val_*.bin",
+        )
+    val_tokens = baseline.load_validation_tokens(bpb_val_files, seq_len)
     if args.bpb_val_tokens > 0:
         usable = (args.bpb_val_tokens // seq_len) * seq_len
         if usable <= 0:
@@ -2814,7 +3001,11 @@ def main() -> None:
         if args.migrate_zero_adapter_resume:
             adapter_migration = migrate_zero_adapter_resume(payload, wrapper)
         migrate_legacy_wrapper_checkpoint(payload, wrapper)
-        validate_renderer_checkpoint(payload, args.resume)
+        validate_renderer_checkpoint(
+            payload,
+            args.resume,
+            expected_rollout_policy_schema=rollout_policy_schema,
+        )
         if not resume_execution_schema_compatible(
             payload,
             allow_reverse_kl_migration=args.migrate_reverse_kl_resume,
@@ -3012,9 +3203,11 @@ def main() -> None:
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
                 "math_data_identity": data_identity,
                 "reward_schema": REWARD_SCHEMA,
+                "reasoning_mode": args.reasoning_mode,
+                "context_tokens": context_tokens,
                 "math_modal_answer_baseline": math_modal_baseline,
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
-                "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+                "rollout_policy_schema": rollout_policy_schema,
                 "thought_input_schema": THOUGHT_INPUT_SCHEMA,
                 "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
                 "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
@@ -3070,6 +3263,14 @@ def main() -> None:
     if not args.resume:
         logger.log(type="math_modal_answer_baseline", **math_modal_baseline)
 
+    def rollout_force_members(groups_count: int, samples: int) -> torch.Tensor:
+        """Latent mode's 50/50 forced-THINK split; inert in pinned modes."""
+        if pin_emit:
+            return torch.zeros(
+                groups_count * samples, dtype=torch.bool, device=device
+            )
+        return half_forced_group_members(groups_count, samples, device)
+
     def finish_group(
         batch: LatentRolloutBatch,
         row: dict,
@@ -3080,6 +3281,7 @@ def main() -> None:
             batch, row["reward_model"]["ground_truth"], tokenizer, stop_ids,
             answer_style(row),
             args.nearby_reward_max,
+            solution_prefix_ids=answer_prefix_ids,
         )
         # Stepwise rollout and parallel replay disagree numerically at
         # bf16 scale; recompute the stored PPO statistics through the
@@ -3104,12 +3306,12 @@ def main() -> None:
     ) -> list[LatentRolloutBatch]:
         """One rollout: a scored prompt group per sampled DAPO problem."""
         rollout_rows = sampler.next_rows(prompt_count)
+        prompt_budget = args.prompt_tokens - len(answer_prefix_ids)
         encoded_rows = [
             (
                 row,
-                encode_prompt(
-                    tokenizer, prompt_text(row), args.prompt_tokens
-                ),
+                encode_prompt(tokenizer, prompt_text(row), prompt_budget)
+                + list(answer_prefix_ids),
             )
             for row in rollout_rows
         ]
@@ -3134,11 +3336,12 @@ def main() -> None:
                 )
                 batch = rollout_continuations(
                     wrapper, prompt_ids[None],
-                    args.continuation_tokens, max_stream_steps,
+                    train_max_new_tokens, max_stream_steps,
                     args.temperature, args.top_p, stop_ids=stop_ids or None,
-                    force_initial_think=half_forced_group_members(
-                        1, args.samples_per_prompt, device
+                    force_initial_think=rollout_force_members(
+                        1, args.samples_per_prompt
                     ),
+                    pin_emit=pin_emit,
                     record_likelihoods=False,
                     cache_dtype=torch.bfloat16,
                     tensor_positions=rollout_step_core is not None,
@@ -3182,12 +3385,11 @@ def main() -> None:
             )
             prompt_lengths = prompt_lengths_cpu.to(device)
             batched = rollout_continuations(
-                wrapper, prompt_ids, args.continuation_tokens, max_stream_steps,
+                wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
                 args.temperature, args.top_p, stop_ids=stop_ids or None,
                 prompt_lengths=prompt_lengths,
-                force_initial_think=half_forced_group_members(
-                    len(chunk), samples, device
-                ),
+                force_initial_think=rollout_force_members(len(chunk), samples),
+                pin_emit=pin_emit,
                 record_likelihoods=False,
                 cache_dtype=torch.bfloat16,
                 tensor_positions=rollout_step_core is not None,
@@ -3284,7 +3486,8 @@ def main() -> None:
         captured_attempts: list[dict[str, object]] = []
         eval_started = time.perf_counter()
         metrics = evaluate_aime_latent(
-            wrapper, tokenizer, aime_rows, args.aime_samples, args.aime_max_tokens,
+            wrapper, tokenizer, aime_rows, args.aime_samples,
+            aime_max_new_tokens,
             aime_stream_steps, args.aime_chunk, args.seed, device,
             prompt_tokens=args.prompt_tokens,
             batch_trajectories=args.eval_batch_trajectories,
@@ -3292,6 +3495,8 @@ def main() -> None:
             compiled_tail_batch=args.eval_tail_batch or None,
             answer_style_override="aime",
             captured_attempts=captured_attempts,
+            pin_emit=pin_emit,
+            prompt_suffix_ids=answer_prefix_ids,
         )
         metrics["dataset_modal_answer"] = aime_modal_baseline["answer"]
         metrics["dataset_modal_answer_style"] = "aime"
@@ -3340,12 +3545,14 @@ def main() -> None:
         eval_started = time.perf_counter()
         metrics = evaluate_aime_latent(
             wrapper, tokenizer, bench_rows, args.bench_samples,
-            args.bench_max_tokens, bench_stream_steps, args.bench_samples,
+            bench_max_new_tokens, bench_stream_steps, args.bench_samples,
             eval_seed, device, prompt_tokens=args.prompt_tokens,
             batch_trajectories=args.eval_batch_trajectories,
             compiled_step_core=eval_step_core,
             compiled_tail_batch=args.eval_tail_batch or None,
             captured_attempts=captured_attempts,
+            pin_emit=pin_emit,
+            prompt_suffix_ids=answer_prefix_ids,
         )
         metrics["dataset_modal_answer"] = bench_dataset_baseline["answer"]
         metrics["dataset_modal_answer_style"] = bench_dataset_baseline["style"]

@@ -52,6 +52,46 @@ DEFAULT_MODEL_CONFIG = {
 }
 
 
+def _load_nano_model(architecture: str, payload, device: torch.device):
+    """Construct and strict-load a nanogpt-mini backbone.
+
+    The nano branch never merges the fresh DEFAULT_MODEL_CONFIG — the two
+    architectures share no constructor signature. All parameters are frozen
+    (the trainer re-enables what it trains); there are no probes to unfreeze.
+    """
+    from postraining.nano_backbone import (
+        NANO_DEFAULT_MODEL_CONFIG,
+        NanoGPTBackbone,
+        NanoTiedDotBackbone,
+    )
+
+    config = dict(NANO_DEFAULT_MODEL_CONFIG)
+    if isinstance(payload, dict) and "model_config" in payload:
+        config.update(payload["model_config"])
+    if "tieddot" in architecture:
+        model_class = NanoTiedDotBackbone
+    else:
+        model_class = NanoGPTBackbone
+    model = model_class(**config).to(device)
+    model.model_config = config
+    model.architecture = architecture
+    # RoPE positions seen in pretraining bound the usable RL context: the
+    # half-truncate rotary has no extrapolation. Old checkpoints predate the
+    # field and were all trained on 1024-token windows.
+    model.train_context_tokens = (
+        int(payload.get("train_seq_len", 1024))
+        if isinstance(payload, dict)
+        else 1024
+    )
+    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    # The checkpoint stores a bf16 embedding; the backbone keeps fp32 masters
+    # (bf16 -> fp32 is value-exact, and load_state_dict casts on copy).
+    model.load_state_dict(state, strict=True)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
 def load_model(
     checkpoint: str | Path, device: torch.device, payload: dict | None = None
 ) -> FreshLeJEPAGPT:
@@ -67,6 +107,8 @@ def load_model(
         architecture = payload.get("architecture", architecture)
     model_class = FreshLeJEPAGPT
     architecture = architecture or EXPERIMENT_ARCHITECTURE
+    if architecture.startswith("nanogpt_mini"):
+        return _load_nano_model(architecture, payload, device)
     if architecture.endswith("additive_codebook_probes_v2"):
         from fresh_lejepa_train_v2 import FreshLeJEPAGPTV2
 

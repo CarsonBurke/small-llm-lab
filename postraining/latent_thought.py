@@ -34,6 +34,23 @@ from torch import Tensor, nn
 THINK, EMIT = 0, 1
 RENDERER_FEATURES_SCHEMA = "input_latent+belief/v1"
 ROLLOUT_POLICY_SCHEMA = "half_group_members_forced_initial_latent_think/v1"
+# Pinned-EMIT reasoning modes never sample the gate or a thought: the rollout
+# is a plain token policy. The tag embeds the mode because cot and none differ
+# in their trained emission budgets, so their checkpoints are not one policy.
+PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS = {
+    "cot": "pinned_emit_token_only_cot/v1",
+    "none": "pinned_emit_token_only_answer_prefix/v1",
+}
+
+
+def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
+    """The rollout-policy schema tag a reasoning mode trains and resumes."""
+    if reasoning_mode == "latent":
+        return ROLLOUT_POLICY_SCHEMA
+    try:
+        return PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS[reasoning_mode]
+    except KeyError:
+        raise ValueError(f"unknown reasoning mode {reasoning_mode!r}") from None
 THOUGHT_INPUT_SCHEMA = "fresh_zero_affine/v5"
 THOUGHT_DISTRIBUTION_SCHEMA = (
     "state_dependent_diag_tanh_log_sigma_scaled_residual_-5_2/v2"
@@ -58,6 +75,7 @@ def validate_renderer_checkpoint(
     checkpoint: str,
     *,
     allow_transition_reset: bool = False,
+    expected_rollout_policy_schema: str = ROLLOUT_POLICY_SCHEMA,
 ) -> None:
     """Reject wrapper checkpoints trained with incompatible policy semantics."""
     actual = payload.get("renderer_features_schema")
@@ -69,12 +87,13 @@ def validate_renderer_checkpoint(
             "features and cannot be resumed or evaluated as this policy."
         )
     rollout_policy = payload.get("rollout_policy_schema")
-    if rollout_policy != ROLLOUT_POLICY_SCHEMA:
+    if rollout_policy != expected_rollout_policy_schema:
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: rollout "
-            f"schema is {rollout_policy!r}, expected {ROLLOUT_POLICY_SCHEMA!r}. "
-            "Old or untagged VAPO checkpoints used a different forced-initial "
-            "assignment and cannot be resumed or evaluated as this policy."
+            f"schema is {rollout_policy!r}, expected "
+            f"{expected_rollout_policy_schema!r}. The checkpoint was trained "
+            "under a different reasoning mode or forced-initial assignment "
+            "and cannot be resumed or evaluated as this policy."
         )
     thought_input = payload.get("thought_input_schema")
     if thought_input != THOUGHT_INPUT_SCHEMA:

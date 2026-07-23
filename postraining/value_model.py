@@ -57,6 +57,11 @@ class SeparateCritic(nn.Module):
         so it must map the stored stream into its own representation.
         """
         token_latent = self.trunk.embed_tokens(batch.token_ids)
+        pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+        if batch.thoughts.size(-1) == 0:
+            # Pinned-EMIT rollouts store zero-width thoughts and contain no
+            # THOUGHT slots; the adapter cannot consume a zero-width input.
+            return token_latent * pad_scale
         think_mask = batch.kind == THOUGHT_SLOT
         # The kind-select makes dense adapter evaluation exactly equivalent
         # to compact boolean assignment, while avoiding the latter's
@@ -67,7 +72,7 @@ class SeparateCritic(nn.Module):
         inputs = torch.where(
             think_mask[..., None], thought_latent, token_latent
         )
-        return inputs * (batch.kind != PAD_SLOT)[..., None].to(inputs.dtype)
+        return inputs * pad_scale
 
     def value_logits(self, batch: LatentRolloutBatch) -> Tensor:
         """(batch, stream, num_bins) value distribution logits, fp32."""

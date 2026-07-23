@@ -35,13 +35,21 @@ def verify_terminated_answer(
     tokenizer,
     stop_ids: tuple[int, ...],
     style: str = "minerva",
+    prefix_ids: tuple[int, ...] = (),
 ) -> tuple[bool, str]:
-    """Verify a response only when it emitted BOS/EOS itself."""
+    """Verify a response only when it emitted BOS/EOS itself.
+
+    ``prefix_ids`` are teacher-forced solution tokens that live in the prompt
+    (the none-mode ``Answer:`` prefix): the emitted continuation alone never
+    contains them, so they rejoin the decode before parsing.
+    """
     stop_set = set(stop_ids)
     cut = next((i for i, token in enumerate(emitted) if token in stop_set), None)
     if cut is None:
         return False, "[UNTERMINATED]"
-    return verify_answer(tokenizer.decode(emitted[: cut + 1]), truth, style)
+    return verify_answer(
+        tokenizer.decode(list(prefix_ids) + emitted[: cut + 1]), truth, style
+    )
 
 
 @torch.no_grad()
@@ -66,8 +74,16 @@ def evaluate_latent_math(
     top_p: float = 0.7,
     compact_finished: bool = False,
     compiled_tail_batch: int | None = COMPILED_EVAL_TAIL_BATCH,
+    pin_emit: bool = False,
+    prompt_suffix_ids: tuple[int, ...] = (),
 ) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
+
+    ``pin_emit`` evaluates a pinned-EMIT (cot/none reasoning mode) policy:
+    no gate or thought is ever sampled and the 50/50 forced-THINK split is
+    inert (every row is unforced). ``prompt_suffix_ids`` are teacher-forced
+    onto the END of every truncated prompt (the none-mode ``Answer:`` prefix)
+    and rejoin the decoded solution before verification.
 
     Generation runs the gate-conditioned rollout, so the evaluated policy is
     exactly the trained one — including its latent thinking. RNG state is
@@ -103,6 +119,10 @@ def evaluate_latent_math(
         raise ValueError("samples must be even for the 50/50 forced split")
     if chunk < 1:
         raise ValueError("chunk must be positive")
+    if prompt_suffix_ids and len(prompt_suffix_ids) >= prompt_tokens:
+        raise ValueError(
+            "prompt_suffix_ids must leave room for at least one prompt token"
+        )
     if batch_trajectories < 1:
         raise ValueError("batch_trajectories must be positive")
     if compiled_tail_batch is not None and compiled_tail_batch < 1:
@@ -162,7 +182,12 @@ def evaluate_latent_math(
     try:
         encoded_rows = [
             (
-                encode_prompt(tokenizer, prompt_text(row), prompt_tokens),
+                encode_prompt(
+                    tokenizer,
+                    prompt_text(row),
+                    prompt_tokens - len(prompt_suffix_ids),
+                )
+                + list(prompt_suffix_ids),
                 row["reward_model"]["ground_truth"],
                 original_index,
                 prompt_text(row),
@@ -175,7 +200,11 @@ def evaluate_latent_math(
         # Stable length bucketing minimizes left-padding and cache work while
         # preserving a deterministic evaluation order for a fixed dataset.
         encoded_rows.sort(key=lambda item: len(item[0]))
-        force_members = half_forced_group_members(1, samples, device)
+        force_members = (
+            torch.zeros(samples, dtype=torch.bool, device=device)
+            if pin_emit
+            else half_forced_group_members(1, samples, device)
+        )
         member_start = 0
         while member_start < samples:
             width = min(chunk, batch_trajectories, samples - member_start)
@@ -238,6 +267,7 @@ def evaluate_latent_math(
                                 else None
                             ),
                             prompt_repeats=width,
+                            pin_emit=pin_emit,
                         )
                     )
                 recurrent_steps_per_rollout.append(
@@ -287,7 +317,8 @@ def evaluate_latent_math(
                     style = row_chunk[group][5]
                     module = row_chunk[group][6]
                     is_correct, _ = verify_terminated_answer(
-                        emitted, truth, tokenizer, stop_ids, style
+                        emitted, truth, tokenizer, stop_ids, style,
+                        prefix_ids=prompt_suffix_ids,
                     )
                     correct += int(is_correct)
                     total += 1
@@ -297,7 +328,7 @@ def evaluate_latent_math(
                         )
                         module_total[module] = module_total.get(module, 0) + 1
                     member = member_start + flat_member % width
-                    forced = member % 2 == 0
+                    forced = member % 2 == 0 and not pin_emit
                     forced_correct += int(is_correct and forced)
                     forced_total += int(forced)
                     unforced_correct += int(is_correct and not forced)
@@ -317,7 +348,9 @@ def evaluate_latent_math(
                             ),
                             None,
                         )
-                        emitted_text = tokenizer.decode(emitted)
+                        emitted_text = tokenizer.decode(
+                            list(prompt_suffix_ids) + emitted
+                        )
                         _, parsed_answer = verify_answer(emitted_text, truth, style)
                         action_trace = "".join(
                             "T" if kind == THOUGHT_SLOT else "E"
@@ -407,6 +440,8 @@ def evaluate_latent_math(
             top_p=top_p,
             compact_finished=compact_finished,
             compiled_tail_batch=compiled_tail_batch,
+            pin_emit=pin_emit,
+            prompt_suffix_ids=prompt_suffix_ids,
         )
         metrics["compile_fallback"] = True
         return metrics
@@ -463,6 +498,7 @@ def evaluate_latent_math(
         **summarize(recurrent_steps_per_rollout, "recurrent_steps_per_rollout"),
         "compiled": compiled_step_core is not None,
         "compile_fallback": False,
+        "pin_emit": pin_emit,
         "finished_compaction": (
             f"compiled_tail_b{compiled_tail_batch}"
             if compiled_step_core is not None and compiled_tail_batch is not None

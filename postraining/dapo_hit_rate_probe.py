@@ -22,6 +22,7 @@ import train_gpt as baseline  # noqa: F401  (import order: patches must load fir
 import sentencepiece as spm
 from fresh_lejepa_train import FreshHyperparameters
 from postraining.core import (
+    POSTTRAIN_CONTEXT_TOKENS,
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_RESPONSE_TOKENS,
     POSTTRAIN_STREAM_TOKENS,
@@ -48,25 +49,44 @@ def main() -> None:
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument("--prompts", type=int, default=64)
     parser.add_argument("--samples", type=int, default=16)
-    parser.add_argument(
-        "--prompt-tokens", type=int, default=POSTTRAIN_PROMPT_TOKENS
-    )
-    parser.add_argument(
-        "--max-new-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
-    )
-    parser.add_argument(
-        "--max-stream-steps", type=int, default=POSTTRAIN_STREAM_TOKENS
-    )
+    # None derives the backbone defaults after the checkpoint loads:
+    # fresh PoPE 1024/1024/4096; nano prompt 512 with the response scaled to
+    # its recorded pretraining window (256 at seq 1024, 1024 at seq >= 2560 —
+    # nano's half-truncate RoPE has no extrapolation).
+    parser.add_argument("--prompt-tokens", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--max-stream-steps", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.samples < 2 or args.samples % 2:
         parser.error("--samples must be even for the 50/50 forced split")
-    validate_posttraining_context_budget(args.prompt_tokens, args.max_stream_steps)
 
     device = torch.device("cuda")
     backbone = load_model(args.checkpoint, device)
+    is_nano = backbone.architecture.startswith("nanogpt_mini")
+    context_tokens = (
+        getattr(backbone, "train_context_tokens", 1024)
+        if is_nano
+        else POSTTRAIN_CONTEXT_TOKENS
+    )
+    if args.prompt_tokens is None:
+        args.prompt_tokens = 512 if is_nano else POSTTRAIN_PROMPT_TOKENS
+    if args.max_new_tokens is None:
+        args.max_new_tokens = (
+            min(1024, (context_tokens - args.prompt_tokens) // 2)
+            if is_nano
+            else POSTTRAIN_RESPONSE_TOKENS
+        )
+    if args.max_stream_steps is None:
+        args.max_stream_steps = min(
+            4 * args.max_new_tokens if is_nano else POSTTRAIN_STREAM_TOKENS,
+            context_tokens - args.prompt_tokens,
+        )
+    validate_posttraining_context_budget(
+        args.prompt_tokens, args.max_stream_steps, context_tokens
+    )
     backbone.eval()
     wrapper = LatentThoughtModel(backbone).to(device).eval()
     with torch.no_grad():

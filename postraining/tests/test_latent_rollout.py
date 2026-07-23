@@ -1891,6 +1891,7 @@ def test_evaluate_aime_latent_batches_unequal_prompt_groups_without_replay_stora
                 kwargs["record_likelihoods"],
                 args[2],
                 args[3],
+                kwargs["prompt_repeats"],
             )
         )
         return original(wrapper_arg, prompt_ids, *args, **kwargs)
@@ -1912,12 +1913,16 @@ def test_evaluate_aime_latent_batches_unequal_prompt_groups_without_replay_stora
         record_likelihoods,
         temperature,
         top_p,
+        prompt_repeats,
     ) = seen[0]
-    assert prompt_ids.shape == (12, 4)
-    assert prompt_lengths.tolist() == [1] * 4 + [2] * 4 + [4] * 4
+    # Unique prompts pass through once; members are expanded structurally
+    # through ``prompt_repeats`` after the shared deterministic prefix.
+    assert prompt_ids.shape == (3, 4)
+    assert prompt_repeats == 4
+    assert prompt_lengths.tolist() == [1, 2, 4]
     assert prompt_ids[0].tolist() == [0, 0, 0, 1]
-    assert prompt_ids[4].tolist() == [0, 0, 1, 2]
-    assert prompt_ids[8].tolist() == [1, 2, 3, 4]
+    assert prompt_ids[1].tolist() == [0, 0, 1, 2]
+    assert prompt_ids[2].tolist() == [1, 2, 3, 4]
     assert forced.tolist() == [True, False, True, False] * 3
     assert replay_storage is False
     assert record_likelihoods is False
