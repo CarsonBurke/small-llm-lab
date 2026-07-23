@@ -2167,17 +2167,37 @@ def test_rollout_stops_rows_at_any_stop_token_and_records_nothing_after():
         assert not batch.action_mask[index, last + 1:].any()
 
 
-def test_math_prompt_sampler_is_sequential_resumable_and_never_reuses():
+def test_math_prompt_sampler_is_sequential_and_resumable_in_epoch_zero():
     rows = [{"id": index} for index in range(7)]
     full = MathPromptSampler(rows, seed=3).next_rows(7)
     assert [row["id"] for row in full] == list(range(7))
     resumed = MathPromptSampler(rows, seed=3)
     resumed.cursor = 4
     assert resumed.next_rows(3) == full[4:]
-    # Data order has no RNG dependence, and exhaustion never wraps epochs.
+    # The first epoch's order has no RNG dependence.
     assert MathPromptSampler(rows, seed=4).next_rows(7) == full
-    with pytest.raises(RuntimeError, match="one-pass rows"):
-        resumed.next_rows(1)
+
+
+def test_math_prompt_sampler_wraps_epochs_with_deterministic_reshuffles():
+    rows = [{"id": index} for index in range(7)]
+    sampler = MathPromptSampler(rows, seed=3)
+    # A single request spanning three epochs: each epoch is a permutation of
+    # the full dataset, epoch 0 is the given order, and later epochs differ.
+    stream = [row["id"] for row in sampler.next_rows(21)]
+    epochs = [stream[0:7], stream[7:14], stream[14:21]]
+    assert epochs[0] == list(range(7))
+    for epoch in epochs[1:]:
+        assert sorted(epoch) == list(range(7))
+    assert epochs[1] != epochs[0]
+    assert sampler.cursor == 21
+    assert sampler.epoch == 3
+    # Epoch order depends only on (seed, epoch): a resume mid-epoch continues
+    # the identical stream, and a different seed reshuffles differently.
+    resumed = MathPromptSampler(rows, seed=3)
+    resumed.cursor = 10
+    assert [row["id"] for row in resumed.next_rows(11)] == stream[10:]
+    other_seed = [row["id"] for row in MathPromptSampler(rows, seed=4).next_rows(21)]
+    assert other_seed[7:] != stream[7:]
 
 
 def test_math_dataset_identity_binds_bytes_exclusions_and_order(tmp_path):

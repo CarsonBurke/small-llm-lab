@@ -310,7 +310,15 @@ def sample_prompt_batch(
 
 
 class MathPromptSampler:
-    """Strictly sequential, one-pass prompt stream with a resumable cursor."""
+    """Sequential prompt stream with a resumable monotonic cursor.
+
+    The first epoch walks ``rows`` in their given order, so existing one-pass
+    runs, resumes, and curriculum cursors keep their exact historical stream.
+    When a run's step budget outlasts the dataset, later epochs reuse every
+    prompt exactly once per epoch in a deterministic per-epoch shuffle derived
+    from ``seed`` — the cursor keeps counting total prompts consumed, so
+    checkpoints resume mid-epoch without replaying or skipping prompts.
+    """
 
     def __init__(
         self,
@@ -321,21 +329,36 @@ class MathPromptSampler:
         if not rows:
             raise ValueError("no math prompts loaded")
         self.rows = rows
-        del seed  # retained in the API for checkpoint/CLI compatibility only
+        self.seed = seed
         self.cursor = 0
         self.dataset_identity = dataset_identity
+        self._order_epoch: int | None = None
+        self._order: list[int] | None = None
+
+    @property
+    def epoch(self) -> int:
+        return self.cursor // len(self.rows)
+
+    def _epoch_order(self, epoch: int) -> list[int]:
+        if epoch != self._order_epoch:
+            order = list(range(len(self.rows)))
+            if epoch > 0:
+                random.Random(self.seed * 1_000_003 + epoch).shuffle(order)
+            self._order_epoch, self._order = epoch, order
+        assert self._order is not None
+        return self._order
 
     def next_rows(self, count: int) -> list[dict]:
         if count < 0:
             raise ValueError("prompt count must be nonnegative")
-        end = self.cursor + count
-        if end > len(self.rows):
-            raise RuntimeError(
-                f"prompt stream exhausted at {self.cursor}; requested {count} "
-                f"from {len(self.rows)} one-pass rows"
-            )
-        picked = self.rows[self.cursor:end]
-        self.cursor = end
+        picked: list[dict] = []
+        while count:
+            epoch, offset = divmod(self.cursor, len(self.rows))
+            take = min(count, len(self.rows) - offset)
+            order = self._epoch_order(epoch)
+            picked.extend(self.rows[i] for i in order[offset:offset + take])
+            self.cursor += take
+            count -= take
         return picked
 
 
@@ -2958,10 +2981,10 @@ def main() -> None:
                     "--exclude-modules setting"
                 )
             actor_cursor = int(actor_init_payload.get("sampler_cursor", -1))
-            if not 0 <= actor_cursor < len(math_rows):
+            if actor_cursor < 0:
                 raise ValueError(
-                    "initialization source has no valid unused first-epoch prompt "
-                    f"cursor: {actor_cursor} for {len(math_rows)} rows"
+                    "initialization source has no valid prompt cursor: "
+                    f"{actor_cursor}"
                 )
             sampler.cursor = actor_cursor
             print(
@@ -3029,6 +3052,13 @@ def main() -> None:
             raise ValueError(
                 "resume checkpoint's prompt cursor belongs to different dataset "
                 "bytes, exclusions, or ordering"
+            )
+        resume_seed = payload.get("args", {}).get("seed")
+        if resume_seed is not None and int(resume_seed) != args.seed:
+            raise ValueError(
+                "resume requires the checkpoint's --seed: prompt epochs after "
+                f"the first reshuffle from it (checkpoint seed {resume_seed}, "
+                f"got {args.seed})"
             )
         wrapper.load_state_dict(payload["model"], strict=True)
         critic.load_state_dict(payload["critic"], strict=True)
@@ -3107,11 +3137,21 @@ def main() -> None:
                 warmup_updates + remaining_actor_steps
             )
     if sampler.cursor + planned_prompt_count > len(math_rows):
-        raise ValueError(
-            "posttraining run would cross the dataset's first epoch and "
-            "reuse prompts: cursor "
-            f"{sampler.cursor} + planned {planned_prompt_count} > "
-            f"{len(math_rows)} rows"
+        if args.consume_all_prompts:
+            raise ValueError(
+                "one-pass run would cross the dataset's first epoch and "
+                "reuse prompts: cursor "
+                f"{sampler.cursor} + planned {planned_prompt_count} > "
+                f"{len(math_rows)} rows"
+            )
+        final_epoch = (sampler.cursor + planned_prompt_count - 1) // len(
+            math_rows
+        )
+        print(
+            f"prompt plan spans {final_epoch + 1} epochs of the "
+            f"{len(math_rows)}-row dataset ({planned_prompt_count} prompts); "
+            "epochs after the first reshuffle deterministically from --seed",
+            flush=True,
         )
 
     # Rollout and evaluation use the identical dynamic narrow-prefix step.
