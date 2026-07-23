@@ -2293,7 +2293,10 @@ def main() -> None:
     # every actor-side optimizer state empty from the critic-warm checkpoint;
     # using the critic's 3e-4 rate also removes the prior hand-tuned split
     # between trunk, renderer, gate, adapter, and continuous-policy heads.
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    # 5e-5 is the empirically stable RL rate across the latent-VAPO runs;
+    # the old 3e-4 default (a pretraining-scale rate) caused behavior-KL
+    # spikes and policy collapse when a job omitted --learning-rate.
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--value-bins", type=int, default=101)
     # HL-Gauss projection sigma as a fraction of bin width (cleanrl v215 /
     # Dreamer4 default).
