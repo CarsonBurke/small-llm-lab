@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from fractions import Fraction
 from pathlib import Path
 
@@ -412,8 +412,9 @@ def main() -> None:
     rational_fraction_sum = sum(Fraction(str(value)) for value in fractions.values())
     if rational_fraction_sum != 1:
         parser.error("source fractions must sum exactly to 1")
-    if any(fraction <= 0.0 for fraction in fractions.values()):
-        parser.error("every source fraction must be positive")
+    if any(fraction < 0.0 for fraction in fractions.values()):
+        parser.error("source fractions must not be negative")
+    fractions = {name: value for name, value in fractions.items() if value > 0.0}
     if not 0.0 <= args.template_fraction <= 1.0:
         parser.error("--template-fraction must be in [0, 1]")
     required_stream_tokens = args.training_steps * (
@@ -439,30 +440,38 @@ def main() -> None:
             f"(e.g. {stale[0].name}); remove them or pick a fresh --output"
         )
     easy_dir = Path(args.deepmind_easy_dir)
-    missing = [
-        module
-        for module in DEEPMIND_EASY_MODULES
-        if not (easy_dir / f"{module}.txt").exists()
-    ]
-    if missing:
-        parser.error(f"missing DeepMind module files: {missing}")
-    tokenizer = spm.SentencePieceProcessor(model_file=args.tokenizer)
-    sources: dict[str, Iterator[np.ndarray]] = {
-        "fineweb": fineweb_documents(Path(args.fineweb_dataset)),
-        "finemath": encoded_documents(
+    if "deepmind_easy" in fractions:
+        missing = [
+            module
+            for module in DEEPMIND_EASY_MODULES
+            if not (easy_dir / f"{module}.txt").exists()
+        ]
+        if missing:
+            parser.error(f"missing DeepMind module files: {missing}")
+    tokenizer = (
+        spm.SentencePieceProcessor(model_file=args.tokenizer)
+        if fractions.keys() - {"fineweb"}
+        else None
+    )
+    source_builders: dict[str, Callable[[], Iterator[np.ndarray]]] = {
+        "fineweb": lambda: fineweb_documents(Path(args.fineweb_dataset)),
+        "finemath": lambda: encoded_documents(
             finemath_texts(sorted(Path(args.finemath_dir).rglob("*.parquet"))),
             tokenizer,
         ),
-        "deepmind_easy": encoded_qa_documents(
+        "deepmind_easy": lambda: encoded_qa_documents(
             deepmind_worksheets(easy_dir, args.template_fraction), tokenizer
         ),
-        "openmath": encoded_qa_documents(
+        "openmath": lambda: encoded_qa_documents(
             openmath_documents(
                 sorted(Path(args.openmath_dir).rglob("*.parquet")),
                 args.template_fraction,
             ),
             tokenizer,
         ),
+    }
+    sources: dict[str, Iterator[np.ndarray]] = {
+        name: source_builders[name]() for name in fractions
     }
     budgets = allocate_token_budgets(total_tokens, fractions)
     written_tokens = {name: 0 for name in sources}
