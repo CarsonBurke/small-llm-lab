@@ -96,7 +96,9 @@ def main() -> None:
                 profile_launches(at, args.profile_steps, profile_label)
 
         # --- eager narrow (the current production path) ---
-        caches = wrapper.make_generation_cache(batch, length, device)
+        caches = wrapper.make_generation_cache(
+            batch, length, device, dtype=torch.bfloat16
+        )
 
         def eager_step(position: int) -> None:
             wrapper.step_core(latent[:, None], caches, position)
@@ -107,7 +109,9 @@ def main() -> None:
         # --- manual CUDA graph over the EAGER static-shape step ---
         # Captured BEFORE any reduce-overhead compile so dynamo's cudagraph
         # trees cannot interfere with the capture.
-        manual_caches = wrapper.make_static_generation_cache(batch, length, device)
+        manual_caches = wrapper.make_static_generation_cache(
+            batch, length, device, dtype=torch.bfloat16
+        )
         manual_position = torch.full(
             (), args.start_position, dtype=torch.long, device=device
         )
@@ -140,7 +144,9 @@ def main() -> None:
         compiled_core = torch.compile(
             wrapper.step_core, mode="reduce-overhead", fullgraph=True, dynamic=False
         )
-        static_caches = wrapper.make_static_generation_cache(batch, length, device)
+        static_caches = wrapper.make_static_generation_cache(
+            batch, length, device, dtype=torch.bfloat16
+        )
         position_index = torch.zeros((), dtype=torch.long, device=device)
 
         def compiled_step(position: int) -> None:
@@ -151,6 +157,65 @@ def main() -> None:
 
         with torch.no_grad():
             bench("compiled static", compiled_step, "compiled static")
+
+        # --- compiled dynamic row-mask (the production TRAINING tail) ---
+        # Tensor position + growing (batch, position+1) mask is exactly the
+        # left-padded tail after compaction: narrow shapes, dynamic compile.
+        torch._dynamo.reset()
+        compiled_dynamic = torch.compile(
+            wrapper.step_core,
+            mode="max-autotune-no-cudagraphs",
+            fullgraph=True,
+            dynamic=True,
+        )
+        dynamic_caches = wrapper.make_generation_cache(
+            batch, length, device, dtype=torch.bfloat16
+        )
+        row_valid = torch.ones((batch, length), dtype=torch.bool, device=device)
+
+        def dynamic_row_step(position: int) -> None:
+            position_index.fill_(position)
+            compiled_dynamic(
+                latent[:, None],
+                dynamic_caches,
+                position_index,
+                row_valid[:, : position + 1],
+            )
+
+        with torch.no_grad():
+            bench(
+                "compiled dynamic row-mask (production tail)",
+                dynamic_row_step,
+                "compiled dynamic row-mask",
+            )
+
+        # --- compiled static row-mask (the --rollout-tail-graph path) ---
+        # Fixed-width (batch, cache_length) mask extended one column per
+        # step, as rollout_continuations' static-tail switch does.
+        torch._dynamo.reset()
+        compiled_row_core = torch.compile(
+            wrapper.step_core, mode="reduce-overhead", fullgraph=True, dynamic=False
+        )
+        static_row_caches = wrapper.make_static_generation_cache(
+            batch, length, device, dtype=torch.bfloat16
+        )
+        row_mask = (
+            key_masks[args.start_position][None].expand(batch, length).clone()
+        )
+
+        def compiled_row_step(position: int) -> None:
+            position_index.fill_(position)
+            row_mask[:, position] = True
+            compiled_row_core(
+                latent[:, None], static_row_caches, position_index, row_mask
+            )
+
+        with torch.no_grad():
+            bench(
+                "compiled static row-mask (tail graph)",
+                compiled_row_step,
+                "compiled static row-mask",
+            )
 
 
 if __name__ == "__main__":
