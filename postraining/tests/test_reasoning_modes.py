@@ -206,6 +206,8 @@ def test_score_math_rollout_prepends_answer_prefix():
         old_gate_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
         old_thought_logprobs=torch.zeros(1, stream, 0),
+        old_thought_means=torch.zeros(1, stream, 0),
+        old_thought_log_sigmas=torch.zeros(1, stream, 0),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(1),

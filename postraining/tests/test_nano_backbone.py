@@ -221,6 +221,8 @@ def test_nano_critic_smoke():
         old_gate_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
         old_thought_logprobs=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
+        old_thought_means=torch.zeros(batch_size, stream, 0),
+        old_thought_log_sigmas=torch.zeros(batch_size, stream, 0),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(batch_size),

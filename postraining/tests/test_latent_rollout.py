@@ -44,19 +44,28 @@ from postraining.latent_thought import (
     THOUGHT_MEAN_SCHEMA,
     LatentThoughtModel,
 )
+from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import _pope_construction
 from postraining.train_latent_vapo import (
     EXECUTION_SCHEMA,
     GAIN_SCALED_EXECUTION_SCHEMA,
     GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
+    JOINT_CLIP_EXECUTION_SCHEMA,
+    PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
     PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
     PREVIOUS_EXECUTION_SCHEMA,
+    UNANCHORED_VALUE_EXECUTION_SCHEMA,
     MathPromptSampler,
     REWARD_SCHEMA,
     build_optimizers,
+    migrate_anchored_value_resume,
+    value_support_geometry_matches,
     evaluate_aime_latent,
     joint_action_logprobs,
+    joint_thought_policy_loss,
     per_dimension_thought_policy_loss,
+    project_thought_means,
+    projected_thought_policy_loss,
     math_dataset_identity,
     measure_post_update_policy_drift,
     migrate_zero_adapter_resume,
@@ -760,11 +769,59 @@ def test_length_aware_replay_planner_sorts_and_respects_attention_area():
             bucket_multiple=4,
         )
     )
-    planned_rows = [row for _, rows, _ in shards for row in rows.tolist()]
+    planned_rows = [
+        row for _, rows, _, _ in shards for row in rows.tolist()
+    ]
     assert planned_rows == [3, 1, 2, 4, 0]
-    for microbatch, rows, stream_length in shards:
+    for microbatch, rows, stream_length, host_rows in shards:
         assert microbatch.kind.shape == (rows.numel(), stream_length)
         assert rows.numel() == 1 or rows.numel() * stream_length**2 <= budget
+        # The host-side row list mirrors the device index tensor so
+        # per-shard branch guards never need a device sync.
+        assert host_rows == rows.tolist()
+
+
+def test_length_aware_microbatches_slot_budget_bounds_linear_term():
+    wrapper = _wrapper()
+    batch = rollout_continuations(
+        wrapper,
+        torch.randint(0, 32, (8, 4)),
+        max_new_tokens=4,
+        max_stream_steps=20,
+        temperature=1.0,
+        top_p=1.0,
+    )
+    # Uniform short lengths: the quadratic budget alone would pack all 8
+    # rows into one shard; the linear slot budget must split them.
+    for row in range(8):
+        batch.kind[row, :8] = TOKEN_SLOT
+        batch.kind[row, 8:] = PAD_SLOT
+    shards = list(
+        iter_length_aware_microbatches(
+            batch,
+            max_trajectories=8,
+            attention_budget=10**9,
+            slot_budget=3 * 8,
+        )
+    )
+    assert len(shards) == 3  # 3 + 3 + 2 rows
+    covered = sorted(
+        row for _, rows, _, _ in shards for row in rows.tolist()
+    )
+    assert covered == list(range(8))
+    for microbatch, rows, stream_length, host_rows in shards:
+        assert rows.numel() == 1 or rows.numel() * stream_length <= 3 * 8
+        assert host_rows == rows.tolist()
+    # A single over-budget row still ships as its own shard.
+    lone = list(
+        iter_length_aware_microbatches(
+            batch,
+            max_trajectories=8,
+            attention_budget=10**9,
+            slot_budget=1,
+        )
+    )
+    assert all(rows.numel() == 1 for _, rows, _, _ in lone)
 
 
 def test_length_aware_refresh_writes_noncontiguous_parent_rows():
@@ -933,6 +990,326 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
             if "step" in state
         }
         assert steps == {1}
+
+
+def test_joint_thought_policy_loss_matches_per_dim_reporting_at_ratio_one():
+    torch.manual_seed(5)
+    actions, dims = 6, 8
+    new_thought = torch.randn(actions, dims, requires_grad=True)
+    old_thought = new_thought.detach().clone()
+    new_gate = torch.randn(actions, requires_grad=True)
+    old_gate = new_gate.detach().clone()
+    advantages = torch.randn(actions)
+    gate_mask = (torch.arange(actions) % 2 == 0).float()
+    denominator = torch.tensor(24.0)
+
+    joint_loss, joint_clip, joint_gate_clip = joint_thought_policy_loss(
+        new_gate, old_gate, new_thought, old_thought,
+        advantages, gate_mask, denominator,
+    )
+    per_dim_loss, per_dim_clip, per_dim_gate_clip = (
+        per_dimension_thought_policy_loss(
+            new_gate, old_gate, new_thought, old_thought,
+            advantages, gate_mask, denominator,
+        )
+    )
+    # At ratio one both objectives report one action's loss (the detached
+    # baseline correction) and nothing clips under either band.
+    torch.testing.assert_close(joint_loss, per_dim_loss)
+    assert float(joint_clip) == 0.0
+    assert float(joint_gate_clip) == 0.0
+    assert float(per_dim_clip) == 0.0
+    assert float(per_dim_gate_clip) == 0.0
+
+
+def test_joint_thought_clip_is_all_or_nothing_where_per_dim_never_binds():
+    # Drift spread thinly across dimensions: 0.01/dim is far inside the
+    # per-dimension band while the summed joint ratio (0.64) is far outside
+    # it. The joint objective must kill the favorable-direction gradient for
+    # the whole action, keep the harmful direction live and unclipped, and
+    # count each out-of-band action once.
+    actions, dims = 2, 64
+    old_thought = torch.zeros(actions, dims)
+    drift = torch.full((actions, dims), 0.01)
+    advantages = torch.tensor([1.0, -1.0])
+    gate_mask = torch.zeros(actions)  # forced thinks: Gaussian factor only
+    old_gate = torch.zeros(actions)
+    denominator = torch.tensor(2.0)
+
+    new_thought = drift.clone().requires_grad_(True)
+    new_gate = torch.zeros(actions, requires_grad=True)
+    joint_loss, joint_clip, joint_gate_clip = joint_thought_policy_loss(
+        new_gate, old_gate, new_thought, old_thought,
+        advantages, gate_mask, denominator,
+    )
+    joint_loss.backward()
+    assert torch.all(new_thought.grad[0] == 0.0)
+    assert torch.all(new_thought.grad[1] != 0.0)
+    assert float(joint_clip) == pytest.approx(1.0)
+    assert float(joint_gate_clip) == 0.0
+
+    per_dim_thought = drift.clone().requires_grad_(True)
+    per_dim_gate = torch.zeros(actions, requires_grad=True)
+    per_dim_loss, per_dim_clip, _ = per_dimension_thought_policy_loss(
+        per_dim_gate, old_gate, per_dim_thought, old_thought,
+        advantages, gate_mask, denominator,
+    )
+    per_dim_loss.backward()
+    assert float(per_dim_clip) == 0.0
+    assert torch.all(per_dim_thought.grad[0] != 0.0)
+
+
+def test_joint_thought_policy_loss_validates_shapes_and_update_mode():
+    new_thought = torch.zeros(3, 4)
+    with pytest.raises(ValueError, match="gate mask"):
+        joint_thought_policy_loss(
+            torch.zeros(3), torch.zeros(3), new_thought, new_thought,
+            torch.zeros(3), torch.zeros(2), torch.tensor(3.0),
+        )
+    with pytest.raises(ValueError, match="must match"):
+        joint_thought_policy_loss(
+            torch.zeros(3), torch.zeros(3), new_thought,
+            torch.zeros(3, 5), torch.zeros(3), torch.zeros(3),
+            torch.tensor(3.0),
+        )
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper)
+    assign_terminal_rewards(batch, torch.rand(2))
+    refresh_old_statistics(wrapper, critic, batch)
+    with pytest.raises(ValueError, match="thought clip mode"):
+        update_minibatch(
+            wrapper, critic, batch, _optimizers(wrapper, critic),
+            thought_clip_mode="bogus",
+        )
+
+
+def test_project_thought_means_is_the_identity_inside_the_trust_region():
+    torch.manual_seed(9)
+    old_means = torch.randn(4, 8)
+    old_log_sigmas = torch.randn(4, 8) * 0.3
+    # Shift each mean by well under sqrt(epsilon) in behavior-sigma units.
+    shift = torch.randn(4, 8)
+    shift = shift / shift.square().sum(-1, keepdim=True).sqrt()
+    new_means = (
+        old_means + 0.1 * shift * old_log_sigmas.exp()
+    ).requires_grad_(True)
+
+    projected, scale, mahalanobis_sq = project_thought_means(
+        new_means, old_means, old_log_sigmas, epsilon=0.3
+    )
+    torch.testing.assert_close(
+        mahalanobis_sq, torch.full((4,), 0.01), atol=1e-5, rtol=1e-5
+    )
+    assert torch.all(scale == 1.0)
+    assert torch.equal(projected, new_means)
+    # Inside the region the map is the identity, so gradients pass through
+    # completely untouched.
+    upstream = torch.randn(4, 8)
+    projected.backward(upstream)
+    torch.testing.assert_close(new_means.grad, upstream)
+
+
+def test_project_thought_means_boundary_jacobian_kills_radial_gradient():
+    # Outside the region the analytic Jacobian is s * (I - u u^T) in
+    # behavior-sigma units: the radial component (which would keep pushing
+    # outward) is annihilated while tangential learning survives, scaled.
+    torch.manual_seed(13)
+    epsilon = 1.0
+    old_means = torch.zeros(1, 3)
+    old_log_sigmas = torch.zeros(1, 3)  # sigma = 1: normalized == raw
+    direction = torch.tensor([[2.0, 0.0, 0.0]])
+
+    radial = direction.clone().requires_grad_(True)
+    projected, scale, mahalanobis_sq = project_thought_means(
+        radial, old_means, old_log_sigmas, epsilon
+    )
+    assert float(mahalanobis_sq.detach()) == pytest.approx(4.0)
+    assert float(scale.detach()) == pytest.approx(0.5)
+    torch.testing.assert_close(projected, torch.tensor([[1.0, 0.0, 0.0]]))
+    projected.backward(torch.tensor([[1.0, 0.0, 0.0]]))  # upstream along u
+    torch.testing.assert_close(
+        radial.grad, torch.zeros(1, 3), atol=1e-6, rtol=0.0
+    )
+
+    tangential = direction.clone().requires_grad_(True)
+    projected, _, _ = project_thought_means(
+        tangential, old_means, old_log_sigmas, epsilon
+    )
+    projected.backward(torch.tensor([[0.0, 1.0, 0.0]]))  # upstream _|_ u
+    torch.testing.assert_close(
+        tangential.grad, torch.tensor([[0.0, 0.5, 0.0]])
+    )
+
+    # Full Jacobian against the closed form on a generic point.
+    generic = torch.randn(1, 3, dtype=torch.float64)
+    generic = generic * (3.0 / generic.norm())
+    jacobian = torch.autograd.functional.jacobian(
+        lambda m: project_thought_means(
+            m, old_means.double(), old_log_sigmas.double(), epsilon
+        )[0],
+        generic,
+    ).reshape(3, 3)
+    unit = (generic / generic.norm()).reshape(3, 1)
+    expected_scale = math.sqrt(epsilon) / generic.norm()
+    torch.testing.assert_close(
+        jacobian,
+        expected_scale * (torch.eye(3, dtype=torch.float64) - unit @ unit.T),
+    )
+
+
+def test_project_thought_means_distance_is_twice_the_frozen_sigma_kl():
+    torch.manual_seed(17)
+    old_means = torch.randn(5, 6)
+    new_means = torch.randn(5, 6)
+    old_log_sigmas = torch.randn(5, 6) * 0.4
+    _, _, mahalanobis_sq = project_thought_means(
+        new_means, old_means, old_log_sigmas, epsilon=0.3
+    )
+    normalized = (new_means - old_means) / old_log_sigmas.exp()
+    torch.testing.assert_close(mahalanobis_sq, normalized.square().sum(-1))
+    # At equal sigmas the Gaussian KL reduces to half the squared
+    # Mahalanobis distance, so epsilon = 0.3 caps KL at 0.15 nats.
+    sigma_sq = (2.0 * old_log_sigmas).exp()
+    kl = 0.5 * ((new_means - old_means).square() / sigma_sq).sum(-1)
+    torch.testing.assert_close(mahalanobis_sq, 2.0 * kl)
+
+    with pytest.raises(ValueError, match="epsilon"):
+        project_thought_means(new_means, old_means, old_log_sigmas, 0.0)
+    with pytest.raises(ValueError, match="must match"):
+        project_thought_means(
+            new_means, old_means[:, :4], old_log_sigmas, 0.3
+        )
+    with pytest.raises(ValueError, match="log sigmas"):
+        project_thought_means(
+            new_means, old_means, old_log_sigmas[:, :4], 0.3
+        )
+
+
+def test_projected_thought_policy_loss_matches_joint_gradient_at_age_zero():
+    # Fresh behavior statistics mean no projection and ratio one, where the
+    # projected surrogate and the joint clip objective are both exactly
+    # A * grad(log pi): identical losses AND identical gradients.
+    torch.manual_seed(21)
+    actions, dims = 6, 8
+    base_thought = torch.randn(actions, dims)
+    advantages = torch.randn(actions)
+    gate_mask = (torch.arange(actions) % 2 == 0).float()
+    base_gate = torch.randn(actions)
+    denominator = torch.tensor(24.0)
+
+    projected_thought = base_thought.clone().requires_grad_(True)
+    projected_gate = base_gate.clone().requires_grad_(True)
+    projected_loss, projection_fraction, projected_gate_clip = (
+        projected_thought_policy_loss(
+            projected_gate, base_gate.clone(),
+            projected_thought, base_thought.clone(),
+            torch.ones(actions), advantages, gate_mask, denominator,
+        )
+    )
+    projected_loss.backward()
+
+    joint_thought = base_thought.clone().requires_grad_(True)
+    joint_gate = base_gate.clone().requires_grad_(True)
+    joint_loss, joint_clip, joint_gate_clip = joint_thought_policy_loss(
+        joint_gate, base_gate.clone(),
+        joint_thought, base_thought.clone(),
+        advantages, gate_mask, denominator,
+    )
+    joint_loss.backward()
+
+    torch.testing.assert_close(projected_loss, joint_loss)
+    torch.testing.assert_close(projected_thought.grad, joint_thought.grad)
+    torch.testing.assert_close(projected_gate.grad, joint_gate.grad)
+    assert float(projection_fraction) == 0.0
+    assert float(joint_clip) == 0.0
+    assert float(projected_gate_clip) == float(joint_gate_clip) == 0.0
+
+
+def test_projected_thought_policy_loss_ratio_guard_and_validation():
+    actions, dims = 2, 4
+    old_thought = torch.zeros(actions, dims)
+    # Joint log-ratios +5 and -5, far beyond the +/-2 numerical guard.
+    new_thought = torch.tensor([[1.25] * dims, [-1.25] * dims])
+    new_thought = new_thought.requires_grad_(True)
+    advantages = torch.tensor([1.0, 1.0])
+    gate_mask = torch.zeros(actions)  # forced thinks: Gaussian factor only
+    gate = torch.zeros(actions)
+    denominator = torch.tensor(2.0)
+
+    loss, _, _ = projected_thought_policy_loss(
+        gate.clone().requires_grad_(True), gate,
+        new_thought, old_thought,
+        torch.ones(actions), advantages, gate_mask, denominator,
+    )
+    expected = -(math.exp(2.0) + math.exp(-2.0)) / 2.0
+    torch.testing.assert_close(loss, torch.tensor(expected))
+    loss.backward()
+    # The clamp is saturated on both rows, so no gradient flows: the guard
+    # only exists to bound the exponential, never to steer learning.
+    torch.testing.assert_close(new_thought.grad, torch.zeros(actions, dims))
+
+    with pytest.raises(ValueError, match="trust scale"):
+        projected_thought_policy_loss(
+            gate, gate, old_thought, old_thought,
+            torch.ones(3), advantages, gate_mask, denominator,
+        )
+    with pytest.raises(ValueError, match="gate advantages"):
+        projected_thought_policy_loss(
+            gate, gate, old_thought, old_thought,
+            torch.ones(actions), advantages, gate_mask, denominator,
+            gate_advantages=torch.zeros(3),
+        )
+    with pytest.raises(ValueError, match="ratio guard"):
+        projected_thought_policy_loss(
+            gate, gate, old_thought, old_thought,
+            torch.ones(actions), advantages, gate_mask, denominator,
+            ratio_guard=0.0,
+        )
+
+
+def test_refresh_stores_behavior_gaussian_parameters_for_projection():
+    wrapper = _wrapper()
+    critic = _critic()
+    with torch.no_grad():
+        # Bias the gate toward THINK so thought actions certainly occur, and
+        # give sigma real state dependence so a head/belief mismatch in the
+        # stored statistics could not slip through zeros.
+        wrapper.gate.head.bias.fill_(-2.0)
+        wrapper.transition.log_sigma_head.weight.normal_(std=0.02)
+        wrapper.transition.log_sigma_head.bias.copy_(
+            torch.linspace(-2.4, -1.6, wrapper.backbone.tok_emb.embedding_dim)
+        )
+    batch = _rollout(wrapper, batch=4, prompt=6, new_tokens=4)
+    assert batch.old_thought_means.size(-1) == 0  # zero-width until refresh
+    assert batch.old_thought_log_sigmas.size(-1) == 0
+    refresh_old_statistics(wrapper, critic, batch)
+
+    with torch.no_grad():
+        beliefs, predicted, _, _ = replay_head_inputs(wrapper, batch)
+        thought_means, _, think_mask = select_thought_actions(batch, predicted)
+        thought_log_sigmas = wrapper.transition.predict_log_sigma(
+            beliefs[think_mask]
+        )
+    assert think_mask.sum() > 0
+    expected_means = torch.zeros_like(batch.old_thought_means)
+    expected_means[think_mask] = thought_means.float()
+    expected_log_sigmas = torch.zeros_like(batch.old_thought_log_sigmas)
+    expected_log_sigmas[think_mask] = thought_log_sigmas.float()
+    assert torch.equal(batch.old_thought_means, expected_means)
+    assert torch.equal(batch.old_thought_log_sigmas, expected_log_sigmas)
+
+    # Age-0 canary: against its own refresh the policy is at distance zero
+    # EXACTLY, so nothing projects and the surrogate sits at ratio one.
+    projected, scale, mahalanobis_sq = project_thought_means(
+        thought_means.float(),
+        batch.old_thought_means[think_mask],
+        batch.old_thought_log_sigmas[think_mask],
+        epsilon=0.3,
+    )
+    assert torch.all(mahalanobis_sq == 0.0)
+    assert torch.all(scale == 1.0)
+    assert torch.equal(projected, thought_means.float())
 
 
 def test_thought_pg_gradient_reaches_the_trunk_and_fresh_mean_head():
@@ -1804,6 +2181,63 @@ def test_fixed_finished_tail_never_expands_a_smaller_batch(monkeypatch):
     assert set(observed_batch_sizes) == {8}
 
 
+def test_progressive_compaction_shrinks_above_the_fixed_tail(monkeypatch):
+    # With a fixed finished tail configured, a wave of early finishers that
+    # still leaves MORE survivors than the tail width must shrink the batch
+    # progressively under the >=25%-dead rule instead of stepping the dead
+    # rows at full width until the final tail snap.
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(0, 32, (128, 4))
+    original_step_core = wrapper.step_core
+    observed_batch_sizes: list[int] = []
+
+    def observed_step_core(next_input, *args, **kwargs):
+        observed_batch_sizes.append(next_input.size(0))
+        return original_step_core(next_input, *args, **kwargs)
+
+    wrapper.step_core = observed_step_core
+    calls = 0
+
+    def staged_tokens(logits, _temperature, _top_p):
+        nonlocal calls
+        tokens = torch.full(
+            (logits.size(0),), 6, dtype=torch.long, device=logits.device
+        )
+        if calls == 0:
+            # 40 dead of 128 (>=25%, 88 survivors > 16): progressive shrink.
+            tokens[:40] = 5
+        elif calls == 16:
+            # Batch order is now the 88 survivors; leave 12 for the tail.
+            tokens[: logits.size(0) - 12] = 5
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", staged_tokens)
+    batch = rollout_continuations(
+        wrapper,
+        prompt_ids,
+        max_new_tokens=40,
+        max_stream_steps=48,
+        temperature=1.0,
+        top_p=0.7,
+        stop_ids=(5,),
+        compact_finished=True,
+        finished_batch_size=16,
+        record_likelihoods=False,
+    )
+
+    emitted = emitted_token_rows(batch)
+    assert emitted[:40] == [[5]] * 40
+    assert emitted[40:116] == [[6] * 16 + [5]] * 76
+    assert all(row == [6] * 40 for row in emitted[116:])
+    # Full width, one intermediate width, then the fixed tail — never an
+    # intermediate width equal to the tail (which would engage a tail graph
+    # early), never an expansion.
+    assert sorted(set(observed_batch_sizes)) == [16, 88, 128]
+
+
 def test_finished_row_compaction_preserves_model_dependent_survivor_tokens(
     monkeypatch,
 ):
@@ -1849,6 +2283,117 @@ def test_finished_row_compaction_preserves_model_dependent_survivor_tokens(
     compacted = emitted_token_rows(run(True))
     assert compacted[:80] == [[5]] * 80
     assert compacted[80:] == fixed[80:]
+
+
+def test_static_tail_switch_matches_the_dynamic_tail(monkeypatch):
+    """The tail_caches switch is invisible to the sampled trajectories.
+
+    Mixed prompt lengths make left-pad masking load-bearing: if the
+    fixed-width tail mask wrongly attended a pad slot's garbage K/V, the
+    argmax tokens below would flip. The third run reuses the DIRTY caches
+    from the second to pin that stale slots beyond the live prefix stay
+    masked, and spies on ``tail_step_core`` to pin the constant shapes the
+    CUDA graph relies on.
+    """
+    wrapper = _deterministic_wrapper()
+    generator = torch.Generator().manual_seed(17)
+    prompt_ids = torch.randint(1, 32, (64, 4), generator=generator)
+    prompt_ids[:32, 0] = 0
+    prompt_lengths = torch.tensor([3] * 32 + [4] * 32)
+    calls = 0
+
+    def terminate_then_argmax(logits, _temperature, _top_p):
+        nonlocal calls
+        tokens = logits.argmax(-1)
+        if calls == 0:
+            # Leave 12 live rows so the fixed B16 tail retains 4 fillers —
+            # six of them LEFT-PADDED (rows 0-5) so a tail mask that wrongly
+            # attends a surviving row's pad slot would flip its argmax.
+            tokens[6:58] = 5
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", terminate_then_argmax)
+
+    seen_shapes = set()
+    original_step_core = wrapper.step_core
+
+    def spy_tail_core(next_input, caches, position, key_mask):
+        seen_shapes.add((next_input.size(0), tuple(key_mask.shape)))
+        return original_step_core(next_input, caches, position, key_mask)
+
+    def run(tail_caches=None, tail_step_core=None):
+        nonlocal calls
+        calls = 0
+        return rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=32,
+            max_stream_steps=32,
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            tensor_positions=True,
+            compact_finished=True,
+            finished_batch_size=16,
+            record_likelihoods=False,
+            tail_caches=tail_caches,
+            tail_step_core=tail_step_core,
+        )
+
+    dynamic = emitted_token_rows(run())
+    static_caches = wrapper.make_static_generation_cache(
+        16, 40, torch.device("cpu")
+    )
+    static = emitted_token_rows(run(tail_caches=static_caches))
+    assert static == dynamic
+    # The switch actually landed the survivors in the static caches.
+    assert sum(float(cache[0].abs().sum()) for cache in static_caches) > 0.0
+
+    reused = emitted_token_rows(
+        run(tail_caches=static_caches, tail_step_core=spy_tail_core)
+    )
+    assert reused == static
+    assert seen_shapes == {(16, (16, 40))}
+
+
+def test_static_tail_validation_rejects_misfit_caches():
+    wrapper = _deterministic_wrapper()
+    prompt_ids = torch.randint(1, 32, (8, 4))
+    cpu = torch.device("cpu")
+
+    def run(**overrides):
+        kwargs = dict(
+            max_new_tokens=4,
+            max_stream_steps=8,
+            temperature=1.0,
+            top_p=1.0,
+            tensor_positions=True,
+            compact_finished=True,
+            finished_batch_size=4,
+            record_likelihoods=False,
+        )
+        kwargs.update(overrides)
+        return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+    good = wrapper.make_static_generation_cache(4, 12, cpu)
+    with pytest.raises(ValueError, match="finished_batch_size"):
+        run(tail_caches=good, finished_batch_size=None)
+    with pytest.raises(ValueError, match="tensor_positions"):
+        run(tail_caches=good, tensor_positions=False)
+    with pytest.raises(ValueError, match="do not fit"):
+        run(tail_caches=wrapper.make_static_generation_cache(3, 12, cpu))
+    with pytest.raises(ValueError, match="do not fit"):
+        run(tail_caches=wrapper.make_static_generation_cache(4, 8, cpu))
+    with pytest.raises(ValueError, match="dtype"):
+        run(
+            tail_caches=wrapper.make_static_generation_cache(
+                4, 12, cpu, dtype=torch.bfloat16
+            )
+        )
 
 
 def test_evaluate_aime_latent_batches_unequal_prompt_groups_without_replay_storage(
@@ -2237,43 +2782,229 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
 
 
+def test_value_support_geometry_matches_compares_args_not_shapes() -> None:
+    current = SimpleNamespace(
+        value_anchored_support=True, value_bins=101, value_margin_bins=4
+    )
+    saved = {
+        "value_anchored_support": True,
+        "value_bins": 101,
+        "value_margin_bins": 4,
+    }
+    assert value_support_geometry_matches(saved, current)
+    # Anchored 103/3 collides with 101/4 on total head width (110 bins) but
+    # changes bin width and sigma; the args comparison catches what a strict
+    # state-dict shape check cannot.
+    assert not value_support_geometry_matches(
+        dict(saved, value_bins=103, value_margin_bins=3), current
+    )
+    assert not value_support_geometry_matches(
+        dict(saved, value_anchored_support=False), current
+    )
+    # Pre-v22 checkpoints carry none of the keys.
+    assert not value_support_geometry_matches({}, current)
+    legacy = SimpleNamespace(
+        value_anchored_support=False, value_bins=101, value_margin_bins=4
+    )
+    # Unanchored grids ignore the margin flag entirely.
+    assert value_support_geometry_matches(
+        {
+            "value_anchored_support": False,
+            "value_bins": 101,
+            "value_margin_bins": 9,
+        },
+        legacy,
+    )
+    assert not value_support_geometry_matches({}, legacy)
+
+
+def test_anchored_value_migration_transfers_trunk_and_rebuilds_head() -> None:
+    """v21->v22 critic migration: trunk/adapter verbatim, head at the prior."""
+
+    def anchored_target(seed: int) -> SeparateCritic:
+        num_bins, v_min, v_max = anchored_unit_geometry(17, 3)
+        torch.manual_seed(seed)
+        with _pope_construction():
+            trunk = FreshLeJEPASharedRMSV1PoPE(**KWARGS).eval()
+        return SeparateCritic(
+            trunk,
+            num_bins=num_bins,
+            sigma_ratio=1.0,
+            v_min=v_min,
+            v_max=v_max,
+            prior_value=0.05,
+        ).eval()
+
+    source_critic = _critic(seed=3)
+    source_state = source_critic.state_dict()
+    target_critic = anchored_target(seed=21)
+    provenance = migrate_anchored_value_resume(
+        {"critic": source_state}, target_critic
+    )
+    assert provenance["rebuilt_state"] == [
+        "head.bias",
+        "head.weight",
+        "support.centers",
+        "support.edges",
+    ]
+
+    target_state = target_critic.state_dict()
+    for key, value in source_state.items():
+        if key.startswith(("head.", "support.")):
+            continue
+        torch.testing.assert_close(target_state[key], value, rtol=0, atol=0)
+    # The head keeps its fresh v215 init: zero weights, prior projected into
+    # the bias on the ANCHORED grid.
+    assert float(target_critic.head.weight.abs().max()) == 0.0
+    torch.testing.assert_close(
+        target_critic.head.bias,
+        target_critic.support.project_to_logprobs(
+            torch.tensor(0.05), eps=1e-6
+        ),
+    )
+    assert target_critic.support.edges.numel() == 17 + 1 + 2 * 3 + 1
+
+    # Sources that differ beyond head/support state must fail loudly instead
+    # of silently skipping or shape-crashing later.
+    unexpected = dict(source_state)
+    unexpected["renderer.probe.weight"] = torch.zeros(1)
+    with pytest.raises(ValueError, match="only in head/support"):
+        migrate_anchored_value_resume(
+            {"critic": unexpected}, anchored_target(seed=22)
+        )
+    truncated = {
+        key: value
+        for key, value in source_state.items()
+        if not key.startswith("adapter.")
+    }
+    with pytest.raises(ValueError, match="only in head/support"):
+        migrate_anchored_value_resume(
+            {"critic": truncated}, anchored_target(seed=23)
+        )
+
+
 def test_resume_schema_requires_matching_explicit_migration() -> None:
     current = {"execution_schema": EXECUTION_SCHEMA}
     assert resume_execution_schema_compatible(current)
-    assert not resume_execution_schema_compatible(
-        current,
-        allow_reverse_kl_migration=True,
+    for extra_flag in (
+        "allow_reverse_kl_migration",
+        "allow_performance_migration",
+        "allow_joint_clip_migration",
+        "allow_anchored_value_migration",
+        "allow_projected_thought_migration",
+    ):
+        assert not resume_execution_schema_compatible(
+            current, **{extra_flag: True}
+        )
+    joint_clip_previous = {
+        "execution_schema": JOINT_CLIP_EXECUTION_SCHEMA
+    }
+    assert not resume_execution_schema_compatible(joint_clip_previous)
+    assert resume_execution_schema_compatible(
+        joint_clip_previous,
+        allow_projected_thought_migration=True,
     )
     assert not resume_execution_schema_compatible(
-        current,
+        joint_clip_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
+    )
+    assert not resume_execution_schema_compatible(
+        joint_clip_previous,
+        allow_anchored_value_migration=True,
+    )
+    unanchored_previous = {
+        "execution_schema": UNANCHORED_VALUE_EXECUTION_SCHEMA
+    }
+    assert not resume_execution_schema_compatible(unanchored_previous)
+    assert not resume_execution_schema_compatible(
+        unanchored_previous,
+        allow_anchored_value_migration=True,
+    )
+    assert resume_execution_schema_compatible(
+        unanchored_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
+    )
+    assert not resume_execution_schema_compatible(
+        unanchored_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
+        allow_joint_clip_migration=True,
+    )
+    per_dim_previous = {
+        "execution_schema": PER_DIM_REVERSE_KL_EXECUTION_SCHEMA
+    }
+    assert not resume_execution_schema_compatible(per_dim_previous)
+    assert not resume_execution_schema_compatible(
+        per_dim_previous,
+        allow_anchored_value_migration=True,
+        allow_joint_clip_migration=True,
+    )
+    assert resume_execution_schema_compatible(
+        per_dim_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
+        allow_joint_clip_migration=True,
+    )
+    assert not resume_execution_schema_compatible(
+        per_dim_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
+        allow_joint_clip_migration=True,
         allow_performance_migration=True,
+    )
+    assert not resume_execution_schema_compatible(
+        per_dim_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
+        allow_joint_clip_migration=True,
+        allow_reverse_kl_migration=True,
     )
     performance_previous = {
         "execution_schema": PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA
     }
     assert not resume_execution_schema_compatible(performance_previous)
+    assert not resume_execution_schema_compatible(
+        performance_previous,
+        allow_anchored_value_migration=True,
+        allow_performance_migration=True,
+        allow_joint_clip_migration=True,
+    )
     assert resume_execution_schema_compatible(
         performance_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
         allow_performance_migration=True,
+        allow_joint_clip_migration=True,
     )
     assert not resume_execution_schema_compatible(
         performance_previous,
+        allow_projected_thought_migration=True,
+        allow_anchored_value_migration=True,
         allow_reverse_kl_migration=True,
         allow_performance_migration=True,
+        allow_joint_clip_migration=True,
     )
     previous = {"execution_schema": PREVIOUS_EXECUTION_SCHEMA}
     assert not resume_execution_schema_compatible(previous)
     assert not resume_execution_schema_compatible(
         previous,
         allow_reverse_kl_migration=True,
+        allow_performance_migration=True,
+        allow_joint_clip_migration=True,
+        allow_anchored_value_migration=True,
     )
     assert resume_execution_schema_compatible(
         previous,
         allow_reverse_kl_migration=True,
         allow_performance_migration=True,
+        allow_joint_clip_migration=True,
+        allow_anchored_value_migration=True,
+        allow_projected_thought_migration=True,
     )
-    # Even trained v18 state is structurally resumable because v19 changes
-    # only the objective; the explicit flag prevents an accidental change.
+    # Even trained v18 state is structurally resumable because objective
+    # revisions preserve state; the explicit flags prevent accidental change.
     assert not resume_execution_schema_compatible(
         {
             "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
@@ -2288,6 +3019,9 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
             "optimizers": {"actor": {"state": {1: {"step": 1}}}},
         },
         allow_reverse_kl_migration=True,
+        allow_performance_migration=True,
+        allow_joint_clip_migration=True,
+        allow_anchored_value_migration=True,
     )
     assert resume_execution_schema_compatible(
         {
@@ -2297,6 +3031,9 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
         },
         allow_reverse_kl_migration=True,
         allow_performance_migration=True,
+        allow_joint_clip_migration=True,
+        allow_anchored_value_migration=True,
+        allow_projected_thought_migration=True,
     )
 
     # Older actor optimizers and policy semantics must fail at the schema

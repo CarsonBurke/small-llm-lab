@@ -150,6 +150,9 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_dim_abs_log_ratio_max": 0.08,
         "thought_joint_abs_log_ratio_max": 0.3,
         "harmful_positive_log_ratio_max": 0.4,
+        "thought_trust_d_mean": 0.05,
+        "thought_trust_d_max": 0.2,
+        "thought_projection_penalty": 0.01,
         "trunk_grad_norm": 1.0,
         "renderer_grad_norm": 2.0,
         "adapter_grad_norm": 3.0,
@@ -210,6 +213,9 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         thought_dim_abs_log_ratio_max=0.05,
         thought_joint_abs_log_ratio_max=0.25,
         harmful_positive_log_ratio_max=0.2,
+        thought_trust_d_mean=0.02,
+        thought_trust_d_max=0.1,
+        thought_projection_penalty=0.01,
         trunk_grad_norm=10.0,
         critic_grad_norm=11.0,
     )
@@ -222,6 +228,9 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
         thought_dim_abs_log_ratio_max=0.09,
         thought_joint_abs_log_ratio_max=0.45,
         harmful_positive_log_ratio_max=0.6,
+        thought_trust_d_mean=0.06,
+        thought_trust_d_max=0.3,
+        thought_projection_penalty=0.02,
         trunk_grad_norm=20.0,
         critic_grad_norm=21.0,
     )
@@ -247,6 +256,11 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["ratio/thought_dim_abs_log_max"] == pytest.approx(0.09)
     assert dashboard["ratio/thought_joint_abs_log_max"] == pytest.approx(0.45)
     assert dashboard["ratio/harmful_positive_log_max"] == pytest.approx(0.6)
+    # Trust statistics: d_mean weighted by thought actions (equal counts
+    # here, so plain mean), d_max as max, penalty summed like the losses.
+    assert dashboard["trust/thought_d_mean"] == pytest.approx(0.04)
+    assert dashboard["trust/thought_d_max"] == pytest.approx(0.3)
+    assert dashboard["trust/projection_penalty"] == pytest.approx(0.03)
     assert "grad/critic_mean" not in dashboard
     assert dashboard["loss/positive_lm_weighted"] == pytest.approx(0.8)
     assert "thought_behavior_kl_per_dim" not in dashboard

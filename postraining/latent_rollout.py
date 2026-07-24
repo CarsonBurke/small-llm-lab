@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 
 from postraining.core import top_p_sample
-from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
+from postraining.latent_thought import EMIT, THINK, LatentThoughtModel, StepOutput
 
 TOKEN_SLOT, THOUGHT_SLOT, PAD_SLOT = 0, 1, -1
 
@@ -65,6 +65,13 @@ class LatentRolloutBatch:
     # (batch, stream, dim): old diagonal-Gaussian factors retained so replay
     # can clip every latent dimension against the frozen behavior policy.
     old_thought_logprobs: Tensor
+    # (batch, stream, dim), fp32: the behavior policy's Gaussian parameters at
+    # THINK positions. The projected THINK objective measures its Mahalanobis
+    # trust region against these directly instead of estimating divergence
+    # from single-sample ratios. Filled by refresh_old_statistics through the
+    # exact replay path, like the log-probabilities above.
+    old_thought_means: Tensor
+    old_thought_log_sigmas: Tensor
     old_values: Tensor
     rewards: Tensor
     reward_scalar: Tensor  # (batch,)
@@ -75,11 +82,17 @@ class LatentRolloutBatch:
     # for pinned-EMIT rollouts, whose thought tensors are always zero-width.
     statistics_refreshed: bool = False
 
-    def to(self, device: torch.device) -> "LatentRolloutBatch":
+    def to(
+        self, device: torch.device, non_blocking: bool = False
+    ) -> "LatentRolloutBatch":
         moved = {}
         for field in fields(self):
             value = getattr(self, field.name)
-            moved[field.name] = value.to(device) if isinstance(value, Tensor) else value
+            moved[field.name] = (
+                value.to(device, non_blocking=non_blocking)
+                if isinstance(value, Tensor)
+                else value
+            )
         return LatentRolloutBatch(**moved)
 
     @property
@@ -195,6 +208,8 @@ def rollout_continuations(
     cache_dtype: torch.dtype | None = None,
     prompt_repeats: int = 1,
     pin_emit: bool = False,
+    tail_caches: list[tuple[Tensor, ...]] | None = None,
+    tail_step_core=None,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
@@ -258,6 +273,20 @@ def rollout_continuations(
     row indices remain attached to all trajectory records, so compaction changes
     compute and RNG consumption, not the sampled policy distribution or output
     attribution.
+
+    ``tail_caches`` (with ``finished_batch_size``) switches the compacted tail
+    onto caller-owned static caches (``make_static_generation_cache`` of
+    exactly ``finished_batch_size`` rows, at least ``max_stream`` long):
+    at the tail compaction the survivors' live cache prefix is copied into
+    them and every remaining step attends the full static width under a
+    fixed-shape per-row ``key_mask`` that combines causality with each row's
+    left-pad validity — constant shapes, so ``tail_step_core`` (a
+    CUDA-graph-compiled ``step_core``) replays one graph per step. Reusing one
+    cache set across rollouts of identical shape keeps the graph from
+    re-recording; stale values it carries stay masked, exactly like the zero
+    fill at allocation. Without ``tail_step_core`` the tail runs through the
+    ordinary ``wrapper.step`` (the eager 2-D-mask path), which is what CPU
+    tests exercise.
     """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
@@ -346,7 +375,46 @@ def rollout_continuations(
             (cache_length, cache_length), dtype=torch.bool, device=device
         ).tril_()
 
+    tail_mask: Tensor | None = None
+    tail_length = 0
+    if tail_caches is not None:
+        if preallocated_caches:
+            raise ValueError(
+                "tail_caches is the mid-rollout static switch; preallocated "
+                "caches are already static for the whole rollout"
+            )
+        if finished_batch_size is None or not compact_finished:
+            raise ValueError(
+                "tail_caches requires compact_finished and "
+                "finished_batch_size: the static switch happens at the "
+                "fixed-size tail compaction"
+            )
+        if position_index is None:
+            raise ValueError("tail_caches requires tensor_positions")
+        tail_length = tail_caches[0][0].size(2)
+        if (
+            tail_caches[0][0].size(0) != finished_batch_size
+            or tail_length < max_stream
+        ):
+            raise ValueError(
+                f"tail caches ({tuple(tail_caches[0][0].shape)}) do not fit "
+                f"tail batch {finished_batch_size} x stream {max_stream}"
+            )
+        if tail_caches[0][0].dtype != caches[0][0].dtype:
+            raise ValueError(
+                f"tail cache dtype {tail_caches[0][0].dtype} must match the "
+                f"rollout cache dtype {caches[0][0].dtype}"
+            )
+
     def step_position(position: int) -> tuple[int | Tensor, Tensor | None]:
+        if tail_mask is not None:
+            # Fixed-shape tail: the full-width row mask grows by one column
+            # per step in place, so the step's shapes never change and the
+            # mask write is one tiny kernel. Generated slots are always
+            # attendable; only each row's left-pad prefix stays False.
+            position_index.fill_(position)
+            tail_mask[:, position] = True
+            return position_index, tail_mask
         if position_index is not None:
             position_index.fill_(position)
             step_position_value: int | Tensor = position_index
@@ -388,6 +456,8 @@ def rollout_continuations(
     old_thought_logprobs = thoughts.new_zeros(
         (batch, max_stream, 0)
     )
+    old_thought_means = thoughts.new_zeros((batch, max_stream, 0))
+    old_thought_log_sigmas = thoughts.new_zeros((batch, max_stream, 0))
     old_values = torch.zeros_like(action_mask)
 
     if valid_slots is None:
@@ -474,18 +544,24 @@ def rollout_continuations(
                 break
             current_count = active.numel()
             compacted_count = active_count
-            if finished_batch_size is not None:
-                compacted_count = (
-                    min(current_count, finished_batch_size)
-                    if active_count <= finished_batch_size
-                    else current_count
-                )
+            snap_to_tail = (
+                finished_batch_size is not None
+                and active_count <= finished_batch_size
+            )
+            if snap_to_tail:
+                compacted_count = min(current_count, finished_batch_size)
+            # Above the tail width, compact progressively under the same
+            # >=25%-dead hysteresis as the tail-free path: a few long
+            # survivors must not keep stepping hundreds of finished rows at
+            # full width until the final tail snap. Intermediate widths never
+            # equal the static tail size, so they run on the dynamic-shape
+            # step core and cannot engage the tail graph early.
             should_compact = (
                 compact_finished
                 and not preallocated_caches
                 and compacted_count < current_count
                 and (
-                    finished_batch_size is not None
+                    snap_to_tail
                     or current_count - active_count
                     >= max(1, current_count // 4)
                 )
@@ -505,21 +581,84 @@ def rollout_continuations(
                     valid_slots = valid_slots.index_select(0, keep)
                     pad_lengths = pad_lengths.index_select(0, keep)
                 live_prefix = position + 1
-                for layer, cache in enumerate(caches):
-                    compacted = []
-                    for tensor in cache:
-                        target = torch.empty(
-                            (compacted_count, *tensor.shape[1:]),
-                            dtype=tensor.dtype,
-                            device=tensor.device,
-                        )
-                        target[:, :, :live_prefix].copy_(
-                            tensor[:, :, :live_prefix].index_select(0, keep)
-                        )
-                        compacted.append(target)
-                    # Replace one layer at a time so old+new full-capacity
-                    # caches do not coexist across all layers at peak memory.
-                    caches[layer] = tuple(compacted)
+                if (
+                    tail_caches is not None
+                    and compacted_count == tail_caches[0][0].size(0)
+                ):
+                    # Static-tail switch: land the survivors' live prefix in
+                    # the caller-owned graph-static caches. Slots at or after
+                    # ``live_prefix`` keep stale-but-finite values from
+                    # earlier rollouts; the fixed-width row mask hides them,
+                    # exactly like the zero fill at allocation.
+                    for layer, cache in enumerate(caches):
+                        static_layer = tail_caches[layer]
+                        for tensor, target in zip(
+                            cache, static_layer, strict=True
+                        ):
+                            target[:, :, :live_prefix].copy_(
+                                tensor[:, :, :live_prefix].index_select(
+                                    0, keep
+                                )
+                            )
+                        # Replace one layer at a time so the dynamic caches
+                        # free as the static ones fill.
+                        caches[layer] = static_layer
+                    tail_mask = torch.zeros(
+                        (compacted_count, tail_length),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    if valid_slots is not None:
+                        # Rows were compacted above, so this is the
+                        # survivors' causal-and-valid mask at the switch.
+                        tail_mask[:, :live_prefix] = valid_slots[
+                            :, :live_prefix
+                        ]
+                    else:
+                        tail_mask[:, :live_prefix] = True
+                elif snap_to_tail or finished_batch_size is None:
+                    for layer, cache in enumerate(caches):
+                        compacted = []
+                        for tensor in cache:
+                            target = torch.empty(
+                                (compacted_count, *tensor.shape[1:]),
+                                dtype=tensor.dtype,
+                                device=tensor.device,
+                            )
+                            target[:, :, :live_prefix].copy_(
+                                tensor[:, :, :live_prefix].index_select(
+                                    0, keep
+                                )
+                            )
+                            compacted.append(target)
+                        # Replace one layer at a time so old+new
+                        # full-capacity caches do not coexist across all
+                        # layers at peak memory.
+                        caches[layer] = tuple(compacted)
+                else:
+                    # Progressive above-tail compaction gathers the
+                    # survivors into the FRONT of the existing storage and
+                    # keeps narrowed contiguous views. Reallocating here
+                    # (the branch above) adds a full-capacity transient per
+                    # tensor at peak KV pressure — that exact allocation
+                    # OOMed the v23 smoke run. The view keeps the original
+                    # storage alive until the tail snap frees it, which is
+                    # the same footprint the pre-progressive code held at
+                    # full width; the transient shrinks to survivors x
+                    # live-prefix. The survivor gather is materialized
+                    # BEFORE the in-place copy, so overlapping rows cannot
+                    # alias.
+                    for layer, cache in enumerate(caches):
+                        compacted = []
+                        for tensor in cache:
+                            survivors = tensor[
+                                :, :, :live_prefix
+                            ].index_select(0, keep)
+                            tensor[
+                                :compacted_count, :, :live_prefix
+                            ].copy_(survivors)
+                            compacted.append(tensor[:compacted_count])
+                        caches[layer] = tuple(compacted)
                 output = output.__class__(
                     belief=output.belief.index_select(0, keep),
                     predicted=output.predicted.index_select(0, keep),
@@ -616,7 +755,20 @@ def rollout_continuations(
         # static pool and are only valid until the NEXT replay: everything
         # read from ``output`` above happens before this call, and every
         # consumer copies out (float()/gather/where).  Keep it that way.
-        output = wrapper.step(next_input, caches, step_pos, key_mask)
+        if tail_mask is not None and tail_step_core is not None:
+            belief, predicted, thought_log_sigma, logits = tail_step_core(
+                next_input, caches, step_pos, key_mask
+            )
+            output = StepOutput(
+                belief=belief,
+                predicted=predicted,
+                thought_log_sigma=thought_log_sigma,
+                input_latent=next_input.squeeze(1),
+                logits=logits,
+                caches=caches,
+            )
+        else:
+            output = wrapper.step(next_input, caches, step_pos, key_mask)
         caches = output.caches
         position = next_position
 
@@ -631,6 +783,8 @@ def rollout_continuations(
         old_gate_logprobs=old_gate_logprobs,
         old_token_logprobs=old_token_logprobs,
         old_thought_logprobs=old_thought_logprobs,
+        old_thought_means=old_thought_means,
+        old_thought_log_sigmas=old_thought_log_sigmas,
         old_values=old_values,
         rewards=torch.zeros_like(action_mask),
         reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
@@ -684,8 +838,14 @@ def split_rollout_groups(
 
 def pack_rollout_groups_for_replay(
     groups: Sequence[LatentRolloutBatch],
+    pin_memory: bool = False,
 ) -> LatentRolloutBatch:
     """Right-pad independent prompt groups into one exact replay batch.
+
+    ``pin_memory`` allocates the packed CPU tensors in page-locked memory
+    (via the caching host allocator, so repeated same-size packs recycle
+    their blocks) so the subsequent H2D upload can run as a fast DMA copy;
+    it is ignored for on-device groups or CUDA-less hosts.
 
     Every source stream keeps its original position zero and action boundary;
     only unused tail columns are appended. This matters because full-sequence
@@ -705,6 +865,11 @@ def pack_rollout_groups_for_replay(
         raise ValueError("rollout groups must share one device")
     max_stream = max(group.stream_length for group in groups)
     total_rows = sum(group.kind.size(0) for group in groups)
+    pin = (
+        pin_memory
+        and next(iter(devices)).type == "cpu"
+        and torch.cuda.is_available()
+    )
     combined: dict[str, Tensor | int] = {}
     for field in fields(groups[0]):
         if field.name == "prompt_length":
@@ -730,8 +895,12 @@ def pack_rollout_groups_for_replay(
                     f"rollout field {field.name} has incompatible stream shapes"
                 )
             fill = PAD_SLOT if field.name == "kind" else 0
-            output = first.new_full(
-                (total_rows, max_stream, *first.shape[2:]), fill
+            output = torch.full(
+                (total_rows, max_stream, *first.shape[2:]),
+                fill,
+                dtype=first.dtype,
+                device=first.device,
+                pin_memory=pin,
             )
             row_start = 0
             for value in values:
@@ -744,7 +913,8 @@ def pack_rollout_groups_for_replay(
                 raise ValueError(
                     f"rollout field {field.name} has incompatible row shapes"
                 )
-            combined[field.name] = torch.cat(values)
+            rows = torch.cat(values)
+            combined[field.name] = rows.pin_memory() if pin else rows
         else:
             raise ValueError(f"unsupported scalar rollout field {field.name}")
     return LatentRolloutBatch(**combined)
@@ -772,6 +942,8 @@ def scatter_replay_statistics(
         "old_gate_logprobs",
         "old_token_logprobs",
         "old_thought_logprobs",
+        "old_thought_means",
+        "old_thought_log_sigmas",
         "old_values",
     )
     statistics = {
@@ -935,6 +1107,25 @@ def replay_head_inputs(
     return beliefs, predicted, stream_inputs, token_targets
 
 
+def compact_emit_token_logprobs(
+    backbone, emit_features: Tensor, emit_targets: Tensor
+) -> Tensor:
+    """log P(target token) at each compact EMIT slot.
+
+    Refresh and the trainer's update step both come through this one helper
+    so their eager forwards stay bit-identical (the behavior-age-0 zero-clip
+    canary). Its vocabulary-wide temporaries scale with slots x vocab; the
+    replay planner's slot budget bounds that, not this function.
+    """
+    logits = backbone.logits_from_features(emit_features)
+    return (
+        logits.float()
+        .log_softmax(-1)
+        .gather(-1, emit_targets[..., None])
+        .squeeze(-1)
+    )
+
+
 def select_thought_actions(
     batch: LatentRolloutBatch, predicted: Tensor
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -984,14 +1175,24 @@ def iter_length_aware_microbatches(
     max_trajectories: int,
     attention_budget: int,
     bucket_multiple: int = 1,
+    slot_budget: int | None = None,
 ):
-    """Yield stable length-sorted replay shards under a B*L^2 budget.
+    """Yield stable length-sorted replay shards under B*L^2 and B*L budgets.
 
-    Causal full-stream replay is governed by attention area, not row count.
-    Stable sorting groups similarly sized independent trajectories; normal
-    ~150-position groups fit all 32 rows, while rare 1K-4K outliers
-    automatically receive smaller shards. ``rows`` maps each compact shard
-    back into the parent batch for refresh-stat writes.
+    Causal full-stream replay is governed by two independent memory terms:
+    attention area (B*L^2, quadratic) and the vocabulary head over the
+    shard's slots (B*L x 50257-wide logits plus their autograd-retained
+    log-softmax — the LINEAR term, and the larger one for fat shards of
+    ordinary-length trajectories). ``slot_budget`` bounds the linear term;
+    without it, raising ``attention_budget`` alone lets short-L shards grow
+    their slot count unboundedly and the emit-logits pass OOMs before
+    attention does. Stable sorting groups similarly sized independent
+    trajectories; rare 1K-4K outliers automatically receive smaller shards.
+    ``rows`` maps each compact shard back into the parent batch for
+    refresh-stat writes. The final element repeats those row indices as the
+    host-side Python list they were built from, so callers can make
+    per-shard branch decisions (has-THINK, has-EMIT) against a once-per-batch
+    CPU table instead of a blocking device sync inside every shard.
     """
     if max_trajectories < 1:
         raise ValueError("replay max trajectories must be positive")
@@ -999,6 +1200,8 @@ def iter_length_aware_microbatches(
         raise ValueError("replay attention budget must be positive")
     if bucket_multiple < 1:
         raise ValueError("replay bucket multiple must be positive")
+    if slot_budget is not None and slot_budget < 1:
+        raise ValueError("replay slot budget must be positive")
     lengths = trajectory_used_lengths(batch).to(device="cpu").tolist()
     order = sorted(range(len(lengths)), key=lambda row: (-lengths[row], row))
 
@@ -1018,6 +1221,10 @@ def iter_length_aware_microbatches(
             candidate_rows > max_trajectories
             or candidate_rows * candidate_length * candidate_length
             > attention_budget
+            or (
+                slot_budget is not None
+                and candidate_rows * candidate_length > slot_budget
+            )
         )
         if shard and exceeds:
             row_tensor = torch.tensor(
@@ -1027,6 +1234,7 @@ def iter_length_aware_microbatches(
                 select_trajectory_rows(batch, row_tensor, shard_length),
                 row_tensor,
                 shard_length,
+                shard,
             )
             shard = []
             shard_length = 0
@@ -1040,6 +1248,7 @@ def iter_length_aware_microbatches(
             select_trajectory_rows(batch, row_tensor, shard_length),
             row_tensor,
             shard_length,
+            shard,
         )
 
 
@@ -1050,6 +1259,7 @@ def refresh_old_statistics(
     max_trajectories: int = 32,
     attention_budget: int = 4 * 1024 * 1024,
     bucket_multiple: int = 1,
+    slot_budget: int | None = None,
 ) -> None:
     """Overwrite the stored PPO statistics with parallel-replay recomputations.
 
@@ -1081,8 +1291,13 @@ def refresh_old_statistics(
     # then stay zero-width too, and the thought refresh below is skipped.
     if batch.old_thought_logprobs.shape[-1] == 0:
         batch.old_thought_logprobs = torch.zeros_like(batch.thoughts)
-    for microbatch, rows, stream_length in iter_length_aware_microbatches(
-        batch, max_trajectories, attention_budget, bucket_multiple
+    if batch.old_thought_means.shape[-1] == 0:
+        batch.old_thought_means = torch.zeros_like(batch.thoughts)
+    if batch.old_thought_log_sigmas.shape[-1] == 0:
+        batch.old_thought_log_sigmas = torch.zeros_like(batch.thoughts)
+    for microbatch, rows, stream_length, _ in iter_length_aware_microbatches(
+        batch, max_trajectories, attention_budget, bucket_multiple,
+        slot_budget=slot_budget,
     ):
         beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
             wrapper, microbatch
@@ -1095,16 +1310,18 @@ def refresh_old_statistics(
             * microbatch.gate_mask
         )
         emit_mask = microbatch.emit_mask.bool()
-        emit_features = wrapper.renderer_features(
-            stream_inputs[emit_mask], beliefs[emit_mask]
-        )
-        emit_logits = backbone.logits_from_features(emit_features)
-        compact_token_logprobs = (
-            emit_logits.float()
-            .log_softmax(-1)
-            .gather(-1, token_targets[emit_mask][..., None])
-            .squeeze(-1)
-        )
+        # The grad-mode compile-guard argument above covers only the compiled
+        # replay_head_inputs; this tail is eager, where grad mode changes no
+        # forward kernel. Dropping its (discarded) graph keeps the retained
+        # log-softmax outputs — ~0.3 KB per EMIT slot times the vocabulary —
+        # out of the refresh peak.
+        with torch.no_grad():
+            emit_features = wrapper.renderer_features(
+                stream_inputs[emit_mask], beliefs[emit_mask]
+            )
+            compact_token_logprobs = compact_emit_token_logprobs(
+                backbone, emit_features, token_targets[emit_mask]
+            )
         token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         token_logprobs[emit_mask] = compact_token_logprobs
         if microbatch.thoughts.size(-1):
@@ -1114,15 +1331,38 @@ def refresh_old_statistics(
             thought_means, thought_targets, think_mask = select_thought_actions(
                 microbatch, predicted
             )
+            thought_log_sigma = wrapper.transition.predict_log_sigma(
+                beliefs[think_mask]
+            )
             compact_thought_logprobs = wrapper.transition.per_dim_log_prob(
                 thought_targets,
                 thought_means,
-                wrapper.transition.predict_log_sigma(beliefs[think_mask]),
+                thought_log_sigma,
             ).float()
             thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
             thought_logprobs[think_mask] = compact_thought_logprobs
+            # Behavior Gaussian parameters come from the SAME replay forward
+            # as the log-probabilities so the age-0 canary extends to the
+            # projected objective: Mahalanobis distance is exactly zero on
+            # fresh behavior.
+            thought_mean_statistics = torch.zeros_like(
+                microbatch.old_thought_means
+            )
+            thought_mean_statistics[think_mask] = thought_means.detach().float()
+            thought_log_sigma_statistics = torch.zeros_like(
+                microbatch.old_thought_log_sigmas
+            )
+            thought_log_sigma_statistics[think_mask] = (
+                thought_log_sigma.detach().float()
+            )
         else:
             thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
+            thought_mean_statistics = torch.zeros_like(
+                microbatch.old_thought_means
+            )
+            thought_log_sigma_statistics = torch.zeros_like(
+                microbatch.old_thought_log_sigmas
+            )
         with torch.no_grad():
             # Advanced row indexing materializes a copy, so assignment must
             # target the parent explicitly (``view.copy_`` would update only
@@ -1131,4 +1371,10 @@ def refresh_old_statistics(
             batch.old_gate_logprobs[rows, :stream_length] = gate_logprobs
             batch.old_token_logprobs[rows, :stream_length] = token_logprobs
             batch.old_thought_logprobs[rows, :stream_length] = thought_logprobs
+            batch.old_thought_means[rows, :stream_length] = (
+                thought_mean_statistics
+            )
+            batch.old_thought_log_sigmas[rows, :stream_length] = (
+                thought_log_sigma_statistics
+            )
     batch.statistics_refreshed = True

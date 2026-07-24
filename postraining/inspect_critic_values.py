@@ -44,6 +44,7 @@ from postraining.latent_thought import (
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
 )
+from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import fresh_trunk, load_model
 from postraining.train_latent_vapo import score_math_rollout
 from postraining.train_vapo import prompt_text
@@ -56,6 +57,46 @@ def value_color(value: float, low: float, high: float) -> str:
     unit = min(max((value - low) / span, 0.0), 1.0)
     hue = 120 * unit  # 0 red .. 120 green
     return f"hsl({hue:.0f} 70% 42%)"
+
+
+def gpt2_unicode_to_bytes() -> dict[str, int]:
+    """Invert GPT-2's bytes_to_unicode table (the byte-level BPE alphabet)."""
+    printable = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("\xa1"), ord("\xac") + 1))
+        + list(range(ord("\xae"), ord("\xff") + 1))
+    )
+    chars = printable[:]
+    shift = 0
+    for byte in range(256):
+        if byte not in printable:
+            chars.append(256 + shift)
+            shift += 1
+    ordered_bytes = printable + [b for b in range(256) if b not in printable]
+    return {chr(c): b for c, b in zip(chars, ordered_bytes)}
+
+
+def token_display_text(tokenizer, token_id: int, unicode_to_byte) -> str:
+    """Decode ONE token to display text, byte-exact.
+
+    A lone BPE token can hold a fragment of a multi-byte UTF-8 character;
+    ``decode([id])`` then yields U+FFFD.  Recover the token's raw bytes via
+    the GPT-2 byte alphabet and show undecodable fragments as ``⟨HH⟩`` hex
+    markers instead.  Falls back to plain decode for non-GPT-2 tokenizers.
+    """
+    piece = getattr(tokenizer, "id_to_piece", None)
+    if piece is None or unicode_to_byte is None:
+        return tokenizer.decode([token_id])
+    text = piece(token_id)
+    if any(ch not in unicode_to_byte for ch in text):
+        return text  # special token like <|endoftext|>: show it literally
+    raw = bytes(unicode_to_byte[ch] for ch in text)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "".join(
+            chr(b) if b < 0x80 else f"⟨{b:02X}⟩" for b in raw
+        )
 
 
 def main() -> None:
@@ -106,10 +147,22 @@ def main() -> None:
     step = payload.get("step")
     print(f"policy+critic: {wrapper_path} (step {step}, mode {reasoning_mode})")
 
+    # Reconstruct the training run's support geometry: pre-v22 checkpoints
+    # lack the anchored-support args and used the legacy [0, 1]-edge grid.
+    if saved_args.get("value_anchored_support", False):
+        value_num_bins, value_v_min, value_v_max = anchored_unit_geometry(
+            saved_args.get("value_bins", 101),
+            saved_args.get("value_margin_bins", 4),
+        )
+    else:
+        value_num_bins = saved_args.get("value_bins", 101)
+        value_v_min, value_v_max = 0.0, 1.0
     critic = SeparateCritic(
         fresh_trunk(backbone, device),
-        num_bins=saved_args.get("value_bins", 101),
+        num_bins=value_num_bins,
         sigma_ratio=saved_args.get("value_sigma_ratio", 2.0),
+        v_min=value_v_min,
+        v_max=value_v_max,
         prior_value=saved_args.get("value_prior", 0.05),
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
@@ -134,6 +187,11 @@ def main() -> None:
     rows = load_unique_math_rows(args.math_data)
     picked = random.Random(args.seed).sample(range(len(rows)), args.rows)
     generator = torch.Generator(device=device).manual_seed(args.seed)
+    unicode_to_byte = (
+        gpt2_unicode_to_bytes()
+        if "gpt2vocab" in backbone.architecture
+        else None
+    )
 
     records = []
     for prompt_index, row_index in enumerate(picked):
@@ -186,7 +244,9 @@ def main() -> None:
                         "action": bool(actions[sample_index, position]),
                         "token_id": token_id,
                         "text": (
-                            tokenizer.decode([token_id])
+                            token_display_text(
+                                tokenizer, token_id, unicode_to_byte
+                            )
                             if kind == TOKEN_SLOT
                             else "<think>"
                         ),
@@ -196,7 +256,11 @@ def main() -> None:
             generated = [
                 s for s in slots if s["action"] and s["kind"] == "token"
             ]
-            emitted_text = "".join(s["text"] for s in generated)
+            # Decode the whole sequence at once: multi-byte characters span
+            # token boundaries, so per-token decodes cannot be concatenated.
+            emitted_text = tokenizer.decode(
+                [s["token_id"] for s in generated]
+            )
             record = {
                 "prompt_index": prompt_index,
                 "dataset_index": row_index,
@@ -212,13 +276,16 @@ def main() -> None:
             }
             records.append(record)
             generated_values = [s["value"] for s in generated]
+            thought_count = sum(
+                1 for s in slots if s["action"] and s["kind"] == "thought"
+            )
             print(
                 f"prompt {prompt_index:2d} (row {row_index}) "
                 f"reward {record['reward']:.3f} truth {truth!r:>12} | "
                 f"V(start) {record['value_at_prompt_end']:.3f} "
                 f"V(mean) {sum(generated_values) / max(len(generated_values), 1):.3f} "
                 f"V(last) {generated_values[-1] if generated_values else float('nan'):.3f} "
-                f"| {emitted_text!r}"
+                f"thinks {thought_count:3d} | {emitted_text!r}"
             )
 
     out_dir = Path(
@@ -237,9 +304,35 @@ def main() -> None:
     sections = []
     for record in records:
         spans = []
-        for slot in record["slots"]:
-            if not slot["action"]:
+        action_slots = [s for s in record["slots"] if s["action"]]
+        index = 0
+        while index < len(action_slots):
+            slot = action_slots[index]
+            if slot["kind"] == "thought":
+                # Collapse a consecutive THINK run into one labeled span.
+                run = [slot]
+                while (
+                    index + len(run) < len(action_slots)
+                    and action_slots[index + len(run)]["kind"] == "thought"
+                ):
+                    run.append(action_slots[index + len(run)])
+                index += len(run)
+                mean_value = sum(s["value"] for s in run) / len(run)
+                color = value_color(mean_value, low, high)
+                label = (
+                    "&lt;think&gt;" if len(run) == 1
+                    else f"&lt;think ×{len(run)}&gt;"
+                )
+                per_slot = " ".join(f"{s['value']:.3f}" for s in run)
+                spans.append(
+                    f'<span class="tok think" style="background:{color}" '
+                    f'title="think run ×{len(run)}, V mean '
+                    f'{mean_value:.4f}, per-slot [{per_slot}], pos '
+                    f'{run[0]["position"]}-{run[-1]["position"]}">'
+                    f"{label}</span>"
+                )
                 continue
+            index += 1
             color = value_color(slot["value"], low, high)
             label = html.escape(slot["text"]).replace("\n", "\\n") or "·"
             spans.append(
@@ -265,6 +358,7 @@ def main() -> None:
         "max-width:1200px;margin:2rem auto;padding:0 1rem}"
         ".tok{padding:0 .1em;margin:0 1px;border-radius:3px;color:#fff;"
         "white-space:pre-wrap}"
+        ".think{outline:1px dashed #e8edf7;font-style:italic}"
         ".prompt{color:#9aa8bd;font-size:.85em}"
         ".good{color:#47d18c}.bad{color:#ff6b7a}"
         "code{background:#131924;padding:0 .3em;border-radius:3px}"

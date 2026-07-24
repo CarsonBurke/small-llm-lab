@@ -7,15 +7,34 @@ without inheriting that discrete-token target.
 
 - PPO trains everything through one differentiable teacher-forced replay.
   Gate and content log probabilities form one joint action probability at
-  each stream position. EMIT clips its joint gate+token ratio. THINK clips
-  each diagonal-Gaussian dimension separately while retaining the summed
-  joint-score gradient; optional THINK clips its shared gate once as a
-  separate factor.
+  each stream position. EMIT clips its joint gate+token ratio. THINK (v23)
+  trains under a TRPL-style Mahalanobis trust region: the mean's movement
+  from stored behavior is measured in closed form and projected back onto
+  the trust boundary when it exceeds ``--thought-trust-epsilon`` (radial
+  gradients vanish, tangential ones survive), the surrogate scores the
+  sampled thought under the PROJECTED Gaussian against unit-normalized
+  advantages, and a projection penalty (zero inside the region) keeps the
+  raw rollout mean tracking its projection. This replaces the v21/v22
+  joint ratio clip, whose fixed band was noise-dominated at 512 dimensions
+  (the clip decision fired on sampled rollout noise, not policy movement,
+  while the unclipped harmful side carried unbounded importance weights).
+  Known gap: only the MEAN is projected. Sigma still enters the surrogate
+  through the current head and nothing trust-regions it beyond the
+  tanh-bounded log-sigma range and the +/-2 ratio guard (which bounds by
+  zeroing a saturated action's gradient). Acceptable while sigma is
+  effectively pinned; the TRPL covariance projection (reference bound
+  1e-3) is the planned companion once sigma is deliberately unpinned.
+  Optional THINK clips its shared gate once as a separate 1-D factor.
+  ``--thought-clip-mode joint`` and ``per_dim`` remain ablation arms.
 - The critic is a SEPARATE from-scratch model (same architecture class,
   fresh weights, fully trainable, no SIGReg or latent prediction) trained
   purely by HL-Gauss cross-entropy on [0, 1] value targets.  It values
   every stream position — vocab AND latent — which is what gives thinking
-  its training signal.
+  its training signal. The support (v22) anchors bin CENTERS at exactly 0
+  and 1 with margin bins beyond each — Dreamer3's exact-zero bucket applied
+  to both ends of the unit range — so the dominant exact-0/exact-1 verifier
+  targets project symmetrically instead of decoding a truncation bias
+  inward; labels smooth at sigma_ratio 1.0.
 - An optional Bernoulli gate-entropy bonus can preserve THINK exploration;
   there is no continuous-policy entropy bonus or beta-NLL. A sampled reverse
   KL constrains aggregate drift of the 512-D Gaussian against the frozen
@@ -46,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 import hashlib
 import json
@@ -95,11 +115,13 @@ from postraining.core import (
     validate_posttraining_context_budget,
     verify_answer,
 )
+from postraining.hl_gauss import anchored_unit_geometry
 from postraining.latent_rollout import (
     PAD_SLOT,
     THOUGHT_SLOT,
     LatentRolloutBatch,
     assign_terminal_rewards,
+    compact_emit_token_logprobs,
     compact_stream_to_device,
     pack_rollout_groups_for_replay,
     emitted_token_rows,
@@ -132,6 +154,15 @@ from postraining.value_model import SeparateCritic
 
 
 EXECUTION_SCHEMA = (
+    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_projected_thought_trust_no_kl_anchored_value_zero_affine_general_lr_sequential_data/v23"
+)
+JOINT_CLIP_EXECUTION_SCHEMA = (
+    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_joint_thought_clip_no_kl_anchored_value_zero_affine_general_lr_sequential_data/v22"
+)
+UNANCHORED_VALUE_EXECUTION_SCHEMA = (
+    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_joint_thought_clip_no_kl_zero_affine_general_lr_sequential_data/v21"
+)
+PER_DIM_REVERSE_KL_EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_per_dim_clip_reverse_kl_zero_affine_general_lr_sequential_data/v20"
 )
 PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA = (
@@ -147,6 +178,14 @@ GAIN_SCALED_THOUGHT_INPUT_SCHEMA = (
     "fresh_learned_scalar_identity_affine_s1e-4/v4"
 )
 PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
+
+# Refreshed device minibatches held for their update instead of the
+# scatter-to-CPU/repack/re-upload round trip. Bounded because packed batch
+# bytes track the pool's longest stream (a think-heavy pool can quadruple
+# them); past the budget the refresh loop falls back to the scatter path
+# for the remaining minibatches. VRAM-resident only between a pool's
+# refresh and its last update — never across a collection.
+RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
 DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
 DEFAULT_PERIODIC_EVAL_EVERY = 150
 # v2: the grading style follows each row's reward_model.style (Minerva for
@@ -173,25 +212,79 @@ def resume_execution_schema_compatible(
     *,
     allow_reverse_kl_migration: bool = False,
     allow_performance_migration: bool = False,
+    allow_joint_clip_migration: bool = False,
+    allow_anchored_value_migration: bool = False,
+    allow_projected_thought_migration: bool = False,
 ) -> bool:
     """Resume compatible policy state at a complete rollout-pool boundary."""
     execution_schema = payload.get("execution_schema")
     if execution_schema == EXECUTION_SCHEMA:
-        return not allow_reverse_kl_migration and not allow_performance_migration
-    # v20 changes only execution: identical prompts and policies are sampled,
-    # but deterministic prefixes are shared and finished rows are compacted.
-    # A pool-boundary v19 checkpoint therefore resumes without an objective or
-    # state migration, but only by explicit opt-in because future RNG-to-row
-    # attribution and floating-point execution are not preserved.
+        return not (
+            allow_reverse_kl_migration
+            or allow_performance_migration
+            or allow_joint_clip_migration
+            or allow_anchored_value_migration
+            or allow_projected_thought_migration
+        )
+    # v23 changes only the THINK objective (Mahalanobis trust-region
+    # projection replaces the joint ratio clip); no parameters or execution
+    # change, and the pool is rebuilt on resume, so a v22 checkpoint resumes
+    # by objective opt-in alone.
+    if execution_schema == JOINT_CLIP_EXECUTION_SCHEMA:
+        return (
+            allow_projected_thought_migration
+            and not allow_reverse_kl_migration
+            and not allow_performance_migration
+            and not allow_joint_clip_migration
+            and not allow_anchored_value_migration
+        )
+    # v22 changes only the critic support (anchored 0/1 bin centers, sharper
+    # sigma): actor state and rollout execution are untouched, but the value
+    # head belongs to the old grid and must be rebuilt, so the resume is
+    # never silent.
+    if execution_schema == UNANCHORED_VALUE_EXECUTION_SCHEMA:
+        return (
+            allow_projected_thought_migration
+            and allow_anchored_value_migration
+            and not allow_reverse_kl_migration
+            and not allow_performance_migration
+            and not allow_joint_clip_migration
+        )
+    # v21 changes only the THINK objective (joint clip-higher on the Gaussian,
+    # reverse KL retired to an ablation knob); sampling, RNG-to-row
+    # attribution, and floating-point execution are identical to v20, so a
+    # pool-boundary v20 checkpoint resumes by objective opt-in alone.
+    if execution_schema == PER_DIM_REVERSE_KL_EXECUTION_SCHEMA:
+        return (
+            allow_projected_thought_migration
+            and allow_anchored_value_migration
+            and allow_joint_clip_migration
+            and not allow_reverse_kl_migration
+            and not allow_performance_migration
+        )
+    # v20 changed only execution relative to v19: identical prompts and
+    # policies are sampled, but deterministic prefixes are shared and finished
+    # rows are compacted. A pool-boundary v19 checkpoint therefore needs the
+    # execution acknowledgement on top of the objective one, because future
+    # RNG-to-row attribution and floating-point execution are not preserved.
     if execution_schema == PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA:
-        return allow_performance_migration and not allow_reverse_kl_migration
-    # v18 needs both independent acknowledgements: reverse KL changes the
-    # objective and v20 changes stochastic execution. A direct v18 -> v20
-    # resume preserves learning/cursor state but is neither objective- nor
-    # bit-execution-identical.
+        return (
+            allow_projected_thought_migration
+            and allow_anchored_value_migration
+            and allow_joint_clip_migration
+            and allow_performance_migration
+            and not allow_reverse_kl_migration
+        )
+    # v18 needs every acknowledgement: v19 added reverse KL (an objective its
+    # checkpoints never trained under), v20 changed stochastic execution, v21
+    # changed the THINK objective again, v22 rebuilt the value support, and
+    # v23 replaced the THINK clip with the projected trust region.
     return (
         allow_reverse_kl_migration
         and allow_performance_migration
+        and allow_joint_clip_migration
+        and allow_anchored_value_migration
+        and allow_projected_thought_migration
         and execution_schema == PREVIOUS_EXECUTION_SCHEMA
     )
 
@@ -281,6 +374,66 @@ def migrate_zero_adapter_resume(
             "adapter.projection.bias",
         ],
         "reset_optimizer_state": True,
+    }
+
+
+def value_support_geometry_matches(saved_args: dict, args) -> bool:
+    """Whether a checkpoint's critic support geometry matches the CLI's.
+
+    Distinct (bins, margin) pairs can collide on the same total head width
+    (e.g. anchored 101/4 and 103/3 both build 110 bins), in which case a
+    strict state-dict load succeeds while sigma and the projection width
+    silently change — so geometry must be compared as ARGS, not shapes.
+    Margin only shapes the grid when the support is anchored.
+    """
+    return (
+        bool(saved_args.get("value_anchored_support", False))
+        == args.value_anchored_support
+        and saved_args.get("value_bins") == args.value_bins
+        and (
+            not args.value_anchored_support
+            or saved_args.get("value_margin_bins") == args.value_margin_bins
+        )
+    )
+
+
+def migrate_anchored_value_resume(
+    payload: dict, critic: SeparateCritic
+) -> dict[str, object]:
+    """Load a pre-anchored critic into the anchored-support geometry.
+
+    The trunk and adapter transfer verbatim — they are the critic's learned
+    capacity and are grid-agnostic. The value head and support buffers belong
+    to the source's [0, 1]-edge grid (a different bin count), so they keep
+    the freshly constructed state: zero head weights with the prior projected
+    into the bias. Decoded values collapse to the prior until the head
+    relearns from the transferred trunk features; the caller must also start
+    the critic AdamW optimizer fresh, because its saved moments include the
+    old head parameters.
+    """
+    source = payload["critic"]
+    rebuilt_prefixes = ("head.", "support.")
+    transferred = {
+        key: value
+        for key, value in source.items()
+        if not key.startswith(rebuilt_prefixes)
+    }
+    result = critic.load_state_dict(transferred, strict=False)
+    expected_missing = {
+        key
+        for key in critic.state_dict()
+        if key.startswith(rebuilt_prefixes)
+    }
+    if result.unexpected_keys or set(result.missing_keys) != expected_missing:
+        raise ValueError(
+            "anchored-value migration expects the source critic to differ "
+            "only in head/support state; got unexpected keys "
+            f"{sorted(result.unexpected_keys)} and missing keys "
+            f"{sorted(result.missing_keys)}"
+        )
+    return {
+        "transferred_parameters": len(transferred),
+        "rebuilt_state": sorted(expected_missing),
     }
 
 
@@ -835,6 +988,18 @@ def aggregate_actor_tensorboard_metrics(
         "kl/thought_behavior_joint": _weighted_metric_mean(
             metrics, "thought_behavior_kl_joint", "thought_action_count"
         ),
+        # Closed-form squared-Mahalanobis movement of the THINK mean from
+        # stored behavior (the projected objective's trust statistic; the
+        # sampled-ratio KL above stays as a cross-check).
+        "trust/thought_d_mean": _weighted_metric_mean(
+            metrics, "thought_trust_d_mean", "thought_action_count"
+        ),
+        "trust/thought_d_max": max(
+            metric["thought_trust_d_max"] for metric in metrics
+        ),
+        "trust/projection_penalty": sum(
+            metric["thought_projection_penalty"] for metric in metrics
+        ),
         "kl/policy_behavior_per_action": sum(
             metric["policy_behavior_kl_per_action"] for metric in metrics
         ),
@@ -1011,6 +1176,9 @@ def write_actor_tensorboard_metrics(
                 "ratio/thought_dim_abs_log_max",
                 "ratio/thought_joint_abs_log_max",
                 "ratio/harmful_positive_log_max",
+                "trust/thought_d_mean",
+                "trust/thought_d_max",
+                "trust/projection_penalty",
             )
         )
         tensorboard.add_scalar(
@@ -1028,6 +1196,9 @@ def write_actor_tensorboard_metrics(
             "ratio/thought_dim_abs_log_max",
             "ratio/thought_joint_abs_log_max",
             "ratio/harmful_positive_log_max",
+            "trust/thought_d_mean",
+            "trust/thought_d_max",
+            "trust/projection_penalty",
         }:
             continue
         tensorboard.add_scalar(tag, value, step)
@@ -1393,6 +1564,208 @@ def per_dimension_thought_policy_loss(
     )
 
 
+def joint_thought_policy_loss(
+    new_gate_logprobs: torch.Tensor,
+    old_gate_logprobs: torch.Tensor,
+    new_thought_logprobs: torch.Tensor,
+    old_thought_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    gate_mask: torch.Tensor,
+    action_denominator: torch.Tensor,
+    epsilon_low: float = 0.20,
+    epsilon_high: float = 0.28,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Clip a diagonal-Gaussian THINK action's JOINT ratio exactly once.
+
+    The thought is one action: its per-dimension log-ratios sum into a single
+    joint ratio and the clip-higher band applies to that ratio, exactly like
+    EMIT's joint gate+token clip. Unlike the per-dimension objective this
+    imposes the trust region on the actual sampled action, at the cost of an
+    all-or-nothing gradient per thought — one clipped joint ratio silences
+    every dimension of that action's favorable-direction gradient, and the
+    harmful direction carries the raw ``exp(sum)`` ratio (watch
+    ``harmful_positive_log_ratio_max``; the log-space clip inside
+    ``clipped_policy_loss`` bounds only the favorable side).
+
+    The optional Bernoulli gate is clipped exactly once as its own factor. A
+    detached baseline correction makes an unchanged optional THINK report one
+    action's loss rather than two, matching the per-dimension objective's
+    reporting. A forced THINK has ``gate_mask == 0`` and trains only the
+    Gaussian factor. Clip fractions are action-normalized, like the
+    per-dimension objective's.
+    """
+    if new_thought_logprobs.ndim != 2:
+        raise ValueError("thought log-probabilities must have shape [N, D]")
+    if new_thought_logprobs.shape != old_thought_logprobs.shape:
+        raise ValueError("new and old thought log-probabilities must match")
+    if new_thought_logprobs.size(1) < 1:
+        raise ValueError("thought log-probabilities need at least one dimension")
+    expected_vector_shape = (new_thought_logprobs.size(0),)
+    for name, value in (
+        ("new gate log-probabilities", new_gate_logprobs),
+        ("old gate log-probabilities", old_gate_logprobs),
+        ("advantages", advantages),
+        ("gate mask", gate_mask),
+    ):
+        if tuple(value.shape) != expected_vector_shape:
+            raise ValueError(f"{name} must have shape {expected_vector_shape}")
+
+    thought_loss, thought_clip_fraction, _ = clipped_policy_loss(
+        new_thought_logprobs.sum(-1),
+        old_thought_logprobs.sum(-1),
+        advantages,
+        torch.ones_like(advantages),
+        epsilon_low=epsilon_low,
+        epsilon_high=epsilon_high,
+        denominator=action_denominator,
+        estimate_kl=False,
+    )
+    gate_loss, gate_clip_fraction, _ = clipped_policy_loss(
+        new_gate_logprobs,
+        old_gate_logprobs,
+        advantages,
+        gate_mask,
+        epsilon_low=epsilon_low,
+        epsilon_high=epsilon_high,
+        denominator=action_denominator,
+        estimate_kl=False,
+    )
+    optional_gate_baseline = (
+        advantages.detach() * gate_mask
+    ).sum() / action_denominator.clamp_min(1)
+    return (
+        thought_loss + gate_loss + optional_gate_baseline,
+        thought_clip_fraction,
+        gate_clip_fraction,
+    )
+
+
+def project_thought_means(
+    new_means: torch.Tensor,
+    old_means: torch.Tensor,
+    old_log_sigmas: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """TRPL-style mean projection onto the behavior trust region.
+
+    Distances are squared Mahalanobis in behavior-sigma units (= twice the
+    Gaussian KL while sigma is frozen), computed in closed form from the
+    stored behavior means — no sampled ratio enters the trust decision, so
+    unlike the joint clip it cannot fire on rollout noise. Inside the region
+    the mean passes through untouched. Outside, the excess is scaled back
+    onto the boundary WITH the gradient flowing through the scale: the
+    Jacobian ``s * (I - u u^T)`` annihilates the radial component (nothing
+    keeps pushing outward) while tangential learning survives.
+
+    Returns ``(projected_means, scale, mahalanobis_sq)`` with ``scale == 1``
+    exactly where no projection occurred.
+    """
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("trust epsilon must be finite and positive")
+    if new_means.shape != old_means.shape:
+        raise ValueError("new and old thought means must match")
+    if old_log_sigmas.shape != old_means.shape:
+        raise ValueError("behavior log sigmas must match the means")
+    normalized_shift = (new_means - old_means) * (-old_log_sigmas).exp()
+    mahalanobis_sq = normalized_shift.square().sum(-1)
+    # Both torch.where branches evaluate; the clamp keeps the unselected
+    # rsqrt finite at zero shift (age-0 rows) so its zeroed gradient cannot
+    # poison the backward pass with 0 * inf.
+    scale = torch.where(
+        mahalanobis_sq > epsilon,
+        (epsilon / mahalanobis_sq.clamp_min(1e-12)).sqrt(),
+        torch.ones_like(mahalanobis_sq),
+    )
+    projected = old_means + scale[:, None] * (new_means - old_means)
+    return projected, scale, mahalanobis_sq
+
+
+def projected_thought_policy_loss(
+    new_gate_logprobs: torch.Tensor,
+    old_gate_logprobs: torch.Tensor,
+    projected_thought_logprobs: torch.Tensor,
+    old_thought_logprobs: torch.Tensor,
+    trust_scale: torch.Tensor,
+    advantages: torch.Tensor,
+    gate_mask: torch.Tensor,
+    action_denominator: torch.Tensor,
+    epsilon_low: float = 0.20,
+    epsilon_high: float = 0.28,
+    ratio_guard: float = 2.0,
+    gate_advantages: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Surrogate for THINK actions scored under the PROJECTED Gaussian.
+
+    ``exp(log pi_proj - log pi_behavior) * A`` with the gradient through the
+    ratio, exactly the unclipped PPO surrogate — the trust region lives in
+    the projection, not in a ratio band. With the mean projected, the
+    MEAN-driven part of the joint log-ratio concentrates near zero
+    (its sampling noise has standard deviation ~sqrt(2 * d_M) <=
+    sqrt(2 * epsilon)); the sigma-driven part is NOT constrained by the
+    projection (see the module docstring on the sigma gap), so
+    ``ratio_guard`` — a symmetric log-space clamp — bounds the exponential
+    against Gaussian-tail and sigma-drift excursions. It is a numerical
+    guard, not a trust mechanism: a saturated clamp zeroes that action's
+    gradient rather than steering it.
+
+    The optional Bernoulli gate keeps its own 1-D textbook clip, and the
+    detached baseline makes an unchanged optional THINK report one action's
+    loss, both exactly as in the joint/per-dimension objectives. The gate
+    factor uses ``gate_advantages`` (raw scale, matching the EMIT gate)
+    while ``advantages`` are the caller's unit-normalized values that
+    calibrate the thought surrogate. The middle return value is the
+    action-normalized PROJECTION fraction (reported through the
+    thought-clip-fraction channel).
+    """
+    if projected_thought_logprobs.ndim != 2:
+        raise ValueError("thought log-probabilities must have shape [N, D]")
+    if projected_thought_logprobs.shape != old_thought_logprobs.shape:
+        raise ValueError("new and old thought log-probabilities must match")
+    if ratio_guard <= 0.0:
+        raise ValueError("ratio guard must be positive")
+    if gate_advantages is None:
+        gate_advantages = advantages
+    expected_vector_shape = (projected_thought_logprobs.size(0),)
+    for name, value in (
+        ("new gate log-probabilities", new_gate_logprobs),
+        ("old gate log-probabilities", old_gate_logprobs),
+        ("trust scale", trust_scale),
+        ("advantages", advantages),
+        ("gate advantages", gate_advantages),
+        ("gate mask", gate_mask),
+    ):
+        if tuple(value.shape) != expected_vector_shape:
+            raise ValueError(f"{name} must have shape {expected_vector_shape}")
+
+    joint_log_ratio = (
+        projected_thought_logprobs.sum(-1) - old_thought_logprobs.sum(-1)
+    )
+    guarded_log_ratio = joint_log_ratio.clamp(-ratio_guard, ratio_guard)
+    denominator = action_denominator.to(
+        joint_log_ratio.device
+    ).clamp_min(1)
+    thought_loss = -(guarded_log_ratio.exp() * advantages).sum() / denominator
+    projection_fraction = (trust_scale < 1.0).sum() / denominator
+    gate_loss, gate_clip_fraction, _ = clipped_policy_loss(
+        new_gate_logprobs,
+        old_gate_logprobs,
+        gate_advantages,
+        gate_mask,
+        epsilon_low=epsilon_low,
+        epsilon_high=epsilon_high,
+        denominator=action_denominator,
+        estimate_kl=False,
+    )
+    optional_gate_baseline = (
+        gate_advantages.detach() * gate_mask
+    ).sum() / action_denominator.clamp_min(1)
+    return (
+        thought_loss + gate_loss + optional_gate_baseline,
+        projection_fraction,
+        gate_clip_fraction,
+    )
+
+
 def sampled_reverse_kl(
     new_logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -1421,6 +1794,9 @@ def update_minibatch(
     positive_reward_threshold: float = 0.5,
     thought_pg_coef: float = 1.0,
     thought_reverse_kl_coef: float = 0.0,
+    thought_clip_mode: str = "projected",
+    thought_trust_epsilon: float = 0.03,
+    thought_projection_penalty_coef: float = 1.0,
     gate_pg_coef: float = 1.0,
     gate_entropy_coef: float = 0.0,
     actor_step: bool = True,
@@ -1433,6 +1809,7 @@ def update_minibatch(
     replay_max_trajectories: int = 32,
     replay_attention_budget: int = 4 * 1024 * 1024,
     replay_bucket: int = 1,
+    replay_slot_budget: int | None = None,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -1442,10 +1819,11 @@ def update_minibatch(
     callers keep the self-contained single-step defaults.
 
     The group is replayed in stable length-sorted shards because causal
-    attention is quadratic in stream length. The planner bounds B*L^2 and
-    trims every shard independently. The actor objectives keep denominators
-    from the COMPLETE optimizer minibatch, which can span prompt groups, so
-    sharding changes only floating-point reduction order.
+    attention is quadratic in stream length. The planner bounds B*L^2, B*L
+    (the vocabulary head's linear memory term), and trims every shard
+    independently. The actor objectives keep denominators from the COMPLETE
+    optimizer minibatch, which can span prompt groups, so sharding changes
+    only floating-point reduction order.
     """
     backbone = wrapper.backbone
     if critic_step:
@@ -1462,6 +1840,19 @@ def update_minibatch(
     ):
         raise ValueError(
             "thought reverse KL coefficient must be finite and nonnegative"
+        )
+    if thought_clip_mode not in ("projected", "joint", "per_dim"):
+        raise ValueError(
+            f"unknown thought clip mode {thought_clip_mode!r}; "
+            "expected 'projected', 'joint', or 'per_dim'"
+        )
+    if (
+        not math.isfinite(thought_projection_penalty_coef)
+        or thought_projection_penalty_coef < 0.0
+    ):
+        raise ValueError(
+            "thought projection penalty coefficient must be finite and "
+            "nonnegative"
         )
     if not value_only and not batch.statistics_refreshed:
         # The explicit flag also covers pinned-EMIT batches, whose zero-width
@@ -1516,6 +1907,8 @@ def update_minibatch(
             "thought_sigma_sum", "thought_expected_noise_norm_sum",
             "thought_realized_noise_norm_sum", "thought_normalized_noise_square_sum",
             "thought_mean_norm_sum",
+            "thought_trust_sum", "thought_trust_max",
+            "thought_projection_penalty",
         )
     }
     totals["thought_log_sigma_min"] = zero.new_full((), float("inf"))
@@ -1535,12 +1928,47 @@ def update_minibatch(
     )
     advantages = advantages.detach()
     value_targets = value_targets.detach()
+    # Standardize THINK advantages (projected mode): the projected surrogate
+    # has no ratio band making it scale-invariant, so the trust and penalty
+    # coefficients are calibrated against unit-scale advantages. Centering
+    # matters as much as scaling — without it a low-variance pool (all
+    # trajectories sharing an outcome) turns mean/std into an unbounded
+    # gradient amplifier; the subtracted per-minibatch constant is a
+    # standard score-function baseline (the projected Gaussian normalizes
+    # to one, so E[b * grad ratio] = 0). Computed over the complete
+    # minibatch's actions; EMIT and the gate keep raw advantages (their
+    # clip decisions never depended on this scale).
+    advantage_action_count = batch.action_mask.sum().clamp_min(1)
+    advantage_scale_mean = (
+        advantages * batch.action_mask
+    ).sum() / advantage_action_count
+    thought_advantage_normalizer = (
+        (advantages.square() * batch.action_mask).sum()
+        / advantage_action_count
+        - advantage_scale_mean.square()
+    ).clamp_min(0).sqrt().clamp_min(1e-6)
 
-    for microbatch, rows, stream_length in iter_length_aware_microbatches(
+    # One host transfer for the whole minibatch replaces the blocking
+    # ``bool(think_mask.any())`` device round-trip previously inside every
+    # replay shard, each of which stalled the CPU's launch-ahead on all
+    # queued GPU work before it.
+    row_has_think = (
+        ((batch.gate_actions == THINK) & batch.action_mask.bool())
+        .any(dim=1)
+        .cpu()
+    )
+
+    for (
+        microbatch,
+        rows,
+        stream_length,
+        host_rows,
+    ) in iter_length_aware_microbatches(
         batch,
         replay_max_trajectories,
         replay_attention_budget,
         replay_bucket,
+        slot_budget=replay_slot_budget,
     ):
         micro_advantages = advantages[rows, :stream_length]
         micro_value_targets = value_targets[rows, :stream_length]
@@ -1638,12 +2066,10 @@ def update_minibatch(
         emit_features = wrapper.renderer_features(
             stream_inputs[emit_mask], beliefs[emit_mask]
         )
-        emit_logits = backbone.logits_from_features(emit_features)
-        compact_token_logprobs = (
-            emit_logits.float()
-            .log_softmax(-1)
-            .gather(-1, token_targets[emit_mask][..., None])
-            .squeeze(-1)
+        # Shared with refresh_old_statistics: identical chunk boundaries keep
+        # the two eager forwards bit-identical (the age-0 zero-clip canary).
+        compact_token_logprobs = compact_emit_token_logprobs(
+            backbone, emit_features, token_targets[emit_mask]
         )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         new_token_logprobs[emit_mask] = compact_token_logprobs
@@ -1666,7 +2092,11 @@ def update_minibatch(
         compact_old_thought_logprobs = None
         thought_reverse_kl_factors = None
         weighted_thought_reverse_kl = zero
-        if bool(think_mask.any()):
+        projected_policy_thought_logprobs = None
+        thought_trust_scale = None
+        weighted_projection_penalty = zero
+        shard_has_think = bool(row_has_think[host_rows].any())
+        if shard_has_think:
             thought_means, thought_targets, _ = select_thought_actions(
                 microbatch, predicted
             )
@@ -1723,6 +2153,80 @@ def update_minibatch(
             old_thought_joint = old_thought_joint.masked_scatter(
                 think_mask, compact_old_thought_logprobs.sum(-1)
             )
+            if thought_clip_mode == "projected":
+                behavior_thought_means = (
+                    microbatch.old_thought_means[think_mask].float()
+                )
+                behavior_thought_log_sigmas = (
+                    microbatch.old_thought_log_sigmas[think_mask].float()
+                )
+                if thought_pg_coef == 0.0:
+                    with torch.no_grad():
+                        (
+                            projected_thought_means,
+                            thought_trust_scale,
+                            thought_trust_sq,
+                        ) = project_thought_means(
+                            thought_means.detach().float(),
+                            behavior_thought_means,
+                            behavior_thought_log_sigmas,
+                            thought_trust_epsilon,
+                        )
+                        projected_policy_thought_logprobs = (
+                            wrapper.transition.per_dim_log_prob(
+                                thought_targets,
+                                projected_thought_means,
+                                thought_log_sigma.detach(),
+                            ).float()
+                        )
+                else:
+                    (
+                        projected_thought_means,
+                        thought_trust_scale,
+                        thought_trust_sq,
+                    ) = project_thought_means(
+                        thought_means.float(),
+                        behavior_thought_means,
+                        behavior_thought_log_sigmas,
+                        thought_trust_epsilon,
+                    )
+                    raw_projected_logprobs = (
+                        wrapper.transition.per_dim_log_prob(
+                            thought_targets,
+                            projected_thought_means,
+                            thought_log_sigma,
+                        ).float()
+                    )
+                    projected_policy_thought_logprobs = (
+                        raw_projected_logprobs.detach()
+                        + thought_pg_coef
+                        * (
+                            raw_projected_logprobs
+                            - raw_projected_logprobs.detach()
+                        )
+                    )
+                    # TRPL projection penalty: pull the raw mean toward its
+                    # detached projection so the rollout policy tracks the
+                    # trained one. The gap is zero wherever no projection
+                    # occurred, so this term never acts inside the region.
+                    projection_gap = (
+                        thought_means.float()
+                        - projected_thought_means.detach()
+                    ) * (-behavior_thought_log_sigmas).exp()
+                    weighted_projection_penalty = (
+                        thought_projection_penalty_coef
+                        * thought_pg_coef
+                        * projection_gap.square().sum()
+                        / policy_action_denominator.clamp_min(1)
+                    )
+                with torch.no_grad():
+                    totals["thought_trust_sum"] += thought_trust_sq.sum()
+                    totals["thought_trust_max"] = torch.maximum(
+                        totals["thought_trust_max"], thought_trust_sq.max()
+                    )
+                    totals["thought_projection_penalty"] += (
+                        weighted_projection_penalty.detach()
+                    )
 
         if gate_pg_coef == 0.0:
             policy_gate_logprobs = new_gate_logprobs.detach()
@@ -1776,12 +2280,34 @@ def update_minibatch(
         weighted_policy_loss = weighted_emit_policy_loss
         weighted_policy_clip = weighted_emit_policy_clip
         if policy_thought_logprobs is not None:
-            (
-                weighted_thought_policy_loss,
-                weighted_thought_policy_clip,
-                weighted_thought_gate_clip,
-            ) = (
-                per_dimension_thought_policy_loss(
+            if thought_clip_mode == "projected":
+                (
+                    weighted_thought_policy_loss,
+                    weighted_thought_policy_clip,
+                    weighted_thought_gate_clip,
+                ) = projected_thought_policy_loss(
+                    policy_gate_logprobs[think_mask],
+                    microbatch.old_gate_logprobs[think_mask],
+                    projected_policy_thought_logprobs,
+                    compact_old_thought_logprobs,
+                    thought_trust_scale,
+                    (micro_advantages[think_mask] - advantage_scale_mean)
+                    / thought_advantage_normalizer,
+                    microbatch.gate_mask[think_mask],
+                    policy_action_denominator,
+                    gate_advantages=micro_advantages[think_mask],
+                )
+            else:
+                thought_loss_function = (
+                    joint_thought_policy_loss
+                    if thought_clip_mode == "joint"
+                    else per_dimension_thought_policy_loss
+                )
+                (
+                    weighted_thought_policy_loss,
+                    weighted_thought_policy_clip,
+                    weighted_thought_gate_clip,
+                ) = thought_loss_function(
                     policy_gate_logprobs[think_mask],
                     microbatch.old_gate_logprobs[think_mask],
                     policy_thought_logprobs,
@@ -1790,7 +2316,6 @@ def update_minibatch(
                     microbatch.gate_mask[think_mask],
                     policy_action_denominator,
                 )
-            )
             weighted_policy_loss = (
                 weighted_policy_loss + weighted_thought_policy_loss
             )
@@ -1823,6 +2348,7 @@ def update_minibatch(
         actor_total = (
             weighted_policy_loss
             + weighted_thought_reverse_kl
+            + weighted_projection_penalty
             + positive_lm_weight * weighted_positive_lm
             - weighted_gate_entropy_bonus
         )
@@ -1831,6 +2357,7 @@ def update_minibatch(
                 "non-finite actor loss before optimizer step: "
                 f"policy={float(weighted_policy_loss)} "
                 f"thought_reverse_kl={float(weighted_thought_reverse_kl)} "
+                f"projection_penalty={float(weighted_projection_penalty)} "
                 f"positive_lm={float(weighted_positive_lm)} "
                 f"gate_entropy_bonus={float(weighted_gate_entropy_bonus)} "
             )
@@ -1864,7 +2391,7 @@ def update_minibatch(
                 * microbatch.emit_mask
             ).sum()
             totals["positive_lm"] += weighted_positive_lm.detach()
-            if bool(think_mask.any()):
+            if shard_has_think:
                 detached_log_sigma = thought_log_sigma.detach().float()
                 residual = thought_targets.float() - thought_means.detach().float()
                 normalized_residual = residual * (-detached_log_sigma).exp()
@@ -2046,6 +2573,11 @@ def update_minibatch(
             totals["thought_kl_sum"]
             / (denominators["thought"] * thought_dim)
         ),
+        thought_trust_d_mean=(
+            totals["thought_trust_sum"] / denominators["thought"]
+        ),
+        thought_trust_d_max=totals["thought_trust_max"],
+        thought_projection_penalty=totals["thought_projection_penalty"],
         policy_behavior_kl_per_action=(
             totals["gate_kl_sum"]
             + totals["renderer_kl_sum"]
@@ -2142,6 +2674,7 @@ def measure_post_update_policy_drift(
     replay_max_trajectories: int,
     replay_attention_budget: int,
     replay_bucket: int,
+    replay_slot_budget: int | None = None,
     replay_function: Callable = replay_head_inputs,
 ) -> dict[str, float]:
     """Evaluate the just-updated policy on its behavior trajectories.
@@ -2182,11 +2715,23 @@ def measure_post_update_policy_drift(
             if stored_batch.kind.device == device
             else stored_batch.to(device)
         )
-        for microbatch, _, _ in iter_length_aware_microbatches(
+        # Per-shard branch tables, one host transfer per stored batch (free
+        # for CPU pools) instead of two blocking device syncs per shard.
+        row_has_emit = stored_batch.emit_mask.bool().any(dim=1).cpu()
+        row_has_think = (
+            (
+                (stored_batch.gate_actions == THINK)
+                & stored_batch.action_mask.bool()
+            )
+            .any(dim=1)
+            .cpu()
+        )
+        for microbatch, _, _, host_rows in iter_length_aware_microbatches(
             batch,
             replay_max_trajectories,
             replay_attention_budget,
             replay_bucket,
+            slot_budget=replay_slot_budget,
         ):
             beliefs, predicted, stream_inputs, token_targets = replay_function(
                 wrapper, microbatch
@@ -2198,7 +2743,7 @@ def measure_post_update_policy_drift(
 
             emit_mask = microbatch.emit_mask.bool()
             token_logprobs = torch.zeros_like(microbatch.old_token_logprobs).float()
-            if bool(emit_mask.any()):
+            if bool(row_has_emit[host_rows].any()):
                 emit_logits = wrapper.backbone.logits_from_features(
                     wrapper.renderer_features(
                         stream_inputs[emit_mask], beliefs[emit_mask]
@@ -2222,7 +2767,7 @@ def measure_post_update_policy_drift(
             thought_joint = torch.zeros_like(token_logprobs)
             old_thought_joint = torch.zeros_like(token_logprobs)
             thought_log_ratio = None
-            if bool(think_mask.any()):
+            if bool(row_has_think[host_rows].any()):
                 thought_means, thought_targets, _ = select_thought_actions(
                     microbatch, predicted
                 )
@@ -2455,10 +3000,29 @@ def main() -> None:
     parser.add_argument(
         "--reset-optimizers-on-resume", action="store_true"
     )
+    # With the anchored support (default): interior divisions of [0, 1], so
+    # bin width is 1/value_bins and the total head width is
+    # value_bins + 1 + 2 * value_margin_bins. With --no-value-anchored-support:
+    # the legacy total bin count over [0, 1] edges.
     parser.add_argument("--value-bins", type=int, default=101)
-    # HL-Gauss projection sigma as a fraction of bin width (cleanrl v215 /
-    # Dreamer4 default).
-    parser.add_argument("--value-sigma-ratio", type=float, default=2.0)
+    # Dreamer3's exact-zero bucket generalized to both ends of the unit
+    # target range: 0 and 1 become bin CENTERS with margin bins beyond each,
+    # so the dominant exact-0/exact-1 verifier targets project symmetrically
+    # instead of decoding a truncation bias ~0.8*sigma inward.
+    parser.add_argument(
+        "--value-anchored-support",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    # Bins beyond each anchor. margin + 0.5 half-widths must cover >= 3 sigma
+    # of the label Gaussian or the truncation bias the anchors exist to
+    # remove comes back through the support edge.
+    parser.add_argument("--value-margin-bins", type=int, default=4)
+    # HL-Gauss projection sigma as a fraction of bin width. cleanrl v215 /
+    # Dreamer4 used 2.0; the dg_v25 critic ablations walked it down (0.75,
+    # then 0.5 on a much coarser grid), and sharper labels also shrink what
+    # remains of any boundary bias proportionally.
+    parser.add_argument("--value-sigma-ratio", type=float, default=1.0)
     # Head bias starts at the projected prior; binary verifier rewards start
     # near-zero for a small model, and a prior near the expected reward mean
     # removes the early decode transient a far-off prior causes.
@@ -2468,6 +3032,11 @@ def main() -> None:
     # -3 gives std 0.050 and expected 512-D noise norm 1.13. The fresh
     # adapter starts at exact zero, so neither exploration nor the fresh mean
     # enters the recurrent trunk until replay gradients open its affine map.
+    # exp(-3.0) ~= 0.050 per-dim noise: expected noise norm at 512 dims is
+    # 0.050*sqrt(512) ~= 1.13, i.e. ~42% of a 2.7 thought mean norm (~22%
+    # at the observed 5.2 drift ceiling). -2.5 was considered and rejected
+    # (noise norm 1.86 ~= 69% of mean: too much); raising the MEAN head's
+    # init instead is the open alternative if exploration needs more range.
     parser.add_argument("--thought-log-sigma-init", type=float, default=-3.0)
     # Initialization only. The orthogonal map gives an RMS-normalized belief
     # an exactly controlled mean RMS without weakening matrix optimization.
@@ -2479,8 +3048,38 @@ def main() -> None:
     # Dreamer4-style reverse KL from the frozen rollout behavior policy to the
     # current diagonal-Gaussian thought policy. The factorwise k3 estimator is
     # summed over latent dimensions but divided by ALL policy actions, so 0.3
-    # has action-level scale and directly complements per-dimension PPO clip.
-    parser.add_argument("--thought-reverse-kl-coef", type=float, default=0.3)
+    # has action-level scale. Off by default since v21: the joint clip alone
+    # owns the thought trust region; nonzero values are an ablation arm
+    # (they complemented per-dimension clipping, which never bounded
+    # aggregate drift).
+    parser.add_argument("--thought-reverse-kl-coef", type=float, default=0.0)
+    # v23 default: TRPL-style Mahalanobis mean projection onto the behavior
+    # trust region. The sampled joint ratio of a 512-D Gaussian is
+    # noise-dominated (log-ratio ~ N(-KL, 2*KL), so at any real drift the
+    # v21/v22 'joint' clip decision fired on sampled noise, not on policy
+    # movement, and its unclipped harmful side carried e^3+ importance
+    # weights). The projection measures movement in closed form from stored
+    # behavior means instead. 'joint' and 'per_dim' remain ablation arms.
+    parser.add_argument(
+        "--thought-clip-mode",
+        choices=("projected", "joint", "per_dim"),
+        default="projected",
+    )
+    # Squared-Mahalanobis trust radius per THINK action, in behavior-sigma
+    # units (= twice the Gaussian KL at frozen sigma; 0.03 ~= 0.015 nats).
+    # The default is the TRPL reference BaseProjectionLayer mean bound
+    # (mean 0.03; its cov bound 1e-3 becomes relevant only once sigma is
+    # unpinned and the covariance projection lands). Movement beyond the
+    # radius is projected back: radial gradients vanish, tangential ones
+    # survive.
+    parser.add_argument("--thought-trust-epsilon", type=float, default=0.03)
+    # TRPL projection penalty: pulls the raw mean toward its (detached)
+    # projection so the rollout policy tracks the trained one. Identically
+    # zero while no projection occurs — this is a constraint hinge, not an
+    # always-on KL penalty.
+    parser.add_argument(
+        "--thought-projection-penalty-coef", type=float, default=1.0
+    )
     # Head-only Bernoulli entropy bonus, averaged over optional gate
     # decisions. Kept small enough that it cannot outweigh the gate's
     # advantage signal: at 1e-2 (and even 4e-3-scale) the bonus dragged the
@@ -2598,6 +3197,19 @@ def main() -> None:
     parser.add_argument(
         "--rollout-compile", action=argparse.BooleanOptionalAction, default=True
     )
+    # Route the fixed-size compacted training tail (--rollout-tail-batch
+    # survivors, ~85% of decode iterations) through persistent static caches
+    # and a CUDA-graph-compiled step. The eval-compile note above measured
+    # full-cache attention 2.6x slower than narrowing at 512-row eval widths;
+    # at the 16-row tail the step is launch-bound, so the graph should win —
+    # off by default until bench_step_compile confirms it at the production
+    # shape. Costs a persistent tail-batch x full-stream bf16 cache
+    # (~0.7 GiB at 16 x 3584 for the 6-layer nano).
+    parser.add_argument(
+        "--rollout-tail-graph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     # Checkpoint in true actor/critic optimizer-update units.
     parser.add_argument("--save-every", type=int, default=32)
     parser.add_argument("--warmup-save-every", type=int, default=10)
@@ -2615,6 +3227,12 @@ def main() -> None:
     parser.add_argument(
         "--replay-attention-budget", type=int, default=4 * 1024 * 1024
     )
+    # Bounds the LINEAR per-shard memory term: slots x 50257-wide emit
+    # logits (plus their autograd-retained log-softmax, ~6 bytes/element in
+    # the update path). 8192 slots ~= 2.5 GiB retained per shard. Without
+    # this, raising --replay-attention-budget lets short-L shards grow their
+    # slot count unboundedly and the vocabulary head OOMs before attention.
+    parser.add_argument("--replay-slot-budget", type=int, default=8192)
     parser.add_argument(
         "--post-update-kl-every",
         type=int,
@@ -2666,11 +3284,35 @@ def main() -> None:
         "is intentionally not bit-exact",
     )
     parser.add_argument(
+        "--migrate-joint-clip-resume",
+        action="store_true",
+        help="explicitly resume a v20 per-dimension-clip/reverse-KL "
+        "checkpoint under the v21 joint thought clip (no KL) objective "
+        "while preserving all training state; execution is unchanged",
+    )
+    parser.add_argument(
+        "--migrate-anchored-value-resume",
+        action="store_true",
+        help="explicitly resume a v21 unanchored-value checkpoint under the "
+        "v22 anchored support: trunk, adapter, actor, and cursor state "
+        "transfer verbatim, while the value head restarts at the projected "
+        "prior with fresh critic AdamW state (the old head belongs to a "
+        "different grid and cannot be carried over)",
+    )
+    parser.add_argument(
         "--migrate-zero-adapter-resume",
         action="store_true",
         help="explicitly resume a v15 gain-scaled checkpoint while replacing "
         "only its adapter with the zero-initialized affine and fresh adapter "
         "Adam state; entering v20 also requires both migration flags",
+    )
+    parser.add_argument(
+        "--migrate-projected-thought-resume",
+        action="store_true",
+        help="explicitly resume a v22 joint-clip checkpoint under the v23 "
+        "projected THINK trust region; all training state transfers "
+        "verbatim (the pool and its stored behavior statistics are rebuilt "
+        "on resume)",
     )
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
@@ -2685,6 +3327,18 @@ def main() -> None:
     ):
         parser.error(
             "--thought-reverse-kl-coef must be finite and nonnegative"
+        )
+    if (
+        not math.isfinite(args.thought_trust_epsilon)
+        or args.thought_trust_epsilon <= 0.0
+    ):
+        parser.error("--thought-trust-epsilon must be finite and positive")
+    if (
+        not math.isfinite(args.thought_projection_penalty_coef)
+        or args.thought_projection_penalty_coef < 0.0
+    ):
+        parser.error(
+            "--thought-projection-penalty-coef must be finite and nonnegative"
         )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         parser.error("--learning-rate must be finite and positive")
@@ -2716,6 +3370,8 @@ def main() -> None:
         parser.error("--thought-log-sigma-init must be strictly inside (-5, 2)")
     if args.replay_attention_budget < 1:
         parser.error("--replay-attention-budget must be positive")
+    if args.replay_slot_budget < 1:
+        parser.error("--replay-slot-budget must be positive")
     if args.post_update_kl_every < 0:
         parser.error("--post-update-kl-every must be nonnegative")
     if args.replay_bucket < 1:
@@ -2728,6 +3384,12 @@ def main() -> None:
         parser.error("--eval-tail-batch must be nonnegative")
     if args.rollout_tail_batch < 0:
         parser.error("--rollout-tail-batch must be nonnegative")
+    if args.rollout_tail_graph and args.rollout_tail_batch < 1:
+        parser.error("--rollout-tail-graph requires --rollout-tail-batch >= 1")
+    if args.rollout_tail_graph and not args.rollout_compile:
+        # The tail switch rides the compiled rollout's tensor positions and
+        # fixed-size compaction; an eager rollout never engages it.
+        parser.error("--rollout-tail-graph requires --rollout-compile")
     if args.bench_only_repeats < 1:
         parser.error("--bench-only-repeats must be positive")
     if args.bench_max_rows < 0:
@@ -2738,6 +3400,32 @@ def main() -> None:
         parser.error("--migrate-reverse-kl-resume requires --resume")
     if args.migrate_v20_execution_resume and not args.resume:
         parser.error("--migrate-v20-execution-resume requires --resume")
+    if args.migrate_joint_clip_resume and not args.resume:
+        parser.error("--migrate-joint-clip-resume requires --resume")
+    if args.migrate_anchored_value_resume and not args.resume:
+        parser.error("--migrate-anchored-value-resume requires --resume")
+    if args.migrate_projected_thought_resume and not args.resume:
+        parser.error("--migrate-projected-thought-resume requires --resume")
+    if args.migrate_anchored_value_resume and not args.value_anchored_support:
+        parser.error(
+            "--migrate-anchored-value-resume migrates INTO the anchored "
+            "support; it cannot combine with --no-value-anchored-support"
+        )
+    if args.value_bins < 1:
+        parser.error("--value-bins must be positive")
+    if args.value_margin_bins < 0:
+        parser.error("--value-margin-bins must be nonnegative")
+    if not math.isfinite(args.value_sigma_ratio) or args.value_sigma_ratio <= 0.0:
+        parser.error("--value-sigma-ratio must be finite and positive")
+    if (
+        args.value_anchored_support
+        and args.value_margin_bins + 0.5 < 3.0 * args.value_sigma_ratio
+    ):
+        parser.error(
+            "--value-margin-bins must give the anchors >= 3 sigma of slack "
+            "(margin + 0.5 >= 3 * sigma_ratio), or boundary targets decode "
+            "the truncation bias the anchored support exists to remove"
+        )
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
     if args.prompts_per_minibatch < 1:
@@ -3007,14 +3695,32 @@ def main() -> None:
         for parameter in backbone.critic_probe.parameters():
             parameter.requires_grad_(False)
 
+    if args.value_anchored_support:
+        value_num_bins, value_v_min, value_v_max = anchored_unit_geometry(
+            args.value_bins, args.value_margin_bins
+        )
+    else:
+        value_num_bins, value_v_min, value_v_max = args.value_bins, 0.0, 1.0
     critic = SeparateCritic(
         fresh_trunk(backbone, device),
-        num_bins=args.value_bins,
+        num_bins=value_num_bins,
         sigma_ratio=args.value_sigma_ratio,
+        v_min=value_v_min,
+        v_max=value_v_max,
         prior_value=args.value_prior,
     ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if args.actor_critic_init:
+        init_args = actor_init_payload.get("args", {})
+        if not value_support_geometry_matches(init_args, args):
+            raise ValueError(
+                "--actor-critic-init warm critic was trained on a different "
+                "value support geometry (anchored/bins/margin "
+                f"{init_args.get('value_anchored_support', False)}/"
+                f"{init_args.get('value_bins')}/"
+                f"{init_args.get('value_margin_bins')}); rerun critic warmup "
+                "under the current flags or start with --actor-init"
+            )
         critic.load_state_dict(actor_init_payload["critic"], strict=True)
 
     optimizers = build_optimizers(
@@ -3258,15 +3964,23 @@ def main() -> None:
             payload,
             allow_reverse_kl_migration=args.migrate_reverse_kl_resume,
             allow_performance_migration=args.migrate_v20_execution_resume,
+            allow_joint_clip_migration=args.migrate_joint_clip_resume,
+            allow_anchored_value_migration=args.migrate_anchored_value_resume,
+            allow_projected_thought_migration=(
+                args.migrate_projected_thought_resume
+            ),
         ):
             raise ValueError(
                 "resume checkpoint execution schema must be "
                 f"{EXECUTION_SCHEMA!r}; "
                 f"got {payload.get('execution_schema')!r}. Use --actor-init or "
                 "--actor-critic-init for an initialization restart, or "
-                "the migration flags matching the source: v19 requires "
-                "--migrate-v20-execution-resume; v18 requires that plus "
-                "--migrate-reverse-kl-resume."
+                "the migration flags matching the source: v22 requires "
+                "--migrate-projected-thought-resume; v21 requires that plus "
+                "--migrate-anchored-value-resume; v20 additionally requires "
+                "--migrate-joint-clip-resume; v19 additionally requires "
+                "--migrate-v20-execution-resume; v18 requires all of those "
+                "plus --migrate-reverse-kl-resume."
             )
         if payload.get("reward_schema") != REWARD_SCHEMA:
             raise ValueError(
@@ -3286,7 +4000,24 @@ def main() -> None:
                 f"got {args.seed})"
             )
         wrapper.load_state_dict(payload["model"], strict=True)
-        critic.load_state_dict(payload["critic"], strict=True)
+        anchored_value_migration = None
+        if args.migrate_anchored_value_resume:
+            anchored_value_migration = migrate_anchored_value_resume(
+                payload, critic
+            )
+        else:
+            resume_args = payload.get("args", {})
+            if not value_support_geometry_matches(resume_args, args):
+                raise ValueError(
+                    "resume checkpoint critic support geometry "
+                    "(anchored/bins/margin "
+                    f"{resume_args.get('value_anchored_support', False)}/"
+                    f"{resume_args.get('value_bins')}/"
+                    f"{resume_args.get('value_margin_bins')}) does not match "
+                    "the current flags; resume with the checkpoint's value "
+                    "support flags"
+                )
+            critic.load_state_dict(payload["critic"], strict=True)
         if args.reset_optimizers_on_resume:
             # Trunk-optimizer migration: keep model, critic, step, and prompt
             # cursor; every optimizer starts with empty state under the
@@ -3310,6 +4041,18 @@ def main() -> None:
             )
         else:
             for name, optimizer in optimizers.items():
+                if anchored_value_migration is not None and name == "critic":
+                    # The saved critic AdamW moments are positionally keyed
+                    # over param groups that include the OLD grid's head
+                    # parameters; loading them against the rebuilt head would
+                    # misalign shapes. Trunk-matrix Muon state (critic_muon)
+                    # is grid-agnostic and loads normally.
+                    print(
+                        "anchored-value migration: fresh critic AdamW state "
+                        "(saved moments belong to the old value head)",
+                        flush=True,
+                    )
+                    continue
                 optimizer.load_state_dict(payload["optimizers"][name])
         # The sigma head is learned: the model load above restored it, and
         # (unlike the old fixed-buffer scheme) the CLI must NOT reassert it on
@@ -3350,6 +4093,23 @@ def main() -> None:
             actor_init_provenance["zero_adapter_resume_migration"] = (
                 adapter_migration
             )
+        if anchored_value_migration is not None:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["anchored_value_resume_migration"] = {
+                "source_execution_schema": source_execution_schema,
+                "target_execution_schema": EXECUTION_SCHEMA,
+                **anchored_value_migration,
+            }
+        if args.migrate_projected_thought_resume:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["projected_thought_resume_migration"] = {
+                "source_execution_schema": source_execution_schema,
+                "target_execution_schema": EXECUTION_SCHEMA,
+                "thought_trust_epsilon": args.thought_trust_epsilon,
+                "thought_projection_penalty_coef": (
+                    args.thought_projection_penalty_coef
+                ),
+            }
 
     if args.actor_critic_init:
         torch.set_rng_state(actor_init_payload["cpu_rng"])
@@ -3416,6 +4176,29 @@ def main() -> None:
         compiled_generation_step if args.rollout_compile else None
     )
     eval_step_core = compiled_generation_step if args.eval_compile else None
+
+    # Static-tail CUDA graph for the fixed-size compacted training tail.
+    # The caches are allocated ONCE and live for the whole run: a fresh
+    # allocation would move the static addresses and force a graph
+    # re-record. The artifact wraps the ORIGINAL eager step_core (collect's
+    # temporary rollout_step_core patch never reaches it), and it only ever
+    # runs under the training autocast at one shape, so it stays a single
+    # cudagraph specialization.
+    rollout_tail_caches = None
+    rollout_tail_step_core = None
+    if args.rollout_tail_graph:
+        rollout_tail_caches = wrapper.make_static_generation_cache(
+            args.rollout_tail_batch,
+            args.prompt_tokens + max_stream_steps,
+            device,
+            dtype=torch.bfloat16,
+        )
+        rollout_tail_step_core = torch.compile(
+            wrapper.step_core,
+            mode="reduce-overhead",
+            fullgraph=True,
+            dynamic=False,
+        )
 
     # Preserve the eager function for infrequent no-grad diagnostics. Calling
     # the compiled training artifact under no-grad would create a distinct
@@ -3522,6 +4305,11 @@ def main() -> None:
                     ),
                     "architecture": backbone.architecture,
                     "value_bins": args.value_bins,
+                    "value_anchored_support": args.value_anchored_support,
+                    "value_margin_bins": args.value_margin_bins,
+                    "value_num_bins_total": value_num_bins,
+                    "value_v_min": value_v_min,
+                    "value_v_max": value_v_max,
                     "value_sigma_ratio": args.value_sigma_ratio,
                     "value_prior": args.value_prior,
                     "parameters": sum(p.numel() for p in critic.parameters()),
@@ -3578,6 +4366,7 @@ def main() -> None:
                 max_trajectories=args.replay_max_trajectories,
                 attention_budget=args.replay_attention_budget,
                 bucket_multiple=args.replay_bucket,
+                slot_budget=args.replay_slot_budget,
             )
         return batch
 
@@ -3585,6 +4374,7 @@ def main() -> None:
         refresh_statistics: bool,
         prompt_count: int,
         offload_to_cpu: bool,
+        scoring_pool: ThreadPoolExecutor | None,
     ) -> list[LatentRolloutBatch]:
         """One rollout: a scored prompt group per sampled DAPO problem."""
         rollout_rows = sampler.next_rows(prompt_count)
@@ -3638,6 +4428,8 @@ def main() -> None:
                         else None
                     ),
                     prompt_repeats=args.samples_per_prompt,
+                    tail_caches=rollout_tail_caches,
+                    tail_step_core=rollout_tail_step_core,
                 )
                 if offload_to_cpu:
                     batch = compact_stream_to_device(batch, cpu)
@@ -3648,6 +4440,13 @@ def main() -> None:
         # each launch carries chunk*samples rows instead of samples — the
         # sequential per-group loop is launch-bound, not compute-bound.
         samples = args.samples_per_prompt
+        pending_scored: list = []
+
+        def drain_scored() -> None:
+            for future in pending_scored:
+                groups.append(future.result())
+            pending_scored.clear()
+
         for chunk_start in range(0, len(encoded_rows), args.rollout_groups):
             encoded_chunk = encoded_rows[
                 chunk_start : chunk_start + args.rollout_groups
@@ -3686,6 +4485,8 @@ def main() -> None:
                     else None
                 ),
                 prompt_repeats=samples,
+                tail_caches=rollout_tail_caches,
+                tail_step_core=rollout_tail_step_core,
             )
             if offload_to_cpu:
                 # One chunk-level D2H transfer, then all variable-length
@@ -3703,17 +4504,28 @@ def main() -> None:
             # Every split owns cloned storage; drop the much larger
             # groups*samples rollout before the first full-stream replay.
             del batched
-            for group_index, (group, row) in enumerate(
-                zip(split_groups, chunk, strict=True)
-            ):
-                groups.append(retain_group(group, row))
-                # Once retained, remove the source from the temporary chunk
-                # list immediately. This bounds both GPU storage in ordinary
-                # collection and host storage in the offloaded actor path.
-                if offload_to_cpu:
+            if scoring_pool is None:
+                for group_index, (group, row) in enumerate(
+                    zip(split_groups, chunk, strict=True)
+                ):
+                    groups.append(retain_group(group, row))
+                    # Once retained, remove the source from the temporary
+                    # chunk list immediately. This bounds GPU storage in
+                    # ordinary collection.
                     split_groups[group_index] = None
-                del group
+                    del group
+            else:
+                # The previous chunk's futures ran during this chunk's
+                # rollout; draining before submitting keeps `groups` in
+                # chunk order. Host storage stays bounded at one pending
+                # chunk beyond what `groups` retains anyway.
+                drain_scored()
+                for group, row in zip(split_groups, chunk, strict=True):
+                    pending_scored.append(
+                        scoring_pool.submit(retain_group, group, row)
+                    )
             del split_groups
+        drain_scored()
         return groups
 
     def training_autocast():
@@ -3734,6 +4546,14 @@ def main() -> None:
         original_step_core = wrapper.step_core
         if rollout_step_core is not None:
             wrapper.step_core = rollout_step_core
+        # Offloaded chunks are host tensors after compact_stream_to_device's
+        # barrier, so one worker thread can trim and score chunk N (the
+        # tokenizer's decode releases the GIL) while the launch-bound rollout
+        # loop feeds chunk N+1 to the GPU. On-device chunks stay sequential:
+        # worker tensor ops would enqueue D2H syncs into the rollout stream.
+        scoring_pool = (
+            ThreadPoolExecutor(max_workers=1) if offload_to_cpu else None
+        )
         try:
             # rollout_continuations itself is no-grad, while the optional
             # refresh below must remain grad-enabled so refresh/update share
@@ -3745,8 +4565,11 @@ def main() -> None:
                     if prompt_count is None
                     else prompt_count,
                     offload_to_cpu,
+                    scoring_pool,
                 )
         finally:
+            if scoring_pool is not None:
+                scoring_pool.shutdown(wait=True)
             wrapper.step_core = original_step_core
 
     def training_update(*update_args, **update_kwargs):
@@ -3956,6 +4779,7 @@ def main() -> None:
                     replay_max_trajectories=args.replay_max_trajectories,
                     replay_attention_budget=args.replay_attention_budget,
                     replay_bucket=args.replay_bucket,
+                    replay_slot_budget=args.replay_slot_budget,
                 )
                 for group in groups
             ]
@@ -4103,10 +4927,14 @@ def main() -> None:
 
         # Assemble each shuffled optimizer minibatch on CPU with RIGHT tail
         # padding, then refresh all old statistics under the still-frozen
-        # behavior policy. Scatter only those statistics back into compact
-        # groups: retaining four max-length padded B256 host batches would
-        # waste up to ~20 GiB. Update repacks the identical order and width,
-        # preserving the exact replay plan while keeping transfers batched.
+        # behavior policy. The refreshed DEVICE batch is retained and consumed
+        # directly by the matching update below — repacking and re-uploading
+        # the identical order and width, plus the d2h stat scatter, was pure
+        # round-trip overhead. Retention is bounded: past the budget (streams
+        # lengthen when thinking grows) the pre-retention path takes over —
+        # scatter stats to the CPU groups and let update repack.
+        retained_device_batches: dict[int, LatentRolloutBatch] = {}
+        retained_bytes_total = 0
         packed_batch_bytes_max = 0
         packed_real_slots = 0
         packed_capacity_slots = 0
@@ -4114,54 +4942,94 @@ def main() -> None:
         pool_h2d_seconds = 0.0
         pool_refresh_seconds = 0.0
         pool_d2h_seconds = 0.0
-        for minibatch_order in minibatch_orders:
-            selected_groups = [groups[index] for index in minibatch_order]
+        old_value_sums = []
+        old_value_counts = []
+        def pack_minibatch(
+            minibatch_order: list[int],
+        ) -> tuple[LatentRolloutBatch, list[LatentRolloutBatch], float]:
+            selected = [groups[index] for index in minibatch_order]
             pack_started = time.perf_counter()
-            cpu_batch = pack_rollout_groups_for_replay(
-                selected_groups
+            packed = pack_rollout_groups_for_replay(selected, pin_memory=True)
+            return packed, selected, time.perf_counter() - pack_started
+
+        # Minibatch orders are a disjoint partition of the pool, so a single
+        # worker can pack minibatch N+1's pinned host batch while N's H2D
+        # and refresh occupy the GPU — the worker only reads groups this
+        # loop's scatter fallback never writes in the same iteration.
+        pack_pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            pack_future = pack_pool.submit(
+                pack_minibatch, minibatch_orders[0]
             )
-            pool_cpu_pack_seconds += time.perf_counter() - pack_started
-            transfer_started = time.perf_counter()
-            device_batch = cpu_batch.to(device)
-            torch.cuda.synchronize()
-            pool_h2d_seconds += time.perf_counter() - transfer_started
-            del cpu_batch
-            refresh_started = time.perf_counter()
-            with training_autocast():
-                refresh_old_statistics(
-                    wrapper,
-                    critic,
-                    device_batch,
-                    max_trajectories=args.replay_max_trajectories,
-                    attention_budget=args.replay_attention_budget,
-                    bucket_multiple=args.replay_bucket,
+            for age, minibatch_order in enumerate(minibatch_orders):
+                cpu_batch, selected_groups, pack_elapsed = (
+                    pack_future.result()
                 )
-            torch.cuda.synchronize()
-            pool_refresh_seconds += time.perf_counter() - refresh_started
-            packed_batch_bytes_max = max(
-                packed_batch_bytes_max,
-                sum(
+                pool_cpu_pack_seconds += pack_elapsed
+                if age + 1 < len(minibatch_orders):
+                    pack_future = pack_pool.submit(
+                        pack_minibatch, minibatch_orders[age + 1]
+                    )
+                transfer_started = time.perf_counter()
+                device_batch = cpu_batch.to(device, non_blocking=True)
+                torch.cuda.synchronize()
+                pool_h2d_seconds += time.perf_counter() - transfer_started
+                del cpu_batch
+                refresh_started = time.perf_counter()
+                with training_autocast():
+                    refresh_old_statistics(
+                        wrapper,
+                        critic,
+                        device_batch,
+                        max_trajectories=args.replay_max_trajectories,
+                        attention_budget=args.replay_attention_budget,
+                        bucket_multiple=args.replay_bucket,
+                        slot_budget=args.replay_slot_budget,
+                    )
+                torch.cuda.synchronize()
+                pool_refresh_seconds += time.perf_counter() - refresh_started
+                packed_batch_bytes = sum(
                     value.numel() * value.element_size()
                     for field in fields(device_batch)
-                    if isinstance((value := getattr(device_batch, field.name)), torch.Tensor)
-                ),
-            )
-            packed_real_slots += int((device_batch.kind != PAD_SLOT).sum())
-            packed_capacity_slots += device_batch.kind.numel()
-            transfer_started = time.perf_counter()
-            scatter_replay_statistics(device_batch, selected_groups)
-            pool_d2h_seconds += time.perf_counter() - transfer_started
-            del device_batch
-            del selected_groups
-        old_value_sum = 0.0
-        old_value_count = 0
-        for group in groups:
-            generated = group.action_mask.bool()
-            old_value_sum += float(group.old_values[generated].sum())
-            old_value_count += int(generated.sum())
+                    if isinstance(
+                        (value := getattr(device_batch, field.name)),
+                        torch.Tensor,
+                    )
+                )
+                packed_batch_bytes_max = max(
+                    packed_batch_bytes_max, packed_batch_bytes
+                )
+                packed_real_slots += int(
+                    (device_batch.kind != PAD_SLOT).sum()
+                )
+                packed_capacity_slots += device_batch.kind.numel()
+                generated = device_batch.action_mask.bool()
+                old_value_sums.append(
+                    device_batch.old_values[generated].sum()
+                )
+                old_value_counts.append(generated.sum())
+                if (
+                    retained_bytes_total + packed_batch_bytes
+                    <= RETAINED_MINIBATCH_BUDGET_BYTES
+                ):
+                    retained_device_batches[age] = device_batch
+                    retained_bytes_total += packed_batch_bytes
+                else:
+                    transfer_started = time.perf_counter()
+                    scatter_replay_statistics(device_batch, selected_groups)
+                    pool_d2h_seconds += (
+                        time.perf_counter() - transfer_started
+                    )
+                del device_batch
+                del selected_groups
+        finally:
+            pack_pool.shutdown(wait=True)
+        old_value_sum = float(torch.stack(old_value_sums).sum())
+        old_value_count = int(torch.stack(old_value_counts).sum())
         rollout_metrics["old_value_mean"] = (
             old_value_sum / old_value_count if old_value_count else 0.0
         )
+        rollout_metrics["retained_minibatches"] = len(retained_device_batches)
         rollout_metrics["packed_batch_gib_max"] = packed_batch_bytes_max / 2**30
         rollout_metrics["packed_padding_utilization"] = (
             packed_real_slots / packed_capacity_slots
@@ -4175,6 +5043,12 @@ def main() -> None:
         torch.cuda.synchronize()
         collect_seconds = time.perf_counter() - collect_started
         rollout_peak_vram_bytes = torch.cuda.max_memory_allocated()
+        # Restart the peak counter here so the train rows below report the
+        # UPDATE-phase peak (packed minibatch + replay-shard activations),
+        # not the collection-phase KV-cache peak that always dominates it.
+        # Replay memory knobs (--replay-attention-budget and retained device
+        # batches) are tuned against this number.
+        torch.cuda.reset_peak_memory_stats()
         rollout_step = step + pool_updates
         logger.log(
             type="rollout", step=rollout_step,
@@ -4246,16 +5120,30 @@ def main() -> None:
                 parameter.detach().clone() for parameter in mean_parameters
             ]
             selected_groups = [groups[index] for index in minibatch_order]
-            minibatch_pack_started = time.perf_counter()
-            cpu_minibatch = pack_rollout_groups_for_replay(selected_groups)
-            minibatch_pack_seconds = (
-                time.perf_counter() - minibatch_pack_started
+            retained_minibatch = retained_device_batches.pop(
+                behavior_age, None
             )
-            minibatch_h2d_started = time.perf_counter()
-            device_minibatch = cpu_minibatch.to(device)
-            torch.cuda.synchronize()
-            minibatch_h2d_seconds = time.perf_counter() - minibatch_h2d_started
-            del cpu_minibatch
+            if retained_minibatch is not None:
+                # Refreshed on-device in the pool loop above; identical to
+                # what repacking selected_groups would rebuild.
+                device_minibatch = retained_minibatch
+                minibatch_pack_seconds = 0.0
+                minibatch_h2d_seconds = 0.0
+            else:
+                minibatch_pack_started = time.perf_counter()
+                cpu_minibatch = pack_rollout_groups_for_replay(
+                    selected_groups, pin_memory=True
+                )
+                minibatch_pack_seconds = (
+                    time.perf_counter() - minibatch_pack_started
+                )
+                minibatch_h2d_started = time.perf_counter()
+                device_minibatch = cpu_minibatch.to(device, non_blocking=True)
+                torch.cuda.synchronize()
+                minibatch_h2d_seconds = (
+                    time.perf_counter() - minibatch_h2d_started
+                )
+                del cpu_minibatch
             (
                 policy_action_denominator,
                 gate_action_denominator,
@@ -4269,6 +5157,11 @@ def main() -> None:
                 positive_reward_threshold=args.positive_reward_threshold,
                 thought_pg_coef=args.thought_pg_coef,
                 thought_reverse_kl_coef=args.thought_reverse_kl_coef,
+                thought_clip_mode=args.thought_clip_mode,
+                thought_trust_epsilon=args.thought_trust_epsilon,
+                thought_projection_penalty_coef=(
+                    args.thought_projection_penalty_coef
+                ),
                 gate_entropy_coef=args.gate_entropy_coef,
                 gate_pg_coef=(
                     0.0 if next_step <= args.gate_freeze_steps else 1.0
@@ -4283,6 +5176,7 @@ def main() -> None:
                 replay_max_trajectories=args.replay_max_trajectories,
                 replay_attention_budget=args.replay_attention_budget,
                 replay_bucket=args.replay_bucket,
+                replay_slot_budget=args.replay_slot_budget,
             )
             # The first minibatch runs against refresh-computed behavior
             # statistics with the actor untouched. Later disjoint minibatches
@@ -4403,6 +5297,7 @@ def main() -> None:
                         replay_max_trajectories=args.replay_max_trajectories,
                         replay_attention_budget=args.replay_attention_budget,
                         replay_bucket=args.replay_bucket,
+                        replay_slot_budget=args.replay_slot_budget,
                         replay_function=diagnostic_replay_head_inputs,
                     )
                 if not all(
