@@ -14,6 +14,32 @@ import torch
 from torch import Tensor, nn
 
 
+def anchored_unit_geometry(
+    interior_bins: int, margin_bins: int
+) -> tuple[int, float, float]:
+    """Support geometry whose bin centers include exactly 0.0 and 1.0.
+
+    ``interior_bins`` uniform divisions set the bin width 1/interior_bins;
+    the grid is then laid out so 0 and 1 are bin CENTERS (Dreamer3's
+    exact-zero bucket, applied to both ends of the unit target range), with
+    ``margin_bins`` extra bins beyond each anchor.  Without the margin a
+    boundary target's Gaussian is truncated at the support edge and its
+    renormalized label decodes ~0.8*sigma inward; margin_bins + 0.5 half
+    bin-widths of slack keep that bias below the truncated tail mass.
+
+    Returns ``(num_bins, v_min, v_max)`` for ``HLGaussSupport``.
+    """
+    if interior_bins < 1:
+        raise ValueError("anchored support needs at least one interior bin")
+    if margin_bins < 0:
+        raise ValueError("anchored support margin must be non-negative")
+    width = 1.0 / interior_bins
+    num_bins = interior_bins + 1 + 2 * margin_bins
+    v_min = -(margin_bins + 0.5) * width
+    v_max = 1.0 + (margin_bins + 0.5) * width
+    return num_bins, v_min, v_max
+
+
 class HLGaussSupport(nn.Module):
     """Uniform-edge discretized support with HL-Gauss target projection.
 

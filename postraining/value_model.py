@@ -9,6 +9,11 @@ prediction, no shared parameters with the policy: its only loss is HL-Gauss
 cross-entropy on [0, 1] value targets (cleanrl iterthink v215 critic recipe:
 softmax-CE to a Gaussian-smoothed two-hot, expected-scalar decode, zero-weight
 head with the prior projected into the bias, no value clipping).
+
+The trainer passes ``hl_gauss.anchored_unit_geometry`` for v_min/v_max/
+num_bins by default, putting bin centers at exactly 0 and 1 with margin bins
+beyond each so boundary targets project without truncation bias; the
+constructor defaults below are the legacy [0, 1]-edge grid.
 """
 
 from __future__ import annotations
