@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -134,6 +137,65 @@ def test_left_padded_rollout_matches_unpadded():
     reference_step = wrapper.token_step(next_token, reference_caches, length)
     torch.testing.assert_close(padded_step.belief, reference_step.belief, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(padded_step.logits, reference_step.logits, rtol=1e-4, atol=1e-4)
+
+
+@torch.no_grad()
+def test_eager_tensor_position_step_accepts_a_bf16_cache():
+    """The step path must write its own dtype into the cache, not assume one.
+
+    Eager ``index_copy_`` refuses a dtype mismatch, so without the cast this
+    raises the moment the rollout falls out of compile.
+    """
+    for cls in (NanoGPTBackbone, NanoTiedDotBackbone):
+        wrapper = LatentThoughtModel(_backbone(cls)).eval()
+        caches = wrapper.make_static_generation_cache(
+            2, 12, torch.device("cpu"), dtype=torch.bfloat16
+        )
+        key_mask = torch.zeros(12, dtype=torch.bool)
+        input_ids = torch.randint(
+            0, KWARGS["vocab_size"], (2, 5),
+            generator=torch.Generator().manual_seed(47),
+        )
+        for t in range(5):
+            key_mask[t] = True
+            out = wrapper.token_step(
+                input_ids[:, t], caches, torch.tensor(t), key_mask
+            )
+            assert torch.isfinite(out.logits).all()
+        for cache in caches:
+            assert cache[0].dtype == torch.bfloat16
+            assert cache[1].dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or os.environ.get("RUN_CUDA_TESTS") != "1",
+    reason="set RUN_CUDA_TESTS=1 on CUDA host",
+)
+@torch.no_grad()
+def test_eager_step_under_cuda_bf16_autocast():
+    """The real asymmetry: autocast norms k to fp32 and leaves v bf16.
+
+    ``rms_norm`` is on autocast's fp32 list and ``linear`` is not, so only
+    CUDA autocast produces the mismatched pair the cache has to absorb.
+    """
+    # .cuda() on the WRAPPER, not on the backbone alone: LatentThoughtModel
+    # builds its own transition and adapter parameters in __init__, so moving
+    # only the argument leaves those on the host and the first projection
+    # fails with mat2 on cpu.
+    wrapper = LatentThoughtModel(_backbone()).cuda().eval()
+    device = torch.device("cuda")
+    caches = wrapper.make_static_generation_cache(
+        2, 12, device, dtype=torch.bfloat16
+    )
+    key_mask = torch.zeros(12, dtype=torch.bool, device=device)
+    input_ids = torch.randint(0, KWARGS["vocab_size"], (2, 5), device=device)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        for t in range(5):
+            key_mask[t] = True
+            out = wrapper.token_step(
+                input_ids[:, t], caches, torch.tensor(t, device=device), key_mask
+            )
+            assert torch.isfinite(out.logits).all()
 
 
 @torch.no_grad()

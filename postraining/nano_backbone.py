@@ -13,13 +13,10 @@ Conventions chosen for the latent-thought family:
 
 - ``embed_tokens(ids) = norm1(embed(ids))``: the input norm belongs to the
   TOKEN path, mirroring fresh_lejepa's rms-normed ``tok_emb``. Injected
-  thoughts (zero-init adapter) and PAD zeros bypass ``norm1`` — RMS-norm is
-  scale-invariant, so normalizing an epsilon-scale adapter output would jump
-  discontinuously to a full-RMS input and reinstate the full-strength
-  intervention collapse the zero-init ``ThoughtAdapter`` exists to prevent.
-  ``temporal_belief_from_token_latent`` therefore starts at the block loop,
-  and ``embed_tokens`` composed with it reproduces the pretraining forward
-  exactly.
+  thoughts (identity-init adapter) and PAD zeros bypass ``norm1`` so the
+  continuous thought coordinates reach the block stack unchanged.
+  ``temporal_belief_from_token_latent`` starts at the block loop, and
+  ``embed_tokens`` composed with it reproduces the pretraining forward exactly.
 - Belief = the post-``norm2`` final hidden state — precisely what the
   pretrained readout consumes, so no new probe is needed.
 - ``logits_from_features`` keeps the standard ``cat(input_latent, belief)``
@@ -174,6 +171,17 @@ class _NanoPostrainingMixin:
         q = self._rotate_step(q, position, angular_freq).transpose(1, 2)
         k = self._rotate_step(k, position, angular_freq).transpose(1, 2)
         v = v.transpose(1, 2)
+        # Autocast puts rms_norm on the fp32 list and linear on the bf16 one,
+        # so k arrives fp32 and v bf16 while the cache holds one dtype: eager
+        # index_copy_ rejects the mismatch outright. Cast as _attention_prefill
+        # does. Every branch below reads its SDPA keys back out of the cache,
+        # so rounding here is what the attention already sees. q is cast for
+        # the same reason one step later — it never enters the cache, but eager
+        # SDPA demands all three agree, and autocast casts it to the cache
+        # dtype anyway (scaled_dot_product_attention is on the bf16 list).
+        q = q.to(cache[0].dtype)
+        k = k.to(cache[0].dtype)
+        v = v.to(cache[1].dtype)
         attn_mask = None
         if key_mask is not None and key_mask.dim() == 2:
             if torch.is_tensor(position):
