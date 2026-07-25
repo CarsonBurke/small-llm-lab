@@ -448,6 +448,109 @@ realized drift, audit's predicted sweet spot) or constrain the trunk
 (rejected: fights the LM objective). alpha stays 8 (paper-faithful,
 free).
 
+### v24: Dreamer4 reverse KL REPLACES TRL (2026-07-24, user-directed)
+
+TRPL audit no.3 (agent, vs the paper-faithful reimplementation in
+`../cleanrl/cleanrl/shared/trl_projection.py`) found a FACTOR-OF-2
+misalignment that audits no.1 and no.2 both missed. The reference
+`kl_mean_part` returns `0.5 * maha` and compares THAT against
+`mean_bound = 0.03`, so the paper's bound is 0.03 nats of mean KL.
+`project_thought_means` compares the UN-HALVED `mahalanobis_sq`
+against the same 0.03, i.e. 0.015 nats — the region is 2x tighter than
+the paper's, and audit no.1's "apples-to-apples with the reference
+mean_bound 0.03" (line ~380 above) is wrong. Verified numerically:
+identical shifts give distances differing by exactly 2.000 and
+post-projection boundary radii by exactly sqrt(2)
+(0.008438 vs 0.011934 at sigma = e^-3.02). The same un-halving is in
+the tracking penalty (`projection_gap.square().sum()`, which also
+normalizes by behavior sigma where the reference uses the PROJECTED
+sigma), so alpha 8 is effectively 16 in paper units — moot, since
+alpha measurably does nothing. Per-dimension the bound is 7.75x
+tighter than the paper's setting at d=17 (0.00766 vs 0.0594 sigma/dim);
+sqrt(2) of that is the bug, 5.5x is d=512 vs d=17.
+
+Decisive finding: the 0.03 that matters is NOT the one the projection
+bounds. `new_thought_logprobs` is built from the RAW `thought_means`, so
+`kl/thought_behavior_joint` and `trust/thought_d_mean` both measure the
+raw ACTING policy. Job 363 over 17,499 updates: median raw KL 0.0424
+nats, p90 0.0671, p99 0.0799, max 0.5087, **68.4% of updates above
+0.03** and 36% above 0.05; `d_max` reached 179.67 (~90 nats on one
+action). `d_mean` exceeded eps on 75.0% of updates, matching audit
+no.1's ~75% projection-rate prediction exactly. The projection bounds
+only the projected mean inside the surrogate; the raw drift arrives
+through the Muon-owned trunk, which no projection or tracking penalty
+can reach (see the alpha=8 result above). There is NO KL-triggered
+early stop anywhere — `--post-update-kl-every` is pure telemetry.
+
+v24 therefore turns the Dreamer4 reverse-KL penalty back on as THE
+default trust mechanism, and REMOVES the projection from the default
+path entirely: `--thought-reverse-kl-coef` 0.0 -> **0.5** (user call;
+dreamer4 parity would be 0.3), `--thought-clip-mode` projected ->
+**none**. The two are now MUTUALLY EXCLUSIVE by construction -- see the
+biconditional below. Dreamer4 reference for the coefficient's
+`pmpo_kl_div_loss_weight` (`../dreamer4/dreamer4.py:5247`, with
+`pmpo_reverse_kl = True`; its HalfCheetah script uses 0.3, cartpole
+0.05). Its `kl_div` is `KL(behavior || current)` summed over action
+dims and masked-meaned over positions — same direction and same
+normalization convention as `sampled_reverse_kl` here, so the weight
+transfers. Caveat: dreamer4 balances it against a PMPO loss
+(`advantage.tanh().abs()` weighting), not a PPO surrogate on
+unit-normalized advantages, so 0.3 is parity-by-construction, not a
+tuned value for this objective.
+
+- New `--thought-clip-mode none`: no projection, no ratio band, no
+  tracking penalty, leaving reverse KL as the sole constraint. It reuses
+  `projected_thought_policy_loss` with an identity projection and an
+  all-ones trust scale, so the objective SHAPE is identical to
+  'projected' and exactly one term differs — the clean A/B. The +/-2
+  log-ratio guard still applies (numerical, not a trust region).
+  Rejected at coefficient 0: that is the unconstrained 512-D surrogate
+  job 348 already showed cannot bound drift.
+- EXACTLY ONE trust mechanism per run, enforced as a biconditional
+  (nonzero coefficient <=> clip mode 'none') in BOTH `update_minibatch`
+  and argv (`validate_args`). The surrogate-side modes and the penalty
+  are alternative SOLUTIONS -- the clip modes bound movement inside the
+  surrogate, the penalty prices realized aggregate divergence of the
+  acting policy -- so mixing them makes neither term's contribution
+  attributable. Arms: reverse-KL only (`--thought-clip-mode none`, the
+  DEFAULT) or TRL only (`--thought-clip-mode projected
+  --thought-reverse-kl-coef 0`). The mixed configuration that v24
+  originally shipped is now REJECTED, not merely discouraged.
+- `clip/thought_projection` finally surfaced. `thought_policy_clip_fraction`
+  has been computed since v23 but never reached the dashboard dict, so
+  the projected arm's headline diagnostic ("projection fraction a
+  minority", the stated v23 success signal) was invisible for all of
+  job 363. Joined the age-0 canary list (exactly 0 on fresh behavior).
+- `EXECUTION_SCHEMA` -> v24 (`..._reverse_kl_thought_trust_...`; the
+  first-cut name encoded the now-forbidden mixture and was replaced
+  before any checkpoint carried it);
+  v23 becomes `NO_THOUGHT_KL_EXECUTION_SCHEMA`; resume needs
+  `--migrate-thought-reverse-kl-resume`, which is rejected together with
+  `--thought-reverse-kl-coef 0`. Every older schema now additionally
+  requires the new flag. State transfers verbatim.
+- `main()` split into `build_arg_parser()` + `validate_args(parser,
+  args)` so the shipped defaults and the argv guards are testable
+  without running training; backbone-dependent checks stay in `main`.
+  `update_minibatch`'s signature defaults now track the CLI defaults,
+  so a caller that omits them exercises the SHIPPED arm.
+- Tests: none-vs-projected once the region binds; none rejects
+  coefficient 0; every surrogate mode rejects a nonzero coefficient
+  (parametrized); shipped defaults pinned in both the signature and the
+  parser; argv guards exercised through `validate_args`. Migration
+  lattice extended. 326 postraining + 83 repo green (409 total).
+
+DELIBERATELY NOT CHANGED: `--thought-trust-epsilon` stays 0.03. In this
+convention that enforces 0.015 nats, inside the user's stated 0.03
+ceiling; "fixing" the halving to reach paper-0.03 would LOOSEN the only
+constraint currently being enforced while the raw policy is the thing
+out of bounds. Revisit once the raw KL is actually under 0.03. The
+paper-unit conversion is: current eps 0.03 -> 0.015 nats, 0.06 ->
+0.030 nats (paper Table 2), 0.10 -> 0.050 nats (audit's predicted sweet
+spot), 0.30 -> 0.150 nats.
+
+STILL OPEN: a target-KL early stop on the inner epochs is what would
+make 0.03 a hard ceiling rather than a soft penalty. Not implemented.
+
 ### GPU-utilization audit (2026-07-24, read-only, job-348-era telemetry)
 
 Collection is CPU/latency-serialized, not compute-bound. Steady-state pool
@@ -516,3 +619,444 @@ Smoke job 356 (40 steps, TORCH_LOGS=recompiles) verdicts:
   peak memory profile matches job 348 while dead-row compute still
   drops. Tail-snap and tail-free (None) paths keep the realloc
   behavior unchanged. Re-smoked as job 358; 20k run queued as 359.
+
+## Post-training perf pass, 2026-07-24 (v23 run in flight as job 363)
+
+CORRECTION, same day, before trusting anything below: the numbers I first
+wrote here as "steady state (last 100 pools)" were actually a MID-RUN
+window (~step 2000 of 4248). Job 363 is not stationary -- the policy is
+learning to answer with fewer actions, and every collection cost tracks
+that. Do not quote a window from this run without its step range.
+
+  window (steps)     collect  actions/traj
+  44-440              13.20 s   417.4
+  1944-2340            8.93 s   154.1   <- what I originally called steady
+  3048-3444            8.38 s   104.4
+  3852-4248            6.25 s    83.4   <- current
+
+Current pool (last 100 pools, steps 3852-4248): collect 6.25 s, refresh
+0.541, d2h 0.198, cpu pack 0.198, h2d 0.065; update 0.566 s/step.
+actions_per_trajectory 83.3, thoughts_per_trajectory 2.17, packed padding
+utilization 0.255, packed_batch_gib_max 2.59, retained_minibatches 3.59,
+ended_fraction 0.998.
+
+The pool split, taken from pool_seconds (cumulative from pool start, so
+the last train row of each pool IS the pool wall time) rather than
+reconstructed:
+
+  window        pool wall   collect          update
+  first 100      18.88 s    13.17 (69.7%)    5.91 (31.3%)
+  middle         12.25 s     9.23 (75.4%)    3.12 (25.5%)
+  last 100        8.55 s     6.30 (73.7%)    2.43 (28.5%)
+
+**Generation is 70-75% of pool wall time and that share is STABLE across
+the whole run.** There are 4 updates per pool (prompts_per_rollout 64 /
+prompts_per_minibatch 16), not 16 -- I briefly published a "generation is
+only ~41%, the update path is now the larger half" correction here that
+was built on 16 updates/pool. That was wrong; it inverted the ranking on
+a bad divisor. Generation was and remains the right target. The original
+"~60%" was a mild underestimate, not an overstatement.
+
+Within collect, generation proper is 64.6% of pool wall; the remaining
+~9 points are refresh 6.6, cpu pack 2.5, d2h 1.8, h2d 0.8. (collect_seconds
+brackets all of those, which is why it reads 73.7%. Both numbers are right
+-- quote which one you mean.) The decomposition closes to a 0.013 s
+residual in every window, so this accounting is exact, not approximate.
+
+RETRACTED, and this is the important one: I wrote here that
+ended_fraction 0.998 meant the "~2% of rows run to max_new_tokens=1024"
+premise had "largely dissolved". WRONG, and backwards. 0.2% of 1024 rows
+is ~2 unfinished rows per pool, and under lockstep ONE such row in a
+256-row chunk forces the entire chunk to the full budget. Direct evidence
+from the bench rows, which is not subtle:
+
+  step   emitted_tokens          recurrent_steps_per_rollout
+         mean   p95    max       mean    p95    max
+  3752   108.4  1024   1024      1048.7  1055   1055
+  4052    87.6  1024   1024      1042.6  1047   1047
+  4352    68.3   150   1024      1044.0  1050   1050
+  4500    68.0   125   1024      1039.8  1045   1045
+
+Every chunk runs ~1044 steps to serve a mean of 68 emitted tokens -- a
+15x waste factor that is FLAT while emitted_tokens_mean fell 108 -> 68.
+Note p95 == max on the step count: that IS the lockstep signature, every
+chunk pays its slowest row. Bench ended_fraction is 0.92-0.96, not the
+0.998 of the training rollout -- different populations, don't mix them.
+
+Corroborated independently from the training side: packed_batch_gib_max
+inverts exactly to a packed stream width (8244 B/slot at B=256 -- four
+(B,L,512) fp32 fields = 8192 B plus ten scalar-per-slot fields = 52 B).
+Over the last 120 pools that gives mean 1260, median 1280, max 1600, and
+every single value lands on an exact multiple of 64, which is what
+trim_stream(multiple=replay_bucket=64) produces. Meanwhile
+rollout_diagnostics' stream_length reads 407 because aggregate_diagnostics
+takes the MEAN over the 64 groups, not the max. So one group per minibatch
+is still running out past 1200 slots in essentially every pool.
+
+So the runaway rows are the #1 item and are relatively BIGGER than at
+mid-run, not smaller. ~2 rows in 1024 set the step count for the whole
+pool.
+
+What the drift does change, and these do hold:
+- d2h fell 0.732 -> 0.198 and retained_minibatches rose 2.74 -> 3.59
+  (shorter streams fit the 8 GiB budget), so both the scatter win and the
+  RETAINED_MINIBATCH_BUDGET_BYTES bump are worth proportionally less than
+  the mid-run numbers suggested.
+- Absolute headroom everywhere is smaller: the whole pool is now 8.55 s
+  against 18.88 s early. Percentages are the honest unit here, not
+  seconds.
+
+Method note, since I got this wrong once: do NOT reconstruct pool wall
+time as collect + N x update_seconds. Read it off the last train row's
+pool_seconds, and get N from prompts_per_rollout // prompts_per_minibatch
+in the manifest, never from a ratio of record-slice lengths.
+
+What survives unchanged: per-step decode cost is 1.94 ms, measured
+independently from the bench rows and the aime rows and corroborated by
+the training regression slope (1.8-2.9 ms/step), and it is nearly FLAT in
+batch width -- so narrowing the batch (the prior audit's F2) does not
+touch the price. Chunks still step in lockstep until the last row
+finishes. The changes below are all overhead removal that scales with
+STEP COUNT, which is why they hold up as the run's action counts fall.
+
+Landed (all bit-exact against the prior implementation unless noted):
+
+- latent_rollout.py decode loop: the six per-step boolean-row-mask stream
+  writes became torch.where over the dense (live_rows, position) index.
+  A boolean index has a data-dependent output shape, so each one copied
+  its count to the host and drained this launch-bound loop -- six syncs
+  per step, which made the SYNC_EVERY guard pointless. Verified bit-exact
+  over 320 randomized trials (pin_emit x record_likelihoods x
+  replay_storage, including compaction permutations) and, independently,
+  field-by-field against HEAD over 14 rollout configurations.
+- latent_rollout.py scatter_replay_statistics: narrow each group's slice
+  ON DEVICE before it crosses the bus. The packed batch is padded to its
+  longest group, so the whole-batch transfer moved ~2.4x the bytes any
+  group keeps. Destinations stay PAGEABLE on purpose: an earlier pinned +
+  async version was reverted after review because these buffers become
+  the pool's long-lived behavior statistics (order of GBs) and this box
+  is 60 GB with 31 GB already in swap -- pinning that much is worse than
+  the bandwidth is worth. The pinned variant remains available if the
+  host memory picture changes.
+- core.py generalized_advantage_and_return_targets: hoisted the residual,
+  the shifted validity, and gamma*lambdas out of the reverse recurrence;
+  15 -> 8 eager launches per column. Bit-exact across dtypes, gammas,
+  scalar/per-row lambdas, gappy masks, and length 0/1.
+- train_latent_vapo.py update_minibatch: the two per-shard
+  torch.isfinite(loss) guards were host syncs at maximum queue depth,
+  immediately before backward -- roughly two dozen per minibatch. They
+  now accumulate on device and resolve in ONE sync after the shard loop,
+  still above every step_optimizers call in the function (including the
+  value_only return path). Tests assert weights are unchanged after the
+  raise. This is the one deliberate behavior change: a poisoned shard now
+  wastes its backward pass before aborting.
+
+New telemetry: perf/decode_steps_per_chunk_mean, decode_steps_per_chunk_max,
+decode_step_utilization (lockstep_decode_metrics). A chunk pays one decode
+step per action of its LONGEST row; the utilization ratio against mean
+actions is the share of decode work that produced nothing. This is the
+number that decides whether the max_stream_steps / rollout_groups change
+below is worth an execution-schema bump. Row length is read from
+action_mask, NOT from stream_length: groups reach the metric through
+trim_stream, which rounds the kept length UP to --replay-bucket (64) and
+pads past the original stream to bound compiled replay shapes. The first
+version of this metric measured stream_length and so carried up to a full
+bucket of pool-to-pool jitter -- fatal for a metric whose entire job is
+detecting a change. Caught in review; the unit test now pins that
+bucketing moves nothing.
+
+Operational, and the single largest wall-clock item found: the machine
+auto-suspended 00:00:00 -> 08:57:22 (8 h 57 m, ~half the run's wall
+clock) and will do so again nightly. Confirmed via journalctl, not
+inferred from a telemetry gap (telemetry completeness checked at 0.3%
+over a live 21-minute window). Fix is to wrap the runner:
+`systemd-inhibit --what=sleep:idle mlq daemon ...` (or the submit itself).
+
+Open, deliberately NOT done -- each needs the GPU, which job 363 holds:
+- max_stream_steps 3584 -> 1536 or 2048, and --rollout-groups 16 -> 32.
+  KV is allocated at full num_heads (make_generation_cache uses
+  attention.num_heads, NOT num_kv_heads -- GQA does not shrink it) for the
+  whole prompt+3584 window while stream_actions_max is ~1050. Confirmed by
+  a second pass that max_stream_steps gates ONLY validation, allocation
+  shapes, and the loop bound: no RNG draw shape depends on it (gate.sample,
+  sample_latent, and top_p_sample all draw at the live row width), the step
+  count is bound by max_new_tokens=1024 and never reaches either budget, and
+  resume validates only execution/prompt-order/data schemas, not this arg.
+
+  Footprint is B x max_stream, and this is the bit I had WRONG:
+
+    config                          B x L        vs today
+    today      (256, 512+3584)   1,048,576         --
+    2048 steps, groups 32 (512, 2560)  1,310,720   +25%  (+3.5 GiB)
+    1536 steps, groups 32 (512, 2048)  1,048,576   exactly neutral
+
+  Doubling the chunk width doubles B, so 2048 + groups 32 is NOT the
+  memory-neutral trade I implied -- 1536 is. Also: my "2.15 GiB thoughts"
+  was a GB/GiB slip; B*L*512*4 = 2^31 B = 2.000 GiB exactly, and the freed
+  amount at 2048/groups-16 is 5.27 GiB, not ~5.5.
+
+  Measured headroom (last 100 pools, verified directly from metrics.jsonl):
+  rollout peak_vram_bytes mean 17.10, p90 18.68, max 18.93 GiB; train peak
+  mean 13.44, max 14.22. The (512, 2560) projection lands ~20-22 GiB on a
+  32 GiB card, so 2048 fits -- but benchmark at 1536 FIRST, because it is
+  the single-variable test: any per-step change is attributable to width
+  alone rather than to a 25% larger footprint picking different autotune
+  kernels. Raising 1536 -> 2048 later needs no second schema bump.
+
+  Sequencing: max_stream_steps alone needs NO execution-schema bump (it
+  changes no draw shape and no step count); --rollout-groups 32 does,
+  because it changes which RNG draws map to which row. Land them as two
+  steps. A v24 bump is five mechanical edits around EXECUTION_SCHEMA
+  (train_latent_vapo.py:156) plus the resume cascade at :210-289 and the
+  test matrix at test_latent_rollout.py:2985-3020; 363's checkpoints CAN
+  resume across it behind a --migrate flag (the v19->v20 precedent:
+  identical prompts/policy/parameters, only RNG-to-row attribution moves).
+  Behavior-age-0 bit-exactness does not interact -- it is a property of the
+  replay path, which never sees chunk width, cache length, or rollout RNG.
+
+  One caveat that is a HYPOTHESIS, not a finding: attention narrows the KV
+  cache with torch.narrow on dim 2, so strides are cache_length-dependent
+  and Inductor bakes that length as a literal under
+  max-autotune-no-cudagraphs. A different constant could select a different
+  kernel and hence a different bf16 reduction order -- mathematically
+  identical, not bitwise. Directly testable by running groups=16 +
+  max_stream_steps=2048 at a fixed seed and diffing.
+
+  Break-even, against the pool-aligned decomposition (only the 5.38 s of
+  generation moves -- refresh, pack, d2h and h2d are per-minibatch work on
+  a fixed 4x256 partition and do not scale with --rollout-groups). Halving
+  the chunk count also makes each chunk likelier to contain a row that runs
+  to the cap: P(chunk holds one) goes 1-0.998^256 = 0.40 to 1-0.998^512 =
+  0.64, so total steps fall by ~0.58, not 0.50.
+
+    r = c(512)/c(256)   generation   pool    change
+    1.00                   3.12      6.07    -27%
+    1.15                   3.59      6.54    -21%
+    1.20                   3.74      6.70    -20%
+    1.40                   4.37      7.32    -12%
+    1.60                   4.99      7.94     -5%
+    1.72                   5.38      8.33      0%   <- true break-even
+
+  Book -20%, not the -29% I first estimated off collect_seconds. Kill line
+  r > 1.4. Expected r is 1.15-1.30.
+
+  BENCHMARK BLOCKER -- addressed in code, NOT VERIFIED ON HARDWARE.
+  bench_step_compile.py held five live KV cache sets in one --batch-sizes
+  iteration (12288*B*L each = 6.375 GiB at B=512/L=1088, so 31.9 GiB) and
+  OOMed before reaching the variant we care about. It now takes --variant,
+  and each block drops its caches, closures and captured graph before the
+  next allocates. Two things that made this more than a del: a CUDAGraph
+  owns a private pool that only returns to the allocator when the GRAPH
+  object is collected, so it must go before its caches; and position_index
+  was defined inside the compiled-static block but consumed by dynamic-row
+  and static-row, so a naive selector would have failed with NameError. It
+  is hoisted.
+
+  What is actually verified: an AST pass confirms position_index is bound
+  in shared setup ahead of the first guard, that no variant reads a name
+  bound by another, and that each frees every name it binds; argparse is
+  exercised for the no-arg, single, multi and invalid cases; the default
+  runs all five in the original order. What is NOT verified: that the peak
+  is really one cache set. That is a claim about allocator and cudagraph-
+  pool behaviour and it needs a run with torch.cuda.max_memory_allocated
+  to confirm -- job 363 holds the GPU. Treat "~6.4 GiB peak" as the design
+  intent, not a measurement. Run --variant dynamic-row at B=256 first as a
+  cheap smoke test before spending a slot on the B=512 comparison.
+
+  Bias note for whoever runs it: running a subset skips the eager block,
+  which is currently the first CUDA work in the process and incidentally
+  warms cuBLAS handles and SDPA backend selection. That work moves into
+  the selected variant's own compile plus the 64 warmup steps, which are
+  timed separately and discarded. Whatever residual bias remains applies
+  identically at B=256 and B=512, so the RATIO -- the decision metric -- is
+  unaffected. Do not compare absolute ms/step across different --variant
+  sets.
+- RETAINED_MINIBATCH_BUDGET_BYTES 8 -> 13 GiB -- deferred. Worth less than
+  the ~0.96 s/pool I estimated now that retained_minibatches is 3.59. Do
+  NOT change it in the same job as a width change: different phases, but
+  they surface on the same peak_vram_bytes field, so you would not know
+  which one moved.
+- Capping the stream budget truncates ~3-6% of rows by the eval length
+  percentiles, so it is a real objective change and needs an ablation,
+  not a free win. The MOTIVATION is now the strongest item on this list
+  (see the retraction above): chunks run ~1044 steps for a mean of 68
+  emitted tokens. If chunks stopped near the p99 row instead of the max,
+  generation goes ~5.38 -> ~2.4 s, i.e. **-36% of pool wall** -- larger
+  than everything else here combined, and it collapses the packed width
+  (2.59 -> ~0.9 GiB) which fixes retention and ~75% of the GAE scan for
+  free. Two separate costs to accept, and they are the whole difficulty:
+  changing when the loop stops changes the RNG stream for the rest of the
+  chunk (schema bump), and truncating a row changes its reward (objective
+  change, for ~2 rows/pool that are emitting garbage anyway). The
+  objective-NEUTRAL variant is to merge the four chunks' tails so tail
+  rows decode together. USER DECISION, not mine to make: this trades a
+  small objective change for the largest measured win in the run.
+
+  TAIL MERGE, specced (objective-neutral alternative to the above). Per-row
+  `position` is the enabling change and is SMALL inside the compiled step
+  -- three sites, all verified by reading nano_backbone.py:
+
+    (a) :142-144 RoPE. theta = position * angular_freq then
+        .cos()[None,None,None,:]. A (B,) position makes theta (B, 64), so
+        the reshape becomes [:, None, None, :]. Two lines.
+    (b) :182-183 KV write. cache[0].index_copy_(2, index, k) writes ONE
+        slot for every row; per-row needs scatter_ with the index
+        broadcast to (B,H,1,D). Flattening to a linear index does not work
+        -- element (b,h,l,d) sits at b*HLD + h*LD + l*D + d, so a per-row l
+        is not a uniform stride.
+    (c) :186-188 mask. Add arange(W)[None,:] <= position[:,None], else a
+        row at position 40 attends slots 41..W holding stale KV.
+
+  The piece of luck, confirmed at :181: position_length = key_mask.shape[-1].
+  The attention extent already comes from the MASK WIDTH, not from
+  position, so torch.narrow at :184-185 needs no change at all.
+
+  Cost: one extra compile at startup (dynamo guards on rank, () -> (B,) is
+  a new graph; dynamic=True already covers B and mask width, no new dynamic
+  dim). The KV store stops being a contiguous slice store and becomes a
+  real scatter -- same bytes, still coalesced within a row since D=128 is
+  contiguous, but B separate 256-B runs per head. That is the one place to
+  expect a regression.
+
+  Per-row position is NOT a general win: SDPA extent becomes max(position)
+  over the live set, so a row at 40 batched with a row at 1000 pays 1000
+  columns. It converts "every row pays the slowest row's STEP COUNT" into
+  "every row pays the slowest row's ATTENTION WIDTH". It pays only when
+  merged rows have similar positions -- which the tail case satisfies,
+  since parked survivors all ran near the cap.
+
+  It also is not sufficient. Chunks are generated SEQUENTIALLY
+  (train_latent_vapo.py:4550), so when chunk 1 is in its tail, chunks 2-4
+  do not exist yet. Merging needs PARKING: run each chunk to its tail, park
+  that tail's KV, finish all four together. A parked 16-row tail is
+  12288*16*4096 = 0.75 GiB, so three parked tails ~2.25 GiB against the
+  measured 18.93 GiB peak -- affordable. Merging is a ~3 GiB D2D copy,
+  ~2 ms. Chunks have different prompt widths, so the merged buffer needs a
+  per-row pad offset, which valid_slots already expresses.
+
+  VALUE -- re-derived, and the estimate I was handed (tail ~60% of steps,
+  from the mid-run window) is stale in BOTH directions. The tail fraction
+  is volatile and tracks the policy's answer-length distribution:
+
+    step   emit mean/p95      chunk steps   head   tail   tail%
+    3900   108.1 / 1024          1044       1026     18     2%
+    4052    87.6 / 1024          1043       1026     17     2%
+    4200    76.6 /  423          1041        425    616    59%
+    4352    68.3 /  150          1044        152    892    85%
+    4652    63.7 /  130          1038        132    906    87%
+
+  At step 3900 this change was worth almost NOTHING (tail 2%); it is now
+  worth 85-88%. Any estimate here must be dated.
+
+  THE VOLATILITY IS A STRONGER ARGUMENT THAN EITHER ESTIMATE. Going 2% ->
+  88% in ~750 steps means the prize is a function of the policy's current
+  answer-length distribution, not of the code. A schema bump justified by
+  today's spot measurement can be worth nothing by the time it lands. That
+  cuts against implementing either variant on a single reading, and it
+  applies equally to the -31% and -42% figures. What it argues FOR is
+  landing decode_step_utilization first (already done, costs nothing) and
+  watching the ratio across several hundred steps before committing.
+
+  Direction of the error: both caveats below bias the SAME way -- p95
+  approximates p93.75 at 16 of 256 rows, which reads the head high and the
+  tail low -- so 85-88% is if anything a slight underestimate.
+
+  At the current 87%:
+  4 x 1040 = 4160 steps becomes 4 x 132 + 906 = 1434, saving ~66% of
+  generation, i.e. 5.38 -> ~1.85 s and pool 8.33 -> ~4.8 s, about -42%.
+  Caveat: this uses BENCH row-length percentiles as a proxy for the
+  training rollout's distribution, and they are different populations
+  (bench ended_fraction 0.92-0.96 vs training 0.998). decode_step_utilization
+  from the new telemetry settles it directly on the next run.
+
+  SUBSTITUTES, NOT ADDITIVE: the tail merge and the runaway-row truncation
+  above target the SAME steps. Truncating near p99 removes the tail
+  outright (~87% of generation); merging makes the tail be paid once
+  instead of four times (~66%). Do not add them. The merge also overlaps
+  --rollout-groups 32 -- with two chunks instead of four it saves 1T not
+  3T -- so if the width change lands first, re-estimate the merge against
+  the post-change baseline, not this one.
+
+  Cross-check on the whole picture: 4 chunks x 1040 steps at the derived
+  1.14 ms/step reproduces the measured generation time, so the "generation
+  is chunk_count x chunk_steps x per_step" model is sound.
+
+- GAE runs over the PADDED rectangle. generalized_advantage_and_return_
+  targets is called once per minibatch on (256, ~1285) while
+  packed_padding_utilization is 0.256, so ~75% of the scan is pure
+  padding: ~10.3k eager launches per update, ~41k per pool. Estimated
+  0.22-0.30 s/pool (~12-15% of the update half) on a 5.5 us/dispatch
+  figure carried over from the decode-loop work -- NOT measured, and a
+  torch.profiler range around train_latent_vapo.py:1970 would settle it
+  in one pool. It is the cheapest measurement on this list. The fix is
+  bit-exact if wanted: the recurrence is row-separable and padding
+  columns contribute exactly 0 (mask=0), so it can move inside the
+  length-aware shard loop, which already narrows to each shard's used
+  length. Not done -- unmeasured, and this project does not land
+  speculative changes.
+Rejected on risk/reward: top_p_sample fp32 fusion (RNG path, schema
+bump), the 18 boolean->integer index conversions in update_minibatch
+(~0.02 s/pool), replay_bucket and bpb_val_tokens default changes, and the
+compact-THINK-indexed old_thought_* refactor.
+
+
+## v24 launch config + perf pass (2026-07-24, job 385)
+
+OBJECTIVE (user-directed): reverse-KL ONLY, never mixed with TRL.
+`--thought-clip-mode none` + `--thought-reverse-kl-coef 0.5` are the
+defaults; the biconditional (nonzero coef <=> mode 'none') is enforced
+in `update_minibatch` and in `validate_args`. `--value-prior` 0.05 ->
+0.0 (critic-warmup agent: KL(optimum || project(prior)) is 0.68 nats at
+0.0 vs 9.84 at 0.05, and the near-frozen AdamW bias took ~1e3 steps to
+unwind that). Takes effect on FRESH warmup only -- `value_prior` is not
+in `execution_schema`, so a resume silently keeps the old bias.
+
+PERF, measured (steps 6, --value-warmup-steps 0, 2nd pool = steady):
+
+| config                          | collect_s | pool_s | peak VRAM |
+|---------------------------------|-----------|--------|-----------|
+| g16 baseline (256-wide x 4)     |  7.03     | 9.01   | 18.76 GB  |
+| g32 + --max-stream-steps 2048   |  6.45     | 8.46   | 18.99 GB  |
+| + --rollout-tail-graph          |  5.61     | 7.34   | 19.32 GB  |
+
+= 20% off collect, 19% off the pool cycle, ~+0.6 GiB VRAM.
+`--rollout-tail-graph` had been off "until bench_step_compile confirms
+it at the production shape" (:3426 comment). CONFIRMED: 52% of decode
+steps run at the 16-row tail where the step is launch-bound (60 eager
+dispatches/step, 0.31 ms of work inside a 1.94 ms step), so the CUDA
+graph wins exactly as that comment predicted.
+
+NEGATIVE RESULT: naive widening does NOT help by itself. An earlier
+rollout-only A/B suggested g32 was SLOWER; that measurement was
+confounded (power-trace window included post-decode CPU). Instrumented
+`collect_seconds` shows g32 is 8% FASTER. Widening beyond that is
+pointless: attention decode has arithmetic intensity exactly 1.0
+FLOP/byte against a 5090 ridge of 117, and KV streaming is >=70% of
+decode bytes, so a wider batch is MORE memory-bound, not less. 1024-wide
+is structurally impossible (48 GiB of KV at cache length 4096).
+
+POWER: 500W is NOT reachable during decode on this model -- roofline,
+not syncs and not occupancy. Measured mem-controller util 44-47%, SM
+util 96%, power 341W: a dispatch-bound loop punctuated by
+bandwidth-bound kernels. Average power rises only by shrinking decode's
+67-75% share of pool wall time so the compute-dense replay/update
+occupies more of it. Pure rollout peaked at 365W; full training at 396W.
+
+REJECTED: replacing `torch.multinomial(probs,1)` with an inline
+gumbel/exponential argmax to "remove two host syncs". Verified on this
+box (torch 2.12.1, RTX 5090) with `set_sync_debug_mode('warn')` and
+three positive controls: multinomial does NOT sync on CUDA, and the
+replacement is 20% SLOWER (94.2 vs 78.0 us/call). The claim came from a
+CPU profile, where the validation path differs.
+
+STILL OPEN (not applied before launch):
+- `split_rollout_groups` runs on the main thread with nothing queued
+  (`train_latent_vapo.py:4805-4807`, 4x/pool): 16 groups x 14 tensors
+  cloned on CPU, measured 0.10-0.18 s/chunk = 0.4-0.75 s/pool of TRUE
+  GPU idle. Fix: submit the split->retain_group chain to the existing
+  scoring pool instead of only retain_group. Costs ~2.4 GiB host mem.
+- Per-chunk 2.36 GiB pinned D2H behind a full-stream barrier
+  (`latent_rollout.py:127-142`), ~0.2-0.3 s/pool, not covered by any
+  existing timer. Needs a side stream; high risk.
+- Checkpoint save on the main thread, measured 0.63 s every 32 steps
+  (0.4% amortized).

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import math
 from types import MethodType, SimpleNamespace
 
@@ -19,6 +20,7 @@ from postraining.latent_rollout import (
     PAD_SLOT,
     THOUGHT_SLOT,
     TOKEN_SLOT,
+    LatentRolloutBatch,
     assemble_stream_latents,
     assign_terminal_rewards,
     pack_rollout_groups_for_replay,
@@ -51,12 +53,14 @@ from postraining.train_latent_vapo import (
     GAIN_SCALED_EXECUTION_SCHEMA,
     GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
     JOINT_CLIP_EXECUTION_SCHEMA,
+    NO_THOUGHT_KL_EXECUTION_SCHEMA,
     PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
     PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
     PREVIOUS_EXECUTION_SCHEMA,
     UNANCHORED_VALUE_EXECUTION_SCHEMA,
     MathPromptSampler,
     REWARD_SCHEMA,
+    build_arg_parser,
     build_optimizers,
     migrate_anchored_value_resume,
     value_support_geometry_matches,
@@ -66,6 +70,7 @@ from postraining.train_latent_vapo import (
     per_dimension_thought_policy_loss,
     project_thought_means,
     projected_thought_policy_loss,
+    lockstep_decode_metrics,
     math_dataset_identity,
     measure_post_update_policy_drift,
     migrate_zero_adapter_resume,
@@ -77,6 +82,7 @@ from postraining.train_latent_vapo import (
     rollout_diagnostics,
     save_checkpoint,
     update_minibatch,
+    validate_args,
     verify_terminated_answer,
 )
 from postraining.value_model import SeparateCritic
@@ -655,6 +661,138 @@ def test_update_minibatch_trains_the_full_policy_model():
     # Only the unused backbone critic probe stays frozen.
     assert torch.equal(backbone.critic_probe.output.weight, frozen_probe_before)
     assert metrics["trunk_grad_norm"] > 0.0
+
+
+def _decode_group(row_actions: list[int], prompt: int, bucket: int = 1):
+    rows = len(row_actions)
+    # trim_stream rounds the kept length up to a replay bucket and pads past
+    # the original stream, so stream_length is deliberately NOT the row length.
+    used = prompt + max(row_actions)
+    stream = -(-used // bucket) * bucket
+    zeros = torch.zeros(rows, stream)
+    action_mask = zeros.clone()
+    for row, count in enumerate(row_actions):
+        action_mask[row, prompt - 1 : prompt - 1 + count] = 1.0
+    return LatentRolloutBatch(
+        kind=torch.full((rows, stream), TOKEN_SLOT, dtype=torch.long),
+        token_ids=torch.zeros((rows, stream), dtype=torch.long),
+        thoughts=torch.zeros(rows, stream, 0),
+        gate_actions=torch.full((rows, stream), EMIT, dtype=torch.long),
+        action_mask=action_mask,
+        gate_mask=zeros.clone(),
+        emit_mask=zeros.clone(),
+        old_gate_logprobs=zeros.clone(),
+        old_token_logprobs=zeros.clone(),
+        old_thought_logprobs=torch.zeros(rows, stream, 0),
+        old_thought_means=torch.zeros(rows, stream, 0),
+        old_thought_log_sigmas=torch.zeros(rows, stream, 0),
+        old_values=zeros.clone(),
+        rewards=zeros.clone(),
+        reward_scalar=torch.zeros(rows),
+        prompt_length=prompt,
+    )
+
+
+def test_lockstep_decode_metrics_price_a_chunk_at_its_longest_trajectory():
+    # Two chunks of two groups: the chunk pays for its longest ROW, not its
+    # mean, which is exactly the lockstep waste the metric has to expose.
+    def pool(bucket: int) -> list:
+        return [
+            _decode_group([3, 2], prompt=2, bucket=bucket),
+            _decode_group([5, 4], prompt=4, bucket=bucket),
+            _decode_group([2, 2], prompt=3, bucket=bucket),
+            _decode_group([1, 1], prompt=2, bucket=bucket),
+        ]
+
+    metrics = lockstep_decode_metrics(pool(bucket=1), chunk_groups=2)
+    assert metrics["decode_steps_per_chunk_max"] == 5.0
+    assert metrics["decode_steps_per_chunk_mean"] == pytest.approx(3.5)
+    # 20 actions over 8 rows is 2.5 kept steps per row against 3.5 paid.
+    assert metrics["decode_step_utilization"] == pytest.approx(2.5 / 3.5)
+    # The pool reaches this function through trim_stream, which rounds every
+    # group's stream up to a replay bucket. Reading the length off
+    # stream_length instead of action_mask made the metric swing by up to a
+    # full bucket for identical decoding -- fatal for a metric meant to
+    # detect a change. Bucketing must move nothing.
+    for bucket in (8, 64):
+        assert lockstep_decode_metrics(
+            pool(bucket=bucket), chunk_groups=2
+        ) == metrics
+    # One group per chunk is the sequential rollout path: nothing is wasted
+    # beyond each group's own ragged rows.
+    solo = lockstep_decode_metrics(pool(bucket=64), chunk_groups=1)
+    assert solo["decode_steps_per_chunk_mean"] == pytest.approx(11 / 4)
+    assert solo["decode_steps_per_chunk_max"] == 5.0
+    with pytest.raises(ValueError, match="at least one rollout group"):
+        lockstep_decode_metrics([], chunk_groups=2)
+
+
+def test_lockstep_decode_metrics_survive_real_replay_bucketing():
+    # The synthetic case above pins the arithmetic; this pins it against an
+    # actual rollout put through the actual trim_stream, which is where the
+    # bucketing bug came from.
+    wrapper = _wrapper()
+    batch = _rollout(wrapper, batch=6, prompt=5, new_tokens=9)
+    row_actions = batch.action_mask.sum(1)
+    baseline = lockstep_decode_metrics([batch], chunk_groups=1)
+    assert baseline["decode_steps_per_chunk_max"] == float(row_actions.max())
+    for multiple in (1, 8, 64, 128):
+        trimmed = trim_stream(batch, multiple=multiple)
+        assert lockstep_decode_metrics([trimmed], chunk_groups=1) == baseline
+    # ...and the quantity the first version read really does move, so the
+    # test above is not vacuous.
+    assert (
+        trim_stream(batch, multiple=128).stream_length
+        != trim_stream(batch, multiple=1).stream_length
+    )
+
+
+def test_update_minibatch_names_the_shard_of_a_non_finite_actor_loss():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assign_terminal_rewards(batch, torch.rand(4))
+    refresh_old_statistics(wrapper, critic, batch)
+    # A poisoned behavior likelihood makes the policy ratio non-finite. The
+    # guard is resolved once per minibatch rather than before each backward,
+    # so it must still abort -- and still name the shard and the term.
+    batch.old_token_logprobs.fill_(float("nan"))
+    trunk_before = wrapper.backbone.blocks[0].attn.proj.weight.clone()
+    critic_before = critic.trunk.blocks[0].attn.proj.weight.clone()
+    with pytest.raises(RuntimeError, match="non-finite loss") as failure:
+        update_minibatch(wrapper, critic, batch, _optimizers(wrapper, critic))
+    assert "shard=0 actor" in str(failure.value)
+    assert "policy=nan" in str(failure.value)
+    # The guard now fires after the backward passes, so what it has to protect
+    # is the weights, not the gradients: nothing may have stepped.
+    assert torch.equal(
+        wrapper.backbone.blocks[0].attn.proj.weight, trunk_before
+    )
+    assert torch.equal(critic.trunk.blocks[0].attn.proj.weight, critic_before)
+
+
+def test_update_minibatch_names_a_non_finite_value_loss_without_an_actor():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assign_terminal_rewards(batch, torch.rand(4))
+    refresh_old_statistics(wrapper, critic, batch)
+    with torch.no_grad():
+        critic.head.weight.fill_(float("nan"))
+    # value_only skips the actor half of every shard and returns through its
+    # own step_optimizers call, so the deferred guard must still catch a critic
+    # that has gone non-finite on its own -- and still catch it first.
+    critic_before = critic.trunk.blocks[0].attn.proj.weight.clone()
+    with pytest.raises(RuntimeError, match="non-finite loss") as failure:
+        update_minibatch(
+            wrapper,
+            critic,
+            batch,
+            _optimizers(wrapper, critic),
+            value_only=True,
+        )
+    assert "shard=0 value" in str(failure.value)
+    assert torch.equal(critic.trunk.blocks[0].attn.proj.weight, critic_before)
 
 
 def test_refresh_old_statistics_matches_the_update_code_path_exactly():
@@ -1394,6 +1532,13 @@ def test_absent_thought_objective_leaves_mean_and_sigma_grad_none_despite_moment
         batch,
         optimizers,
         thought_pg_coef=0.0,
+        # The reverse-KL penalty is itself a THOUGHT objective, so the
+        # "absent objective" premise has to switch it off explicitly now
+        # that it is the shipped default. The trust-mechanism biconditional
+        # then requires a surrogate-side mode; 'projected' contributes
+        # nothing at this drift because the region never binds.
+        thought_clip_mode="projected",
+        thought_reverse_kl_coef=0.0,
     )
 
     assert metrics["thought_behavior_kl_joint"] > 0
@@ -1403,6 +1548,133 @@ def test_absent_thought_objective_leaves_mean_and_sigma_grad_none_despite_moment
         torch.testing.assert_close(parameter, reference)
     for parameter, reference in zip(sigma_parameters, sigma_before, strict=True):
         torch.testing.assert_close(parameter, reference)
+
+
+def _drifted_think_batch(seed: int = 3):
+    """A refreshed rollout whose thought mean has moved well past the region.
+
+    The 0.02 bias shift is ~0.4 behavior sigma per dimension, so the summed
+    squared Mahalanobis distance clears the 0.03 radius by orders of
+    magnitude and the projection is guaranteed to be active in 'projected'.
+    """
+    wrapper = _wrapper(seed)
+    critic = _critic()
+    with torch.no_grad():
+        wrapper.gate.head.weight.zero_()
+        wrapper.gate.head.bias.fill_(-2.0)
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assert bool(((batch.gate_actions == THINK) & batch.action_mask.bool()).any())
+    assign_terminal_rewards(batch, torch.rand(4))
+    refresh_old_statistics(wrapper, critic, batch)
+    with torch.no_grad():
+        wrapper.transition.mean_head.bias.add_(0.02)
+    return wrapper, critic, batch
+
+
+def test_clip_mode_none_drops_the_projection_but_keeps_drift_telemetry():
+    wrapper, critic, batch = _drifted_think_batch()
+    metrics = update_minibatch(
+        wrapper, critic, batch, _optimizers(wrapper, critic),
+        thought_clip_mode="none",
+        thought_reverse_kl_coef=0.3,
+    )
+    # Nothing is ever projected, so both projection-side readouts are exactly
+    # zero — that is what distinguishes this arm in the dashboard.
+    assert float(metrics["thought_projection_penalty"]) == 0.0
+    assert float(metrics["thought_policy_clip_fraction"]) == 0.0
+    # The closed-form drift measurement survives as telemetry, and at this
+    # shift it is far outside the radius the projected arm would enforce.
+    assert float(metrics["thought_trust_d_mean"]) > 0.03
+    assert float(metrics["thought_behavior_kl_joint"]) > 0.0
+    assert float(metrics["thought_reverse_kl_penalty"]) > 0.0
+
+
+def test_clip_mode_none_and_projected_differ_once_the_region_binds():
+    # The two arms are the only two legal configurations: the trust
+    # mechanisms are mutually exclusive, so 'none' carries the reverse-KL
+    # penalty and 'projected' runs with the coefficient at zero.
+    none_wrapper, none_critic, none_batch = _drifted_think_batch()
+    none_metrics = update_minibatch(
+        none_wrapper, none_critic, none_batch,
+        _optimizers(none_wrapper, none_critic),
+        thought_clip_mode="none", thought_reverse_kl_coef=0.3,
+    )
+    projected_wrapper, projected_critic, projected_batch = (
+        _drifted_think_batch()
+    )
+    projected_metrics = update_minibatch(
+        projected_wrapper, projected_critic, projected_batch,
+        _optimizers(projected_wrapper, projected_critic),
+        thought_clip_mode="projected", thought_reverse_kl_coef=0.0,
+    )
+    # Same rollout, same drift: only the trust mechanism differs. The
+    # projected arm pulls every THINK action back to the boundary and pays
+    # the tracking penalty; 'none' does neither.
+    torch.testing.assert_close(
+        torch.tensor(none_metrics["thought_trust_d_mean"]),
+        torch.tensor(projected_metrics["thought_trust_d_mean"]),
+    )
+    assert float(projected_metrics["thought_policy_clip_fraction"]) > 0.0
+    assert float(projected_metrics["thought_projection_penalty"]) > 0.0
+    assert float(none_metrics["thought_policy_clip_fraction"]) == 0.0
+    assert float(none_metrics["thought_projection_penalty"]) == 0.0
+    assert none_metrics["policy_loss"] != projected_metrics["policy_loss"]
+
+
+def test_clip_mode_none_requires_a_reverse_kl_coefficient():
+    wrapper, critic, batch = _drifted_think_batch()
+    with pytest.raises(ValueError, match="must be nonzero"):
+        update_minibatch(
+            wrapper, critic, batch, _optimizers(wrapper, critic),
+            thought_clip_mode="none",
+            thought_reverse_kl_coef=0.0,
+        )
+
+
+@pytest.mark.parametrize("mode", ["projected", "joint", "per_dim"])
+def test_surrogate_trust_modes_refuse_to_mix_with_the_reverse_kl_penalty(mode):
+    # The projection/ratio clips and the reverse-KL penalty are alternative
+    # solutions to THINK drift, never layers of one: combining them makes
+    # neither term's contribution attributable. Exactly one per run.
+    wrapper, critic, batch = _drifted_think_batch()
+    with pytest.raises(ValueError, match="must never be combined"):
+        update_minibatch(
+            wrapper, critic, batch, _optimizers(wrapper, critic),
+            thought_clip_mode=mode,
+            thought_reverse_kl_coef=0.3,
+        )
+
+
+def test_shipped_defaults_are_the_reverse_kl_only_arm():
+    # The default objective is what the run actually trains under, so pin
+    # it: reverse-KL penalty at 0.5, no surrogate-side trust region. The
+    # library default must track the CLI default or tests silently drift
+    # onto an arm production never runs.
+    signature = inspect.signature(update_minibatch)
+    assert signature.parameters["thought_clip_mode"].default == "none"
+    assert signature.parameters["thought_reverse_kl_coef"].default == 0.5
+
+    cli = build_arg_parser().parse_args(["--checkpoint", "c", "--output", "o"])
+    assert cli.thought_clip_mode == "none"
+    assert cli.thought_reverse_kl_coef == 0.5
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--thought-clip-mode", "projected"], "must never be combined"),
+        (["--thought-clip-mode", "joint"], "must never be combined"),
+        (["--thought-reverse-kl-coef", "0"], "must be nonzero"),
+    ],
+)
+def test_cli_enforces_one_thought_trust_mechanism(argv, expected, capsys):
+    # Mirrors the update_minibatch biconditional at argv level so the run
+    # fails in the first second rather than after loading checkpoints.
+    parser = build_arg_parser()
+    args = parser.parse_args(["--checkpoint", "c", "--output", "o", *argv])
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)
+    assert expected in capsys.readouterr().err
 
 
 def test_reverse_kl_alone_anchors_the_continuous_thought_policy():
@@ -2892,21 +3164,43 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
         "allow_joint_clip_migration",
         "allow_anchored_value_migration",
         "allow_projected_thought_migration",
+        "allow_thought_reverse_kl_migration",
     ):
         assert not resume_execution_schema_compatible(
             current, **{extra_flag: True}
         )
+    no_thought_kl_previous = {
+        "execution_schema": NO_THOUGHT_KL_EXECUTION_SCHEMA
+    }
+    assert not resume_execution_schema_compatible(no_thought_kl_previous)
+    assert resume_execution_schema_compatible(
+        no_thought_kl_previous,
+        allow_thought_reverse_kl_migration=True,
+    )
+    # v23 predates only the reverse-KL term; acknowledging any earlier
+    # objective change would misdescribe what the checkpoint trained under.
+    assert not resume_execution_schema_compatible(
+        no_thought_kl_previous,
+        allow_thought_reverse_kl_migration=True,
+        allow_projected_thought_migration=True,
+    )
     joint_clip_previous = {
         "execution_schema": JOINT_CLIP_EXECUTION_SCHEMA
     }
     assert not resume_execution_schema_compatible(joint_clip_previous)
+    assert not resume_execution_schema_compatible(
+        joint_clip_previous,
+        allow_projected_thought_migration=True,
+    )
     assert resume_execution_schema_compatible(
         joint_clip_previous,
         allow_projected_thought_migration=True,
+        allow_thought_reverse_kl_migration=True,
     )
     assert not resume_execution_schema_compatible(
         joint_clip_previous,
         allow_projected_thought_migration=True,
+        allow_thought_reverse_kl_migration=True,
         allow_anchored_value_migration=True,
     )
     assert not resume_execution_schema_compatible(
@@ -2923,6 +3217,7 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
     )
     assert resume_execution_schema_compatible(
         unanchored_previous,
+        allow_thought_reverse_kl_migration=True,
         allow_projected_thought_migration=True,
         allow_anchored_value_migration=True,
     )
@@ -2943,6 +3238,7 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
     )
     assert resume_execution_schema_compatible(
         per_dim_previous,
+        allow_thought_reverse_kl_migration=True,
         allow_projected_thought_migration=True,
         allow_anchored_value_migration=True,
         allow_joint_clip_migration=True,
@@ -2973,6 +3269,7 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
     )
     assert resume_execution_schema_compatible(
         performance_previous,
+        allow_thought_reverse_kl_migration=True,
         allow_projected_thought_migration=True,
         allow_anchored_value_migration=True,
         allow_performance_migration=True,
@@ -3002,6 +3299,7 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
         allow_joint_clip_migration=True,
         allow_anchored_value_migration=True,
         allow_projected_thought_migration=True,
+        allow_thought_reverse_kl_migration=True,
     )
     # Even trained v18 state is structurally resumable because objective
     # revisions preserve state; the explicit flags prevent accidental change.
@@ -3029,6 +3327,7 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
             "step": 1,
             "optimizers": {"actor": {"state": {1: {"step": 1}}}},
         },
+        allow_thought_reverse_kl_migration=True,
         allow_reverse_kl_migration=True,
         allow_performance_migration=True,
         allow_joint_clip_migration=True,

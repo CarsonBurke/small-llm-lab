@@ -210,6 +210,8 @@ def rollout_continuations(
     pin_emit: bool = False,
     tail_caches: list[tuple[Tensor, ...]] | None = None,
     tail_step_core=None,
+    sync_every: int = 16,
+    compact_dead_ratio: float = 0.25,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
@@ -523,12 +525,27 @@ def rollout_continuations(
     ended = torch.zeros(batch, dtype=torch.bool, device=device)
     live_rows = torch.arange(batch, device=device)
     position = prompt_length - 1
-    # ``bool(any())`` is a device-to-host sync that serializes this
+    # ``int(active.sum())`` is a device-to-host sync that serializes this
     # launch-bound loop (the CPU cannot run ahead of the GPU), so the finish
-    # check runs only every SYNC_EVERY steps.  The extra <=SYNC_EVERY-1
-    # steps after all rows finish are no-ops: ``record`` is all-False, and
-    # finished rows already keep stepping on token 0 by design.
-    SYNC_EVERY = 16
+    # and compaction check runs only every SYNC_EVERY steps.  The extra
+    # <=SYNC_EVERY-1 steps after all rows finish are no-ops: ``record`` is
+    # all-False, and finished rows already keep stepping on token 0 by
+    # design.  This is the ONLY host sync in the loop -- the stream writes
+    # below deliberately avoid boolean row indexing, which would reintroduce
+    # one per masked write per step.
+    #
+    # ``sync_every`` also sets how often compaction can fire, and that is now
+    # the dominant term.  A chunk steps at its longest row's length, so with a
+    # median 60 steps per chunk a 16-step period leaves only three or four
+    # chances to narrow the batch, and the dead rows keep paying full width
+    # until the next one.  The check costs a single scalar D2H against a step
+    # that costs milliseconds, so trading more checks for earlier compaction
+    # is close to free -- see ``--rollout-sync-every``.
+    if sync_every < 1:
+        raise ValueError("rollout sync period must be positive")
+    if not 0.0 < compact_dead_ratio <= 1.0:
+        raise ValueError("compaction dead-row ratio must be in (0, 1]")
+    SYNC_EVERY = sync_every
     first_position = position
     while position < max_stream - 1:
         initial = position == first_position
@@ -563,7 +580,7 @@ def rollout_continuations(
                 and (
                     snap_to_tail
                     or current_count - active_count
-                    >= max(1, current_count // 4)
+                    >= max(1, int(current_count * compact_dead_ratio))
                 )
             )
             if should_compact:
@@ -708,31 +725,56 @@ def rollout_continuations(
             )
         )
 
+        # Stream writes address rows through the dense ``live_rows`` index
+        # tensor and select participants with ``torch.where``, never with a
+        # boolean row mask. A boolean index has a data-dependent output
+        # shape, so each one copies its count to the host and drains this
+        # launch-bound loop -- six per step, which made the ``SYNC_EVERY``
+        # guard above pointless. Values are unchanged: every (row, slot) is
+        # written at most once, so keeping the slot's current value for
+        # non-participating rows is exactly what the masked write left there.
         record = active
-        record_rows = live_rows[record]
-        action_mask[record_rows, position] = 1.0
+        row_slots = (live_rows, position)
+        next_position = position + 1
+        next_slots = (live_rows, next_position)
+        ones = action_mask.new_ones(())
+        action_mask[row_slots] = torch.where(
+            record, ones, action_mask[row_slots]
+        )
         if not pin_emit:
             sampled_gate = record & (~force_initial_think if initial else True)
-            sampled_gate_rows = live_rows[sampled_gate]
-            gate_mask[sampled_gate_rows, position] = 1.0
+            gate_mask[row_slots] = torch.where(
+                sampled_gate, ones, gate_mask[row_slots]
+            )
             if gate_logprob is not None:
-                old_gate_logprobs[sampled_gate_rows, position] = gate_logprob[
-                    sampled_gate
-                ].float()
-        gate_actions[record_rows, position] = action[record]
+                old_gate_logprobs[row_slots] = torch.where(
+                    sampled_gate,
+                    gate_logprob.float(),
+                    old_gate_logprobs[row_slots],
+                )
+        gate_actions[row_slots] = torch.where(
+            record, action, gate_actions[row_slots]
+        )
         emits = record & (action == EMIT)
         thinks = record & (action == THINK)
-        emit_rows = live_rows[emits]
-        think_rows = live_rows[thinks]
         if token_logprob is not None:
-            old_token_logprobs[emit_rows, position] = token_logprob[emits]
+            old_token_logprobs[row_slots] = torch.where(
+                emits, token_logprob.float(), old_token_logprobs[row_slots]
+            )
 
-        next_position = position + 1
-        kind[emit_rows, next_position] = TOKEN_SLOT
-        token_ids[emit_rows, next_position] = token[emits]
-        kind[think_rows, next_position] = THOUGHT_SLOT
+        next_kind = kind[next_slots]
+        kind[next_slots] = torch.where(
+            emits,
+            next_kind.new_full((), TOKEN_SLOT),
+            torch.where(thinks, next_kind.new_full((), THOUGHT_SLOT), next_kind),
+        )
+        token_ids[next_slots] = torch.where(
+            emits, token, token_ids[next_slots]
+        )
         if replay_storage and thought is not None:
-            thoughts[think_rows, next_position] = thought[thinks]
+            thoughts[next_slots] = torch.where(
+                thinks[:, None], thought, thoughts[next_slots]
+            )
         emitted += emits.long()
         if stop_tensor is not None:
             ended |= emits & torch.isin(token, stop_tensor)
@@ -926,10 +968,16 @@ def scatter_replay_statistics(
 ) -> None:
     """Copy refreshed packed behavior/value statistics into compact groups.
 
-    This performs four minibatch-level device transfers rather than moving a
-    complete packed batch (including its duplicate sampled thoughts) back to
-    host memory. Compact groups remain the canonical frozen behavior pool and
-    can later be repacked in the identical order for exact PPO replay.
+    Compact groups remain the canonical frozen behavior pool and can later be
+    repacked in the identical order for exact PPO replay.
+
+    Each group's slice is narrowed ON DEVICE before it crosses the bus. The
+    packed batch is padded to its longest group, so transferring it whole and
+    slicing on the host moved roughly 2.4x the bytes any group keeps; the
+    values written are unchanged. The destinations stay pageable on purpose:
+    they become the pool's long-lived behavior statistics, and pinning several
+    gigabytes for the pool's lifetime would cost more in unswappable host
+    memory than the extra transfer bandwidth is worth.
     """
     if not groups:
         raise ValueError("at least one rollout group is required")
@@ -946,25 +994,24 @@ def scatter_replay_statistics(
         "old_thought_log_sigmas",
         "old_values",
     )
-    statistics = {
-        name: getattr(packed, name).to(target_device)
-        for name in statistic_names
-    }
     row_start = 0
     for group in groups:
         row_end = row_start + group.kind.size(0)
-        for name, packed_value in statistics.items():
-            setattr(
-                group,
-                name,
-                packed_value[
-                    row_start:row_end, : group.stream_length
-                ].clone(),
-            )
+        for name in statistic_names:
+            source = getattr(packed, name)[
+                row_start:row_end, : group.stream_length
+            ]
+            if source.device == target_device:
+                setattr(group, name, source.clone())
+                continue
+            # The row/stream narrowing above leaves a strided view; make it
+            # dense on the source device (cheap at device bandwidth) so the
+            # bus carries one contiguous block per statistic.
+            setattr(group, name, source.contiguous().to(target_device))
+        row_start = row_end
         # The groups now carry the packed batch's statistics, so they share
         # its refresh state.
         group.statistics_refreshed = packed.statistics_refreshed
-        row_start = row_end
 
 
 def trim_stream(batch: LatentRolloutBatch, multiple: int = 1) -> LatentRolloutBatch:

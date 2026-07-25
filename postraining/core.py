@@ -434,28 +434,51 @@ def generalized_advantage_and_return_targets(
     remaining exactly row-separable, so callers can compute the complete
     optimizer minibatch once and slice the results for replay shards.
     """
-    advantages = torch.zeros_like(values)
-    return_advantages = torch.zeros_like(values)
+    # Everything that does not carry the recurrence is computed once for the
+    # whole stream instead of per column: the residual, the shifted validity,
+    # and the loop-invariant gamma*lambdas product. The remaining loop body
+    # is bit-identical -- these are the same elementwise expressions in the
+    # same association order, just evaluated for every t at once -- and drops
+    # the eager launch count per column from 15 to 8, which is what this
+    # dispatch-bound reverse scan actually costs.
+    length = values.size(1)
+    if length == 0:
+        # ``torch.stack`` cannot rebuild an empty stream, which the old
+        # preallocated writes handled implicitly.
+        return torch.zeros_like(values), values.clone()
+    zero_column = torch.zeros_like(values[:, :1])
+    next_values = torch.cat((values[:, 1:], zero_column), dim=1)
+    next_valids = torch.cat(
+        (mask[:, 1:], torch.zeros_like(mask[:, :1])), dim=1
+    )
+    deltas = rewards + gamma * next_values * next_valids - values
+    gamma_lambdas = gamma * lambdas
     running_advantage = torch.zeros(
         values.size(0), device=values.device, dtype=values.dtype
     )
     running_return = torch.zeros_like(running_advantage)
-    for t in range(values.size(1) - 1, -1, -1):
-        if t + 1 < values.size(1):
-            next_value = values[:, t + 1]
-            next_valid = mask[:, t + 1]
-        else:
-            next_value = torch.zeros_like(running_advantage)
-            next_valid = torch.zeros_like(mask[:, t])
-        delta = rewards[:, t] + gamma * next_value * next_valid - values[:, t]
+    advantage_columns: list[Tensor] = []
+    return_columns: list[Tensor] = []
+    for t in range(length - 1, -1, -1):
+        delta = deltas[:, t]
+        next_valid = next_valids[:, t]
         running_advantage = (
-            delta + gamma * lambdas * running_advantage * next_valid
+            delta + gamma_lambdas * running_advantage * next_valid
         ) * mask[:, t]
         running_return = (
             delta + gamma * running_return * next_valid
         ) * mask[:, t]
-        advantages[:, t] = running_advantage
-        return_advantages[:, t] = running_return
+        advantage_columns.append(running_advantage)
+        return_columns.append(running_return)
+    # Columns were accumulated from the last position backwards; one stacking
+    # pass replaces two indexed stores per column. The stores also cast each
+    # column back to ``values.dtype`` -- a mask or lambdas in a wider dtype
+    # promotes the accumulators -- so the cast has to be restated here to keep
+    # the result bit-identical.
+    advantages = torch.stack(advantage_columns[::-1], dim=1).to(values.dtype)
+    return_advantages = torch.stack(return_columns[::-1], dim=1).to(
+        values.dtype
+    )
     return advantages, return_advantages + values
 
 
