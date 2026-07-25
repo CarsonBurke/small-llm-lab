@@ -39,9 +39,8 @@ class SeparateCritic(nn.Module):
         super().__init__()
         model_dim = trunk.tok_emb.embedding_dim
         self.trunk = trunk
-        # The critic keeps the original identity affine architecture. Policy-
-        # only interpolation strength must not alter a pretrained critic's
-        # state dict or the meaning of its stored thought stream.
+        # Policy and critic use the same identity-initialized affine
+        # architecture, but own separate weights throughout training.
         self.adapter = AffineThoughtAdapter(model_dim)
         self.support = HLGaussSupport(num_bins, v_min, v_max, sigma_ratio)
         self.head = nn.Linear(model_dim, num_bins)

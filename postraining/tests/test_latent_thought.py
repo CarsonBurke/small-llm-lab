@@ -8,6 +8,7 @@ import torch
 from fresh_lejepa_train import FreshLeJEPAGPT
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.latent_thought import (
+    AffineThoughtAdapter,
     EMIT,
     THINK,
     GaussianTransitionHead,
@@ -299,7 +300,7 @@ def test_transition_mean_head_starts_small_orthogonal_and_zero_bias():
     assert head.MEAN_INIT_GAIN == pytest.approx(0.1)
     torch.testing.assert_close(
         head.predict_log_sigma(torch.randn(3, 8)),
-        torch.full((3, 8), -3.0),
+        torch.full((3, 8), -2.5),
     )
     belief = torch.randn(5, 8)
     belief = torch.nn.functional.rms_norm(belief, (8,))
@@ -492,7 +493,10 @@ def test_fresh_adapter_explicitly_replaces_critic_warm_identity_state():
 
     assert reset
     assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
-    assert torch.count_nonzero(state["adapter.projection.weight"]) == 0
+    torch.testing.assert_close(
+        state["adapter.projection.weight"],
+        torch.eye(32),
+    )
     assert torch.count_nonzero(state["adapter.projection.bias"]) == 0
     assert "adapter.interpolation_strength" not in state
 
@@ -530,27 +534,25 @@ def test_thought_policy_gradient_reaches_the_sigma_head():
     assert head.log_sigma_head.weight.grad.abs().sum().item() > 0.0
 
 
-def test_adapter_starts_as_an_exact_zero_payload():
+def test_adapter_starts_exactly_like_critic_identity_affine():
     torch.manual_seed(19)
     backbone = _pope_model()
     wrapper = LatentThoughtModel(backbone)
+    critic_adapter = AffineThoughtAdapter(32)
     thought = torch.randn(2, 32)
     injected = wrapper.thought_input(thought)
     assert injected.shape == (2, 1, 32)
-    assert torch.count_nonzero(injected) == 0
-    assert torch.count_nonzero(wrapper.adapter.projection.weight) == 0
-    assert torch.count_nonzero(wrapper.adapter.projection.bias) == 0
-
-    # Exact zero remains zero across the normalization boundary; unlike a
-    # merely small random direction, RMSNorm cannot amplify it.
-    typical_action = torch.randn(128, 1, 32) * math.exp(-2)
-    normalized = backbone.blocks[0].attn_norm(
-        wrapper.adapter(typical_action.float()).to(backbone.tok_emb.weight.dtype)
+    for policy_parameter, critic_parameter in zip(
+        wrapper.adapter.parameters(), critic_adapter.parameters(), strict=True
+    ):
+        torch.testing.assert_close(policy_parameter, critic_parameter)
+    torch.testing.assert_close(
+        injected.squeeze(1),
+        thought,
     )
-    assert torch.count_nonzero(normalized) == 0
 
 
-def test_zero_adapter_affine_learns_on_its_first_backward_pass():
+def test_identity_adapter_affine_learns_on_its_first_backward_pass():
     adapter = ThoughtAdapter(4)
     thought = torch.randn(3, 4, requires_grad=True)
 
@@ -564,15 +566,18 @@ def test_zero_adapter_affine_learns_on_its_first_backward_pass():
         adapter.projection.bias.grad,
         torch.full((4,), 3.0),
     )
-    # The content path opens after the first affine update; only its first
-    # input gradient is zero because W itself starts at zero.
-    assert torch.count_nonzero(thought.grad) == 0
+    # Content gradient is live from step 0 because W starts as I.
+    torch.testing.assert_close(
+        thought.grad,
+        torch.ones_like(thought),
+    )
 
 
 def test_adapter_bias_is_a_shared_thought_type_offset():
     adapter = ThoughtAdapter(4)
     marker = torch.tensor([0.25, -0.5, 1.0, 0.75])
     with torch.no_grad():
+        adapter.projection.weight.zero_()
         adapter.projection.bias.copy_(marker)
     thoughts = torch.randn(3, 4)
 

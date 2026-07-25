@@ -9,12 +9,12 @@ The transition policy is a diagonal Gaussian whose mean comes from a fresh
 linear head over the belief and whose per-dimension log-sigma is predicted
 from that same belief. The mean starts as a zero-bias orthogonal map at gain
 0.1, with no initial obligation to imitate a discrete-token embedding.
-Thoughts pass through a separate fresh affine embedder after sampling. Its
-weight and bias start at exact zero: the first thought payload is therefore a
-neutral recurrent input, while the single affine layer still receives a
-nonzero first-step gradient. The adapter is recurrent policy state, not part
-of the Gaussian likelihood: its bias can become a shared thought-type marker
-while its weight learns how sampled thought content should enter the trunk.
+Thoughts pass through a separate fresh affine embedder after sampling. It uses
+the same identity weight and zero bias initialization as the critic's thought
+adapter, so the first thought payload is the sampled thought itself. The
+adapter is recurrent policy state, not part of the Gaussian likelihood: its
+bias can become a shared thought-type marker while its weight learns how
+sampled thought content should enter the trunk.
 
 The renderer is deliberately separated from that thought path: it consumes
 the current stream input and the raw belief, while the fresh mean head is
@@ -51,7 +51,17 @@ def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
         return PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS[reasoning_mode]
     except KeyError:
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}") from None
-THOUGHT_INPUT_SCHEMA = "fresh_zero_affine/v5"
+THOUGHT_INPUT_SCHEMA = "fresh_identity_affine/v7"
+# Runtime semantics after the first step are the checkpointed affine, not the
+# init tag. Accept retired affine-init tags so trained checkpoints remain
+# resumable; every fresh actor restart and new save writes v7.
+COMPATIBLE_THOUGHT_INPUT_SCHEMAS = frozenset(
+    {
+        THOUGHT_INPUT_SCHEMA,
+        "fresh_scaled_eye_0.1_affine/v6",
+        "fresh_zero_affine/v5",
+    }
+)
 THOUGHT_DISTRIBUTION_SCHEMA = (
     "state_dependent_diag_tanh_log_sigma_scaled_residual_-5_2/v2"
 )
@@ -96,13 +106,13 @@ def validate_renderer_checkpoint(
             "and cannot be resumed or evaluated as this policy."
         )
     thought_input = payload.get("thought_input_schema")
-    if thought_input != THOUGHT_INPUT_SCHEMA:
+    if thought_input not in COMPATIBLE_THOUGHT_INPUT_SCHEMAS:
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"input schema is {thought_input!r}, expected "
-            f"{THOUGHT_INPUT_SCHEMA!r}. Old or untagged VAPO checkpoints "
-            "used a different thought embedder and cannot be resumed or "
-            "evaluated as this policy."
+            f"input schema is {thought_input!r}, expected one of "
+            f"{sorted(COMPATIBLE_THOUGHT_INPUT_SCHEMAS)!r}. Old or untagged "
+            "VAPO checkpoints used a different thought embedder and cannot "
+            "be resumed or evaluated as this policy."
         )
     thought_distribution = payload.get("thought_distribution_schema")
     if (
@@ -196,7 +206,7 @@ class GaussianTransitionHead(nn.Module):
 
     MEAN_INIT_GAIN = FreshThoughtMeanHead.INIT_OUTPUT_GAIN
 
-    def __init__(self, model_dim: int, log_sigma: float = -3.0):
+    def __init__(self, model_dim: int, log_sigma: float = -2.5):
         super().__init__()
         # Keep log-sigma registered first. Legacy v11 actor optimizers stored
         # this pair as their fifth group; the fresh mean becomes a sixth group
@@ -426,39 +436,7 @@ class AffineThoughtAdapter(nn.Module):
 
 
 class ThoughtAdapter(AffineThoughtAdapter):
-    """Exactly-zero-initialized policy thought embedder.
-
-    A fresh thought action at log-sigma -3 has noise RMS about 0.050 per
-    dimension. Feeding the earlier, noisier initialization
-    through an identity adapter made v17's random initialization a
-    full-strength recurrent intervention and collapsed termination. A
-    separate tiny scalar avoided that initial collapse, but made the affine
-    map poorly identified and attenuated every gradient into its geometry.
-
-    Zeroing this single final affine is not gradient-dead: for output
-    ``W @ thought + b``, the first backward pass has ``dW = dout outer
-    thought`` and ``db = dout`` even when W and b are zero. Only the gradient
-    into the thought is zero on that first pass; it opens as soon as W learns.
-
-    This is not claimed to be an exact no-op: THINK still advances PoPE and
-    writes a KV position, and PoPE's softplus Q/K geometry gives even a zero
-    input a contextual read. It does suppress the random payload direction
-    that caused the measured v17 failure without a saturating or redundant
-    gate.
-    """
-
-    def __init__(self, model_dim: int):
-        super().__init__(model_dim)
-        self.reset_fresh()
-
-    def reset_fresh(self) -> None:
-        """Restore the deterministic post-critic fresh initialization."""
-        with torch.no_grad():
-            nn.init.zeros_(self.projection.weight)
-            nn.init.zeros_(self.projection.bias)
-
-    def forward(self, thought: Tensor) -> Tensor:
-        return self.projection(thought)
+    """Policy thought embedder initialized exactly like the critic adapter."""
 
 
 def migrate_legacy_wrapper_checkpoint(
@@ -490,7 +468,7 @@ def migrate_legacy_wrapper_checkpoint(
         if "adapter.correction.weight" in state_dict:
             raise ValueError(
                 "legacy residual thought adapters cannot be resumed into the "
-                "fresh zero-affine policy; use an explicit actor restart"
+                "fresh identity affine policy; use an explicit actor restart"
             )
     sigma_migrated = migrate_scalar_log_sigma_state(
         state_dict, wrapper.transition
