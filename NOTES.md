@@ -358,11 +358,18 @@ ablation arms), `--thought-trust-epsilon 0.03` (user 2026-07-24: match
 the TRPL reference BaseProjectionLayer mean bound 0.03; ~0.015 nats KL
 at frozen sigma; the reference cov bound 1e-3 applies once sigma unpins
 and the cov projection lands), `--thought-projection-penalty-coef 1.0`.
-`--thought-log-sigma-init` stays -3.0: -2.5 was evaluated (sigma 0.082,
-noise norm 1.86 = ~69% of a 2.7 thought-mean norm, ~36% at the 5.2
-ceiling, vs ~42%/~22% at -3.0) and rejected by user 2026-07-24 as too
-noisy; raising the mean-head init is the alternative if exploration
-needs more range. Sigma remains unconstrained by the projection
+Superseded by user decision 2026-07-25: `--thought-log-sigma-init` is
+-2.5 (sigma 0.082, expected 512-D noise norm 1.86 = ~69% of a 2.7
+thought-mean norm), and the policy adapter now shares the critic's exact
+identity-weight, zero-bias initialization. Job 468
+(`rl_latent_identity_sigma25_2k`) is the 2,000-step validation arm,
+matched to the canceled v25 command. Job 469
+(`rl_latent_identity_sigma30_2k`, after job 468) holds sigma at -3.0:
+job 469 versus job 448's first 2,000 steps isolates identity versus zero
+adapter initialization, while job 468 versus job 469 isolates sigma
+-2.5 versus -3.0. Do not scale either to 20,000 steps unless reward/bench,
+forced-vs-unforced thought payoff, termination, and BPB improve together.
+Sigma remains unconstrained by the projection
 (tanh-bounded head is the backstop; documented gap). Cov projection
 deferred while sigma stays pinned. Telemetry: `trust/thought_d_mean`,
 `trust/thought_d_max`, `trust/projection_penalty` — all three joined the
@@ -1019,12 +1026,45 @@ PERF, measured (steps 6, --value-warmup-steps 0, 2nd pool = steady):
 | g32 + --max-stream-steps 2048   |  6.45     | 8.46   | 18.99 GB  |
 | + --rollout-tail-graph          |  5.61     | 7.34   | 19.32 GB  |
 
-= 20% off collect, 19% off the pool cycle, ~+0.6 GiB VRAM.
-`--rollout-tail-graph` had been off "until bench_step_compile confirms
-it at the production shape" (:3426 comment). CONFIRMED: 52% of decode
-steps run at the 16-row tail where the step is launch-bound (60 eager
-dispatches/step, 0.31 ms of work inside a 1.94 ms step), so the CUDA
-graph wins exactly as that comment predicted.
+RETRACTED, do not cite the table above. `--steps 6` truncates pool 2 to
+512 trajectories and 2 updates, so every row is a half pool compared
+against a full one. Re-measured at `--steps 8` below.
+
+RETRACTED likewise: "52% of decode steps run at the 16-row tail". That
+number had no source. `ended_fraction` measures 0.735-0.82 across every
+run, i.e. 18-27% of rows are still alive at the 1024-token cap, and the
+16-row tail graph needs >=96.9% ended before it engages. It never fires
+at the production shape. Measured directly: `cs_notail2` (tail graph
+OFF) gives refresh 2.38 s and pool 19.27 s against a control at 2.35 s
+and 19.32 s. **`--rollout-tail-graph` is NEUTRAL** and costs ~1.2 s of
+compile plus 0.8 GiB; defaulting it off is free. An earlier -19% claim
+for it came from the truncated-pool table and was wrong.
+
+CORRECTED perf pass (steps 8, steady pool). Raw generation seconds
+confound trajectory length, which drifts 554-591 actions/traj run to
+run, so the comparable column is normalized decode cost,
+ms per row-step = 1000 * gen / (util * steps * 2):
+
+| run                        | gen  | util  | ms/row-step | pool  |
+|----------------------------|------|-------|-------------|-------|
+| cs_F_ctrl (baseline)       | 8.29 | 0.560 | 7.0898      | 19.32 |
+| cs_notail2 (baseline rpt)  | 8.27 | 0.550 | 7.1974      | 19.27 |
+| cs_E_split                 | 7.64 | 0.529 | 6.9051      | 17.94 |
+| cs_H_bundle                | 7.64 | 0.566 | 6.4582      | 18.53 |
+| cs_I_profoff               | 7.41 | 0.552 | 6.4363      | 17.99 |
+
+Control-to-control noise floor is 1.5% (the two baselines above).
+Cumulative landed: **-9.2% normalized generation, -6.9% pool wall**,
+from splitting/retaining rollout groups on the scoring worker, the RoPE
+step table, and skipping the temperature divide at T=1.0.
+
+SUPERSEDED IN PART: the RoPE step table was later REMOVED -- it
+perturbed stepped-decode numerics, and the age-0 canary could not have
+caught that because the canary runs the prefill path
+(`replay_head_inputs`) while the table lived in `_attention_step`. See
+the 2026-07-25 section. The group split and the T=1.0 divide skip both
+stand; the -9.2% figure now overstates what is shipped by whatever the
+table was worth, which was never isolated on its own.
 
 NEGATIVE RESULT: naive widening does NOT help by itself. An earlier
 rollout-only A/B suggested g32 was SLOWER; that measurement was
@@ -1041,6 +1081,415 @@ util 96%, power 341W: a dispatch-bound loop punctuated by
 bandwidth-bound kernels. Average power rises only by shrinking decode's
 67-75% share of pool wall time so the compute-dense replay/update
 occupies more of it. Pure rollout peaked at 365W; full training at 396W.
+
+CORRECTION (2026-07-24, `--profile`): the last sentence had the phases
+backwards. Decode is the BEST phase, not the worst. Pool 3 of
+`runs/cr_prof_final`, 17.56 s wall, accounting reconciled to 0.07%:
+
+| phase                            | wall   | power | SM util |
+|----------------------------------|--------|-------|---------|
+| collect / decode                 | 6.82 s | 396 W | 97%     |
+| update / forward_backward        | 7.26 s | 324 W | 83%     |
+| refresh_pipeline / refresh       | 2.40 s | 291 W | 79%     |
+| refresh_pipeline / stat_scatter  | 0.29 s | 330 W | 10%     |
+| update / optimizer_step          | 0.010 s| --    | --      |
+
+SECOND CORRECTION -- the power/util columns above are ALIASED, do not
+cite them for any phase under ~1 s. NVML refreshes every 500 ms and the
+sampler polls at 250 ms: 489 duplicate sample pairs against 29
+singletons across 1007 samples. Every reading describes a ~0.5 s window
+ENDING at its timestamp, so a short phase draws its stats from time
+spent outside itself. Consequences:
+
+* `stat_scatter_d2h` "330 W / 10%" is ONE sample, the byte-identical
+  tuple that also opens `forward_backward`. It describes neither phase.
+  Discard the row.
+* `refresh` "291 W / 79%" is 2.40 s cut into four ~0.6 s windows, every
+  sample straddling a boundary. Lag-trimmed it reads 81.2% util and
+  **355 W power-while-busy -- statistically identical to
+  forward_backward's 353 W.** Refresh is NOT a distinct low-power phase;
+  it is the same replay kernels without a backward.
+* `forward_backward` "83%" is real but biased low; lag-trimming
+  converges to **88.6-89.6%**. The ~5.6 lost points are the
+  inter-minibatch boundary leaking into the phase head.
+* `device_seconds ~= wall_seconds` (99.4%) carries NO information -- it
+  is a CUDA-event pair around the phase, device-timeline wall, not
+  kernel-busy time.
+
+So there is NO low-power replay phase to fix. Total idle inside
+`forward_backward` is at most 0.83 s of 7.26 s = 4.7% of pool wall, and
+that is the ceiling on any "the GPU drains" optimization.
+
+The decisive datum, using the CORRECTED per-pool shard count (185
+update + 185 refresh; `artifact_calls` was cumulative in that run, so
+1586 was 4x the truth):
+
+| phase                     | wall    | shards | ms/shard |
+|---------------------------|---------|--------|----------|
+| update / forward_backward | 7.263 s | 185    | 39.26    |
+| refresh_pipeline / refresh| 2.400 s | 185    | 12.97    |
+
+Ratio **3.03**, the textbook forward:forward+backward ratio to 1%. Both
+sit at ~30 TFLOP/s ~= 14% MFU. Refresh runs the same compiled artifact
+with no backward, no surrogate, no telemetry and ~6 boolean-mask indexes
+per shard against update's ~15 -- so if mask syncs were dragging update
+down, its cost per FLOP would be worse. It is identical.
+
+`optimizer_step` at 0.010 s settles the Polar Express question anyway:
+speed-neutral at this scale, its value is step geometry, not wall clock.
+
+500 W IS PHYSICALLY OUT OF REACH ON THIS WORKLOAD, and this supersedes
+the "shrink decode's share" advice above. Peak power over the entire
+251 s trace is **420.0 W**; exactly 2 samples of 1007 exceed 420 W and
+ZERO exceed 450 W. Board limit is 575 W (default, unmodified), clocks
+stay pinned at 2820-2857 MHz, and the card is neither power- nor
+thermally throttled. It is not being asked to switch enough transistors.
+
+The intuition inverts: power tracks DRAM/L2 traffic, not tensor cores.
+Decode at AI ~= 1.0 against a ridge of 117 -- as memory-bound as this
+workload gets -- is the HIGHEST-power phase at 407 W while busy. The
+replay update, ~50x more arithmetically intense, runs at 353 W while
+busy. Removing every nanosecond of idle from `forward_backward` moves it
+from 324 W to 353 W, and 353 is the arithmetic ceiling. Reaching 500 W
+needs a wider model, not better scheduling.
+
+WATTS IS THE WRONG OBJECTIVE and actively misleads: the highest-power
+phase is decode, so maximizing watts rewards moving work INTO the phase
+that is ~47% wasted on dead rows. Track wall time per unit of learning
+-- pool seconds per gradient step, or seconds per unit of BPB/reward
+movement. For a non-wall-clock proxy use MFU (update path: 14%) or
+achieved GB/s.
+
+RANKED, where the update path's 7.26 s actually goes (>=6.43 s busy,
+<=0.83 s idle):
+
+1. 50257-wide readout + its log_softmax chain, **2.0-3.0 s (28-41%),
+   UNMEASURED**. ~182k emit slots/pass. The GEMM (M~182k, K=512,
+   N=50257) is compute-bound at AI ~400 and is 53% of all FLOPs, but the
+   elementwise chain is pure bandwidth: bf16 logits plus an
+   autograd-retained fp32 log-softmax (NOTES:181 already records
+   "~6 B/elem" for this tensor), written, re-read, gathered, traversed
+   again in backward. Order 0.8-1.5 TB/pool.
+2. Skinny trunk GEMMs, 0.8-1.5 s. d=512 means K=512 in every
+   projection; cuBLAS bf16 gets 40-60% of peak on those shapes and
+   backward doubles the count. Structural to a 6x512 model.
+3. Eager loss-body elementwise + autograd, ~0.16 s.
+4. Host syncs from boolean masking. Forward side 0.02-0.15 s as priced
+   below; BACKWARD side was never counted and is where the cost sits.
+   Fixed, -5.58% on this phase. See the correction below.
+5. Allocator: EXONERATED by direct measurement -- pool 3 has
+   `num_alloc_retries 0, num_ooms 0, num_device_alloc 1,
+   num_device_free 0, num_sync_all_streams 0`.
+6. Varying (B,L) shard sizes: negligible. Shards average ~4000 slots;
+   M is not the problem, K is.
+
+THE BOOLEAN-MASK SYNC FIX IS NOT WORTH FUNDING -- **WRONG ON SCOPE, and
+the fix shipped at -5.58%.** The arithmetic below is correct for every
+sync it counted, and I am leaving it intact because the reasoning is
+sound and reusable. It counted the wrong half of the graph.
+
+The original claim: there are 15 boolean-index sites per shard on the
+shipped path, but only the FIRST drains a deep queue and that drain is
+unavoidable (the forward's result is the loss body's input). Syncs 2-15
+hit a near-empty queue at ~10-20 us: 15 x 20 us x 185 shards =
+**0.055 s/pool**, 0.14 s pessimistic -- 0.3-0.8% of pool wall, the same
+order as the 1.1% that already refuted the decode-sync claim.
+NOTES:998 priced and rejected this once already.
+
+Every number in that paragraph held up. Measured forward syncs are
+<=33 us, at the fast end of the 10-20 us estimate, and killing them all
+moved `refresh` -- which is forward-only -- by 0.15%, total CI overlap.
+The forward audit was right and the refresh arm proves it.
+
+What it never looked at: **`autograd/graph.py:882`, 1074 syncs per
+pool, >=0.39 ms each -- ~12x a forward sync.** Boolean-mask indexing
+lowers to `masked_select`, and `masked_select` syncs AGAIN in backward,
+where it stalls the autograd engine at maximum queue depth instead of a
+near-empty one. Total syncs per pool 7152 -> 1079. The
+`update/forward_backward` phase, normalized by `decode` in the same
+pool, went **1.0086 -> 0.9523, -5.58%, non-overlapping CIs at n=4.**
+
+Two methodology lessons worth more than the fix:
+
+* A phase audit that walks forward call sites is not a sync audit. Ask
+  what each data-dependent op costs in BACKWARD before pricing it.
+* Raw phase wall cannot resolve 5% at n=4 here: `decode` alone varies
+  **8.1% within a single control arm**. Normalize the phase under test
+  by another phase in the same pool. This does NOT contradict the 1.5%
+  floor at NOTES:1049 -- that one is already a normalized metric
+  (ms per row-step). The two together are the point: raw phase wall is
+  ~8%, the same quantity normalized is ~1.5%, so never A/B on raw wall.
+
+The bit-exactness risk was real and was discharged, not dodged:
+`masked_fill(~mask, 0)` replaces boolean indexing where a sum follows,
+which also keeps a non-finite PAD slot out of the total (multiplying by
+the mask would not: NaN x 0 = NaN). Refresh and update stay on one
+kernel, and the behaviour-age-0 canary reads exactly 0.0 in both arms.
+
+WHERE THE EFFORT SHOULD GO, ranked by measured payoff:
+
+1. **CONTINUOUS BATCHING / ROW REFILL -- 3.21 s of 17.56 s (18.3% of
+   pool wall). Never attempted; 4-60x the sync fix.**
+   `decode_step_utilization` is 0.5295 on pool 3 (0.52-0.59 across all
+   four pools -- direct telemetry, not the bench-percentile proxy
+   NOTES:962 warns about). `ended_fraction` 0.806, and
+   `decode_steps_per_chunk` mean 1044.5 == max 1045: the lockstep
+   signature. Since NOTES:716 establishes per-step decode cost is FLAT
+   in batch width, compaction alone saves NOTHING -- refill does,
+   because each of the ~1044 steps then yields 512 useful actions
+   instead of 271, collecting the pool in ~0.53x the steps. The enabling
+   primitive is already specced: the per-row `position` change at
+   NOTES:895-926 (RoPE reshape, KV `scatter_`, mask `arange <=
+   position`). Costs an execution-schema bump because RNG-to-row
+   attribution moves; v19->v20 is the precedent.
+
+2. **Measure the readout/log_softmax chain BEFORE writing code for it.**
+   One pool with `--profile-trace` fills `top_kernels` (the path exists;
+   `kernels: {}` above only because `profile_trace` was false). If
+   log_softmax + its backward + gather + the readout GEMMs exceed
+   ~1.5 s/pool, a fused CE that never materializes the fp32 log-softmax
+   is worth 1-2 s/pool with NO schema bump and NO objective change --
+   and `compact_emit_token_logprobs` already exists to keep refresh and
+   update on one kernel, so bit-exactness is preserved by construction.
+   If it comes back under 0.5 s, drop it. Cheapest decisive measurement
+   on the list.
+
+3. **Default `--rollout-tail-graph` off.** Confirmed dead by direct
+   count: pool 3 ran **32 `rollout_tail_step` calls against 2080
+   `generation_step` calls -- 1.52% of decode steps**. It needs >=96.9%
+   ended to engage and `ended_fraction` is 0.735-0.82. The ~1.2 s
+   compile and 0.8 GiB are pure cost.
+
+4. The sync fix, as hygiene only. 0.02-0.15 s/pool.
+
+UNSETTLED without hardware: the split between the log_softmax chain and
+the skinny trunk GEMMs inside the 6.43 s busy time. One profiled pool
+with `--profile-trace` decides it -- if `_log_softmax` +
+`_log_softmax_backward_data` + `gather` + readout GEMMs exceed ~4 s of
+device time, item 2 outranks item 1; under ~2 s, item 1 stands alone.
+
+COMPILE CONVERGENCE (same run, answering "compile once per training
+run"): pool 0 = 12.9 s compiling in 8 records, plus 4.7 s of Triton
+autotune / cudagraph recording in 4 more. Pools 1, 2, 3 = 0 records.
+`compilations_outside_pools` 0, `dead_artifacts` none.
+
+Three writers append to the Dynamo compilation-metrics stream and only
+one is a frame compile: forward (`convert_frame.py`, the only writer
+that fills `co_name`), lazy backward (`runtime_wrappers.py`, no code
+object, `is_forward=False`), and RUNTIME (`_dynamo/utils.py`, no code
+object, `is_forward = not is_backward`), which bills Triton autotuning
+or a cudagraph re-record. Classifying on `co_name is None` alone
+conflates the last two and inflated the pool-0 headline by 27% -- an
+earlier note here said "12 compilations / 17.57 s". Records are now
+classified by `(is_runtime, is_forward)` and the two are reported
+separately.
+
+"Zero records after pool 0" is also the WRONG convergence test: a
+`reduce-overhead` artifact re-records its cudagraph whenever the pool it
+captured against is invalidated, which can happen in a perfectly
+converged run. The test is zero FORWARD and BACKWARD records per pool,
+with runtime rows reported separately.
+
+"Compile exactly once" is NOT reachable, by construction: two
+`torch.compile` wrappers on one code object never share a cache entry
+(`_TorchCompileInductorWrapper.__eq__` compares `(config, dynamic,
+name)`), so `step_core` under max-autotune/dynamic and under
+reduce-overhead/static are two artifacts. Floor is ~8-10 records:
+those two, `replay_head_inputs` and `value_logits` with their backwards,
+and three `_polar_express` shapes that `dynamic=False` in `muon.py`
+makes unavoidable (0.13 s total). Target: all of them before pool 0
+ends, zero forward/backward records in every pool after.
+
+UNVERIFIED at length: 4 pools cannot show whether new length buckets
+appear at step 5000+.
+
+DUCK SHAPES -- the rollout batch dim was never dynamic. `dynamic=True`
+only sets `assume_static_by_default=False`; unmarked dims still get DUCK
+sizing, so every input dim sharing a value on the first trace gets ONE
+symbol. The model is 512 wide and `--rollout-groups 32 x
+--samples-per-prompt 16` = 512, so the batch dim was unified with
+`model_dim`, the first `rms_norm` against a 512-wide parameter emitted
+`Eq(s, 512)`, and the first compaction recompiled. Eval carries the same
+hazard at 128 rows against `head_dim` 128. Switchable with
+`torch.fx.experimental._config.use_duck_shape = False` via
+`--duck-shape`.
+
+KEEP DUCK SHAPING ON. A/B at 16 steps, no instrument, steady-state pool
+3: duck-on 17.68 s vs duck-off 18.49 s, i.e. duck-off is 4.6% SLOWER,
+above the 1.5% noise floor. Duck-off buys one 6.41 s recompile back and
+then loses 0.81 s every pool -- 67 minutes over 5000 pools. The reason
+is that duck-on does not stay specialized: automatic dynamic makes the
+batch dim symbolic on the SECOND shape, so duck-on converges to the same
+dynamic batch dim after paying once, while keeping every other dim
+duck-specialized. Duck-off de-specializes dims that never needed it.
+n=1 per arm; repeat before betting anything large on 4.6%.
+
+The eval hazard at 128 rows vs `head_dim` 128 is real but bounded: one
+extra recompile the first time eval generation runs, then automatic
+dynamic takes over. Startup cost, not per-pool, so it does not bite at
+any step count.
+
+`accumulated_recompile_limit` is NOT a long-run hazard -- an earlier
+note here claimed it was and raised it to 512. Retracted. Two counters
+gate `exceeds_recompile_limit`: `compute_cache_size` walks the LIVE
+entry list, so an invalidated cudagraph entry LEAVES the list and its
+churn does not accumulate; the `frame_compile_id` backstop is
+historical but increments once per compile of that frame. Both are
+bounded by distinct shape/guard classes, not by step count. Measured
+maximum across every frame: **3**, against a default of 256. Reverted
+to the default.
+
+CONVERGENCE, measured both arms, 16 steps / 4 pools: every compilation
+in the run happens in pool 0 (8 compiles under duck-on, 7 under
+duck-off), and pools 1, 2, 3 have zero forward, zero backward AND zero
+runtime records. This held BEFORE any of the recompile work, so it is a
+property of the code, not of a fix. Of the 8: `step_core` 0/0 first
+trace (6.88 s), `step_core` 0/1 the duck-sizing recompile (6.41 s,
+avoidable), `step_core` 0/2 the `--rollout-tail-graph` artifact
+(0.38 s), `replay_head_inputs` (4.66 s), `value_logits` (4.25 s), and
+three `_polar_express` grad shapes (24,512,512) / (6,2048,512) /
+(6,512,2048) at 0.13 s total.
+
+BEHAVIOUR-AGE-0 EXACTNESS holds as a measured invariant, not an
+argument: `ratio/joint_abs_log_max` and `ratio/thought_joint_abs_log_max`
+are exactly 0.000e+00 at every age-0 step (1, 5, 9, 13) in all three
+runs including the duck-off arm, which was the one most likely to split
+refresh and update onto different artifacts.
+
+OPEN, and the biggest risk to a 20k run: one control run showed
+`refresh 18.219 s` against a 2.1-2.7 s steady state, intermittent and
+not reproduced in either profiled run.
+
+Ruled out: the duck-shape recompile, which fires at the first compaction
+inside pool 1 and costs 6.4 s, not 16. Allocator retry is also out --
+`num_alloc_retries` and `num_ooms` are 0 on every profiled pool.
+
+STILL UNEXPLAINED. A one-row-shard attribution was proposed and then
+RETRACTED -- see the retraction below the evidence.
+
+The observation (jobs 421 pool 2 and 422 pool 3, both after pool 0, in
+refresh) is a LATE Dynamo recompile from torch's 0/1 specialization:
+
+```
+replay_head_inputs:1137  reason=1/0: 2 <= batch.token_ids.size()[0]
+value_logits:82          reason=2/0: 2 <= batch.token_ids.size()[0]
+```
+
+The first trace assumed row count >= 2, so the guard can only fail on a
+shard of 0 or 1 rows. Replay shards always hold >= 1 row, so it is
+exactly a **one-row replay shard**. `plan_replay_shards`
+(`latent_rollout.py:1279-1314`) packs greedily over rows sorted by
+descending length and yields the remainder, so a trailing one-row shard
+is DATA-dependent -- some pools, not others. That is the intermittency.
+Reproduces under both flags tested: 421 is duck-ON/tail-off, 422 is
+duck-OFF/tail-on. Absent from 414, 417, 418.
+
+Warm cost 1.59 s (421) and 1.38 s (422), both with an FX cache hit. Cold
+is the story: the `step_core` NoneType variant cost 6.39 s cold with
+`inductor 3.85` against 0.38 s warm, a 17x swing on ONE frame. Two
+frames plus autotune at that ratio is the right order for 16 s, and
+`cr_prof_ctrl` ran before anything had ever compiled the one-row
+variant. STRONGLY INDICATED, not proven -- the cold number for these two
+frames is not yet measured directly.
+
+RETRACTION -- this does NOT explain the 18.2 s stall, and the
+specialization was already known. It is documented in-file at
+`train_latent_vapo.py:5849-5857`, naming the same guard, the same
+planner behaviour, and recording that `mark_unbacked` was already tried
+and rejected (Inductor's constant folder raises
+`GuardOnDataDependentSymNode` on the row dim). A prior measurement at
+`:5756-5758` puts the same event at **7.2 s -> 1.7 s** after the
+`unsafe_marked_cacheable_functions` autocast fix.
+
+So the 1.59 s (421) and 1.38 s (422) figures CONFIRM the documented
+1.7 s rather than revealing anything. The pre-fix cost was 7.2 s with
+the FX cache already hitting, so even a genuinely cold variant lands
+near 7-8 s, not 16. And `cr_prof_ctrl`'s pool-0 refresh of 10.82 s is
+itself a post-autocast-fix number, so that run already had the fix in.
+The story was fitted to a magnitude that was never measured.
+
+WHAT SURVIVES: the specialization fires LATE -- pool 2 in 421, pool 3 in
+422 -- so it is the only known compile after pool 0.
+
+SUPERSEDED: "and it costs ~1.5 s per process, not 16." That 1.5 s is a
+cache-HIT cost. The BUILD cost, measured in job 445, is
+`replay_head_inputs` 6.52 s plus `value_logits` 10.53 s = 17.05 s. So
+the magnitude does fit the stall after all; see the 2026-07-25 section.
+
+Planner names, twice corrected and now checked against the file: the
+plan is built by `plan_length_aware_shards`
+(`latent_rollout.py:1330`) and `iter_length_aware_microbatches`
+(`:1288`) is only the iterator over it. The split is new -- the file was
+refactored mid-session by the host-sync work, which is why earlier
+entries name only the iterator. "plan_replay_shards" never existed.
+
+CONTRADICTING THE IN-FILE COMMENT -- verified on a toy model, NOT
+against the production guard: a red-team pass
+reproduced both frames on CPU and found `mark_unbacked` on the row dim
+DOES work for `value_logits`, and for `replay_head_inputs` too once the
+`torch.zeros_like` plus slice-assign at `latent_rollout.py:1152-1153`
+becomes `F.pad(batch.token_ids[:, 1:], (0, 1))`. The blocker is
+Inductor's `constant_fold_uniform_value` on that specific `zeros_like`,
+not the row dim as such. That would delete the specialization outright.
+
+The probe was then re-run against the repo's real `NanoGPTBackbone`,
+`LatentThoughtModel` and `select_trajectory_rows`, forward and
+backward: baseline recompiles at one row; `mark_unbacked` alone raises
+`GuardOnDataDependentSymNode` exactly as the in-file comment says; and
+`mark_unbacked` plus the `F.pad` rewrite serves both row counts with
+one graph. So the comment's DIAGNOSIS is right and its CONCLUSION is
+wrong -- the blocker is that foldable `zeros_like`, not the row dim.
+
+What remains unverified is that this removes PRODUCTION's guard. The
+toy raised a different one (`128*rows*stream > 4096`, from Inductor's
+codecache) so it reproduces the recompile but not the exact guard, and
+the production graph may hold other foldable uniform-value nodes. The
+honest label is "verified on a toy model; not verified against the
+production guard".
+
+NOT LANDED, deliberately. It is worth a one-off compile, and against a
+multi-hour run that is noise. It edits the one path refresh and update
+share and the one the age-0 canary rides. Wrong risk-to-payoff ratio
+until something else justifies touching that path.
+
+TWO LIVE LEADS for the actual stall, in rated order:
+
+1. **Allocator retry.** `num_alloc_retries` empties the caching
+   allocator and synchronizes every stream -- a device-wide stall that
+   appears in no phase's own time. Sampled per pool at
+   `train_latent_vapo.py:3840-3860` and read ZERO in every profiled
+   pool -- but no profiled run has reproduced the stall either, so this
+   is untested, not excluded. A long shard from an unusually long
+   trajectory is exactly the data-dependent trigger that fits.
+2. **A device clock event.** Job 422 pool 2 shows a collect window at
+   **195 MHz and 35 W for 0.8 s** against 2820 MHz / 340 W steady state
+   -- the GPU dropping to idle clocks mid-phase. Nothing rules out a
+   longer instance, and it would never reproduce under a profiler.
+
+BEST INSTRUMENT: the 20k run itself. It is ~5000 pools against the ~20
+that have been profiled, and `pool_refresh_seconds` lands in
+`metrics.jsonl` every pool. A 40-step smoke gives 10 pools and is
+underpowered for an event seen once in twenty.
+
+Superseded cold-compile hypothesis, kept because the data behind it
+stands:
+the coldest-cache run of the group, and the measured cold-vs-warm
+refresh delta on pool 1 is 23.50 s vs 11.65 s, the right order for a
+16 s excursion. Refresh by pool, showing warmth is the whole pool-1
+story and duck shaping changes nothing in steady state:
+
+| run                        | pool 1 | pool 2 | pool 3 | pool 4 |
+|----------------------------|--------|--------|--------|--------|
+| cr_prof_final (on, warm)   | 10.99  | 2.59   | 2.24   | 2.31   |
+| cr_duck_on 417 (on, warm)  | 11.65  | 2.65   | 2.32   | --     |
+| cr_duck_off 416 (off, COLD)| 23.50  | 2.68   | 2.35   | 2.43   |
+
+The duck-off row is NOT a comparable arm: turning duck shaping off
+changes the traced graphs, so every FX and AOT cache key is new and
+pool 1 pays a full cold compile. Test in flight: a profiled 10-pool run
+with `TORCHINDUCTOR_CACHE_DIR` in a scratch dir (cold cache without
+disturbing the shared one), reading which pool compiles and why. If
+nothing after pool 1 compiles even cold, compilation is not the cause.
 
 REJECTED: replacing `torch.multinomial(probs,1)` with an inline
 gumbel/exponential argmax to "remove two host syncs". Verified on this
@@ -1060,3 +1509,376 @@ STILL OPEN (not applied before launch):
   existing timer. Needs a side stream; high risk.
 - Checkpoint save on the main thread, measured 0.63 s every 32 steps
   (0.4% amortized).
+
+
+## bf16 cache dtype fix + RoPE step table, verified on GPU (2026-07-25)
+
+THE BUG (real, reproduced on hardware for both `NanoGPTBackbone` and
+`NanoTiedDotBackbone`): under `autocast("cuda", bf16)` with bf16 caches,
+`F.rms_norm` returns **fp32** (it is on `AT_FORALL_FP32`) while `v`,
+never normed, stays **bf16**. Both `index_copy_` into same-dtype caches,
+so eager raises
+
+    RuntimeError: index_copy_(): self and source expected to have the
+    same dtype, but got (self) BFloat16 and (source) Float
+
+Compile hides it; eager does not. Live on `--no-rollout-compile`, any
+Dynamo bail-out, `sample_latent.py`, `inspect_critic_values.py`.
+
+Casting only the `index_copy_` writes is a HALF FIX: `q` is fp32 too and
+never reconciled, so eager SDPA then raises `Expected query, key and
+value to have the same dtype`. It is invisible under CUDA autocast only
+because SDPA is on the lower-precision list and silently down-casts `q`.
+The fix casts all three. `.copy_()` slice-stores never raised because
+`copy_` converts silently -- only `index_copy_` is strict.
+
+`rms_norm` has NO AutocastCPU kernel (fallthrough), so CPU
+reproductions of this are misleading. Verify on CUDA.
+
+ATTRIBUTION (job 441, `mode="default"` so Inductor kernel choice is
+deterministic; 128 steps x batch 16, bf16 caches, real CUDA autocast,
+each variant a fresh process):
+
+    CONTROL baseline vs itself : bit-identical   <- noise floor zero
+    CONTROL fixed vs itself    : bit-identical
+    dtype casts alone (q,k,v)  : DIFFERS
+    RoPE table alone           : BIT-IDENTICAL
+    both together              : DIFFERS
+    k+v casts, no q cast       : DIFFERS
+    k cast only                : DIFFERS
+
+The two self-comparison controls are load-bearing -- an earlier bisect
+WITHOUT them reported "RoPE table alone: DIFFERS" and was wrong,
+because autotuner variance was being read as attribution.
+
+CORRECTION -- "the RoPE step table is bit-identical" is TRUE ONLY IN
+THAT ARTIFACT. Job 435 also ran the TAIL artifact (`reduce-overhead`,
+`dynamic=False` -- the CUDA-graph decode tail training actually uses):
+
+    tail CONTROL baseline vs itself : bit-identical  <- regime is
+    tail CONTROL fixed vs itself    : bit-identical     deterministic
+    tail dtype casts alone          : DIFFERS
+    tail RoPE table alone           : DIFFERS   <- 30 elements, 6 layers
+
+Both controls clean, so it is not noise. **The table IS implicated.**
+It was DROPPED -- a perf change with no compiled measurement behind it
+does not get to move bytes. The dtype cast was kept.
+
+How provably-identical table CONTENTS still move bits: the eager proof
+was of the table's values. Under compile the old path computes
+`cos`/`sin` inline in the fused kernel via Triton's libdevice, and the
+table path replaces that with a memory load -- different fusion,
+different FMA contraction, possibly a different sin/cos implementation
+than eager ATen. Values equal, arithmetic re-associated. **An eager
+value-equality proof does NOT imply compiled bit-equality.**
+
+**The dtype cast owns the remaining drift and it is unavoidable** --
+the k-only cast is the smallest change that makes `index_copy_` legal
+and already shows the full effect.
+
+WHAT DIFFERS: `logits`, greedy tokens, sampled tokens and cache V are
+IDENTICAL in every differing pair over all 128 steps. Only cache K
+moves: 26 elements across ~6.3M written slots (~4e-6 density), every
+max|d| a power of two equal to exactly 1 bf16 ulp at that magnitude --
+values landing the other side of a rounding boundary, not error
+accumulation. Cause: an explicit `.to(bf16)` is a separate rounding
+point, so Inductor contracts the producing FMAs differently.
+
+NONDETERMINISM, and this is the part to remember: under
+`max-autotune-no-cudagraphs` (the ACTUAL rollout compile mode) the
+fixed variant differs run-to-run at the same 1-ulp magnitude between two
+identical processes, while the baseline does not. The casts give the
+autotuner a second viable schedule. **Cross-process bit-reproducibility
+is therefore not achievable in the rollout artifact.** Do not go hunting
+for a regression when you see this.
+
+Autotune selection happens ONCE PER PROCESS at compile time, so it
+cannot vary within a run. It affects reproducibility across restarts and
+resumes, not intra-run consistency. (n=1 pair per cell; a replication at
+n=4 against casts-only was queued, since the table was a plausible cause
+of the autotune tie.)
+
+THE CANARY DOES NOT COVER THIS, and an earlier note here claimed it did.
+`refresh_old_statistics` (`latent_rollout.py:1411`) and
+`update_minibatch` both compute through `replay_head_inputs`, the
+parallel replay/prefill path. The dtype change is in `_attention_step`,
+which runs ONLY in stepped decode (`step_core`); the prefill path
+already cast to the cache dtype and was untouched. So the 0.000e+00
+age-0 result is real and reassuring about refresh/update agreement, but
+it is STRUCTURALLY INSENSITIVE to a decode-path numerics change and is
+not evidence either way about this one.
+
+The honest argument is the simpler one: decode drift changes WHICH
+TOKENS get sampled into the replay. That is data, not the ratio
+identity -- a different draw from the same distribution, not a
+correctness failure. The crash it prevents is a correctness failure.
+
+DECISION: took the fix. A 1-ulp perturbation that moved zero tokens in
+2048 sampled steps beats shipping a latent hard error into a 20k-step
+run. "Bit-exact vs HEAD" was the WRONG launch criterion in the first
+place -- the age-0 canary is the criterion, and it holds.
+
+RESOLVED, and it turned up something bigger. `eval_open_loop.py:192`
+carried "the stepwise cache path does not support autocast: fp32 caches
+reject bf16 values". Both halves of that comment are false:
+
+* The cache absorbs bf16 now, via the q/k/v casts.
+* **Open-loop eval runs fp32 while rollout runs CUDA bf16 autocast**
+  (`training_autocast()`, train_latent_vapo.py:6419). The comment
+  claimed the fp32 choice MATCHED the rollout regime. It never did.
+
+So every open-loop number on record measures a precision the trainer
+does not use. Left fp32 on purpose: switching it moves the whole
+historical series, which is a deliberate call rather than a cleanup.
+The comment now says so instead of asserting the opposite.
+
+## Muon step compensation + batching (2026-07-25)
+
+`POLAR_EXPRESS_STEP_COMPENSATION` **2.4 -> 1.45**, from job 442: 624
+non-degenerate real gradients out of live post-training, every Muon
+parameter over 8 steps of both optimizers. Ratio of new to old update
+norm, by shape:
+
+| shape       | n   | ratio |                                  |
+|-------------|-----|-------|----------------------------------|
+| (512, 512)  | 414 | 0.823 | no rectangular term              |
+| (512, 2048) | 108 | 0.570 | no rectangular term              |
+| (2048, 512) | 102 | 0.494 | lost a 2.0x rectangular scale    |
+
+Geometric mean 0.690, so compensation is 1/0.690 = 1.45. At the
+previously chosen 2.4 the 414 (512,512) matrices -- the bulk of the
+trunk -- step **1.97x** harder than tuned. Stable ranks measured
+1.0-2.6. This overrides an earlier user-directed 2e-4; at
+`--learning-rate 5e-5` the derived Muon LR is now 1.2083e-4.
+
+BATCHING IS NOT BIT-EXACT, and the test that asserted it was is fixed
+rather than the kernel. cuBLAS selects its strided-batched GEMM by
+batch count, so a 3-row `bmm` and a 1-row `bmm` accumulate in different
+orders; five iterations of a cubic amplify that bf16 rounding to a few
+percent on the small elements of a near-orthogonal matrix. This is not
+a defect: `bmm` cannot mix batch entries, Muon's output is not on the
+age-0 canary path, and shape buckets are fixed within a run so runs
+stay reproducible. `test_cuda_kernels_match_the_per_tensor_reference`
+now pins the property that actually matters -- each batched row tracks
+its own unbatched result >20x more closely than a sibling's -- which
+still catches a real row-mixing bug while tolerating rounding.
+
+## v25 20k launch: job 448 (2026-07-25)
+
+Config as v24 plus the Muon compensation at 1.45, `--duck-shape` off,
+`--rollout-tail-graph` off, `--replay-max-trajectories 128`,
+`--replay-attention-budget 16777216`, `--rollout-groups 32`,
+`--max-stream-steps 2048`. Step 0 baselines: teacher-forced val_bpb
+1.2415, aime_avg@32 0.0000, bench_avg@8 0.1189.
+
+The trainer records NO provenance -- no git hash, no source snapshot.
+With a working tree this far from HEAD that makes a run
+unreconstructable, so 448's diff, HEAD and untracked tests are copied
+into `runs/rl_gpt2vocab_latent_v25/provenance/`. Worth making the
+trainer do this itself.
+
+STEADY STATE, first 8 pools:
+
+| metric                    | pool 0 | pools 1-7          |
+|---------------------------|--------|--------------------|
+| `pool_refresh_seconds`    | 6.71   | 2.01-2.77          |
+| `collect_seconds`         | 15.68  | 9.95-11.33         |
+| `decode_step_utilization` | 0.578  | 0.535-0.583        |
+
+Pool 0 is compile-inflated and not comparable. Do NOT read the ~2.1 s
+refresh against the 2.40 s at NOTES:1115 as an improvement: that
+baseline ran a different shard count and budget. Different measurement,
+not a better one.
+
+500 W IS CONFIRMED UNREACHABLE, second independent measurement, this
+time on the shipped config and sampled at 1 Hz against NVML's measured
+500 ms refresh so no reading is a duplicate.
+
+An early n=150 window gave median 335 / mean 320 W. SUPERSEDED: that
+window opened during startup and understated steady state by ~13%. Over
+n=764 (12.7 min of healthy pools): min 158, p25 330, **median 381**,
+p75 400, p95 420, **max 429**, mean 361 W. Zero samples >=450 W, zero
+>=500 W. Median util 97%, SM clock 2797-2842 MHz with ZERO samples
+below 1000 MHz, board limit 575 W, not throttled. Agrees with the
+1007-sample trace (peak 420 W, zero above 450).
+
+The lesson is the same one that produced the aliasing retraction: a
+short window is not a small version of a long one when the run has
+phases. Take the baseline over pool interiors, not from process start.
+
+Steady state at ~361 W mean is where this workload already sat before
+any of this session's work. Power did not move, and was never the thing
+to move.
+
+The target should be retired, not pursued. Power tracks DRAM/L2
+traffic, so the highest-power phase is decode -- the phase running at
+0.56 utilization, i.e. the one wasting the most work. Maximizing watts
+rewards moving work INTO it. Every real win so far LOWERED mean power
+while cutting wall time. Track pool seconds per gradient step.
+
+CONTINUOUS BATCHING is now measured across 8 independent pools rather
+than one: `decode_step_utilization` 0.535-0.583. Still the largest
+unclaimed item on the list, still never attempted, and the 8-pool
+spread makes it a stable target rather than a single-pool artifact.
+
+### Compile floor: REACHED (job 445, ten pools)
+
+Zero compilations and zero runtime records in pools 1-9. All seven
+compiles and all three runtime records land in pool 0:
+
+1. `step_core` first compile.
+2. `step_core` second entry -- the frame is called with and without a
+   `key_mask`, so it is two graphs. Removing it costs a masked SDPA on
+   the common path.
+3. `replay_head_inputs` first compile.
+4. `value_logits` first compile.
+5-7. `_polar_express`, one per Muon shape class: (24,512,512),
+   (6,2048,512), (6,512,2048). 0.13 s for all three.
+
+"Compile exactly once" was never reachable: two `torch.compile`
+wrappers on one code object cannot share a cache entry.
+
+The only post-pool-0 record ever seen is `replay_head_inputs` +
+`value_logits` recompiling for a ONE-ROW replay shard. It did not fire
+in ten pools, so it is data-dependent, not periodic. 448's settings do
+not make it immune -- at a 2048 stream the attention budget caps a
+shard at four rows -- but they do remove the solo-shard-by-length case,
+so only remainders can be one row.
+
+### The 18.2 s refresh stall: candidate found, magnitude fits
+
+The retraction of the original attribution was itself too hasty. The
+"1.7 s" at `train_latent_vapo.py:5757` is a cache-HIT cost, not a build
+cost. Job 445 measured the build: `replay_head_inputs` **6.52 s** and
+`value_logits` **10.53 s**, 17.05 s for the pair, and that is with the
+FX graph cache still hitting. A 16-18 s excess in ONE refresh
+occurrence is exactly that size.
+
+Job 445 pool 0 reported `uneven: refresh_pipeline.refresh longest
+occurrence 18.028 s of 20.559 s over 4` -- one occurrence of four. That
+distinction is why the stall stayed unexplained: a phase mean cannot
+tell one 18 s occurrence from four slow ones.
+
+Open question is now narrow: can the on-disk cache miss for the one-row
+variant? Job 449 answers it with a scratch `TORCHINDUCTOR_CACHE_DIR`.
+448's own pool 0 spent only 6.71 s in refresh total, so no 17 s
+artifact build happened there -- consistent with a warm cache.
+
+Falsifiable prediction from this hypothesis: across 448's ~5000 pools,
+ONE early outlier and none after. A recurring cadence kills it and puts
+an allocator or device event back in play.
+
+CAUTION on job 445's wall times: its steady pools are ~35% slower than
+422's because CPU work was running on the box alongside it
+(`score_wait` reaching 3 s is the scoring worker starved of CPU). Its
+compile accounting is unaffected, but do not use its wall times as a
+baseline for anyone's change. Related: the shared FX cache is
+invalidated by ordinary source edits, so "warm" is not a stable
+baseline while several people are editing.
+
+### Task #3 ANSWERED: the 18.2 s refresh stall is a cold-window compile
+
+First, the discriminator I circulated was WRONG and the correction is the
+whole method. "A compile inflates only refresh; a clock drop inflates the
+whole pool, so compare against `collect_seconds`" does not work, because
+`collect_seconds` SPANS the refresh pipeline: `collect_started = started`
+at `train_latent_vapo.py:6841`, `collect_seconds` computed at `:7014`
+after the refresh loop and after `torch.cuda.synchronize()` in
+`pool_barrier`. It inflates whenever refresh does and can never separate
+them. The quantity that separates them is the RESIDUAL,
+`collect_seconds - pool_refresh_seconds`, against its own median.
+
+With the residual, outliers split into two non-overlapping classes.
+Across all 96 historical runs, threshold refresh > max(3 s, 4x run median):
+
+**Class A -- refresh-confined, residual at its median. Three events in the
+entire recorded history**, all in the first four pools of their run:
+
+| run                        | pool | of  | refresh | residual x |
+|----------------------------|------|-----|---------|------------|
+| `cr_prof_ctrl`             | 3    | 4   | 18.219  | **1.00**   |
+| `..._v21_perdim_16m_...`   | 1    | 268 | 3.064   | 1.52       |
+| `..._v21_perdim_16m_...`   | 2    | 268 | 15.546  | 1.51       |
+
+v21 ran 268 pools and never produced another. Its residual is flat
+through the event (83.3, 83.1, 79.6, 72.6, 80.4 s at pools 1-5), so
+decode was untouched while refresh took 15.5 s.
+
+**This is the stall.** Magnitude matches the 17.05 s first build of
+`replay_head_inputs` + `value_logits` measured in job 445. Which pool it
+lands in varies because the one-row shard is data-dependent. Warm hits at
+~1.7 s fall under the 3 s floor and are invisible to the detector, which
+is consistent with the story rather than a gap in it. Cost: 15.9 s once
+per run, 0.55% of v21's total collect wall.
+
+**Class B -- pool-wide, residual inflated too. 20 events, and most are
+not anomalies at all**: at 11 of them `stream_length` is 4-6x the run
+median (1008-1317 against medians of 197-240). Longer trajectories, more
+work, everything slower. v23's cluster at pools 155-180 is entirely this.
+The remaining ~9 are real: normal stream length, 15-25 s of ADDITIVE
+excess in refresh and in the non-refresh remainder alike. Something takes
+the whole pool, not one phase of it. **The 195 MHz / 35 W device-clock
+lead belongs here, not with the refresh stall.** Untested: no run on
+record carries device samples through one of these events. Job 448 now
+does -- see `runs/rl_gpt2vocab_latent_v25/device_trace.csv`.
+
+Aggregate for both classes: under 1.5% of collect wall in every long run
+(0.55%, 0.92%, 0.94%, 1.48%). Not a throughput problem beside the 18.3%
+of pool wall that dead-row decode costs.
+
+CHECKPOINT HYPOTHESIS IS DEAD, and the way it died is worth keeping. A
+40-row lookback put a checkpoint before nearly every event BY
+CONSTRUCTION. Counted properly: 2 of 337 checkpoints in one run precede a
+stall, and `cr_prof_ctrl` -- the original 18.2 s case -- has no
+checkpoint rows at all. A lookback window wide enough to catch a frequent
+event will always "explain" a rare one.
+
+JOB 448, 32 pools: zero outliers of either class. Refresh median 1.99 s,
+max 2.769 s (pool 0). Residual median 8.25 s, so decode is 4x refresh --
+pointing at continuous batching again. Pool 0 refresh of only 6.7 s means
+the on-disk FX cache was already warm, so class A may never fire in this
+run. Observing it needs a COLD-CACHE start, not a longer run.
+
+### The anchored-value test flake: closed, cause UNEXPLAINED (2026-07-25)
+
+`test_anchored_value_migration_transfers_trunk_and_rebuilds_head` failed
+ONCE, in the live main tree, and never again. Closed as test-only.
+
+DO NOT record the cause as a torn read. I proposed that and it does not
+survive checking: `git log -L 470,510` shows the filter last touched by
+`b193e2f`, three commits back; neither the working-tree diff nor the
+provenance snapshot taken at 00:01:29 -- inside the failure window -- has
+a hunk overlapping those lines; and `value_model.py` was not written that
+day at all. There is also a mechanical objection: `test_latent_rollout.py`
+imports `migrate_anchored_value_resume` at module scope, so a truncated
+file fails collection for the WHOLE file and a half-written one raises
+SyntaxError. A silently-wrong filter needs the edit to land inside the
+filter, and none did. "Cause unexplained" is the honest label; a
+plausible story recorded as settled would misdirect the next person.
+
+What DID cause agents to disagree about the suite, and this is
+established: provenance copies of two test files were written into
+`runs/<name>/provenance/` with real `.py` names, colliding by basename
+with the modules in `postraining/tests/`. From 00:01:29 to 00:20:18
+repo-root `pytest` ERRORED at collection and collected ZERO tests. Two
+agents running "the full suite" either side of that window ran different
+sets. Fixed by `pytest.ini` (`testpaths`, `norecursedirs`) so the suite
+is one stable set, and `postraining/tests/__init__.py` so each test
+module is imported once rather than existing twice in `sys.modules`.
+
+THE MIGRATION FILTER IS SOUND, verified against a real `SeparateCritic`
+rather than by reading. 60 state-dict keys; top-level children exactly
+`trunk`, `adapter`, `support`, `head`; exactly 4 keys match the
+prefixes; NO key containing "head" or "support" escapes the filter, and
+`startswith` is anchored so it cannot over-match. The grid scalars
+(`num_bins`, `v_min`, `v_max`, `bin_width`, `sigma`, `eps`) are plain
+Python attributes on `HLGaussSupport`, NOT buffers, so they are absent
+from the state dict and can never leak -- the target's fresh geometry
+always wins. `strict=False` hides nothing: the checks at `:497-503` are
+TIGHTER than `strict=True`, because they pin which keys may be absent.
+Pathological case tested -- source and target both 17 bins, so a leaked
+head would be silently copyable rather than shape-rejected -- and the
+head stayed exactly 0.0.
+
+Two real defects came out of the audit anyway; see tasks #11 and #12.
+Neither affects job 448.
