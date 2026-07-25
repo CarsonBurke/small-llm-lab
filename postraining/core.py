@@ -503,8 +503,13 @@ def clipped_policy_loss(
     log_ratio = torch.where(
         mask.bool(), new_logprobs - old_logprobs, torch.zeros_like(new_logprobs)
     )
-    log_lower = torch.log(log_ratio.new_tensor(1.0 - epsilon_low))
-    log_upper = torch.log(log_ratio.new_tensor(1.0 + epsilon_high))
+    # ``new_full`` rather than ``new_tensor``: both materialize the same
+    # constant in the same dtype on the same device, but new_tensor builds it
+    # on the host and copies, and a copy from pageable memory blocks until
+    # the stream drains -- twice per replay shard, at the top of the eager
+    # tail. new_full is a fill kernel and takes the scalar as an argument.
+    log_lower = torch.log(log_ratio.new_full((), 1.0 - epsilon_low))
+    log_upper = torch.log(log_ratio.new_full((), 1.0 + epsilon_high))
     # This is algebraically the standard min(r*A, clip(r)*A), expressed in
     # log space so a favorable but extremely large joint ratio is clipped
     # before exp. PPO deliberately leaves the harmful direction unclipped.
@@ -554,7 +559,13 @@ def positive_example_lm_loss(
 
 
 def top_p_sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:
-    logits = logits.float() / temperature
+    logits = logits.float()
+    if temperature != 1.0:
+        # Dividing by exactly 1.0 is the identity in IEEE arithmetic, so the
+        # skip is bit-exact -- but the kernel is not free: it reads and writes
+        # a (rows, 50304) fp32 tensor at every rollout step of the training
+        # configuration, which samples at temperature 1.0.
+        logits = logits / temperature
     if top_p >= 1.0:
         # Nucleus truncation is a no-op at top_p >= 1 (cumsum - probs never
         # exceeds 1), and the same distribution needs no full-vocab sort —
