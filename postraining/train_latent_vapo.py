@@ -46,7 +46,7 @@ without inheriting that discrete-token target.
   KL constrains aggregate drift of the 512-D Gaussian against the frozen
   rollout behavior policy, complementing factorwise PPO clipping.
   A zero-initialized belief-conditioned head learns diagonal per-dimension
-  thought log-sigma, starting at -3 in every dimension.
+  thought log-sigma, starting at -2.5 in every dimension.
 - No pretraining anchor: SIGReg and the latent target-prediction objective are
   dropped at RL time. The fresh mean and recurrent policy train purely on
   their ability to think; the teacher-forced val-BPB guard is the drift
@@ -70,15 +70,20 @@ is attempted.
 from __future__ import annotations
 
 import argparse
+import atexit
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import fields
 import hashlib
 import json
 import math
 import os
 import random
+import subprocess
+import threading
 import time
+import warnings
 from pathlib import Path
 
 import sentencepiece as spm
@@ -128,6 +133,7 @@ from postraining.latent_rollout import (
     LatentRolloutBatch,
     assign_terminal_rewards,
     compact_emit_token_logprobs,
+    compact_slots,
     compact_stream_to_device,
     pack_rollout_groups_for_replay,
     emitted_token_rows,
@@ -136,7 +142,10 @@ from postraining.latent_rollout import (
     refresh_old_statistics,
     replay_head_inputs,
     scatter_replay_statistics,
+    scatter_slots,
     select_thought_actions,
+    slot_index,
+    think_slot_mask,
     rollout_continuations,
     split_rollout_groups,
     trim_stream,
@@ -160,6 +169,9 @@ from postraining.value_model import SeparateCritic
 
 
 EXECUTION_SCHEMA = (
+    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_identity_affine_general_lr_sequential_data/v25"
+)
+ZERO_AFFINE_EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_zero_affine_general_lr_sequential_data/v24"
 )
 NO_THOUGHT_KL_EXECUTION_SCHEMA = (
@@ -197,6 +209,36 @@ PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
 DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
 DEFAULT_PERIODIC_EVAL_EVERY = 150
+# Restores the trunk step size that the Muon:AdamW rate ratio was chosen for,
+# after ``postraining.muon`` moved to Polar Express. It is a property of that
+# orthogonalizer, not of the RL objective, and it multiplies only the DERIVED
+# --muon-learning-rate default: an explicit rate on the command line is taken
+# literally. See the derivation in validate_args.
+#
+# MEASURED, not guessed (job 442, 624 non-degenerate real gradients from live
+# post-training, every Muon parameter over 8 steps of both optimizers). The
+# move to Polar Express shrank the step by two independent mechanisms: Polar
+# Express at 5 iterations leaves a wider singular-value ripple than the 12
+# Newton-Schulz iterations it replaced, and the old ``max(1, rows/cols)**0.5``
+# rectangular scale was dropped. ``new/old`` step norm by shape:
+#
+#     (512, 512)   n=414   0.823      <- 24 matrices, no rectangular term
+#     (512, 2048)  n=108   0.570      <- 6 matrices, no rectangular term
+#     (2048, 512)  n=102   0.494      <- 6 matrices, lost a 2.0x rect scale
+#
+# Geometric mean 0.690, so the compensation is 1/0.690. The first value used
+# here was 2.4, which is what a synthetic-gaussian bracket suggested; against
+# real gradients that overshoots badly, because real trunk gradients are very
+# low rank (stable rank 1.0-2.6) and that is the regime where Polar Express
+# and Newton-Schulz diverge most. At 2.4 the 414 (512, 512) matrices -- two
+# thirds of the trunk -- would step 1.97x the tuned configuration. At 1.45 the
+# spread is 1.19 / 0.83 / 0.72, centred on 1.
+#
+# A single scalar cannot correct all three shapes at once; that needs the
+# per-parameter rectangular term back, which needs param groups, which is
+# blocked on the momentum-aliasing bug in ``Muon._momenta`` (keyed by
+# (shape, device) but bucketed per param group). Left as future work.
+POLAR_EXPRESS_STEP_COMPENSATION = 1.45
 # v2: the grading style follows each row's reward_model.style (Minerva for
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
 # instead of Minerva-normalizing everything.
@@ -229,6 +271,19 @@ def resume_execution_schema_compatible(
     """Resume compatible policy state at a complete rollout-pool boundary."""
     execution_schema = payload.get("execution_schema")
     if execution_schema == EXECUTION_SCHEMA:
+        return not (
+            allow_reverse_kl_migration
+            or allow_performance_migration
+            or allow_joint_clip_migration
+            or allow_anchored_value_migration
+            or allow_projected_thought_migration
+            or allow_thought_reverse_kl_migration
+        )
+    # v25 changes only the fresh adapter initialization. A v24 resume restores
+    # its learned adapter and optimizer state exactly, so it needs no state or
+    # objective migration. The new checkpoint records the source schema in
+    # actor-init provenance.
+    if execution_schema == ZERO_AFFINE_EXECUTION_SCHEMA:
         return not (
             allow_reverse_kl_migration
             or allow_performance_migration
@@ -328,19 +383,20 @@ def migrate_zero_adapter_resume(
 
     The recurrent policy semantics change, so this migration is never silent:
     the caller must opt in. All actor state and Adam moments are retained
-    except the three old adapter parameters. The new weight/bias start at exact
-    zero with fresh optimizer state; the removed scalar has no successor.
+    except the three old adapter parameters. The new weight/bias take the
+    current fresh init (identity, zero bias) with fresh optimizer state; the
+    removed scalar has no successor.
     """
     actual_execution = payload.get("execution_schema")
     actual_input = payload.get("thought_input_schema")
     if actual_execution != GAIN_SCALED_EXECUTION_SCHEMA:
         raise ValueError(
-            "zero-adapter migration requires execution schema "
+            "--migrate-zero-adapter-resume requires execution schema "
             f"{GAIN_SCALED_EXECUTION_SCHEMA!r}; got {actual_execution!r}"
         )
     if actual_input != GAIN_SCALED_THOUGHT_INPUT_SCHEMA:
         raise ValueError(
-            "zero-adapter migration requires thought-input schema "
+            "--migrate-zero-adapter-resume requires thought-input schema "
             f"{GAIN_SCALED_THOUGHT_INPUT_SCHEMA!r}; got {actual_input!r}"
         )
 
@@ -381,7 +437,16 @@ def migrate_zero_adapter_resume(
         )
 
     state.pop(scalar_key)
-    state[weight_key] = torch.zeros_like(state[weight_key])
+    # Write the fresh init explicitly rather than cloning live parameters:
+    # the wrapper may already hold stepped Adam values when tests (or a
+    # pre-load probe) have touched it, and migration must land on the
+    # deterministic post-critic affine, not that dirtied state.
+    dim = wrapper.adapter.projection.weight.shape[0]
+    state[weight_key] = torch.eye(
+        dim,
+        dtype=state[weight_key].dtype,
+        device=state[weight_key].device,
+    )
     state[bias_key] = torch.zeros_like(state[bias_key])
     old_state = actor_optimizer["state"]
     for parameter_id in (scalar_id, weight_id, bias_id):
@@ -404,6 +469,7 @@ def migrate_zero_adapter_resume(
             "adapter.projection.weight",
             "adapter.projection.bias",
         ],
+        "target_adapter_initialization": "identity_weight_zero_bias",
         "reset_optimizer_state": True,
     }
 
@@ -1610,11 +1676,13 @@ def per_dimension_thought_policy_loss(
             raise ValueError(f"{name} must have shape {expected_vector_shape}")
 
     dimension_log_ratio = new_thought_logprobs - old_thought_logprobs
+    # new_full, not new_tensor: see clipped_policy_loss -- the host-built
+    # constant costs a blocking copy every call.
     log_lower = torch.log(
-        dimension_log_ratio.new_tensor(1.0 - epsilon_low)
+        dimension_log_ratio.new_full((), 1.0 - epsilon_low)
     )
     log_upper = torch.log(
-        dimension_log_ratio.new_tensor(1.0 + epsilon_high)
+        dimension_log_ratio.new_full((), 1.0 + epsilon_high)
     )
     dimension_advantages = advantages[:, None]
     effective_dimension_log_ratio = torch.where(
@@ -2195,17 +2263,23 @@ def update_minibatch(
             microbatch.gate_actions.float(), beliefs
         )
 
-        emit_mask = microbatch.emit_mask.bool()
+        # One nonzero per mask per shard. Every compaction below then goes
+        # through index_select, whose output shape is known on the host, so
+        # the eager tail stops stalling once per indexing expression --
+        # forward AND backward, since index_select's gradient is index_add
+        # while boolean indexing's re-derives the index from the mask.
+        emit_index = slot_index(microbatch.emit_mask.bool())
         emit_features = wrapper.renderer_features(
-            stream_inputs[emit_mask], beliefs[emit_mask]
+            compact_slots(stream_inputs, emit_index),
+            compact_slots(beliefs, emit_index),
         )
         # Shared with refresh_old_statistics: identical chunk boundaries keep
         # the two eager forwards bit-identical (the age-0 zero-clip canary).
         compact_token_logprobs = compact_emit_token_logprobs(
-            backbone, emit_features, token_targets[emit_mask]
+            backbone, emit_features, compact_slots(token_targets, emit_index)
         )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
-        new_token_logprobs[emit_mask] = compact_token_logprobs
+        scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
 
         micro_positive = microbatch.reward_scalar >= positive_reward_threshold
         weighted_positive_lm = positive_example_lm_loss(
@@ -2215,12 +2289,13 @@ def update_minibatch(
             denominator=positive_token_denominator,
         )
 
-        think_mask = (
-            (microbatch.gate_actions == THINK)
-            & microbatch.action_mask.bool()
-        )
         new_thought_joint = torch.zeros_like(new_token_logprobs)
         old_thought_joint = torch.zeros_like(new_token_logprobs)
+        # Bound only on the has-THINK path, and read again further down
+        # under ``policy_thought_logprobs is not None``, which is set in the
+        # same branch. Reset here with the rest so a previous shard's index
+        # can never survive into this one.
+        think_index = None
         policy_thought_logprobs = None
         compact_old_thought_logprobs = None
         thought_reverse_kl_factors = None
@@ -2230,11 +2305,12 @@ def update_minibatch(
         weighted_projection_penalty = zero
         shard_has_think = bool(row_has_think[host_rows].any())
         if shard_has_think:
-            thought_means, thought_targets, _ = select_thought_actions(
-                microbatch, predicted
+            think_index = slot_index(think_slot_mask(microbatch))
+            thought_means, thought_targets = select_thought_actions(
+                microbatch, predicted, think_index
             )
             thought_log_sigma = wrapper.transition.predict_log_sigma(
-                beliefs[think_mask]
+                compact_slots(beliefs, think_index)
             )
             if thought_pg_coef != 0.0 or thought_reverse_kl_coef != 0.0:
                 new_thought_logprobs = wrapper.transition.per_dim_log_prob(
@@ -2250,9 +2326,9 @@ def update_minibatch(
                         thought_log_sigma.detach(),
                     )
             new_thought_logprobs = new_thought_logprobs.float()
-            compact_old_thought_logprobs = (
-                microbatch.old_thought_logprobs[think_mask].float()
-            )
+            compact_old_thought_logprobs = compact_slots(
+                microbatch.old_thought_logprobs, think_index
+            ).float()
             if thought_reverse_kl_coef != 0.0:
                 thought_reverse_kl_factors = sampled_reverse_kl(
                     new_thought_logprobs,
@@ -2280,19 +2356,25 @@ def update_minibatch(
                     + thought_pg_coef
                     * (new_thought_logprobs - new_thought_logprobs.detach())
                 )
-            new_thought_joint = new_thought_joint.masked_scatter(
-                think_mask, policy_thought_logprobs.sum(-1)
+            # index_copy_ rather than masked_scatter: both place the compact
+            # values at the mask's true slots in order, but masked_scatter's
+            # gradient is masked_select, whose output shape is data
+            # dependent, so the backward pass stalls the host.
+            scatter_slots(
+                new_thought_joint, think_index, policy_thought_logprobs.sum(-1)
             )
-            old_thought_joint = old_thought_joint.masked_scatter(
-                think_mask, compact_old_thought_logprobs.sum(-1)
+            scatter_slots(
+                old_thought_joint,
+                think_index,
+                compact_old_thought_logprobs.sum(-1),
             )
             if thought_clip_mode == "projected":
-                behavior_thought_means = (
-                    microbatch.old_thought_means[think_mask].float()
-                )
-                behavior_thought_log_sigmas = (
-                    microbatch.old_thought_log_sigmas[think_mask].float()
-                )
+                behavior_thought_means = compact_slots(
+                    microbatch.old_thought_means, think_index
+                ).float()
+                behavior_thought_log_sigmas = compact_slots(
+                    microbatch.old_thought_log_sigmas, think_index
+                ).float()
                 if thought_pg_coef == 0.0:
                     with torch.no_grad():
                         (
@@ -2377,8 +2459,12 @@ def update_minibatch(
                     # dropped. thought_trust_epsilon is unused in this mode.
                     _, _, thought_trust_sq = project_thought_means(
                         thought_means.detach().float(),
-                        microbatch.old_thought_means[think_mask].float(),
-                        microbatch.old_thought_log_sigmas[think_mask].float(),
+                        compact_slots(
+                            microbatch.old_thought_means, think_index
+                        ).float(),
+                        compact_slots(
+                            microbatch.old_thought_log_sigmas, think_index
+                        ).float(),
                         thought_trust_epsilon,
                     )
                     totals["thought_trust_sum"] += thought_trust_sq.sum()
@@ -2438,6 +2524,18 @@ def update_minibatch(
         weighted_policy_loss = weighted_emit_policy_loss
         weighted_policy_clip = weighted_emit_policy_clip
         if policy_thought_logprobs is not None:
+            compact_gate_logprobs = compact_slots(
+                policy_gate_logprobs, think_index
+            )
+            compact_old_gate_logprobs = compact_slots(
+                microbatch.old_gate_logprobs, think_index
+            )
+            compact_thought_advantages = compact_slots(
+                micro_advantages, think_index
+            )
+            compact_thought_gate_mask = compact_slots(
+                microbatch.gate_mask, think_index
+            )
             # 'none' shares this surrogate: with an identity projection and an
             # all-ones trust scale it reduces to the same unclipped IS form
             # under the +/-2 numerical guard, which is exactly the arm we want
@@ -2448,16 +2546,16 @@ def update_minibatch(
                     weighted_thought_policy_clip,
                     weighted_thought_gate_clip,
                 ) = projected_thought_policy_loss(
-                    policy_gate_logprobs[think_mask],
-                    microbatch.old_gate_logprobs[think_mask],
+                    compact_gate_logprobs,
+                    compact_old_gate_logprobs,
                     projected_policy_thought_logprobs,
                     compact_old_thought_logprobs,
                     thought_trust_scale,
-                    (micro_advantages[think_mask] - advantage_scale_mean)
+                    (compact_thought_advantages - advantage_scale_mean)
                     / thought_advantage_normalizer,
-                    microbatch.gate_mask[think_mask],
+                    compact_thought_gate_mask,
                     policy_action_denominator,
-                    gate_advantages=micro_advantages[think_mask],
+                    gate_advantages=compact_thought_advantages,
                 )
             else:
                 thought_loss_function = (
@@ -2470,12 +2568,12 @@ def update_minibatch(
                     weighted_thought_policy_clip,
                     weighted_thought_gate_clip,
                 ) = thought_loss_function(
-                    policy_gate_logprobs[think_mask],
-                    microbatch.old_gate_logprobs[think_mask],
+                    compact_gate_logprobs,
+                    compact_old_gate_logprobs,
                     policy_thought_logprobs,
                     compact_old_thought_logprobs,
-                    micro_advantages[think_mask],
-                    microbatch.gate_mask[think_mask],
+                    compact_thought_advantages,
+                    compact_thought_gate_mask,
                     policy_action_denominator,
                 )
             weighted_policy_loss = (
@@ -2591,7 +2689,9 @@ def update_minibatch(
                 )
                 thought_log_ratio = (
                     new_thought_logprobs
-                    - microbatch.old_thought_logprobs[think_mask]
+                    - compact_slots(
+                        microbatch.old_thought_logprobs, think_index
+                    )
                 )
                 totals["thought_dim_abs_log_ratio_max"] = torch.maximum(
                     totals["thought_dim_abs_log_ratio_max"],
@@ -2940,48 +3040,55 @@ def measure_post_update_policy_drift(
             ).float()
             gate_log_ratio = gate_logprobs - microbatch.old_gate_logprobs.float()
 
-            emit_mask = microbatch.emit_mask.bool()
             token_logprobs = torch.zeros_like(microbatch.old_token_logprobs).float()
             if bool(row_has_emit[host_rows].any()):
+                emit_index = slot_index(microbatch.emit_mask.bool())
                 emit_logits = wrapper.backbone.logits_from_features(
                     wrapper.renderer_features(
-                        stream_inputs[emit_mask], beliefs[emit_mask]
+                        compact_slots(stream_inputs, emit_index),
+                        compact_slots(beliefs, emit_index),
                     )
                 )
                 compact_token_logprobs = (
                     emit_logits.float()
                     .log_softmax(-1)
-                    .gather(-1, token_targets[emit_mask][..., None])
+                    .gather(
+                        -1, compact_slots(token_targets, emit_index)[..., None]
+                    )
                     .squeeze(-1)
                 )
-                token_logprobs[emit_mask] = compact_token_logprobs
+                scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
             token_log_ratio = (
                 token_logprobs - microbatch.old_token_logprobs.float()
             )
 
-            think_mask = (
-                (microbatch.gate_actions == THINK)
-                & microbatch.action_mask.bool()
-            )
+            think_mask = think_slot_mask(microbatch)
             thought_joint = torch.zeros_like(token_logprobs)
             old_thought_joint = torch.zeros_like(token_logprobs)
             thought_log_ratio = None
             if bool(row_has_think[host_rows].any()):
-                thought_means, thought_targets, _ = select_thought_actions(
-                    microbatch, predicted
+                think_index = slot_index(think_mask)
+                thought_means, thought_targets = select_thought_actions(
+                    microbatch, predicted, think_index
                 )
                 thought_log_sigma = wrapper.transition.predict_log_sigma(
-                    beliefs[think_mask]
+                    compact_slots(beliefs, think_index)
                 )
                 thought_logprobs = wrapper.transition.per_dim_log_prob(
                     thought_targets, thought_means, thought_log_sigma
                 ).float()
-                old_thought_logprobs = microbatch.old_thought_logprobs[
-                    think_mask
-                ].float()
+                old_thought_logprobs = compact_slots(
+                    microbatch.old_thought_logprobs, think_index
+                ).float()
                 thought_log_ratio = thought_logprobs - old_thought_logprobs
-                thought_joint[think_mask] = thought_logprobs.sum(-1)
-                old_thought_joint[think_mask] = old_thought_logprobs.sum(-1)
+                scatter_slots(
+                    thought_joint, think_index, thought_logprobs.sum(-1)
+                )
+                scatter_slots(
+                    old_thought_joint,
+                    think_index,
+                    old_thought_logprobs.sum(-1),
+                )
 
             new_joint, old_joint = joint_action_logprobs(
                 gate_logprobs,
@@ -3121,6 +3228,1275 @@ def purge_benchmark_reports_after(output: Path, step: int) -> int:
     return removed
 
 
+PROFILE_SCHEMA = "latent_vapo_profile_v1"
+
+# nvidia-smi query order. Power leads because a power collapse is the
+# user-visible symptom; the SM clock separates an idle GPU from a throttled
+# one at the same reported utilization.
+DEVICE_SAMPLE_FIELDS = (
+    "utilization_gpu_percent",
+    "utilization_memory_percent",
+    "power_draw_watts",
+    "clocks_sm_mhz",
+    "memory_used_mib",
+)
+
+# Host-side launch calls, as kineto names the CUPTI runtime and driver
+# callbacks. Triton launches every compiled kernel through the DRIVER entry
+# point cuLaunchKernelEx, so matching only the cudaLaunchKernel family would
+# miss most of an Inductor-compiled decode loop's dispatches — which is the
+# one number the launch-bound decode loop is diagnosed by.
+LAUNCH_EVENT_PREFIXES = (
+    "cudaLaunchKernel",
+    "cudaLaunchCooperativeKernel",
+    "cuLaunchKernel",
+    "cuLaunchCooperativeKernel",
+)
+
+
+def compilation_record(metric) -> dict:
+    """Turn one Dynamo CompilationMetrics row into a reportable record.
+
+    Three different things append to that stream and only one of them is a
+    frame compilation:
+
+    * a forward compile, from ``_dynamo/convert_frame.py``, which is the
+      only writer that fills ``co_name``, and hardcodes ``is_forward=True``;
+    * a lazy backward compile, from ``_aot_autograd/runtime_wrappers.py``,
+      which carries no code object and sets ``is_forward=False``;
+    * a RUNTIME row, from ``_dynamo/utils.py``, billing Triton autotuning or
+      a cudagraph re-record against the compile id that caused it. It also
+      has no code object and sets ``is_forward = not is_backward``.
+
+    So ``co_name is None`` does not mean "backward" — the pair
+    ``(is_runtime, is_forward)`` is what separates them, and conflating the
+    last two inflates compile time by whatever autotuning cost. Fields the
+    writer left unset stay ``None`` here rather than becoming ``0.0``: an
+    absent column and a measured zero are different claims.
+    """
+
+    def seconds(micros: int | None) -> float | None:
+        return None if micros is None else micros / 1e6
+
+    if metric.is_runtime:
+        kind = "runtime"
+        name = f"runtime of {metric.compile_id}"
+    elif metric.is_forward is False:
+        kind = "backward"
+        name = f"backward of {metric.compile_id}"
+    else:
+        kind = "forward"
+        name = metric.co_name or f"compile {metric.compile_id}"
+    return {
+        "compile_id": str(metric.compile_id),
+        "kind": kind,
+        "function": name,
+        "file": metric.co_filename,
+        "line": metric.co_firstlineno,
+        "cache_size": str(metric.cache_size),
+        "is_forward": metric.is_forward,
+        "is_runtime": bool(metric.is_runtime),
+        "recompile_reason": metric.recompile_reason,
+        "seconds": (metric.duration_us or 0) / 1e6,
+        "dynamo_seconds": seconds(metric.dynamo_cumulative_compile_time_us),
+        "aot_seconds": seconds(metric.aot_autograd_cumulative_compile_time_us),
+        "inductor_seconds": seconds(
+            metric.inductor_cumulative_compile_time_us
+        ),
+        "backward_seconds": seconds(metric.backward_cumulative_compile_time_us),
+        "runtime_autotune_seconds": seconds(
+            metric.runtime_triton_autotune_time_us
+        ),
+        "runtime_cudagraph_seconds": seconds(metric.runtime_cudagraphify_time_us),
+    }
+
+
+class InertPhase:
+    """The disabled profiler's phase object.
+
+    One shared instance with empty ``__enter__``/``__exit__`` is what makes
+    ``--profile`` free when it is off: a phase costs one attribute lookup
+    and two empty calls, and nothing is timed, recorded, or synchronized.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exception) -> bool:
+        return False
+
+
+INERT_PHASE = InertPhase()
+
+
+class DisabledProfiler:
+    """Every profiler entry point, doing nothing.
+
+    Call sites stay unconditional rather than wrapped in ``if profiling:``
+    so the profiled and unprofiled control flow cannot drift apart.
+    """
+
+    enabled = False
+
+    def phase(self, name: str) -> InertPhase:
+        return INERT_PHASE
+
+    def worker_span(self, name: str) -> InertPhase:
+        return INERT_PHASE
+
+    def register_artifact(self, name: str, function):
+        return function
+
+    def pool_started(self, step: int) -> None:
+        pass
+
+    def pool_finished(self, step: int, wall_seconds: float) -> dict:
+        return {}
+
+    def close(self) -> dict:
+        return {}
+
+
+class DeviceSampler:
+    """Background ``nvidia-smi`` poller stamped on the profiler's clock.
+
+    Samples carry a ``perf_counter`` stamp taken at READ time rather than
+    nvidia-smi's own wall clock, so they share one monotonic timeline with
+    the phase records and can be sliced per phase without clock conversion.
+
+    Polling is not measuring. nvidia-smi returns whatever NVML last
+    latched, and each field latches on its own schedule: on this device
+    power refreshes about every 500 ms against the default 250 ms poll, so
+    half the readings are copies of the one before. A phase shorter than
+    one refresh can therefore contain nothing but a value formed before it
+    started. ``window`` measures each field's refresh period from the data
+    and reports a field only when enough readings were formed entirely
+    inside the phase; otherwise it withholds that field and says so. A
+    withheld number is better than a stale one attributed to the wrong
+    phase.
+    """
+
+    # Below this many attributable readings a field's distribution is not a
+    # distribution. Three is not principled, it is the smallest count for
+    # which a minimum and a mean say different things.
+    MINIMUM_READINGS = 3
+
+    # A field changing on fewer than this share of polls is quiet, not
+    # slow, and its median gap measures silence instead of a refresh rate.
+    # The live fields here change on 20-50% of polls, and the fallback is
+    # the poll interval, so the boundary is nowhere near either case.
+    QUIET_FRACTION = 0.05
+
+    # The most a field's refresh may be believed to lag the poller. This
+    # device refreshes at 2x the default poll and the bound is 4x, so it
+    # binds only where the median has stopped measuring a refresh rate.
+    MAXIMUM_OVERSAMPLE = 4
+
+    def __init__(self, interval_ms: int, device: torch.device):
+        self.interval_ms = interval_ms
+        self.device = device
+        self.samples: list[tuple[float, tuple[float, ...]]] = []
+        self.error: str | None = None
+        self._process = None
+        self._thread = None
+        self._periods: list[float] | None = None
+        self._periods_at = -1
+
+    def _selector(self) -> list[str]:
+        """Pin nvidia-smi to the training GPU, by UUID.
+
+        Without this every visible GPU emits its own line each tick and idle
+        devices are averaged into the phase summary. The UUID is used rather
+        than an index because nvidia-smi numbers devices physically while
+        CUDA_VISIBLE_DEVICES renumbers them.
+        """
+        if self.device.type != "cuda":
+            return []
+        uuid = getattr(
+            torch.cuda.get_device_properties(self.device), "uuid", None
+        )
+        return ["-i", f"GPU-{uuid}"] if uuid is not None else []
+
+    def start(self) -> None:
+        if self.interval_ms <= 0:
+            self.error = "sampling disabled"
+            return
+        try:
+            self._process = subprocess.Popen(
+                [
+                    "nvidia-smi",
+                    *self._selector(),
+                    "--query-gpu=utilization.gpu,utilization.memory,"
+                    "power.draw,clocks.sm,memory.used",
+                    "--format=csv,noheader,nounits",
+                    f"-lms={self.interval_ms}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as failure:
+            self.error = f"nvidia-smi unavailable: {failure}"
+            return
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
+
+    def _read(self) -> None:
+        for line in self._process.stdout:
+            columns = line.strip().split(", ")
+            if len(columns) != len(DEVICE_SAMPLE_FIELDS):
+                continue
+            try:
+                values = tuple(float(column) for column in columns)
+            except ValueError:
+                continue
+            self.samples.append((time.perf_counter(), values))
+        # nvidia-smi rejecting the selector looks exactly like a quiet GPU
+        # otherwise: stderr goes nowhere and the report shows no samples.
+        if not self.samples and self._process.poll():
+            self.error = (
+                f"nvidia-smi exited {self._process.returncode} without "
+                "producing a sample"
+            )
+
+    def stop(self) -> None:
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def period_ms(self, field: str) -> float:
+        """How often this field actually changes underneath the poller.
+
+        Measured, not assumed, because the fields do not share a schedule.
+        The estimate is the median gap between CHANGES. On this device that
+        reads 500 ms for power, clocks and both utilizations against a
+        250 ms poll, and the gap histogram is a single sharp mode there, so
+        the median is measuring the driver's refresh rather than how often
+        the quantity happens to move.
+
+        A field that changes rarely falls back to the delivered sample
+        spacing instead of taking a median of long quiet stretches. That is
+        not a concession: aliasing is the risk of reporting a value formed
+        outside the phase as the phase's, and a field that barely moves
+        holds the same value inside and out.
+
+        The estimate is clamped into ``[spacing, MAXIMUM_OVERSAMPLE *
+        spacing]``. Below the spacing it would claim a resolution the
+        poller never delivered; far above it, the median has stopped
+        measuring a refresh and started measuring a quiet stretch, and
+        there is no reading of the data that makes an unbounded answer
+        safer than a bounded wrong one. ``spacing`` is the delivered gap,
+        not the requested interval: ``-lms`` is a request, and a starved
+        reader thread that delivers a line a second apart would otherwise
+        have every reading credited with a quarter-second of coverage it
+        does not have.
+
+        Recomputed whenever the series has grown. The first caller is the
+        end of pool 0, whose samples are the least representative in the
+        run -- cold compilation holds the GPU at a flat idle, which reads
+        as a quiet field -- and freezing that answer would set the run's
+        resolution from its worst window.
+        """
+        if self._periods is None or self._periods_at != len(self.samples):
+            self._periods_at = len(self.samples)
+            self._periods = [
+                self._measure_period(position)
+                for position in range(len(DEVICE_SAMPLE_FIELDS))
+            ]
+        return self._periods[DEVICE_SAMPLE_FIELDS.index(field)]
+
+    def spacing_ms(self) -> float:
+        """The gap the poller actually delivered, in milliseconds."""
+        gaps = sorted(
+            later - earlier
+            for (earlier, _), (later, _) in zip(self.samples, self.samples[1:])
+        )
+        if not gaps:
+            return float(self.interval_ms)
+        return max(float(self.interval_ms), gaps[len(gaps) // 2] * 1e3)
+
+    def _measure_period(self, index: int) -> float:
+        spacing = self.spacing_ms()
+        changes = [
+            stamp
+            for position, (stamp, values) in enumerate(self.samples)
+            if position > 0
+            and values[index] != self.samples[position - 1][1][index]
+        ]
+        gaps = sorted(
+            later - earlier for earlier, later in zip(changes, changes[1:])
+        )
+        if len(gaps) < 4 or len(changes) < self.QUIET_FRACTION * len(
+            self.samples
+        ):
+            return spacing
+        return min(
+            self.MAXIMUM_OVERSAMPLE * spacing,
+            max(spacing, gaps[len(gaps) // 2] * 1e3),
+        )
+
+    def _readings(
+        self, field: str, windows: list[tuple[float, float]]
+    ) -> list[tuple[float, float]]:
+        """One field's readings that belong to this phase and no other.
+
+        The driver refreshes the field every ``period``, so a reading
+        stamped ``t`` was latched somewhere in ``[t - period, t]``. It is
+        admitted only when that whole interval falls inside one occurrence,
+        which is what keeps a value formed before the phase from being
+        reported as the phase's.
+
+        Admitted samples are then thinned to one per period, since polling
+        faster than the refresh re-reads the same latch. A changed value is
+        always kept: a change proves a new latch regardless of the clock.
+
+        Returns ``(seconds_covered, value)`` pairs rather than bare values.
+        A reading covers one refresh period, EXCEPT where a change let it
+        through early, and only the caller that turns readings into seconds
+        can tell the difference. Charging every reading a whole period once
+        reported more seconds below the power floor than the phase lasted.
+        """
+        index = DEVICE_SAMPLE_FIELDS.index(field)
+        period = self.period_ms(field) / 1e3
+        readings: list[tuple[float, float]] = []
+        previous: float | None = None
+        admitted = float("-inf")
+        for stamp, values in self.samples:
+            value = values[index]
+            changed = value != previous
+            previous = value
+            formed = any(
+                started <= stamp - period and stamp <= ended
+                for started, ended in windows
+            )
+            if formed and (changed or stamp - admitted >= period):
+                readings.append((min(period, stamp - admitted), value))
+                admitted = stamp
+        return readings
+
+    def window(
+        self, windows: list[tuple[float, float]], power_floor: float
+    ) -> dict:
+        """Power and clock statistics pooled over one phase's occurrences.
+
+        Deliberately not a mean of per-occurrence means. A power collapse
+        lasting a few hundred milliseconds inside a ten-second decode phase
+        moves the mean by a couple of watts and disappears; the minimum
+        and the seconds spent under the floor are what make it a line
+        item. There is no percentile column: at a 500 ms refresh even a
+        ten-second phase yields about twenty readings, and a twentieth of
+        twenty is the minimum under another name. Readings are pooled across occurrences so
+        four decode chunks are one distribution, not four averages.
+
+        Fields are reported independently. A short phase usually keeps its
+        utilization numbers and loses its power numbers, because those two
+        refresh at different rates, and reporting the pair as though they
+        were equally well measured is what made a one-sample phase look
+        like a measurement.
+        """
+        # Nothing sampled at all is not the same claim as sampled and
+        # withheld, and a run on a device with no sampler should not report
+        # every field as suppressed.
+        if not self.samples:
+            return {}
+        drawn = self._readings("power_draw_watts", windows)
+        clocked = self._readings("clocks_sm_mhz", windows)
+        used = self._readings("utilization_gpu_percent", windows)
+        power = sorted(watts for _, watts in drawn)
+        clocks = sorted(mhz for _, mhz in clocked)
+        utilization = [percent for _, percent in used]
+        stats: dict = {}
+        withheld = []
+        for field, readings in (
+            ("power_draw_watts", power),
+            ("clocks_sm_mhz", clocks),
+            ("utilization_gpu_percent", utilization),
+        ):
+            if len(readings) < self.MINIMUM_READINGS:
+                withheld.append(field)
+            else:
+                stats[f"{field}_period_ms"] = self.period_ms(field)
+                stats[f"{field}_readings"] = len(readings)
+        if "power_draw_watts_readings" in stats:
+            stats.update(
+                {
+                    "power_draw_watts_mean": sum(power) / len(power),
+                    "power_draw_watts_min": power[0],
+                    "power_draw_watts_max": power[-1],
+                    # Seconds, not a count: comparable across phases of
+                    # different lengths and answerable against the phase's
+                    # own wall, which it can no longer exceed because each
+                    # reading is charged only the span it covers.
+                    "seconds_below_power_floor": sum(
+                        covered
+                        for covered, watts in drawn
+                        if watts < power_floor
+                    ),
+                }
+            )
+        if "clocks_sm_mhz_readings" in stats:
+            stats["clocks_sm_mhz_mean"] = sum(clocks) / len(clocks)
+            stats["clocks_sm_mhz_min"] = clocks[0]
+        if "utilization_gpu_percent_readings" in stats:
+            stats["utilization_gpu_percent_mean"] = sum(utilization) / len(
+                utilization
+            )
+        if withheld:
+            stats["withheld"] = withheld
+        return stats
+
+
+class SyncDetector:
+    """Blocking host syncs, believed only after positive controls pass.
+
+    ``set_sync_debug_mode("warn")`` reports each blocking synchronization as
+    a Python warning located at the calling line. The detector first trips
+    three syncs it knows must fire and refuses to report anything unless it
+    caught all three: a broken detector and a sync-free window look
+    identical otherwise, which is how an earlier investigation came to
+    report a host sync from a process that was running on CPU.
+
+    One known blind spot, reported alongside the counts rather than left for
+    someone to trip over: torch installs its warning handler per thread, so
+    a sync raised on an autograd backward worker never reaches this hook.
+    Absence of a site here is not proof that the thread is sync-free.
+    """
+
+    # c10 emits "called a synchronizing CUDA operation" through PyErr_WarnEx
+    # with stacklevel 1, so the warning lands on the caller's own line.
+    SYNC_MESSAGE = "called a synchronizing CUDA operation"
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.sites: dict[str, int] = {}
+        self.controls_passed = False
+        self.control_detail: dict[str, bool] = {}
+        self._active = False
+        self._previous_showwarning = None
+        self._previous_filters = None
+
+    def _install(self) -> None:
+        self._previous_showwarning = warnings.showwarning
+        self._previous_filters = warnings.filters[:]
+        fallback = self._previous_showwarning
+
+        def record(message, category, filename, lineno, file=None, line=None):
+            if self.SYNC_MESSAGE in str(message):
+                key = f"{filename}:{lineno}"
+                self.sites[key] = self.sites.get(key, 0) + 1
+            else:
+                fallback(message, category, filename, lineno, file, line)
+
+        warnings.showwarning = record
+        # The sync warning repeats from one location every call, and the
+        # default once-per-location filter would collapse a hot loop's
+        # thousands of syncs into a single report. Restored on the way out:
+        # the filter list is process-global state this must not leak.
+        warnings.simplefilter("always")
+
+    def _restore(self) -> None:
+        if self._previous_showwarning is not None:
+            warnings.showwarning = self._previous_showwarning
+            self._previous_showwarning = None
+        if self._previous_filters is not None:
+            warnings.filters[:] = self._previous_filters
+            warnings._filters_mutated()
+            self._previous_filters = None
+
+    def run_controls(self) -> None:
+        if self.device.type != "cuda":
+            self.control_detail = {"cuda_device": False}
+            return
+        probe = torch.ones(4, device=self.device)
+        self._install()
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            for name, call in (
+                ("item", lambda: probe.sum().item()),
+                ("cpu", lambda: probe.cpu()),
+                ("bool_any", lambda: bool(probe.any())),
+            ):
+                before = sum(self.sites.values())
+                call()
+                self.control_detail[name] = sum(self.sites.values()) > before
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+            self._restore()
+        self.sites.clear()
+        self.controls_passed = all(self.control_detail.values())
+
+    def enable(self) -> None:
+        if not self.controls_passed or self._active:
+            return
+        self._install()
+        torch.cuda.set_sync_debug_mode("warn")
+        self._active = True
+
+    def disable(self) -> None:
+        if not self._active:
+            return
+        torch.cuda.set_sync_debug_mode("default")
+        self._restore()
+        self._active = False
+
+    def report(self) -> dict:
+        if not self.controls_passed:
+            return {
+                "trusted": False,
+                "reason": "positive controls did not all trip, so an empty "
+                "result would be indistinguishable from a broken detector",
+                "controls": self.control_detail,
+                "sites": [],
+                "total": 0,
+            }
+        ranked = sorted(self.sites.items(), key=lambda entry: -entry[1])
+        return {
+            "trusted": True,
+            "controls": self.control_detail,
+            "blind_spot": "torch's warning handler is per thread, so syncs "
+            "on autograd backward workers are not counted here",
+            "sites": [
+                {"location": location, "count": count}
+                for location, count in ranked
+            ],
+            "total": sum(self.sites.values()),
+        }
+
+
+class RunProfiler:
+    """Per-phase accounting for one profiling run.
+
+    Three properties this exists to provide, none of which the hand-rolled
+    ``pool_*_seconds`` counters it supplements had:
+
+    - Phases nest, and each one reports SELF time (its wall minus its
+      children's). Root self times plus one explicit ``unaccounted`` row
+      equal the pool wall time by construction, so work that no phase covers
+      shows up as a remainder instead of hiding inside a plausible number.
+    - Phase timing takes no barrier. Host time comes from ``perf_counter``
+      and device time from a CUDA event pair resolved ONCE per pool, so
+      measuring a phase does not drain the pipeline into it.
+    - A blocking host sync is a line item attributed to a source location
+      rather than silently folded into whatever phase it lands in.
+    """
+
+    enabled = True
+
+    def __init__(
+        self,
+        output: Path,
+        device: torch.device,
+        args: argparse.Namespace,
+    ):
+        self.directory = output / "profile"
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.device = device
+        self.args = args
+        self._path: list[str] = []
+        self._records: list[dict] = []
+        self._events: list[tuple[tuple[str, ...], object, object]] = []
+        self._worker_spans: list[tuple[str, float, float]] = []
+        self._call_counts: dict[str, int] = {}
+        self._calls_before_pool: dict[str, int] = {}
+        self._compile_seconds: dict[str, float] = {}
+        self._runtime_seconds: dict[str, float] = {}
+        self._seen_compilations: set[tuple] = set()
+        self._before_pool: list[dict] = []
+        self._memory_before: dict = {}
+        self._kernels: dict | None = None
+        self._torch_profile = None
+        self._closed = False
+        self.pools: list[dict] = []
+        self.pool_index = 0
+
+        # The compilation metrics deque is bounded (64 by default) and evicts
+        # silently, so without raising it a profiled run would drop the
+        # earliest compilations, which are the ones worth seeing.
+        torch._dynamo.utils.set_compilation_metrics_limit(
+            max(args.profile_compile_records, 64)
+        )
+        # Anything already compiled before this object existed belongs to
+        # whoever compiled it, not to this run's accounting.
+        self._new_compilations()
+        self.sampler = DeviceSampler(args.profile_device_interval_ms, device)
+        self.sampler.start()
+        self.sync_detector = SyncDetector(device)
+        self.sync_detector.run_controls()
+        # The sampler owns a child process and sync debug mode is global
+        # state; a run that ends by raising must still release both, and a
+        # partial profile is worth printing.
+        atexit.register(self.close)
+
+    @contextmanager
+    def phase(self, name: str):
+        self._path.append(name)
+        path = tuple(self._path)
+        start_event = None
+        if self.device.type == "cuda":
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            ended = time.perf_counter()
+            if start_event is not None:
+                end_event = torch.cuda.Event(enable_timing=True)
+                end_event.record()
+                self._events.append((path, start_event, end_event))
+            self._records.append(
+                {"path": path, "started": started, "ended": ended}
+            )
+            self._path.pop()
+
+    @contextmanager
+    def worker_span(self, name: str):
+        """Time a region running on a background worker thread.
+
+        Kept out of the phase tree: a worker span overlaps whatever
+        main-thread phase is open, so summing it in would break the
+        reconciliation. It is reported per phase as overlap instead.
+        ``list.append`` is the only shared mutation, which the GIL makes
+        atomic, so this needs no lock.
+        """
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._worker_spans.append(
+                (name, started, time.perf_counter())
+            )
+
+    def register_artifact(self, name: str, function):
+        """Count calls into a compiled artifact so its compile time can be
+        priced against its use. An artifact that is compiled and never
+        called is pure cost, and this run has had one."""
+        if function is None:
+            return None
+        self._call_counts[name] = 0
+
+        def counted(*call_args, **call_kwargs):
+            self._call_counts[name] += 1
+            return function(*call_args, **call_kwargs)
+
+        return counted
+
+    def pool_started(self, step: int) -> None:
+        self._records.clear()
+        self._events.clear()
+        self._worker_spans.clear()
+        self._kernels = None
+        # Allocator counters, read as a per-pool delta. An allocation retry
+        # flushes the cache and synchronizes every stream, which presents
+        # exactly as a power collapse and costs nothing to rule in or out.
+        self._memory_before = (
+            torch.cuda.memory_stats() if self.device.type == "cuda" else {}
+        )
+        # Drained here as well as at pool end so cold compilation — step-0
+        # eval, the value-warmup loop, everything before the first pool — is
+        # reported in its own bucket instead of being billed to pool 0, whose
+        # own wall time it can exceed.
+        self._before_pool = self._new_compilations()
+        # Snapshot rather than zero: close() reports run totals from the same
+        # counters, and a pool's figure is the delta against this.
+        self._calls_before_pool = dict(self._call_counts)
+        if self._path:
+            raise RuntimeError(
+                f"profile phase stack left open across pools: {self._path}"
+            )
+        # Each instrument gets its own pool. Sync detection raises a Python
+        # warning per blocking call, which would both distort a kineto trace
+        # and be distorted by one, so it runs on the pools AFTER the traced
+        # window rather than sharing them.
+        traced_from = self.args.profile_skip_pools
+        sync_from = traced_from + self.args.profile_pools
+        if sync_from <= self.pool_index < sync_from + self.args.profile_sync_pools:
+            self.sync_detector.enable()
+        if traced_from <= self.pool_index < sync_from:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if self.device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            # A fresh profile per pool rather than one scheduled window:
+            # kernel launch counts are only meaningful attributed to a single
+            # pool, and torch's schedule() spends a whole pool on warmup
+            # between active windows.
+            self._torch_profile = torch.profiler.profile(
+                activities=activities,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=self.args.profile_stack,
+            )
+            self._torch_profile.start()
+
+    def _device_seconds(self) -> dict[tuple[str, ...], float]:
+        if not self._events:
+            return {}
+        # The one barrier this profiler takes, once per pool and only under
+        # the flag: elapsed_time is undefined until both events complete.
+        torch.cuda.synchronize()
+        totals: dict[tuple[str, ...], float] = {}
+        for path, start_event, end_event in self._events:
+            totals[path] = totals.get(path, 0.0) + (
+                start_event.elapsed_time(end_event) / 1e3
+            )
+        return totals
+
+    def _summarize_kernels(self) -> dict:
+        """Top kernels by device time, and the launch count two ways.
+
+        Device-side kernel invocations and host-side ``cudaLaunchKernel``
+        calls answer different questions and may disagree; a launch-bound
+        loop is diagnosed by the host-side number.
+        """
+        profile, self._torch_profile = self._torch_profile, None
+        if profile is None:
+            return {}
+        profile.stop()
+        # Measured on this trainer: one pool is 1.03M device launches, and
+        # its Chrome trace is 2.3 GB — past what Perfetto will open, and the
+        # launch counts and kernel ranking come from key_averages anyway.
+        # So the export is opt-in and the counts are not.
+        trace = None
+        exported = None
+        if self.args.profile_trace:
+            trace = self.directory / f"trace_pool_{self.pool_index}.json"
+            try:
+                profile.export_chrome_trace(str(trace))
+                exported = trace.stat().st_size
+            except (OSError, MemoryError, RuntimeError) as failure:
+                return {"trace": str(trace), "error": f"export: {failure}"}
+        try:
+            averages = profile.key_averages()
+        except (AssertionError, MemoryError, RuntimeError) as failure:
+            return {
+                "trace": str(trace) if trace else None,
+                "trace_bytes": exported,
+                "error": f"key_averages: {failure}",
+            }
+        kernels = []
+        device_launches = 0
+        host_launches = 0
+        for entry in averages:
+            if getattr(entry, "device_type", None) == (
+                torch.autograd.DeviceType.CUDA
+            ):
+                device_launches += entry.count
+                kernels.append(
+                    {
+                        "name": entry.key,
+                        "count": entry.count,
+                        "device_seconds": (
+                            getattr(entry, "self_device_time_total", 0) or 0
+                        )
+                        / 1e6,
+                    }
+                )
+            elif entry.key.startswith(LAUNCH_EVENT_PREFIXES):
+                host_launches += entry.count
+        kernels.sort(key=lambda kernel: -kernel["device_seconds"])
+        return {
+            "trace": str(trace) if trace else None,
+            "trace_bytes": exported,
+            "device_kernel_launches": device_launches,
+            "host_cuda_launch_calls": host_launches,
+            "total_device_seconds": sum(
+                kernel["device_seconds"] for kernel in kernels
+            ),
+            "top_kernels": kernels[: self.args.profile_top_kernels],
+        }
+
+    def _new_compilations(self) -> list[dict]:
+        fresh = []
+        for metric in torch._dynamo.utils.get_compilation_metrics():
+            key = (
+                str(metric.compile_id),
+                metric.co_name,
+                metric.is_forward,
+                metric.is_runtime,
+                metric.start_time_us,
+            )
+            if key in self._seen_compilations:
+                continue
+            self._seen_compilations.add(key)
+            fresh.append(compilation_record(metric))
+        return fresh
+
+    def _bill_compilations(self, entries: list[dict]) -> None:
+        """Add records to the run totals, keeping the two kinds apart.
+
+        Compile time is charged to the frame, which is what a fix targets.
+        Runtime autotuning and cudagraph re-records have no frame, so they
+        are charged to the compile id that provoked them.
+        """
+        for entry in entries:
+            if entry["kind"] == "runtime":
+                self._runtime_seconds[entry["compile_id"]] = (
+                    self._runtime_seconds.get(entry["compile_id"], 0.0)
+                    + entry["seconds"]
+                )
+            else:
+                self._compile_seconds[entry["function"]] = (
+                    self._compile_seconds.get(entry["function"], 0.0)
+                    + entry["seconds"]
+                )
+
+    def _allocator_delta(self) -> dict:
+        """Allocator events this pool caused.
+
+        ``num_alloc_retries`` is the one to watch: a retry empties the
+        caching allocator and synchronizes every stream, which is a
+        device-wide stall that looks like nothing else in the phase table.
+        """
+        if self.device.type != "cuda":
+            return {}
+        after = torch.cuda.memory_stats()
+        return {
+            counter: after.get(counter, 0)
+            - self._memory_before.get(counter, 0)
+            for counter in (
+                "num_alloc_retries",
+                "num_ooms",
+                "num_device_alloc",
+                "num_device_free",
+                "num_sync_all_streams",
+            )
+        }
+
+    def pool_finished(self, step: int, wall_seconds: float) -> dict:
+        if self._path:
+            raise RuntimeError(
+                f"profile phase stack still open at pool end: {self._path}"
+            )
+        self.sync_detector.disable()
+        kernels = self._summarize_kernels()
+        device_seconds = self._device_seconds()
+        walls: dict[tuple[str, ...], float] = {}
+        counts: dict[tuple[str, ...], int] = {}
+        windows: dict[tuple[str, ...], list[tuple[float, float]]] = {}
+        for record in self._records:
+            path = record["path"]
+            walls[path] = walls.get(path, 0.0) + (
+                record["ended"] - record["started"]
+            )
+            counts[path] = counts.get(path, 0) + 1
+            windows.setdefault(path, []).append(
+                (record["started"], record["ended"])
+            )
+        # Worker spans overlap main-thread phases by construction, so they
+        # are reported alongside a phase rather than summed into the tree.
+        # The quantity that matters is worker CPU running INSIDE decode: the
+        # decode loop is launch-bound, and a worker holding the GIL there
+        # stops the host from launching and drains the GPU.
+        worker_seconds: dict[tuple[str, ...], float] = {}
+        for path, spans in windows.items():
+            worker_seconds[path] = sum(
+                max(0.0, min(ended, worker_ended) - max(started, worker_started))
+                for _, worker_started, worker_ended in self._worker_spans
+                for started, ended in spans
+            )
+        # Depth-first, siblings by descending wall time. The report indents by
+        # depth, so any order that separates a phase from its parent prints a
+        # tree that lies about who owns what.
+        def tree_order(path: tuple[str, ...]) -> tuple:
+            return tuple(
+                (-walls[path[: depth + 1]], path[depth])
+                for depth in range(len(path))
+            )
+
+        phases = []
+        for path in sorted(walls, key=tree_order):
+            children = sum(
+                wall
+                for other, wall in walls.items()
+                if len(other) == len(path) + 1 and other[: len(path)] == path
+            )
+            phases.append(
+                {
+                    "path": list(path),
+                    "name": path[-1],
+                    "depth": len(path) - 1,
+                    "count": counts[path],
+                    "wall_seconds": walls[path],
+                    "self_seconds": walls[path] - children,
+                    "device_seconds": device_seconds.get(path),
+                    "worker_seconds": worker_seconds.get(path, 0.0),
+                    # On the same perf_counter clock as device_samples.json,
+                    # so the raw power series can be sliced by phase offline.
+                    "windows": windows[path],
+                    "device": self.sampler.window(
+                        windows[path], self.args.profile_power_floor
+                    ),
+                }
+            )
+        roots = sum(wall for path, wall in walls.items() if len(path) == 1)
+        unaccounted = wall_seconds - roots
+        if unaccounted < -1e-6:
+            raise RuntimeError(
+                "profile phase tree is broken: root phases total "
+                f"{roots:.3f} s inside a {wall_seconds:.3f} s pool"
+            )
+        before_pool, self._before_pool = self._before_pool, []
+        compilations = self._new_compilations()
+        self._bill_compilations(before_pool + compilations)
+        pool = {
+            "schema": PROFILE_SCHEMA,
+            "pool_index": self.pool_index,
+            "step": step,
+            "wall_seconds": wall_seconds,
+            "phases": phases,
+            "unaccounted_seconds": unaccounted,
+            "unaccounted_fraction": (
+                unaccounted / wall_seconds if wall_seconds else 0.0
+            ),
+            "reconciled": unaccounted
+            <= self.args.profile_reconcile_tolerance * max(wall_seconds, 1e-9),
+            # Split so "did this pool compile anything?" has an answer that
+            # cold startup cannot contaminate. Steady state means both lists
+            # hold no record of kind "forward" or "backward" from some pool
+            # onwards. Runtime records are NOT part of that test: a
+            # reduce-overhead artifact re-records its cudagraph whenever the
+            # pool it captured against is invalidated, which can happen at
+            # any point in a perfectly converged run.
+            "compilations_before_pool": before_pool,
+            "compilations": compilations,
+            "compile_seconds": sum(
+                entry["seconds"]
+                for entry in before_pool + compilations
+                if entry["kind"] != "runtime"
+            ),
+            "runtime_seconds": sum(
+                entry["seconds"]
+                for entry in before_pool + compilations
+                if entry["kind"] == "runtime"
+            ),
+            "artifact_calls": {
+                name: count - self._calls_before_pool.get(name, 0)
+                for name, count in self._call_counts.items()
+            },
+            "kernels": kernels,
+            "allocator": self._allocator_delta(),
+            "worker_seconds_total": sum(
+                ended - started for _, started, ended in self._worker_spans
+            ),
+        }
+        self.pools.append(pool)
+        (self.directory / f"pool_{self.pool_index}.json").write_text(
+            json.dumps(pool, indent=2)
+        )
+        if not pool["reconciled"]:
+            print(
+                f"WARNING profile pool {self.pool_index}: "
+                f"{unaccounted:.3f} s of {wall_seconds:.3f} s "
+                f"({100.0 * pool['unaccounted_fraction']:.1f}%) is covered by "
+                "no phase; the accounting is not closed",
+                flush=True,
+            )
+        self.pool_index += 1
+        return pool
+
+    def close(self) -> dict:
+        if self._closed:
+            return {}
+        self._closed = True
+        if self._torch_profile is not None:
+            self._torch_profile.stop()
+            self._torch_profile = None
+        self.sampler.stop()
+        self.sync_detector.disable()
+        # A run whose modes exit before the pool loop (--bench-only,
+        # --bpb-only, --rollout-only) still compiles, and so does anything
+        # after the last pool. Without this drain those compilations are
+        # simply never reported.
+        outside_pools = self._before_pool + self._new_compilations()
+        self._bill_compilations(outside_pools)
+        summary = {
+            "schema": PROFILE_SCHEMA,
+            "pools": self.pools,
+            "compilations_outside_pools": outside_pools,
+            "syncs": self.sync_detector.report(),
+            "artifact_calls": dict(self._call_counts),
+            "compile_seconds_by_function": dict(self._compile_seconds),
+            "runtime_seconds_by_compile_id": dict(self._runtime_seconds),
+            "dead_artifacts": [
+                name for name, calls in self._call_counts.items() if not calls
+            ],
+            "device_sampler_error": self.sampler.error,
+            "device_samples": len(self.sampler.samples),
+            # The poll interval is a request; these are what the driver
+            # actually delivered, and they are the reason a short phase
+            # reports no power.
+            "device_sample_period_ms": {
+                field: self.sampler.period_ms(field)
+                for field in DEVICE_SAMPLE_FIELDS
+            },
+        }
+        (self.directory / "profile_summary.json").write_text(
+            json.dumps(summary, indent=2)
+        )
+        # The raw series, not just its per-phase digest. A periodic collapse
+        # is defined by its period, and no summary statistic carries that;
+        # at a quarter-second interval a whole run is a few thousand rows.
+        (self.directory / "device_samples.json").write_text(
+            json.dumps(
+                {
+                    "fields": ["perf_counter", *DEVICE_SAMPLE_FIELDS],
+                    "samples": [
+                        [stamp, *values] for stamp, values in self.sampler.samples
+                    ],
+                }
+            )
+        )
+        print(format_profile_summary(summary), flush=True)
+        return summary
+
+
+@contextmanager
+def device_timed(sink: list):
+    """Time a device region with a CUDA event pair instead of a barrier.
+
+    A host wall clock around an asynchronous region measures launch cost,
+    and making it measure device time needs a ``synchronize`` that drains
+    the pipeline into the very region being timed. The pair is recorded on
+    the stream and read later, after a barrier the caller already takes.
+    """
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    try:
+        yield
+    finally:
+        end_event.record()
+        sink.append((start_event, end_event))
+
+
+def elapsed_seconds(events: list) -> float:
+    """Total device seconds over recorded pairs.
+
+    Waits on each end event rather than requiring the caller to have taken a
+    barrier: elapsed_time raises on an event that has not completed, and
+    where a barrier has already happened this returns immediately.
+    """
+    total = 0.0
+    for start_event, end_event in events:
+        end_event.synchronize()
+        total += start_event.elapsed_time(end_event)
+    return total / 1e3
+
+
+def format_compile_split(entry: dict) -> str:
+    """Render only the sub-timings the writer actually filled in.
+
+    A runtime record has no dynamo or inductor column and a forward has no
+    autotune column; printing the absent ones as ``0.00`` reads as a
+    measurement rather than as silence.
+    """
+    parts = [
+        (label, entry[field])
+        for label, field in (
+            ("dynamo", "dynamo_seconds"),
+            ("aot", "aot_seconds"),
+            ("inductor", "inductor_seconds"),
+            ("backward", "backward_seconds"),
+            ("autotune", "runtime_autotune_seconds"),
+            ("cudagraph", "runtime_cudagraph_seconds"),
+        )
+        if entry.get(field) is not None
+    ]
+    return (
+        " / ".join(f"{label} {value:.2f}" for label, value in parts)
+        if parts
+        else "no sub-timings reported"
+    )
+
+
+def format_profile_summary(summary: dict) -> str:
+    """End-of-run table. Plain text so it survives the job log."""
+    lines = ["", "=" * 96, "PROFILE SUMMARY", "=" * 96]
+    for pool in summary["pools"]:
+        records = pool["compilations_before_pool"] + pool["compilations"]
+        compiles = [entry for entry in records if entry["kind"] != "runtime"]
+        lines.append(
+            f"\npool {pool['pool_index']} (actor step {pool['step']}): "
+            f"{pool['wall_seconds']:.3f} s wall, "
+            f"{pool['compile_seconds']:.3f} s compiling in "
+            f"{len(compiles)} compilations, "
+            f"{pool['runtime_seconds']:.3f} s in "
+            f"{len(records) - len(compiles)} runtime records"
+        )
+        lines.append(
+            f"  {'phase':<30}{'n':>5}{'wall s':>9}{'self s':>9}{'% pool':>8}"
+            f"{'gpu s':>9}{'wrkr s':>8}{'W mean':>8}{'W min':>7}"
+            f"{'s<flr':>7}{'MHz':>6}"
+        )
+        for phase in pool["phases"]:
+            label = "  " * phase["depth"] + phase["name"]
+            share = 100.0 * phase["self_seconds"] / max(pool["wall_seconds"], 1e-9)
+            device = phase["device_seconds"]
+            sampled = phase["device"]
+
+            def column(name: str, digits: int = 0, width: int = 7) -> str:
+                value = sampled.get(name)
+                text = "-" if value is None else f"{value:.{digits}f}"
+                return f"{text:>{width}}"
+
+            lines.append(
+                f"  {label:<30}{phase['count']:>5}"
+                f"{phase['wall_seconds']:>9.3f}{phase['self_seconds']:>9.3f}"
+                f"{share:>8.1f}"
+                f"{(f'{device:.3f}' if device is not None else '-'):>9}"
+                f"{phase['worker_seconds']:>8.2f}"
+                + column("power_draw_watts_mean", width=8)
+                + column("power_draw_watts_min")
+                + column("seconds_below_power_floor", digits=1)
+                + column("clocks_sm_mhz_min", width=6)
+            )
+        flag = "" if pool["reconciled"] else "  <-- NOT CLOSED"
+        lines.append(
+            f"  {'unaccounted':<30}{'':>5}{'':>9}"
+            f"{pool['unaccounted_seconds']:>9.3f}"
+            f"{100.0 * pool['unaccounted_fraction']:>8.1f}{flag}"
+        )
+        # A phase total hides a stall. Four refreshes averaging 4.5 s and
+        # three refreshes at 0.7 s plus one at 16 s are the same row above,
+        # and only the second is worth chasing. Printed with the start
+        # stamp because device_samples.json shares this clock, so an
+        # outlier can be looked up against power and clocks directly.
+        for phase in pool["phases"]:
+            spans = [ended - started for started, ended in phase["windows"]]
+            if len(spans) < 2:
+                continue
+            longest = max(spans)
+            # Twice the mean of the OTHER occurrences. Comparing against the
+            # mean of all of them buries the outlier in its own average: at
+            # two occurrences no span can reach twice a mean it is half of,
+            # so the one case this is for -- 0.7 s and then 16 s -- would
+            # never print.
+            if longest < 1.0 or longest * (len(spans) - 1) < 2.0 * (
+                sum(spans) - longest
+            ):
+                continue
+            started = max(phase["windows"], key=lambda pair: pair[1] - pair[0])[0]
+            lines.append(
+                f"    uneven: {'.'.join(phase['path'])} longest occurrence "
+                f"{longest:.3f} s of {phase['wall_seconds']:.3f} s over "
+                f"{len(spans)}, started {started:.3f}"
+            )
+        allocator = pool["allocator"]
+        if any(allocator.values()):
+            lines.append(
+                "    allocator this pool: "
+                + ", ".join(
+                    f"{counter.removeprefix('num_')}={value}"
+                    for counter, value in allocator.items()
+                    if value
+                )
+            )
+        for label, entries in (
+            ("before pool", pool["compilations_before_pool"]),
+            ("in pool", pool["compilations"]),
+        ):
+            lines.extend(
+                f"    {entry['kind']} ({label}) {entry['function']}:"
+                f"{entry['line']} {entry['seconds']:.2f} s "
+                f"({format_compile_split(entry)}) cache_size="
+                f"{entry['cache_size']} reason="
+                f"{entry['recompile_reason'] or 'first compile'}"
+                for entry in entries
+            )
+        kernels = pool["kernels"]
+        if kernels and "error" not in kernels:
+            lines.append(
+                f"    kernel launches: {kernels['device_kernel_launches']} "
+                f"device-side, {kernels['host_cuda_launch_calls']} host "
+                f"launch calls; {kernels['total_device_seconds']:.3f} s "
+                "total device time"
+                + (
+                    f"; trace {kernels['trace_bytes'] / 2**20:.0f} MiB"
+                    if kernels.get("trace_bytes")
+                    else ""
+                )
+            )
+            for kernel in kernels["top_kernels"]:
+                lines.append(
+                    f"      {kernel['device_seconds']:8.3f} s "
+                    f"x{kernel['count']:<9} {kernel['name'][:56]}"
+                )
+        elif kernels:
+            lines.append(f"    kernel summary failed: {kernels['error']}")
+    outside = summary["compilations_outside_pools"]
+    if outside:
+        lines.append(
+            f"\n{len(outside)} compilations outside any pool "
+            "(startup, evaluation, or after the last pool):"
+        )
+        for entry in outside:
+            lines.append(
+                f"  {entry['kind']} {entry['function']}:{entry['line']} "
+                f"{entry['seconds']:.2f} s reason="
+                f"{entry['recompile_reason'] or 'first compile'}"
+            )
+    calls = summary["artifact_calls"]
+    if calls:
+        lines.append("\ncompiled artifact calls over the run:")
+        for name, count in sorted(calls.items()):
+            note = "  <-- NEVER CALLED; its compile time is waste" if not count else ""
+            lines.append(f"  {name:<40}{count:>12}{note}")
+    compiles = summary["compile_seconds_by_function"]
+    if compiles:
+        lines.append("\ncompile seconds by frame:")
+        for name, seconds in sorted(compiles.items(), key=lambda item: -item[1]):
+            lines.append(f"  {name:<40}{seconds:>12.2f}")
+    runtimes = summary["runtime_seconds_by_compile_id"]
+    if runtimes:
+        lines.append(
+            "\nruntime seconds (Triton autotuning and cudagraph re-records,"
+            " charged to the compile id that caused them):"
+        )
+        for name, seconds in sorted(runtimes.items(), key=lambda item: -item[1]):
+            lines.append(f"  {name:<40}{seconds:>12.2f}")
+    syncs = summary["syncs"]
+    lines.append("\nblocking host syncs:")
+    if not syncs["trusted"]:
+        lines.append(f"  NOT REPORTED: {syncs['reason']}")
+        lines.append(f"  positive controls: {syncs['controls']}")
+    else:
+        lines.append(f"  positive controls all tripped: {syncs['controls']}")
+        lines.append(
+            f"  {syncs['total']} blocking syncs over the sampled pools"
+        )
+        for site in syncs["sites"][:20]:
+            lines.append(f"    {site['count']:>9}  {site['location']}")
+        lines.append(f"  blind spot: {syncs['blind_spot']}")
+    if summary["device_sampler_error"]:
+        lines.append(f"\ndevice sampler: {summary['device_sampler_error']}")
+    else:
+        lines.append(f"\ndevice samples: {summary['device_samples']}")
+        # With no samples every period is the fallback, and printing those
+        # under "measured" would be the report inventing its own evidence.
+        periods = summary.get("device_sample_period_ms") or {}
+        if periods and summary["device_samples"]:
+            lines.append(
+                "  measured refresh: "
+                + ", ".join(
+                    f"{field} {period:.0f} ms"
+                    for field, period in periods.items()
+                )
+            )
+            lines.append(
+                "  a phase shorter than a field's refresh reports '-' for it "
+                "rather than a value formed before the phase began"
+            )
+    lines.append("=" * 96)
+    return "\n".join(lines)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """The CLI surface, separate from main() so the shipped defaults
     and the argv-level guards are testable without running training."""
@@ -3187,10 +4563,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--trunk-optimizer", choices=("muon", "adamw"), default="muon"
     )
     # Default: --learning-rate scaled by pretraining's Muon:generic-Adam
-    # ratio (0.025 / 0.015). NOTE: at equal nominal LR a Muon step moves each
-    # element ~1/sqrt(model_dim) as far as AdamW, so this default under-moves
-    # the trunk relative to the AdamW baseline; it is the conservative anchor
-    # for the planned LR sweep, not a tuned optimum.
+    # ratio (0.025 / 0.015), then by POLAR_EXPRESS_STEP_COMPENSATION (see the
+    # derivation in validate_args). NOTE: at equal nominal LR a Muon step
+    # moves each element ~1/sqrt(model_dim) as far as AdamW, so this default
+    # under-moves the trunk relative to the AdamW baseline; it is the
+    # conservative anchor for the planned LR sweep, not a tuned optimum.
     parser.add_argument("--muon-learning-rate", type=float, default=None)
     # Defaults to --muon-learning-rate. The critic trunk is from-scratch
     # (genuine pretraining regime), so it may tolerate a higher rate.
@@ -3237,16 +4614,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # unwind through head.weight alone.
     parser.add_argument("--value-prior", type=float, default=0.0)
     # Initialization only: the bounded output of the state-dependent
-    # log-sigma head. Zero-init weights make noise state-independent at step 0;
-    # -3 gives std 0.050 and expected 512-D noise norm 1.13. The fresh
-    # adapter starts at exact zero, so neither exploration nor the fresh mean
-    # enters the recurrent trunk until replay gradients open its affine map.
-    # exp(-3.0) ~= 0.050 per-dim noise: expected noise norm at 512 dims is
-    # 0.050*sqrt(512) ~= 1.13, i.e. ~42% of a 2.7 thought mean norm (~22%
-    # at the observed 5.2 drift ceiling). -2.5 was considered and rejected
-    # (noise norm 1.86 ~= 69% of mean: too much); raising the MEAN head's
-    # init instead is the open alternative if exploration needs more range.
-    parser.add_argument("--thought-log-sigma-init", type=float, default=-3.0)
+    # log-sigma head. Zero-init weights make noise state-independent at step 0.
+    # -2.5 gives std ~0.082 and expected 512-D noise norm ~1.86 (~69% of a 2.7
+    # thought mean norm at gain 0.1). The policy uses the same identity affine
+    # initialization as the critic, so the sampled distribution reaches the
+    # trunk without an extra initial scale or rotation.
+    parser.add_argument("--thought-log-sigma-init", type=float, default=-2.5)
     # Initialization only. The orthogonal map gives an RMS-normalized belief
     # an exactly controlled mean RMS without weakening matrix optimization.
     parser.add_argument("--thought-mean-gain-init", type=float, default=0.1)
@@ -3456,6 +4829,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compile-replay", action=argparse.BooleanOptionalAction, default=True
     )
+    # Duck shaping gives every input dimension that happens to share a VALUE
+    # on the first trace the same symbol. This model is 512 wide and the
+    # rollout batch is rollout_groups * samples_per_prompt = 512, so the
+    # first rollout trace unifies the batch dim with model_dim, the first
+    # rms_norm against a 512-wide parameter then emits Eq(symbol, 512), and
+    # the batch dim is static from then on: the first compaction recompiles.
+    # Eval carries the same hazard at 128 rows against head_dim 128. Turning
+    # duck shaping off costs some extra symbols and guards and removes the
+    # whole class.
+    #
+    # Off by default on the measurement, not the theory: warm 16-step runs
+    # put pool 0 at 37.5 s with it off against 38.4 s on, and the extra
+    # step_core specialization it causes cost 6.4 s of compile plus 3.6 s
+    # of autotune in the run where the cache was cold for it. Steady state
+    # is unchanged rather than better — pool 1 spans 19.9-20.6 s with it on
+    # across three runs and 20.3-20.9 s with it off, pool 2 spans 17.1-17.2
+    # against 17.2-17.6, and those ranges overlap. Kept as a flag because
+    # that is a startup argument, not a throughput one, and a wider model
+    # or a different rollout batch moves which dimensions collide.
+    parser.add_argument(
+        "--duck-shape", action=argparse.BooleanOptionalAction, default=False
+    )
     # Stable length-sorted shards are bounded by B*L^2 attention area rather
     # than a fixed row count. This admits all 32 normal ~150-token rows and
     # automatically isolates rare 1K-4K outliers.
@@ -3561,7 +4956,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--migrate-zero-adapter-resume",
         action="store_true",
         help="explicitly resume a v15 gain-scaled checkpoint while replacing "
-        "only its adapter with the zero-initialized affine and fresh adapter "
+        "only its adapter with the fresh identity affine and fresh adapter "
         "Adam state; entering v20 also requires both migration flags",
     )
     parser.add_argument(
@@ -3573,6 +4968,101 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "on resume)",
     )
     parser.add_argument("--seed", type=int, default=1337)
+    # Profiling. Off by default and costing nothing when off: every call site
+    # runs unconditionally against a disabled profiler whose phase object has
+    # empty enter/exit. A profiled run is not a training run — it takes a
+    # per-pool barrier to resolve CUDA events, runs torch.profiler over whole
+    # pools, and turns on sync debug mode — so --profile is recorded in the
+    # manifest and refuses a long --steps without --profile-force.
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="write a closed per-phase timing breakdown, kernel launch "
+        "counts, compile accounting, host-sync attribution and a GPU power "
+        "trace to <output>/profile; for diagnosis only, never for a run "
+        "whose metrics matter",
+    )
+    parser.add_argument(
+        "--profile-force",
+        action="store_true",
+        help="allow --profile with more than --profile-max-steps steps",
+    )
+    parser.add_argument(
+        "--profile-max-steps",
+        type=int,
+        default=40,
+        help="largest --steps that --profile accepts without --profile-force",
+    )
+    parser.add_argument(
+        "--profile-pools",
+        type=int,
+        default=1,
+        help="pools that get kernel-level accounting: launch counts and the "
+        "top kernels by device time. Measured cost is roughly an eighth of "
+        "the profiled pool, so this is a window, not the whole run",
+    )
+    parser.add_argument(
+        "--profile-trace",
+        action="store_true",
+        help="also write a Chrome trace for each pool in that window; "
+        "measured at 2.3 GB per pool, which is past what Perfetto opens, so "
+        "the launch counts come without it by default",
+    )
+    parser.add_argument(
+        "--profile-skip-pools",
+        type=int,
+        default=1,
+        help="pools to leave untraced first; pool 0 carries compilation and "
+        "allocator growth that no later pool repeats",
+    )
+    parser.add_argument(
+        "--profile-stack",
+        action="store_true",
+        help="record Python stacks in the Chrome trace; multiplies trace size",
+    )
+    parser.add_argument(
+        "--profile-sync-pools",
+        type=int,
+        default=1,
+        help="pools over which to attribute blocking host syncs to a source "
+        "line; the warning path itself is slow, so keep this small. These "
+        "run after the traced pools, so reaching them needs at least "
+        "--profile-skip-pools + --profile-pools + 1 pools",
+    )
+    parser.add_argument(
+        "--profile-top-kernels",
+        type=int,
+        default=20,
+        help="kernels to report per pool, ranked by total device time",
+    )
+    parser.add_argument(
+        "--profile-device-interval-ms",
+        type=int,
+        default=250,
+        help="nvidia-smi sampling interval for the power and utilization "
+        "timeline; 0 disables the sampler",
+    )
+    parser.add_argument(
+        "--profile-power-floor",
+        type=float,
+        default=150.0,
+        help="watts below which the GPU counts as starved; each phase "
+        "reports the seconds it spent there, which a mean hides",
+    )
+    parser.add_argument(
+        "--profile-compile-records",
+        type=int,
+        default=4096,
+        help="compilation metrics to retain; torch's deque holds 64 and "
+        "evicts the earliest silently",
+    )
+    parser.add_argument(
+        "--profile-reconcile-tolerance",
+        type=float,
+        default=0.02,
+        help="fraction of pool wall time allowed to fall outside every phase "
+        "before the run warns that its accounting is not closed",
+    )
     return parser
 
 
@@ -3625,7 +5115,21 @@ def validate_args(
         # Pretraining ran Muon at 0.025 beside the generic AdamW groups at
         # 0.015; carrying that ratio onto the RL rate is the "proportionate"
         # translation of the pretraining recipe.
-        args.muon_learning_rate = args.learning_rate * (0.025 / 0.015)
+        #
+        # POLAR_EXPRESS_STEP_COMPENSATION restores the step size that ratio
+        # was chosen for. Muon now orthogonalizes with modded-nanogpt's Polar
+        # Express, which deliberately stops in a ripple band around the polar
+        # factor instead of converging onto it -- worth about half the step on
+        # a low-rank trunk gradient -- and, following that reference, no
+        # longer scales rectangular updates by max(1, rows/cols)**0.5, costing
+        # the twelve (2048, 512) and (512, 2048) matrices a further 2**0.5.
+        # Without this the orthogonalization swap would silently shrink the
+        # trunk step by ~2.4x, and the ratio above already under-moves it.
+        args.muon_learning_rate = (
+            args.learning_rate
+            * (0.025 / 0.015)
+            * POLAR_EXPRESS_STEP_COMPENSATION
+        )
     if args.critic_muon_learning_rate is None:
         args.critic_muon_learning_rate = args.muon_learning_rate
     for name, value in (
@@ -3778,6 +5282,32 @@ def validate_args(
             "--bench-samples must be at least "
             f"{CAPTURE_SAMPLES_PER_PROBLEM} for automatic answer capture"
         )
+    # A profiled run perturbs what it measures, so it must never be mistaken
+    # for a training run whose numbers are quoted.
+    if args.profile and not args.profile_force:
+        if args.steps > args.profile_max_steps:
+            parser.error(
+                f"--profile with --steps {args.steps} exceeds "
+                f"--profile-max-steps {args.profile_max_steps}; profile a "
+                "short run, or pass --profile-force to accept that this "
+                "run's timings are not comparable to an unprofiled one"
+            )
+    for name, value in (
+        ("--profile-pools", args.profile_pools),
+        ("--profile-skip-pools", args.profile_skip_pools),
+        ("--profile-sync-pools", args.profile_sync_pools),
+        ("--profile-top-kernels", args.profile_top_kernels),
+    ):
+        if value < 0:
+            parser.error(f"{name} must be nonnegative")
+    if args.profile_device_interval_ms < 0:
+        parser.error("--profile-device-interval-ms must be nonnegative")
+    if not 0.0 <= args.profile_reconcile_tolerance <= 1.0:
+        parser.error(
+            "--profile-reconcile-tolerance is a fraction of pool wall time"
+        )
+    if not math.isfinite(args.profile_power_floor) or args.profile_power_floor < 0.0:
+        parser.error("--profile-power-floor must be finite and nonnegative")
 
 
 def main() -> None:
@@ -3981,7 +5511,7 @@ def main() -> None:
                 args.thought_log_sigma_init if args.actor_critic_init else None
             ),
             "fresh_adapter_initialized": bool(args.actor_critic_init),
-            "fresh_adapter_zero_initialized": bool(args.actor_critic_init),
+            "fresh_adapter_identity_initialized": bool(args.actor_critic_init),
         }
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
@@ -4265,10 +5795,10 @@ def main() -> None:
             allow_projected_thought_migration=(
                 args.migrate_projected_thought_resume
             ),
-            allow_thought_reverse_kl_migration=(
-                args.migrate_thought_reverse_kl_resume
-            ),
-        ):
+                allow_thought_reverse_kl_migration=(
+                    args.migrate_thought_reverse_kl_resume
+                ),
+            ):
             raise ValueError(
                 "resume checkpoint execution schema must be "
                 f"{EXECUTION_SCHEMA!r}; "
@@ -4373,6 +5903,13 @@ def main() -> None:
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
         source_execution_schema = payload.get("execution_schema")
+        if source_execution_schema == ZERO_AFFINE_EXECUTION_SCHEMA:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["identity_affine_execution_relabel"] = {
+                "source_execution_schema": source_execution_schema,
+                "target_execution_schema": EXECUTION_SCHEMA,
+                "adapter_state": "preserved",
+            }
         if source_execution_schema == PREVIOUS_EXECUTION_SCHEMA:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["reverse_kl_resume_migration"] = {
@@ -4390,7 +5927,7 @@ def main() -> None:
             }
         if adapter_migration is not None:
             actor_init_provenance = dict(actor_init_provenance or {})
-            actor_init_provenance["zero_adapter_resume_migration"] = (
+            actor_init_provenance["identity_adapter_resume_migration"] = (
                 adapter_migration
             )
         if anchored_value_migration is not None:
@@ -4464,6 +6001,57 @@ def main() -> None:
             flush=True,
         )
 
+    # Built before the first torch.compile so compile accounting starts from
+    # an empty metrics deque, and so every compiled artifact below can be
+    # wrapped in a call counter. When --profile is absent this is the
+    # do-nothing profiler and every profiling call site below is inert.
+    profiler = (
+        RunProfiler(Path(args.output), device, args)
+        if args.profile
+        else DisabledProfiler()
+    )
+
+    # Every compiled graph in this process reaches a fp32 head region —
+    # FreshThoughtMeanHead, StateDependentLogSigmaHead, or
+    # SeparateCritic.value_logits — so all of them carry _enter_autocast
+    # nodes, and AOTAutogradCache refuses to key on an unrecognized
+    # call_function target. It therefore BYPASSED on every process start
+    # (measured: "Bypassing autograd cache due to: Unsupported call_function
+    # target _enter_autocast", 8 bypasses in an 8-step smoke). Inductor's FX
+    # graph cache was already hitting, which is why cold compilation was
+    # ~93% AOTAutograd and only 0.28 s of codegen per graph. Declaring the
+    # two autocast markers cacheable lets the AOT artifact persist across
+    # processes: warm pool-1 replay refresh 18.1 s -> 11.0 s, per-shard
+    # steady state unchanged, and the one-off single-row shard
+    # specialization 7.2 s -> 1.7 s. Sound because the autocast arguments
+    # are constants baked into the graph nodes and hashed with them, and
+    # because bf16 is the only ambient autocast dtype here — the ambient
+    # DTYPE is not part of the cache key, only whether autocast is on.
+    # Declared before the first torch.compile and outside every flag, since
+    # this value is serialized into the on-disk key of EVERY graph: gating
+    # it would make an artifact's key depend on an unrelated flag. Bump the
+    # version string to invalidate every cached artifact.
+    for autocast_marker in (
+        "torch.amp.autocast_mode._enter_autocast",
+        "torch.amp.autocast_mode._exit_autocast",
+    ):
+        torch._inductor.config.unsafe_marked_cacheable_functions[
+            autocast_marker
+        ] = "v1"
+
+    # See the --duck-shape help. Set before the first compile because it
+    # decides how the FIRST trace allocates symbols, which is the only trace
+    # that matters here.
+    torch.fx.experimental._config.use_duck_shape = args.duck_shape
+    # Note for whoever meets a recompile-limit failure here: cache_size_limit
+    # (raised to 64 below) is not the only ceiling. exceeds_recompile_limit
+    # checks accumulated_recompile_limit (default 256) FIRST, and then again
+    # as a backstop on the frame's compile id. Under fullgraph=True either
+    # raises rather than falling back to eager, so it would kill a long run
+    # mid-flight. Deliberately NOT raised: compute_cache_size walks the live
+    # entry list, so invalidated entries do not accumulate there, and the
+    # measured maximum for any frame in this process is 3.
+
     # Rollout and evaluation use the identical dynamic narrow-prefix step.
     # Compile it once: separate wrappers paid the same large cold compilation
     # cost at step-0 eval and again at the first training collect. If eval ever
@@ -4474,11 +6062,14 @@ def main() -> None:
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, 64
         )
-        compiled_generation_step = torch.compile(
-            wrapper.step_core,
-            mode="max-autotune-no-cudagraphs",
-            fullgraph=True,
-            dynamic=True,
+        compiled_generation_step = profiler.register_artifact(
+            "generation_step",
+            torch.compile(
+                wrapper.step_core,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=True,
+                dynamic=True,
+            ),
         )
     rollout_step_core = (
         compiled_generation_step if args.rollout_compile else None
@@ -4501,11 +6092,14 @@ def main() -> None:
             device,
             dtype=torch.bfloat16,
         )
-        rollout_tail_step_core = torch.compile(
-            wrapper.step_core,
-            mode="reduce-overhead",
-            fullgraph=True,
-            dynamic=False,
+        rollout_tail_step_core = profiler.register_artifact(
+            "rollout_tail_step",
+            torch.compile(
+                wrapper.step_core,
+                mode="reduce-overhead",
+                fullgraph=True,
+                dynamic=False,
+            ),
         )
 
     # Preserve the eager function for infrequent no-grad diagnostics. Calling
@@ -4516,23 +6110,38 @@ def main() -> None:
     # Replay compilation is independent of rollout. Dynamic B/L plus bounded
     # 64-token buckets lets one artifact cover the length-aware shard plan;
     # no CUDA graph owns outputs that remain live through eager losses/backward.
+    # Measured, not assumed: one artifact each covers 23 distinct (B, L) shard
+    # shapes and every unseen shape costs 3-26 ms, so the bucket exists to keep
+    # the packed batches compact, NOT to limit compilations. The only shape
+    # that can still recompile is a single-row shard — the framework's 0/1
+    # specialization, guard "2 <= batch.token_ids.size()[0]" — which the
+    # planner emits whenever the row remainder is one. That is one extra
+    # compile per process and torch offers no way to avoid it here:
+    # mark_unbacked makes Inductor's constant folder raise
+    # GuardOnDataDependentSymNode on the row dimension.
     trim_multiple = args.replay_bucket if args.compile_replay else 1
     if args.compile_replay:
         torch._dynamo.config.cache_size_limit = 64
-        critic.value_logits = torch.compile(
-            critic.value_logits,
-            # Length buckets still span many GEMM shapes. Max-autotune
-            # repeatedly stalls training to benchmark each new regime;
-            # default Inductor dispatches them to stable cuBLAS kernels.
-            mode="default",
-            fullgraph=True,
-            dynamic=True,
+        critic.value_logits = profiler.register_artifact(
+            "critic_value_logits",
+            torch.compile(
+                critic.value_logits,
+                # Length buckets still span many GEMM shapes. Max-autotune
+                # repeatedly stalls training to benchmark each new regime;
+                # default Inductor dispatches them to stable cuBLAS kernels.
+                mode="default",
+                fullgraph=True,
+                dynamic=True,
+            ),
         )
-        compiled_replay = torch.compile(
-            replay_head_inputs,
-            mode="default",
-            fullgraph=True,
-            dynamic=True,
+        compiled_replay = profiler.register_artifact(
+            "replay_head_inputs",
+            torch.compile(
+                replay_head_inputs,
+                mode="default",
+                fullgraph=True,
+                dynamic=True,
+            ),
         )
         # Both consumers bound the function by name at import time:
         # update_minibatch through this module's global,
@@ -4572,6 +6181,11 @@ def main() -> None:
         json.dumps(
             {
                 "phase": "latent_vapo_dapo",
+                # Top level, not buried in args: a profiled run's timings are
+                # perturbed by the profiler and must not be quoted as this
+                # configuration's cost.
+                "profiled": bool(args.profile),
+                "profile_schema": PROFILE_SCHEMA if args.profile else None,
                 "execution_schema": EXECUTION_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
                 "math_data_identity": data_identity,
@@ -4687,14 +6301,15 @@ def main() -> None:
         """One rollout: a scored prompt group per sampled DAPO problem."""
         rollout_rows = sampler.next_rows(prompt_count)
         prompt_budget = args.prompt_tokens - len(answer_prefix_ids)
-        encoded_rows = [
-            (
-                row,
-                encode_prompt(tokenizer, prompt_text(row), prompt_budget)
-                + list(answer_prefix_ids),
-            )
-            for row in rollout_rows
-        ]
+        with profiler.phase("prompt_encode"):
+            encoded_rows = [
+                (
+                    row,
+                    encode_prompt(tokenizer, prompt_text(row), prompt_budget)
+                    + list(answer_prefix_ids),
+                )
+                for row in rollout_rows
+            ]
         # The sequential sampler has already consumed these rows. Stable
         # length sorting only reduces left-padding inside this pool; it does
         # not alter dataset coverage, reuse, or use RNG to order data.
@@ -4714,12 +6329,106 @@ def main() -> None:
                     encoded,
                     dtype=torch.long, device=device,
                 )
-                batch = rollout_continuations(
-                    wrapper, prompt_ids[None],
-                    train_max_new_tokens, max_stream_steps,
+                with profiler.phase("decode"):
+                    batch = rollout_continuations(
+                        wrapper, prompt_ids[None],
+                        train_max_new_tokens, max_stream_steps,
+                        args.temperature, args.top_p,
+                        stop_ids=stop_ids or None,
+                        force_initial_think=rollout_force_members(
+                            1, args.samples_per_prompt
+                        ),
+                        pin_emit=pin_emit,
+                        record_likelihoods=False,
+                        cache_dtype=torch.bfloat16,
+                        sync_every=args.rollout_sync_every,
+                        compact_dead_ratio=args.rollout_compact_dead_ratio,
+                        tensor_positions=rollout_step_core is not None,
+                        compact_finished=(
+                            rollout_step_core is None
+                            or args.rollout_tail_batch > 0
+                        ),
+                        finished_batch_size=(
+                            args.rollout_tail_batch
+                            if rollout_step_core is not None
+                            and args.rollout_tail_batch > 0
+                            else None
+                        ),
+                        prompt_repeats=args.samples_per_prompt,
+                        tail_caches=rollout_tail_caches,
+                        tail_step_core=rollout_tail_step_core,
+                    )
+                if offload_to_cpu:
+                    with profiler.phase("stream_d2h"):
+                        batch = compact_stream_to_device(batch, cpu)
+                with profiler.phase("score_inline"):
+                    groups.append(retain_group(batch, row))
+                del batch
+            return groups
+        # Left-padded batched rollout: all chunk groups step together, so
+        # each launch carries chunk*samples rows instead of samples — the
+        # sequential per-group loop is launch-bound, not compute-bound.
+        samples = args.samples_per_prompt
+        pending_scored: list = []
+
+        def drain_scored() -> None:
+            # Each future carries one chunk's worth of retained groups, in
+            # chunk order. Timed as a phase because this is where a scoring
+            # worker that has fallen behind the GPU shows up: the wait is
+            # host time inside collect that no rollout kernel covers.
+            with profiler.phase("score_wait"):
+                for future in pending_scored:
+                    groups.extend(future.result())
+                pending_scored.clear()
+
+        def split_and_retain_chunk(batched, lengths, chunk_rows) -> list:
+            """Split one host-resident chunk into groups and retain each.
+
+            Runs on the scoring worker so the whole CPU tail of a chunk
+            overlaps the next chunk's rollout instead of stalling the GPU.
+            """
+            # Timed as a worker span, not a phase: this runs concurrently
+            # with the next chunk's decode, and decode is launch-bound, so
+            # worker CPU held here is time the host cannot spend launching.
+            with profiler.worker_span("score"):
+                split_groups = split_rollout_groups(batched, samples, lengths)
+                retained = []
+                for index, (group, row) in enumerate(
+                    zip(split_groups, chunk_rows, strict=True)
+                ):
+                    retained.append(retain_group(group, row))
+                    # Release each source as soon as it is retained so the
+                    # chunk's cloned storage does not stay live to the end.
+                    split_groups[index] = None
+                    del group
+            return retained
+
+        for chunk_start in range(0, len(encoded_rows), args.rollout_groups):
+            encoded_chunk = encoded_rows[
+                chunk_start : chunk_start + args.rollout_groups
+            ]
+            chunk = [row for row, _ in encoded_chunk]
+            encoded = [ids for _, ids in encoded_chunk]
+            with profiler.phase("prompt_upload"):
+                width = max(len(ids) for ids in encoded)
+                prompt_ids = torch.zeros(
+                    (len(chunk), width), dtype=torch.long, device=device
+                )
+                for index, ids in enumerate(encoded):
+                    prompt_ids[index, width - len(ids):] = torch.tensor(
+                        ids, dtype=torch.long, device=device
+                    )
+                prompt_lengths_cpu = torch.tensor(
+                    [len(ids) for ids in encoded], dtype=torch.long
+                )
+                prompt_lengths = prompt_lengths_cpu.to(device)
+            with profiler.phase("decode"):
+                batched = rollout_continuations(
+                    wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
                     args.temperature, args.top_p, stop_ids=stop_ids or None,
+                    prompt_lengths=prompt_lengths,
                     force_initial_think=rollout_force_members(
-                        1, args.samples_per_prompt
+                        len(chunk), samples
                     ),
                     pin_emit=pin_emit,
                     record_likelihoods=False,
@@ -4737,106 +6446,59 @@ def main() -> None:
                         and args.rollout_tail_batch > 0
                         else None
                     ),
-                    prompt_repeats=args.samples_per_prompt,
+                    prompt_repeats=samples,
                     tail_caches=rollout_tail_caches,
                     tail_step_core=rollout_tail_step_core,
                 )
-                if offload_to_cpu:
-                    batch = compact_stream_to_device(batch, cpu)
-                groups.append(retain_group(batch, row))
-                del batch
-            return groups
-        # Left-padded batched rollout: all chunk groups step together, so
-        # each launch carries chunk*samples rows instead of samples — the
-        # sequential per-group loop is launch-bound, not compute-bound.
-        samples = args.samples_per_prompt
-        pending_scored: list = []
-
-        def drain_scored() -> None:
-            for future in pending_scored:
-                groups.append(future.result())
-            pending_scored.clear()
-
-        for chunk_start in range(0, len(encoded_rows), args.rollout_groups):
-            encoded_chunk = encoded_rows[
-                chunk_start : chunk_start + args.rollout_groups
-            ]
-            chunk = [row for row, _ in encoded_chunk]
-            encoded = [ids for _, ids in encoded_chunk]
-            width = max(len(ids) for ids in encoded)
-            prompt_ids = torch.zeros(
-                (len(chunk), width), dtype=torch.long, device=device
-            )
-            for index, ids in enumerate(encoded):
-                prompt_ids[index, width - len(ids):] = torch.tensor(
-                    ids, dtype=torch.long, device=device
-                )
-            prompt_lengths_cpu = torch.tensor(
-                [len(ids) for ids in encoded], dtype=torch.long
-            )
-            prompt_lengths = prompt_lengths_cpu.to(device)
-            batched = rollout_continuations(
-                wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
-                args.temperature, args.top_p, stop_ids=stop_ids or None,
-                prompt_lengths=prompt_lengths,
-                force_initial_think=rollout_force_members(len(chunk), samples),
-                pin_emit=pin_emit,
-                record_likelihoods=False,
-                cache_dtype=torch.bfloat16,
-                sync_every=args.rollout_sync_every,
-                compact_dead_ratio=args.rollout_compact_dead_ratio,
-                tensor_positions=rollout_step_core is not None,
-                compact_finished=(
-                    rollout_step_core is None
-                    or args.rollout_tail_batch > 0
-                ),
-                finished_batch_size=(
-                    args.rollout_tail_batch
-                    if rollout_step_core is not None
-                    and args.rollout_tail_batch > 0
-                    else None
-                ),
-                prompt_repeats=samples,
-                tail_caches=rollout_tail_caches,
-                tail_step_core=rollout_tail_step_core,
-            )
             if offload_to_cpu:
                 # One chunk-level D2H transfer, then all variable-length
                 # splitting, trimming, decoding, and scoring stay on CPU.
                 # This avoids one synchronization/transfer per prompt group.
-                batched = compact_stream_to_device(batched, cpu)
+                with profiler.phase("stream_d2h"):
+                    batched = compact_stream_to_device(batched, cpu)
             expanded_prompt_lengths = prompt_lengths_cpu.repeat_interleave(
                 samples
             )
             if not offload_to_cpu:
                 expanded_prompt_lengths = expanded_prompt_lengths.to(device)
-            split_groups = split_rollout_groups(
-                batched, samples, expanded_prompt_lengths
-            )
-            # Every split owns cloned storage; drop the much larger
-            # groups*samples rollout before the first full-stream replay.
-            del batched
             if scoring_pool is None:
-                for group_index, (group, row) in enumerate(
-                    zip(split_groups, chunk, strict=True)
-                ):
-                    groups.append(retain_group(group, row))
-                    # Once retained, remove the source from the temporary
-                    # chunk list immediately. This bounds GPU storage in
-                    # ordinary collection.
-                    split_groups[group_index] = None
-                    del group
-            else:
-                # The previous chunk's futures ran during this chunk's
-                # rollout; draining before submitting keeps `groups` in
-                # chunk order. Host storage stays bounded at one pending
-                # chunk beyond what `groups` retains anyway.
-                drain_scored()
-                for group, row in zip(split_groups, chunk, strict=True):
-                    pending_scored.append(
-                        scoring_pool.submit(retain_group, group, row)
+                with profiler.phase("score_inline"):
+                    split_groups = split_rollout_groups(
+                        batched, samples, expanded_prompt_lengths
                     )
-            del split_groups
+                    # Every split owns cloned storage; drop the much larger
+                    # groups*samples rollout before the first full-stream
+                    # replay.
+                    del batched
+                    for group_index, (group, row) in enumerate(
+                        zip(split_groups, chunk, strict=True)
+                    ):
+                        groups.append(retain_group(group, row))
+                        # Once retained, remove the source from the temporary
+                        # chunk list immediately. This bounds GPU storage in
+                        # ordinary collection.
+                        split_groups[group_index] = None
+                        del group
+                    del split_groups
+            else:
+                # The split is 16 groups x 14 tensors of CLONED host storage
+                # (~2.4 GiB per chunk); running it here left the GPU with
+                # nothing queued between chunk N's last decode step and chunk
+                # N+1's first, a measured 0.10-0.18 s hole per chunk. It is
+                # pure CPU work on host tensors after
+                # compact_stream_to_device's barrier, so it belongs on the
+                # worker alongside the trim/decode/score it feeds.
+                # Draining the PREVIOUS chunk before submitting this one
+                # keeps `groups` in chunk order and still bounds host storage
+                # at one pending chunk.
+                drain_scored()
+                pending_scored.append(
+                    scoring_pool.submit(
+                        split_and_retain_chunk,
+                        batched, expanded_prompt_lengths, chunk,
+                    )
+                )
+                del batched
         drain_scored()
         return groups
 
@@ -4870,7 +6532,7 @@ def main() -> None:
             # rollout_continuations itself is no-grad, while the optional
             # refresh below must remain grad-enabled so refresh/update share
             # one compiled replay specialization and identical PPO numerics.
-            with training_autocast():
+            with profiler.phase("collect"), training_autocast():
                 return _collect(
                     refresh_statistics,
                     args.prompts_per_rollout
@@ -5200,6 +6862,11 @@ def main() -> None:
     step = start_step
     while step < args.steps:
         previous_step = step
+        # Before the clock starts: attaching the profiler's own machinery
+        # would otherwise land inside this pool's wall time and inside its
+        # unaccounted remainder, making traced and untraced pools
+        # incomparable on the one row that matters.
+        profiler.pool_started(step)
         started = time.perf_counter()
         collect_started = started
         requested_pool_updates = min(
@@ -5224,19 +6891,21 @@ def main() -> None:
             prompt_count=pool_prompt_count,
             offload_to_cpu=True,
         )
-        rollout_metrics = aggregate_diagnostics(
-            groups, args.samples_per_prompt, stop_ids
-        )
-        rollout_metrics.update(
-            lockstep_decode_metrics(groups, max(args.rollout_groups, 1))
-        )
-        minibatch_orders = optimizer_minibatch_orders(
-            len(groups),
-            args.prompts_per_minibatch,
-            allow_partial_final=(
-                args.consume_all_prompts and sampler.cursor == len(math_rows)
-            ),
-        )
+        with profiler.phase("rollout_diagnostics"):
+            rollout_metrics = aggregate_diagnostics(
+                groups, args.samples_per_prompt, stop_ids
+            )
+            rollout_metrics.update(
+                lockstep_decode_metrics(groups, max(args.rollout_groups, 1))
+            )
+            minibatch_orders = optimizer_minibatch_orders(
+                len(groups),
+                args.prompts_per_minibatch,
+                allow_partial_final=(
+                    args.consume_all_prompts
+                    and sampler.cursor == len(math_rows)
+                ),
+            )
         if len(minibatch_orders) != pool_updates:
             raise RuntimeError("rollout pool did not produce the planned updates")
 
@@ -5251,12 +6920,16 @@ def main() -> None:
         retained_device_batches: dict[int, LatentRolloutBatch] = {}
         retained_bytes_total = 0
         packed_batch_bytes_max = 0
-        packed_real_slots = 0
+        packed_real_slot_counts = []
         packed_capacity_slots = 0
         pool_cpu_pack_seconds = 0.0
-        pool_h2d_seconds = 0.0
-        pool_refresh_seconds = 0.0
-        pool_d2h_seconds = 0.0
+        # Transfer and replay are asynchronous, so these are event pairs read
+        # after the single barrier at the end of collection. Wall clocks here
+        # used to need a synchronize per minibatch, which drained the pipeline
+        # eight times a pool purely to read a clock.
+        h2d_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        refresh_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        d2h_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         old_value_sums = []
         old_value_counts = []
         def pack_minibatch(
@@ -5264,7 +6937,10 @@ def main() -> None:
         ) -> tuple[LatentRolloutBatch, list[LatentRolloutBatch], float]:
             selected = [groups[index] for index in minibatch_order]
             pack_started = time.perf_counter()
-            packed = pack_rollout_groups_for_replay(selected, pin_memory=True)
+            with profiler.worker_span("pack"):
+                packed = pack_rollout_groups_for_replay(
+                    selected, pin_memory=True
+                )
             return packed, selected, time.perf_counter() - pack_started
 
         # Minibatch orders are a disjoint partition of the pool, so a single
@@ -5273,90 +6949,125 @@ def main() -> None:
         # loop's scatter fallback never writes in the same iteration.
         pack_pool = ThreadPoolExecutor(max_workers=1)
         try:
-            pack_future = pack_pool.submit(
-                pack_minibatch, minibatch_orders[0]
-            )
-            for age, minibatch_order in enumerate(minibatch_orders):
-                cpu_batch, selected_groups, pack_elapsed = (
-                    pack_future.result()
+            with profiler.phase("refresh_pipeline"):
+                pack_future = pack_pool.submit(
+                    pack_minibatch, minibatch_orders[0]
                 )
-                pool_cpu_pack_seconds += pack_elapsed
-                if age + 1 < len(minibatch_orders):
-                    pack_future = pack_pool.submit(
-                        pack_minibatch, minibatch_orders[age + 1]
+                for age, minibatch_order in enumerate(minibatch_orders):
+                    with profiler.phase("pack_wait"):
+                        cpu_batch, selected_groups, pack_elapsed = (
+                            pack_future.result()
+                        )
+                    pool_cpu_pack_seconds += pack_elapsed
+                    if age + 1 < len(minibatch_orders):
+                        pack_future = pack_pool.submit(
+                            pack_minibatch, minibatch_orders[age + 1]
+                        )
+                    with profiler.phase("h2d"), device_timed(h2d_events):
+                        device_batch = cpu_batch.to(device, non_blocking=True)
+                    # Safe without a barrier: the source is pinned, so it came
+                    # from the caching host allocator, which records a CUDA
+                    # event when the block is freed and withholds it from
+                    # reuse until the copy retires.
+                    del cpu_batch
+                    with (
+                        profiler.phase("refresh"),
+                        device_timed(refresh_events),
+                        training_autocast(),
+                    ):
+                        refresh_old_statistics(
+                            wrapper,
+                            critic,
+                            device_batch,
+                            max_trajectories=args.replay_max_trajectories,
+                            attention_budget=args.replay_attention_budget,
+                            bucket_multiple=args.replay_bucket,
+                            slot_budget=args.replay_slot_budget,
+                        )
+                    packed_batch_bytes = sum(
+                        value.numel() * value.element_size()
+                        for field in fields(device_batch)
+                        if isinstance(
+                            (value := getattr(device_batch, field.name)),
+                            torch.Tensor,
+                        )
                     )
-                transfer_started = time.perf_counter()
-                device_batch = cpu_batch.to(device, non_blocking=True)
-                torch.cuda.synchronize()
-                pool_h2d_seconds += time.perf_counter() - transfer_started
-                del cpu_batch
-                refresh_started = time.perf_counter()
-                with training_autocast():
-                    refresh_old_statistics(
-                        wrapper,
-                        critic,
-                        device_batch,
-                        max_trajectories=args.replay_max_trajectories,
-                        attention_budget=args.replay_attention_budget,
-                        bucket_multiple=args.replay_bucket,
-                        slot_budget=args.replay_slot_budget,
+                    packed_batch_bytes_max = max(
+                        packed_batch_bytes_max, packed_batch_bytes
                     )
-                torch.cuda.synchronize()
-                pool_refresh_seconds += time.perf_counter() - refresh_started
-                packed_batch_bytes = sum(
-                    value.numel() * value.element_size()
-                    for field in fields(device_batch)
-                    if isinstance(
-                        (value := getattr(device_batch, field.name)),
-                        torch.Tensor,
+                    # Reduced on device and read once after the pool's single
+                    # barrier; int() here was a blocking sync per minibatch.
+                    packed_real_slot_counts.append(
+                        (device_batch.kind != PAD_SLOT).sum()
                     )
-                )
-                packed_batch_bytes_max = max(
-                    packed_batch_bytes_max, packed_batch_bytes
-                )
-                packed_real_slots += int(
-                    (device_batch.kind != PAD_SLOT).sum()
-                )
-                packed_capacity_slots += device_batch.kind.numel()
-                generated = device_batch.action_mask.bool()
-                old_value_sums.append(
-                    device_batch.old_values[generated].sum()
-                )
-                old_value_counts.append(generated.sum())
-                if (
-                    retained_bytes_total + packed_batch_bytes
-                    <= RETAINED_MINIBATCH_BUDGET_BYTES
-                ):
-                    retained_device_batches[age] = device_batch
-                    retained_bytes_total += packed_batch_bytes
-                else:
-                    transfer_started = time.perf_counter()
-                    scatter_replay_statistics(device_batch, selected_groups)
-                    pool_d2h_seconds += (
-                        time.perf_counter() - transfer_started
+                    packed_capacity_slots += device_batch.kind.numel()
+                    generated = device_batch.action_mask.bool()
+                    # masked_fill, not boolean indexing: the latter lowers to
+                    # masked_select, whose output size is data dependent, so
+                    # it blocks the host on every minibatch. masked_fill also
+                    # keeps a non-finite PAD slot out of the sum, which
+                    # multiplying by the mask would not.
+                    old_value_sums.append(
+                        device_batch.old_values.masked_fill(
+                            ~generated, 0.0
+                        ).sum()
                     )
-                del device_batch
-                del selected_groups
+                    old_value_counts.append(generated.sum())
+                    if (
+                        retained_bytes_total + packed_batch_bytes
+                        <= RETAINED_MINIBATCH_BUDGET_BYTES
+                    ):
+                        retained_device_batches[age] = device_batch
+                        retained_bytes_total += packed_batch_bytes
+                    else:
+                        with (
+                            profiler.phase("stat_scatter_d2h"),
+                            device_timed(d2h_events),
+                        ):
+                            scatter_replay_statistics(
+                                device_batch, selected_groups
+                            )
+                    del device_batch
+                    del selected_groups
         finally:
             pack_pool.shutdown(wait=True)
-        old_value_sum = float(torch.stack(old_value_sums).sum())
-        old_value_count = int(torch.stack(old_value_counts).sum())
-        rollout_metrics["old_value_mean"] = (
-            old_value_sum / old_value_count if old_value_count else 0.0
-        )
-        rollout_metrics["retained_minibatches"] = len(retained_device_batches)
-        rollout_metrics["packed_batch_gib_max"] = packed_batch_bytes_max / 2**30
-        rollout_metrics["packed_padding_utilization"] = (
-            packed_real_slots / packed_capacity_slots
-            if packed_capacity_slots
-            else 0.0
-        )
-        rollout_metrics["pool_cpu_pack_seconds"] = pool_cpu_pack_seconds
-        rollout_metrics["pool_h2d_seconds"] = pool_h2d_seconds
-        rollout_metrics["pool_refresh_seconds"] = pool_refresh_seconds
-        rollout_metrics["pool_d2h_seconds"] = pool_d2h_seconds
-        torch.cuda.synchronize()
+        # A phase of its own because this is where every kernel the pool
+        # enqueued and has not retired actually drains. Folded into the
+        # remainder it would be the largest anonymous entry in the table.
+        with profiler.phase("pool_barrier"):
+            # The only barrier this loop takes on its own account. Every
+            # device reduction and event pair below is read after it, so no
+            # per-minibatch metric drains the pipeline. Whether refresh
+            # itself still blocks inside the shard planner is a separate
+            # question, and one --profile answers rather than assumes.
+            torch.cuda.synchronize()
         collect_seconds = time.perf_counter() - collect_started
+        with profiler.phase("pool_reductions"):
+            old_value_sum = float(torch.stack(old_value_sums).sum())
+            old_value_count = int(torch.stack(old_value_counts).sum())
+            rollout_metrics["old_value_mean"] = (
+                old_value_sum / old_value_count if old_value_count else 0.0
+            )
+            rollout_metrics["retained_minibatches"] = len(
+                retained_device_batches
+            )
+            rollout_metrics["packed_batch_gib_max"] = (
+                packed_batch_bytes_max / 2**30
+            )
+            packed_real_slots = int(torch.stack(packed_real_slot_counts).sum())
+            rollout_metrics["packed_padding_utilization"] = (
+                packed_real_slots / packed_capacity_slots
+                if packed_capacity_slots
+                else 0.0
+            )
+            rollout_metrics["pool_cpu_pack_seconds"] = pool_cpu_pack_seconds
+            # Device time on the transfer and replay streams, not host wall
+            # time.
+            rollout_metrics["pool_h2d_seconds"] = elapsed_seconds(h2d_events)
+            rollout_metrics["pool_refresh_seconds"] = elapsed_seconds(
+                refresh_events
+            )
+            rollout_metrics["pool_d2h_seconds"] = elapsed_seconds(d2h_events)
         rollout_peak_vram_bytes = torch.cuda.max_memory_allocated()
         # Restart the peak counter here so the train rows below report the
         # UPDATE-phase peak (packed minibatch + replay-shard activations),
@@ -5365,333 +7076,350 @@ def main() -> None:
         # batches) are tuned against this number.
         torch.cuda.reset_peak_memory_stats()
         rollout_step = step + pool_updates
-        logger.log(
-            type="rollout", step=rollout_step,
-            collect_seconds=collect_seconds,
-            pool_updates=pool_updates,
-            pool_trajectories=pool_prompt_count * args.samples_per_prompt,
-            peak_vram_bytes=rollout_peak_vram_bytes,
-            **rollout_metrics,
-        )
-        tensorboard.add_scalar(
-            "perf/collect_seconds", collect_seconds, rollout_step
-        )
-        tensorboard.add_scalar(
-            "perf/rollout_peak_vram_gib",
-            rollout_peak_vram_bytes / 2**30,
-            rollout_step,
-        )
-        tensorboard.add_scalar(
-            "perf/packed_batch_gib_max",
-            rollout_metrics["packed_batch_gib_max"],
-            rollout_step,
-        )
-        tensorboard.add_scalar(
-            "perf/packed_padding_utilization",
-            rollout_metrics["packed_padding_utilization"],
-            rollout_step,
-        )
-        tensorboard.add_scalar(
-            "perf/decode_steps_per_chunk_mean",
-            rollout_metrics["decode_steps_per_chunk_mean"],
-            rollout_step,
-        )
-        tensorboard.add_scalar(
-            "perf/decode_step_utilization",
-            rollout_metrics["decode_step_utilization"],
-            rollout_step,
-        )
-        tensorboard.add_scalar(
-            "perf/pool_cpu_pack_seconds", pool_cpu_pack_seconds, rollout_step
-        )
-        tensorboard.add_scalar(
-            "perf/pool_h2d_seconds", pool_h2d_seconds, rollout_step
-        )
-        tensorboard.add_scalar(
-            "perf/pool_refresh_seconds", pool_refresh_seconds, rollout_step
-        )
-        tensorboard.add_scalar(
-            "perf/pool_d2h_seconds", pool_d2h_seconds, rollout_step
-        )
-        rollout_dashboard = rollout_tensorboard_metrics(rollout_metrics)
-        # Horizontal anti-collapse calibration: on DAPO, a terminated
-        # constant modal answer already earns nontrivial exact and shaped
-        # reward. On-policy improvement is meaningful only relative to both.
-        rollout_dashboard["reward/modal_constant_exact_baseline"] = float(
-            math_modal_baseline["accuracy"]
-        )
-        rollout_dashboard["reward/modal_constant_shaped_baseline"] = float(
-            math_modal_baseline["shaped_reward"]
-        )
-        for tag, value in rollout_dashboard.items():
-            tensorboard.add_scalar(tag, value, rollout_step)
+        with profiler.phase("pool_logging"):
+            logger.log(
+                type="rollout", step=rollout_step,
+                collect_seconds=collect_seconds,
+                pool_updates=pool_updates,
+                pool_trajectories=pool_prompt_count * args.samples_per_prompt,
+                peak_vram_bytes=rollout_peak_vram_bytes,
+                **rollout_metrics,
+            )
+            tensorboard.add_scalar(
+                "perf/collect_seconds", collect_seconds, rollout_step
+            )
+            tensorboard.add_scalar(
+                "perf/rollout_peak_vram_gib",
+                rollout_peak_vram_bytes / 2**30,
+                rollout_step,
+            )
+            tensorboard.add_scalar(
+                "perf/pool_cpu_pack_seconds",
+                pool_cpu_pack_seconds,
+                rollout_step,
+            )
+            for tag in (
+                "packed_batch_gib_max",
+                "packed_padding_utilization",
+                "decode_steps_per_chunk_mean",
+                "decode_step_utilization",
+                "pool_h2d_seconds",
+                "pool_refresh_seconds",
+                "pool_d2h_seconds",
+            ):
+                tensorboard.add_scalar(
+                    f"perf/{tag}", rollout_metrics[tag], rollout_step
+                )
+            rollout_dashboard = rollout_tensorboard_metrics(rollout_metrics)
+            # Horizontal anti-collapse calibration: on DAPO, a terminated
+            # constant modal answer already earns nontrivial exact and shaped
+            # reward. On-policy improvement is meaningful only relative to
+            # both.
+            rollout_dashboard["reward/modal_constant_exact_baseline"] = float(
+                math_modal_baseline["accuracy"]
+            )
+            rollout_dashboard["reward/modal_constant_shaped_baseline"] = float(
+                math_modal_baseline["shaped_reward"]
+            )
+            for tag, value in rollout_dashboard.items():
+                tensorboard.add_scalar(tag, value, rollout_step)
 
         for behavior_age, minibatch_order in enumerate(minibatch_orders):
             # Actor and critic each take one optimizer step over the same
             # effective trajectory minibatch. Prompt groups and replay shards
             # are memory partitions, not optimizer minibatches.
-            update_started = time.perf_counter()
-            next_step = step + 1
-            zero_optimizers(optimizers, "actor")
-            zero_optimizers(optimizers, "critic")
-            sigma_parameters = list(
-                wrapper.transition.log_sigma_head.parameters()
-            )
-            sigma_before = [
-                parameter.detach().clone() for parameter in sigma_parameters
-            ]
-            mean_parameters = list(wrapper.transition.mean_head.parameters())
-            mean_before = [
-                parameter.detach().clone() for parameter in mean_parameters
-            ]
-            selected_groups = [groups[index] for index in minibatch_order]
-            retained_minibatch = retained_device_batches.pop(
-                behavior_age, None
-            )
-            if retained_minibatch is not None:
-                # Refreshed on-device in the pool loop above; identical to
-                # what repacking selected_groups would rebuild.
-                device_minibatch = retained_minibatch
-                minibatch_pack_seconds = 0.0
-                minibatch_h2d_seconds = 0.0
-            else:
-                minibatch_pack_started = time.perf_counter()
-                cpu_minibatch = pack_rollout_groups_for_replay(
-                    selected_groups, pin_memory=True
+            with profiler.phase("update"):
+                update_started = time.perf_counter()
+                next_step = step + 1
+                zero_optimizers(optimizers, "actor")
+                zero_optimizers(optimizers, "critic")
+                sigma_parameters = list(
+                    wrapper.transition.log_sigma_head.parameters()
                 )
-                minibatch_pack_seconds = (
-                    time.perf_counter() - minibatch_pack_started
-                )
-                minibatch_h2d_started = time.perf_counter()
-                device_minibatch = cpu_minibatch.to(device, non_blocking=True)
-                torch.cuda.synchronize()
-                minibatch_h2d_seconds = (
-                    time.perf_counter() - minibatch_h2d_started
-                )
-                del cpu_minibatch
-            (
-                policy_action_denominator,
-                gate_action_denominator,
-                positive_token_denominator,
-            ) = actor_minibatch_denominators(
-                [device_minibatch], [0], args.positive_reward_threshold
-            )
-            metrics = training_update(
-                wrapper, critic, device_minibatch, optimizers,
-                positive_lm_weight=args.positive_lm_weight,
-                positive_reward_threshold=args.positive_reward_threshold,
-                thought_pg_coef=args.thought_pg_coef,
-                thought_reverse_kl_coef=args.thought_reverse_kl_coef,
-                thought_clip_mode=args.thought_clip_mode,
-                thought_trust_epsilon=args.thought_trust_epsilon,
-                thought_projection_penalty_coef=(
-                    args.thought_projection_penalty_coef
-                ),
-                gate_entropy_coef=args.gate_entropy_coef,
-                gate_pg_coef=(
-                    0.0 if next_step <= args.gate_freeze_steps else 1.0
-                ),
-                actor_step=False,
-                critic_step=False,
-                policy_action_denominator=policy_action_denominator,
-                gate_action_denominator=gate_action_denominator,
-                positive_token_denominator=positive_token_denominator,
-                value_action_denominator=policy_action_denominator,
-                gae_lambda_alpha=args.gae_lambda_alpha,
-                replay_max_trajectories=args.replay_max_trajectories,
-                replay_attention_budget=args.replay_attention_budget,
-                replay_bucket=args.replay_bucket,
-                replay_slot_budget=args.replay_slot_budget,
-            )
-            # The first minibatch runs against refresh-computed behavior
-            # statistics with the actor untouched. Later disjoint minibatches
-            # intentionally have behavior age 1..N.
-            if behavior_age == 0:
-                guard = "policy_clip_fraction"
-                if metrics[guard] > 1e-6:
-                    print(
-                        f"WARNING step {next_step}: behavior-age-0 {guard}="
-                        f"{metrics[guard]:.3e} (expected exactly 0; "
-                        "refresh/update code paths diverged)",
-                        flush=True,
-                    )
-            minibatch_metrics = [metrics]
-            actor_dashboard = aggregate_actor_tensorboard_metrics(
-                minibatch_metrics
-            )
-            nonfinite_gradients = {
-                name: actor_dashboard[name]
-                for name in (
-                    "grad/trunk", "grad/gate", "grad/adapter", "grad/renderer",
-                    "grad/sigma", "grad/thought_mean", "grad/critic",
-                )
-                if not math.isfinite(actor_dashboard[name])
-            }
-            if nonfinite_gradients:
-                raise RuntimeError(
-                    "non-finite gradients before optimizer step: "
-                    f"{nonfinite_gradients}"
-                )
-            step_optimizers(optimizers, "actor")
-            step_optimizers(optimizers, "critic")
-            # Gradient buffers have already been reduced to scalar telemetry.
-            # Release them before the optional second replay so this read-only
-            # diagnostic cannot stack an inference forward on top of the
-            # training step's peak allocation.
-            zero_optimizers(optimizers, "actor")
-            zero_optimizers(optimizers, "critic")
-            with torch.no_grad():
-                sigma_deltas = [
-                    parameter.detach() - before
-                    for parameter, before in zip(
-                        sigma_parameters, sigma_before, strict=True
-                    )
+                sigma_before = [
+                    parameter.detach().clone() for parameter in sigma_parameters
                 ]
-                mean_deltas = [
-                    parameter.detach() - before
-                    for parameter, before in zip(
-                        mean_parameters, mean_before, strict=True
-                    )
+                mean_parameters = list(wrapper.transition.mean_head.parameters())
+                mean_before = [
+                    parameter.detach().clone() for parameter in mean_parameters
                 ]
-                head_updates = scalar_tensors_to_floats(
-                    {
-                        "sigma/head_update_rms": (
-                            torch.stack(
-                                [delta.square().sum() for delta in sigma_deltas]
-                            ).sum()
-                            / sum(delta.numel() for delta in sigma_deltas)
-                        ).sqrt(),
-                        "sigma/head_update_abs_max": torch.stack(
-                            [delta.abs().max() for delta in sigma_deltas]
-                        ).max(),
-                        "sigma/mean_head_update_rms": (
-                            torch.stack(
-                                [delta.square().sum() for delta in mean_deltas]
-                            ).sum()
-                            / sum(delta.numel() for delta in mean_deltas)
-                        ).sqrt(),
-                        "sigma/mean_head_update_abs_max": torch.stack(
-                            [delta.abs().max() for delta in mean_deltas]
-                        ).max(),
-                        "sigma/mean_head_parameter_abs_max": torch.stack(
-                            [
-                                wrapper.transition.mean_head.output_gain.detach().abs()
-                                * wrapper.transition.mean_head.weight.detach().abs().max(),
-                                wrapper.transition.mean_head.bias.detach().abs().max(),
-                            ]
-                        ).max(),
-                        # Overwrite the pre-update minibatch snapshot with the
-                        # adapter magnitude the next rollout will deploy.
-                        "behavior/thought_adapter_weight_rms": (
-                            wrapper.adapter.projection.weight.detach()
-                            .square().mean().sqrt()
-                        ),
-                        "behavior/thought_adapter_bias_rms": (
-                            wrapper.adapter.projection.bias.detach()
-                            .square().mean().sqrt()
-                        ),
-                        "sigma/mean_output_gain": (
-                            wrapper.transition.mean_head.output_gain.detach()
-                        ),
-                        "sigma/state_residual_gain": (
-                            wrapper.transition.log_sigma_head.residual_gain.detach()
-                        ),
-                    }
+                selected_groups = [groups[index] for index in minibatch_order]
+                retained_minibatch = retained_device_batches.pop(
+                    behavior_age, None
                 )
-            if not all(math.isfinite(value) for value in head_updates.values()):
-                raise RuntimeError(
-                    f"non-finite policy head after optimizer step {next_step}: "
-                    f"{head_updates}"
+                minibatch_h2d_events = []
+                if retained_minibatch is not None:
+                    # Refreshed on-device in the pool loop above; identical to
+                    # what repacking selected_groups would rebuild.
+                    device_minibatch = retained_minibatch
+                    minibatch_pack_seconds = 0.0
+                else:
+                    with profiler.phase("minibatch_pack"):
+                        minibatch_pack_started = time.perf_counter()
+                        cpu_minibatch = pack_rollout_groups_for_replay(
+                            selected_groups, pin_memory=True
+                        )
+                        minibatch_pack_seconds = (
+                            time.perf_counter() - minibatch_pack_started
+                        )
+                    with (
+                        profiler.phase("minibatch_h2d"),
+                        device_timed(minibatch_h2d_events),
+                    ):
+                        device_minibatch = cpu_minibatch.to(
+                            device, non_blocking=True
+                        )
+                    # See the pool-loop transfer: freeing pinned host storage
+                    # with the copy in flight is safe, the caching host
+                    # allocator defers reuse behind a recorded event.
+                    del cpu_minibatch
+                (
+                    policy_action_denominator,
+                    gate_action_denominator,
+                    positive_token_denominator,
+                ) = actor_minibatch_denominators(
+                    [device_minibatch], [0], args.positive_reward_threshold
                 )
-            actor_dashboard.update(head_updates)
-            actor_dashboard["perf/minibatch_h2d_seconds"] = (
-                minibatch_h2d_seconds
-            )
-            actor_dashboard["perf/minibatch_cpu_pack_seconds"] = (
-                minibatch_pack_seconds
-            )
-            if next_step == 1 or (
-                args.post_update_kl_every > 0
-                and next_step % args.post_update_kl_every == 0
-            ):
-                drift_started = time.perf_counter()
-                with training_autocast():
-                    post_update_drift = measure_post_update_policy_drift(
-                        wrapper,
-                        [device_minibatch],
+                with profiler.phase("forward_backward"):
+                    metrics = training_update(
+                        wrapper, critic, device_minibatch, optimizers,
+                        positive_lm_weight=args.positive_lm_weight,
+                        positive_reward_threshold=args.positive_reward_threshold,
+                        thought_pg_coef=args.thought_pg_coef,
+                        thought_reverse_kl_coef=args.thought_reverse_kl_coef,
+                        thought_clip_mode=args.thought_clip_mode,
+                        thought_trust_epsilon=args.thought_trust_epsilon,
+                        thought_projection_penalty_coef=(
+                            args.thought_projection_penalty_coef
+                        ),
+                        gate_entropy_coef=args.gate_entropy_coef,
+                        gate_pg_coef=(
+                            0.0 if next_step <= args.gate_freeze_steps else 1.0
+                        ),
+                        actor_step=False,
+                        critic_step=False,
+                        policy_action_denominator=policy_action_denominator,
+                        gate_action_denominator=gate_action_denominator,
+                        positive_token_denominator=positive_token_denominator,
+                        value_action_denominator=policy_action_denominator,
+                        gae_lambda_alpha=args.gae_lambda_alpha,
                         replay_max_trajectories=args.replay_max_trajectories,
                         replay_attention_budget=args.replay_attention_budget,
                         replay_bucket=args.replay_bucket,
                         replay_slot_budget=args.replay_slot_budget,
-                        replay_function=diagnostic_replay_head_inputs,
                     )
-                if not all(
-                    math.isfinite(value) for value in post_update_drift.values()
-                ):
+                # The first minibatch runs against refresh-computed behavior
+                # statistics with the actor untouched. Later disjoint minibatches
+                # intentionally have behavior age 1..N.
+                if behavior_age == 0:
+                    guard = "policy_clip_fraction"
+                    if metrics[guard] > 1e-6:
+                        print(
+                            f"WARNING step {next_step}: behavior-age-0 {guard}="
+                            f"{metrics[guard]:.3e} (expected exactly 0; "
+                            "refresh/update code paths diverged)",
+                            flush=True,
+                        )
+                minibatch_metrics = [metrics]
+                # Reading the loss and gradient scalars is where the host
+                # first waits on the backward, so this phase carries the
+                # whole minibatch's device time that forward_backward only
+                # enqueued.
+                with profiler.phase("grad_telemetry"):
+                    actor_dashboard = aggregate_actor_tensorboard_metrics(
+                        minibatch_metrics
+                    )
+                    nonfinite_gradients = {
+                        name: actor_dashboard[name]
+                        for name in (
+                            "grad/trunk", "grad/gate", "grad/adapter",
+                            "grad/renderer", "grad/sigma",
+                            "grad/thought_mean", "grad/critic",
+                        )
+                        if not math.isfinite(actor_dashboard[name])
+                    }
+                if nonfinite_gradients:
                     raise RuntimeError(
-                        f"non-finite post-update policy drift at step {next_step}: "
-                        f"{post_update_drift}"
+                        "non-finite gradients before optimizer step: "
+                        f"{nonfinite_gradients}"
                     )
-                actor_dashboard.update(post_update_drift)
-                actor_dashboard["perf/post_update_kl_seconds"] = (
-                    time.perf_counter() - drift_started
+                with profiler.phase("optimizer_step"):
+                    step_optimizers(optimizers, "actor")
+                    step_optimizers(optimizers, "critic")
+                    # Gradient buffers have already been reduced to scalar
+                    # telemetry. Release them before the optional second
+                    # replay so this read-only diagnostic cannot stack an
+                    # inference forward on top of the training step's peak
+                    # allocation.
+                    zero_optimizers(optimizers, "actor")
+                    zero_optimizers(optimizers, "critic")
+                with torch.no_grad():
+                    sigma_deltas = [
+                        parameter.detach() - before
+                        for parameter, before in zip(
+                            sigma_parameters, sigma_before, strict=True
+                        )
+                    ]
+                    mean_deltas = [
+                        parameter.detach() - before
+                        for parameter, before in zip(
+                            mean_parameters, mean_before, strict=True
+                        )
+                    ]
+                    head_updates = scalar_tensors_to_floats(
+                        {
+                            "sigma/head_update_rms": (
+                                torch.stack(
+                                    [delta.square().sum() for delta in sigma_deltas]
+                                ).sum()
+                                / sum(delta.numel() for delta in sigma_deltas)
+                            ).sqrt(),
+                            "sigma/head_update_abs_max": torch.stack(
+                                [delta.abs().max() for delta in sigma_deltas]
+                            ).max(),
+                            "sigma/mean_head_update_rms": (
+                                torch.stack(
+                                    [delta.square().sum() for delta in mean_deltas]
+                                ).sum()
+                                / sum(delta.numel() for delta in mean_deltas)
+                            ).sqrt(),
+                            "sigma/mean_head_update_abs_max": torch.stack(
+                                [delta.abs().max() for delta in mean_deltas]
+                            ).max(),
+                            "sigma/mean_head_parameter_abs_max": torch.stack(
+                                [
+                                    wrapper.transition.mean_head.output_gain.detach().abs()
+                                    * wrapper.transition.mean_head.weight.detach().abs().max(),
+                                    wrapper.transition.mean_head.bias.detach().abs().max(),
+                                ]
+                            ).max(),
+                            # Overwrite the pre-update minibatch snapshot with the
+                            # adapter magnitude the next rollout will deploy.
+                            "behavior/thought_adapter_weight_rms": (
+                                wrapper.adapter.projection.weight.detach()
+                                .square().mean().sqrt()
+                            ),
+                            "behavior/thought_adapter_bias_rms": (
+                                wrapper.adapter.projection.bias.detach()
+                                .square().mean().sqrt()
+                            ),
+                            "sigma/mean_output_gain": (
+                                wrapper.transition.mean_head.output_gain.detach()
+                            ),
+                            "sigma/state_residual_gain": (
+                                wrapper.transition.log_sigma_head.residual_gain.detach()
+                            ),
+                        }
+                    )
+                if not all(math.isfinite(value) for value in head_updates.values()):
+                    raise RuntimeError(
+                        f"non-finite policy head after optimizer step {next_step}: "
+                        f"{head_updates}"
+                    )
+                actor_dashboard.update(head_updates)
+                actor_dashboard["perf/minibatch_h2d_seconds"] = (
+                    elapsed_seconds(minibatch_h2d_events)
                 )
-            # One PPO epoch uses every behavior group exactly once. Release
-            # the compact host sources and packed device batch after its
-            # update and optional drift.
-            del device_minibatch
-            del selected_groups
-            for index in minibatch_order:
-                groups[index] = None
-            step = next_step
-            update_seconds = time.perf_counter() - update_started
-            logger.log(
-                type="train",
-                step=step,
-                behavior_age=behavior_age,
-                trajectories=(
-                    len(minibatch_order) * args.samples_per_prompt
-                ),
-                seconds=update_seconds,
-                pool_seconds=time.perf_counter() - started,
-                peak_vram_bytes=torch.cuda.max_memory_allocated(),
-                dashboard=actor_dashboard,
-                group_metrics=minibatch_metrics,
-            )
-            tensorboard.add_scalar("perf/update_seconds", update_seconds, step)
-            write_actor_tensorboard_metrics(
-                tensorboard, actor_dashboard, behavior_age, step
-            )
+                actor_dashboard["perf/minibatch_cpu_pack_seconds"] = (
+                    minibatch_pack_seconds
+                )
+                if next_step == 1 or (
+                    args.post_update_kl_every > 0
+                    and next_step % args.post_update_kl_every == 0
+                ):
+                    drift_started = time.perf_counter()
+                    with profiler.phase("post_update_drift"), training_autocast():
+                        post_update_drift = measure_post_update_policy_drift(
+                            wrapper,
+                            [device_minibatch],
+                            replay_max_trajectories=args.replay_max_trajectories,
+                            replay_attention_budget=args.replay_attention_budget,
+                            replay_bucket=args.replay_bucket,
+                            replay_slot_budget=args.replay_slot_budget,
+                            replay_function=diagnostic_replay_head_inputs,
+                        )
+                    if not all(
+                        math.isfinite(value) for value in post_update_drift.values()
+                    ):
+                        raise RuntimeError(
+                            f"non-finite post-update policy drift at step {next_step}: "
+                            f"{post_update_drift}"
+                        )
+                    actor_dashboard.update(post_update_drift)
+                    actor_dashboard["perf/post_update_kl_seconds"] = (
+                        time.perf_counter() - drift_started
+                    )
+                # One PPO epoch uses every behavior group exactly once. Release
+                # the compact host sources and packed device batch after its
+                # update and optional drift.
+                del device_minibatch
+                del selected_groups
+                for index in minibatch_order:
+                    groups[index] = None
+                step = next_step
+                update_seconds = time.perf_counter() - update_started
+                logger.log(
+                    type="train",
+                    step=step,
+                    behavior_age=behavior_age,
+                    trajectories=(
+                        len(minibatch_order) * args.samples_per_prompt
+                    ),
+                    seconds=update_seconds,
+                    pool_seconds=time.perf_counter() - started,
+                    peak_vram_bytes=torch.cuda.max_memory_allocated(),
+                    dashboard=actor_dashboard,
+                    group_metrics=minibatch_metrics,
+                )
+                tensorboard.add_scalar("perf/update_seconds", update_seconds, step)
+                write_actor_tensorboard_metrics(
+                    tensorboard, actor_dashboard, behavior_age, step
+                )
 
         # No operation below consumes behavior groups. Release the emptied
         # container before
         # BPB/evaluation allocates its own full-context activations and KV
         # caches, and before the next collect evaluates its RHS.
-        zero_optimizers(optimizers, "actor")
-        zero_optimizers(optimizers, "critic")
-        del groups
+        # Freeing a pool's host storage is tens of thousands of refcount
+        # drops and allocator returns, so it gets a name rather than
+        # inflating the remainder.
+        with profiler.phase("pool_teardown"):
+            zero_optimizers(optimizers, "actor")
+            zero_optimizers(optimizers, "critic")
+            del groups
 
         if crossed_interval(previous_step, step, args.bpb_every):
-            eval_started = time.perf_counter()
-            bpb = teacher_forced_bpb()
-            eval_seconds = time.perf_counter() - eval_started
-            logger.log(type="bpb", step=step, val_bpb=bpb, seconds=eval_seconds)
-            tensorboard.add_scalar("guard/val_bpb", bpb, step)
-            tensorboard.add_scalar("perf/bpb_eval_seconds", eval_seconds, step)
+            with profiler.phase("bpb_eval"):
+                eval_started = time.perf_counter()
+                bpb = teacher_forced_bpb()
+                eval_seconds = time.perf_counter() - eval_started
+                logger.log(
+                    type="bpb", step=step, val_bpb=bpb, seconds=eval_seconds
+                )
+                tensorboard.add_scalar("guard/val_bpb", bpb, step)
+                tensorboard.add_scalar(
+                    "perf/bpb_eval_seconds", eval_seconds, step
+                )
         if aime_rows and crossed_interval(previous_step, step, args.aime_every):
-            aime_eval(step)
+            with profiler.phase("aime_eval"):
+                aime_eval(step)
         if bench_rows and crossed_interval(previous_step, step, args.bench_every):
-            bench_eval(step)
+            with profiler.phase("bench_eval"):
+                bench_eval(step)
         if crossed_interval(previous_step, step, args.save_every):
-            save_started = time.perf_counter()
-            save_checkpoint(
-                output / "latent_vapo_checkpoint.pt", wrapper, critic,
-                optimizers, step, args, sampler, warmup_step,
-                actor_init_provenance,
-            )
-            save_seconds = time.perf_counter() - save_started
-            logger.log(type="checkpoint", step=step, seconds=save_seconds)
-            tensorboard.add_scalar("perf/checkpoint_seconds", save_seconds, step)
+            with profiler.phase("checkpoint_save"):
+                save_started = time.perf_counter()
+                save_checkpoint(
+                    output / "latent_vapo_checkpoint.pt", wrapper, critic,
+                    optimizers, step, args, sampler, warmup_step,
+                    actor_init_provenance,
+                )
+                save_seconds = time.perf_counter() - save_started
+                logger.log(type="checkpoint", step=step, seconds=save_seconds)
+                tensorboard.add_scalar(
+                    "perf/checkpoint_seconds", save_seconds, step
+                )
+        profiler.pool_finished(step, time.perf_counter() - started)
     if args.consume_all_prompts and sampler.cursor != len(math_rows):
         raise RuntimeError(
             "--consume-all-prompts completed without exhausting the target "
@@ -5712,6 +7440,7 @@ def main() -> None:
         # a one-pass dataset ending between cadence boundaries.
         aime_eval(step)
     tensorboard.close()
+    profiler.close()
 
 
 if __name__ == "__main__":

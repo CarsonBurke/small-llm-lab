@@ -188,8 +188,19 @@ def main() -> None:
     y = raw[1:].reshape(-1, seq_len)
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    # Plain fp32, matching the RL rollout/replay regime (the stepwise cache
-    # path does not support autocast: fp32 caches reject bf16 values).
+    # Plain fp32. Both halves of the old justification here were wrong and
+    # are recorded rather than deleted, because the number they produce is
+    # every open-loop figure on record.
+    #
+    # "The stepwise cache path does not support autocast": it does now. The
+    # q/k/v casts in nano_backbone let a bf16 cache absorb the fp32 tensors
+    # autocast produces for rms_norm.
+    #
+    # "Matching the RL rollout/replay regime": it does not. Rollout runs
+    # under `training_autocast()` -- CUDA bf16 -- so this eval measures a
+    # numeric regime training never uses. Switching it to bf16 would make
+    # the eval faithful and would move every historical open-loop number,
+    # so it is a deliberate call, not a cleanup. Left fp32 pending that call.
     metrics = open_loop_depth_metrics(
         wrapper, x, y, args.ground, args.imagine, *luts,
         mode=args.mode, generator=generator,
