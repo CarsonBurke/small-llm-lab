@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import inspect
 import math
+from dataclasses import fields
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -27,13 +28,18 @@ from postraining.latent_rollout import (
     continuation_reward,
     emitted_token_rows,
     half_forced_group_members,
+    compact_slots,
     iter_length_aware_microbatches,
+    plan_length_aware_shards,
     refresh_old_statistics,
     replay_beliefs,
     replay_head_inputs,
     scatter_replay_statistics,
+    scatter_slots,
     select_trajectory_rows,
     select_thought_actions,
+    slot_index,
+    think_slot_mask,
     rollout_continuations,
     split_rollout_groups,
     trim_stream,
@@ -58,6 +64,7 @@ from postraining.train_latent_vapo import (
     PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
     PREVIOUS_EXECUTION_SCHEMA,
     UNANCHORED_VALUE_EXECUTION_SCHEMA,
+    ZERO_AFFINE_EXECUTION_SCHEMA,
     MathPromptSampler,
     REWARD_SCHEMA,
     build_arg_parser,
@@ -834,8 +841,9 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
     )
     assert torch.equal(batch.old_token_logprobs, token_logprobs)
     with torch.no_grad():
-        thought_means, thought_targets, think_mask = select_thought_actions(
-            batch, predicted
+        think_mask = think_slot_mask(batch)
+        thought_means, thought_targets = select_thought_actions(
+            batch, predicted, slot_index(think_mask)
         )
         compact_logprobs = wrapper.transition.per_dim_log_prob(
             thought_targets,
@@ -917,6 +925,49 @@ def test_length_aware_replay_planner_sorts_and_respects_attention_area():
         # The host-side row list mirrors the device index tensor so
         # per-shard branch guards never need a device sync.
         assert host_rows == rows.tolist()
+
+
+def test_replay_shards_weakly_mark_the_stream_dimension_dynamic():
+    """Every shard leaves the planner with a weakly dynamic stream dim.
+
+    Without the mark, a first traced shard whose bucketed length equals the
+    model width duck-types the stream symbol onto the thought width and the
+    NEXT length pays a full recompile. The mark must land on the shard
+    tensors the planner yields, since that is the single path refresh and
+    update share.
+    """
+    wrapper = _wrapper()
+    batch = rollout_continuations(
+        wrapper,
+        torch.randint(0, 32, (4, 4)),
+        max_new_tokens=4,
+        max_stream_steps=20,
+        temperature=1.0,
+        top_p=1.0,
+    )
+    for row in range(4):
+        batch.kind[row, :8] = TOKEN_SLOT
+        batch.kind[row, 8:] = PAD_SLOT
+    shards = list(
+        iter_length_aware_microbatches(
+            batch, max_trajectories=4, attention_budget=10**9
+        )
+    )
+    assert shards
+    for microbatch, _, stream_length, _ in shards:
+        stream_tensors = [
+            value
+            for field in fields(microbatch)
+            if isinstance((value := getattr(microbatch, field.name)), torch.Tensor)
+            and value.dim() >= 2
+            and value.size(1) == stream_length
+        ]
+        assert stream_tensors
+        for value in stream_tensors:
+            # maybe_mark_dynamic records a WEAK hint: it steers the first
+            # trace away from duck sizing without erroring if some later
+            # guard genuinely has to specialize the dimension.
+            assert 1 in getattr(value, "_dynamo_weak_dynamic_indices", set())
 
 
 def test_length_aware_microbatches_slot_budget_bounds_linear_term():
@@ -1425,7 +1476,10 @@ def test_refresh_stores_behavior_gaussian_parameters_for_projection():
 
     with torch.no_grad():
         beliefs, predicted, _, _ = replay_head_inputs(wrapper, batch)
-        thought_means, _, think_mask = select_thought_actions(batch, predicted)
+        think_mask = think_slot_mask(batch)
+        thought_means, _ = select_thought_actions(
+            batch, predicted, slot_index(think_mask)
+        )
         thought_log_sigmas = wrapper.transition.predict_log_sigma(
             beliefs[think_mask]
         )
@@ -1465,8 +1519,9 @@ def test_thought_pg_gradient_reaches_the_trunk_and_fresh_mean_head():
     refresh_old_statistics(wrapper, critic, batch)
 
     beliefs, predicted, _, _ = replay_head_inputs(wrapper, batch)
-    thought_means, thought_targets, think_mask = select_thought_actions(
-        batch, predicted
+    think_mask = think_slot_mask(batch)
+    thought_means, thought_targets = select_thought_actions(
+        batch, predicted, slot_index(think_mask)
     )
     new_logprobs = wrapper.transition.per_dim_log_prob(
         thought_targets,
@@ -3169,6 +3224,21 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
         assert not resume_execution_schema_compatible(
             current, **{extra_flag: True}
         )
+    zero_affine_previous = {
+        "execution_schema": ZERO_AFFINE_EXECUTION_SCHEMA
+    }
+    assert resume_execution_schema_compatible(zero_affine_previous)
+    for extra_flag in (
+        "allow_reverse_kl_migration",
+        "allow_performance_migration",
+        "allow_joint_clip_migration",
+        "allow_anchored_value_migration",
+        "allow_projected_thought_migration",
+        "allow_thought_reverse_kl_migration",
+    ):
+        assert not resume_execution_schema_compatible(
+            zero_affine_previous, **{extra_flag: True}
+        )
     no_thought_kl_previous = {
         "execution_schema": NO_THOUGHT_KL_EXECUTION_SCHEMA
     }
@@ -3430,7 +3500,10 @@ def test_zero_adapter_resume_migration_preserves_unrelated_adam_state() -> None:
     torch.testing.assert_close(payload["cuda_rng"][0], torch.arange(2, dtype=torch.uint8))
     assert payload["python_rng"] == (3, (1, 2, 3), None)
     assert "adapter.interpolation_strength" not in model
-    assert torch.count_nonzero(model["adapter.projection.weight"]) == 0
+    torch.testing.assert_close(
+        model["adapter.projection.weight"],
+        torch.eye(model["adapter.projection.weight"].shape[0]),
+    )
     assert torch.count_nonzero(model["adapter.projection.bias"]) == 0
     assert current_optimizer["param_groups"][2]["params"] == [
         weight_id, bias_id
@@ -4145,3 +4218,99 @@ def test_split_rollout_groups_rejects_mixed_lengths_within_a_group():
     )
     with pytest.raises(ValueError, match="share one prompt length"):
         split_rollout_groups(batch, 2, lengths)
+
+
+def _boolean_mask(rows: int, stream: int, seed: int = 5) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(seed)
+    mask = torch.rand(rows, stream, generator=generator) < 0.35
+    # An all-false and an all-true row: the compaction must survive both.
+    mask[0] = False
+    mask[-1] = True
+    return mask
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_slot_index_compaction_reproduces_boolean_indexing(dtype):
+    # The whole point of index_select here is that it gathers the same slots
+    # in the same order as tensor[mask], so no numeric result may move.
+    mask = _boolean_mask(6, 11)
+    index = slot_index(mask)
+    generator = torch.Generator().manual_seed(21)
+    for shape in ((6, 11), (6, 11, 4)):
+        values = torch.randn(*shape, generator=generator).to(dtype)
+        assert torch.equal(compact_slots(values, index), values[mask])
+
+    values = torch.randn(6, 11, 4, generator=generator).to(dtype)
+    source = compact_slots(values, index)
+    by_index = scatter_slots(torch.zeros_like(values), index, source)
+    by_mask = torch.zeros_like(values)
+    by_mask[mask] = source
+    assert torch.equal(by_index, by_mask)
+    # masked_scatter fills the same slots from the same flat source, so the
+    # replaced call site is exact too.
+    assert torch.equal(
+        torch.zeros_like(values).masked_scatter(mask[..., None], source),
+        by_index,
+    )
+
+
+def test_slot_index_survives_an_empty_mask():
+    mask = torch.zeros(3, 4, dtype=torch.bool)
+    index = slot_index(mask)
+    assert index.numel() == 0
+    values = torch.randn(3, 4, 2)
+    assert torch.equal(compact_slots(values, index), values[mask])
+    assert torch.equal(
+        scatter_slots(torch.zeros_like(values), index, values[mask]),
+        torch.zeros_like(values),
+    )
+
+
+def test_compact_slots_refuses_a_layout_it_would_have_to_copy():
+    # reshape would silently materialize the whole dense tensor here, which
+    # is exactly the cost the index path exists to avoid.
+    mask = _boolean_mask(4, 6)
+    values = torch.randn(6, 4, 3).transpose(0, 1)
+    with pytest.raises(RuntimeError):
+        compact_slots(values, slot_index(mask))
+
+
+def test_slot_scatter_carries_gradients_to_the_compact_source():
+    mask = _boolean_mask(4, 7)
+    index = slot_index(mask)
+    source = torch.randn(int(mask.sum()), requires_grad=True)
+    destination = scatter_slots(torch.zeros(4, 7), index, source)
+    weights = torch.randn(4, 7)
+    (destination * weights).sum().backward()
+    assert torch.equal(source.grad, weights[mask])
+
+
+def test_the_shard_plan_matches_the_rows_the_iterator_yields():
+    # The planner now uploads every shard's rows in one transfer and hands
+    # out views of it; those views must still be the host plan, in order.
+    wrapper = _wrapper()
+    batch = _rollout(wrapper, batch=6, prompt=5, new_tokens=4)
+    plan = plan_length_aware_shards(batch, 2, 4 * 1024 * 1024, 1)
+    assert len(plan) > 1
+    shards = list(iter_length_aware_microbatches(batch, 2, 4 * 1024 * 1024, 1))
+    assert len(shards) == len(plan)
+    for (host_rows, length, rows), (microbatch, yielded, yielded_length, yielded_rows) in zip(
+        plan, shards, strict=True
+    ):
+        assert host_rows == yielded_rows
+        assert length == yielded_length
+        assert torch.equal(rows, torch.tensor(host_rows, dtype=torch.long))
+        assert torch.equal(yielded, rows)
+        assert microbatch.kind.size(0) == len(host_rows)
+
+
+def test_clip_bounds_are_the_same_constants_without_the_host_copy():
+    # new_full replaced new_tensor purely to drop a blocking copy; the bound
+    # it builds has to be the identical float.
+    for dtype in (torch.float32, torch.bfloat16):
+        reference = torch.zeros(3, dtype=dtype)
+        for offset in (1.0 - 0.20, 1.0 + 0.28, 1.0 - 0.03):
+            assert torch.equal(
+                torch.log(reference.new_tensor(offset)),
+                torch.log(reference.new_full((), offset)),
+            )

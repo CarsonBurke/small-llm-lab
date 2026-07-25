@@ -1173,19 +1173,72 @@ def compact_emit_token_logprobs(
     )
 
 
+def slot_index(mask: Tensor) -> Tensor:
+    """Flat positions of a (rows, stream) mask's true slots, in row order.
+
+    ``values[mask]`` gathers exactly these slots in exactly this order, so
+    ``compact_slots``/``scatter_slots`` reproduce boolean indexing bit for
+    bit. The point of naming the index is that deriving it costs ONE
+    device->host synchronization -- boolean indexing has a data-dependent
+    output shape, so every separate ``values[mask]`` pays that stall again,
+    and the replay tail runs eagerly with a dozen of them per shard.
+    """
+    return mask.reshape(-1).nonzero().squeeze(-1)
+
+
+def _slot_rows(values: Tensor) -> Tensor:
+    """(rows, stream, ...) seen as (slots, ...), or an error.
+
+    ``view`` rather than ``reshape`` on purpose: a non-contiguous input
+    would send ``reshape`` through a copy of the whole dense tensor, which
+    is the cost this path exists to avoid, and silently. Every operand
+    here is contiguous today, but two of them (``beliefs``,
+    ``stream_inputs``) come out of a compiled artifact whose output
+    strides are an Inductor default rather than a contract, so the failure
+    is deliberately loud. The slot count is spelled out instead of ``-1``
+    because a zero-width trailing dimension makes ``-1`` ambiguous, and
+    pinned-EMIT batches carry zero-width thoughts.
+    """
+    return values.view(values.shape[0] * values.shape[1], *values.shape[2:])
+
+
+def compact_slots(values: Tensor, index: Tensor) -> Tensor:
+    """``values[mask]`` for a (rows, stream, ...) tensor and a slot index."""
+    return _slot_rows(values).index_select(0, index)
+
+
+def scatter_slots(
+    destination: Tensor, index: Tensor, source: Tensor
+) -> Tensor:
+    """``destination[mask] = source`` for a slot index. In place."""
+    _slot_rows(destination).index_copy_(0, index, source)
+    return destination
+
+
+def think_slot_mask(batch: LatentRolloutBatch) -> Tensor:
+    """Positions holding a THINK action, the one definition shared by all."""
+    return (batch.gate_actions == THINK) & batch.action_mask.bool()
+
+
 def select_thought_actions(
-    batch: LatentRolloutBatch, predicted: Tensor
-) -> tuple[Tensor, Tensor, Tensor]:
+    batch: LatentRolloutBatch, predicted: Tensor, think_index: Tensor
+) -> tuple[Tensor, Tensor]:
     """Select fresh-head means and sampled actions at actual THINK positions.
 
     The mean head has already run densely. Compacting only its consumers
     ensures EMIT/prompt/pad outputs have no gradient edge and prevents unused
     PPO ratios from overflowing before a zero mask is applied.
+
+    ``think_index`` comes from ``slot_index(think_slot_mask(batch))``; the
+    caller passes it because it needs the same index for its own compactions
+    and one synchronization per shard is enough.
     """
-    think_mask = (batch.gate_actions == THINK) & batch.action_mask.bool()
     thought_targets = torch.zeros_like(batch.thoughts)
     thought_targets[:, :-1] = batch.thoughts[:, 1:]
-    return predicted[think_mask], thought_targets[think_mask], think_mask
+    return (
+        compact_slots(predicted, think_index),
+        compact_slots(thought_targets, think_index),
+    )
 
 
 def trajectory_used_lengths(batch: LatentRolloutBatch) -> Tensor:
@@ -1199,7 +1252,21 @@ def trajectory_used_lengths(batch: LatentRolloutBatch) -> Tensor:
 def select_trajectory_rows(
     batch: LatentRolloutBatch, rows: Tensor, stream_length: int
 ) -> LatentRolloutBatch:
-    """Materialize selected rows at a compact, shared stream length."""
+    """Materialize selected rows at a compact, shared stream length.
+
+    Every stream dimension leaves here WEAKLY marked dynamic — a hint that
+    steers the first trace and still lets a later guard specialize, unlike
+    ``mark_dynamic``, which would raise on a length-1 shard.
+    ``dynamic=True`` alone gives the first trace DUCK-typed sizes, so any
+    input dim that happens to MATCH another gets the same symbol:
+    ``thoughts`` is (rows, stream, model_dim) with model_dim 512, and 512 is
+    a legal ``--replay-bucket`` multiple, so a first shard of bucketed length
+    512 unifies the stream symbol with the thought width and the adapter's
+    512-wide Linear then specializes it (measured: the NEXT shard length
+    costs a full 18.5 s recompile; with the mark, 9 ms). This is the one path
+    refresh and update share, so marking here is what keeps a mark from
+    drifting between them and splitting their single compiled artifact.
+    """
     if stream_length < batch.prompt_length or stream_length > batch.stream_length:
         raise ValueError("invalid replay stream length")
     selected = {}
@@ -1211,6 +1278,7 @@ def select_trajectory_rows(
             and value.size(1) == batch.stream_length
         ):
             value = value[rows, :stream_length]
+            torch._dynamo.maybe_mark_dynamic(value, 1)
         elif isinstance(value, Tensor) and value.dim() >= 1:
             value = value[rows]
         selected[field.name] = value
@@ -1240,6 +1308,37 @@ def iter_length_aware_microbatches(
     host-side Python list they were built from, so callers can make
     per-shard branch decisions (has-THINK, has-EMIT) against a once-per-batch
     CPU table instead of a blocking device sync inside every shard.
+
+    The whole plan is decided on the host before the first shard is
+    yielded, which is what lets every shard's row indices reach the device
+    in ONE asynchronous transfer from pinned memory. Building them per
+    shard with ``torch.tensor(..., device=cuda)`` copies from pageable
+    memory, and that is a blocking copy: it stalls the host at the top of
+    every shard, right where the launch queue is deepest.
+    """
+    for shard_rows, shard_length, row_tensor in plan_length_aware_shards(
+        batch, max_trajectories, attention_budget, bucket_multiple, slot_budget
+    ):
+        yield (
+            select_trajectory_rows(batch, row_tensor, shard_length),
+            row_tensor,
+            shard_length,
+            shard_rows,
+        )
+
+
+def plan_length_aware_shards(
+    batch: LatentRolloutBatch,
+    max_trajectories: int,
+    attention_budget: int,
+    bucket_multiple: int = 1,
+    slot_budget: int | None = None,
+) -> list[tuple[list[int], int, Tensor]]:
+    """The shard plan: (host rows, stream length, device row index) each.
+
+    Separated from the yielding loop so the plan is complete before any
+    shard runs, and so tests can assert on it without materializing
+    microbatches.
     """
     if max_trajectories < 1:
         raise ValueError("replay max trajectories must be positive")
@@ -1254,6 +1353,7 @@ def iter_length_aware_microbatches(
 
     shard: list[int] = []
     shard_length = 0
+    plan: list[tuple[list[int], int]] = []
 
     def bucketed(length: int) -> int:
         return min(
@@ -1274,29 +1374,38 @@ def iter_length_aware_microbatches(
             )
         )
         if shard and exceeds:
-            row_tensor = torch.tensor(
-                shard, dtype=torch.long, device=batch.kind.device
-            )
-            yield (
-                select_trajectory_rows(batch, row_tensor, shard_length),
-                row_tensor,
-                shard_length,
-                shard,
-            )
+            plan.append((shard, shard_length))
             shard = []
             shard_length = 0
         shard.append(row)
         shard_length = max(shard_length, bucketed(lengths[row]))
     if shard:
-        row_tensor = torch.tensor(
-            shard, dtype=torch.long, device=batch.kind.device
+        plan.append((shard, shard_length))
+
+    device = batch.kind.device
+    flat = torch.tensor(
+        [row for shard_rows, _ in plan for row in shard_rows],
+        dtype=torch.long,
+    )
+    if device.type == "cuda":
+        # One pinned, asynchronous transfer for every shard's rows. The
+        # staging buffer loses its last Python reference on this line; it
+        # survives because ``pin_memory`` allocates through the CUDA
+        # caching HOST allocator, which records a stream event on free and
+        # will not recycle the block until the copy retires. Disabling that
+        # allocator would turn this into a race that yields wrong row
+        # indices without crashing.
+        flat = flat.pin_memory().to(device, non_blocking=True)
+    else:
+        flat = flat.to(device)
+    planned = []
+    offset = 0
+    for shard_rows, length in plan:
+        planned.append(
+            (shard_rows, length, flat.narrow(0, offset, len(shard_rows)))
         )
-        yield (
-            select_trajectory_rows(batch, row_tensor, shard_length),
-            row_tensor,
-            shard_length,
-            shard,
-        )
+        offset += len(shard_rows)
+    return planned
 
 
 def refresh_old_statistics(
@@ -1356,7 +1465,7 @@ def refresh_old_statistics(
             ).float()
             * microbatch.gate_mask
         )
-        emit_mask = microbatch.emit_mask.bool()
+        emit_index = slot_index(microbatch.emit_mask.bool())
         # The grad-mode compile-guard argument above covers only the compiled
         # replay_head_inputs; this tail is eager, where grad mode changes no
         # forward kernel. Dropping its (discarded) graph keeps the retained
@@ -1364,22 +1473,24 @@ def refresh_old_statistics(
         # out of the refresh peak.
         with torch.no_grad():
             emit_features = wrapper.renderer_features(
-                stream_inputs[emit_mask], beliefs[emit_mask]
+                compact_slots(stream_inputs, emit_index),
+                compact_slots(beliefs, emit_index),
             )
             compact_token_logprobs = compact_emit_token_logprobs(
-                backbone, emit_features, token_targets[emit_mask]
+                backbone, emit_features, compact_slots(token_targets, emit_index)
             )
         token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
-        token_logprobs[emit_mask] = compact_token_logprobs
+        scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
         if microbatch.thoughts.size(-1):
             # The thought decided at gate position p is stored at p+1 — the
             # same shift as token targets — so per-dim log-probs align with
-            # think_mask.
-            thought_means, thought_targets, think_mask = select_thought_actions(
-                microbatch, predicted
+            # the THINK slots.
+            think_index = slot_index(think_slot_mask(microbatch))
+            thought_means, thought_targets = select_thought_actions(
+                microbatch, predicted, think_index
             )
             thought_log_sigma = wrapper.transition.predict_log_sigma(
-                beliefs[think_mask]
+                compact_slots(beliefs, think_index)
             )
             compact_thought_logprobs = wrapper.transition.per_dim_log_prob(
                 thought_targets,
@@ -1387,7 +1498,7 @@ def refresh_old_statistics(
                 thought_log_sigma,
             ).float()
             thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
-            thought_logprobs[think_mask] = compact_thought_logprobs
+            scatter_slots(thought_logprobs, think_index, compact_thought_logprobs)
             # Behavior Gaussian parameters come from the SAME replay forward
             # as the log-probabilities so the age-0 canary extends to the
             # projected objective: Mahalanobis distance is exactly zero on
@@ -1395,12 +1506,18 @@ def refresh_old_statistics(
             thought_mean_statistics = torch.zeros_like(
                 microbatch.old_thought_means
             )
-            thought_mean_statistics[think_mask] = thought_means.detach().float()
+            scatter_slots(
+                thought_mean_statistics,
+                think_index,
+                thought_means.detach().float(),
+            )
             thought_log_sigma_statistics = torch.zeros_like(
                 microbatch.old_thought_log_sigmas
             )
-            thought_log_sigma_statistics[think_mask] = (
-                thought_log_sigma.detach().float()
+            scatter_slots(
+                thought_log_sigma_statistics,
+                think_index,
+                thought_log_sigma.detach().float(),
             )
         else:
             thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
