@@ -25,6 +25,8 @@ from postraining.latent_rollout import (
 from postraining.latent_thought import THINK, LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
+LATENT_EVAL_METRIC_SCHEMA = "native_policy_plus_forced_intervention/v1"
+
 
 COMPILED_EVAL_TAIL_BATCH = 16
 
@@ -472,8 +474,20 @@ def evaluate_latent_math(
             f"{prefix}_max": ordered[-1],
         }
 
+    policy_accuracy = (
+        correct / max(total, 1)
+        if pin_emit
+        else unforced_correct / max(unforced_total, 1)
+    )
     metrics: dict[str, object] = {
+        "evaluation_metric_schema": LATENT_EVAL_METRIC_SCHEMA,
+        # Preserve the historical all-attempt metric and its denominator. The
+        # deployed latent policy's unforced-only score is explicit so resumed
+        # JSONL/TensorBoard series never silently change meaning.
         "accuracy": correct / max(total, 1),
+        "policy_accuracy": policy_accuracy,
+        "interventional_accuracy": correct / max(total, 1),
+        "policy_samples": total if pin_emit else unforced_total,
         "samples": total,
         "prompt_groups": len(prompt_correct),
         "prompt_any_correct_fraction": sum(

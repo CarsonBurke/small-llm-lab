@@ -208,10 +208,11 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
   <header>
     <p class="eyebrow">Held-out automatic benchmark</p>
     <h1>What the model answered</h1>
-    <p class="subtitle">Step {int(payload['step'])} · {problem_count} dataset problems · {samples_per_problem} policy samples each</p>
+    <p class="subtitle">Step {int(payload['step'])} · {problem_count} dataset problems · {samples_per_problem} rollout samples each</p>
   </header>
   <section class="summary" aria-label="Benchmark summary">
-    <div><span>Overall accuracy</span><strong>{_percent(metrics['accuracy'])}</strong></div>
+    <div><span>All-rollout accuracy</span><strong>{_percent(metrics['accuracy'])}</strong></div>
+    <div><span>Native policy accuracy</span><strong>{_percent(metrics.get('policy_accuracy', metrics['unforced_initial_accuracy']))}</strong></div>
     <div><span>Forced accuracy</span><strong>{_percent(metrics['forced_initial_accuracy'])}</strong></div>
     <div><span>Unforced accuracy</span><strong>{_percent(metrics['unforced_initial_accuracy'])}</strong></div>
     <div><span>Optional think fraction</span><strong>{_percent(metrics['think_fraction'])}</strong></div>
@@ -349,7 +350,18 @@ def sample_json_to_report_payload(
         int(attempt["emitted_token_count"]) for attempt in attempts
     )
     metrics = {
+        "evaluation_metric_schema": (
+            "native_policy_plus_forced_intervention/v1"
+        ),
         "accuracy": sum(int(attempt["correct"]) for attempt in attempts) / total,
+        "interventional_accuracy": (
+            sum(int(attempt["correct"]) for attempt in attempts) / total
+        ),
+        "policy_accuracy": sum(
+            int(attempt["correct"]) for attempt in unforced_attempts
+        )
+        / max(len(unforced_attempts), 1),
+        "policy_samples": len(unforced_attempts),
         "forced_initial_accuracy": sum(
             int(attempt["correct"]) for attempt in forced_attempts
         )

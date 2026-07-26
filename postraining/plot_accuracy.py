@@ -1,4 +1,4 @@
-"""Plot AIME 2024 accuracy against VAPO update step."""
+"""Plot native-policy and forced-THINK interventional AIME accuracy."""
 
 from __future__ import annotations
 
@@ -15,16 +15,40 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     entries = [
-        item for item in (
-            json.loads(line) for line in Path(args.metrics).read_text().splitlines() if line.strip()
+        item
+        for item in (
+            json.loads(line)
+            for line in Path(args.metrics).read_text().splitlines()
+            if line.strip()
         )
-        if item.get("type") == "aime" or ("accuracy" in item and set(item) >= {"step", "samples"})
+        if item.get("type") == "aime"
+        or ("accuracy" in item and set(item) >= {"step", "samples"})
     ]
     entries.sort(key=lambda item: item["step"])
     plt.figure(figsize=(7, 4.5))
-    plt.plot([x["step"] for x in entries], [100 * x["accuracy"] for x in entries], marker="o", label="Fresh LeJEPA + VAPO")
+    native = [item for item in entries if "policy_accuracy" in item]
+    if native:
+        plt.plot(
+            [item["step"] for item in native],
+            [100 * item["policy_accuracy"] for item in native],
+            marker="o",
+            label="Native policy",
+        )
+    all_rollouts = [
+        item
+        for item in entries
+        if "policy_accuracy" not in item
+        or item.get("forced_initial_fraction", 0.0) > 0.0
+    ]
+    if all_rollouts:
+        plt.plot(
+            [item["step"] for item in all_rollouts],
+            [100 * item["accuracy"] for item in all_rollouts],
+            marker="o",
+            label="All rollouts",
+        )
     plt.xlabel("Gradient update step")
-    plt.ylabel("AIME 2024 avg@32 accuracy (%)")
+    plt.ylabel("AIME 2024 accuracy (%)")
     plt.grid(alpha=0.25)
     plt.legend()
     plt.tight_layout()

@@ -706,7 +706,9 @@ def rollout_continuations(
         # RNG draw order (gate, token, thought) is part of the execution
         # schema; pin_emit skips the gate/thought draws entirely but must not
         # reorder the latent path's consumption.
-        token = top_p_sample(output.logits, temperature, top_p)
+        token = top_p_sample(
+            output.logits, temperature, top_p, generator=generator
+        )
         token_logprob = None
         if record_likelihoods:
             token_logprob = (
@@ -1138,22 +1140,22 @@ def replay_beliefs(
 
 def replay_head_inputs(
     wrapper: LatentThoughtModel, batch: LatentRolloutBatch
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """Replay the stream and derive everything the PPO heads consume.
 
-    Returns (beliefs, predicted, stream_inputs, token_targets).  Renderer
-    features are deliberately formed only at EMIT positions by consumers;
-    its four-layer wide probe and vocabulary projection are positionwise, so
-    dense prompt/thought/pad evaluation was pure waste. Both
+    Returns (beliefs, stream_inputs). Renderer features and thought means are
+    deliberately formed only at their consuming positions;
+    both are positionwise, so dense prompt/token/pad evaluation is pure waste.
+    Both
     ``refresh_old_statistics`` and the trainer's update step go through this
     single code path; that is what makes the recomputed "old" statistics
     exact — behavior-age-0 PPO ratios are one by construction.
     """
     stream_inputs, beliefs = replay_beliefs(wrapper, batch)
-    predicted = wrapper.thought_mean(beliefs)
-    token_targets = torch.zeros_like(batch.token_ids)
-    token_targets[:, :-1] = batch.token_ids[:, 1:]
-    return beliefs, predicted, stream_inputs, token_targets
+    # Downstream compaction deliberately uses ``view`` to reject hidden dense
+    # copies. Inductor output strides are not a public contract, so make the
+    # replay boundary's row-major contract explicit.
+    return beliefs.contiguous(), stream_inputs.contiguous()
 
 
 def compact_emit_token_logprobs(
@@ -1209,6 +1211,18 @@ def compact_slots(values: Tensor, index: Tensor) -> Tensor:
     return _slot_rows(values).index_select(0, index)
 
 
+def compact_next_slots(values: Tensor, action_index: Tensor) -> Tensor:
+    """Values consumed one stream position after compact action slots.
+
+    Row/column indexing is intentional: a malformed final-column action must
+    fail instead of silently wrapping to the next row's first slot.
+    """
+    stream_length = values.shape[1]
+    rows = torch.div(action_index, stream_length, rounding_mode="floor")
+    columns = action_index.remainder(stream_length) + 1
+    return values[rows, columns]
+
+
 def scatter_slots(
     destination: Tensor, index: Tensor, source: Tensor
 ) -> Tensor:
@@ -1222,24 +1236,29 @@ def think_slot_mask(batch: LatentRolloutBatch) -> Tensor:
     return (batch.gate_actions == THINK) & batch.action_mask.bool()
 
 
-def select_thought_actions(
-    batch: LatentRolloutBatch, predicted: Tensor, think_index: Tensor
+def compact_thought_actions(
+    wrapper: LatentThoughtModel,
+    batch: LatentRolloutBatch,
+    beliefs: Tensor,
+    think_index: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Select fresh-head means and sampled actions at actual THINK positions.
+    """Evaluate means and select sampled actions at actual THINK positions.
 
-    The mean head has already run densely. Compacting only its consumers
-    ensures EMIT/prompt/pad outputs have no gradient edge and prevents unused
-    PPO ratios from overflowing before a zero mask is applied.
+    The D-by-D mean projection runs only after beliefs have been compacted.
+    Prompt, token, and pad positions never consume a thought mean, and in
+    ordinary runs outnumber THINK decisions by two orders of magnitude.
 
     ``think_index`` comes from ``slot_index(think_slot_mask(batch))``; the
     caller passes it because it needs the same index for its own compactions
     and one synchronization per shard is enough.
     """
-    thought_targets = torch.zeros_like(batch.thoughts)
-    thought_targets[:, :-1] = batch.thoughts[:, 1:]
+    # The sample chosen by a THINK decision at stream slot p is consumed and
+    # stored at p+1. Action positions can never occupy the final stream slot,
+    # so selecting the shifted flat indices avoids allocating and copying a
+    # dense (rows, stream, dim) target tensor for every replay shard.
     return (
-        compact_slots(predicted, think_index),
-        compact_slots(thought_targets, think_index),
+        wrapper.thought_mean(compact_slots(beliefs, think_index)),
+        compact_next_slots(batch.thoughts, think_index),
     )
 
 
@@ -1457,16 +1476,17 @@ def refresh_old_statistics(
         batch, max_trajectories, attention_budget, bucket_multiple,
         slot_budget=slot_budget,
     ):
-        beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
+        beliefs, stream_inputs = replay_head_inputs(
             wrapper, microbatch
         )
         values = critic.values(microbatch).float()
-        gate_logprobs = (
-            wrapper.gate.log_prob(
-                microbatch.gate_actions.float(), beliefs
-            ).float()
-            * microbatch.gate_mask
-        )
+        with torch.no_grad():
+            gate_logprobs = (
+                wrapper.gate.log_prob(
+                    microbatch.gate_actions.float(), beliefs
+                ).float()
+                * microbatch.gate_mask
+            )
         emit_index = slot_index(microbatch.emit_mask.bool())
         # The grad-mode compile-guard argument above covers only the compiled
         # replay_head_inputs; this tail is eager, where grad mode changes no
@@ -1479,56 +1499,62 @@ def refresh_old_statistics(
                 compact_slots(beliefs, emit_index),
             )
             compact_token_logprobs = compact_emit_token_logprobs(
-                backbone, emit_features, compact_slots(token_targets, emit_index)
+                backbone,
+                emit_features,
+                compact_next_slots(microbatch.token_ids, emit_index),
             )
         token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
+        thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
+        thought_mean_statistics = torch.zeros_like(
+            microbatch.old_thought_means
+        )
+        thought_log_sigma_statistics = torch.zeros_like(
+            microbatch.old_thought_log_sigmas
+        )
         if microbatch.thoughts.size(-1):
             # The thought decided at gate position p is stored at p+1 — the
             # same shift as token targets — so per-dim log-probs align with
             # the THINK slots.
             think_index = slot_index(think_slot_mask(microbatch))
-            thought_means, thought_targets = select_thought_actions(
-                microbatch, predicted, think_index
-            )
-            thought_log_sigma = wrapper.transition.predict_log_sigma(
-                compact_slots(beliefs, think_index)
-            )
-            compact_thought_logprobs = wrapper.transition.per_dim_log_prob(
-                thought_targets,
-                thought_means,
-                thought_log_sigma,
-            ).float()
-            thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
-            scatter_slots(thought_logprobs, think_index, compact_thought_logprobs)
-            # Behavior Gaussian parameters come from the SAME replay forward
-            # as the log-probabilities so the age-0 canary extends to the
-            # projected objective: Mahalanobis distance is exactly zero on
-            # fresh behavior.
-            thought_mean_statistics = torch.zeros_like(
-                microbatch.old_thought_means
-            )
-            scatter_slots(
-                thought_mean_statistics,
-                think_index,
-                thought_means.detach().float(),
-            )
-            thought_log_sigma_statistics = torch.zeros_like(
-                microbatch.old_thought_log_sigmas
-            )
-            scatter_slots(
-                thought_log_sigma_statistics,
-                think_index,
-                thought_log_sigma.detach().float(),
-            )
-        else:
-            thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)
-            thought_mean_statistics = torch.zeros_like(
-                microbatch.old_thought_means
-            )
-            thought_log_sigma_statistics = torch.zeros_like(
-                microbatch.old_thought_log_sigmas
-            )
+            if think_index.numel():
+                # Like the renderer above, this eager tail does not share the
+                # compiled replay's grad-mode guard. Its behavior statistics
+                # are detached outputs, so retaining an autograd graph here is
+                # pure refresh overhead.
+                with torch.no_grad():
+                    thought_means, thought_targets = compact_thought_actions(
+                        wrapper, microbatch, beliefs, think_index
+                    )
+                    thought_log_sigma = (
+                        wrapper.transition.predict_log_sigma(
+                            compact_slots(beliefs, think_index)
+                        )
+                    )
+                    compact_thought_logprobs = (
+                        wrapper.transition.per_dim_log_prob(
+                            thought_targets,
+                            thought_means,
+                            thought_log_sigma,
+                        ).float()
+                    )
+                    scatter_slots(
+                        thought_logprobs,
+                        think_index,
+                        compact_thought_logprobs,
+                    )
+                    # Store parameters from the same forward so the age-0
+                    # projected-policy distance is exactly zero.
+                    scatter_slots(
+                        thought_mean_statistics,
+                        think_index,
+                        thought_means.float(),
+                    )
+                    scatter_slots(
+                        thought_log_sigma_statistics,
+                        think_index,
+                        thought_log_sigma.float(),
+                    )
         with torch.no_grad():
             # Advanced row indexing materializes a copy, so assignment must
             # target the parent explicitly (``view.copy_`` would update only

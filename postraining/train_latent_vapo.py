@@ -107,7 +107,6 @@ from postraining.core import (
     POSTTRAIN_CONTEXT_TOKENS,
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_RESPONSE_TOKENS,
-    POSTTRAIN_STREAM_TOKENS,
     answer_style,
     clipped_policy_loss,
     encode_prompt,
@@ -131,17 +130,18 @@ from postraining.latent_rollout import (
     LatentRolloutBatch,
     assign_terminal_rewards,
     compact_emit_token_logprobs,
+    compact_next_slots,
     compact_slots,
     compact_stream_to_device,
-    pack_rollout_groups_for_replay,
+    compact_thought_actions,
     emitted_token_rows,
+    pack_rollout_groups_for_replay,
     half_forced_group_members,
     iter_length_aware_microbatches,
     refresh_old_statistics,
     replay_head_inputs,
     scatter_replay_statistics,
     scatter_slots,
-    select_thought_actions,
     slot_index,
     think_slot_mask,
     rollout_continuations,
@@ -166,6 +166,11 @@ from postraining.latent_thought import (
 )
 from postraining.model_io import fresh_trunk, load_model
 from postraining.muon import MUON_ALGORITHM_SCHEMA, Muon
+from postraining.reasoning_modes import (
+    mode_rollout_budget,
+    training_rollout_budget,
+)
+from postraining.provenance import capture_source_provenance
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
@@ -200,6 +205,7 @@ PREVIOUS_EXECUTION_SCHEMA = (
 )
 PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 ACTOR_OBJECTIVE_SCHEMA = "vapo_policy_no_positive_example_lm/v1"
+REPLAY_NUMERICS_SCHEMA = "compact_think_head_next_slot_targets/v1"
 ADAMW_ALGORITHM_SCHEMA = (
     "torch_adamw_betas0.9_0.999_eps1e-8_amsgrad_false_weight_decay0/v1"
 )
@@ -385,6 +391,20 @@ def resume_execution_schema_compatible(
     )
 
 
+def resume_replay_schema_compatible(
+    payload: dict,
+    *,
+    allow_compact_replay_migration: bool = False,
+) -> bool:
+    """Require an explicit boundary migration from dense replay numerics."""
+    source = payload.get("replay_numerics_schema")
+    if source == REPLAY_NUMERICS_SCHEMA:
+        return not allow_compact_replay_migration
+    # v26 and earlier did not label replay numerics and evaluated the mean
+    # densely. Unknown labeled schemas are never guessed compatible.
+    return source is None and allow_compact_replay_migration
+
+
 def value_support_geometry_matches(saved_args: dict, args) -> bool:
     """Whether a checkpoint's critic support geometry matches the CLI's.
 
@@ -398,6 +418,7 @@ def value_support_geometry_matches(saved_args: dict, args) -> bool:
         bool(saved_args.get("value_anchored_support", False))
         == args.value_anchored_support
         and saved_args.get("value_bins") == args.value_bins
+        and saved_args.get("value_sigma_ratio") == args.value_sigma_ratio
         and (
             not args.value_anchored_support
             or saved_args.get("value_margin_bins") == args.value_margin_bins
@@ -2206,7 +2227,7 @@ def update_minibatch(
         # A stream position is one MDP action. EMIT clips the joint gate+token
         # ratio. THINK clips one ratio per Gaussian dimension while retaining
         # their summed score gradient; its optional gate is clipped once.
-        beliefs, predicted, stream_inputs, token_targets = replay_head_inputs(
+        beliefs, stream_inputs = replay_head_inputs(
             wrapper, microbatch
         )
         new_gate_logprobs = wrapper.gate.log_prob(
@@ -2226,7 +2247,9 @@ def update_minibatch(
         # Shared with refresh_old_statistics: identical chunk boundaries keep
         # the two eager forwards bit-identical (the age-0 zero-clip canary).
         compact_token_logprobs = compact_emit_token_logprobs(
-            backbone, emit_features, compact_slots(token_targets, emit_index)
+            backbone,
+            emit_features,
+            compact_next_slots(microbatch.token_ids, emit_index),
         )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
@@ -2248,8 +2271,8 @@ def update_minibatch(
         shard_has_think = bool(row_has_think[host_rows].any())
         if shard_has_think:
             think_index = slot_index(think_slot_mask(microbatch))
-            thought_means, thought_targets = select_thought_actions(
-                microbatch, predicted, think_index
+            thought_means, thought_targets = compact_thought_actions(
+                wrapper, microbatch, beliefs, think_index
             )
             thought_log_sigma = wrapper.transition.predict_log_sigma(
                 compact_slots(beliefs, think_index)
@@ -3041,7 +3064,7 @@ def measure_post_update_policy_drift(
             replay_bucket,
             slot_budget=replay_slot_budget,
         ):
-            beliefs, predicted, stream_inputs, token_targets = replay_function(
+            beliefs, stream_inputs = replay_function(
                 wrapper, microbatch
             )
             gate_logprobs = wrapper.gate.log_prob(
@@ -3062,7 +3085,10 @@ def measure_post_update_policy_drift(
                     emit_logits.float()
                     .log_softmax(-1)
                     .gather(
-                        -1, compact_slots(token_targets, emit_index)[..., None]
+                        -1,
+                        compact_next_slots(
+                            microbatch.token_ids, emit_index
+                        )[..., None],
                     )
                     .squeeze(-1)
                 )
@@ -3077,8 +3103,8 @@ def measure_post_update_policy_drift(
             thought_log_ratio = None
             if bool(row_has_think[host_rows].any()):
                 think_index = slot_index(think_mask)
-                thought_means, thought_targets = select_thought_actions(
-                    microbatch, predicted, think_index
+                thought_means, thought_targets = compact_thought_actions(
+                    wrapper, microbatch, beliefs, think_index
                 )
                 thought_log_sigma = wrapper.transition.predict_log_sigma(
                     compact_slots(beliefs, think_index)
@@ -3186,6 +3212,8 @@ def save_checkpoint(
             wrapper.thought_action_transform,
         ),
         "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
+        "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
+        "source_provenance": getattr(args, "source_provenance", None),
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
         "math_data_identity": sampler.dataset_identity,
         "reward_schema": REWARD_SCHEMA,
@@ -5012,6 +5040,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "verbatim (the pool and its stored behavior statistics are rebuilt "
         "on resume)",
     )
+    parser.add_argument(
+        "--migrate-compact-replay-resume",
+        action="store_true",
+        help="explicitly resume a pre-compact-replay checkpoint under the "
+        "compact THINK-head numerics; policy/optimizer/cursor state transfers "
+        "verbatim and the next rollout pool is rebuilt",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     # Profiling. Off by default and costing nothing when off: every call site
     # runs unconditionally against a disabled profiler whose phase object has
@@ -5218,6 +5253,19 @@ def validate_args(
         # The tail switch rides the compiled rollout's tensor positions and
         # fixed-size compaction; an eager rollout never engages it.
         parser.error("--rollout-tail-graph requires --rollout-compile")
+    # PPO refresh/update score the backbone's categorical distribution
+    # directly. Temperature and nucleus transforms define a different policy;
+    # accepting them here would sample under q while optimizing log p.
+    if args.temperature != 1.0:
+        parser.error(
+            "--temperature must be 1 for latent VAPO; transformed sampling "
+            "is not part of the scored PPO policy"
+        )
+    if args.top_p != 1.0:
+        parser.error(
+            "--top-p must be 1 for latent VAPO; nucleus sampling is not part "
+            "of the scored PPO policy"
+        )
     if args.bench_only_repeats < 1:
         parser.error("--bench-only-repeats must be positive")
     if args.bench_max_rows < 0:
@@ -5232,6 +5280,8 @@ def validate_args(
         parser.error("--migrate-anchored-value-resume requires --resume")
     if args.migrate_projected_thought_resume and not args.resume:
         parser.error("--migrate-projected-thought-resume requires --resume")
+    if args.migrate_compact_replay_resume and not args.resume:
+        parser.error("--migrate-compact-replay-resume requires --resume")
     if args.migrate_thought_reverse_kl_resume and not args.resume:
         parser.error("--migrate-thought-reverse-kl-resume requires --resume")
     if (
@@ -5415,35 +5465,37 @@ def main() -> None:
         )
 
     def mode_budgets(max_tokens: int) -> tuple[int, int]:
-        """(max_new_tokens, max_stream_steps) for one rollout/eval budget."""
-        if args.reasoning_mode == "none":
-            return args.answer_tokens, args.answer_tokens
-        if args.reasoning_mode == "cot":
-            return max_tokens, max_tokens
-        return max_tokens, min(
-            4 * max_tokens, context_tokens - args.prompt_tokens
+        return mode_rollout_budget(
+            args.reasoning_mode,
+            max_tokens,
+            answer_tokens=args.answer_tokens,
+            prompt_tokens=args.prompt_tokens,
+            context_tokens=context_tokens,
         )
 
-    if args.reasoning_mode == "latent":
-        train_max_new_tokens = args.continuation_tokens
-        if args.max_stream_steps is None:
-            max_stream_steps = min(
-                POSTTRAIN_STREAM_TOKENS, context_tokens - args.prompt_tokens
-            )
-        elif args.max_stream_steps == 0:
-            _, max_stream_steps = mode_budgets(args.continuation_tokens)
-        else:
-            max_stream_steps = args.max_stream_steps
-    else:
-        train_max_new_tokens, max_stream_steps = mode_budgets(
-            args.continuation_tokens
-        )
+    train_max_new_tokens, max_stream_steps = training_rollout_budget(
+        args.reasoning_mode,
+        args.continuation_tokens,
+        answer_tokens=args.answer_tokens,
+        prompt_tokens=args.prompt_tokens,
+        context_tokens=context_tokens,
+        max_stream_steps=args.max_stream_steps,
+    )
     # The eval budget always scales with its own emit cap; an explicit
     # --max-stream-steps is a training-rollout knob.
     aime_max_new_tokens, aime_stream_steps = mode_budgets(args.aime_max_tokens)
     bench_max_new_tokens, bench_stream_steps = mode_budgets(
         args.bench_max_tokens
     )
+    # Persist effective values as well as the user's raw override. Readers
+    # should not have to reconstruct backbone-dependent defaults from a later
+    # checkout merely to reproduce a checkpoint's rollout policy.
+    args.resolved_train_max_new_tokens = train_max_new_tokens
+    args.resolved_train_max_stream_steps = max_stream_steps
+    args.resolved_aime_max_new_tokens = aime_max_new_tokens
+    args.resolved_aime_max_stream_steps = aime_stream_steps
+    args.resolved_bench_max_new_tokens = bench_max_new_tokens
+    args.resolved_bench_max_stream_steps = bench_stream_steps
     validate_posttraining_context_budget(
         args.prompt_tokens, max_stream_steps, context_tokens
     )
@@ -5534,6 +5586,7 @@ def main() -> None:
             wrapper,
             initialize_fresh_mean=bool(args.actor_critic_init),
             initialize_fresh_adapter=bool(args.actor_critic_init),
+            initialize_fresh_gate=bool(args.actor_critic_init),
         )
         validate_renderer_checkpoint(
             actor_init_payload,
@@ -5566,6 +5619,12 @@ def main() -> None:
                 actor_init_payload["sampler_cursor"]
             ),
             "fresh_mean_initialized": bool(args.actor_critic_init),
+            "fresh_gate_initialized": bool(args.actor_critic_init),
+            "fresh_gate_think_probability": (
+                args.init_think_probability
+                if args.actor_critic_init
+                else None
+            ),
             "fresh_mean_output_gain": (
                 args.thought_mean_gain_init if args.actor_critic_init else None
             ),
@@ -5610,10 +5669,11 @@ def main() -> None:
         if not value_support_geometry_matches(init_args, args):
             raise ValueError(
                 "--actor-critic-init warm critic was trained on a different "
-                "value support geometry (anchored/bins/margin "
+                "value support geometry (anchored/bins/margin/sigma_ratio "
                 f"{init_args.get('value_anchored_support', False)}/"
                 f"{init_args.get('value_bins')}/"
-                f"{init_args.get('value_margin_bins')}); rerun critic warmup "
+                f"{init_args.get('value_margin_bins')}/"
+                f"{init_args.get('value_sigma_ratio')}); rerun critic warmup "
                 "under the current flags or start with --actor-init"
             )
         source_critic_adapter_init = init_args.get(
@@ -5929,6 +5989,18 @@ def main() -> None:
                 "--migrate-v20-execution-resume; v18 requires all of those "
                 "plus --migrate-reverse-kl-resume."
             )
+        if not resume_replay_schema_compatible(
+            payload,
+            allow_compact_replay_migration=(
+                args.migrate_compact_replay_resume
+            ),
+        ):
+            raise ValueError(
+                "resume checkpoint replay numerics schema must be "
+                f"{REPLAY_NUMERICS_SCHEMA!r}; got "
+                f"{payload.get('replay_numerics_schema')!r}. Pre-compact "
+                "checkpoints require --migrate-compact-replay-resume."
+            )
         if payload.get("reward_schema") != REWARD_SCHEMA:
             raise ValueError(
                 f"resume checkpoint reward schema must be {REWARD_SCHEMA!r}; "
@@ -5965,10 +6037,11 @@ def main() -> None:
             if not value_support_geometry_matches(resume_args, args):
                 raise ValueError(
                     "resume checkpoint critic support geometry "
-                    "(anchored/bins/margin "
+                    "(anchored/bins/margin/sigma_ratio "
                     f"{resume_args.get('value_anchored_support', False)}/"
                     f"{resume_args.get('value_bins')}/"
-                    f"{resume_args.get('value_margin_bins')}) does not match "
+                    f"{resume_args.get('value_margin_bins')}/"
+                    f"{resume_args.get('value_sigma_ratio')}) does not match "
                     "the current flags; resume with the checkpoint's value "
                     "support flags"
                 )
@@ -6042,6 +6115,14 @@ def main() -> None:
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
         source_execution_schema = payload.get("execution_schema")
+        if args.migrate_compact_replay_resume:
+            actor_init_provenance = dict(actor_init_provenance or {})
+            actor_init_provenance["compact_replay_resume_migration"] = {
+                "source_replay_numerics_schema": payload.get(
+                    "replay_numerics_schema"
+                ),
+                "target_replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
+            }
         if source_execution_schema == ZERO_AFFINE_EXECUTION_SCHEMA:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["identity_affine_execution_relabel"] = {
@@ -6289,6 +6370,10 @@ def main() -> None:
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    source_provenance = capture_source_provenance(
+        output / "provenance", Path(__file__).resolve().parents[1]
+    )
+    args.source_provenance = source_provenance
     logger = JsonlLogger(output / "metrics.jsonl")
     tensorboard_purge_step = None
     if args.resume:
@@ -6320,11 +6405,13 @@ def main() -> None:
                 # configuration's cost.
                 "profiled": bool(args.profile),
                 "profile_schema": PROFILE_SCHEMA if args.profile else None,
+                "source_provenance": source_provenance,
                 "execution_schema": execution_schema_for_adapter(
                     args.thought_adapter,
                     args.thought_action_transform,
                 ),
                 "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
+                "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
                 "math_data_identity": data_identity,
                 "reward_schema": REWARD_SCHEMA,
@@ -6742,6 +6829,9 @@ def main() -> None:
         )
         tensorboard.add_scalar("aime/accuracy", metrics["accuracy"], step)
         tensorboard.add_scalar(
+            "aime/policy_accuracy", metrics["policy_accuracy"], step
+        )
+        tensorboard.add_scalar(
             "aime/forced_initial_accuracy",
             metrics["forced_initial_accuracy"],
             step,
@@ -6754,7 +6844,14 @@ def main() -> None:
         tensorboard.add_scalar(
             "aime/optional_think_fraction", metrics["think_fraction"], step
         )
-        print(f"step:{step} aime_avg@{args.aime_samples}:{metrics['accuracy']:.4f}", flush=True)
+        print(
+            f"step:{step} "
+            f"aime_policy_avg@{metrics['policy_samples']}:"
+            f"{metrics['policy_accuracy']:.4f} "
+            f"aime_interventional_avg@{args.aime_samples}:"
+            f"{metrics['interventional_accuracy']:.4f}",
+            flush=True,
+        )
 
     def bench_eval(
         step: int,
@@ -6808,6 +6905,9 @@ def main() -> None:
         )
         tensorboard.add_scalar("bench/accuracy", metrics["accuracy"], step)
         tensorboard.add_scalar(
+            "bench/policy_accuracy", metrics["policy_accuracy"], step
+        )
+        tensorboard.add_scalar(
             "bench/forced_initial_accuracy",
             metrics["forced_initial_accuracy"],
             step,
@@ -6820,7 +6920,14 @@ def main() -> None:
         tensorboard.add_scalar(
             "bench/optional_think_fraction", metrics["think_fraction"], step
         )
-        print(f"step:{step} bench_avg@{args.bench_samples}:{metrics['accuracy']:.4f}", flush=True)
+        print(
+            f"step:{step} "
+            f"bench_policy_avg@{metrics['policy_samples']}:"
+            f"{metrics['policy_accuracy']:.4f} "
+            f"bench_interventional_avg@{args.bench_samples}:"
+            f"{metrics['interventional_accuracy']:.4f}",
+            flush=True,
+        )
 
     if args.bench_only:
         for repeat in range(args.bench_only_repeats):

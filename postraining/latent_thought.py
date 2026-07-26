@@ -606,6 +606,7 @@ def migrate_legacy_wrapper_checkpoint(
     *,
     initialize_fresh_mean: bool = False,
     initialize_fresh_adapter: bool = False,
+    initialize_fresh_gate: bool = False,
 ) -> tuple[bool, bool, bool]:
     """Apply exact state-layout migrations before strict validation/loading."""
     state_dict = payload["model"]
@@ -631,6 +632,18 @@ def migrate_legacy_wrapper_checkpoint(
                 "legacy residual thought adapters cannot be resumed into the "
                 "current thought policy; use an explicit actor restart"
             )
+    if initialize_fresh_gate:
+        # Critic warmup never deploys or trains the actor. An explicit actor
+        # restart therefore owns the complete Bernoulli policy, including the
+        # CLI-requested initial THINK probability. Strict-loading the warmup
+        # checkpoint without replacing these tensors would silently restore
+        # that source run's zero-weight/bias initialization.
+        state_dict["gate.head.weight"] = (
+            wrapper.gate.head.weight.detach().clone()
+        )
+        state_dict["gate.head.bias"] = (
+            wrapper.gate.head.bias.detach().clone()
+        )
     sigma_weight_key = "transition.log_sigma_head.weight"
     sigma_bias_key = "transition.log_sigma_head.bias"
     sigma_gain_key = "transition.log_sigma_head.residual_gain"

@@ -555,7 +555,13 @@ def masked_token_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
 
-def top_p_sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:
+def top_p_sample(
+    logits: Tensor,
+    temperature: float,
+    top_p: float,
+    *,
+    generator: torch.Generator | None = None,
+) -> Tensor:
     logits = logits.float()
     if temperature != 1.0:
         # Dividing by exactly 1.0 is the identity in IEEE arithmetic, so the
@@ -568,12 +574,16 @@ def top_p_sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:
         # exceeds 1), and the same distribution needs no full-vocab sort —
         # which otherwise runs at EVERY rollout step of the top-p-1 training
         # configuration.
-        return torch.multinomial(logits.softmax(dim=-1), 1).squeeze(-1)
+        return torch.multinomial(
+            logits.softmax(dim=-1), 1, generator=generator
+        ).squeeze(-1)
     sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
     probs = sorted_logits.softmax(dim=-1)
     remove = probs.cumsum(dim=-1) - probs > top_p
     sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
-    sampled = torch.multinomial(sorted_logits.softmax(dim=-1), 1)
+    sampled = torch.multinomial(
+        sorted_logits.softmax(dim=-1), 1, generator=generator
+    )
     return sorted_indices.gather(-1, sampled).squeeze(-1)
 
 

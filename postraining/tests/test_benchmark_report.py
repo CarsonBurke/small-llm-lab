@@ -68,7 +68,8 @@ def test_render_benchmark_report_is_self_contained_and_escapes_model_text():
     report = render_benchmark_report(_payload())
 
     assert "What the model answered" in report
-    assert "Overall accuracy</span><strong>25.00%" in report
+    assert "All-rollout accuracy</span><strong>25.00%" in report
+    assert "Native policy accuracy</span><strong>37.50%" in report
     assert "Prompts solved at least once</span><strong>50.00%" in report
     assert "Mixed-reward prompt groups</span><strong>12.50%" in report
     assert "Mean within-group reward std</span><strong>0.0312" in report
@@ -152,6 +153,9 @@ def test_sample_json_converter_preserves_exact_panel_and_computes_metrics(tmp_pa
     assert payload["step"] == 158
     assert payload["attempts"][0]["answer_style"] == "exact"
     assert payload["metrics"]["accuracy"] == 0.25
+    assert payload["metrics"]["interventional_accuracy"] == 0.25
+    assert payload["metrics"]["policy_accuracy"] == 0.0
+    assert payload["metrics"]["policy_samples"] == 8
     assert payload["metrics"]["forced_initial_accuracy"] == 0.5
     assert payload["metrics"]["unforced_initial_accuracy"] == 0.0
     assert payload["metrics"]["think_fraction"] == 8 / 40
@@ -177,7 +181,7 @@ def test_sample_json_converter_supports_full_rectangular_evaluations():
     assert payload["problem_count"] == 2
     assert payload["samples_per_problem"] == 3
     assert len(payload["attempts"]) == 6
-    assert "2 dataset problems · 3 policy samples each" in report
+    assert "2 dataset problems · 3 rollout samples each" in report
     assert report.count('class="attempt ') == 6
 
 

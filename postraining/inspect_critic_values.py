@@ -47,7 +47,11 @@ from postraining.latent_thought import (
 )
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import fresh_trunk, load_model
-from postraining.train_latent_vapo import score_math_rollout
+from postraining.reasoning_modes import checkpoint_training_rollout_budget
+from postraining.train_latent_vapo import (
+    answer_prefix_token_ids,
+    score_math_rollout,
+)
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
@@ -121,11 +125,18 @@ def main() -> None:
         parser.error("--rows and --samples must be positive")
 
     wrapper_path = Path(args.wrapper_checkpoint)
+    manifest_path = wrapper_path.parent / "manifest.json"
+    manifest_payload = (
+        json.loads(manifest_path.read_text())
+        if manifest_path.exists()
+        else {}
+    )
     if args.checkpoint is None:
-        manifest = wrapper_path.parent / "manifest.json"
-        if not manifest.exists():
-            parser.error(f"cannot resolve the base checkpoint: {manifest} not found")
-        args.checkpoint = json.loads(manifest.read_text())["base"]["checkpoint"]
+        if not manifest_payload:
+            parser.error(
+                f"cannot resolve the base checkpoint: {manifest_path} not found"
+            )
+        args.checkpoint = manifest_payload["base"]["checkpoint"]
         print(f"base checkpoint (from manifest): {args.checkpoint}")
 
     device = torch.device("cuda")
@@ -188,12 +199,20 @@ def main() -> None:
         )
     )
     prompt_budget = saved_args.get("prompt_tokens", 512)
-    response_budget = saved_args.get("continuation_tokens", 1024)
     pin_emit = reasoning_mode != "latent"
-    # Pinned modes spend the whole stream on tokens; latent gets 4x slack.
-    stream_budget = (
-        response_budget if pin_emit else 4 * response_budget
+    context_tokens = manifest_payload.get("context_tokens")
+    if context_tokens is None:
+        context_tokens = (
+            getattr(backbone, "train_context_tokens", 1024)
+            if backbone.architecture.startswith("nanogpt_mini")
+            else 5 * 1024
+        )
+    response_budget, stream_budget = checkpoint_training_rollout_budget(
+        saved_args, context_tokens=context_tokens
     )
+    solution_prefix_ids: tuple[int, ...] = ()
+    if reasoning_mode == "none":
+        solution_prefix_ids = answer_prefix_token_ids(tokenizer)
 
     rows = load_unique_math_rows(args.math_data)
     picked = random.Random(args.seed).sample(range(len(rows)), args.rows)
@@ -207,7 +226,14 @@ def main() -> None:
     records = []
     for prompt_index, row_index in enumerate(picked):
         row = rows[row_index]
-        encoded = encode_prompt(tokenizer, prompt_text(row), prompt_budget)
+        encoded = (
+            encode_prompt(
+                tokenizer,
+                prompt_text(row),
+                prompt_budget - len(solution_prefix_ids),
+            )
+            + list(solution_prefix_ids)
+        )
         prompt_ids = torch.tensor(encoded, dtype=torch.long, device=device)
         with torch.no_grad(), torch.autocast(
             device_type=device.type, dtype=torch.bfloat16
@@ -233,6 +259,7 @@ def main() -> None:
         score_math_rollout(
             batch, truth, tokenizer, stop_ids, answer_style(row),
             saved_args.get("nearby_reward_max", 0.1),
+            solution_prefix_ids=solution_prefix_ids,
         )
         kinds = batch.kind.cpu()
         tokens = batch.token_ids.cpu()

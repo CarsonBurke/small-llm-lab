@@ -598,6 +598,35 @@ def test_explicit_actor_restart_replaces_mean_and_sigma_heads():
     )
 
 
+def test_explicit_actor_restart_replaces_the_complete_gate():
+    wrapper = LatentThoughtModel(_pope_model())
+    with torch.no_grad():
+        wrapper.gate.head.weight.zero_()
+        wrapper.gate.head.bias.fill_(1.25)
+    expected_weight = wrapper.gate.head.weight.detach().clone()
+    expected_bias = wrapper.gate.head.bias.detach().clone()
+    state = {
+        key: value.detach().clone()
+        for key, value in wrapper.state_dict().items()
+    }
+    state["gate.head.weight"].fill_(0.5)
+    state["gate.head.bias"].fill_(-2.0)
+    payload = {"model": state}
+
+    migrate_legacy_wrapper_checkpoint(
+        payload, wrapper, initialize_fresh_gate=True
+    )
+    wrapper.load_state_dict(state, strict=True)
+
+    torch.testing.assert_close(wrapper.gate.head.weight, expected_weight)
+    torch.testing.assert_close(wrapper.gate.head.bias, expected_bias)
+    belief = torch.randn(4, expected_weight.shape[1])
+    expected_emit_probability = torch.sigmoid(expected_bias).expand(4)
+    torch.testing.assert_close(
+        wrapper.gate.emit_logit(belief).sigmoid(), expected_emit_probability
+    )
+
+
 def test_fresh_adapter_explicitly_replaces_critic_warm_identity_state():
     wrapper = LatentThoughtModel(_pope_model())
     state = {

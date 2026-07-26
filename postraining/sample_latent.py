@@ -432,7 +432,9 @@ def main() -> None:
         ) / max(len(records) * args.samples, 1)
         print(
             f"sampled {len(records)} problems x {args.samples}: "
-            f"accuracy={metrics['accuracy']:.4f}, "
+            f"policy_accuracy={metrics['policy_accuracy']:.4f}, "
+            f"interventional_accuracy="
+            f"{metrics['interventional_accuracy']:.4f}, "
             f"terminated={terminated:.4f}"
         )
         if args.json_out:

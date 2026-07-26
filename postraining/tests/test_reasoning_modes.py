@@ -35,6 +35,11 @@ from postraining.latent_thought import (
     validate_renderer_checkpoint,
 )
 from postraining.core import GPT2BPETokenizer, load_posttraining_tokenizer
+from postraining.reasoning_modes import (
+    checkpoint_training_rollout_budget,
+    mode_rollout_budget,
+    training_rollout_budget,
+)
 from postraining.nano_backbone import NanoGPTBackbone
 from postraining.train_latent_vapo import (
     answer_prefix_token_ids,
@@ -61,6 +66,81 @@ def _pinned_rollout(wrapper, **overrides):
     )
     kwargs.update(overrides)
     return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+
+def test_reasoning_budgets_cover_latent_cot_and_answer_only_modes():
+    common = dict(
+        answer_tokens=24,
+        prompt_tokens=1024,
+        context_tokens=5120,
+    )
+    assert mode_rollout_budget("latent", 700, **common) == (700, 2800)
+    assert mode_rollout_budget("latent", 2048, **common) == (2048, 4096)
+    assert mode_rollout_budget("cot", 700, **common) == (700, 700)
+    assert mode_rollout_budget("none", 700, **common) == (24, 24)
+
+    assert training_rollout_budget(
+        "latent", 1024, max_stream_steps=None, **common
+    ) == (1024, 4096)
+    assert training_rollout_budget(
+        "latent", 512, max_stream_steps=0, **common
+    ) == (512, 2048)
+    assert training_rollout_budget(
+        "latent", 1024, max_stream_steps=2048, **common
+    ) == (1024, 2048)
+    with pytest.raises(ValueError, match="only valid for latent"):
+        training_rollout_budget(
+            "cot", 1024, max_stream_steps=2048, **common
+        )
+
+
+@pytest.mark.parametrize(
+    ("saved", "expected"),
+    [
+        (
+            {
+                "resolved_train_max_new_tokens": 700,
+                "resolved_train_max_stream_steps": 1900,
+            },
+            (700, 1900),
+        ),
+        (
+            {
+                "reasoning_mode": "latent",
+                "continuation_tokens": 1024,
+                "prompt_tokens": 1024,
+                "max_stream_steps": 2048,
+            },
+            (1024, 2048),
+        ),
+        (
+            {
+                "reasoning_mode": "latent",
+                "continuation_tokens": 1024,
+                "prompt_tokens": 1024,
+            },
+            (1024, 4096),
+        ),
+        (
+            {"reasoning_mode": "cot", "continuation_tokens": 700},
+            (700, 700),
+        ),
+        (
+            {
+                "reasoning_mode": "none",
+                "continuation_tokens": 700,
+                "answer_tokens": 24,
+            },
+            (24, 24),
+        ),
+    ],
+)
+def test_checkpoint_rollout_budget_reconstructs_new_and_legacy_runs(
+    saved, expected
+):
+    assert checkpoint_training_rollout_budget(
+        saved, context_tokens=5120
+    ) == expected
 
 
 def test_pin_emit_rollout_invariants():
