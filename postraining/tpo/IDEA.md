@@ -92,9 +92,9 @@ At each action position, replace the clipped surrogate with anchored CE:
 What this deletes and keeps:
 
 - **Keeps**: separate HL-Gauss critic, value warmup, length-adaptive GAE γ=1, packed
-  shuffled pool with 4 disjoint age-0..3 minibatches, positive-example LM loss, gate
-  entropy bonus (initially), reverse-KL on thoughts (initially — TPO's frozen-q
-  anchoring may subsume it; ablate its removal second).
+  shuffled pool with 4 disjoint age-0..3 minibatches, gate entropy bonus
+  (initially), reverse-KL on thoughts (initially — TPO's frozen-q anchoring may
+  subsume it; ablate its removal second).
 - **Deletes**: PPO ratios and clip-higher, and the entire per-dim thought clip +
   straight-through rescale machinery — TPO's per-candidate gradient weight is p−q,
   bounded in [−1,1], with no ratios to explode. Frozen q structurally covers the

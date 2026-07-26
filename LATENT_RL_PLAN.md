@@ -20,21 +20,17 @@ kept only as a do-no-harm regression guard.
   objective that trains that projector. It has a distinct architecture ID,
   and `model_io.load_model` reconstructs that exact class.
 - `LatentThoughtModel` (latent_thought.py) wraps the backbone with:
-  - `GaussianTransitionHead`: diagonal Gaussian over the next projected
-    token latent with a belief-conditioned per-dimension log-sigma head.
-    Its weights start at zero and its bias starts at -2 (std 0.135; expected
-    512-D noise norm 3.06), so the initial policy is state-independent while
-    RL can learn selective uncertainty in every latent coordinate.
-    The mean IS the backbone's prediction path — at RL time the policy
-    gradient flows through it into the whole trunk. (The earlier JEDI/EDM
-    diffusion-transition design was dropped: a Gaussian around the
-    predictor gives a tractable PPO log-density with none of the
-    reverse-chain ratio machinery. The v1 delta-offset/learned-log-std
-    heads were removed with the frozen-trunk design, Jul 18.)
+  - `GaussianTransitionHead`: diagonal Gaussian over a continuous thought.
+    The fresh mean is a zero-bias unit-orthogonal map behind a learned 0.1
+    output gain. The treatment sigma head uses a unit-orthogonal state map
+    behind a learned 0.01 gain and centers bounded log-sigma at -2
+    (std 0.135; expected 512-D noise norm 3.06). A zero-weight,
+    state-independent sigma map remains the matched control.
   - `ThinkEmitGate`: zero-init Bernoulli head — exactly 50/50 at start.
-  - `ThoughtAdapter`: identity-initialized affine embedding for injected
-    thoughts, so an untrained thought is exactly the sampled imagined
-    next-token latent. Its bias can learn a shared thought-type marker.
+  - `ThoughtAdapter`: one full-width unit-orthogonal affine followed by
+    `2*SiLU`. It gives the thought path nonlinear mixing before the shared
+    trunk without a second matrix multiply. The v25 identity affine remains
+    the control.
   - Renderer: `[current input latent, raw belief] -> policy_probe -> vocab`.
     It deliberately bypasses `prediction_latent`, which is reserved for the
     continuous thought policy. Cached and parallel belief-renderer paths are
@@ -82,9 +78,10 @@ into the entire trunk. Gate and content factors form one action probability:
 gate+token for EMIT, gate+summed Gaussian density for optional THINK, and the
 Gaussian density alone for a forced THINK. VAPO's clipped surrogate is then
 applied once per joint action. Sigma is a learned diagonal function of the
-current belief, initialized at log-sigma -2, smoothly bounded to [-5, 2],
-and trained only by the joint policy objective: no beta-NLL,
-continuous-policy entropy bonus, or KL penalty.
+current belief, initialized around log-sigma -2, smoothly bounded to [-5, 2],
+and trained by the joint policy objective. There is no beta-NLL or
+continuous-policy entropy bonus; the current policy also uses a sampled
+reverse-KL trust term against rollout behavior.
 The separate optional gate-entropy ablation is documented below.
 The v1 delta/log-std heads and the frozen-trunk adaptation trainer
 (`train_adaptation.py`, `adaptation_core.py`) were deleted.
@@ -173,10 +170,9 @@ and `sample_latent.py` stream inspection.
 
 - `SeparateCritic`: a **from-scratch** trunk of the same architecture class
   (fully trainable, ~28.9M params, training-only scaffolding) with its own
-  thought adapter and an HL-Gauss categorical value head (cleanrl v215
-  recipe: 101 bins on [0,1], sigma_ratio 2.0, zero-weight head with
-  projected-prior bias, softmax-CE to truncated-Gaussian two-hot targets, no
-  value clipping, no advantage normalization).
+  unit-orthogonal affine thought adapter and an HL-Gauss categorical value
+  head. The current support anchors bin centers at 0 and 1 with margin bins;
+  the head starts at the projected prior with zero weight.
 - The policy's stepwise path never computes values; the critic scores stored
   streams in parallel. v2 rationale: with the policy trunk now
   reward-trained, a shared-trunk critic would couple value estimation to a
@@ -187,24 +183,20 @@ and `sample_latent.py` stream inspection.
 
 ### Training (train_latent_vapo.py)
 
-- VAPO-aligned objective: length-adaptive GAE (λ from |trajectory|), one
-  clip-higher PPO ratio (0.20/0.28) per joint action, and positive-example
-  LM loss token-normalized across correct trajectories.
-- v6 optimizer layout: one actor AdamW with param groups — pretrained
-  trunk at the VAPO paper's `--actor-lr` (1e-6), scalar gate at `--gate-lr`
-  (1e-4), recurrent thought adapter at `--adapter-lr` (1e-6), and renderer
-  probe at `--renderer-lr` (1e-6), with the paired continuous-policy
-  log-sigma head also fixed to `--actor-lr` (1e-6) — plus the critic AdamW (3e-4,
-  from-scratch scale). The adapter is not treated as an isolated fresh head:
-  it changes every later belief and therefore every factor of the recurrent
-  512-D thought policy. Old v1
-  checkpoints cannot `--resume` across this change (optimizer keys and
-  head shapes differ); none are worth keeping. Likewise, VAPO checkpoints
-  from before the `input_latent+belief/v1` renderer schema are rejected on
-  resume/eval even though tensor shapes happen to match.
+- VAPO-derived objective: length-adaptive GAE (λ from |trajectory|),
+  clip-higher PPO (0.20/0.28) for emitted tokens and the optional gate, and a
+  Gaussian thought-policy surrogate with reverse-KL trust. VAPO's auxiliary
+  positive-example LM loss is deliberately omitted; emitted tokens, thoughts,
+  and optional gate decisions train through their policy losses.
+- Current optimizer layout: block matrices in both actor and critic trunks
+  use Muon with Polar Express. Embeddings, norms, readouts, adapters, gate,
+  mean, sigma, and value head use AdamW. The generic AdamW rate is 5e-5;
+  the derived Muon rate preserves the pretraining Muon:Adam ratio and applies
+  the measured Polar Express step correction. Weight decay is zero in RL.
+  Exact parameter-partition checks prevent overlap or omission.
 - Actor and critic gradients accumulate across length-varying prompt groups
   and each optimizer steps once on the same effective trajectory minibatch.
-  Actor policy/NLL and critic value CE use their global token denominators;
+  Actor policy and critic value CE use their global action denominators;
   replay groups and length-aware shards are memory partitions only. PPO is
   restricted to one pass so generated trajectories are never reused. The
   default behavior pool is one fresh 16-prompt × 32-sample B512 minibatch per
@@ -303,9 +295,9 @@ rewards, no synthetic RL tasks:
   (`build_deepmind_eval_set.py`). The RL trainer evaluates it every
   `--bench-every` steps (`bench/accuracy`), and `eval_aime.py --test-file`
   probes it emit-only between pretraining stages.
-- Paper alignment kept: value warmup, length-adaptive GAE, clip-higher,
-  positive-example LM loss, token-level (here: action-level) loss; critic is
-  HL-Gauss instead of MSE (deliberate deviation, documented above).
+- Paper components kept: value warmup, length-adaptive GAE, clip-higher, and
+  token-level (here: action-level) loss. Deliberate deviations are removal of
+  the positive-example LM auxiliary and use of HL-Gauss instead of MSE.
 - **Gate-entropy ablation** (user call, Jul 19): VAPO's objective has no
   entropy term — the paper only monitors entropy, with clip-higher as the
   exploration mechanism — but the optional THINK gate collapsed before its

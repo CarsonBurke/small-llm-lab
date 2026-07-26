@@ -48,7 +48,8 @@ COLD-START FIX (user-approved Jul 18): 50/50 zero-init gate is reward-starved �
 noisy thoughts (not sampling config) collapse accuracy; value warmup "instant convergence"
 was the tell (critic hit the exact HL-Gauss CE floor 1.4292 predicting constant 0).
 New `--init-think-probability 0.1` sets the gate head BIAS (weights stay zero); sigma
-unchanged at -1.5. Jobs 133 (b8 samples) and 134 (zero-init, starved; dir staged as
+used the then-current -1.5 (the current default is -2). Jobs 133 (b8 samples)
+and 134 (zero-init, starved; dir staged as
 `latent_vapo_dm_v1_zeroinit_starved`) superseded by job 135 (`latent_vapo_dm_v1`,
 samples-per-prompt 32, init think 10%).
 COMPILE (user prescription Jul 18, in progress): torch.compile reduce-overhead/CUDA
@@ -155,7 +156,8 @@ evals unchanged (bench stays held out).
 NOTE: algorithm is VAPO everywhere; "DAPO" = the DAPO-Math-17K prompt dataset/verifier
 4. `latent_vapo_attached_gate` — `train_latent_vapo --rollout-only` reward-variance gate
    (BINDING: exit 2 stops the chain)
-5. `latent_vapo_attached_v1` — full latent VAPO **v2** (user redesign, Jul 18): FULL-MODEL
+5. `latent_vapo_attached_v1` — historical Jul 18 latent VAPO **v2**
+   configuration, since superseded by `LATENT_RL_PLAN.md`: FULL-MODEL
    training (no frozen trunk — world model retrained from "will be" to "should be" by
    per-dim thought PPO through the prediction path + token PPO), fixed thought sigma
    (log -1.5; no beta-NLL, no entropy, no KL), NO pretraining objective at RL time

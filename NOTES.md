@@ -381,6 +381,34 @@ d == 2*KL closed form, age-0 gradient == joint mode at ratio 1, ratio
 guard saturation, refresh storage + age-0 exactness); 311 postraining +
 83 repo tests green.
 
+Superseded again on 2026-07-25, pending separate 2,000-step ablations:
+
+- Job 470 (`rl_latent_identity_sigma20_2k`) tested central log-sigma `-2.0`,
+  per the user call. It was canceled by request at step 1556,
+  so it is not a completed ablation. The user judged it clearly better than
+  `-2.5`; at step 1500 the recorded evidence was still mixed: it had worse BPB
+  (1.25769 versus 1.25504) and bench accuracy (0.138 versus 0.216) than
+  job 468 at the same step. It kept more optional thinking but did not
+  improve the late rollout reward mean.
+- A line-by-line CleanRL SAC review rejected `-1.5` as a transferred default.
+  It is only the raw-zero midpoint of CleanRL's `[-5, 2]` safety map, not an
+  explicit log-std initialization. Our selected default returns to `-2.0`
+  (std 0.135; expected 512-D noise norm 3.06). Its inverse raw bias is
+  `-0.14384`, retains 98% of the midpoint's local tanh sensitivity, and has
+  no decay toward zero because the RL AdamW weight decay is zero.
+- The sigma treatment uses a unit-orthogonal state map behind a learned
+  outer gain of `0.01`. This equals an orthogonal gain-0.01 map at
+  initialization, while the explicit gain keeps Adam's matrix updates
+  behind the same scale. The old zero-weight, state-independent head remains
+  the control.
+- The actor treatment is one unit-orthogonal full-width affine followed by
+  `2*SiLU`; the v25 identity affine remains the control. The critic treatment
+  keeps one affine and changes only its fresh initialization from identity to
+  unit-orthogonal.
+- Run the sigma-state, actor-adapter, and critic-adapter arms separately.
+  The critic arm needs a matched critic warmup. Combine only winners. No new
+  run was queued while this change was prepared.
+
 TRPL paper audit (2026-07-24, vs arXiv 2101.09207 + boschresearch/
 trust-region-layers): mean projection algebraically EXACT vs Eq. 6
 (mu0+sqrt(eps/d)(mu-mu0) == (mu+w*mu0)/(1+w), w=sqrt(d/eps)-1); distance
