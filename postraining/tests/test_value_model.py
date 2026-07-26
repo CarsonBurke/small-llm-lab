@@ -168,6 +168,21 @@ def test_critic_dense_masked_inputs_match_compact_routing():
     torch.testing.assert_close(critic.assemble_inputs(batch), expected)
 
 
+def test_tanh_critic_transforms_raw_thoughts_before_its_adapter():
+    critic = _critic()
+    critic.thought_action_transform = "tanh"
+    batch = _batch()
+    thought_mask = batch.kind == THOUGHT_SLOT
+    batch.thoughts[thought_mask] = 2.5
+    token_latent = critic.trunk.embed_tokens(batch.token_ids)
+    expected = token_latent.clone()
+    expected[thought_mask] = critic.adapter(
+        batch.thoughts[thought_mask].float().tanh()
+    ).to(token_latent.dtype)
+    expected *= (batch.kind != PAD_SLOT)[..., None].to(expected.dtype)
+    torch.testing.assert_close(critic.assemble_inputs(batch), expected)
+
+
 def test_all_critic_parameters_receive_value_gradients():
     critic = _critic()
     with torch.no_grad():

@@ -238,6 +238,9 @@ def main() -> None:
             payload,
             args.wrapper_checkpoint,
             expected_thought_input_schema=wrapper.thought_input_schema,
+            expected_thought_action_transform_schema=(
+                wrapper.thought_action_transform_schema
+            ),
         )
         wrapper.load_state_dict(payload["model"], strict=True)
         wrapper_step = payload.get("step")

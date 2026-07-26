@@ -61,6 +61,11 @@ COMPATIBLE_IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMAS = frozenset(
     }
 )
 THOUGHT_ADAPTER_KINDS = ("identity_affine", "orthogonal_silu")
+THOUGHT_ACTION_TRANSFORM_KINDS = ("identity", "tanh")
+THOUGHT_ACTION_TRANSFORM_SCHEMAS = {
+    "identity": "raw_gaussian_recurrent_input/v1",
+    "tanh": "tanh_raw_gaussian_recurrent_input/v1",
+}
 SIGMA_STATE_INIT_KINDS = ("constant", "orthogonal")
 CRITIC_ADAPTER_INIT_KINDS = ("identity", "orthogonal")
 SIGMA_STATE_INIT_SCHEMAS = {
@@ -98,6 +103,20 @@ def thought_input_schema_for_adapter(kind: str) -> str:
     raise ValueError(f"unknown thought adapter kind {kind!r}")
 
 
+def transform_thought_action(thought: Tensor, kind: str) -> Tensor:
+    """Map a raw Gaussian action into the recurrent input consumed by a trunk.
+
+    Rollout storage and policy likelihoods remain in the raw Gaussian space.
+    This transform belongs only at actor/critic stream-input boundaries.
+    """
+    thought = thought.float()
+    if kind == "identity":
+        return thought
+    if kind == "tanh":
+        return thought.tanh()
+    raise ValueError(f"unknown thought action transform {kind!r}")
+
+
 def wrapper_init_kwargs_from_checkpoint(payload: dict) -> dict[str, str]:
     """Recover policy semantics before constructing a checkpoint wrapper.
 
@@ -114,6 +133,9 @@ def wrapper_init_kwargs_from_checkpoint(payload: dict) -> dict[str, str]:
         "sigma_state_init": saved_args.get(
             "thought_sigma_state_init", "constant"
         ),
+        "thought_action_transform": saved_args.get(
+            "thought_action_transform", "identity"
+        ),
     }
 
 
@@ -124,6 +146,9 @@ def validate_renderer_checkpoint(
     allow_transition_reset: bool = False,
     expected_rollout_policy_schema: str = ROLLOUT_POLICY_SCHEMA,
     expected_thought_input_schema: str = THOUGHT_INPUT_SCHEMA,
+    expected_thought_action_transform_schema: str = (
+        THOUGHT_ACTION_TRANSFORM_SCHEMAS["identity"]
+    ),
 ) -> None:
     """Reject wrapper checkpoints trained with incompatible policy semantics."""
     actual = payload.get("renderer_features_schema")
@@ -158,6 +183,18 @@ def validate_renderer_checkpoint(
             f"{expected_thought_input_schema!r}. The checkpoint uses a "
             "different deployed thought adapter and cannot be resumed or "
             "evaluated as this policy."
+        )
+    thought_action_transform = payload.get(
+        "thought_action_transform_schema",
+        THOUGHT_ACTION_TRANSFORM_SCHEMAS["identity"],
+    )
+    if thought_action_transform != expected_thought_action_transform_schema:
+        raise ValueError(
+            f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
+            f"action transform schema is {thought_action_transform!r}, "
+            f"expected {expected_thought_action_transform_schema!r}. The "
+            "checkpoint recurrently consumed a different action and cannot "
+            "be resumed or evaluated as this policy."
         )
     thought_distribution = payload.get("thought_distribution_schema")
     if (
@@ -689,6 +726,7 @@ class LatentThoughtModel(nn.Module):
         *,
         thought_adapter: str = "orthogonal_silu",
         sigma_state_init: str = "orthogonal",
+        thought_action_transform: str = "identity",
     ):
         super().__init__()
         self.backbone = backbone
@@ -696,6 +734,14 @@ class LatentThoughtModel(nn.Module):
         self.thought_adapter_kind = thought_adapter
         self.thought_input_schema = thought_input_schema_for_adapter(
             thought_adapter
+        )
+        if thought_action_transform not in THOUGHT_ACTION_TRANSFORM_KINDS:
+            raise ValueError(
+                f"unknown thought action transform {thought_action_transform!r}"
+            )
+        self.thought_action_transform = thought_action_transform
+        self.thought_action_transform_schema = (
+            THOUGHT_ACTION_TRANSFORM_SCHEMAS[thought_action_transform]
         )
         if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
             raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
@@ -918,12 +964,18 @@ class LatentThoughtModel(nn.Module):
         )
 
     def thought_input(self, thought: Tensor) -> Tensor:
-        # The adapter runs in fp32 on the raw thought and the result is
+        # The transform and adapter run in fp32 and the result is
         # rounded to the embedding dtype afterwards — the same cast order as
         # ``assemble_stream_latents`` — so rollout and replay agree exactly
         # and the fp32 adapter never sees a low-precision operand.
-        return self.adapter(thought.float())[:, None].to(
+        return self.adapt_thought_action(thought)[:, None].to(
             self.backbone.tok_emb.weight.dtype
+        )
+
+    def adapt_thought_action(self, thought: Tensor) -> Tensor:
+        """Transform one raw Gaussian action, then apply the actor adapter."""
+        return self.adapter(
+            transform_thought_action(thought, self.thought_action_transform)
         )
 
     def new_parameters(self):

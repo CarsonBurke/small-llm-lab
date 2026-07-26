@@ -1115,7 +1115,9 @@ def assemble_stream_latents(
     # The kind-select makes dense adapter evaluation value/gradient-equivalent
     # to boolean-index assignment. Unlike the latter, it has static output
     # shapes and keeps the full replay trunk inside one Inductor graph.
-    thought_latent = wrapper.adapter(batch.thoughts).to(token_latent.dtype)
+    thought_latent = wrapper.adapt_thought_action(batch.thoughts).to(
+        token_latent.dtype
+    )
     inputs = torch.where(think_mask[..., None], thought_latent, token_latent)
     return inputs * pad_scale
 

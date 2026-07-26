@@ -367,11 +367,25 @@ def test_assembled_latents_zero_pads_and_route_thoughts_through_adapter():
     assert float(latents[pads].abs().sum()) == 0.0
     thought_slots = batch.kind == THOUGHT_SLOT
     if thought_slots.any():
-        expected = wrapper.adapter(batch.thoughts).to(latents.dtype)
+        expected = wrapper.adapt_thought_action(batch.thoughts).to(latents.dtype)
         torch.testing.assert_close(latents[thought_slots], expected[thought_slots])
     token_slots = batch.kind == TOKEN_SLOT
     expected_tokens = wrapper.embed_tokens(batch.token_ids)
     torch.testing.assert_close(latents[token_slots], expected_tokens[token_slots])
+
+
+def test_tanh_replay_consumes_squashed_thoughts_but_keeps_raw_actions():
+    wrapper = _wrapper()
+    wrapper.thought_action_transform = "tanh"
+    batch = _rollout(wrapper)
+    thought_slots = batch.kind == THOUGHT_SLOT
+    assert thought_slots.any()
+    with torch.no_grad():
+        batch.thoughts[thought_slots] = 2.5
+        latents = assemble_stream_latents(wrapper, batch)
+    expected = wrapper.adapter(batch.thoughts.float().tanh()).to(latents.dtype)
+    torch.testing.assert_close(latents[thought_slots], expected[thought_slots])
+    assert torch.all(batch.thoughts[thought_slots] == 2.5)
 
 
 def test_terminal_reward_lands_on_the_last_action():
@@ -1709,6 +1723,7 @@ def test_shipped_defaults_are_the_reverse_kl_only_arm():
     assert cli.thought_clip_mode == "none"
     assert cli.thought_reverse_kl_coef == 0.5
     assert cli.thought_log_sigma_init == -2.0
+    assert cli.thought_action_transform == "identity"
 
 
 @pytest.mark.parametrize(
@@ -3080,6 +3095,10 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["thought_distribution_schema"] == THOUGHT_DISTRIBUTION_SCHEMA
     assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
     assert payload["thought_sigma_init_schema"] == wrapper.sigma_state_init_schema
+    assert (
+        payload["thought_action_transform_schema"]
+        == wrapper.thought_action_transform_schema
+    )
     assert payload["critic_adapter_init_schema"] == critic.adapter_init_schema
     assert "torch_adamw" in payload["optimizer_schema"]
 

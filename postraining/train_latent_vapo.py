@@ -154,12 +154,14 @@ from postraining.latent_thought import (
     CRITIC_ADAPTER_INIT_KINDS,
     RENDERER_FEATURES_SCHEMA,
     SIGMA_STATE_INIT_KINDS,
+    THOUGHT_ACTION_TRANSFORM_KINDS,
     THOUGHT_ADAPTER_KINDS,
     THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
     LatentThoughtModel,
     migrate_legacy_wrapper_checkpoint,
     rollout_policy_schema_for_mode,
+    transform_thought_action,
     validate_renderer_checkpoint,
 )
 from postraining.model_io import fresh_trunk, load_model
@@ -174,6 +176,7 @@ EXECUTION_SCHEMA = (
 IDENTITY_AFFINE_EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_identity_affine_general_lr_sequential_data/v25"
 )
+TANH_ACTION_EXECUTION_SCHEMA_SUFFIX = "+tanh_raw_gaussian_recurrent_input/v1"
 ZERO_AFFINE_EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_zero_affine_general_lr_sequential_data/v24"
 )
@@ -202,13 +205,23 @@ ADAMW_ALGORITHM_SCHEMA = (
 )
 
 
-def execution_schema_for_adapter(kind: str) -> str:
-    """Execution schema for the selected deployed actor adapter."""
+def execution_schema_for_adapter(
+    kind: str, thought_action_transform: str = "identity"
+) -> str:
+    """Execution schema for the selected deployed recurrent thought path."""
     if kind == "orthogonal_silu":
-        return EXECUTION_SCHEMA
-    if kind == "identity_affine":
-        return IDENTITY_AFFINE_EXECUTION_SCHEMA
-    raise ValueError(f"unknown thought adapter kind {kind!r}")
+        schema = EXECUTION_SCHEMA
+    elif kind == "identity_affine":
+        schema = IDENTITY_AFFINE_EXECUTION_SCHEMA
+    else:
+        raise ValueError(f"unknown thought adapter kind {kind!r}")
+    if thought_action_transform == "identity":
+        return schema
+    if thought_action_transform == "tanh":
+        return schema + TANH_ACTION_EXECUTION_SCHEMA_SUFFIX
+    raise ValueError(
+        f"unknown thought action transform {thought_action_transform!r}"
+    )
 
 
 def optimizer_schema_for_trunk_optimizer(kind: str) -> str:
@@ -1020,6 +1033,53 @@ def aggregate_actor_tensorboard_metrics(
         "sigma/mean_head_weight_rms": last["thought_mean_weight_rms"],
         "sigma/mean_head_bias_rms": last["thought_mean_bias_rms"],
         "sigma/mean_output_gain": last["thought_mean_output_gain"],
+        "thought_input/raw_abs_max": max(
+            metric["thought_raw_abs_max"] for metric in metrics
+        ),
+        "thought_input/raw_abs_gt_0_5_fraction": _weighted_metric_mean(
+            metrics, "thought_raw_abs_gt_0_5_fraction", "thought_action_count"
+        ),
+        "thought_input/raw_abs_gt_0_8_fraction": _weighted_metric_mean(
+            metrics, "thought_raw_abs_gt_0_8_fraction", "thought_action_count"
+        ),
+        "thought_input/raw_abs_gt_1_fraction": _weighted_metric_mean(
+            metrics, "thought_raw_abs_gt_1_fraction", "thought_action_count"
+        ),
+        "thought_input/raw_abs_gt_2_fraction": _weighted_metric_mean(
+            metrics, "thought_raw_abs_gt_2_fraction", "thought_action_count"
+        ),
+        "thought_input/transform_distortion_rms": math.sqrt(
+            _weighted_metric_mean(
+                [
+                    {
+                        **metric,
+                        "thought_transform_distortion_square_mean": (
+                            metric["thought_transform_distortion_rms"] ** 2
+                        ),
+                    }
+                    for metric in metrics
+                ],
+                "thought_transform_distortion_square_mean",
+                "thought_action_count",
+            )
+        ),
+        "thought_input/squashed_raw_norm": _weighted_metric_mean(
+            metrics, "thought_squashed_raw_norm", "thought_action_count"
+        ),
+        "thought_input/adapter_output_norm": _weighted_metric_mean(
+            metrics, "thought_adapter_output_norm", "thought_action_count"
+        ),
+        "thought_input/post_thought_belief_norm": _weighted_metric_mean(
+            metrics, "post_thought_belief_norm", "thought_action_count"
+        ),
+        "thought_input/mean_abs_max": max(
+            metric["thought_mean_abs_max"] for metric in metrics
+        ),
+        "thought_input/mean_abs_gt_0_8_fraction": _weighted_metric_mean(
+            metrics,
+            "thought_mean_abs_gt_0_8_fraction",
+            "thought_action_count",
+        ),
         "kl/gate_behavior": _weighted_metric_mean(
             metrics, "gate_behavior_kl", "gate_action_count"
         ),
@@ -1974,6 +2034,14 @@ def update_minibatch(
             "thought_sigma_sum", "thought_expected_noise_norm_sum",
             "thought_realized_noise_norm_sum", "thought_normalized_noise_square_sum",
             "thought_mean_norm_sum",
+            "thought_raw_abs_max", "thought_raw_abs_gt_0_5_count",
+            "thought_raw_abs_gt_0_8_count",
+            "thought_raw_abs_gt_1_count", "thought_raw_abs_gt_2_count",
+            "thought_transform_distortion_square_sum",
+            "thought_squashed_raw_norm_sum",
+            "thought_adapter_output_norm_sum",
+            "post_thought_belief_norm_sum",
+            "thought_mean_abs_max", "thought_mean_abs_gt_0_8_count",
             "thought_trust_sum", "thought_trust_max",
             "thought_projection_penalty",
         )
@@ -2558,6 +2626,42 @@ def update_minibatch(
                 totals["thought_normalized_noise_square_sum"] += (
                     normalized_residual.square().sum()
                 )
+                raw_thought = thought_targets.detach().float()
+                transformed_thought = transform_thought_action(
+                    raw_thought, wrapper.thought_action_transform
+                )
+                raw_abs = raw_thought.abs()
+                totals["thought_raw_abs_max"] = torch.maximum(
+                    totals["thought_raw_abs_max"], raw_abs.max()
+                )
+                totals["thought_raw_abs_gt_0_5_count"] += (
+                    raw_abs > 0.5
+                ).sum()
+                totals["thought_raw_abs_gt_0_8_count"] += (
+                    raw_abs > 0.8
+                ).sum()
+                totals["thought_raw_abs_gt_1_count"] += (raw_abs > 1.0).sum()
+                totals["thought_raw_abs_gt_2_count"] += (raw_abs > 2.0).sum()
+                totals["thought_transform_distortion_square_sum"] += (
+                    transformed_thought - raw_thought
+                ).square().sum()
+                totals["thought_squashed_raw_norm_sum"] += (
+                    transformed_thought.norm(dim=-1).sum()
+                )
+                thought_input_index = think_index + 1
+                totals["thought_adapter_output_norm_sum"] += compact_slots(
+                    stream_inputs.detach(), thought_input_index
+                ).float().norm(dim=-1).sum()
+                totals["post_thought_belief_norm_sum"] += compact_slots(
+                    beliefs.detach(), thought_input_index
+                ).float().norm(dim=-1).sum()
+                mean_abs = thought_means.detach().float().abs()
+                totals["thought_mean_abs_max"] = torch.maximum(
+                    totals["thought_mean_abs_max"], mean_abs.max()
+                )
+                totals["thought_mean_abs_gt_0_8_count"] += (
+                    mean_abs > 0.8
+                ).sum()
                 thought_log_ratio = (
                     new_thought_logprobs
                     - compact_slots(
@@ -2794,6 +2898,43 @@ def update_minibatch(
         ).sqrt(),
         thought_mean_norm=(
             totals["thought_mean_norm_sum"] / denominators["thought"]
+        ),
+        thought_raw_abs_max=totals["thought_raw_abs_max"],
+        thought_raw_abs_gt_0_5_fraction=(
+            totals["thought_raw_abs_gt_0_5_count"]
+            / (denominators["thought"] * thought_dim)
+        ),
+        thought_raw_abs_gt_0_8_fraction=(
+            totals["thought_raw_abs_gt_0_8_count"]
+            / (denominators["thought"] * thought_dim)
+        ),
+        thought_raw_abs_gt_1_fraction=(
+            totals["thought_raw_abs_gt_1_count"]
+            / (denominators["thought"] * thought_dim)
+        ),
+        thought_raw_abs_gt_2_fraction=(
+            totals["thought_raw_abs_gt_2_count"]
+            / (denominators["thought"] * thought_dim)
+        ),
+        thought_transform_distortion_rms=(
+            totals["thought_transform_distortion_square_sum"]
+            / (denominators["thought"] * thought_dim)
+        ).sqrt(),
+        thought_squashed_raw_norm=(
+            totals["thought_squashed_raw_norm_sum"] / denominators["thought"]
+        ),
+        thought_adapter_output_norm=(
+            totals["thought_adapter_output_norm_sum"]
+            / denominators["thought"]
+        ),
+        post_thought_belief_norm=(
+            totals["post_thought_belief_norm_sum"]
+            / denominators["thought"]
+        ),
+        thought_mean_abs_max=totals["thought_mean_abs_max"],
+        thought_mean_abs_gt_0_8_fraction=(
+            totals["thought_mean_abs_gt_0_8_count"]
+            / (denominators["thought"] * thought_dim)
         ),
         thought_mean_weight_rms=(
             wrapper.transition.mean_head.output_gain.detach().abs()
@@ -3041,7 +3182,8 @@ def save_checkpoint(
         "step": step,
         "value_warmup_step": warmup_step,
         "execution_schema": execution_schema_for_adapter(
-            wrapper.thought_adapter_kind
+            wrapper.thought_adapter_kind,
+            wrapper.thought_action_transform,
         ),
         "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
@@ -3051,6 +3193,9 @@ def save_checkpoint(
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": rollout_policy_schema_for_mode(reasoning_mode),
         "thought_input_schema": wrapper.thought_input_schema,
+        "thought_action_transform_schema": (
+            wrapper.thought_action_transform_schema
+        ),
         "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
         "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
         "thought_sigma_init_schema": wrapper.sigma_state_init_schema,
@@ -4518,6 +4663,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--thought-action-transform",
+        choices=THOUGHT_ACTION_TRANSFORM_KINDS,
+        default="identity",
+        help=(
+            "recurrent input transform applied after raw Gaussian sampling; "
+            "likelihoods and replay storage remain in raw action space"
+        ),
+    )
+    parser.add_argument(
         "--critic-adapter-init",
         choices=CRITIC_ADAPTER_INIT_KINDS,
         default="orthogonal",
@@ -5309,6 +5463,7 @@ def main() -> None:
         backbone,
         thought_adapter=args.thought_adapter,
         sigma_state_init=args.thought_sigma_state_init,
+        thought_action_transform=args.thought_action_transform,
     ).to(device)
     # No module here behaves differently under train(): pin eval mode once so
     # the training flag (a dynamo guard) never flips between the step-0 evals
@@ -5388,6 +5543,9 @@ def main() -> None:
             allow_transition_reset=bool(args.actor_critic_init),
             expected_rollout_policy_schema=rollout_policy_schema,
             expected_thought_input_schema=wrapper.thought_input_schema,
+            expected_thought_action_transform_schema=(
+                wrapper.thought_action_transform_schema
+            ),
         )
         wrapper.load_state_dict(actor_init_payload["model"], strict=True)
         actor_init_provenance = {
@@ -5444,6 +5602,7 @@ def main() -> None:
         v_max=value_v_max,
         prior_value=args.value_prior,
         adapter_init=args.critic_adapter_init,
+        thought_action_transform=args.thought_action_transform,
     ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if args.actor_critic_init:
@@ -5710,7 +5869,8 @@ def main() -> None:
     warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
     if args.resume:
         target_execution_schema = execution_schema_for_adapter(
-            args.thought_adapter
+            args.thought_adapter,
+            args.thought_action_transform,
         )
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         resume_args = payload.get("args", {})
@@ -5738,6 +5898,9 @@ def main() -> None:
             args.resume,
             expected_rollout_policy_schema=rollout_policy_schema,
             expected_thought_input_schema=wrapper.thought_input_schema,
+            expected_thought_action_transform_schema=(
+                wrapper.thought_action_transform_schema
+            ),
         )
         if not resume_execution_schema_compatible(
             payload,
@@ -6158,7 +6321,8 @@ def main() -> None:
                 "profiled": bool(args.profile),
                 "profile_schema": PROFILE_SCHEMA if args.profile else None,
                 "execution_schema": execution_schema_for_adapter(
-                    args.thought_adapter
+                    args.thought_adapter,
+                    args.thought_action_transform,
                 ),
                 "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
@@ -6170,6 +6334,9 @@ def main() -> None:
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
                 "rollout_policy_schema": rollout_policy_schema,
                 "thought_input_schema": wrapper.thought_input_schema,
+                "thought_action_transform_schema": (
+                    wrapper.thought_action_transform_schema
+                ),
                 "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
                 "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
                 "thought_sigma_init_schema": wrapper.sigma_state_init_schema,

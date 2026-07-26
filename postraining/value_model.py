@@ -26,7 +26,10 @@ from postraining.latent_rollout import PAD_SLOT, THOUGHT_SLOT, LatentRolloutBatc
 from postraining.latent_thought import (
     CRITIC_ADAPTER_INIT_KINDS,
     CRITIC_ADAPTER_INIT_SCHEMAS,
+    THOUGHT_ACTION_TRANSFORM_KINDS,
+    THOUGHT_ACTION_TRANSFORM_SCHEMAS,
     AffineThoughtAdapter,
+    transform_thought_action,
 )
 
 
@@ -40,6 +43,7 @@ class SeparateCritic(nn.Module):
         v_max: float = 1.0,
         prior_value: float = 0.0,
         adapter_init: str = "orthogonal",
+        thought_action_transform: str = "identity",
     ):
         super().__init__()
         if adapter_init not in CRITIC_ADAPTER_INIT_KINDS:
@@ -48,6 +52,14 @@ class SeparateCritic(nn.Module):
         self.trunk = trunk
         self.adapter_init = adapter_init
         self.adapter_init_schema = CRITIC_ADAPTER_INIT_SCHEMAS[adapter_init]
+        if thought_action_transform not in THOUGHT_ACTION_TRANSFORM_KINDS:
+            raise ValueError(
+                f"unknown thought action transform {thought_action_transform!r}"
+            )
+        self.thought_action_transform = thought_action_transform
+        self.thought_action_transform_schema = (
+            THOUGHT_ACTION_TRANSFORM_SCHEMAS[thought_action_transform]
+        )
         self.adapter = AffineThoughtAdapter(
             model_dim, initialization=adapter_init
         )
@@ -79,9 +91,11 @@ class SeparateCritic(nn.Module):
         # The kind-select makes dense adapter evaluation exactly equivalent
         # to compact boolean assignment, while avoiding the latter's
         # dynamic-shape nonzero graph break inside torch.compile.
-        thought_latent = self.adapter(batch.thoughts.float()).to(
-            token_latent.dtype
-        )
+        thought_latent = self.adapter(
+            transform_thought_action(
+                batch.thoughts, self.thought_action_transform
+            )
+        ).to(token_latent.dtype)
         inputs = torch.where(
             think_mask[..., None], thought_latent, token_latent
         )

@@ -168,6 +168,17 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_mean_weight_rms": 0.00044,
         "thought_mean_bias_rms": 0.0,
         "thought_mean_output_gain": 0.01,
+        "thought_raw_abs_max": 0.7,
+        "thought_raw_abs_gt_0_5_fraction": 0.05,
+        "thought_raw_abs_gt_0_8_fraction": 0.01,
+        "thought_raw_abs_gt_1_fraction": 0.005,
+        "thought_raw_abs_gt_2_fraction": 0.0,
+        "thought_transform_distortion_rms": 0.02,
+        "thought_squashed_raw_norm": 2.8,
+        "thought_adapter_output_norm": 2.9,
+        "post_thought_belief_norm": 4.0,
+        "thought_mean_abs_max": 0.6,
+        "thought_mean_abs_gt_0_8_fraction": 0.0,
     }
     metrics.update(overrides)
     return metrics

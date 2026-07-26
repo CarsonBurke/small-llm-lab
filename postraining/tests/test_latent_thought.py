@@ -18,6 +18,7 @@ from postraining.latent_thought import (
     migrate_scalar_log_sigma_state,
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
+    THOUGHT_ACTION_TRANSFORM_SCHEMAS,
     THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
@@ -262,24 +263,55 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
     )
     with pytest.raises(ValueError, match="different deployed thought adapter"):
         validate_renderer_checkpoint(affine_payload, "nonlinear-v26.pt")
+    tanh_payload = {
+        "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
+        "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
+        "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+        "thought_action_transform_schema": (
+            THOUGHT_ACTION_TRANSFORM_SCHEMAS["tanh"]
+        ),
+        "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
+        "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
+    }
+    validate_renderer_checkpoint(
+        tanh_payload,
+        "tanh.pt",
+        expected_thought_action_transform_schema=(
+            THOUGHT_ACTION_TRANSFORM_SCHEMAS["tanh"]
+        ),
+    )
+    with pytest.raises(ValueError, match="different action"):
+        validate_renderer_checkpoint(tanh_payload, "tanh-as-raw.pt")
 
 
 def test_wrapper_checkpoint_kwargs_preserve_legacy_policy_semantics():
     assert wrapper_init_kwargs_from_checkpoint({"args": {}}) == {
         "thought_adapter": "identity_affine",
         "sigma_state_init": "constant",
+        "thought_action_transform": "identity",
     }
     assert wrapper_init_kwargs_from_checkpoint(
         {
             "args": {
                 "thought_adapter": "orthogonal_silu",
                 "thought_sigma_state_init": "orthogonal",
+                "thought_action_transform": "tanh",
             }
         }
     ) == {
         "thought_adapter": "orthogonal_silu",
         "sigma_state_init": "orthogonal",
+        "thought_action_transform": "tanh",
     }
+
+
+def test_tanh_thought_input_transforms_once_before_the_adapter():
+    wrapper = LatentThoughtModel(
+        _pope_model(), thought_action_transform="tanh"
+    ).eval()
+    raw = torch.linspace(-3.0, 3.0, 64).view(2, 32)
+    expected = wrapper.adapter(raw.tanh())[:, None]
+    torch.testing.assert_close(wrapper.thought_input(raw), expected)
 
 
 def test_gate_zero_init_is_exactly_uniform():
