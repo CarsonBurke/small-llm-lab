@@ -45,8 +45,8 @@ without inheriting that discrete-token target.
   there is no continuous-policy entropy bonus or beta-NLL. A sampled reverse
   KL constrains aggregate drift of the 512-D Gaussian against the frozen
   rollout behavior policy, complementing factorwise PPO clipping.
-  A zero-initialized belief-conditioned head learns diagonal per-dimension
-  thought log-sigma, starting at -2.5 in every dimension.
+  A weak orthogonal belief-conditioned head learns diagonal per-dimension
+  thought log-sigma around its configured initial level.
 - No pretraining anchor: SIGReg and the latent target-prediction objective are
   dropped at RL time. The fresh mean and recurrent policy train purely on
   their ability to think; the teacher-forced val-BPB guard is the drift
@@ -55,12 +55,11 @@ without inheriting that discrete-token target.
 Prompts are DAPO-Math-17K. An EOS-terminated, verifier-correct final Answer:
 field receives reward 1; a wrong but strictly numeric final field receives
 bounded distance shaping of at most 0.1. Malformed or unterminated responses
-receive zero. The auxiliary positive-example LM loss remains exact-only via
-its reward threshold, and AIME 2024 avg@k is the eval. Prompt groups roll out
-and replay separately because their lengths differ, then accumulate into the
-shared actor/critic optimizer minibatch. ``--rollout-only`` reports whether
-rewards vary within prompt groups at the initial 50/50 gate before any update
-is attempted.
+receive zero. AIME 2024 avg@k is the eval. Prompt groups roll out and replay
+separately because their lengths differ, then accumulate into the shared
+actor/critic optimizer minibatch. ``--rollout-only`` reports whether rewards
+vary within prompt groups at the initial 50/50 gate before any update is
+attempted.
 
     python3 -m postraining.train_latent_vapo \
         --checkpoint ablation_results/<run>/pretraining_checkpoint.pt \
@@ -122,7 +121,6 @@ from postraining.core import (
     module_answer_baselines,
     nearby_numeric_reward,
     parse_numeric_answer,
-    positive_example_lm_loss,
     validate_posttraining_context_budget,
     verify_answer,
 )
@@ -153,9 +151,11 @@ from postraining.latent_rollout import (
 from postraining.latent_thought import (
     EMIT,
     THINK,
+    CRITIC_ADAPTER_INIT_KINDS,
     RENDERER_FEATURES_SCHEMA,
+    SIGMA_STATE_INIT_KINDS,
+    THOUGHT_ADAPTER_KINDS,
     THOUGHT_DISTRIBUTION_SCHEMA,
-    THOUGHT_INPUT_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
     LatentThoughtModel,
     migrate_legacy_wrapper_checkpoint,
@@ -163,12 +163,15 @@ from postraining.latent_thought import (
     validate_renderer_checkpoint,
 )
 from postraining.model_io import fresh_trunk, load_model
-from postraining.muon import Muon
+from postraining.muon import MUON_ALGORITHM_SCHEMA, Muon
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
 
 EXECUTION_SCHEMA = (
+    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_orthogonal_silu_adapter_general_lr_sequential_data/v26"
+)
+IDENTITY_AFFINE_EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_identity_affine_general_lr_sequential_data/v25"
 )
 ZERO_AFFINE_EXECUTION_SCHEMA = (
@@ -192,13 +195,30 @@ PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA = (
 PREVIOUS_EXECUTION_SCHEMA = (
     "shuffled_pool1024_disjoint_b256_per_dim_thought_clip_zero_affine_general_lr_sequential_data/v18"
 )
-GAIN_SCALED_EXECUTION_SCHEMA = (
-    "disjoint_b512_gain_scaled_gaussian_adapter_general_lr_sequential_data/v15"
-)
-GAIN_SCALED_THOUGHT_INPUT_SCHEMA = (
-    "fresh_learned_scalar_identity_affine_s1e-4/v4"
-)
 PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
+ACTOR_OBJECTIVE_SCHEMA = "vapo_policy_no_positive_example_lm/v1"
+ADAMW_ALGORITHM_SCHEMA = (
+    "torch_adamw_betas0.9_0.999_eps1e-8_amsgrad_false_weight_decay0/v1"
+)
+
+
+def execution_schema_for_adapter(kind: str) -> str:
+    """Execution schema for the selected deployed actor adapter."""
+    if kind == "orthogonal_silu":
+        return EXECUTION_SCHEMA
+    if kind == "identity_affine":
+        return IDENTITY_AFFINE_EXECUTION_SCHEMA
+    raise ValueError(f"unknown thought adapter kind {kind!r}")
+
+
+def optimizer_schema_for_trunk_optimizer(kind: str) -> str:
+    """Exact update algorithm whose state a checkpoint may restore."""
+    if kind == "adamw":
+        return ADAMW_ALGORITHM_SCHEMA
+    if kind == "muon":
+        return f"{MUON_ALGORITHM_SCHEMA}+{ADAMW_ALGORITHM_SCHEMA}"
+    raise ValueError(f"unknown trunk optimizer {kind!r}")
+
 
 # Refreshed device minibatches held for their update instead of the
 # scatter-to-CPU/repack/re-upload round trip. Bounded because packed batch
@@ -261,6 +281,7 @@ def math_dataset_identity(path: str | Path, exclude_modules: str) -> str:
 def resume_execution_schema_compatible(
     payload: dict,
     *,
+    expected_execution_schema: str = EXECUTION_SCHEMA,
     allow_reverse_kl_migration: bool = False,
     allow_performance_migration: bool = False,
     allow_joint_clip_migration: bool = False,
@@ -270,7 +291,7 @@ def resume_execution_schema_compatible(
 ) -> bool:
     """Resume compatible policy state at a complete rollout-pool boundary."""
     execution_schema = payload.get("execution_schema")
-    if execution_schema == EXECUTION_SCHEMA:
+    if execution_schema == expected_execution_schema:
         return not (
             allow_reverse_kl_migration
             or allow_performance_migration
@@ -279,10 +300,13 @@ def resume_execution_schema_compatible(
             or allow_projected_thought_migration
             or allow_thought_reverse_kl_migration
         )
+    # Every older policy used an affine thought interface. Its saved matrices
+    # have the same shapes as v26 but acquire different semantics under
+    # 2*SiLU, so no objective flag can make a nonlinear resume sound.
+    if expected_execution_schema != IDENTITY_AFFINE_EXECUTION_SCHEMA:
+        return False
     # v25 changes only the fresh adapter initialization. A v24 resume restores
-    # its learned adapter and optimizer state exactly, so it needs no state or
-    # objective migration. The new checkpoint records the source schema in
-    # actor-init provenance.
+    # its learned affine and optimizer state exactly.
     if execution_schema == ZERO_AFFINE_EXECUTION_SCHEMA:
         return not (
             allow_reverse_kl_migration
@@ -292,11 +316,6 @@ def resume_execution_schema_compatible(
             or allow_projected_thought_migration
             or allow_thought_reverse_kl_migration
         )
-    # v24 restores the Dreamer4 reverse-KL term the v21 objective retired, so
-    # a v23 checkpoint resumes under an objective it never trained: the
-    # sampled k3 penalty now bounds the aggregate drift the mean projection
-    # leaves untouched. No parameters or execution change and the pool is
-    # rebuilt on resume, so the objective opt-in alone suffices.
     if execution_schema == NO_THOUGHT_KL_EXECUTION_SCHEMA:
         return (
             allow_thought_reverse_kl_migration
@@ -306,10 +325,6 @@ def resume_execution_schema_compatible(
             and not allow_joint_clip_migration
             and not allow_anchored_value_migration
         )
-    # v23 changes only the THINK objective (Mahalanobis trust-region
-    # projection replaces the joint ratio clip); no parameters or execution
-    # change, and the pool is rebuilt on resume, so a v22 checkpoint resumes
-    # by objective opt-in alone.
     if execution_schema == JOINT_CLIP_EXECUTION_SCHEMA:
         return (
             allow_thought_reverse_kl_migration
@@ -319,10 +334,6 @@ def resume_execution_schema_compatible(
             and not allow_joint_clip_migration
             and not allow_anchored_value_migration
         )
-    # v22 changes only the critic support (anchored 0/1 bin centers, sharper
-    # sigma): actor state and rollout execution are untouched, but the value
-    # head belongs to the old grid and must be rebuilt, so the resume is
-    # never silent.
     if execution_schema == UNANCHORED_VALUE_EXECUTION_SCHEMA:
         return (
             allow_thought_reverse_kl_migration
@@ -332,10 +343,6 @@ def resume_execution_schema_compatible(
             and not allow_performance_migration
             and not allow_joint_clip_migration
         )
-    # v21 changes only the THINK objective (joint clip-higher on the Gaussian,
-    # reverse KL retired to an ablation knob); sampling, RNG-to-row
-    # attribution, and floating-point execution are identical to v20, so a
-    # pool-boundary v20 checkpoint resumes by objective opt-in alone.
     if execution_schema == PER_DIM_REVERSE_KL_EXECUTION_SCHEMA:
         return (
             allow_thought_reverse_kl_migration
@@ -345,11 +352,6 @@ def resume_execution_schema_compatible(
             and not allow_reverse_kl_migration
             and not allow_performance_migration
         )
-    # v20 changed only execution relative to v19: identical prompts and
-    # policies are sampled, but deterministic prefixes are shared and finished
-    # rows are compacted. A pool-boundary v19 checkpoint therefore needs the
-    # execution acknowledgement on top of the objective one, because future
-    # RNG-to-row attribution and floating-point execution are not preserved.
     if execution_schema == PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA:
         return (
             allow_thought_reverse_kl_migration
@@ -359,11 +361,6 @@ def resume_execution_schema_compatible(
             and allow_performance_migration
             and not allow_reverse_kl_migration
         )
-    # v18 needs every acknowledgement: v19 added reverse KL (an objective its
-    # checkpoints never trained under), v20 changed stochastic execution, v21
-    # changed the THINK objective again, v22 rebuilt the value support, v23
-    # replaced the THINK clip with the projected trust region, and v24
-    # restored the reverse-KL term alongside it.
     return (
         allow_reverse_kl_migration
         and allow_performance_migration
@@ -373,105 +370,6 @@ def resume_execution_schema_compatible(
         and allow_thought_reverse_kl_migration
         and execution_schema == PREVIOUS_EXECUTION_SCHEMA
     )
-
-
-def migrate_zero_adapter_resume(
-    payload: dict,
-    wrapper: LatentThoughtModel,
-) -> dict[str, object]:
-    """Explicitly replace v15's gain-scaled adapter while preserving resume.
-
-    The recurrent policy semantics change, so this migration is never silent:
-    the caller must opt in. All actor state and Adam moments are retained
-    except the three old adapter parameters. The new weight/bias take the
-    current fresh init (identity, zero bias) with fresh optimizer state; the
-    removed scalar has no successor.
-    """
-    actual_execution = payload.get("execution_schema")
-    actual_input = payload.get("thought_input_schema")
-    if actual_execution != GAIN_SCALED_EXECUTION_SCHEMA:
-        raise ValueError(
-            "--migrate-zero-adapter-resume requires execution schema "
-            f"{GAIN_SCALED_EXECUTION_SCHEMA!r}; got {actual_execution!r}"
-        )
-    if actual_input != GAIN_SCALED_THOUGHT_INPUT_SCHEMA:
-        raise ValueError(
-            "--migrate-zero-adapter-resume requires thought-input schema "
-            f"{GAIN_SCALED_THOUGHT_INPUT_SCHEMA!r}; got {actual_input!r}"
-        )
-
-    state = payload["model"]
-    scalar_key = "adapter.interpolation_strength"
-    if scalar_key not in state:
-        raise ValueError("gain-scaled checkpoint is missing its adapter scalar")
-    scalar = state[scalar_key]
-    weight_key = "adapter.projection.weight"
-    bias_key = "adapter.projection.bias"
-    expected_shapes = {
-        weight_key: tuple(wrapper.adapter.projection.weight.shape),
-        bias_key: tuple(wrapper.adapter.projection.bias.shape),
-    }
-    for key, expected_shape in expected_shapes.items():
-        if key not in state or tuple(state[key].shape) != expected_shape:
-            actual_shape = tuple(state[key].shape) if key in state else None
-            raise ValueError(
-                f"gain-scaled checkpoint {key} shape must be "
-                f"{expected_shape}; got {actual_shape}"
-            )
-    if scalar.numel() != 1 or not torch.isfinite(scalar).all():
-        raise ValueError("gain-scaled checkpoint adapter scalar must be finite")
-
-    actor_optimizer = payload["optimizers"]["actor"]
-    groups = actor_optimizer["param_groups"]
-    if len(groups) != 6 or len(groups[2]["params"]) != 3:
-        raise ValueError(
-            "gain-scaled actor optimizer does not have the expected six-group "
-            "layout with scalar/weight/bias adapter parameters"
-        )
-
-    source_strength = float(scalar)
-    scalar_id, weight_id, bias_id = groups[2]["params"]
-    if len({scalar_id, weight_id, bias_id}) != 3:
-        raise ValueError(
-            "gain-scaled actor optimizer adapter parameter IDs must be distinct"
-        )
-
-    state.pop(scalar_key)
-    # Write the fresh init explicitly rather than cloning live parameters:
-    # the wrapper may already hold stepped Adam values when tests (or a
-    # pre-load probe) have touched it, and migration must land on the
-    # deterministic post-critic affine, not that dirtied state.
-    dim = wrapper.adapter.projection.weight.shape[0]
-    state[weight_key] = torch.eye(
-        dim,
-        dtype=state[weight_key].dtype,
-        device=state[weight_key].device,
-    )
-    state[bias_key] = torch.zeros_like(state[bias_key])
-    old_state = actor_optimizer["state"]
-    for parameter_id in (scalar_id, weight_id, bias_id):
-        old_state.pop(parameter_id, None)
-    # Optimizer state_dict loading maps saved parameter IDs to live parameters
-    # positionally. Retain the old weight/bias IDs in their original order so
-    # later groups and every unrelated moment remain aligned.
-    groups[2]["params"] = [weight_id, bias_id]
-
-    # Adapter migration changes only v15's recurrent input semantics. Land on
-    # the last no-KL schema so entering v19's objective remains a second,
-    # explicit migration rather than an accidental side effect of this flag.
-    payload["execution_schema"] = PREVIOUS_EXECUTION_SCHEMA
-    payload["thought_input_schema"] = THOUGHT_INPUT_SCHEMA
-    return {
-        "source_execution_schema": actual_execution,
-        "source_thought_input_schema": actual_input,
-        "source_adapter_strength": source_strength,
-        "reset_parameters": [
-            "adapter.projection.weight",
-            "adapter.projection.bias",
-        ],
-        "target_adapter_initialization": "identity_weight_zero_bias",
-        "reset_optimizer_state": True,
-    }
 
 
 def value_support_geometry_matches(saved_args: dict, args) -> bool:
@@ -1032,10 +930,6 @@ def aggregate_actor_tensorboard_metrics(
     # optimizer minibatch, so its loss is a contribution to be summed rather
     # than another independently normalized minibatch mean.
     policy_contribution = sum(metric["policy_loss"] for metric in metrics)
-    positive_lm_contribution = sum(
-        metric["positive_lm_loss"] * metric["positive_lm_weight"]
-        for metric in metrics
-    )
     thought_reverse_kl_contribution = sum(
         metric["thought_reverse_kl_penalty"] for metric in metrics
     )
@@ -1044,12 +938,10 @@ def aggregate_actor_tensorboard_metrics(
     )
     return {
         "loss/policy": policy_contribution,
-        "loss/positive_lm_weighted": positive_lm_contribution,
         "kl/thought_reverse_weighted": thought_reverse_kl_contribution,
         "bonus/gate_entropy_weighted": gate_entropy_bonus,
         "loss/actor_total": (
             policy_contribution
-            + positive_lm_contribution
             + thought_reverse_kl_contribution
             - gate_entropy_bonus
         ),
@@ -1289,9 +1181,8 @@ def plan_one_pass_training(
 def actor_minibatch_denominators(
     groups: list[LatentRolloutBatch],
     indices: list[int],
-    positive_reward_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Global action/gate/positive-token denominators for one actor step."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Global action and gate denominators for one actor step."""
     if not indices:
         raise ValueError("at least one prompt group is required")
     action_count = torch.stack(
@@ -1300,18 +1191,7 @@ def actor_minibatch_denominators(
     gate_action_count = torch.stack(
         [groups[index].gate_mask.sum() for index in indices]
     ).sum()
-    positive_token_count = torch.stack(
-        [
-            (
-                groups[index].emit_mask
-                * (
-                    groups[index].reward_scalar >= positive_reward_threshold
-                )[:, None]
-            ).sum()
-            for index in indices
-        ]
-    ).sum()
-    return action_count, gate_action_count, positive_token_count
+    return action_count, gate_action_count
 
 
 def write_actor_tensorboard_metrics(
@@ -1506,12 +1386,11 @@ def build_optimizers(
 
     ``trunk_optimizer="muon"`` restores the pretraining update geometry:
     block matrices (ndim >= 2) move from the AdamW trunk group into separate
-    ``actor_muon``/``critic_muon`` Muon optimizers — same NewtonSchulz5
-    orthogonalization, momentum, and rectangular scaling the trunk was
-    pretrained under — while embeddings, readout, gains, and every RL-only
-    head stay under AdamW. Weight decay stays 0 everywhere: pretraining's
-    Muon decay (0.05) regularizes a from-scratch run, but over a long RL
-    schedule it would only shrink the pretrained weights.
+    ``actor_muon``/``critic_muon`` Muon optimizers. Polar Express supplies
+    the orthogonalized momentum update, while embeddings, readout, gains,
+    and every RL-only head stay under AdamW. Weight decay stays 0 everywhere:
+    pretraining's Muon decay (0.05) regularizes a from-scratch run, but over
+    a long RL schedule it would only shrink the pretrained weights.
     """
     if trunk_optimizer not in ("adamw", "muon"):
         raise ValueError(f"unknown trunk optimizer {trunk_optimizer!r}")
@@ -1584,6 +1463,17 @@ def build_optimizers(
     ]
     if len(actor_registered) != len({id(p) for p in actor_registered}):
         raise AssertionError("actor parameter registered in two optimizers")
+    actor_registered_ids = {id(parameter) for parameter in actor_registered}
+    actor_expected_ids = {
+        id(parameter)
+        for parameter in wrapper.parameters()
+        if parameter.requires_grad
+    }
+    if actor_registered_ids != actor_expected_ids:
+        raise AssertionError(
+            "every trainable actor parameter must belong to exactly one "
+            "optimizer"
+        )
     trunk_coverage = {id(p) for p in trunk_parameters} | actor_muon_ids
     trunk_expected = {
         id(parameter)
@@ -1950,8 +1840,6 @@ def update_minibatch(
     batch: LatentRolloutBatch,
     optimizers: dict[str, torch.optim.Optimizer],
     value_only: bool = False,
-    positive_lm_weight: float = 0.0,
-    positive_reward_threshold: float = 0.5,
     thought_pg_coef: float = 1.0,
     # Kept in lockstep with the CLI defaults so callers that omit them
     # exercise the SHIPPED arm; the pair must satisfy the biconditional
@@ -1966,7 +1854,6 @@ def update_minibatch(
     critic_step: bool = True,
     policy_action_denominator: torch.Tensor | None = None,
     gate_action_denominator: torch.Tensor | None = None,
-    positive_token_denominator: torch.Tensor | None = None,
     value_action_denominator: torch.Tensor | None = None,
     gae_lambda_alpha: float = 0.05,
     replay_max_trajectories: int = 32,
@@ -2047,7 +1934,6 @@ def update_minibatch(
             "actor update requires refresh_old_statistics after rollout"
         )
 
-    positive = batch.reward_scalar >= positive_reward_threshold
     thought_actions = (batch.gate_actions == THINK).float() * batch.action_mask
     optional_think_actions = (
         (batch.gate_actions == THINK).float() * batch.gate_mask
@@ -2066,10 +1952,6 @@ def update_minibatch(
         gate_action_denominator = batch.gate_mask.sum()
     if value_action_denominator is None:
         value_action_denominator = batch.action_mask.sum()
-    if positive_token_denominator is None:
-        positive_token_denominator = (
-            batch.emit_mask * positive[:, None]
-        ).sum()
     zero = batch.action_mask.new_zeros(())
     totals = {
         key: zero.clone()
@@ -2080,7 +1962,7 @@ def update_minibatch(
             "thought_policy_clip", "thought_gate_policy_clip", "gate_kl_sum",
             "gate_entropy_sum", "gate_entropy_bonus",
             "emit_probability_sum",
-            "positive_lm", "renderer_kl_sum", "thought_kl_sum",
+            "renderer_kl_sum", "thought_kl_sum",
             "advantage_sum", "advantage_square_sum",
             "optional_think_advantage_sum", "forced_initial_think_advantage_sum",
             "thought_advantage_sum", "emit_advantage_sum", "target_square_sum",
@@ -2280,14 +2162,6 @@ def update_minibatch(
         )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
-
-        micro_positive = microbatch.reward_scalar >= positive_reward_threshold
-        weighted_positive_lm = positive_example_lm_loss(
-            new_token_logprobs,
-            microbatch.emit_mask,
-            micro_positive,
-            denominator=positive_token_denominator,
-        )
 
         new_thought_joint = torch.zeros_like(new_token_logprobs)
         old_thought_joint = torch.zeros_like(new_token_logprobs)
@@ -2609,7 +2483,6 @@ def update_minibatch(
             weighted_policy_loss
             + weighted_thought_reverse_kl
             + weighted_projection_penalty
-            + positive_lm_weight * weighted_positive_lm
             - weighted_gate_entropy_bonus
         )
         finite_guards.append(
@@ -2623,7 +2496,6 @@ def update_minibatch(
                     "projection_penalty": (
                         weighted_projection_penalty.detach()
                     ),
-                    "positive_lm": weighted_positive_lm.detach(),
                     "gate_entropy_bonus": (
                         weighted_gate_entropy_bonus.detach()
                     ),
@@ -2659,7 +2531,6 @@ def update_minibatch(
                 (torch.expm1(renderer_log_ratio) - renderer_log_ratio)
                 * microbatch.emit_mask
             ).sum()
-            totals["positive_lm"] += weighted_positive_lm.detach()
             if shard_has_think:
                 detached_log_sigma = thought_log_sigma.detach().float()
                 residual = thought_targets.float() - thought_means.detach().float()
@@ -2861,8 +2732,6 @@ def update_minibatch(
         gate_entropy=totals["gate_entropy_sum"] / denominators["gate"],
         gate_entropy_bonus=totals["gate_entropy_bonus"],
         emit_probability=totals["emit_probability_sum"] / denominators["gate"],
-        positive_lm_loss=totals["positive_lm"],
-        positive_fraction=positive.float().mean(),
         gate_behavior_kl=totals["gate_kl_sum"] / denominators["gate"],
         renderer_behavior_kl=totals["renderer_kl_sum"] / denominators["emit"],
         thought_behavior_kl_joint=(
@@ -2959,7 +2828,6 @@ def update_minibatch(
         gate_pg_coef=float(gate_pg_coef),
         thought_pg_coef=float(thought_pg_coef),
         thought_reverse_kl_coef=float(thought_reverse_kl_coef),
-        positive_lm_weight=float(positive_lm_weight),
         gate_entropy_coef=float(gate_entropy_coef),
     )
     return metrics
@@ -3172,16 +3040,24 @@ def save_checkpoint(
     payload = {
         "step": step,
         "value_warmup_step": warmup_step,
-        "execution_schema": EXECUTION_SCHEMA,
+        "execution_schema": execution_schema_for_adapter(
+            wrapper.thought_adapter_kind
+        ),
+        "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
         "math_data_identity": sampler.dataset_identity,
         "reward_schema": REWARD_SCHEMA,
         "reasoning_mode": reasoning_mode,
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": rollout_policy_schema_for_mode(reasoning_mode),
-        "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+        "thought_input_schema": wrapper.thought_input_schema,
         "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
         "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
+        "thought_sigma_init_schema": wrapper.sigma_state_init_schema,
+        "critic_adapter_init_schema": critic.adapter_init_schema,
+        "optimizer_schema": optimizer_schema_for_trunk_optimizer(
+            getattr(args, "trunk_optimizer", "adamw")
+        ),
         "model": wrapper.state_dict(),
         "critic": critic.state_dict(),
         "optimizers": {name: opt.state_dict() for name, opt in optimizers.items()},
@@ -4556,7 +4432,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # spikes and policy collapse when a job omitted --learning-rate.
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     # Trunk update geometry. "muon" mirrors pretraining: block matrices step
-    # under NewtonSchulz5-orthogonalized momentum while embeddings, readout,
+    # under Polar-Express-orthogonalized momentum while embeddings, readout,
     # gains, and every RL-only head stay under AdamW. Old checkpoints
     # (pre-Muon-split) resume with "adamw".
     parser.add_argument(
@@ -4613,16 +4489,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # which the near-frozen bias (AdamW at 5e-5) then takes ~1e3 steps to
     # unwind through head.weight alone.
     parser.add_argument("--value-prior", type=float, default=0.0)
-    # Initialization only: the bounded output of the state-dependent
-    # log-sigma head. Zero-init weights make noise state-independent at step 0.
-    # -2.5 gives std ~0.082 and expected 512-D noise norm ~1.86 (~69% of a 2.7
-    # thought mean norm at gain 0.1). The policy uses the same identity affine
-    # initialization as the critic, so the sampled distribution reaches the
-    # trunk without an extra initial scale or rotation.
-    parser.add_argument("--thought-log-sigma-init", type=float, default=-2.5)
+    # Initialization only: the central bounded output of the state-dependent
+    # log-sigma head. -2 gives std ~0.135 and expected 512-D noise norm ~3.06.
+    # Its inverse raw bias is only -0.144 in the [-5, 2] tanh map, retaining
+    # 98% of the midpoint's local sensitivity. The orthogonal state map starts
+    # behind a 0.01 gain, so it adds only mild statewise variation while
+    # retaining every input direction.
+    parser.add_argument("--thought-log-sigma-init", type=float, default=-2.0)
+    parser.add_argument(
+        "--thought-sigma-state-init",
+        choices=SIGMA_STATE_INIT_KINDS,
+        default="orthogonal",
+        help=(
+            "fresh log-sigma state map; constant is the zero-weight control, "
+            "orthogonal is the full-rank 0.01-gain treatment"
+        ),
+    )
     # Initialization only. The orthogonal map gives an RMS-normalized belief
     # an exactly controlled mean RMS without weakening matrix optimization.
     parser.add_argument("--thought-mean-gain-init", type=float, default=0.1)
+    parser.add_argument(
+        "--thought-adapter",
+        choices=THOUGHT_ADAPTER_KINDS,
+        default="orthogonal_silu",
+        help=(
+            "deployed thought input map; identity_affine is the v25 control, "
+            "orthogonal_silu adds full-width random mixing and 2*SiLU"
+        ),
+    )
+    parser.add_argument(
+        "--critic-adapter-init",
+        choices=CRITIC_ADAPTER_INIT_KINDS,
+        default="orthogonal",
+        help="fresh critic thought-affine initialization",
+    )
     # Gradient multiplier for the thought factor inside the joint action log
     # probability. The forward ratio stays exact; 0 detaches only that factor
     # as a control arm while token/gate gradients still train the trunk.
@@ -4721,8 +4621,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # (abundant within-group reward variance) while the gate stays free to
     # think more wherever it pays.
     parser.add_argument("--init-think-probability", type=float, default=0.1)
-    parser.add_argument("--positive-lm-weight", type=float, default=0.1)
-    parser.add_argument("--positive-reward-threshold", type=float, default=0.5)
     parser.add_argument(
         "--nearby-reward-max",
         type=float,
@@ -4953,13 +4851,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "different grid and cannot be carried over)",
     )
     parser.add_argument(
-        "--migrate-zero-adapter-resume",
-        action="store_true",
-        help="explicitly resume a v15 gain-scaled checkpoint while replacing "
-        "only its adapter with the fresh identity affine and fresh adapter "
-        "Adam state; entering v20 also requires both migration flags",
-    )
-    parser.add_argument(
         "--migrate-projected-thought-resume",
         action="store_true",
         help="explicitly resume a v22 joint-clip checkpoint under the v23 "
@@ -5143,11 +5034,11 @@ def validate_args(
     if (
         not math.isfinite(args.nearby_reward_max)
         or args.nearby_reward_max < 0.0
-        or args.nearby_reward_max >= args.positive_reward_threshold
+        or args.nearby_reward_max >= 1.0
     ):
         parser.error(
             "--nearby-reward-max must be finite, nonnegative, and below "
-            "--positive-reward-threshold"
+            "the exact-answer reward of 1"
         )
     if not -5.0 < args.thought_log_sigma_init < 2.0:
         parser.error("--thought-log-sigma-init must be strictly inside (-5, 2)")
@@ -5177,8 +5068,6 @@ def validate_args(
         parser.error("--bench-only-repeats must be positive")
     if args.bench_max_rows < 0:
         parser.error("--bench-max-rows must be nonnegative")
-    if args.migrate_zero_adapter_resume and not args.resume:
-        parser.error("--migrate-zero-adapter-resume requires --resume")
     if args.migrate_reverse_kl_resume and not args.resume:
         parser.error("--migrate-reverse-kl-resume requires --resume")
     if args.migrate_v20_execution_resume and not args.resume:
@@ -5416,7 +5305,11 @@ def main() -> None:
     # embeddings, fresh thought mean/sigma, renderer, gate, and adapter. The
     # retired pretrained prediction projector remains checkpointed but has no
     # graph edge; the backbone critic probe is frozen and unused.
-    wrapper = LatentThoughtModel(backbone).to(device)
+    wrapper = LatentThoughtModel(
+        backbone,
+        thought_adapter=args.thought_adapter,
+        sigma_state_init=args.thought_sigma_state_init,
+    ).to(device)
     # No module here behaves differently under train(): pin eval mode once so
     # the training flag (a dynamo guard) never flips between the step-0 evals
     # and the training loop and re-specializes the compiled step.
@@ -5433,7 +5326,7 @@ def main() -> None:
     wrapper.transition.mean_head.reset_output_gain(
         args.thought_mean_gain_init
     )
-    wrapper.transition.reset_noise(args.thought_log_sigma_init)
+    wrapper.transition.set_noise_level(args.thought_log_sigma_init)
     with torch.no_grad():
         # P(EMIT) = sigmoid(bias) while the zero-init weights ignore the belief.
         wrapper.gate.head.bias.fill_(
@@ -5469,6 +5362,18 @@ def main() -> None:
                 raise ValueError(
                     "--actor-critic-init checkpoint uses an incompatible reward schema"
                 )
+        else:
+            init_args = actor_init_payload.get("args", {})
+            source_sigma_state_init = init_args.get(
+                "thought_sigma_state_init", "constant"
+            )
+            if source_sigma_state_init != args.thought_sigma_state_init:
+                raise ValueError(
+                    f"{initialization_path} used --thought-sigma-state-init "
+                    f"{source_sigma_state_init!r}, not "
+                    f"{args.thought_sigma_state_init!r}; a trained actor must "
+                    "retain its initialization lineage"
+                )
         migrate_legacy_wrapper_checkpoint(
             actor_init_payload,
             wrapper,
@@ -5478,17 +5383,13 @@ def main() -> None:
         validate_renderer_checkpoint(
             actor_init_payload,
             initialization_path,
-            # A critic-warmup checkpoint has not updated the actor, and its
-            # transition head is reset below before the policy is ever used.
+            # A critic-warmup checkpoint has not updated the actor; the
+            # explicit migration above installed this run's fresh transition.
             allow_transition_reset=bool(args.actor_critic_init),
             expected_rollout_policy_schema=rollout_policy_schema,
+            expected_thought_input_schema=wrapper.thought_input_schema,
         )
         wrapper.load_state_dict(actor_init_payload["model"], strict=True)
-        if args.actor_critic_init:
-            # A critic-warmup checkpoint has never trained its actor, so this
-            # run owns the initial exploration level. A trained --actor-init
-            # source instead preserves its learned state-dependent noise.
-            wrapper.transition.reset_noise(args.thought_log_sigma_init)
         actor_init_provenance = {
             "checkpoint": str(initialization_path),
             "critic_initialized": bool(args.actor_critic_init),
@@ -5496,6 +5397,9 @@ def main() -> None:
             "source_step": actor_init_payload.get("step"),
             "source_reward_schema": actor_init_payload.get("reward_schema"),
             "source_execution_schema": actor_init_payload.get("execution_schema"),
+            "source_actor_objective_schema": actor_init_payload.get(
+                "actor_objective_schema"
+            ),
             "source_value_warmup_step": actor_init_payload.get(
                 "value_warmup_step"
             ),
@@ -5510,8 +5414,13 @@ def main() -> None:
             "fresh_log_sigma": (
                 args.thought_log_sigma_init if args.actor_critic_init else None
             ),
+            "fresh_sigma_state_init": (
+                args.thought_sigma_state_init if args.actor_critic_init else None
+            ),
             "fresh_adapter_initialized": bool(args.actor_critic_init),
-            "fresh_adapter_identity_initialized": bool(args.actor_critic_init),
+            "fresh_adapter_kind": (
+                args.thought_adapter if args.actor_critic_init else None
+            ),
         }
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
@@ -5534,6 +5443,7 @@ def main() -> None:
         v_min=value_v_min,
         v_max=value_v_max,
         prior_value=args.value_prior,
+        adapter_init=args.critic_adapter_init,
     ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if args.actor_critic_init:
@@ -5546,6 +5456,29 @@ def main() -> None:
                 f"{init_args.get('value_bins')}/"
                 f"{init_args.get('value_margin_bins')}); rerun critic warmup "
                 "under the current flags or start with --actor-init"
+            )
+        source_critic_adapter_init = init_args.get(
+            "critic_adapter_init", "identity"
+        )
+        if source_critic_adapter_init != args.critic_adapter_init:
+            raise ValueError(
+                "--actor-critic-init warm critic used "
+                f"--critic-adapter-init {source_critic_adapter_init!r}, not "
+                f"{args.critic_adapter_init!r}; rerun critic warmup under the "
+                "current adapter initialization"
+            )
+        expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
+            args.trunk_optimizer
+        )
+        if (
+            actor_init_payload.get("optimizer_schema")
+            != expected_optimizer_schema
+        ):
+            raise ValueError(
+                "--actor-critic-init optimizer schema is "
+                f"{actor_init_payload.get('optimizer_schema')!r}, expected "
+                f"{expected_optimizer_schema!r}; rerun critic warmup under "
+                "the current optimizer implementation"
             )
         critic.load_state_dict(actor_init_payload["critic"], strict=True)
 
@@ -5776,18 +5709,39 @@ def main() -> None:
     start_step = 0
     warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
     if args.resume:
+        target_execution_schema = execution_schema_for_adapter(
+            args.thought_adapter
+        )
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
-        adapter_migration = None
-        if args.migrate_zero_adapter_resume:
-            adapter_migration = migrate_zero_adapter_resume(payload, wrapper)
+        resume_args = payload.get("args", {})
+        source_sigma_state_init = resume_args.get(
+            "thought_sigma_state_init", "constant"
+        )
+        if source_sigma_state_init != args.thought_sigma_state_init:
+            raise ValueError(
+                "resume checkpoint used --thought-sigma-state-init "
+                f"{source_sigma_state_init!r}, not "
+                f"{args.thought_sigma_state_init!r}"
+            )
+        source_critic_adapter_init = resume_args.get(
+            "critic_adapter_init", "identity"
+        )
+        if source_critic_adapter_init != args.critic_adapter_init:
+            raise ValueError(
+                "resume checkpoint used --critic-adapter-init "
+                f"{source_critic_adapter_init!r}, not "
+                f"{args.critic_adapter_init!r}"
+            )
         migrate_legacy_wrapper_checkpoint(payload, wrapper)
         validate_renderer_checkpoint(
             payload,
             args.resume,
             expected_rollout_policy_schema=rollout_policy_schema,
+            expected_thought_input_schema=wrapper.thought_input_schema,
         )
         if not resume_execution_schema_compatible(
             payload,
+            expected_execution_schema=target_execution_schema,
             allow_reverse_kl_migration=args.migrate_reverse_kl_resume,
             allow_performance_migration=args.migrate_v20_execution_resume,
             allow_joint_clip_migration=args.migrate_joint_clip_resume,
@@ -5795,13 +5749,13 @@ def main() -> None:
             allow_projected_thought_migration=(
                 args.migrate_projected_thought_resume
             ),
-                allow_thought_reverse_kl_migration=(
-                    args.migrate_thought_reverse_kl_resume
-                ),
-            ):
+            allow_thought_reverse_kl_migration=(
+                args.migrate_thought_reverse_kl_resume
+            ),
+        ):
             raise ValueError(
                 "resume checkpoint execution schema must be "
-                f"{EXECUTION_SCHEMA!r}; "
+                f"{target_execution_schema!r}; "
                 f"got {payload.get('execution_schema')!r}. Use --actor-init or "
                 "--actor-critic-init for an initialization restart, or "
                 "the migration flags matching the source: v23 requires "
@@ -5816,6 +5770,14 @@ def main() -> None:
             raise ValueError(
                 f"resume checkpoint reward schema must be {REWARD_SCHEMA!r}; "
                 f"got {payload.get('reward_schema')!r}"
+            )
+        if payload.get("actor_objective_schema") != ACTOR_OBJECTIVE_SCHEMA:
+            raise ValueError(
+                "resume checkpoint actor objective schema must be "
+                f"{ACTOR_OBJECTIVE_SCHEMA!r}; got "
+                f"{payload.get('actor_objective_schema')!r}. Use "
+                "--actor-init for an initialization restart under the "
+                "current objective."
             )
         if payload.get("math_data_identity") != data_identity:
             raise ValueError(
@@ -5848,6 +5810,20 @@ def main() -> None:
                     "support flags"
                 )
             critic.load_state_dict(payload["critic"], strict=True)
+        expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
+            args.trunk_optimizer
+        )
+        if (
+            not args.reset_optimizers_on_resume
+            and payload.get("optimizer_schema") != expected_optimizer_schema
+        ):
+            raise ValueError(
+                "resume checkpoint optimizer schema is "
+                f"{payload.get('optimizer_schema')!r}, expected "
+                f"{expected_optimizer_schema!r}; pass "
+                "--reset-optimizers-on-resume to keep model/cursor state "
+                "while discarding incompatible optimizer state"
+            )
         if args.reset_optimizers_on_resume:
             # Trunk-optimizer migration: keep model, critic, step, and prompt
             # cursor; every optimizer starts with empty state under the
@@ -5907,7 +5883,7 @@ def main() -> None:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["identity_affine_execution_relabel"] = {
                 "source_execution_schema": source_execution_schema,
-                "target_execution_schema": EXECUTION_SCHEMA,
+                "target_execution_schema": target_execution_schema,
                 "adapter_state": "preserved",
             }
         if source_execution_schema == PREVIOUS_EXECUTION_SCHEMA:
@@ -5923,25 +5899,20 @@ def main() -> None:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["performance_resume_migration"] = {
                 "source_execution_schema": source_execution_schema,
-                "target_execution_schema": EXECUTION_SCHEMA,
+                "target_execution_schema": target_execution_schema,
             }
-        if adapter_migration is not None:
-            actor_init_provenance = dict(actor_init_provenance or {})
-            actor_init_provenance["identity_adapter_resume_migration"] = (
-                adapter_migration
-            )
         if anchored_value_migration is not None:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["anchored_value_resume_migration"] = {
                 "source_execution_schema": source_execution_schema,
-                "target_execution_schema": EXECUTION_SCHEMA,
+                "target_execution_schema": target_execution_schema,
                 **anchored_value_migration,
             }
         if args.migrate_projected_thought_resume:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["projected_thought_resume_migration"] = {
                 "source_execution_schema": source_execution_schema,
-                "target_execution_schema": EXECUTION_SCHEMA,
+                "target_execution_schema": target_execution_schema,
                 "thought_trust_epsilon": args.thought_trust_epsilon,
                 "thought_projection_penalty_coef": (
                     args.thought_projection_penalty_coef
@@ -5951,7 +5922,7 @@ def main() -> None:
             actor_init_provenance = dict(actor_init_provenance or {})
             actor_init_provenance["thought_reverse_kl_resume_migration"] = {
                 "source_execution_schema": source_execution_schema,
-                "target_execution_schema": EXECUTION_SCHEMA,
+                "target_execution_schema": target_execution_schema,
                 "thought_reverse_kl_coef": args.thought_reverse_kl_coef,
                 "thought_clip_mode": args.thought_clip_mode,
             }
@@ -6186,7 +6157,10 @@ def main() -> None:
                 # configuration's cost.
                 "profiled": bool(args.profile),
                 "profile_schema": PROFILE_SCHEMA if args.profile else None,
-                "execution_schema": EXECUTION_SCHEMA,
+                "execution_schema": execution_schema_for_adapter(
+                    args.thought_adapter
+                ),
+                "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
                 "math_data_identity": data_identity,
                 "reward_schema": REWARD_SCHEMA,
@@ -6195,9 +6169,13 @@ def main() -> None:
                 "math_modal_answer_baseline": math_modal_baseline,
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
                 "rollout_policy_schema": rollout_policy_schema,
-                "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+                "thought_input_schema": wrapper.thought_input_schema,
                 "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
                 "thought_mean_schema": THOUGHT_MEAN_SCHEMA,
+                "thought_sigma_init_schema": wrapper.sigma_state_init_schema,
+                "optimizer_schema": optimizer_schema_for_trunk_optimizer(
+                    args.trunk_optimizer
+                ),
                 "args": vars(args),
                 "base": {
                     "checkpoint": str(args.checkpoint),
@@ -6234,6 +6212,7 @@ def main() -> None:
                     "value_v_max": value_v_max,
                     "value_sigma_ratio": args.value_sigma_ratio,
                     "value_prior": args.value_prior,
+                    "adapter_init_schema": critic.adapter_init_schema,
                     "parameters": sum(p.numel() for p in critic.parameters()),
                 },
             },
@@ -7176,15 +7155,12 @@ def main() -> None:
                 (
                     policy_action_denominator,
                     gate_action_denominator,
-                    positive_token_denominator,
                 ) = actor_minibatch_denominators(
-                    [device_minibatch], [0], args.positive_reward_threshold
+                    [device_minibatch], [0]
                 )
                 with profiler.phase("forward_backward"):
                     metrics = training_update(
                         wrapper, critic, device_minibatch, optimizers,
-                        positive_lm_weight=args.positive_lm_weight,
-                        positive_reward_threshold=args.positive_reward_threshold,
                         thought_pg_coef=args.thought_pg_coef,
                         thought_reverse_kl_coef=args.thought_reverse_kl_coef,
                         thought_clip_mode=args.thought_clip_mode,
@@ -7200,7 +7176,6 @@ def main() -> None:
                         critic_step=False,
                         policy_action_denominator=policy_action_denominator,
                         gate_action_denominator=gate_action_denominator,
-                        positive_token_denominator=positive_token_denominator,
                         value_action_denominator=policy_action_denominator,
                         gae_lambda_alpha=args.gae_lambda_alpha,
                         replay_max_trajectories=args.replay_max_trajectories,

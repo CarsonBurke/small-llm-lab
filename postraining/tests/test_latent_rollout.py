@@ -55,9 +55,9 @@ from postraining.latent_thought import (
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import _pope_construction
 from postraining.train_latent_vapo import (
+    ACTOR_OBJECTIVE_SCHEMA,
     EXECUTION_SCHEMA,
-    GAIN_SCALED_EXECUTION_SCHEMA,
-    GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
+    IDENTITY_AFFINE_EXECUTION_SCHEMA,
     JOINT_CLIP_EXECUTION_SCHEMA,
     NO_THOUGHT_KL_EXECUTION_SCHEMA,
     PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
@@ -80,7 +80,6 @@ from postraining.train_latent_vapo import (
     lockstep_decode_metrics,
     math_dataset_identity,
     measure_post_update_policy_drift,
-    migrate_zero_adapter_resume,
     resume_execution_schema_compatible,
     sampled_reverse_kl,
     sample_prompt_batch,
@@ -1075,8 +1074,6 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
     micro_optimizers = _optimizers(micro_wrapper, micro_critic)
 
     kwargs = dict(
-        positive_lm_weight=0.1,
-        positive_reward_threshold=0.5,
         thought_pg_coef=0.7,
         thought_reverse_kl_coef=0.3,
         gate_pg_coef=0.8,
@@ -1105,7 +1102,6 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         "value_loss",
         "policy_loss",
         "thought_reverse_kl_penalty",
-        "positive_lm_loss",
         "gate_entropy_bonus",
         "advantage_mean",
         "advantage_std",
@@ -1712,6 +1708,7 @@ def test_shipped_defaults_are_the_reverse_kl_only_arm():
     cli = build_arg_parser().parse_args(["--checkpoint", "c", "--output", "o"])
     assert cli.thought_clip_mode == "none"
     assert cli.thought_reverse_kl_coef == 0.5
+    assert cli.thought_log_sigma_init == -2.0
 
 
 @pytest.mark.parametrize(
@@ -2088,7 +2085,6 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
         critic,
         first,
         optimizers,
-        positive_lm_weight=1.0,
     )
     assert first_metrics["joint_abs_log_ratio_max"] == 0.0
     for name, behavior_tensor in frozen_later.items():
@@ -2944,31 +2940,6 @@ def test_evaluation_compile_failure_restarts_eager_and_restores_capture(monkeypa
     assert second_metrics["compile_fallback"] is False
 
 
-def test_positive_lm_loss_applies_only_above_the_reward_threshold():
-    wrapper = _wrapper()
-    critic = _critic()
-    backbone = wrapper.backbone
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    optimizers = _optimizers(wrapper, critic, learning_rate=1e-4)
-    assign_terminal_rewards(batch, torch.tensor([0.9, 0.1, 0.6, 0.2]))
-    refresh_old_statistics(wrapper, critic, batch)
-    metrics = update_minibatch(
-        wrapper, critic, batch, optimizers, positive_lm_weight=0.1
-    )
-    assert metrics["positive_fraction"] == 0.5
-    # NLL of real emitted tokens under a softcapped 32-way softmax is
-    # strictly positive whenever any trajectory qualifies.
-    assert metrics["positive_lm_loss"] > 0.0
-    # No qualifying trajectory: the loss term is exactly zero.
-    assign_terminal_rewards(batch, torch.tensor([0.1, 0.2, 0.3, 0.4]))
-    refresh_old_statistics(wrapper, critic, batch)
-    metrics = update_minibatch(
-        wrapper, critic, batch, optimizers, positive_lm_weight=0.1
-    )
-    assert metrics["positive_fraction"] == 0.0
-    assert metrics["positive_lm_loss"] == 0.0
-
-
 def test_value_only_update_touches_only_the_critic():
     wrapper = _wrapper()
     critic = _critic()
@@ -3105,8 +3076,12 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["sampler_cursor"] == 3
     assert payload["execution_schema"] == EXECUTION_SCHEMA
     assert payload["reward_schema"] == REWARD_SCHEMA
+    assert payload["actor_objective_schema"] == ACTOR_OBJECTIVE_SCHEMA
     assert payload["thought_distribution_schema"] == THOUGHT_DISTRIBUTION_SCHEMA
     assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
+    assert payload["thought_sigma_init_schema"] == wrapper.sigma_state_init_schema
+    assert payload["critic_adapter_init_schema"] == critic.adapter_init_schema
+    assert "torch_adamw" in payload["optimizer_schema"]
 
 
 def test_value_support_geometry_matches_compares_args_not_shapes() -> None:
@@ -3182,7 +3157,7 @@ def test_anchored_value_migration_transfers_trunk_and_rebuilds_head() -> None:
         torch.testing.assert_close(target_state[key], value, rtol=0, atol=0)
     # The head keeps its fresh v215 init: zero weights, prior projected into
     # the bias on the ANCHORED grid.
-    assert float(target_critic.head.weight.abs().max()) == 0.0
+    assert float(target_critic.head.weight.detach().abs().max()) == 0.0
     torch.testing.assert_close(
         target_critic.head.bias,
         target_critic.support.project_to_logprobs(
@@ -3224,368 +3199,88 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
         assert not resume_execution_schema_compatible(
             current, **{extra_flag: True}
         )
-    zero_affine_previous = {
-        "execution_schema": ZERO_AFFINE_EXECUTION_SCHEMA
-    }
-    assert resume_execution_schema_compatible(zero_affine_previous)
-    for extra_flag in (
-        "allow_reverse_kl_migration",
-        "allow_performance_migration",
-        "allow_joint_clip_migration",
-        "allow_anchored_value_migration",
-        "allow_projected_thought_migration",
-        "allow_thought_reverse_kl_migration",
+    affine = {"execution_schema": IDENTITY_AFFINE_EXECUTION_SCHEMA}
+    assert not resume_execution_schema_compatible(affine)
+    assert resume_execution_schema_compatible(
+        affine,
+        expected_execution_schema=IDENTITY_AFFINE_EXECUTION_SCHEMA,
+    )
+    for old_schema in (
+        ZERO_AFFINE_EXECUTION_SCHEMA,
+        NO_THOUGHT_KL_EXECUTION_SCHEMA,
+        JOINT_CLIP_EXECUTION_SCHEMA,
+        UNANCHORED_VALUE_EXECUTION_SCHEMA,
+        PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
+        PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
+        PREVIOUS_EXECUTION_SCHEMA,
+        "older/v5",
     ):
         assert not resume_execution_schema_compatible(
-            zero_affine_previous, **{extra_flag: True}
+            {"execution_schema": old_schema}
         )
-    no_thought_kl_previous = {
-        "execution_schema": NO_THOUGHT_KL_EXECUTION_SCHEMA
-    }
-    assert not resume_execution_schema_compatible(no_thought_kl_previous)
     assert resume_execution_schema_compatible(
-        no_thought_kl_previous,
-        allow_thought_reverse_kl_migration=True,
+        {"execution_schema": ZERO_AFFINE_EXECUTION_SCHEMA},
+        expected_execution_schema=IDENTITY_AFFINE_EXECUTION_SCHEMA,
     )
-    # v23 predates only the reverse-KL term; acknowledging any earlier
-    # objective change would misdescribe what the checkpoint trained under.
-    assert not resume_execution_schema_compatible(
-        no_thought_kl_previous,
-        allow_thought_reverse_kl_migration=True,
-        allow_projected_thought_migration=True,
-    )
-    joint_clip_previous = {
-        "execution_schema": JOINT_CLIP_EXECUTION_SCHEMA
-    }
-    assert not resume_execution_schema_compatible(joint_clip_previous)
-    assert not resume_execution_schema_compatible(
-        joint_clip_previous,
-        allow_projected_thought_migration=True,
-    )
-    assert resume_execution_schema_compatible(
-        joint_clip_previous,
-        allow_projected_thought_migration=True,
-        allow_thought_reverse_kl_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        joint_clip_previous,
-        allow_projected_thought_migration=True,
-        allow_thought_reverse_kl_migration=True,
-        allow_anchored_value_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        joint_clip_previous,
-        allow_anchored_value_migration=True,
-    )
-    unanchored_previous = {
-        "execution_schema": UNANCHORED_VALUE_EXECUTION_SCHEMA
-    }
-    assert not resume_execution_schema_compatible(unanchored_previous)
-    assert not resume_execution_schema_compatible(
-        unanchored_previous,
-        allow_anchored_value_migration=True,
-    )
-    assert resume_execution_schema_compatible(
-        unanchored_previous,
-        allow_thought_reverse_kl_migration=True,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        unanchored_previous,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-        allow_joint_clip_migration=True,
-    )
-    per_dim_previous = {
-        "execution_schema": PER_DIM_REVERSE_KL_EXECUTION_SCHEMA
-    }
-    assert not resume_execution_schema_compatible(per_dim_previous)
-    assert not resume_execution_schema_compatible(
-        per_dim_previous,
-        allow_anchored_value_migration=True,
-        allow_joint_clip_migration=True,
-    )
-    assert resume_execution_schema_compatible(
-        per_dim_previous,
-        allow_thought_reverse_kl_migration=True,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-        allow_joint_clip_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        per_dim_previous,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-        allow_joint_clip_migration=True,
-        allow_performance_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        per_dim_previous,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-        allow_joint_clip_migration=True,
-        allow_reverse_kl_migration=True,
-    )
-    performance_previous = {
-        "execution_schema": PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA
-    }
-    assert not resume_execution_schema_compatible(performance_previous)
-    assert not resume_execution_schema_compatible(
-        performance_previous,
-        allow_anchored_value_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-    )
-    assert resume_execution_schema_compatible(
-        performance_previous,
-        allow_thought_reverse_kl_migration=True,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        performance_previous,
-        allow_projected_thought_migration=True,
-        allow_anchored_value_migration=True,
-        allow_reverse_kl_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-    )
-    previous = {"execution_schema": PREVIOUS_EXECUTION_SCHEMA}
-    assert not resume_execution_schema_compatible(previous)
-    assert not resume_execution_schema_compatible(
-        previous,
-        allow_reverse_kl_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-        allow_anchored_value_migration=True,
-    )
-    assert resume_execution_schema_compatible(
-        previous,
-        allow_reverse_kl_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-        allow_anchored_value_migration=True,
-        allow_projected_thought_migration=True,
-        allow_thought_reverse_kl_migration=True,
-    )
-    # Even trained v18 state is structurally resumable because objective
-    # revisions preserve state; the explicit flags prevent accidental change.
-    assert not resume_execution_schema_compatible(
-        {
-            "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
-            "step": 1,
-            "optimizers": {"actor": {"state": {1: {"step": 1}}}},
-        }
-    )
-    assert not resume_execution_schema_compatible(
-        {
-            "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
-            "step": 1,
-            "optimizers": {"actor": {"state": {1: {"step": 1}}}},
-        },
-        allow_reverse_kl_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-        allow_anchored_value_migration=True,
-    )
-    assert resume_execution_schema_compatible(
-        {
-            "execution_schema": PREVIOUS_EXECUTION_SCHEMA,
-            "step": 1,
-            "optimizers": {"actor": {"state": {1: {"step": 1}}}},
-        },
-        allow_thought_reverse_kl_migration=True,
-        allow_reverse_kl_migration=True,
-        allow_performance_migration=True,
-        allow_joint_clip_migration=True,
-        allow_anchored_value_migration=True,
-        allow_projected_thought_migration=True,
-    )
-
-    # Older actor optimizers and policy semantics must fail at the schema
-    # guard, not deep inside optimizer loading.
-    legacy = {
-        "execution_schema": "frozen_pool_2048_four_disjoint_b512_stable_actor_lrs/v6",
-        "args": {
-            "prompts_per_rollout": 16,
-            "prompts_per_minibatch": 16,
-            "samples_per_prompt": 32,
-            "ppo_epochs": 1,
-        },
-    }
-    assert not resume_execution_schema_compatible(legacy)
-    assert not resume_execution_schema_compatible(
-        {"execution_schema": "configurable_disjoint_b512_behavior_pool/v7"}
-    )
-    assert not resume_execution_schema_compatible(
-        {"execution_schema": GAIN_SCALED_EXECUTION_SCHEMA}
-    )
-    assert not resume_execution_schema_compatible({"execution_schema": "older/v5"})
-
-
-def test_zero_adapter_resume_migration_preserves_unrelated_adam_state() -> None:
-    wrapper = _wrapper()
-    critic = _critic()
-    optimizer = _optimizers(wrapper, critic)["actor"]
-    # Materialize a distinct moment tensor for every current actor parameter.
-    for index, parameter in enumerate(
-        parameter
-        for group in optimizer.param_groups
-        for parameter in group["params"]
-    ):
-        parameter.grad = torch.full_like(parameter, (index + 1) / 1000)
-    optimizer.step()
-    current_optimizer = copy.deepcopy(optimizer.state_dict())
-    weight_id, bias_id = current_optimizer["param_groups"][2]["params"]
-    scalar_id = max(
-        parameter_id
-        for group in current_optimizer["param_groups"]
-        for parameter_id in group["params"]
-    ) + 1
-    current_optimizer["param_groups"][2]["params"] = [
-        scalar_id, weight_id, bias_id
-    ]
-    current_optimizer["state"][scalar_id] = {
-        "step": torch.tensor(7.0),
-        "exp_avg": torch.tensor(0.25),
-        "exp_avg_sq": torch.tensor(0.5),
-    }
-    unaffected_ids = {
-        parameter_id
-        for group_index, group in enumerate(current_optimizer["param_groups"])
-        if group_index != 2
-        for parameter_id in group["params"]
-    }
-    unaffected_before = {
-        parameter_id: copy.deepcopy(current_optimizer["state"][parameter_id])
-        for parameter_id in unaffected_ids
-    }
-
-    model = copy.deepcopy(wrapper.state_dict())
-    model["adapter.projection.weight"].fill_(1.0)
-    model["adapter.projection.bias"].fill_(2.0)
-    model["adapter.interpolation_strength"] = torch.tensor(-4.5e-4)
-    critic_state = {"sentinel": torch.arange(4)}
-    critic_optimizer_state = {"sentinel": torch.arange(3)}
-    cpu_rng_state = torch.random.get_rng_state().clone()
-    payload = {
-        "execution_schema": GAIN_SCALED_EXECUTION_SCHEMA,
-        "thought_input_schema": GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
-        "model": model,
-        "critic": critic_state,
-        "optimizers": {
-            "actor": current_optimizer,
-            "critic": critic_optimizer_state,
-        },
-        "step": 640,
-        "sampler_cursor": 11040,
-        "cpu_rng": cpu_rng_state,
-        "cuda_rng": [torch.arange(2, dtype=torch.uint8)],
-        "python_rng": (3, (1, 2, 3), None),
-    }
-
-    provenance = migrate_zero_adapter_resume(payload, wrapper)
-
-    assert payload["execution_schema"] == PREVIOUS_EXECUTION_SCHEMA
-    assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
-    assert provenance["source_adapter_strength"] == pytest.approx(-4.5e-4)
-    assert payload["step"] == 640
-    assert payload["sampler_cursor"] == 11040
-    assert payload["critic"] is critic_state
-    assert payload["optimizers"]["critic"] is critic_optimizer_state
-    torch.testing.assert_close(payload["cpu_rng"], cpu_rng_state)
-    torch.testing.assert_close(payload["cuda_rng"][0], torch.arange(2, dtype=torch.uint8))
-    assert payload["python_rng"] == (3, (1, 2, 3), None)
-    assert "adapter.interpolation_strength" not in model
-    torch.testing.assert_close(
-        model["adapter.projection.weight"],
-        torch.eye(model["adapter.projection.weight"].shape[0]),
-    )
-    assert torch.count_nonzero(model["adapter.projection.bias"]) == 0
-    assert current_optimizer["param_groups"][2]["params"] == [
-        weight_id, bias_id
-    ]
-    assert all(
-        parameter_id not in current_optimizer["state"]
-        for parameter_id in (scalar_id, weight_id, bias_id)
-    )
-    for parameter_id, expected in unaffected_before.items():
-        for key, value in expected.items():
-            torch.testing.assert_close(
-                current_optimizer["state"][parameter_id][key], value
-            )
-
-    migrated_wrapper = _wrapper(seed=99)
-    migrated_wrapper.load_state_dict(model, strict=True)
-    migrated_optimizer = _optimizers(migrated_wrapper, _critic(), 1e-3)["actor"]
-    migrated_optimizer.load_state_dict(current_optimizer)
-    assert not migrated_optimizer.state[
-        migrated_wrapper.adapter.projection.weight
-    ]
-    assert not migrated_optimizer.state[
-        migrated_wrapper.adapter.projection.bias
-    ]
-
-
-def test_zero_adapter_resume_migration_rejects_wrong_source_schema() -> None:
-    wrapper = _wrapper()
-    with pytest.raises(ValueError, match="requires execution schema"):
-        migrate_zero_adapter_resume(
+    migration_cases = (
+        (
+            NO_THOUGHT_KL_EXECUTION_SCHEMA,
+            {"allow_thought_reverse_kl_migration": True},
+        ),
+        (
+            JOINT_CLIP_EXECUTION_SCHEMA,
             {
-                "execution_schema": EXECUTION_SCHEMA,
-                "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+                "allow_thought_reverse_kl_migration": True,
+                "allow_projected_thought_migration": True,
             },
-            wrapper,
+        ),
+        (
+            UNANCHORED_VALUE_EXECUTION_SCHEMA,
+            {
+                "allow_thought_reverse_kl_migration": True,
+                "allow_projected_thought_migration": True,
+                "allow_anchored_value_migration": True,
+            },
+        ),
+        (
+            PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
+            {
+                "allow_thought_reverse_kl_migration": True,
+                "allow_projected_thought_migration": True,
+                "allow_anchored_value_migration": True,
+                "allow_joint_clip_migration": True,
+            },
+        ),
+        (
+            PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
+            {
+                "allow_thought_reverse_kl_migration": True,
+                "allow_projected_thought_migration": True,
+                "allow_anchored_value_migration": True,
+                "allow_joint_clip_migration": True,
+                "allow_performance_migration": True,
+            },
+        ),
+        (
+            PREVIOUS_EXECUTION_SCHEMA,
+            {
+                "allow_thought_reverse_kl_migration": True,
+                "allow_projected_thought_migration": True,
+                "allow_anchored_value_migration": True,
+                "allow_joint_clip_migration": True,
+                "allow_performance_migration": True,
+                "allow_reverse_kl_migration": True,
+            },
+        ),
+    )
+    for old_schema, flags in migration_cases:
+        payload = {"execution_schema": old_schema}
+        assert resume_execution_schema_compatible(
+            payload,
+            expected_execution_schema=IDENTITY_AFFINE_EXECUTION_SCHEMA,
+            **flags,
         )
-
-
-@pytest.mark.parametrize(
-    "malformation",
-    ["missing_scalar", "bad_weight", "bad_groups", "duplicate_ids"],
-)
-def test_zero_adapter_resume_migration_rejects_malformed_layout_before_mutation(
-    malformation: str,
-) -> None:
-    wrapper = _wrapper()
-    critic = _critic()
-    optimizer = _optimizers(wrapper, critic)["actor"].state_dict()
-    weight_id, bias_id = optimizer["param_groups"][2]["params"]
-    scalar_id = max(
-        parameter_id
-        for group in optimizer["param_groups"]
-        for parameter_id in group["params"]
-    ) + 1
-    optimizer["param_groups"][2]["params"] = [scalar_id, weight_id, bias_id]
-    model = copy.deepcopy(wrapper.state_dict())
-    model["adapter.interpolation_strength"] = torch.tensor(1e-4)
-    payload = {
-        "execution_schema": GAIN_SCALED_EXECUTION_SCHEMA,
-        "thought_input_schema": GAIN_SCALED_THOUGHT_INPUT_SCHEMA,
-        "model": model,
-        "optimizers": {"actor": optimizer},
-    }
-    if malformation == "missing_scalar":
-        del model["adapter.interpolation_strength"]
-    elif malformation == "bad_weight":
-        model["adapter.projection.weight"] = torch.zeros(1)
-    elif malformation == "bad_groups":
-        optimizer["param_groups"][2]["params"] = [weight_id, bias_id]
-    else:
-        optimizer["param_groups"][2]["params"] = [scalar_id, weight_id, weight_id]
-    before = copy.deepcopy(payload)
-
-    with pytest.raises(ValueError):
-        migrate_zero_adapter_resume(payload, wrapper)
-
-    assert payload.keys() == before.keys()
-    assert payload["execution_schema"] == before["execution_schema"]
-    assert payload["thought_input_schema"] == before["thought_input_schema"]
-    assert payload["model"].keys() == before["model"].keys()
-    for key, value in payload["model"].items():
-        torch.testing.assert_close(value, before["model"][key])
+        assert not resume_execution_schema_compatible(payload, **flags)
 
 
 def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):

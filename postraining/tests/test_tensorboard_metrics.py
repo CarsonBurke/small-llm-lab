@@ -84,25 +84,20 @@ def test_one_pass_plan_consumes_all_dapo_rows_once_including_tail() -> None:
         )
 
 
-def test_actor_denominators_cover_only_selected_groups_and_positive_tokens() -> None:
+def test_actor_denominators_cover_only_selected_groups() -> None:
     class Group:
-        def __init__(self, actions, emits, rewards):
+        def __init__(self, actions):
             self.action_mask = torch.tensor(actions, dtype=torch.float32)
             self.gate_mask = torch.tensor(actions, dtype=torch.float32)
-            self.emit_mask = torch.tensor(emits, dtype=torch.float32)
-            self.reward_scalar = torch.tensor(rewards, dtype=torch.float32)
 
     groups = [
-        Group([[1, 1], [1, 0]], [[1, 1], [1, 0]], [1.0, 0.0]),
-        Group([[1, 1]], [[1, 0]], [1.0]),
-        Group([[1, 1]], [[1, 1]], [1.0]),
+        Group([[1, 1], [1, 0]]),
+        Group([[1, 1]]),
+        Group([[1, 1]]),
     ]
-    actions, gate_actions, positive_tokens = actor_minibatch_denominators(
-        groups, [0, 2], positive_reward_threshold=0.5
-    )
+    actions, gate_actions = actor_minibatch_denominators(groups, [0, 2])
     assert actions == 5
     assert gate_actions == 5
-    assert positive_tokens == 4
 
 
 def _actor_metrics(**overrides: float) -> dict[str, float]:
@@ -127,12 +122,10 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "emit_advantage_mean": -0.1,
         "policy_loss": 1.0,
         "thought_reverse_kl_penalty": 0.06,
-        "positive_lm_loss": 4.0,
         "gate_entropy_bonus": 0.25,
         "gate_pg_coef": 1.0,
         "thought_pg_coef": 1.0,
         "thought_reverse_kl_coef": 0.3,
-        "positive_lm_weight": 0.1,
         "gate_entropy_coef": 0.5,
         "emit_probability": 0.8,
         "thought_adapter_weight_rms": 1e-4,
@@ -262,7 +255,6 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["trust/thought_d_max"] == pytest.approx(0.3)
     assert dashboard["trust/projection_penalty"] == pytest.approx(0.03)
     assert "grad/critic_mean" not in dashboard
-    assert dashboard["loss/positive_lm_weighted"] == pytest.approx(0.8)
     assert "thought_behavior_kl_per_dim" not in dashboard
     assert all(
         not tag.startswith("train/") and not tag.startswith("rollout/")
@@ -276,7 +268,7 @@ def test_actor_dashboard_has_only_the_authoritative_joint_policy_loss() -> None:
     assert dashboard["loss/policy"] == 1.0
     assert dashboard["kl/thought_reverse_weighted"] == pytest.approx(0.06)
     assert dashboard["bonus/gate_entropy_weighted"] == pytest.approx(0.25)
-    assert dashboard["loss/actor_total"] == pytest.approx(1.21)
+    assert dashboard["loss/actor_total"] == pytest.approx(0.81)
     assert "loss/gate_weighted" not in dashboard
     assert "loss/renderer" not in dashboard
     assert "loss/thought_weighted" not in dashboard

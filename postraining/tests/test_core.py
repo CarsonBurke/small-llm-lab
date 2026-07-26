@@ -25,7 +25,6 @@ from postraining.core import (
     nearby_numeric_reward,
     normalize_final_answer,
     parse_numeric_answer,
-    positive_example_lm_loss,
     validate_posttraining_context_budget,
     verify_answer,
 )
@@ -302,43 +301,6 @@ def test_combined_advantage_and_return_targets_match_two_gaes(gamma):
     )
     torch.testing.assert_close(actual_advantages, expected_advantages)
     torch.testing.assert_close(actual_targets, expected_targets)
-
-
-def test_positive_lm_loss_weights_correct_tokens_equally():
-    logprobs = torch.tensor([[-2.0, -2.0, 0.0], [-1.0, -3.0, -5.0]])
-    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-    loss = positive_example_lm_loss(logprobs, mask, torch.tensor([True, True]))
-    torch.testing.assert_close(loss, torch.tensor(2.6))
-
-
-def test_positive_lm_loss_shards_use_the_global_token_denominator():
-    logprobs = torch.tensor([[-2.0, -2.0, 0.0], [-1.0, -3.0, -5.0]])
-    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-    correct = torch.tensor([True, True])
-    denominator = (mask * correct[:, None]).sum()
-    sharded = sum(
-        positive_example_lm_loss(
-            logprobs[index : index + 1],
-            mask[index : index + 1],
-            correct[index : index + 1],
-            denominator=denominator,
-        )
-        for index in range(2)
-    )
-    torch.testing.assert_close(sharded, torch.tensor(2.6))
-
-
-def test_positive_lm_loss_is_differentiable_zero_without_positive_tokens():
-    logprobs = torch.tensor([[-2.0, -3.0]], requires_grad=True)
-    loss = positive_example_lm_loss(
-        logprobs,
-        torch.zeros_like(logprobs),
-        torch.tensor([True]),
-        denominator=torch.tensor(0.0),
-    )
-    assert loss == 0
-    loss.backward()
-    torch.testing.assert_close(logprobs.grad, torch.zeros_like(logprobs))
 
 
 def test_official_verifier_edge_normalization():

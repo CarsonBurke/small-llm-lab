@@ -37,6 +37,11 @@ import torch
 import torch._dynamo
 from torch import Tensor
 
+MUON_ALGORITHM_SCHEMA = (
+    "polar_express5_safety0.02_eps1e-6_bf16_no_rect_"
+    "nesterov_mu0.95_group_isolated/v2"
+)
+
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2.  The coefficients and
 # the safety factor in the normalization below are a matched pair.
 polar_express_coeffs = [

@@ -43,6 +43,7 @@ from postraining.latent_thought import (
     migrate_legacy_wrapper_checkpoint,
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
+    wrapper_init_kwargs_from_checkpoint,
 )
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import fresh_trunk, load_model
@@ -130,10 +131,12 @@ def main() -> None:
     device = torch.device("cuda")
     backbone = load_model(args.checkpoint, device)
     backbone.eval()
-    wrapper = LatentThoughtModel(backbone).to(device)
     payload = torch.load(wrapper_path, map_location="cpu", weights_only=False)
     saved_args = payload.get("args", {})
     reasoning_mode = saved_args.get("reasoning_mode", "latent")
+    wrapper = LatentThoughtModel(
+        backbone, **wrapper_init_kwargs_from_checkpoint(payload)
+    ).to(device)
     migrate_legacy_wrapper_checkpoint(payload, wrapper)
     validate_renderer_checkpoint(
         payload,
@@ -141,6 +144,7 @@ def main() -> None:
         expected_rollout_policy_schema=rollout_policy_schema_for_mode(
             reasoning_mode
         ),
+        expected_thought_input_schema=wrapper.thought_input_schema,
     )
     wrapper.load_state_dict(payload["model"], strict=True)
     wrapper.eval()
@@ -164,6 +168,7 @@ def main() -> None:
         v_min=value_v_min,
         v_max=value_v_max,
         prior_value=saved_args.get("value_prior", 0.05),
+        adapter_init=saved_args.get("critic_adapter_init", "identity"),
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()

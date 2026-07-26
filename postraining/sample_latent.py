@@ -53,6 +53,7 @@ from postraining.latent_thought import (
     LatentThoughtModel,
     migrate_legacy_wrapper_checkpoint,
     validate_renderer_checkpoint,
+    wrapper_init_kwargs_from_checkpoint,
 )
 from postraining.model_io import load_model
 from postraining.train_vapo import prompt_text
@@ -224,18 +225,25 @@ def main() -> None:
     device = torch.device("cuda")
     backbone = load_model(args.checkpoint, device)
     backbone.eval()
-    wrapper = LatentThoughtModel(backbone).to(device)
     wrapper_step = None
     if args.wrapper_checkpoint:
         payload = torch.load(
             args.wrapper_checkpoint, map_location="cpu", weights_only=False
         )
+        wrapper = LatentThoughtModel(
+            backbone, **wrapper_init_kwargs_from_checkpoint(payload)
+        ).to(device)
         migrate_legacy_wrapper_checkpoint(payload, wrapper)
-        validate_renderer_checkpoint(payload, args.wrapper_checkpoint)
+        validate_renderer_checkpoint(
+            payload,
+            args.wrapper_checkpoint,
+            expected_thought_input_schema=wrapper.thought_input_schema,
+        )
         wrapper.load_state_dict(payload["model"], strict=True)
         wrapper_step = payload.get("step")
         print(f"policy: {args.wrapper_checkpoint} (step {payload.get('step')})")
     else:
+        wrapper = LatentThoughtModel(backbone).to(device)
         print("policy: untrained heads over the pretraining checkpoint")
     wrapper.eval()
     if args.emit_only:

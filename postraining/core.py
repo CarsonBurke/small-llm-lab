@@ -555,22 +555,6 @@ def masked_token_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
 
-def positive_example_lm_loss(
-    logprobs: Tensor,
-    mask: Tensor,
-    correct: Tensor,
-    denominator: Tensor | None = None,
-) -> Tensor:
-    """VAPO Eq. 9: NLL averaged over every token in correct responses."""
-    positive_mask = mask * correct[:, None]
-    denom = (
-        positive_mask.sum()
-        if denominator is None
-        else denominator.to(mask.device)
-    ).clamp_min(1)
-    return -(logprobs * positive_mask).sum() / denom
-
-
 def top_p_sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:
     logits = logits.float()
     if temperature != 1.0:

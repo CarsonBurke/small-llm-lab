@@ -11,11 +11,12 @@ import torch
 
 from postraining import muon as muon_module
 from postraining.latent_thought import LatentThoughtModel
-from postraining.muon import Muon, _polar_express
+from postraining.muon import MUON_ALGORITHM_SCHEMA, Muon, _polar_express
 from postraining.nano_backbone import NanoGPTBackbone
 from postraining.train_latent_vapo import (
     build_optimizers,
     renderer_parameters,
+    optimizer_schema_for_trunk_optimizer,
     step_optimizers,
     zero_optimizers,
 )
@@ -61,6 +62,13 @@ def _orthogonalized(matrix: torch.Tensor) -> torch.Tensor:
         torch.zeros_like(matrix),
         torch.tensor(0.0),
     ).float()
+
+
+def test_optimizer_schema_identifies_polar_express_and_adamw():
+    schema = optimizer_schema_for_trunk_optimizer("muon")
+    assert MUON_ALGORITHM_SCHEMA in schema
+    assert "torch_adamw" in schema
+    assert "polar_express5" in schema
 
 
 def test_polar_express_trades_conditioning_for_iterations():
@@ -564,6 +572,13 @@ def test_build_optimizers_muon_layout_partitions_exactly():
     assert not (adamw_actor & actual_actor_muon)
     assert {id(p) for p in renderer_parameters(backbone)} <= adamw_actor
     assert id(backbone.embed.weight) in adamw_actor
+    assert {id(p) for p in wrapper.adapter.parameters()} <= adamw_actor
+    assert {
+        id(p) for p in wrapper.transition.log_sigma_head.parameters()
+    } <= adamw_actor
+    assert {
+        id(p) for p in wrapper.transition.mean_head.parameters()
+    } <= adamw_actor
 
     critic_muon = {
         id(p)
@@ -581,6 +596,7 @@ def test_build_optimizers_muon_layout_partitions_exactly():
     assert not (critic_muon & critic_adamw)
     assert critic_muon | critic_adamw == {id(p) for p in critic.parameters()}
     assert id(critic.head.weight) in critic_adamw
+    assert {id(p) for p in critic.adapter.parameters()} <= critic_adamw
 
 
 def test_build_optimizers_adamw_layout_is_unchanged():

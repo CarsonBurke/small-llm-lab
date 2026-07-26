@@ -9,12 +9,11 @@ The transition policy is a diagonal Gaussian whose mean comes from a fresh
 linear head over the belief and whose per-dimension log-sigma is predicted
 from that same belief. The mean starts as a zero-bias orthogonal map at gain
 0.1, with no initial obligation to imitate a discrete-token embedding.
-Thoughts pass through a separate fresh affine embedder after sampling. It uses
-the same identity weight and zero bias initialization as the critic's thought
-adapter, so the first thought payload is the sampled thought itself. The
-adapter is recurrent policy state, not part of the Gaussian likelihood: its
-bias can become a shared thought-type marker while its weight learns how
-sampled thought content should enter the trunk.
+Thoughts pass through a separate full-width orthogonal projection and
+``2*SiLU`` after sampling. The factor of two makes the adapter locally
+unit-gain at zero while the nonlinearity gives the policy exclusive processing
+before the shared trunk. The adapter is recurrent policy state, not part of
+the Gaussian likelihood.
 
 The renderer is deliberately separated from that thought path: it consumes
 the current stream input and the raw belief, while the fresh mean head is
@@ -51,17 +50,27 @@ def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
         return PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS[reasoning_mode]
     except KeyError:
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}") from None
-THOUGHT_INPUT_SCHEMA = "fresh_identity_affine/v7"
-# Runtime semantics after the first step are the checkpointed affine, not the
-# init tag. Accept retired affine-init tags so trained checkpoints remain
-# resumable; every fresh actor restart and new save writes v7.
-COMPATIBLE_THOUGHT_INPUT_SCHEMAS = frozenset(
+IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA = "fresh_identity_affine/v7"
+ORTHOGONAL_SILU_THOUGHT_INPUT_SCHEMA = "fresh_orthogonal_affine_2silu/v8"
+THOUGHT_INPUT_SCHEMA = ORTHOGONAL_SILU_THOUGHT_INPUT_SCHEMA
+COMPATIBLE_IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMAS = frozenset(
     {
-        THOUGHT_INPUT_SCHEMA,
+        IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA,
         "fresh_scaled_eye_0.1_affine/v6",
         "fresh_zero_affine/v5",
     }
 )
+THOUGHT_ADAPTER_KINDS = ("identity_affine", "orthogonal_silu")
+SIGMA_STATE_INIT_KINDS = ("constant", "orthogonal")
+CRITIC_ADAPTER_INIT_KINDS = ("identity", "orthogonal")
+SIGMA_STATE_INIT_SCHEMAS = {
+    "constant": "zero_weight_constant_sigma/v1",
+    "orthogonal": "unit_orthogonal_weight_gain_0.01/v2",
+}
+CRITIC_ADAPTER_INIT_SCHEMAS = {
+    "identity": "identity_affine/v1",
+    "orthogonal": "unit_orthogonal_affine/v2",
+}
 THOUGHT_DISTRIBUTION_SCHEMA = (
     "state_dependent_diag_tanh_log_sigma_scaled_residual_-5_2/v2"
 )
@@ -80,12 +89,41 @@ THOUGHT_LOG_SIGMA_MIN = -5.0
 THOUGHT_LOG_SIGMA_MAX = 2.0
 
 
+def thought_input_schema_for_adapter(kind: str) -> str:
+    """Return the deployed actor-adapter schema for an ablation kind."""
+    if kind == "identity_affine":
+        return IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA
+    if kind == "orthogonal_silu":
+        return ORTHOGONAL_SILU_THOUGHT_INPUT_SCHEMA
+    raise ValueError(f"unknown thought adapter kind {kind!r}")
+
+
+def wrapper_init_kwargs_from_checkpoint(payload: dict) -> dict[str, str]:
+    """Recover policy semantics before constructing a checkpoint wrapper.
+
+    Checkpoints predating the selectable initializations have no matching
+    argument fields and used the identity actor adapter with constant sigma.
+    The tensor layouts match the new treatment, so callers must recover these
+    semantics before strict loading rather than relying on shape checks.
+    """
+    saved_args = payload.get("args", {})
+    return {
+        "thought_adapter": saved_args.get(
+            "thought_adapter", "identity_affine"
+        ),
+        "sigma_state_init": saved_args.get(
+            "thought_sigma_state_init", "constant"
+        ),
+    }
+
+
 def validate_renderer_checkpoint(
     payload: dict,
     checkpoint: str,
     *,
     allow_transition_reset: bool = False,
     expected_rollout_policy_schema: str = ROLLOUT_POLICY_SCHEMA,
+    expected_thought_input_schema: str = THOUGHT_INPUT_SCHEMA,
 ) -> None:
     """Reject wrapper checkpoints trained with incompatible policy semantics."""
     actual = payload.get("renderer_features_schema")
@@ -106,13 +144,20 @@ def validate_renderer_checkpoint(
             "and cannot be resumed or evaluated as this policy."
         )
     thought_input = payload.get("thought_input_schema")
-    if thought_input not in COMPATIBLE_THOUGHT_INPUT_SCHEMAS:
+    thought_input_matches = thought_input == expected_thought_input_schema
+    if (
+        expected_thought_input_schema == IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA
+        and thought_input
+        in COMPATIBLE_IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMAS
+    ):
+        thought_input_matches = True
+    if not thought_input_matches:
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"input schema is {thought_input!r}, expected one of "
-            f"{sorted(COMPATIBLE_THOUGHT_INPUT_SCHEMAS)!r}. Old or untagged "
-            "VAPO checkpoints used a different thought embedder and cannot "
-            "be resumed or evaluated as this policy."
+            f"input schema is {thought_input!r}, expected "
+            f"{expected_thought_input_schema!r}. The checkpoint uses a "
+            "different deployed thought adapter and cannot be resumed or "
+            "evaluated as this policy."
         )
     thought_distribution = payload.get("thought_distribution_schema")
     if (
@@ -177,7 +222,7 @@ class FreshThoughtMeanHead(nn.Linear):
 
 
 class StateDependentLogSigmaHead(nn.Linear):
-    """Raw log-sigma bias plus a learned, initially weak state residual."""
+    """Raw log-sigma bias plus a learned, weak orthogonal state residual."""
 
     INIT_RESIDUAL_GAIN = 0.01
 
@@ -194,10 +239,11 @@ class GaussianTransitionHead(nn.Module):
     A unit-orthogonal mean map sits behind a learned output gain initialized
     at 0.1. For an RMS-normalized D-wide belief this gives a mean RMS of
     exactly 0.1 while preserving every input direction and avoiding the
-    retired next-token latent prior. A separate zero-init linear head predicts
-    per-dimension log-sigma residuals behind the same kind of 0.01 output
-    gain around a CLI-initialized bias, so exploration starts state-independent
-    and neither D-wide matrix can make an O(D * lr) first functional jump.
+    retired next-token latent prior. A separate unit-orthogonal linear head
+    predicts per-dimension log-sigma residuals behind a 0.01 output gain around
+    a CLI-initialized bias. The head is therefore mildly state-dependent from
+    its first rollout, while the explicit gain controls both its initial
+    function and Adam's scale-insensitive matrix updates.
     Callers compute
     ``predict_log_sigma(belief)`` once per site and pass it to every
     sampling/scoring method so rollout, refresh, and update always price
@@ -206,15 +252,23 @@ class GaussianTransitionHead(nn.Module):
 
     MEAN_INIT_GAIN = FreshThoughtMeanHead.INIT_OUTPUT_GAIN
 
-    def __init__(self, model_dim: int, log_sigma: float = -2.5):
+    def __init__(
+        self,
+        model_dim: int,
+        log_sigma: float = -2.0,
+        sigma_state_init: str = "orthogonal",
+    ):
         super().__init__()
+        if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
+            raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
+        self.sigma_state_init = sigma_state_init
         # Keep log-sigma registered first. Legacy v11 actor optimizers stored
         # this pair as their fifth group; the fresh mean becomes a sixth group
         # so the one-time branch migration can restore every old Adam state
         # without positional remapping.
         self.log_sigma_head = StateDependentLogSigmaHead(model_dim)
         self.mean_head = FreshThoughtMeanHead(model_dim)
-        self.reset_noise(log_sigma)
+        self.reset_noise(log_sigma, sigma_state_init)
 
     def predict_mean(self, belief: Tensor) -> Tensor:
         """State-dependent mean of the continuous thought action.
@@ -227,21 +281,52 @@ class GaussianTransitionHead(nn.Module):
         """
         return self.mean_head(belief)
 
-    def reset_noise(self, log_sigma: float) -> None:
-        """Zero state dependence and initialize an exact bounded log-sigma.
+    def reset_noise(
+        self, log_sigma: float, sigma_state_init: str | None = None
+    ) -> None:
+        """Initialize bounded log-sigma around a CLI-owned statewise mean.
 
-        Zero weights make the head state-independent at initialization —
-        exactly the retired scalar policy — with the CLI owning the level.
-        The learned affine head lives in raw space, so the desired log-sigma
-        is inverse-transformed into its bias.
+        A unit-orthogonal raw-space map preserves the RMS-one belief geometry.
+        Its explicit 0.01 gain gives only about 0.03 RMS log-sigma variation
+        near the usual initialization range, while retaining full rank and an
+        immediate gradient for the learned gain. The inverse-transformed bias
+        remains the exact center of the bounded distribution. ``constant`` is
+        retained only as the matched zero-weight ablation.
         """
+        sigma_state_init = sigma_state_init or self.sigma_state_init
+        if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
+            raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
+        self.sigma_state_init = sigma_state_init
         raw_bias = self.raw_from_log_sigma(log_sigma)
         with torch.no_grad():
-            self.log_sigma_head.weight.zero_()
+            if sigma_state_init == "orthogonal":
+                # Linear.__init__ already consumed the same global RNG as the
+                # retired zero-weight head. Draw the new direction without
+                # shifting later fresh modules or the critic's initialization.
+                devices = (
+                    [self.log_sigma_head.weight.device]
+                    if self.log_sigma_head.weight.is_cuda
+                    else []
+                )
+                with torch.random.fork_rng(devices=devices):
+                    nn.init.orthogonal_(self.log_sigma_head.weight)
+            else:
+                self.log_sigma_head.weight.zero_()
             self.log_sigma_head.bias.fill_(raw_bias)
             self.log_sigma_head.residual_gain.fill_(
                 self.log_sigma_head.INIT_RESIDUAL_GAIN
             )
+
+    def set_noise_level(self, log_sigma: float) -> None:
+        """Change only the fresh policy's central log-sigma.
+
+        Construction owns the random orthogonal direction. CLI scale selection
+        must not draw it again: repeated initialization would consume RNG and
+        silently change every later fresh module.
+        """
+        raw_bias = self.raw_from_log_sigma(log_sigma)
+        with torch.no_grad():
+            self.log_sigma_head.bias.fill_(raw_bias)
 
     @staticmethod
     def raw_from_log_sigma(log_sigma: float) -> float:
@@ -419,16 +504,38 @@ class ThinkEmitGate(nn.Module):
 
 
 class AffineThoughtAdapter(nn.Module):
-    """Identity-initialized affine thought embedder shared with the critic."""
+    """Full-width affine thought embedder with an explicit initialization."""
 
-    def __init__(self, model_dim: int):
+    def __init__(self, model_dim: int, initialization: str = "orthogonal"):
         super().__init__()
+        if initialization not in CRITIC_ADAPTER_INIT_KINDS:
+            raise ValueError(
+                f"unknown affine thought-adapter initialization {initialization!r}"
+            )
+        self.initialization = initialization
         self.projection = nn.Linear(model_dim, model_dim, bias=True)
-        self.reset_affine()
+        self.reset_affine(initialization)
 
-    def reset_affine(self) -> None:
+    def reset_affine(self, initialization: str | None = None) -> None:
+        initialization = initialization or self.initialization
+        if initialization not in CRITIC_ADAPTER_INIT_KINDS:
+            raise ValueError(
+                f"unknown affine thought-adapter initialization {initialization!r}"
+            )
+        self.initialization = initialization
         with torch.no_grad():
-            nn.init.eye_(self.projection.weight)
+            if initialization == "orthogonal":
+                # Preserve the global stream left by Linear.__init__, matching
+                # the old identity reset's RNG consumption.
+                devices = (
+                    [self.projection.weight.device]
+                    if self.projection.weight.is_cuda
+                    else []
+                )
+                with torch.random.fork_rng(devices=devices):
+                    nn.init.orthogonal_(self.projection.weight)
+            else:
+                nn.init.eye_(self.projection.weight)
             nn.init.zeros_(self.projection.bias)
 
     def forward(self, thought: Tensor) -> Tensor:
@@ -436,7 +543,24 @@ class AffineThoughtAdapter(nn.Module):
 
 
 class ThoughtAdapter(AffineThoughtAdapter):
-    """Policy thought embedder initialized exactly like the critic adapter."""
+    """Policy thought mixer: affine control or orthogonal ``2*SiLU``."""
+
+    def __init__(self, model_dim: int, kind: str = "orthogonal_silu"):
+        if kind not in THOUGHT_ADAPTER_KINDS:
+            raise ValueError(f"unknown thought adapter kind {kind!r}")
+        initialization = (
+            "identity" if kind == "identity_affine" else "orthogonal"
+        )
+        super().__init__(model_dim, initialization=initialization)
+        self.kind = kind
+
+    def forward(self, thought: Tensor) -> Tensor:
+        projected = self.projection(thought)
+        if self.kind == "identity_affine":
+            return projected
+        # SiLU'(0)=1/2, so the factor of two gives a unit-gain nonlinear
+        # interface around the small initial thought distribution.
+        return 2.0 * F.silu(projected)
 
 
 def migrate_legacy_wrapper_checkpoint(
@@ -462,24 +586,38 @@ def migrate_legacy_wrapper_checkpoint(
             wrapper.adapter.projection.bias.detach().clone()
         )
         state_dict.pop("adapter.interpolation_strength", None)
-        payload["thought_input_schema"] = THOUGHT_INPUT_SCHEMA
+        payload["thought_input_schema"] = wrapper.thought_input_schema
         adapter_reset = True
     else:
         if "adapter.correction.weight" in state_dict:
             raise ValueError(
                 "legacy residual thought adapters cannot be resumed into the "
-                "fresh identity affine policy; use an explicit actor restart"
+                "current thought policy; use an explicit actor restart"
             )
-    sigma_migrated = migrate_scalar_log_sigma_state(
-        state_dict, wrapper.transition
-    )
+    sigma_weight_key = "transition.log_sigma_head.weight"
+    sigma_bias_key = "transition.log_sigma_head.bias"
     sigma_gain_key = "transition.log_sigma_head.residual_gain"
-    if sigma_gain_key not in state_dict and initialize_fresh_mean:
+    if initialize_fresh_mean:
+        # A critic-warm checkpoint has never deployed its actor. Replace the
+        # whole fresh noise head, including the random orthogonal direction,
+        # instead of loading the checkpoint's obsolete untouched init and
+        # drawing a second direction after load.
+        state_dict.pop("transition.log_sigma", None)
+        state_dict[sigma_weight_key] = (
+            wrapper.transition.log_sigma_head.weight.detach().clone()
+        )
+        state_dict[sigma_bias_key] = (
+            wrapper.transition.log_sigma_head.bias.detach().clone()
+        )
         state_dict[sigma_gain_key] = (
             wrapper.transition.log_sigma_head.residual_gain.detach().clone()
         )
         payload["thought_distribution_schema"] = THOUGHT_DISTRIBUTION_SCHEMA
         sigma_migrated = True
+    else:
+        sigma_migrated = migrate_scalar_log_sigma_state(
+            state_dict, wrapper.transition
+        )
     mean_weight_key = "transition.mean_head.weight"
     mean_bias_key = "transition.mean_head.bias"
     mean_gain_key = "transition.mean_head.output_gain"
@@ -545,13 +683,31 @@ class LatentThoughtModel(nn.Module):
     logits read the raw belief, not the projected thought mean.
     """
 
-    def __init__(self, backbone: nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        *,
+        thought_adapter: str = "orthogonal_silu",
+        sigma_state_init: str = "orthogonal",
+    ):
         super().__init__()
         self.backbone = backbone
         model_dim = backbone.tok_emb.embedding_dim
-        self.transition = GaussianTransitionHead(model_dim)
+        self.thought_adapter_kind = thought_adapter
+        self.thought_input_schema = thought_input_schema_for_adapter(
+            thought_adapter
+        )
+        if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
+            raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
+        self.sigma_state_init = sigma_state_init
+        self.sigma_state_init_schema = SIGMA_STATE_INIT_SCHEMAS[
+            sigma_state_init
+        ]
+        self.transition = GaussianTransitionHead(
+            model_dim, sigma_state_init=sigma_state_init
+        )
         self.gate = ThinkEmitGate(model_dim)
-        self.adapter = ThoughtAdapter(model_dim)
+        self.adapter = ThoughtAdapter(model_dim, kind=thought_adapter)
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.backbone.embed_tokens(token_ids)

@@ -3,7 +3,7 @@
 A fresh trunk (same architecture class as the policy backbone, random init,
 fully trainable) that reads the identical rollout stream — prompt and emitted
 tokens through its own embeddings, thought latents through its own
-identity-initialized affine embedder — and predicts value alone.  No SIGReg,
+orthogonal affine embedder — and predicts value alone.  No SIGReg,
 no next-latent
 prediction, no shared parameters with the policy: its only loss is HL-Gauss
 cross-entropy on [0, 1] value targets (cleanrl iterthink v215 critic recipe:
@@ -23,7 +23,11 @@ from torch import Tensor, nn
 
 from postraining.hl_gauss import HLGaussSupport
 from postraining.latent_rollout import PAD_SLOT, THOUGHT_SLOT, LatentRolloutBatch
-from postraining.latent_thought import AffineThoughtAdapter
+from postraining.latent_thought import (
+    CRITIC_ADAPTER_INIT_KINDS,
+    CRITIC_ADAPTER_INIT_SCHEMAS,
+    AffineThoughtAdapter,
+)
 
 
 class SeparateCritic(nn.Module):
@@ -35,13 +39,18 @@ class SeparateCritic(nn.Module):
         v_min: float = 0.0,
         v_max: float = 1.0,
         prior_value: float = 0.0,
+        adapter_init: str = "orthogonal",
     ):
         super().__init__()
+        if adapter_init not in CRITIC_ADAPTER_INIT_KINDS:
+            raise ValueError(f"unknown critic adapter init {adapter_init!r}")
         model_dim = trunk.tok_emb.embedding_dim
         self.trunk = trunk
-        # Policy and critic use the same identity-initialized affine
-        # architecture, but own separate weights throughout training.
-        self.adapter = AffineThoughtAdapter(model_dim)
+        self.adapter_init = adapter_init
+        self.adapter_init_schema = CRITIC_ADAPTER_INIT_SCHEMAS[adapter_init]
+        self.adapter = AffineThoughtAdapter(
+            model_dim, initialization=adapter_init
+        )
         self.support = HLGaussSupport(num_bins, v_min, v_max, sigma_ratio)
         self.head = nn.Linear(model_dim, num_bins)
         with torch.no_grad():

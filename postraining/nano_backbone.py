@@ -13,7 +13,7 @@ Conventions chosen for the latent-thought family:
 
 - ``embed_tokens(ids) = norm1(embed(ids))``: the input norm belongs to the
   TOKEN path, mirroring fresh_lejepa's rms-normed ``tok_emb``. Injected
-  thoughts (identity-init adapter) and PAD zeros bypass ``norm1`` so the
+  thoughts (after their policy/critic adapter) and PAD zeros bypass ``norm1`` so the
   continuous thought coordinates reach the block stack unchanged.
   ``temporal_belief_from_token_latent`` starts at the block loop, and
   ``embed_tokens`` composed with it reproduces the pretraining forward exactly.

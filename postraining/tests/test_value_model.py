@@ -135,6 +135,25 @@ def test_thoughts_reach_the_critic_through_its_own_adapter():
     assert not torch.equal(baseline_values, perturbed_values)
 
 
+def test_critic_adapter_starts_orthogonal_and_norm_preserving():
+    critic = _critic()
+    weight = critic.adapter.projection.weight.detach()
+    torch.testing.assert_close(
+        weight @ weight.T,
+        torch.eye(weight.shape[0]),
+        rtol=1e-5,
+        atol=5e-7,
+    )
+    assert torch.count_nonzero(critic.adapter.projection.bias) == 0
+    thoughts = torch.randn(16, weight.shape[0])
+    torch.testing.assert_close(
+        critic.adapter(thoughts).norm(dim=-1),
+        thoughts.norm(dim=-1),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 def test_critic_dense_masked_inputs_match_compact_routing():
     critic = _critic()
     batch = _batch()
