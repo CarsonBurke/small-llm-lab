@@ -451,8 +451,18 @@ def generalized_advantage_and_return_targets(
     next_valids = torch.cat(
         (mask[:, 1:], torch.zeros_like(mask[:, :1])), dim=1
     )
-    deltas = rewards + gamma * next_values * next_valids - values
-    gamma_lambdas = gamma * lambdas
+    # The trainer uses undiscounted episodic returns (gamma=1). Leaving the
+    # identity multiply in the eager reverse scan launches one pointwise CUDA
+    # kernel per stream column, at the deepest point of the update queue.
+    # Skipping multiplication by exactly one is bit-exact for IEEE tensors;
+    # keep the general discounted path for callers that choose another gamma.
+    if gamma == 1.0:
+        discounted_next_values = next_values
+        gamma_lambdas = lambdas
+    else:
+        discounted_next_values = gamma * next_values
+        gamma_lambdas = gamma * lambdas
+    deltas = rewards + discounted_next_values * next_valids - values
     running_advantage = torch.zeros(
         values.size(0), device=values.device, dtype=values.dtype
     )
@@ -465,8 +475,11 @@ def generalized_advantage_and_return_targets(
         running_advantage = (
             delta + gamma_lambdas * running_advantage * next_valid
         ) * mask[:, t]
+        discounted_running_return = (
+            running_return if gamma == 1.0 else gamma * running_return
+        )
         running_return = (
-            delta + gamma * running_return * next_valid
+            delta + discounted_running_return * next_valid
         ) * mask[:, t]
         advantage_columns.append(running_advantage)
         return_columns.append(running_return)
