@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 CAPTURE_PROBLEMS = 4
 CAPTURE_SAMPLES_PER_PROBLEM = 4
 CAPTURE_ATTEMPTS = CAPTURE_PROBLEMS * CAPTURE_SAMPLES_PER_PROBLEM
-BENCHMARK_ANSWER_SCHEMA = "latent_benchmark_answers/v1"
+BENCHMARK_ANSWER_SCHEMA = "latent_stop_thinking_answers/v2"
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -85,7 +85,9 @@ def _render_attempt(attempt: Mapping[str, Any]) -> str:
         return html.escape(str(value), quote=True)
 
     state = "correct" if attempt["correct"] else "incorrect"
-    forced = "forced initial THINK" if attempt["forced_initial_think"] else "unforced"
+    thinking = (
+        f"{int(attempt['continued_thought_count'])} continued thoughts"
+    )
     terminated = "terminated" if attempt["terminated"] else "unterminated"
     runs = attempt["think_run_lengths"] or []
     run_text = ", ".join(str(length) for length in runs) if runs else "none"
@@ -95,14 +97,14 @@ def _render_attempt(attempt: Mapping[str, Any]) -> str:
           <h3>Sample {int(attempt['sample_index']) + 1}</h3>
           <div class="badges">
             <span class="badge {state}">{state}</span>
-            <span class="badge">{esc(forced)}</span>
+            <span class="badge">{esc(thinking)}</span>
             <span class="badge">{esc(terminated)}</span>
           </div>
         </header>
         <dl class="stats">
           <div><dt>Parsed answer</dt><dd>{esc(attempt['parsed_answer'])}</dd></div>
           <div><dt>Grader</dt><dd>{esc(attempt['answer_style'])}</dd></div>
-          <div><dt>Thoughts</dt><dd>{int(attempt['optional_thought_count'])} optional / {int(attempt['total_thought_count'])} total</dd></div>
+          <div><dt>Thoughts</dt><dd>{int(attempt['continued_thought_count'])} continued / {int(attempt['total_thought_count'])} total</dd></div>
           <div><dt>Think runs</dt><dd>{esc(run_text)}</dd></div>
           <div><dt>Emitted tokens</dt><dd>{int(attempt['emitted_token_count'])}</dd></div>
         </dl>
@@ -212,10 +214,9 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
   </header>
   <section class="summary" aria-label="Benchmark summary">
     <div><span>All-rollout accuracy</span><strong>{_percent(metrics['accuracy'])}</strong></div>
-    <div><span>Native policy accuracy</span><strong>{_percent(metrics.get('policy_accuracy', metrics['unforced_initial_accuracy']))}</strong></div>
-    <div><span>Forced accuracy</span><strong>{_percent(metrics['forced_initial_accuracy'])}</strong></div>
-    <div><span>Unforced accuracy</span><strong>{_percent(metrics['unforced_initial_accuracy'])}</strong></div>
-    <div><span>Optional think fraction</span><strong>{_percent(metrics['think_fraction'])}</strong></div>
+    <div><span>Policy accuracy</span><strong>{_percent(metrics['policy_accuracy'])}</strong></div>
+    <div><span>Continue-thinking fraction</span><strong>{_percent(metrics['continue_thinking_fraction'])}</strong></div>
+    <div><span>Stopped-thinking trajectories</span><strong>{_percent(metrics.get('stopped_thinking_trajectory_fraction', 0.0))}</strong></div>
     <div><span>Prompts solved at least once</span><strong>{_percent(metrics.get('prompt_any_correct_fraction', 0.0))}</strong></div>
     <div><span>Mixed-reward prompt groups</span><strong>{_percent(metrics.get('prompt_mixed_reward_fraction', 0.0))}</strong></div>
     <div><span>Mean within-group reward std</span><strong>{float(metrics.get('within_group_reward_std', 0.0)):.4f}</strong></div>
@@ -291,6 +292,12 @@ def sample_json_to_report_payload(
         raise ValueError("samples_per_problem must be a positive integer")
     else:
         samples_per_problem = declared_samples
+    sampled_metrics = sampled.get("metrics")
+    pin_emit = bool(
+        sampled_metrics.get("pin_emit", False)
+        if isinstance(sampled_metrics, Mapping)
+        else False
+    )
     attempts: list[dict[str, Any]] = []
     for problem_index, record in enumerate(records):
         samples = record.get("samples")
@@ -304,8 +311,17 @@ def sample_json_to_report_payload(
             )
         for sample_index, sample in enumerate(samples):
             trace = str(sample["trace"]).upper()
-            forced = bool(sample["forced_initial_think"])
             total_thoughts = int(sample["thinks"])
+            continued_thoughts = (
+                0
+                if pin_emit
+                else int(
+                    sample.get(
+                        "continued_thought_count",
+                        max(0, total_thoughts - 1),
+                    )
+                )
+            )
             attempts.append(
                 {
                     "problem_index": problem_index,
@@ -322,14 +338,10 @@ def sample_json_to_report_payload(
                     "terminated": bool(sample["terminated"]),
                     "termination_token_id": None,
                     "emitted_token_count": int(sample["emits"]),
-                    "forced_initial_think": forced,
-                    "forced_thought_count": int(forced),
-                    "optional_thought_count": int(
-                        sample.get(
-                            "optional_thought_count",
-                            total_thoughts - int(forced),
-                        )
+                    "initial_thought_count": (
+                        0 if pin_emit else min(total_thoughts, 1)
                     ),
+                    "continued_thought_count": continued_thoughts,
                     "total_thought_count": total_thoughts,
                     "think_run_lengths": list(sample["think_run_lengths"]),
                     "action_trace": trace,
@@ -337,40 +349,35 @@ def sample_json_to_report_payload(
             )
 
     total = len(attempts)
-    forced_attempts = [
-        attempt for attempt in attempts if attempt["forced_initial_think"]
-    ]
-    unforced_attempts = [
-        attempt for attempt in attempts if not attempt["forced_initial_think"]
-    ]
-    optional_thoughts = sum(
-        int(attempt["optional_thought_count"]) for attempt in attempts
+    continued_thoughts = sum(
+        int(attempt["continued_thought_count"]) for attempt in attempts
     )
-    optional_gate_actions = optional_thoughts + sum(
-        int(attempt["emitted_token_count"]) for attempt in attempts
+    stopped_trajectories = (
+        0
+        if pin_emit
+        else sum("E" in str(attempt["action_trace"]) for attempt in attempts)
     )
+    stop_decisions = continued_thoughts + stopped_trajectories
     metrics = {
         "evaluation_metric_schema": (
-            "native_policy_plus_forced_intervention/v1"
+            "forced_initial_one_way_stop_policy/v2"
         ),
         "accuracy": sum(int(attempt["correct"]) for attempt in attempts) / total,
-        "interventional_accuracy": (
-            sum(int(attempt["correct"]) for attempt in attempts) / total
-        ),
         "policy_accuracy": sum(
-            int(attempt["correct"]) for attempt in unforced_attempts
+            int(attempt["correct"]) for attempt in attempts
         )
-        / max(len(unforced_attempts), 1),
-        "policy_samples": len(unforced_attempts),
-        "forced_initial_accuracy": sum(
-            int(attempt["correct"]) for attempt in forced_attempts
-        )
-        / max(len(forced_attempts), 1),
-        "unforced_initial_accuracy": sum(
-            int(attempt["correct"]) for attempt in unforced_attempts
-        )
-        / max(len(unforced_attempts), 1),
-        "think_fraction": optional_thoughts / max(optional_gate_actions, 1),
+        / total,
+        "policy_samples": total,
+        "continue_thinking_fraction": (
+            continued_thoughts / max(stop_decisions, 1)
+        ),
+        "stop_thinking_fraction": (
+            stopped_trajectories / max(stop_decisions, 1)
+        ),
+        "stopped_thinking_trajectory_fraction": (
+            stopped_trajectories / total
+        ),
+        "pin_emit": pin_emit,
         "samples": total,
     }
     return {

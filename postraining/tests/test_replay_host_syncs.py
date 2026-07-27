@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from postraining.latent_rollout import (
+    build_replay_plan,
     compact_slots,
     iter_length_aware_microbatches,
     plan_length_aware_shards,
@@ -33,7 +34,8 @@ from postraining.latent_rollout import (
     scatter_slots,
     slot_index,
 )
-from postraining.train_latent_vapo import SyncDetector, update_minibatch
+from postraining.runtime.profiling import SyncDetector
+from postraining.train_latent_vapo import update_minibatch
 
 from postraining.tests.test_latent_rollout import (  # noqa: E402
     _bf16_wrapper,
@@ -171,12 +173,12 @@ def test_refresh_syncs_do_not_scale_past_two_per_shard():
     assert len(measured) == 2, measured
     few, many = sorted(measured)
     slope = (measured[many] - measured[few]) / (many - few)
-    # Two nonzero calls per shard, one for the EMIT slots and one for the
-    # THINK slots. Before the index rewrite this slope was above ten.
-    assert slope <= 3.0, measured
+    # The fallback takes one batch-level metadata snapshot; shard count no
+    # longer adds any data-dependent host round-trips.
+    assert slope <= 1.0, measured
 
 
-def test_only_the_index_derivation_blocks_inside_the_replay_tail():
+def test_only_the_fallback_metadata_snapshot_blocks_before_replay():
     wrapper = _bf16_wrapper()
     critic = _critic()
     batch, wrapper, critic = _cuda_batch(wrapper, critic, rows=6)
@@ -187,11 +189,35 @@ def test_only_the_index_derivation_blocks_inside_the_replay_tail():
             wrapper, critic, batch, max_trajectories=2
         ),
     )
-    allowed = _source_lines(slot_index, "nonzero(") | _source_lines(
-        plan_length_aware_shards, 'device="cpu"'
-    )
-    assert len(allowed) == 2, allowed
+    allowed = _source_lines(build_replay_plan, 'to("cpu")')
+    assert len(allowed) == 1, allowed
     assert _rollout_sync_lines(sites) <= allowed, (sites, allowed)
+
+
+def test_cpu_built_replay_plan_removes_replay_tail_host_syncs():
+    wrapper = _bf16_wrapper()
+    critic = _critic()
+    host_batch = _rollout(
+        wrapper, batch=6, prompt=5, new_tokens=4, seed=23
+    )
+    assign_terminal_rewards(host_batch, torch.rand(6))
+    plan = build_replay_plan(host_batch, 2, 1 << 22)
+    batch = host_batch.to(torch.device("cuda"))
+    plan = plan.to(torch.device("cuda"))
+    wrapper = wrapper.cuda()
+    critic = critic.cuda()
+    detector = _detector()
+    _, sites = _count_syncs(
+        detector,
+        lambda: refresh_old_statistics(
+            wrapper,
+            critic,
+            batch,
+            max_trajectories=2,
+            replay_plan=plan,
+        ),
+    )
+    assert not _rollout_sync_lines(sites), sites
 
 
 @pytest.mark.parametrize(
@@ -206,11 +232,25 @@ def test_the_age_zero_canary_holds_on_cuda(clip_mode, reverse_kl):
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
         wrapper.gate.head.weight.normal_(std=0.02)
-    batch, wrapper, critic = _cuda_batch(wrapper, critic, rows=6)
+    host_batch = _rollout(
+        wrapper, batch=6, prompt=5, new_tokens=4, seed=7
+    )
+    assign_terminal_rewards(host_batch, torch.rand(6))
+    replay_plan = build_replay_plan(host_batch, 2, 1 << 22)
+    batch = host_batch.to(torch.device("cuda"))
+    replay_plan = replay_plan.to(torch.device("cuda"))
+    wrapper = wrapper.cuda()
+    critic = critic.cuda()
     # More than one shard, so the shared planner and the per-shard indices
     # are both exercised.
     assert len(plan_length_aware_shards(batch, 2, 1 << 22)) > 1
-    refresh_old_statistics(wrapper, critic, batch, max_trajectories=2)
+    refresh_old_statistics(
+        wrapper,
+        critic,
+        batch,
+        max_trajectories=2,
+        replay_plan=replay_plan,
+    )
     metrics = update_minibatch(
         wrapper,
         critic,
@@ -219,6 +259,7 @@ def test_the_age_zero_canary_holds_on_cuda(clip_mode, reverse_kl):
         replay_max_trajectories=2,
         thought_clip_mode=clip_mode,
         thought_reverse_kl_coef=reverse_kl,
+        replay_plan=replay_plan,
     )
     assert metrics["policy_clip_fraction"] == 0.0
     assert metrics["gate_behavior_kl"] == 0.0
@@ -263,7 +304,7 @@ def test_update_syncs_do_not_scale_past_two_per_shard():
     assert len(measured) == 2, measured
     few, many = sorted(measured)
     slope = (measured[many] - measured[few]) / (many - few)
-    assert slope <= 3.0, measured
+    assert slope <= 1.0, measured
 
 
 def test_the_planner_uploads_shard_rows_without_blocking():

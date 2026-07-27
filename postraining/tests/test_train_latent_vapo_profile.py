@@ -9,7 +9,7 @@ import time
 import pytest
 import torch
 
-from postraining.train_latent_vapo import (
+from postraining.runtime.profiling import (
     DEVICE_SAMPLE_FIELDS,
     INERT_PHASE,
     PROFILE_SCHEMA,
@@ -17,14 +17,13 @@ from postraining.train_latent_vapo import (
     DisabledProfiler,
     RunProfiler,
     SyncDetector,
-    build_arg_parser,
     compilation_record,
     format_compile_split,
     device_timed,
     elapsed_seconds,
     format_profile_summary,
-    validate_args,
 )
+from postraining.vapo.config import build_arg_parser, validate_args
 
 
 def _profile_args(**overrides) -> argparse.Namespace:

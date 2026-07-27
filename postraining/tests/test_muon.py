@@ -16,10 +16,10 @@ from postraining.nano_backbone import NanoGPTBackbone
 from postraining.train_latent_vapo import (
     build_optimizers,
     renderer_parameters,
-    optimizer_schema_for_trunk_optimizer,
     step_optimizers,
     zero_optimizers,
 )
+from postraining.vapo.schemas import optimizer_schema_for_trunk_optimizer
 from postraining.value_model import SeparateCritic
 
 KWARGS = dict(vocab_size=64, num_layers=2, model_dim=256)
@@ -540,6 +540,7 @@ def test_build_optimizers_muon_layout_partitions_exactly():
         wrapper,
         critic,
         learning_rate=1e-3,
+        critic_learning_rate=4e-3,
         trunk_optimizer="muon",
         muon_learning_rate=2e-3,
         critic_muon_learning_rate=3e-3,
@@ -550,6 +551,12 @@ def test_build_optimizers_muon_layout_partitions_exactly():
     assert isinstance(optimizers["critic_muon"], Muon)
     assert optimizers["actor_muon"].param_groups[0]["lr"] == 2e-3
     assert optimizers["critic_muon"].param_groups[0]["lr"] == 3e-3
+    assert {
+        group["lr"] for group in optimizers["actor"].param_groups
+    } == {1e-3}
+    assert {
+        group["lr"] for group in optimizers["critic"].param_groups
+    } == {4e-3}
 
     backbone = wrapper.backbone
     expected_actor_muon = {

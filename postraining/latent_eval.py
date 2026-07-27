@@ -18,14 +18,13 @@ from postraining.latent_rollout import (
     TOKEN_SLOT,
     emitted_token_and_kind_rows,
     emitted_token_rows,
-    half_forced_group_members,
     rollout_continuations,
     trim_stream,
 )
-from postraining.latent_thought import THINK, LatentThoughtModel
+from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
-LATENT_EVAL_METRIC_SCHEMA = "native_policy_plus_forced_intervention/v1"
+LATENT_EVAL_METRIC_SCHEMA = "forced_initial_one_way_stop_policy/v2"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
@@ -82,8 +81,7 @@ def evaluate_latent_math(
     """Batched verifier evaluation through the latent policy itself.
 
     ``pin_emit`` evaluates a pinned-EMIT (cot/none reasoning mode) policy:
-    no gate or thought is ever sampled and the 50/50 forced-THINK split is
-    inert (every row is unforced). ``prompt_suffix_ids`` are teacher-forced
+    no gate or thought is ever sampled. ``prompt_suffix_ids`` are teacher-forced
     onto the END of every truncated prompt (the none-mode ``Answer:`` prefix)
     and rejoin the decoded solution before verification.
 
@@ -117,8 +115,8 @@ def evaluate_latent_math(
     [0, 999]).  Rows tagged with an ``extra_info.module`` additionally get a
     per-module accuracy breakdown so aggregate movement can be attributed.
     """
-    if samples < 2 or samples % 2:
-        raise ValueError("samples must be even for the 50/50 forced split")
+    if samples < 1:
+        raise ValueError("samples must be positive")
     if chunk < 1:
         raise ValueError("chunk must be positive")
     if prompt_suffix_ids and len(prompt_suffix_ids) >= prompt_tokens:
@@ -164,15 +162,14 @@ def evaluate_latent_math(
         )
     correct = 0
     total = 0
-    forced_correct = 0
-    forced_total = 0
-    unforced_correct = 0
-    unforced_total = 0
     prompt_correct = [0] * len(rows)
     module_correct: dict[str, int] = {}
     module_total: dict[str, int] = {}
-    think_actions = torch.zeros((), dtype=torch.float32, device=device)
-    actions = torch.zeros((), dtype=torch.float32, device=device)
+    continue_actions = torch.zeros((), dtype=torch.float32, device=device)
+    stop_decisions = torch.zeros((), dtype=torch.float32, device=device)
+    stopped_trajectories = torch.zeros(
+        (), dtype=torch.float32, device=device
+    )
     emitted_counts: list[int] = []
     stream_action_counts: list[int] = []
     recurrent_steps_per_rollout: list[int] = []
@@ -206,11 +203,6 @@ def evaluate_latent_math(
         # Stable length bucketing minimizes left-padding and cache work while
         # preserving a deterministic evaluation order for a fixed dataset.
         encoded_rows.sort(key=lambda item: len(item[0]))
-        force_members = (
-            torch.zeros(samples, dtype=torch.bool, device=device)
-            if pin_emit
-            else half_forced_group_members(1, samples, device)
-        )
         member_start = 0
         while member_start < samples:
             width = min(chunk, batch_trajectories, samples - member_start)
@@ -235,9 +227,6 @@ def evaluate_latent_math(
                     )
                     prompt_ids[group, -len(prompt) :] = prompt_tensor
                     prompt_lengths[group] = len(prompt)
-                force_chunk = force_members[
-                    member_start : member_start + width
-                ].repeat(len(row_chunk))
                 with torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,
@@ -249,7 +238,6 @@ def evaluate_latent_math(
                             max_new_tokens, max_stream_steps, temperature, top_p,
                             stop_ids=stop_ids or None,
                             prompt_lengths=prompt_lengths,
-                            force_initial_think=force_chunk,
                             tensor_positions=compiled_step_core is not None,
                             replay_storage=False,
                             record_likelihoods=False,
@@ -283,13 +271,19 @@ def evaluate_latent_math(
                     int(count)
                     for count in batch.action_mask.sum(-1).cpu().tolist()
                 )
-                think_actions += (
+                continue_actions += (
                     (
-                        (batch.gate_actions == THINK).float()
-                        * batch.gate_mask
+                        (batch.actions == THINK).float()
+                        * batch.stop_mask
                     ).sum()
                 )
-                actions += batch.gate_mask.sum()
+                stop_decisions += batch.stop_mask.sum()
+                stopped_trajectories += (
+                    ((batch.actions == EMIT) & batch.stop_mask.bool())
+                    .any(-1)
+                    .float()
+                    .sum()
+                )
                 capture_kinds: dict[int, list[int]] = {}
                 capture_members: list[int] = []
                 if (
@@ -334,11 +328,6 @@ def evaluate_latent_math(
                         )
                         module_total[module] = module_total.get(module, 0) + 1
                     member = member_start + flat_member % width
-                    forced = member % 2 == 0 and not pin_emit
-                    forced_correct += int(is_correct and forced)
-                    forced_total += int(forced)
-                    unforced_correct += int(is_correct and not forced)
-                    unforced_total += int(not forced)
                     original_index = row_chunk[group][2]
                     prompt_correct[original_index] += int(is_correct)
                     if (
@@ -391,10 +380,9 @@ def evaluate_latent_math(
                                     emitted[stop_cut] if stop_cut is not None else None
                                 ),
                                 "emitted_token_count": len(emitted),
-                                "forced_initial_think": forced,
-                                "forced_thought_count": int(forced),
-                                "optional_thought_count": (
-                                    total_thoughts - int(forced)
+                                "initial_thought_count": int(not pin_emit),
+                                "continued_thought_count": (
+                                    total_thoughts - int(not pin_emit)
                                 ),
                                 "total_thought_count": total_thoughts,
                                 "think_run_lengths": runs,
@@ -474,20 +462,12 @@ def evaluate_latent_math(
             f"{prefix}_max": ordered[-1],
         }
 
-    policy_accuracy = (
-        correct / max(total, 1)
-        if pin_emit
-        else unforced_correct / max(unforced_total, 1)
-    )
+    policy_accuracy = correct / max(total, 1)
     metrics: dict[str, object] = {
         "evaluation_metric_schema": LATENT_EVAL_METRIC_SCHEMA,
-        # Preserve the historical all-attempt metric and its denominator. The
-        # deployed latent policy's unforced-only score is explicit so resumed
-        # JSONL/TensorBoard series never silently change meaning.
         "accuracy": correct / max(total, 1),
         "policy_accuracy": policy_accuracy,
-        "interventional_accuracy": correct / max(total, 1),
-        "policy_samples": total if pin_emit else unforced_total,
+        "policy_samples": total,
         "samples": total,
         "prompt_groups": len(prompt_correct),
         "prompt_any_correct_fraction": sum(
@@ -506,10 +486,15 @@ def evaluate_latent_math(
             math.sqrt((count / samples) * (1.0 - count / samples))
             for count in prompt_correct
         ) / max(len(prompt_correct), 1),
-        "think_fraction": float(think_actions / actions.clamp_min(1.0)),
-        "forced_initial_accuracy": forced_correct / max(forced_total, 1),
-        "unforced_initial_accuracy": unforced_correct / max(unforced_total, 1),
-        "forced_initial_fraction": forced_total / max(total, 1),
+        "continue_thinking_fraction": float(
+            continue_actions / stop_decisions.clamp_min(1.0)
+        ),
+        "stop_thinking_fraction": float(
+            stopped_trajectories / stop_decisions.clamp_min(1.0)
+        ),
+        "stopped_thinking_trajectory_fraction": float(
+            stopped_trajectories / max(total, 1)
+        ),
         "ended_fraction": terminated_total / max(total, 1),
         **summarize(emitted_counts, "emitted_tokens"),
         **summarize(stream_action_counts, "stream_actions"),

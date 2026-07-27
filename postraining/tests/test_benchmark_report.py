@@ -14,7 +14,6 @@ from postraining.benchmark_report import (
 
 
 def _attempt(problem: int, sample: int) -> dict[str, object]:
-    forced = sample % 2 == 0
     return {
         "problem_index": problem,
         "dataset_index": f"dataset-{problem}",
@@ -28,12 +27,11 @@ def _attempt(problem: int, sample: int) -> dict[str, object]:
         "terminated": sample != 3,
         "termination_token_id": 2 if sample != 3 else None,
         "emitted_token_count": 8,
-        "forced_initial_think": forced,
-        "forced_thought_count": int(forced),
-        "optional_thought_count": 2,
-        "total_thought_count": 2 + int(forced),
-        "think_run_lengths": [1, 1] if not forced else [1, 2],
-        "action_trace": "TETEE" if not forced else "TETTE",
+        "initial_thought_count": 1,
+        "continued_thought_count": 2,
+        "total_thought_count": 3,
+        "think_run_lengths": [3],
+        "action_trace": "TTTEEEEEEEE",
     }
 
 
@@ -44,9 +42,9 @@ def _payload() -> dict[str, object]:
         "reward_schema": "test_reward/v1",
         "metrics": {
             "accuracy": 0.25,
-            "forced_initial_accuracy": 0.125,
-            "unforced_initial_accuracy": 0.375,
-            "think_fraction": 0.2,
+            "policy_accuracy": 0.25,
+            "continue_thinking_fraction": 0.2,
+            "stopped_thinking_trajectory_fraction": 0.75,
             "prompt_any_correct_fraction": 0.5,
             "prompt_mixed_reward_fraction": 0.125,
             "within_group_reward_std": 0.03125,
@@ -69,7 +67,7 @@ def test_render_benchmark_report_is_self_contained_and_escapes_model_text():
 
     assert "What the model answered" in report
     assert "All-rollout accuracy</span><strong>25.00%" in report
-    assert "Native policy accuracy</span><strong>37.50%" in report
+    assert "Policy accuracy</span><strong>25.00%" in report
     assert "Prompts solved at least once</span><strong>50.00%" in report
     assert "Mixed-reward prompt groups</span><strong>12.50%" in report
     assert "Mean within-group reward std</span><strong>0.0312" in report
@@ -128,15 +126,16 @@ def _sample_json() -> dict[str, object]:
                     {
                         "text": f"work {sample}\nAnswer: {problem}</s>",
                         "emitted_text": f"work\nAnswer: {problem}",
-                        "trace": "tEE" if sample % 2 == 0 else "EtE",
-                        "thinks": 1,
+                        "trace": "tEE" if sample % 2 == 0 else "ttEE",
+                        "thinks": 1 if sample % 2 == 0 else 2,
                         "emits": 2,
                         "correct": sample == 0,
                         "prediction": str(problem),
                         "terminated": sample != 3,
-                        "forced_initial_think": sample % 2 == 0,
-                        "optional_thought_count": 0 if sample % 2 == 0 else 1,
-                        "think_run_lengths": [1],
+                        "continued_thought_count": 0 if sample % 2 == 0 else 1,
+                        "think_run_lengths": (
+                            [1] if sample % 2 == 0 else [2]
+                        ),
                     }
                     for sample in range(4)
                 ],
@@ -153,12 +152,9 @@ def test_sample_json_converter_preserves_exact_panel_and_computes_metrics(tmp_pa
     assert payload["step"] == 158
     assert payload["attempts"][0]["answer_style"] == "exact"
     assert payload["metrics"]["accuracy"] == 0.25
-    assert payload["metrics"]["interventional_accuracy"] == 0.25
-    assert payload["metrics"]["policy_accuracy"] == 0.0
-    assert payload["metrics"]["policy_samples"] == 8
-    assert payload["metrics"]["forced_initial_accuracy"] == 0.5
-    assert payload["metrics"]["unforced_initial_accuracy"] == 0.0
-    assert payload["metrics"]["think_fraction"] == 8 / 40
+    assert payload["metrics"]["policy_accuracy"] == 0.25
+    assert payload["metrics"]["policy_samples"] == 16
+    assert payload["metrics"]["continue_thinking_fraction"] == 8 / 24
     assert payload["attempts"][0]["action_trace"] == "TEE"
     assert payload["attempts"][-1]["dataset_index"] == 103
 
@@ -167,6 +163,28 @@ def test_sample_json_converter_preserves_exact_panel_and_computes_metrics(tmp_pa
     source.write_text(json.dumps(sampled))
     assert write_sample_json_report(source, output) == output
     assert "What the model answered" in output.read_text()
+
+
+def test_sample_json_converter_reports_no_stop_decisions_for_pinned_emit():
+    sampled = _sample_json()
+    sampled["metrics"] = {"pin_emit": True}
+    for record in sampled["records"]:
+        for sample in record["samples"]:
+            sample["trace"] = "EE"
+            sample["thinks"] = 0
+            sample["continued_thought_count"] = 0
+            sample["think_run_lengths"] = []
+
+    payload = sample_json_to_report_payload(sampled)
+
+    assert payload["metrics"]["pin_emit"] is True
+    assert payload["metrics"]["continue_thinking_fraction"] == 0.0
+    assert payload["metrics"]["stop_thinking_fraction"] == 0.0
+    assert payload["metrics"]["stopped_thinking_trajectory_fraction"] == 0.0
+    assert all(
+        attempt["initial_thought_count"] == 0
+        for attempt in payload["attempts"]
+    )
 
 
 def test_sample_json_converter_supports_full_rectangular_evaluations():

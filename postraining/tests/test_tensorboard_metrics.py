@@ -6,7 +6,7 @@ import torch
 from postraining.train_latent_vapo import (
     aggregate_actor_tensorboard_metrics,
     aggregate_value_diagnostics,
-    actor_minibatch_denominators,
+    actor_minibatch_action_denominator,
     optimizer_minibatch_orders,
     plan_one_pass_training,
     rollout_tensorboard_metrics,
@@ -84,20 +84,18 @@ def test_one_pass_plan_consumes_all_dapo_rows_once_including_tail() -> None:
         )
 
 
-def test_actor_denominators_cover_only_selected_groups() -> None:
+def test_actor_denominator_covers_only_selected_groups() -> None:
     class Group:
         def __init__(self, actions):
             self.action_mask = torch.tensor(actions, dtype=torch.float32)
-            self.gate_mask = torch.tensor(actions, dtype=torch.float32)
+            self.stop_mask = torch.tensor(actions, dtype=torch.float32)
 
     groups = [
         Group([[1, 1], [1, 0]]),
         Group([[1, 1]]),
         Group([[1, 1]]),
     ]
-    actions, gate_actions = actor_minibatch_denominators(groups, [0, 2])
-    assert actions == 5
-    assert gate_actions == 5
+    assert actor_minibatch_action_denominator(groups, [0, 2]) == 5
 
 
 def _actor_metrics(**overrides: float) -> dict[str, float]:
@@ -127,11 +125,18 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "thought_pg_coef": 1.0,
         "thought_reverse_kl_coef": 0.3,
         "gate_entropy_coef": 0.5,
-        "emit_probability": 0.8,
+        "stop_probability": 0.8,
+        "behavior_stop_probability": 0.82,
+        "stop_probability_delta": -0.02,
+        "stop_probability_abs_delta": 0.02,
+        "stop_probability_abs_delta_max": 0.03,
         "thought_adapter_weight_rms": 1e-4,
         "thought_adapter_bias_rms": 2e-4,
         "gate_entropy": 0.5,
         "gate_behavior_kl": 0.01,
+        "gate_behavior_kl_exact": 0.012,
+        "gate_abs_log_ratio_max": 0.1,
+        "gate_policy_clip_fraction": 0.2,
         "renderer_behavior_kl": 0.02,
         "thought_behavior_kl_joint": 0.03,
         "policy_behavior_kl_per_action": 0.04,
@@ -243,6 +248,30 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["loss/policy"] == pytest.approx(6.0)
     assert dashboard["kl/thought_reverse_weighted"] == pytest.approx(0.12)
     assert dashboard["kl/gate_behavior"] == pytest.approx(2.5)
+    assert dashboard["kl/gate_behavior_exact"] == pytest.approx(0.012)
+    assert dashboard[
+        "gate_same_state/behavior_continue_probability"
+    ] == pytest.approx(0.18)
+    assert dashboard[
+        "gate_same_state/current_continue_probability"
+    ] == pytest.approx(0.2)
+    assert dashboard[
+        "gate_same_state/continue_probability_delta"
+    ] == pytest.approx(0.02)
+    assert dashboard[
+        "gate_same_state/stop_probability_abs_delta"
+    ] == pytest.approx(0.02)
+    assert dashboard[
+        "gate_same_state/stop_probability_abs_delta_max"
+    ] == pytest.approx(0.03)
+    assert dashboard[
+        "bonus/gate_entropy_gate_decision_fraction"
+    ] == pytest.approx(0.2)
+    assert dashboard[
+        "bonus/gate_entropy_counterfactual_per_gate_amplification"
+    ] == pytest.approx(5.0)
+    assert dashboard["clip/gate_all"] == pytest.approx(0.2)
+    assert dashboard["ratio/gate_abs_log_max"] == pytest.approx(0.1)
     assert dashboard["grad/trunk"] == pytest.approx(20.0)
     assert dashboard["grad/critic"] == pytest.approx(21.0)
     assert dashboard["sigma/log_std_mean"] == pytest.approx(-2.0)
@@ -273,6 +302,22 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     )
 
 
+def test_gate_entropy_counterfactual_is_zero_without_gate_decisions():
+    metric = _actor_metrics(
+        gate_action_count=0.0,
+        gate_entropy=0.0,
+        gate_entropy_bonus=0.0,
+    )
+
+    dashboard = aggregate_actor_tensorboard_metrics([metric])
+
+    assert dashboard["bonus/gate_entropy_gate_decision_fraction"] == 0.0
+    assert (
+        dashboard["bonus/gate_entropy_counterfactual_per_gate_amplification"]
+        == 0.0
+    )
+
+
 def test_actor_dashboard_has_only_the_authoritative_joint_policy_loss() -> None:
     metrics = _actor_metrics()
     dashboard = aggregate_actor_tensorboard_metrics([metrics])
@@ -293,7 +338,7 @@ def test_actor_dashboard_ignores_empty_conditional_components() -> None:
         renderer_behavior_kl=999.0,
     )
     dashboard = aggregate_actor_tensorboard_metrics([metrics])
-    assert dashboard["advantage/optional_think_mean"] == 0.0
+    assert dashboard["advantage/continued_think_mean"] == 0.0
     assert dashboard["kl/renderer_behavior"] == 0.0
 
 
@@ -305,20 +350,20 @@ def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:
         "exact_accuracy": 0.05,
         "exact_within_group_reward_std": 0.1,
         "partial_reward_fraction": 0.6,
-        "reward_mean_forced_initial": 0.1,
-        "reward_mean_unforced_initial": 0.3,
+        "reward_mean_continued_thinking": 0.1,
+        "reward_mean_stopped_after_initial": 0.3,
         "ended_fraction": 0.8,
-        "think_fraction": 0.25,
+        "continue_thinking_fraction": 0.25,
+        "stopped_thinking_trajectory_fraction": 0.75,
         "thoughts_per_trajectory": 4.0,
         "emits_per_trajectory": 12.0,
         "actions_per_trajectory": 16.0,
         "think_run_p95": 2.0,
         "think_run_max": 3.0,
         "trajectories": 512,
-        "forced_initial_trajectory_fraction": 0.5,
     }
     dashboard = rollout_tensorboard_metrics(raw)
-    assert dashboard["reward/forced_initial_delta"] == pytest.approx(-0.2)
+    assert dashboard["reward/continued_thinking_mean"] == pytest.approx(0.1)
     assert "rollout/reward_std" not in dashboard
     assert "rollout/actions_per_trajectory" not in dashboard
     assert "rollout/trajectories" not in dashboard
@@ -328,11 +373,11 @@ def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:
         "reward/exact_accuracy",
         "reward/exact_within_group_std",
         "reward/partial_fraction",
-        "reward/forced_initial_mean",
-        "reward/unforced_initial_mean",
-        "reward/forced_initial_delta",
         "reward/ended_fraction",
-        "behavior/optional_think_fraction",
+        "reward/continued_thinking_mean",
+        "reward/stopped_after_initial_mean",
+        "behavior/continue_thinking_fraction",
+        "behavior/stopped_thinking_trajectory_fraction",
         "behavior/thoughts_per_trajectory",
         "behavior/emits_per_trajectory",
         "behavior/think_run_p95",

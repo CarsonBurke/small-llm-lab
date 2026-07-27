@@ -44,7 +44,6 @@ from postraining.latent_rollout import (
     TOKEN_SLOT,
     continuation_reward,
     emitted_token_and_kind_rows,
-    half_forced_group_members,
     rollout_continuations,
     trim_stream,
 )
@@ -194,12 +193,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--emit-only", action="store_true",
-        help="pin optional gate decisions to EMIT; exactly half of each "
-        "group still receives the forced initial latent thought",
+        help="evaluate the token-only policy with no gate or latent thoughts",
     )
     args = parser.parse_args()
-    if args.samples < 2 or args.samples % 2:
-        parser.error("--samples must be even for the 50/50 forced split")
+    if args.samples < 1:
+        parser.error("--samples must be positive")
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
     stream_steps = args.max_stream_steps or 4 * args.max_new_tokens
@@ -250,11 +248,7 @@ def main() -> None:
         print("policy: untrained heads over the pretraining checkpoint")
     wrapper.eval()
     if args.emit_only:
-        # Zero gate weight + saturated bias: EMIT with probability ~1.
-        with torch.no_grad():
-            wrapper.gate.head.weight.zero_()
-            wrapper.gate.head.bias.fill_(30.0)
-        print("gate pinned to EMIT except for the forced half of each group")
+        print("token-only policy: stop gate and latent thoughts bypassed")
 
     tokenizer = load_posttraining_tokenizer(
         backbone.architecture, FreshHyperparameters.tokenizer_path
@@ -280,12 +274,10 @@ def main() -> None:
                     wrapper, prompt_ids, args.continuation_tokens,
                     args.max_stream_steps or 4 * args.continuation_tokens,
                     args.temperature, args.top_p,
-                    force_initial_think=half_forced_group_members(
-                        args.fineweb, args.samples, device
-                    ),
                     replay_storage=False,
                     record_likelihoods=False,
                     cache_dtype=torch.bfloat16,
+                    pin_emit=args.emit_only,
                 )
             )
         emitted_rows, kind_rows = emitted_token_and_kind_rows(batch)
@@ -362,6 +354,7 @@ def main() -> None:
             capture_samples_per_problem=args.samples,
             temperature=args.temperature,
             top_p=args.top_p,
+            pin_emit=args.emit_only,
         )
 
         records = []
@@ -385,11 +378,8 @@ def main() -> None:
                         "correct": bool(attempt["correct"]),
                         "prediction": attempt["parsed_answer"],
                         "terminated": bool(attempt["terminated"]),
-                        "forced_initial_think": bool(
-                            attempt["forced_initial_think"]
-                        ),
-                        "optional_thought_count": int(
-                            attempt["optional_thought_count"]
+                        "continued_thought_count": int(
+                            attempt["continued_thought_count"]
                         ),
                         "think_run_lengths": list(attempt["think_run_lengths"]),
                     }
@@ -433,8 +423,6 @@ def main() -> None:
         print(
             f"sampled {len(records)} problems x {args.samples}: "
             f"policy_accuracy={metrics['policy_accuracy']:.4f}, "
-            f"interventional_accuracy="
-            f"{metrics['interventional_accuracy']:.4f}, "
             f"terminated={terminated:.4f}"
         )
         if args.json_out:
@@ -492,12 +480,10 @@ def main() -> None:
                 args.temperature,
                 args.top_p,
                 stop_ids=stop_ids or None,
-                force_initial_think=half_forced_group_members(
-                    1, args.samples, device
-                ),
                 replay_storage=False,
                 record_likelihoods=False,
                 cache_dtype=torch.bfloat16,
+                pin_emit=args.emit_only,
             )
         )
 

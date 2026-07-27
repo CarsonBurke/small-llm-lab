@@ -152,19 +152,11 @@ def test_pin_emit_rollout_invariants():
     # the pinned policy has no thought action to replay.
     assert batch.thoughts.size(-1) == 0
     assert batch.old_thought_logprobs.size(-1) == 0
-    assert float(batch.gate_mask.sum()) == 0.0
+    assert float(batch.stop_mask.sum()) == 0.0
     assert torch.equal(batch.emit_mask, batch.action_mask)
     action = batch.action_mask.bool()
-    assert bool((batch.gate_actions[action] == EMIT).all())
-    assert float(batch.old_gate_logprobs.abs().sum()) == 0.0
-
-
-def test_pin_emit_rejects_forced_think():
-    wrapper = _wrapper()
-    with pytest.raises(ValueError, match="pin_emit"):
-        _pinned_rollout(
-            wrapper, force_initial_think=torch.tensor([True, False])
-        )
+    assert bool((batch.actions[action] == EMIT).all())
+    assert float(batch.old_stop_logprobs.abs().sum()) == 0.0
 
 
 def test_pin_emit_nano_backbone_rollout():
@@ -236,7 +228,13 @@ def test_update_minibatch_rejects_unrefreshed_batches_in_both_modes():
     optimizers = build_optimizers(wrapper, critic, 1e-4, fused=False)
     for pin_emit in (True, False):
         torch.manual_seed(23)
-        batch = trim_stream(_pinned_rollout(wrapper, pin_emit=pin_emit))
+        batch = trim_stream(
+            _pinned_rollout(
+                wrapper,
+                pin_emit=pin_emit,
+                max_stream_steps=4 if pin_emit else 5,
+            )
+        )
         assert batch.statistics_refreshed is False
         with pytest.raises(RuntimeError, match="requires refresh"):
             update_minibatch(wrapper, critic, batch, optimizers)
@@ -279,11 +277,11 @@ def test_score_math_rollout_prepends_answer_prefix():
         kind=kind,
         token_ids=token_ids,
         thoughts=torch.zeros(1, stream, 0),
-        gate_actions=torch.full((1, stream), EMIT, dtype=torch.long),
+        actions=torch.full((1, stream), EMIT, dtype=torch.long),
         action_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
-        gate_mask=zeros.clone(),
+        stop_mask=zeros.clone(),
         emit_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
-        old_gate_logprobs=zeros.clone(),
+        old_stop_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
         old_thought_logprobs=torch.zeros(1, stream, 0),
         old_thought_means=torch.zeros(1, stream, 0),
@@ -341,7 +339,7 @@ def test_validate_renderer_checkpoint_rejects_mode_mismatch():
         )
 
 
-def test_rollout_diagnostics_pinned_reports_no_forced_or_think():
+def test_rollout_diagnostics_pinned_reports_no_thinking():
     wrapper = _wrapper()
     torch.manual_seed(19)
     batch = trim_stream(
@@ -352,9 +350,8 @@ def test_rollout_diagnostics_pinned_reports_no_forced_or_think():
         )
     )
     metrics = rollout_diagnostics(batch, samples_per_prompt=2)
-    assert metrics["think_fraction"] == 0.0
-    assert metrics["forced_initial_trajectory_fraction"] == 0.0
-    assert metrics["forced_initial_thinks_per_trajectory"] == 0.0
+    assert metrics["continue_thinking_fraction"] == 0.0
+    assert metrics["initial_thoughts_per_trajectory"] == 0.0
     assert metrics["thoughts_per_trajectory"] == 0.0
 
 
@@ -391,7 +388,6 @@ def test_evaluate_latent_math_pin_emit_with_prompt_suffix(monkeypatch):
             (
                 prompt_ids.clone(),
                 kwargs["pin_emit"],
-                kwargs["force_initial_think"].clone(),
             )
         )
         return original(wrapper_arg, prompt_ids, *args, **kwargs)
@@ -403,13 +399,12 @@ def test_evaluate_latent_math_pin_emit_with_prompt_suffix(monkeypatch):
         prompt_tokens=8, batch_trajectories=4,
         pin_emit=True, prompt_suffix_ids=(9, 9),
     )
-    assert metrics["think_fraction"] == 0.0
-    assert metrics["forced_initial_fraction"] == 0.0
+    assert metrics["continue_thinking_fraction"] == 0.0
+    assert metrics["stopped_thinking_trajectory_fraction"] == 0.0
     assert metrics["pin_emit"] is True
     assert len(seen) == 1
-    prompt_ids, pin_emit, forced = seen[0]
+    prompt_ids, pin_emit = seen[0]
     assert pin_emit is True
-    assert not bool(forced.any())
     # The teacher-forced suffix terminates every truncated prompt.
     assert prompt_ids[:, -2:].tolist() == [[9, 9], [9, 9]]
 

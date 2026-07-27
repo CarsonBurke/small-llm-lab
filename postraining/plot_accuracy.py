@@ -1,4 +1,4 @@
-"""Plot native-policy and forced-THINK interventional AIME accuracy."""
+"""Plot native stop-thinking-policy AIME accuracy."""
 
 from __future__ import annotations
 
@@ -34,12 +34,7 @@ def main() -> None:
             marker="o",
             label="Native policy",
         )
-    all_rollouts = [
-        item
-        for item in entries
-        if "policy_accuracy" not in item
-        or item.get("forced_initial_fraction", 0.0) > 0.0
-    ]
+    all_rollouts = [item for item in entries if "policy_accuracy" not in item]
     if all_rollouts:
         plt.plot(
             [item["step"] for item in all_rollouts],

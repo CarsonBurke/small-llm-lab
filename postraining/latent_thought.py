@@ -1,9 +1,10 @@
 """Latent-thought policy modules layered over the LeJEPA backbone.
 
-The backbone remains the sequence model.  At every stream position the model
-either EMITs a token (the pretrained closed loop: the sampled token is fed
-back through ``embed_tokens``) or THINKs (a latent sampled from the transition
-head is fed back directly; it occupies a stream position but renders nothing).
+The backbone remains the sequence model. Every latent-policy trajectory first
+consumes one mandatory latent thought. Thereafter a Bernoulli gate can continue
+thinking or stop. Stopping emits the first token and permanently switches the
+row to the pretrained token-only closed loop; the gate is masked out for every
+later token.
 
 The transition policy is a diagonal Gaussian whose mean comes from a fresh
 linear head over the belief and whose per-dimension log-sigma is predicted
@@ -32,7 +33,7 @@ from torch import Tensor, nn
 
 THINK, EMIT = 0, 1
 RENDERER_FEATURES_SCHEMA = "input_latent+belief/v1"
-ROLLOUT_POLICY_SCHEMA = "half_group_members_forced_initial_latent_think/v1"
+ROLLOUT_POLICY_SCHEMA = "forced_initial_think_one_way_stop_gate/v2"
 # Pinned-EMIT reasoning modes never sample the gate or a thought: the rollout
 # is a plain token policy. The tag embeds the mode because cot and none differ
 # in their trained emission budgets, so their checkpoints are not one policy.
@@ -484,8 +485,8 @@ def migrate_scalar_log_sigma_state(
     return True
 
 
-class ThinkEmitGate(nn.Module):
-    """Bernoulli THINK/EMIT policy over the belief; zero-init is exactly 50/50."""
+class StopThinkingGate(nn.Module):
+    """Bernoulli CONTINUE/STOP policy; action 1 means stop and emit."""
 
     def __init__(self, model_dim: int):
         super().__init__()
@@ -493,15 +494,15 @@ class ThinkEmitGate(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def emit_logit(self, belief: Tensor) -> Tensor:
+    def stop_logit(self, belief: Tensor) -> Tensor:
         with torch.autocast(device_type=belief.device.type, enabled=False):
             return self.head(belief.float()).squeeze(-1)
 
     def sample(
         self, belief: Tensor, generator: torch.Generator | None = None
     ) -> tuple[Tensor, Tensor]:
-        """Sample actions (EMIT=1/THINK=0) with their log-probabilities."""
-        logit = self.emit_logit(belief)
+        """Sample actions (STOP=1/CONTINUE=0) and their log-probabilities."""
+        logit = self.stop_logit(belief)
         probability = logit.sigmoid()
         uniform = torch.rand(
             probability.shape,
@@ -519,7 +520,7 @@ class ThinkEmitGate(nn.Module):
         self, belief: Tensor, generator: torch.Generator | None = None
     ) -> Tensor:
         """Sample an action without computing its likelihood (evaluation)."""
-        probability = self.emit_logit(belief).sigmoid()
+        probability = self.stop_logit(belief).sigmoid()
         uniform = torch.rand(
             probability.shape,
             device=probability.device,
@@ -529,13 +530,13 @@ class ThinkEmitGate(nn.Module):
         return (uniform < probability).long()
 
     def log_prob(self, action: Tensor, belief: Tensor) -> Tensor:
-        logit = self.emit_logit(belief)
+        logit = self.stop_logit(belief)
         return -F.binary_cross_entropy_with_logits(
             logit, action.float(), reduction="none"
         )
 
     def entropy(self, belief: Tensor) -> Tensor:
-        logit = self.emit_logit(belief)
+        logit = self.stop_logit(belief)
         probability = logit.sigmoid()
         return F.binary_cross_entropy_with_logits(logit, probability, reduction="none")
 
@@ -765,7 +766,7 @@ class LatentThoughtModel(nn.Module):
         self.transition = GaussianTransitionHead(
             model_dim, sigma_state_init=sigma_state_init
         )
-        self.gate = ThinkEmitGate(model_dim)
+        self.gate = StopThinkingGate(model_dim)
         self.adapter = ThoughtAdapter(model_dim, kind=thought_adapter)
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:

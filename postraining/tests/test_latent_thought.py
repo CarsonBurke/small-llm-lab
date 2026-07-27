@@ -24,7 +24,7 @@ from postraining.latent_thought import (
     THOUGHT_MEAN_SCHEMA,
     THOUGHT_LOG_SIGMA_MAX,
     THOUGHT_LOG_SIGMA_MIN,
-    ThinkEmitGate,
+    StopThinkingGate,
     ThoughtAdapter,
     validate_renderer_checkpoint,
     wrapper_init_kwargs_from_checkpoint,
@@ -315,9 +315,9 @@ def test_tanh_thought_input_transforms_once_before_the_adapter():
 
 
 def test_gate_zero_init_is_exactly_uniform():
-    gate = ThinkEmitGate(16)
+    gate = StopThinkingGate(16)
     belief = torch.randn(4, 16)
-    assert torch.all(gate.emit_logit(belief) == 0)
+    assert torch.all(gate.stop_logit(belief) == 0)
     log_prob = gate.log_prob(torch.tensor([THINK, EMIT, THINK, EMIT]), belief)
     torch.testing.assert_close(log_prob, torch.full((4,), math.log(0.5)))
     torch.testing.assert_close(gate.entropy(belief), torch.full((4,), math.log(2.0)))
@@ -325,7 +325,7 @@ def test_gate_zero_init_is_exactly_uniform():
 
 def test_gate_sample_log_prob_recomputes_identically():
     torch.manual_seed(11)
-    gate = ThinkEmitGate(16)
+    gate = StopThinkingGate(16)
     with torch.no_grad():
         gate.head.weight.normal_(std=0.5)
         gate.head.bias.normal_()
@@ -621,9 +621,9 @@ def test_explicit_actor_restart_replaces_the_complete_gate():
     torch.testing.assert_close(wrapper.gate.head.weight, expected_weight)
     torch.testing.assert_close(wrapper.gate.head.bias, expected_bias)
     belief = torch.randn(4, expected_weight.shape[1])
-    expected_emit_probability = torch.sigmoid(expected_bias).expand(4)
+    expected_stop_probability = torch.sigmoid(expected_bias).expand(4)
     torch.testing.assert_close(
-        wrapper.gate.emit_logit(belief).sigmoid(), expected_emit_probability
+        wrapper.gate.stop_logit(belief).sigmoid(), expected_stop_probability
     )
 
 
