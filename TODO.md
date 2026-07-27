@@ -1,5 +1,22 @@
 # TODO
 
+## One-way latent stopping policy (2026-07-26)
+
+Current latent rollout schema is `forced_initial_think_one_way_stop_gate/v2`:
+every trajectory takes one mandatory Gaussian THINK, then the Bernoulli gate
+chooses CONTINUE_THINK or STOP_AND_EMIT. STOP is absorbing; all later actions
+are token-only EMITs and carry no stop-gate mask or loss. Thus every action
+trace is `T+E*`, `thoughts_per_trajectory` includes the mandatory thought, and
+evaluation no longer has a forced/unforced intervention split. Fresh runs use
+`--init-stop-thinking-probability` (0.99 is the direct successor to the last
+run's 0.01 initial think probability).
+
+The post-training trainer is now decomposed into `vapo/config.py`,
+`vapo/schemas.py`, `vapo/objectives.py`, and `runtime/profiling.py`; the
+orchestration module fell from 7,736 to under 5,000 lines. Next structural
+cuts, only when they can remain behavior-preserving, are metrics/update and
+collector/evaluation.
+
 ## Posttraining wall-clock (measured Jul 19, v6 run TB wall times)
 67 min through step ~1760: BPB guard 28.4 min (42%, 22 full-val runs at ~77 s,
 value flat 1.402x throughout), collect 20.9 min (median 16.5 s/iteration,
