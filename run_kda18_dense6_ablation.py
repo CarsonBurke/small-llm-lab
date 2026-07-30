@@ -1,4 +1,4 @@
-"""Run the 18-KDA/6-dense 2K ablation if its time-to-BPB is competitive.
+"""Run the 18-KDA-mixer/6-dense 2K ablation if time-to-BPB is competitive.
 
 This script is a GPU/model workload and must run under ``mlq``. It uses the
 20-step production-shape run only as an execution and rejection gate; the
@@ -14,18 +14,18 @@ from pathlib import Path
 
 
 SPEED_RESULT = Path(
-    "ablation_results/nanogpt_gpt2_kda18_dense6_fullblocks_speed20/"
+    "ablation_results/nanogpt_gpt2_kda18_dense6_mixers_speed20/"
     "result.json"
 )
 SHALLOW_REFERENCE = Path(
     "ablation_results/nanogpt_gpt2_kda_lowrank2070_blockcompile_2k/"
     "metrics.jsonl"
 )
-RUN_NAME = "nanogpt_gpt2_kda18_dense6_fullblocks_2k"
+RUN_NAME = "nanogpt_gpt2_kda18_dense6_mixers_2k"
 DECISION_PATH = Path(
-    "ablation_results/kda18_dense6_fullblocks_decision/decision.json"
+    "ablation_results/kda18_dense6_mixers_decision/decision.json"
 )
-MAXIMUM_STEP_MS = 4000.0
+MAXIMUM_STEP_MS = 3200.0
 REQUIRED_TIME_BPB_IMPROVEMENT = 0.005
 
 
@@ -114,16 +114,29 @@ def main() -> int:
         "nanogpt_mini_gpt2vocab_kda_3to1_pm_train.py",
         "--env",
         "NUM_LAYERS=24",
+        "--env",
         "DELTA_ATTENTION_TYPE=kda",
+        "--env",
+        "DELTA_MLP_ON_DELTA=0",
+        "--env",
         "MLP_HIDDEN=2048",
+        "--env",
         "DELTA_DISABLE_RECOMPUTE=1",
+        "--env",
         "DELTA_STATE_V_FIRST=1",
+        "--env",
         "DELTA_EAGER_MODULE=1",
+        "--env",
         "DELTA_BLOCKWISE_COMPILE=1",
+        "--env",
         "DELTA_COMPILE_MODE=default",
+        "--env",
         "KDA_COMPILE_DIAGNOSTICS=0",
+        "--env",
         "FLA_TILELANG=0",
+        "--env",
         "FLA_FLASH_KDA=0",
+        "--env",
         "MBS=8",
     ]
     completed = subprocess.run(command, check=False)
