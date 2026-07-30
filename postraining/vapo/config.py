@@ -404,6 +404,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    # Give the compiled lockstep decode step a flex-decoding block table
+    # instead of a boolean attn_mask. Handing SDPA any mask disqualifies its
+    # fused backends and lands the step on the memory-efficient kernel, which
+    # the v25 profile measured at 32% of pool device time with 98.5% of those
+    # calls coming from the MAIN loop, not the tail (NOTES.md:1285).
+    #
+    # Reaching that main loop is the whole difficulty. Flex decoding lowers
+    # for fully static shapes alone -- measured, and a dynamic batch by itself
+    # is enough to make the lowering fail -- while the survivor count moves
+    # with compaction. The flag therefore also switches compaction to round UP
+    # to a DecodeRangeMask.DEFAULT_ROW_BUCKET multiple, which is affordable
+    # only because a block table can give the surplus rows an empty range:
+    # they read no KV and come back exactly zero. They do still occupy KV
+    # cache, so the grid is linear rather than powers of two -- see
+    # DecodeRangeMask. Microbenchmarked at the production shape (6 layers, 4x128,
+    # 2560-key cache), bucketed flex against the dynamic SDPA step it
+    # replaces: 0.72x at position 128 falling to 0.29x at 2047, and within
+    # 0-19% of an exact-count flex batch throughout.
+    #
+    # Off until the end-to-end A/B confirms it.
+    parser.add_argument(
+        "--rollout-flex-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    # Capture the main decode loop as a CUDA graph instead of launching it.
+    # The v34 kernel profile measured ~348 host launches per decode step for a
+    # six-layer model -- 157k of them on kernels averaging 1.9 us, at or below
+    # launch cost -- and 32% of pool wall with no kernel resident at all. A
+    # replay issues one launch for the whole step.
+    #
+    # The price is a fixed batch and a fixed KV width: capture pins both, so
+    # the loop stops compacting finished rows away and stops sizing its cache
+    # to the chunk. Dead rows keep costing their share of the step's GEMMs
+    # while costing no attention (the empty range is what makes bucket padding
+    # free), so this trades device work for launch overhead and only pays if
+    # the launch bubble is the larger of the two. Off until the A/B says so.
+    parser.add_argument(
+        "--rollout-graph-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     # Checkpoint in true actor/critic optimizer-update units.
     parser.add_argument("--save-every", type=int, default=32)
     parser.add_argument("--warmup-save-every", type=int, default=10)
@@ -455,8 +497,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # much of the decode is spent on already-finished rows.
     parser.add_argument(
         "--rollout-sync-every", type=int, default=16,
-        help="decode steps between the live-row check that also gates "
-        "compaction (lower = narrower batches sooner, more scalar syncs)",
+        help="lockstep-only decode steps between live-row checks that gate "
+        "compaction; continuous_refill retires and admits every iteration",
     )
     parser.add_argument(
         "--rollout-compact-dead-ratio", type=float, default=0.25,
@@ -476,13 +518,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-groups", type=int, default=16)
     parser.add_argument(
         "--rollout-scheduler",
-        choices=("lockstep", "tail_merge"),
+        choices=("lockstep", "continuous_refill"),
         default="lockstep",
-        help="lockstep completes each prompt chunk independently; tail_merge "
-        "parks sparse survivor tails and rolls them into the next chunk at "
-        "an aligned decode position",
+        help="lockstep completes each prompt chunk independently; "
+        "continuous_refill recycles completed physical lanes into later "
+        "prompt groups using request-stable sampling and paged KV attention",
     )
     parser.add_argument("--rollout-only", action="store_true")
+    parser.add_argument(
+        "--rollout-only-repeats",
+        type=int,
+        default=1,
+        help="production-shape rollout pools to collect in one process; "
+        "repeat zero includes compile/cold-start cost and later repeats "
+        "measure steady state",
+    )
     parser.add_argument("--gate-min-within-group-reward-std", type=float, default=0.01)
     parser.add_argument(
         "--actor-init", default=None,
@@ -529,11 +579,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "is intentionally not bit-exact",
     )
     parser.add_argument(
-        "--migrate-tail-merge-resume",
+        "--migrate-rollout-scheduler-resume",
         action="store_true",
-        help="explicitly resume lockstep learning state at a complete pool "
-        "boundary under aligned rolling-tail scheduling; the objective is "
-        "unchanged but future RNG-to-trajectory attribution is not bit-exact",
+        help="explicitly resume learning state at a complete pool boundary "
+        "under continuous-refill scheduling; the objective is unchanged but "
+        "future samples use request-stable rather than global RNG attribution",
     )
     parser.add_argument(
         "--migrate-joint-clip-resume",
@@ -779,28 +829,50 @@ def validate_args(
         parser.error("--rollout-tail-batch must be nonnegative")
     if args.rollout_tail_graph and args.rollout_tail_batch < 1:
         parser.error("--rollout-tail-graph requires --rollout-tail-batch >= 1")
+    if args.rollout_flex_decode and not args.rollout_compile:
+        # The block table replaces the boolean mask of the tensor-position
+        # step, which only the compiled lockstep rollout takes.
+        parser.error("--rollout-flex-decode requires --rollout-compile")
+    if args.rollout_flex_decode and args.rollout_scheduler != "lockstep":
+        # continuous_refill already decodes through flex over paged lanes.
+        parser.error("--rollout-flex-decode applies to the lockstep scheduler")
+    if args.rollout_graph_decode and not args.rollout_flex_decode:
+        # Capture needs one static row count, and the empty KV range is what
+        # makes holding one affordable when rows finish early. The boolean
+        # mask path has no equivalent: a fully masked SDPA row is NaN.
+        parser.error("--rollout-graph-decode requires --rollout-flex-decode")
+    if args.rollout_graph_decode and args.rollout_tail_graph:
+        # The tail graph exists to give the compacted remnant a static shape.
+        # Under capture the main loop never compacts, so there is no remnant
+        # and the tail artifact would only compile and never run.
+        parser.error(
+            "--rollout-graph-decode already holds a static shape; "
+            "--rollout-tail-graph has nothing left to snap to"
+        )
     if args.rollout_tail_graph and not args.rollout_compile:
         # The tail switch rides the compiled rollout's tensor positions and
         # fixed-size compaction; an eager rollout never engages it.
         parser.error("--rollout-tail-graph requires --rollout-compile")
-    if args.rollout_scheduler == "tail_merge":
+    if args.rollout_scheduler == "continuous_refill":
         if args.rollout_groups <= 1:
             parser.error(
-                "--rollout-scheduler tail_merge requires "
+                "--rollout-scheduler continuous_refill requires "
                 "--rollout-groups > 1"
             )
         if args.rollout_groups >= args.prompts_per_rollout:
             parser.error(
-                "--rollout-scheduler tail_merge requires more than one rollout chunk"
+                "--rollout-scheduler continuous_refill requires more than "
+                "one rollout chunk"
             )
-        if args.rollout_tail_batch < 1:
+        if not args.rollout_compile:
             parser.error(
-                "--rollout-scheduler tail_merge requires --rollout-tail-batch >= 1"
+                "--rollout-scheduler continuous_refill requires "
+                "--rollout-compile"
             )
         if args.rollout_tail_graph:
             parser.error(
                 "--rollout-tail-graph is incompatible with "
-                "--rollout-scheduler tail_merge"
+                "--rollout-scheduler continuous_refill"
             )
     # PPO refresh/update score the backbone's categorical distribution
     # directly. Temperature and nucleus transforms define a different policy;
@@ -823,8 +895,8 @@ def validate_args(
         parser.error("--migrate-reverse-kl-resume requires --resume")
     if args.migrate_v20_execution_resume and not args.resume:
         parser.error("--migrate-v20-execution-resume requires --resume")
-    if args.migrate_tail_merge_resume and not args.resume:
-        parser.error("--migrate-tail-merge-resume requires --resume")
+    if args.migrate_rollout_scheduler_resume and not args.resume:
+        parser.error("--migrate-rollout-scheduler-resume requires --resume")
     if args.migrate_joint_clip_resume and not args.resume:
         parser.error("--migrate-joint-clip-resume requires --resume")
     if args.migrate_anchored_value_resume and not args.resume:
@@ -876,6 +948,10 @@ def validate_args(
         parser.error("--ppo-epochs must be 1; trajectory reuse is disabled")
     if args.bpb_val_tokens < 0:
         parser.error("--bpb-val-tokens must be nonnegative")
+    if args.rollout_only_repeats < 1:
+        parser.error("--rollout-only-repeats must be positive")
+    if args.rollout_only_repeats != 1 and not args.rollout_only:
+        parser.error("--rollout-only-repeats requires --rollout-only")
     exclusive_modes = sum(
         (args.bpb_only, args.bench_only, args.rollout_only)
     )

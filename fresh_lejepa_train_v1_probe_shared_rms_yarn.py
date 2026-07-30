@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 import fresh_lejepa_train as v1
 import train_gpt as baseline
@@ -151,9 +152,12 @@ class FreshLeJEPASharedRMSV1FixedYarn(FreshLeJEPASharedRMSProjectorV1Probes):
         cache: tuple[Tensor, Tensor],
         position: int | Tensor,
         key_mask: Tensor | None = None,
+        block_mask: "BlockMask | None" = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         if not isinstance(attention.rotary, FixedTargetYarnRotary):
-            return super()._attention_step(attention, x, cache, position, key_mask)
+            return super()._attention_step(
+                attention, x, cache, position, key_mask, block_mask
+            )
         batch, _, dim = x.shape
         q_dim = attention.num_heads * attention.head_dim
         kv_dim = attention.num_kv_heads * attention.head_dim
@@ -170,6 +174,24 @@ class FreshLeJEPASharedRMSV1FixedYarn(FreshLeJEPASharedRMSProjectorV1Probes):
         q = baseline.apply_rotary_emb(q, cos, sin)
         k = baseline.apply_rotary_emb(k, cos, sin)
         q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
+        if block_mask is not None:
+            # Flex decoding path (see FreshLeJEPAGPT._attention_step).
+            if not torch.is_tensor(position):
+                raise ValueError("block_mask stepping requires a 0-dim tensor position")
+            if key_mask is not None:
+                raise ValueError("block_mask and key_mask are mutually exclusive")
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, value)
+            y = flex_attention(
+                q,
+                cache[0],
+                cache[1],
+                block_mask=block_mask,
+                enable_gqa=attention.num_kv_heads != attention.num_heads,
+            )
+            y = y.transpose(1, 2).contiguous().view(batch, 1, dim)
+            return attention.proj(y), cache
         attn_mask = None
         if key_mask is not None and key_mask.dim() == 2:
             # Per-row (batch, keys) validity for left-padded batched rollouts

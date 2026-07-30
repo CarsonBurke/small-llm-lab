@@ -140,6 +140,194 @@ def test_left_padded_rollout_matches_unpadded():
 
 
 @torch.no_grad()
+def test_paged_refill_matches_independent_masked_decode():
+    """Shuffled physical lanes may advance at different logical positions."""
+    wrapper = LatentThoughtModel(_backbone()).eval()
+    prompts = torch.randint(
+        1,
+        KWARGS["vocab_size"],
+        (2, 5),
+        generator=torch.Generator().manual_seed(37),
+    )
+    lengths = torch.tensor([3, 5])
+    prompts[0, :2] = 0
+    slots = torch.tensor([[2, 0], [3, 1]])
+    paged = wrapper.make_paged_generation_cache(
+        4, 12, torch.device("cpu"), dtype=torch.float32, page_size=4
+    )
+    bank = wrapper.build_prompt_prefix_bank(
+        prompts, lengths, dtype=torch.float32
+    )
+    selected_groups = torch.tensor([1, 0])
+    prefilled = wrapper.admit_prompt_prefixes(
+        bank, selected_groups, slots, paged
+    )
+
+    references = []
+    reference_caches = []
+    key_valid = torch.arange(5)[None] >= (5 - lengths)[:, None]
+    for group in selected_groups.tolist():
+        for _ in range(2):
+            dense_cache = wrapper.make_generation_cache(
+                1, 12, torch.device("cpu"), dtype=torch.float32
+            )
+            reference = wrapper.prefill(
+                prompts[group : group + 1],
+                dense_cache,
+                key_valid[group : group + 1],
+            )
+            references.append(reference)
+            reference_caches.append(dense_cache)
+    torch.testing.assert_close(
+        prefilled.logits,
+        torch.cat([reference.logits for reference in references]),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    next_tokens = torch.tensor([7, 11, 13, 17])
+    positions = torch.full((4,), 5, dtype=torch.long)
+    paged_step = wrapper.token_paged_step(
+        next_tokens,
+        paged,
+        slot_ids=slots.flatten(),
+        positions=positions,
+    )
+    dense_steps = []
+    for row, dense_cache in enumerate(reference_caches):
+        group = int(selected_groups[row // 2])
+        mask = torch.cat(
+            (key_valid[group : group + 1], torch.ones(1, 1, dtype=torch.bool)),
+            dim=1,
+        )
+        dense_steps.append(
+            wrapper.token_step(
+                next_tokens[row : row + 1], dense_cache, 5, mask
+            )
+        )
+    torch.testing.assert_close(
+        paged_step.belief,
+        torch.cat([step.belief for step in dense_steps]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    torch.testing.assert_close(
+        paged_step.logits,
+        torch.cat([step.logits for step in dense_steps]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    # Four lanes of 12, plus the scratch page padding rows write into so they
+    # never address through a slot that a page pool may have reassigned.
+    assert paged.layers[0][0].shape[2] == 4 * 12 + paged.page_size
+    mask = paged.block_mask(slots.flatten(), positions + 1)
+    # A range touches at most two partial pages, but the tables must still
+    # share their last axis: the Triton decode kernel offsets FULL_KV_IDX by
+    # stride("KV_IDX") and bounds it by size("KV_IDX", -1), so a narrower
+    # partial table makes it read the full table at the wrong row stride, and
+    # full pages skip mask_mod so nothing downstream corrects it.
+    assert mask.kv_indices.shape == mask.full_kv_indices.shape
+    assert mask.full_kv_indices.shape[-1] == paged.pages_per_lane
+
+
+@torch.no_grad()
+def test_prompt_prefix_bank_prefills_once_across_repeated_admissions(monkeypatch):
+    wrapper = LatentThoughtModel(_backbone()).eval()
+    prompts = torch.randint(
+        1,
+        KWARGS["vocab_size"],
+        (3, 6),
+        generator=torch.Generator().manual_seed(41),
+    )
+    lengths = torch.tensor([2, 4, 6])
+    prompts[0, :4] = 0
+    prompts[1, :2] = 0
+    calls = 0
+    original = wrapper.backbone.prefill_belief
+
+    def counted_prefill(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wrapper.backbone, "prefill_belief", counted_prefill
+    )
+    bank = wrapper.build_prompt_prefix_bank(
+        prompts, lengths, dtype=torch.float32
+    )
+    assert calls == 1
+    assert bank.prompt_width == 6
+    assert bank.kv_starts.tolist() == [4, 2, 0]
+
+    paged = wrapper.make_paged_generation_cache(
+        4, 10, torch.device("cpu"), dtype=torch.float32, page_size=4
+    )
+    first = wrapper.admit_prompt_prefixes(
+        bank,
+        torch.tensor([2, 0]),
+        torch.tensor([[3, 1], [2, 0]]),
+        paged,
+    )
+    second = wrapper.admit_prompt_prefixes(
+        bank,
+        torch.tensor([1]),
+        torch.tensor([[1, 3]]),
+        paged,
+    )
+    assert calls == 1
+    assert first.logits.shape == (4, KWARGS["vocab_size"])
+    torch.testing.assert_close(
+        second.logits,
+        bank.output.logits[1:2].repeat_interleave(2, dim=0),
+    )
+    assert paged.kv_starts.tolist() == [4, 2, 4, 2]
+
+
+@torch.no_grad()
+def test_paged_step_core_is_one_full_graph_across_ragged_positions():
+    """BlockMask values may change without recompiling the fixed-shape core."""
+    wrapper = LatentThoughtModel(
+        NanoGPTBackbone(vocab_size=32, num_layers=1, model_dim=128).float()
+    ).eval()
+    paged = wrapper.make_paged_generation_cache(
+        2, 8, torch.device("cpu"), dtype=torch.float32, page_size=4
+    )
+    wrapper.prefill_into_paged_slots(
+        torch.randint(0, 32, (1, 3)),
+        torch.tensor([3]),
+        torch.tensor([[0, 1]]),
+        paged,
+    )
+    slot_ids = torch.tensor([0, 1])
+    input_latent = wrapper.embed_tokens(torch.tensor([[3], [5]]))
+    compiled_graphs = []
+
+    def backend(graph, _example_inputs):
+        compiled_graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(
+        wrapper.paged_step_core, backend=backend, fullgraph=True
+    )
+    for positions in (
+        torch.tensor([3, 3]),
+        torch.tensor([4, 5]),
+        torch.tensor([6, 6]),
+    ):
+        block_mask = paged.block_mask(slot_ids, positions + 1)
+        output = compiled(
+            input_latent,
+            paged.layers,
+            positions,
+            block_mask,
+            paged.token_addresses(slot_ids, positions),
+        )
+        assert torch.isfinite(output[-1]).all()
+    assert len(compiled_graphs) == 1
+
+
+@torch.no_grad()
 def test_eager_tensor_position_step_accepts_a_bf16_cache():
     """The step path must write its own dtype into the cache, not assume one.
 

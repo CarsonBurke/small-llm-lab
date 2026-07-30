@@ -25,6 +25,7 @@ from postraining.latent_rollout import (
     assemble_stream_latents,
     assign_terminal_rewards,
     build_replay_plan,
+    compact_emit_token_logprobs,
     compact_next_slots,
     compact_slots,
     compact_thought_actions,
@@ -52,8 +53,10 @@ from postraining.latent_thought import (
     THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
+    DecodeRangeMask,
     LatentThoughtModel,
 )
+from postraining.nano_backbone import NanoGPTBackbone
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import _pope_construction
 from postraining.vapo.config import (
@@ -340,6 +343,65 @@ def test_stop_is_absorbing_and_masks_every_later_emit():
     generated = batch.kind[:, batch.prompt_length :]
     assert torch.all(generated[:, 0] == THOUGHT_SLOT)
     assert torch.all(generated[:, 1:] == TOKEN_SLOT)
+
+
+def test_emit_token_logprobs_helper_matches_the_explicit_readout():
+    """The fused helper is the readout tail, spelled out.
+
+    The trainer hands this function to one ``torch.compile`` artifact shared
+    by refresh and update, so the whole softcap/log-softmax/gather chain now
+    lives behind a single call. Pin it against the formula written out longhand
+    so a fusion can never quietly change what is being computed.
+    """
+    wrapper = _wrapper()
+    batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
+    emit_index = slot_index(batch.emit_mask.bool())
+    with torch.no_grad():
+        stream_inputs, beliefs = replay_beliefs(wrapper, batch)
+        emit_inputs = compact_slots(stream_inputs, emit_index)
+        emit_beliefs = compact_slots(beliefs, emit_index)
+        targets = compact_next_slots(batch.token_ids, emit_index)
+        expected = (
+            wrapper.backbone.logits_from_features(
+                wrapper.renderer_features(emit_inputs, emit_beliefs)
+            )
+            .float()
+            .log_softmax(-1)
+            .gather(-1, targets[..., None])
+            .squeeze(-1)
+        )
+        actual = compact_emit_token_logprobs(
+            wrapper, emit_inputs, emit_beliefs, targets
+        )
+    assert actual.shape == (emit_index.numel(),)
+    assert torch.equal(actual, expected)
+
+
+def test_compiled_emit_token_logprobs_agrees_with_eager():
+    """Compiling the readout tail must not move the value it produces.
+
+    Refresh and update share one artifact, so a fusion cannot desynchronize
+    them relative to each other — but it can move both away from the eager
+    reference, and the PPO ratio is a difference of two log-probabilities
+    where a shifted readout shows up directly as clip fraction. Inductor is
+    free to reorder the vocabulary reduction, so this is a closeness bound
+    rather than bit equality.
+    """
+    wrapper = _wrapper()
+    batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
+    emit_index = slot_index(batch.emit_mask.bool())
+    with torch.no_grad():
+        stream_inputs, beliefs = replay_beliefs(wrapper, batch)
+        emit_inputs = compact_slots(stream_inputs, emit_index)
+        emit_beliefs = compact_slots(beliefs, emit_index)
+        targets = compact_next_slots(batch.token_ids, emit_index)
+        eager = compact_emit_token_logprobs(
+            wrapper, emit_inputs, emit_beliefs, targets
+        )
+        compiled = torch.compile(
+            compact_emit_token_logprobs, fullgraph=True, dynamic=True
+        )(wrapper, emit_inputs, emit_beliefs, targets)
+    torch.testing.assert_close(compiled, eager, rtol=1e-5, atol=1e-6)
 
 
 def test_replay_reproduces_rollout_logprobs():
@@ -1818,6 +1880,35 @@ def test_shipped_math_evaluations_share_the_250_step_cadence():
     assert cli.rollout_scheduler == "lockstep"
 
 
+def test_rollout_only_repeats_are_benchmark_scoped(capsys):
+    parser = build_arg_parser()
+    valid = parser.parse_args(
+        [
+            "--checkpoint", "c", "--output", "o",
+            "--rollout-only",
+            "--rollout-only-repeats", "8",
+        ]
+    )
+    validate_args(parser, valid)
+
+    for argv, message in (
+        (
+            ["--rollout-only", "--rollout-only-repeats", "0"],
+            "--rollout-only-repeats must be positive",
+        ),
+        (
+            ["--rollout-only-repeats", "8"],
+            "--rollout-only-repeats requires --rollout-only",
+        ),
+    ):
+        args = parser.parse_args(
+            ["--checkpoint", "c", "--output", "o", *argv]
+        )
+        with pytest.raises(SystemExit):
+            validate_args(parser, args)
+        assert message in capsys.readouterr().err
+
+
 def test_critic_learning_rate_defaults_to_constant_actor_rate():
     parser = build_arg_parser()
     args = parser.parse_args(
@@ -1847,14 +1938,13 @@ def test_critic_learning_rate_defaults_to_constant_actor_rate():
     )
 
 
-def test_tail_merge_scheduler_requires_multiple_batched_chunks(capsys):
+def test_continuous_refill_requires_multiple_compiled_chunks(capsys):
     parser = build_arg_parser()
     valid = parser.parse_args(
         [
             "--checkpoint", "c", "--output", "o",
-            "--rollout-scheduler", "tail_merge",
+            "--rollout-scheduler", "continuous_refill",
             "--rollout-groups", "32",
-            "--rollout-tail-batch", "16",
         ]
     )
     validate_args(parser, valid)
@@ -1862,15 +1952,17 @@ def test_tail_merge_scheduler_requires_multiple_batched_chunks(capsys):
     for argv, message in (
         (
             ["--rollout-groups", "1"],
-            "--rollout-scheduler tail_merge requires --rollout-groups > 1",
+            "--rollout-scheduler continuous_refill requires "
+            "--rollout-groups > 1",
         ),
         (
             ["--rollout-groups", "64"],
-            "--rollout-scheduler tail_merge requires more than one rollout chunk",
+            "--rollout-scheduler continuous_refill requires more than one "
+            "rollout chunk",
         ),
         (
-            ["--rollout-tail-batch", "0"],
-            "--rollout-scheduler tail_merge requires --rollout-tail-batch >= 1",
+            ["--no-rollout-compile"],
+            "--rollout-scheduler continuous_refill requires --rollout-compile",
         ),
         (
             ["--rollout-tail-graph"],
@@ -1880,10 +1972,30 @@ def test_tail_merge_scheduler_requires_multiple_batched_chunks(capsys):
         args = parser.parse_args(
             [
                 "--checkpoint", "c", "--output", "o",
-                "--rollout-scheduler", "tail_merge",
+                "--rollout-scheduler", "continuous_refill",
                 *argv,
             ]
         )
+        with pytest.raises(SystemExit):
+            validate_args(parser, args)
+        assert message in capsys.readouterr().err
+
+
+def test_graph_decode_requires_the_flex_path_and_replaces_the_tail_graph(capsys):
+    parser = build_arg_parser()
+    base = ["--checkpoint", "c", "--output", "o", "--rollout-graph-decode"]
+    validate_args(parser, parser.parse_args([*base, "--rollout-flex-decode"]))
+
+    for argv, message in (
+        # Capture needs one static row count; the empty KV range that makes
+        # holding one affordable exists only on the flex path.
+        ([], "--rollout-graph-decode requires --rollout-flex-decode"),
+        (
+            ["--rollout-flex-decode", "--rollout-tail-graph"],
+            "--rollout-tail-graph has nothing left to snap to",
+        ),
+    ):
+        args = parser.parse_args([*base, *argv])
         with pytest.raises(SystemExit):
             validate_args(parser, args)
         assert message in capsys.readouterr().err
@@ -2922,9 +3034,11 @@ def test_static_tail_switch_matches_the_dynamic_tail(monkeypatch):
     seen_shapes = set()
     original_step_core = wrapper.step_core
 
-    def spy_tail_core(next_input, caches, position, key_mask):
+    def spy_tail_core(next_input, caches, position, key_mask, block_mask=None):
         seen_shapes.add((next_input.size(0), tuple(key_mask.shape)))
-        return original_step_core(next_input, caches, position, key_mask)
+        return original_step_core(
+            next_input, caches, position, key_mask, block_mask
+        )
 
     def run(tail_caches=None, tail_step_core=None):
         nonlocal calls
@@ -2960,6 +3074,469 @@ def test_static_tail_switch_matches_the_dynamic_tail(monkeypatch):
     )
     assert reused == static
     assert seen_shapes == {(16, (16, 40))}
+
+
+def _deterministic_nano_wrapper() -> LatentThoughtModel:
+    """``_deterministic_wrapper`` on the RoPE nano trunk.
+
+    The flex decode path exists for one QK product over a K/V cache pair,
+    which is the nano trunk; PoPE scores a complex inner product over a
+    k_real/k_imag pair and keeps the boolean path.
+    """
+    torch.manual_seed(3)
+    backbone = NanoGPTBackbone(vocab_size=32, num_layers=2, model_dim=256)
+    backbone = backbone.float().eval()
+    with torch.no_grad():
+        backbone.proj.weight.normal_(std=0.05)
+        backbone.proj.bias.normal_(std=0.05)
+    wrapper = LatentThoughtModel(backbone)
+    with torch.no_grad():
+        wrapper.gate.head.bias.fill_(40.0)
+    wrapper.transition.sample_latent = MethodType(
+        lambda _self, mean, _log_sigma, generator=None: mean.float(),
+        wrapper.transition,
+    )
+    return wrapper
+
+
+def test_flex_decode_mask_reproduces_the_boolean_row_mask(monkeypatch):
+    """The block table IS the boolean tail mask, not an approximation of it.
+
+    Mixed prompt lengths make left-pad masking load-bearing, and the flex path
+    additionally attends the whole static tail cache rather than a narrowed
+    prefix: a block table one slot too wide would let a pad slot or a slot past
+    the write head into the softmax, and the argmax tokens would flip.
+    Compaction runs on both sides, so the run reaches the tail switch through
+    the same surviving-row bookkeeping either way.
+    """
+    wrapper = _deterministic_nano_wrapper()
+    generator = torch.Generator().manual_seed(17)
+    prompt_ids = torch.randint(1, 32, (64, 4), generator=generator)
+    prompt_ids[:32, 0] = 0
+    prompt_lengths = torch.tensor([3] * 32 + [4] * 32)
+    calls = 0
+
+    def terminate_then_argmax(logits, _temperature, _top_p, **_kwargs):
+        nonlocal calls
+        tokens = logits.argmax(-1)
+        # Nobody stops by accident: the 12 survivors must reach the first
+        # 16-step synchronization point for the fixed B16 tail to engage.
+        tokens[tokens == 5] = 6
+        if calls == 1:
+            tokens[6:58] = 5
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", terminate_then_argmax)
+    cpu = torch.device("cpu")
+
+    def run(**overrides):
+        nonlocal calls
+        calls = 0
+        kwargs = dict(
+            max_new_tokens=32,
+            max_stream_steps=33,
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            tensor_positions=True,
+            compact_finished=True,
+            finished_batch_size=16,
+            record_likelihoods=False,
+        )
+        kwargs.update(overrides)
+        return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+    # 37 slots of stream rounded up to whole 16-wide flex KV blocks.
+    boolean_caches = wrapper.make_static_generation_cache(16, 48, cpu)
+    boolean = emitted_token_rows(run(tail_caches=boolean_caches))
+    flex_caches = wrapper.make_static_generation_cache(16, 48, cpu)
+    flex = emitted_token_rows(
+        run(
+            tail_caches=flex_caches,
+            tail_decode_mask=DecodeRangeMask(16, 48, cpu, block_size=16),
+        )
+    )
+    assert flex == boolean
+    # The switch actually landed the survivors in the static caches, so the
+    # agreement above is the tail's doing and not a run that never reached it.
+    assert sum(float(cache[0].abs().sum()) for cache in flex_caches) > 0.0
+
+
+def test_flex_decode_main_loop_and_tail_compose(monkeypatch):
+    """The production combination: bucketed main loop handing off to the tail.
+
+    The two masks are covered separately above, and each is sound alone. What
+    neither covers is the HANDOFF, which is where their differing widths meet:
+    the main loop rolls on a per-chunk cache and the tail on a wider static
+    one, and the switch copies only ``[0, live_prefix)`` between them. If the
+    main loop's bucket left a filler row in the survivor set, or the copy
+    landed the survivors at the wrong rows, the tail would score a different
+    trajectory and the emitted tokens would diverge from the boolean run.
+    """
+    wrapper = _deterministic_nano_wrapper()
+    generator = torch.Generator().manual_seed(17)
+    prompt_ids = torch.randint(1, 32, (64, 4), generator=generator)
+    prompt_ids[:32, 0] = 0
+    prompt_lengths = torch.tensor([3] * 32 + [4] * 32)
+    calls = 0
+
+    def terminate_then_argmax(logits, _temperature, _top_p, **_kwargs):
+        nonlocal calls
+        tokens = logits.argmax(-1)
+        tokens[tokens == 5] = 6
+        if calls == 1:
+            tokens[6:58] = 5
+        calls += 1
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", terminate_then_argmax)
+    cpu = torch.device("cpu")
+
+    def run(**overrides):
+        nonlocal calls
+        calls = 0
+        kwargs = dict(
+            max_new_tokens=32,
+            max_stream_steps=33,
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            tensor_positions=True,
+            compact_finished=True,
+            finished_batch_size=16,
+            record_likelihoods=False,
+        )
+        kwargs.update(overrides)
+        return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+    boolean_caches = wrapper.make_static_generation_cache(16, 48, cpu)
+    boolean = emitted_token_rows(run(tail_caches=boolean_caches))
+
+    flex_caches = wrapper.make_static_generation_cache(16, 48, cpu)
+    flex = emitted_token_rows(
+        run(
+            tail_caches=flex_caches,
+            # A bucket well below the 64 rows rolled out, so the main loop
+            # actually compacts through intermediate widths before the snap
+            # instead of jumping straight to the tail.
+            decode_mask=DecodeRangeMask(
+                64, 48, cpu, block_size=16, row_bucket=8
+            ),
+            tail_decode_mask=DecodeRangeMask(16, 48, cpu, block_size=16),
+        )
+    )
+    assert flex == boolean
+    assert sum(float(cache[0].abs().sum()) for cache in flex_caches) > 0.0
+
+
+def test_graph_arena_rollout_matches_the_allocating_rollout(monkeypatch):
+    """A caller-owned decode arena must change nothing but where KV lives.
+
+    This is the CUDA-graph configuration: one static arena for the whole run
+    instead of a cache sized per chunk, therefore no compaction and one fixed
+    row count. Two things could silently diverge. The prompt fan-out now
+    expands into the caller's tensors rather than a fresh allocation, so a
+    wrong target leaves samples sharing or missing prefix KV. And the arena is
+    REUSED across rollouts, so the second run starts on the first run's KV --
+    unreachable only because each row's range starts at its own left pad and
+    stops at the write head. Running the same prompts twice through one arena
+    and demanding both match the allocating path pins exactly that.
+    """
+    wrapper = _deterministic_nano_wrapper()
+    generator = torch.Generator().manual_seed(29)
+    prompt_ids = torch.randint(1, 32, (8, 4), generator=generator)
+    prompt_ids[:4, 0] = 0
+    prompt_lengths = torch.tensor([3] * 4 + [4] * 4)
+    cpu = torch.device("cpu")
+    repeats = 3
+    rows, width = prompt_ids.size(0) * repeats, 48
+
+    def argmax(logits, _temperature, _top_p, **_kwargs):
+        tokens = logits.argmax(-1)
+        tokens[tokens == 5] = 6
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", argmax)
+
+    def run(**overrides):
+        kwargs = dict(
+            max_new_tokens=32,
+            max_stream_steps=width - prompt_ids.size(1),
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            prompt_repeats=repeats,
+            tensor_positions=True,
+            record_likelihoods=False,
+            decode_mask=DecodeRangeMask(
+                rows, width, cpu, block_size=16, row_bucket=8
+            ),
+        )
+        kwargs.update(overrides)
+        return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+    allocating = emitted_token_rows(run(compact_finished=True))
+    arena = wrapper.make_static_generation_cache(rows, width, cpu)
+    first = emitted_token_rows(run(caches=arena, compact_finished=False))
+    # Deliberately not re-zeroed: reuse across pools is the whole point of a
+    # static arena, and stale KV must already be unreachable.
+    second = emitted_token_rows(run(caches=arena, compact_finished=False))
+
+    assert first == allocating
+    assert second == allocating
+    assert sum(float(cache[0].abs().sum()) for cache in arena) > 0.0
+
+
+def test_a_short_chunk_pads_up_to_the_arena_without_changing_a_row(monkeypatch):
+    """Fewer prompts than the arena holds must run, and run unchanged.
+
+    The arena fixes the row count for the whole run, but real chunks are
+    routinely short: the value warmup takes fewer prompts than there are
+    rollout groups, the final pool takes whatever prompts remain, and
+    --consume-all-prompts takes an arbitrary count. Rejecting those (the first
+    shape of this flag) kills every fresh run at its first warmup rollout, and
+    running them narrower records a second graph at a second shape, which is
+    the cost the arena exists to remove. They pad up instead. This pins that
+    the padding is invisible: the returned batch holds exactly the real rows,
+    and every one is identical to the same chunk on an exactly-sized arena.
+
+    Row-for-row equality holds here because sampling is patched to argmax.
+    Under real sampling it would not: every draw runs at the PADDED row count,
+    so a short chunk's real rows diverge from the same chunk unpadded after
+    the first step. That is a reproducibility property of the flag, not a
+    defect -- the arena width is fixed by config -- but it is why this test
+    pins the plumbing rather than the samples.
+    """
+    wrapper = _deterministic_nano_wrapper()
+    generator = torch.Generator().manual_seed(31)
+    prompt_ids = torch.randint(1, 32, (8, 4), generator=generator)
+    prompt_ids[:4, 0] = 0
+    prompt_lengths = torch.tensor([3] * 4 + [4] * 4)
+    cpu = torch.device("cpu")
+    repeats, width = 3, 48
+    rows = prompt_ids.size(0) * repeats
+
+    sampled_steps = [0]
+
+    def argmax(logits, _temperature, _top_p, **_kwargs):
+        sampled_steps[0] += 1
+        tokens = logits.argmax(-1)
+        tokens[tokens == 5] = 6
+        if sampled_steps[0] > 12:
+            # Every REAL row hits the stop token here and no filler ever does.
+            # Fillers copy the last prompt but sample their own continuations,
+            # so outliving the whole chunk is their ordinary behavior, not a
+            # contrivance; a live one would hold the loop open for the rest of
+            # the stream.
+            tokens[:rows] = 5
+        return tokens
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", argmax)
+
+    def run(arena_rows):
+        sampled_steps[0] = 0
+        return rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=32,
+            max_stream_steps=width - prompt_ids.size(1),
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            prompt_repeats=repeats,
+            tensor_positions=True,
+            record_likelihoods=False,
+            compact_finished=False,
+            caches=wrapper.make_static_generation_cache(arena_rows, width, cpu),
+            decode_mask=DecodeRangeMask(
+                arena_rows, width, cpu, block_size=16, row_bucket=8
+            ),
+        )
+
+    exact = run(rows)
+    exact_steps = sampled_steps[0]
+    # 12 filler rows: four filler prompts, each fanned out to ``repeats``.
+    padded = run(rows + 12)
+
+    # Fillers are ended before the first step, so they never hold the loop
+    # open past the last real row -- the property that makes their empty key
+    # range, and therefore the whole padding scheme, free.
+    assert sampled_steps[0] == exact_steps
+    for field in fields(exact):
+        if field.name == "replay_layout_token":
+            continue
+        left, right = getattr(exact, field.name), getattr(padded, field.name)
+        if not isinstance(left, torch.Tensor):
+            assert left == right, field.name
+            continue
+        assert right.size(0) == rows, field.name
+        torch.testing.assert_close(right, left, msg=field.name)
+
+
+def test_flex_decode_main_loop_matches_the_boolean_rollout(monkeypatch):
+    """Bucketing plus empty ranges must not move a single recorded value.
+
+    Two things here are not obviously free. Rounding the survivor count UP
+    means the batch carries filler rows that the boolean path would have
+    dropped. Giving every STOPPED row an empty range means it now reads zero
+    out of attention where before it read a real (discarded) value — and the
+    loop keeps stepping those rows, so their gate decisions and their token
+    writes change. That is only safe if every consumer masks them. Compare the
+    whole batch, not just the emitted text, so an unmasked leak shows up.
+    """
+    wrapper = _deterministic_nano_wrapper()
+    generator = torch.Generator().manual_seed(23)
+    prompt_ids = torch.randint(1, 32, (24, 4), generator=generator)
+    prompt_ids[:12, 0] = 0
+    prompt_lengths = torch.tensor([3] * 12 + [4] * 12)
+    calls = 0
+
+    def argmax(logits, _temperature, _top_p, **_kwargs):
+        # Deliberately NOT indexed by row position: the two arms compact to
+        # different widths, so their physical row order differs and any
+        # position-indexed rule would stop different sequences in each. Letting
+        # the stop token fall out of the logits keeps the decision a property
+        # of the sequence, which is what makes the arms comparable at all.
+        nonlocal calls
+        calls += 1
+        return logits.argmax(-1)
+
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(latent_rollout, "top_p_sample", argmax)
+    cpu = torch.device("cpu")
+
+    def run(**overrides):
+        nonlocal calls
+        calls = 0
+        kwargs = dict(
+            max_new_tokens=24,
+            max_stream_steps=25,
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=prompt_lengths,
+            tensor_positions=True,
+            compact_finished=True,
+            sync_every=2,
+            record_likelihoods=False,
+        )
+        kwargs.update(overrides)
+        return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+    boolean = run()
+    # 29 slots of stream rounded up to whole 16-wide flex KV blocks.
+    flex = run(decode_mask=DecodeRangeMask(24, 32, cpu, block_size=16))
+
+    assert emitted_token_rows(flex) == emitted_token_rows(boolean)
+    mask = boolean.action_mask.bool()
+    assert torch.equal(flex.action_mask, boolean.action_mask)
+    assert torch.equal(flex.kind[mask], boolean.kind[mask])
+    assert torch.equal(flex.token_ids[mask], boolean.token_ids[mask])
+    assert torch.isfinite(flex.thoughts).all()
+
+
+def test_flex_decode_bucket_rounds_the_survivor_count_up(monkeypatch):
+    """The bucket is what makes the shapes static; pin it directly.
+
+    Compaction that lands on an exact survivor count would respecialize the
+    compiled step per count, which is the whole reason the main loop could not
+    take flex decoding before.
+    """
+    wrapper = _deterministic_nano_wrapper()
+    # Deliberately not a multiple of the bucket: the FIRST width is whatever
+    # the caller rolls out, and only the compacted widths are bucketed.
+    generator = torch.Generator().manual_seed(23)
+    prompt_ids = torch.randint(1, 32, (24, 4), generator=generator)
+    prompt_ids[:12, 0] = 0
+    import postraining.latent_rollout as latent_rollout
+
+    monkeypatch.setattr(
+        latent_rollout,
+        "top_p_sample",
+        lambda logits, _t, _p, **_k: logits.argmax(-1),
+    )
+    cpu = torch.device("cpu")
+    widths: list[int] = []
+    original = wrapper.step
+
+    def record(input_latent, caches, position, key_mask=None, block_mask=None):
+        widths.append(caches[0][0].size(0))
+        return original(input_latent, caches, position, key_mask, block_mask)
+
+    wrapper.step = record
+    try:
+        rollout_continuations(
+            wrapper,
+            prompt_ids,
+            max_new_tokens=24,
+            max_stream_steps=25,
+            temperature=1.0,
+            top_p=0.7,
+            stop_ids=(5,),
+            prompt_lengths=torch.tensor([3] * 12 + [4] * 12),
+            tensor_positions=True,
+            compact_finished=True,
+            sync_every=2,
+            record_likelihoods=False,
+            decode_mask=DecodeRangeMask(
+                24, 32, cpu, block_size=16, row_bucket=4
+            ),
+        )
+    finally:
+        wrapper.step = original
+    assert widths, "the rollout never stepped"
+    compacted = [width for width in widths if width != 24]
+    assert compacted, "the rollout never compacted, so nothing was bucketed"
+    for width in compacted:
+        assert width % 4 == 0, f"batch {width} is not a multiple of the bucket"
+
+
+def test_flex_decode_mask_validation_rejects_misfit_masks():
+    wrapper = _deterministic_nano_wrapper()
+    prompt_ids = torch.randint(1, 32, (8, 4))
+    cpu = torch.device("cpu")
+
+    def run(**overrides):
+        kwargs = dict(
+            max_new_tokens=4,
+            max_stream_steps=8,
+            temperature=1.0,
+            top_p=1.0,
+            tensor_positions=True,
+            record_likelihoods=False,
+        )
+        kwargs.update(overrides)
+        return rollout_continuations(wrapper, prompt_ids, **kwargs)
+
+    tail_kwargs = dict(
+        compact_finished=True,
+        finished_batch_size=4,
+        tail_caches=wrapper.make_static_generation_cache(4, 16, cpu),
+    )
+    with pytest.raises(ValueError, match="multiple of the flex KV block"):
+        DecodeRangeMask(8, 20, cpu, block_size=16)
+    with pytest.raises(ValueError, match="static tail caches"):
+        run(tail_decode_mask=DecodeRangeMask(4, 16, cpu, block_size=16))
+    with pytest.raises(ValueError, match="match the tail cache width"):
+        run(tail_decode_mask=DecodeRangeMask(4, 32, cpu, block_size=16),
+            **tail_kwargs)
+    with pytest.raises(ValueError, match="fewer than"):
+        run(tail_decode_mask=DecodeRangeMask(2, 16, cpu, block_size=16),
+            **tail_kwargs)
 
 
 def test_static_tail_validation_rejects_misfit_caches():
@@ -3483,31 +4060,39 @@ def test_resume_schema_requires_matching_explicit_migration() -> None:
         "allow_anchored_value_migration",
         "allow_projected_thought_migration",
         "allow_thought_reverse_kl_migration",
-        "allow_tail_merge_migration",
+        "allow_rollout_scheduler_migration",
     ):
         assert not resume_execution_schema_compatible(
             current, **{extra_flag: True}
         )
+    continuous_schema = execution_schema_for_adapter(
+        "orthogonal_silu", "identity", "continuous_refill"
+    )
+    assert resume_execution_schema_compatible(
+        {"execution_schema": continuous_schema},
+        expected_execution_schema=continuous_schema,
+    )
+    assert not resume_execution_schema_compatible(
+        current,
+        expected_execution_schema=continuous_schema,
+    )
+    assert resume_execution_schema_compatible(
+        current,
+        expected_execution_schema=continuous_schema,
+        allow_rollout_scheduler_migration=True,
+    )
+    assert not resume_execution_schema_compatible(
+        {"execution_schema": continuous_schema},
+        expected_execution_schema=continuous_schema,
+        allow_rollout_scheduler_migration=True,
+    )
     tail_schema = execution_schema_for_adapter(
         "orthogonal_silu", "identity", "tail_merge"
     )
     assert resume_execution_schema_compatible(
         {"execution_schema": tail_schema},
-        expected_execution_schema=tail_schema,
-    )
-    assert not resume_execution_schema_compatible(
-        current,
-        expected_execution_schema=tail_schema,
-    )
-    assert resume_execution_schema_compatible(
-        current,
-        expected_execution_schema=tail_schema,
-        allow_tail_merge_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        {"execution_schema": tail_schema},
-        expected_execution_schema=tail_schema,
-        allow_tail_merge_migration=True,
+        expected_execution_schema=continuous_schema,
+        allow_rollout_scheduler_migration=True,
     )
     affine = {"execution_schema": IDENTITY_AFFINE_EXECUTION_SCHEMA}
     assert not resume_execution_schema_compatible(affine)
@@ -3933,10 +4518,22 @@ def test_preallocated_caches_that_do_not_fit_are_rejected():
         rollout_continuations(
             wrapper, prompt_ids, 4, 12, 1.0, 1.0, caches=small
         )
-    wrong_batch = wrapper.make_static_generation_cache(3, 32, device)
-    with pytest.raises(ValueError, match="do not fit"):
+    too_few = wrapper.make_static_generation_cache(1, 32, device)
+    with pytest.raises(ValueError, match="fewer than"):
         rollout_continuations(
-            wrapper, prompt_ids, 4, 12, 1.0, 1.0, caches=wrong_batch
+            wrapper, prompt_ids, 4, 12, 1.0, 1.0, caches=too_few
+        )
+    ragged = wrapper.make_static_generation_cache(5, 32, device)
+    with pytest.raises(ValueError, match="whole number"):
+        rollout_continuations(
+            wrapper,
+            prompt_ids,
+            4,
+            12,
+            1.0,
+            1.0,
+            caches=ragged,
+            prompt_repeats=2,
         )
 
 
@@ -4219,7 +4816,9 @@ def test_batched_rollout_rejects_bad_prompt_lengths_and_static_caches():
             prompt_lengths=torch.tensor([5, 6]),
         )
     caches = wrapper.make_generation_cache(2, 9, torch.device("cpu"))
-    with pytest.raises(ValueError, match="eager-only"):
+    # A caller-owned cache with no decode_mask falls back to the shared causal
+    # key mask, which has no room for a per-row left pad.
+    with pytest.raises(ValueError, match="allocated cache or a decode_mask"):
         rollout_continuations(
             wrapper, prompt_ids, 2, 4, 1.0, 1.0,
             caches=caches, prompt_lengths=torch.tensor([5, 5]),

@@ -20,15 +20,23 @@ inspection tool.
 
 from __future__ import annotations
 
+import gc
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 
 import torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask
 
 from postraining.core import top_p_sample
-from postraining.latent_thought import EMIT, THINK, LatentThoughtModel, StepOutput
+from postraining.latent_thought import (
+    EMIT,
+    THINK,
+    DecodeRangeMask,
+    LatentThoughtModel,
+    StepOutput,
+)
 
 TOKEN_SLOT, THOUGHT_SLOT, PAD_SLOT = 0, 1, -1
 
@@ -327,6 +335,8 @@ def rollout_continuations(
     tail_step_core=None,
     sync_every: int = 16,
     compact_dead_ratio: float = 0.25,
+    decode_mask: DecodeRangeMask | None = None,
+    tail_decode_mask: DecodeRangeMask | None = None,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
@@ -405,6 +415,51 @@ def rollout_continuations(
     fill at allocation. Without ``tail_step_core`` the tail runs through the
     ordinary ``wrapper.step`` (the eager 2-D-mask path), which is what CPU
     tests exercise.
+
+    ``decode_mask``/``tail_decode_mask`` (``DecodeRangeMask``) replace the
+    boolean row mask of the main loop and of the static tail with a flex
+    decoding block table. The tail's live keys are one
+    contiguous range per row — left padding is a prefix, the write head is a
+    suffix bound — so no information is lost, and the step leaves the
+    memory-efficient SDPA kernel that a boolean ``attn_mask`` forces it onto
+    (32% of pool device time in the v25 profile). Inductor lowers flex
+    decoding for fully static shapes only. The tail is static already
+    (``finished_batch_size`` rows on fixed-width caches); the MAIN loop, which
+    is 98.5% of the decode iterations at ``--rollout-groups 32``, becomes
+    static by compacting to a ``decode_mask.row_bucket`` multiple instead of
+    to the exact survivor count and giving the surplus rows an EMPTY key
+    range, which reads no KV and returns exactly zero.
+
+    The MAIN loop gets there a different way, because its survivor count is
+    data-dependent and flex decoding only lowers for static shapes. With
+    ``decode_mask`` set, compaction rounds the survivor count UP to a multiple
+    of ``decode_mask.row_bucket`` instead of down to the exact count, and the
+    surplus rows — along with every row that has already stopped — are given an
+    EMPTY range. An empty range reads no KV and returns exactly zero, so the
+    padding is free in TIME: at the production shape a 256-row bucket holding
+    144 live rows measured 0.6% over an exact 144-row batch, against 59% for
+    the SDPA step it replaces. It is not free in MEMORY — the rounded count is
+    also the width the KV cache is reallocated at — which is why the grid is
+    linear rather than powers of two; see ``DecodeRangeMask``. A bounded
+    number of buckets then covers the whole rollout, so the step specializes a
+    bounded number of times.
+
+    Caller-owned ``caches`` are the arena of the fully static main loop: they
+    fix the row count and the KV width for every rollout that shares them, so
+    compaction is off and one recording serves the run. A chunk with fewer
+    prompts than the arena holds is padded up to it with filler prompts whose
+    rows are ended before the first step -- empty key range, nothing recorded
+    -- and those rows are dropped from the returned batch. The arena's row
+    count must therefore be a whole number of ``prompt_repeats`` groups.
+
+    Both are CALLER-owned for the same reason the tail caches are: each
+    carries buffers whose addresses a cudagraph replay captures.
+    ``decode_mask.kv_width`` also pins the main cache width, which keeps that
+    width from varying with the padded prompt width and respecializing the
+    step; it must cover ``prompt + stream`` for every call sharing the
+    artifact. Both paths attend the whole cache under the mask, so caches are
+    zero-filled at allocation: an unwritten slot inside a live block would
+    otherwise be uninitialized memory.
     """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
@@ -419,8 +474,7 @@ def rollout_continuations(
     if prompt_repeats < 1:
         raise ValueError("prompt_repeats must be positive")
     batch = prefix_batch * prompt_repeats
-    if caches is not None and prompt_repeats != 1:
-        raise ValueError("prompt_repeats cannot be used with preallocated caches")
+
     if finished_batch_size is not None and finished_batch_size < 1:
         raise ValueError("finished_batch_size must be positive")
     model_dim = wrapper.backbone.tok_emb.embedding_dim
@@ -430,13 +484,15 @@ def rollout_continuations(
         ids = (stop_ids,) if isinstance(stop_ids, int) else tuple(stop_ids)
         if ids:
             stop_tensor = torch.tensor(ids, dtype=torch.long, device=device)
-    pad_lengths = None
-    valid_slots = None
     if prompt_lengths is not None:
-        if caches is not None:
+        if caches is not None and decode_mask is None:
+            # The boolean preallocated path shares ONE causal mask row across
+            # the batch, which cannot express a per-row left pad. A block
+            # table can: every row carries its own range start, so the flex
+            # arena handles left padding exactly as the allocating path does.
             raise ValueError(
-                "prompt_lengths (left-padded batching) is eager-only and "
-                "cannot be combined with preallocated caches"
+                "prompt_lengths (left-padded batching) needs either an "
+                "allocated cache or a decode_mask"
             )
         if prompt_lengths.shape != (prefix_batch,):
             raise ValueError("prompt_lengths must be one true length per prompt")
@@ -445,6 +501,50 @@ def rollout_continuations(
             (prompt_lengths > prompt_length).any()
         ):
             raise ValueError("prompt_lengths must lie in [1, prompt_ids width]")
+
+    # A caller-owned arena fixes the row count for the whole rollout --
+    # compaction is disabled under it, see ``should_compact`` -- and the point
+    # of owning it is that ONE recording serves every chunk. A chunk carrying
+    # fewer prompts than the arena was sized for therefore cannot simply run
+    # narrower: that records a second graph at a second shape, and short
+    # chunks are routine (the value warmup takes prompts_per_minibatch, the
+    # final pool takes whatever prompts remain, --consume-all-prompts takes an
+    # arbitrary count). The prompt batch is padded up to the arena instead.
+    # Filler rows are ended from step zero, so they get an empty key range
+    # every step -- no KV read, exactly zero out -- record nothing, and are
+    # dropped from the returned trajectories.
+    filler_rows = 0
+    if caches is not None:
+        arena_rows = caches[0][0].size(0)
+        if arena_rows % prompt_repeats:
+            raise ValueError(
+                f"preallocated caches hold {arena_rows} rows, not a whole "
+                f"number of {prompt_repeats}-sample groups"
+            )
+        if arena_rows < batch:
+            raise ValueError(
+                f"preallocated caches hold {arena_rows} rows, fewer than the "
+                f"{batch} this rollout produces"
+            )
+        filler_rows = arena_rows - batch
+        if filler_rows:
+            filler_prompts = filler_rows // prompt_repeats
+            prompt_ids = torch.cat(
+                (
+                    prompt_ids,
+                    prompt_ids[-1:].expand(filler_prompts, prompt_length),
+                )
+            )
+            if prompt_lengths is not None:
+                prompt_lengths = torch.cat(
+                    (prompt_lengths, prompt_lengths[-1:].expand(filler_prompts))
+                )
+            prefix_batch += filler_prompts
+            batch = arena_rows
+
+    pad_lengths = None
+    valid_slots = None
+    if prompt_lengths is not None:
         pad_lengths = (
             prompt_length - prompt_lengths
         ).repeat_interleave(prompt_repeats)
@@ -452,13 +552,73 @@ def rollout_continuations(
         valid_slots = (
             torch.arange(max_stream, device=device)[None, :] >= pad_lengths[:, None]
         )
+    if decode_mask is not None:
+        if not tensor_positions:
+            raise ValueError("decode_mask requires tensor_positions")
+        if caches is not None and decode_mask.kv_width != caches[0][0].size(2):
+            # Preallocated caches are the CUDA-graph path: the block table
+            # spans the whole allocated width, so the two must agree exactly
+            # rather than the mask merely covering the stream. When the caller
+            # owns the caches it owns the width, so this is its error to fix.
+            raise ValueError(
+                f"decode_mask width {decode_mask.kv_width} does not match the "
+                f"preallocated cache width {caches[0][0].size(2)}"
+            )
+        if decode_mask.kv_width < max_stream:
+            raise ValueError(
+                f"decode_mask width {decode_mask.kv_width} does not cover "
+                f"prompt+stream {max_stream}"
+            )
+        if decode_mask.kv_starts.numel() < batch:
+            raise ValueError(
+                f"decode_mask holds {decode_mask.kv_starts.numel()} rows, "
+                f"fewer than the {batch} rolled out"
+            )
+        if decode_mask.kv_starts.device != device:
+            raise ValueError(
+                f"decode_mask is on {decode_mask.kv_starts.device}, not the "
+                f"rollout device {device}"
+            )
+
+    def new_caches(rows: int, length: int) -> list[tuple[Tensor, ...]]:
+        allocated = wrapper.make_generation_cache(
+            rows, length, device, dtype=cache_dtype
+        )
+        if decode_mask is not None and length > prompt_length:
+            # The block table spans the whole cache width, and its live blocks
+            # are read whole; make_generation_cache hands back uninitialized
+            # memory, which would put garbage inside the block holding the
+            # write head. A cache exactly ``prompt_length`` wide is the
+            # transient the fan-out prefills into, and the prefill writes every
+            # one of its columns, so there is nothing there to hide -- and it
+            # is allocated once per chunk, so the memset is not free.
+            for layer in allocated:
+                for tensor in layer:
+                    tensor.zero_()
+        return allocated
+
     preallocated_caches = caches is not None
+    # Only ever set when the caller owns the decode arena AND the prompt fans
+    # out: the prefill still runs once per UNIQUE prompt in a narrow transient
+    # cache, and its result is expanded into the caller's arena below. Without
+    # this the fan-out would prefill every sample separately.
+    expansion_target = None
+    if preallocated_caches and prompt_repeats > 1:
+        if caches[0][0].size(2) < max_stream:
+            raise ValueError(
+                f"preallocated caches are {caches[0][0].size(2)} wide, "
+                f"shorter than prompt+stream {max_stream}"
+            )
+        expansion_target = caches
+        caches = None
     if caches is None:
         cache_batch = prefix_batch if prompt_repeats > 1 else batch
-        cache_length = prompt_length if prompt_repeats > 1 else max_stream
-        caches = wrapper.make_generation_cache(
-            cache_batch, cache_length, device, dtype=cache_dtype
+        cache_length = (
+            prompt_length
+            if prompt_repeats > 1
+            else max_stream if decode_mask is None else decode_mask.kv_width
         )
+        caches = new_caches(cache_batch, cache_length)
         position_index = (
             torch.zeros((), dtype=torch.long, device=device)
             if tensor_positions
@@ -467,17 +627,24 @@ def rollout_continuations(
         key_masks = None
     else:
         cache_length = caches[0][0].size(2)
-        if caches[0][0].size(0) != batch or cache_length < max_stream:
+        if cache_length < max_stream:
             raise ValueError(
                 f"preallocated caches ({tuple(caches[0][0].shape)}) do not fit "
-                f"batch {batch} x stream {max_stream}"
+                f"stream {max_stream}"
             )
         position_index = torch.zeros((), dtype=torch.long, device=device)
         # Row p is the step-p key mask; indexing it is a view, so the hot
-        # loop adds no mask-construction kernels.
-        key_masks = torch.ones(
-            (cache_length, cache_length), dtype=torch.bool, device=device
-        ).tril_()
+        # loop adds no mask-construction kernels. The flex path carries the
+        # same information in its block table, so it needs none of this --
+        # and a cache_length-squared boolean is not free at the widths the
+        # graph path runs at.
+        key_masks = (
+            None
+            if decode_mask is not None
+            else torch.ones(
+                (cache_length, cache_length), dtype=torch.bool, device=device
+            ).tril_()
+        )
 
     tail_mask: Tensor | None = None
     tail_length = 0
@@ -509,8 +676,53 @@ def rollout_continuations(
                 f"tail cache dtype {tail_caches[0][0].dtype} must match the "
                 f"rollout cache dtype {caches[0][0].dtype}"
             )
+    if tail_decode_mask is not None:
+        if tail_caches is None:
+            raise ValueError("tail_decode_mask masks the static tail caches")
+        if tail_decode_mask.kv_width != tail_length:
+            raise ValueError(
+                f"tail_decode_mask width {tail_decode_mask.kv_width} must "
+                f"match the tail cache width {tail_length}"
+            )
+        if tail_decode_mask.kv_starts.device != device:
+            # A cross-device copy into kv_starts is legal, so without this the
+            # run dies inside flex_attention with a kernel-level message that
+            # points away from the caller.
+            raise ValueError(
+                f"tail_decode_mask is on {tail_decode_mask.kv_starts.device}, "
+                f"not the rollout device {device}"
+            )
+        if tail_decode_mask.kv_starts.numel() < finished_batch_size:
+            raise ValueError(
+                f"tail_decode_mask holds "
+                f"{tail_decode_mask.kv_starts.numel()} rows, fewer than the "
+                f"{finished_batch_size} in the tail"
+            )
 
-    def step_position(position: int) -> tuple[int | Tensor, Tensor | None]:
+    # Row b's live keys are always the contiguous range
+    # ``[decode_starts[b], position]``, which is what lets the block tables
+    # carry the same information as the boolean masks they replace. It tracks
+    # ``pad_lengths`` through compaction, and is the tail's starts after the
+    # static switch.
+    decode_starts: Tensor | None = None
+    if decode_mask is not None or tail_decode_mask is not None:
+        decode_starts = (
+            pad_lengths.clone()
+            if pad_lengths is not None
+            else torch.zeros(batch, dtype=torch.long, device=device)
+        )
+    tail_starts: Tensor | None = None
+
+    def step_position(
+        position: int,
+    ) -> tuple[int | Tensor, Tensor | None, BlockMask | None]:
+        if tail_starts is not None:
+            position_index.fill_(position)
+            return (
+                position_index,
+                None,
+                tail_decode_mask.build(tail_starts, position + 1),
+            )
         if tail_mask is not None:
             # Fixed-shape tail: the full-width row mask grows by one column
             # per step in place, so the step's shapes never change and the
@@ -518,16 +730,38 @@ def rollout_continuations(
             # attendable; only each row's left-pad prefix stays False.
             position_index.fill_(position)
             tail_mask[:, position] = True
-            return position_index, tail_mask
+            return position_index, tail_mask, None
         if position_index is not None:
             position_index.fill_(position)
             step_position_value: int | Tensor = position_index
+            if decode_mask is not None:
+                # Finished rows and bucket fillers get an empty range, which
+                # is what makes the padding to a static row count free. Rows
+                # still inside their own left pad fall out for nothing: their
+                # start already exceeds ``position``, so the range is empty
+                # there too and the kernel returns zero rather than the NaN a
+                # fully masked SDPA row would have produced.
+                #
+                # ``active``, not ``~ended``: ``ended`` covers only stop-token
+                # termination, so a row that finished by exhausting
+                # max_new_tokens would keep a full, GROWING key range for
+                # every remaining step. Without a stop token it never gets set
+                # at all. Nothing an inactive row produces is recorded --
+                # ``record = active`` gates every stream write below -- so
+                # zeroing its attention is as safe as it is for a stopped row.
+                # One iteration stale (``active`` is recomputed at the top of
+                # the next pass) and stale in the conservative direction.
+                return (
+                    step_position_value,
+                    None,
+                    decode_mask.build(decode_starts, position + 1, active),
+                )
             if key_masks is not None:
-                return step_position_value, key_masks[position]
+                return step_position_value, key_masks[position], None
         else:
             step_position_value = position
         if valid_slots is None:
-            return step_position_value, None
+            return step_position_value, None, None
         mask = valid_slots[:, : position + 1]
         if position < prompt_length:
             # Rows whose query at ``position`` is still inside their own pad
@@ -538,7 +772,7 @@ def rollout_continuations(
             # output is discarded, and the slot itself stays masked for all
             # real queries via ``valid_slots``.
             mask = mask | (pad_lengths[:, None] > position)
-        return step_position_value, mask
+        return step_position_value, mask, None
 
     kind = torch.full((batch, max_stream), PAD_SLOT, dtype=torch.long, device=device)
     token_ids = torch.zeros((batch, max_stream), dtype=torch.long, device=device)
@@ -590,9 +824,12 @@ def rollout_continuations(
     caches = output.caches
 
     if prompt_repeats > 1:
-        expanded_caches = wrapper.make_generation_cache(
-            batch, max_stream, device, dtype=cache_dtype
-        )
+        expanded_caches = expansion_target
+        if expanded_caches is None:
+            expanded_caches = new_caches(
+                batch,
+                max_stream if decode_mask is None else decode_mask.kv_width,
+            )
         for source_layer, target_layer in zip(
             caches, expanded_caches, strict=True
         ):
@@ -625,6 +862,13 @@ def rollout_continuations(
 
     emitted = torch.zeros(batch, dtype=torch.long, device=device)
     ended = torch.zeros(batch, dtype=torch.bool, device=device)
+    if filler_rows:
+        # Ended before the first step is what makes the arena padding free:
+        # ``active`` is False for these rows forever, so their key range is
+        # empty (no KV read, exactly zero out) and ``record`` never writes a
+        # stream slot for them. They still occupy the batch dimension, which
+        # is the entire point.
+        ended[batch - filler_rows :] = True
     thinking_active = torch.full(
         (batch,), not pin_emit, dtype=torch.bool, device=device
     )
@@ -666,6 +910,18 @@ def rollout_continuations(
                 break
             current_count = active.numel()
             compacted_count = active_count
+            if decode_mask is not None:
+                # Flex decoding lowers for static shapes only, so the survivor
+                # count is rounded UP to a multiple of ROW_BUCKET. The surplus
+                # rows cost no attention work (empty range), which is what
+                # makes this affordable; compacting to the exact count instead
+                # would respecialize the step on every distinct count. They do
+                # still cost cache memory, which is why the grid is linear --
+                # see DecodeRangeMask.DEFAULT_ROW_BUCKET.
+                bucket = decode_mask.row_bucket
+                compacted_count = min(
+                    current_count, -(-active_count // bucket) * bucket
+                )
             snap_to_tail = (
                 finished_batch_size is not None
                 and active_count <= finished_batch_size
@@ -696,6 +952,8 @@ def rollout_continuations(
                     ]
                     keep = torch.cat((keep, fillers))
                 live_rows = live_rows.index_select(0, keep)
+                if decode_starts is not None:
+                    decode_starts = decode_starts.index_select(0, keep)
                 emitted = emitted.index_select(0, keep)
                 ended = ended.index_select(0, keep)
                 thinking_active = thinking_active.index_select(0, keep)
@@ -725,19 +983,23 @@ def rollout_continuations(
                         # Replace one layer at a time so the dynamic caches
                         # free as the static ones fill.
                         caches[layer] = static_layer
-                    tail_mask = torch.zeros(
-                        (compacted_count, tail_length),
-                        dtype=torch.bool,
-                        device=device,
-                    )
-                    if valid_slots is not None:
-                        # Rows were compacted above, so this is the
-                        # survivors' causal-and-valid mask at the switch.
-                        tail_mask[:, :live_prefix] = valid_slots[
-                            :, :live_prefix
-                        ]
+                    if tail_decode_mask is not None:
+                        # Rows were compacted above, so this is the survivors'
+                        # first live key: their left-pad width, or zero when
+                        # the rollout was not left-padded at all.
+                        tail_starts = decode_starts
                     else:
-                        tail_mask[:, :live_prefix] = True
+                        tail_mask = torch.zeros(
+                            (compacted_count, tail_length),
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                        if valid_slots is not None:
+                            tail_mask[:, :live_prefix] = valid_slots[
+                                :, :live_prefix
+                            ]
+                        else:
+                            tail_mask[:, :live_prefix] = True
                 elif snap_to_tail or finished_batch_size is None:
                     for layer, cache in enumerate(caches):
                         compacted = []
@@ -752,6 +1014,10 @@ def rollout_continuations(
                                     0, keep
                                 )
                             )
+                            if decode_mask is not None:
+                                # torch.empty above; the block holding the
+                                # write head is read whole.
+                                target[:, :, live_prefix:].zero_()
                             compacted.append(target)
                         # Replace one layer at a time so old+new
                         # full-capacity caches do not coexist across all
@@ -914,14 +1180,15 @@ def rollout_continuations(
                 wrapper.thought_input(thought),
                 wrapper.embed_tokens(next_token_ids[:, None]),
             )
-        step_pos, key_mask = step_position(next_position)
+        step_pos, key_mask, step_block_mask = step_position(next_position)
         # Under reduce-overhead the step outputs live in the CUDA graph's
         # static pool and are only valid until the NEXT replay: everything
         # read from ``output`` above happens before this call, and every
         # consumer copies out (float()/gather/where).  Keep it that way.
-        if tail_mask is not None and tail_step_core is not None:
+        in_tail = tail_mask is not None or tail_starts is not None
+        if in_tail and tail_step_core is not None:
             belief, predicted, thought_log_sigma, logits = tail_step_core(
-                next_input, caches, step_pos, key_mask
+                next_input, caches, step_pos, key_mask, step_block_mask
             )
             output = StepOutput(
                 belief=belief,
@@ -932,11 +1199,31 @@ def rollout_continuations(
                 caches=caches,
             )
         else:
-            output = wrapper.step(next_input, caches, step_pos, key_mask)
+            output = wrapper.step(
+                next_input, caches, step_pos, key_mask, step_block_mask
+            )
         caches = output.caches
         position = next_position
 
-    return LatentRolloutBatch(
+    # The KV cache is the largest allocation in the process (512 rows x 2304
+    # keys x 6 layers = 14.5 GiB at the production shape) and nothing below
+    # this point needs it: the batch stores replayable data, not activations.
+    # On the flex path the cache does NOT die with these names, though --
+    # something in the compiled step leaves it in a reference CYCLE, so only
+    # the cyclic collector can reclaim it. Measured, chunk N's cache still
+    # resident when chunk N+1 expanded its own: 14.880 GiB against the boolean
+    # path's 1.379 GiB, which OOMs a 32 GB card. ``del`` alone does not fix it
+    # (measured: same OOM, byte for byte); the collection does. It runs once
+    # per rolled-out chunk -- twice a pool -- to reclaim 14.5 GiB, so the walk
+    # is not worth conditioning on anything finer than the path that needs it.
+    # ...and none of that applies when the caller owns the arena: there is no
+    # per-chunk cache to reclaim, the arena is deliberately still referenced
+    # elsewhere, and a full cyclic walk twice a pool would buy nothing.
+    del caches, output
+    if decode_mask is not None and not preallocated_caches:
+        gc.collect()
+
+    rolled = LatentRolloutBatch(
         kind=kind,
         token_ids=token_ids,
         thoughts=thoughts,
@@ -954,6 +1241,38 @@ def rollout_continuations(
         reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
         prompt_length=prompt_length,
     )
+    return rolled if not filler_rows else _drop_filler_rows(rolled, filler_rows)
+
+
+def _drop_filler_rows(
+    batch: LatentRolloutBatch, filler_rows: int
+) -> LatentRolloutBatch:
+    """Drop the trailing rows that existed only to hold a static row count.
+
+    Fillers are appended after the real prompts and every row tensor is
+    prompt-major, so the real trajectories are exactly the leading prefix.
+    That prefix is only the right answer because row ORDER never moves, and
+    the single thing keeping it still is ``not preallocated_caches`` in
+    ``should_compact``: a compaction gathers by ``active.nonzero()``, which
+    would leave the fillers scattered rather than trailing. Relaxing that
+    clause to let an arena compact silently drops real rows and scores filler
+    ones -- no shape disagrees anywhere.
+
+    The prefix is CLONED rather than viewed: a view of dimension zero keeps
+    the padded storage alive for as long as the batch lives, and this batch
+    outlives the rollout by design. The fresh ``replay_layout_token`` the
+    constructor mints is correct -- this is a structural transform, and a plan
+    built against the padded layout must not survive it.
+    """
+    kept = {}
+    for field in fields(batch):
+        if field.name == "replay_layout_token":
+            continue
+        value = getattr(batch, field.name)
+        if isinstance(value, Tensor):
+            value = value[: value.size(0) - filler_rows].clone()
+        kept[field.name] = value
+    return LatentRolloutBatch(**kept)
 
 
 def split_rollout_groups(
@@ -1288,16 +1607,27 @@ def replay_head_inputs(
 
 
 def compact_emit_token_logprobs(
-    backbone, emit_features: Tensor, emit_targets: Tensor
+    wrapper, emit_inputs: Tensor, emit_beliefs: Tensor, emit_targets: Tensor
 ) -> Tensor:
     """log P(target token) at each compact EMIT slot.
 
     Refresh and the trainer's update step both come through this one helper
-    so their eager forwards stay bit-identical (the behavior-age-0 zero-clip
+    so their forwards stay bit-identical (the behavior-age-0 zero-clip
     canary). Its vocabulary-wide temporaries scale with slots x vocab; the
     replay planner's slot budget bounds that, not this function.
+
+    The whole tail — renderer features, the readout GEMM, the logit softcap,
+    the fp32 log-softmax and the target gather — is deliberately ONE function
+    so the trainer can hand it to a single ``torch.compile`` artifact. Run
+    eagerly it is roughly eight separate passes over a (slots, vocab) fp32
+    tensor: ``_raw_logits`` already returns fp32, then the softcap spends a
+    pow, an add, an rsqrt and two multiplies, then log-softmax reads and
+    writes it again. Only the gathered (slots,) result is ever consumed, so
+    every one of those intermediates is bandwidth spent to produce something
+    immediately discarded.
     """
-    logits = backbone.logits_from_features(emit_features)
+    features = wrapper.renderer_features(emit_inputs, emit_beliefs)
+    logits = wrapper.backbone.logits_from_features(features)
     return (
         logits.float()
         .log_softmax(-1)
@@ -1759,7 +2089,6 @@ def refresh_old_statistics(
     deterministic planner so compiled refresh/update forwards remain
     numerically identical for the first behavior minibatch.
     """
-    backbone = wrapper.backbone
     # Pinned-EMIT batches keep zero-width thoughts; their old_thought_logprobs
     # then stay zero-width too, and the thought refresh below is skipped.
     if batch.old_thought_logprobs.shape[-1] == 0:
@@ -1800,21 +2129,19 @@ def refresh_old_statistics(
                 * microbatch.stop_mask
             )
         emit_index = shard.emit_index
-        # The grad-mode compile-guard argument above covers only the compiled
-        # replay_head_inputs; this tail is eager, where grad mode changes no
-        # forward kernel. Dropping its (discarded) graph keeps the retained
-        # log-softmax outputs — ~0.3 KB per EMIT slot times the vocabulary —
-        # out of the refresh peak.
-        with torch.no_grad():
-            emit_features = wrapper.renderer_features(
-                compact_slots(stream_inputs, emit_index),
-                compact_slots(beliefs, emit_index),
-            )
-            compact_token_logprobs = compact_emit_token_logprobs(
-                backbone,
-                emit_features,
-                compact_next_slots(microbatch.token_ids, emit_index),
-            )
+        # Grad-enabled on purpose, for the same reason the compiled replay
+        # above is: the readout tail is itself a compiled artifact now, and
+        # grad mode is a dynamo guard, so a no-grad refresh would trace a
+        # SECOND artifact whose fusions — and therefore whose reduction order
+        # — need not match the update step's. That is exactly the drift the
+        # behavior-age-0 canary exists to catch. The graph is discarded
+        # immediately; the cost is one forward's saved activations.
+        compact_token_logprobs = compact_emit_token_logprobs(
+            wrapper,
+            compact_slots(stream_inputs, emit_index),
+            compact_slots(beliefs, emit_index),
+            compact_next_slots(microbatch.token_ids, emit_index),
+        ).detach()
         token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
         thought_logprobs = torch.zeros_like(microbatch.old_thought_logprobs)

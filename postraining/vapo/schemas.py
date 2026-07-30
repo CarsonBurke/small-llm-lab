@@ -18,6 +18,9 @@ IDENTITY_AFFINE_EXECUTION_SCHEMA = (
 )
 TANH_ACTION_EXECUTION_SCHEMA_SUFFIX = "+tanh_raw_gaussian_recurrent_input/v1"
 TAIL_MERGE_EXECUTION_SCHEMA_SUFFIX = "+scalar_aligned_rolling_tail_merge/v1"
+CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX = (
+    "+request_stable_continuous_refill_paged_flex_attention/v1"
+)
 ZERO_AFFINE_EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_reverse_kl_thought_trust_anchored_value_zero_affine_general_lr_sequential_data/v24"
 )
@@ -69,6 +72,8 @@ def execution_schema_for_adapter(
         )
     if rollout_scheduler == "tail_merge":
         schema += TAIL_MERGE_EXECUTION_SCHEMA_SUFFIX
+    elif rollout_scheduler == "continuous_refill":
+        schema += CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX
     elif rollout_scheduler != "lockstep":
         raise ValueError(f"unknown rollout scheduler {rollout_scheduler!r}")
     return schema
@@ -93,7 +98,7 @@ def resume_execution_schema_compatible(
     allow_anchored_value_migration: bool = False,
     allow_projected_thought_migration: bool = False,
     allow_thought_reverse_kl_migration: bool = False,
-    allow_tail_merge_migration: bool = False,
+    allow_rollout_scheduler_migration: bool = False,
 ) -> bool:
     """Resume compatible policy state at a complete rollout-pool boundary."""
     execution_schema = payload.get("execution_schema")
@@ -105,24 +110,31 @@ def resume_execution_schema_compatible(
             or allow_anchored_value_migration
             or allow_projected_thought_migration
             or allow_thought_reverse_kl_migration
-            or allow_tail_merge_migration
+            or allow_rollout_scheduler_migration
         )
-    if allow_tail_merge_migration:
+    if allow_rollout_scheduler_migration:
         # Scheduling changes only future RNG attribution and batch-shaped
-        # numerics. It is a sound migration exclusively at a completed pool
-        # boundary from the otherwise-identical lockstep schema.
-        return (
-            expected_execution_schema.endswith(TAIL_MERGE_EXECUTION_SCHEMA_SUFFIX)
-            and execution_schema
-            == expected_execution_schema[: -len(TAIL_MERGE_EXECUTION_SCHEMA_SUFFIX)]
-            and not (
-                allow_reverse_kl_migration
-                or allow_performance_migration
-                or allow_joint_clip_migration
-                or allow_anchored_value_migration
-                or allow_projected_thought_migration
-                or allow_thought_reverse_kl_migration
-            )
+        # numerics. It is a sound migration at a completed pool boundary
+        # from the otherwise-identical lockstep or retired tail scheduler.
+        if not expected_execution_schema.endswith(
+            CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX
+        ):
+            return False
+        expected_base = expected_execution_schema[
+            : -len(CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX)
+        ]
+        source_base = execution_schema
+        if not isinstance(source_base, str):
+            return False
+        if source_base.endswith(TAIL_MERGE_EXECUTION_SCHEMA_SUFFIX):
+            source_base = source_base[: -len(TAIL_MERGE_EXECUTION_SCHEMA_SUFFIX)]
+        return source_base == expected_base and not (
+            allow_reverse_kl_migration
+            or allow_performance_migration
+            or allow_joint_clip_migration
+            or allow_anchored_value_migration
+            or allow_projected_thought_migration
+            or allow_thought_reverse_kl_migration
         )
     # Every older policy used an affine thought interface. Its saved matrices
     # have the same shapes as v26 but acquire different semantics under

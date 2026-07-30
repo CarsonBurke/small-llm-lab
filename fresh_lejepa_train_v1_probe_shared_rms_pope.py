@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask
 
 import fresh_lejepa_train as v1
 import fresh_lejepa_train_v4 as v4
@@ -232,12 +233,21 @@ class FreshLeJEPASharedRMSV1PoPE(FreshLeJEPASharedRMSProjectorV1Probes):
         cache: tuple[Tensor, ...],
         position: int | Tensor,
         key_mask: Tensor | None = None,
+        block_mask: "BlockMask | None" = None,
     ) -> tuple[Tensor, tuple[Tensor, ...]]:
         if isinstance(attention, PolarCausalSelfAttention) and (
             attention.position_mode == "pope"
         ):
+            if block_mask is not None:
+                # PoPE scores are a complex inner product over a k_real/k_imag
+                # cache pair, not one QK product flex can score.
+                raise NotImplementedError(
+                    "flex decoding is not implemented for PoPE attention"
+                )
             return attention.forward_step(x, cache, position, key_mask)
-        return super()._attention_step(attention, x, cache, position, key_mask)
+        return super()._attention_step(
+            attention, x, cache, position, key_mask, block_mask
+        )
 
     def _attention_prefill(
         self,

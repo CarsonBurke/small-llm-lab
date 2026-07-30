@@ -46,6 +46,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 import nanogpt_mini_model
 
@@ -151,6 +152,7 @@ class _NanoPostrainingMixin:
         cache: tuple[Tensor, Tensor],
         position: "int | Tensor",
         key_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """One-token attention step; branch structure mirrors fresh_lejepa.
 
@@ -160,6 +162,17 @@ class _NanoPostrainingMixin:
         ``position`` must be a 0-dim tensor in that mode, and masked cache
         slots must hold finite values. A 2-D (batch, keys) ``key_mask``
         keeps the narrow shapes but masks each row's left-padded prefix.
+
+        ``block_mask`` replaces a 2-D ``key_mask`` when every row's attendable
+        keys form one contiguous range, which is always true here: left padding
+        is a prefix and the write head is a suffix bound. It is not a
+        convenience — handing SDPA any ``attn_mask`` at all disqualifies the
+        fused backends and drops this step onto the memory-efficient kernel,
+        which the v25 profile measured at 32% of pool device time with 12672 of
+        its 12684 calls coming from here. The same information as a BlockMask
+        reaches flex decoding, measured 45-64% faster across L=128..2048 on the
+        production shapes. One mask serves all layers, so it is built by the
+        caller, not here.
         """
         batch, _, dim = x.shape
         num_heads, head_dim = attention.num_heads, attention.head_dim
@@ -182,6 +195,19 @@ class _NanoPostrainingMixin:
         q = q.to(cache[0].dtype)
         k = k.to(cache[0].dtype)
         v = v.to(cache[1].dtype)
+        if block_mask is not None:
+            if not torch.is_tensor(position):
+                raise ValueError("block_mask stepping requires a 0-dim tensor position")
+            if key_mask is not None:
+                # The block table already carries the live range; honouring a
+                # boolean mask too would silently pick one and drop the other.
+                raise ValueError("block_mask and key_mask are mutually exclusive")
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, v)
+            y = flex_attention(q, cache[0], cache[1], block_mask=block_mask, scale=0.12)
+            y = y.transpose(1, 2).contiguous().view(batch, 1, dim)
+            return attention.proj(y), cache
         attn_mask = None
         if key_mask is not None and key_mask.dim() == 2:
             if torch.is_tensor(position):
@@ -234,14 +260,90 @@ class _NanoPostrainingMixin:
         cache: tuple[Tensor, Tensor],
         position: "int | Tensor",
         key_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         del x0  # no encoder/decoder skip input in the nano trunk
         attn, cache = self._attention_step(
-            block.attn, block.norm1(x), cache, position, key_mask
+            block.attn, block.norm1(x), cache, position, key_mask, block_mask
         )
         x = x + attn
         x = x + block.mlp(block.norm2(x))
         return x, cache
+
+    @staticmethod
+    def _write_paged_cache(
+        cache: Tensor,
+        value: Tensor,
+        addresses: Tensor,
+    ) -> None:
+        cache.index_copy_(
+            2, addresses, value.permute(2, 1, 0, 3).contiguous()
+        )
+
+    def _attention_paged_step(
+        self,
+        attention: nanogpt_mini_model.CausalSelfAttention,
+        x: Tensor,
+        cache: tuple[Tensor, Tensor],
+        positions: Tensor,
+        block_mask: BlockMask,
+        cache_addresses: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """One-token attention for independently advancing packed cache lanes."""
+        batch, _, dim = x.shape
+        num_heads, head_dim = attention.num_heads, attention.head_dim
+        q = attention.q(x).view(batch, 1, num_heads, head_dim)
+        k = attention.k(x).view(batch, 1, num_heads, head_dim)
+        value = attention.v(x).view(batch, 1, num_heads, head_dim)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        angular_freq = attention.rotary.angular_freq
+        theta = positions[:, None].to(angular_freq.dtype) * angular_freq[None]
+        cos, sin = theta.cos()[:, None, None], theta.sin()[:, None, None]
+
+        def rotate(tensor: Tensor) -> Tensor:
+            first, second = tensor.float().chunk(2, dim=-1)
+            return torch.cat(
+                (first * cos + second * sin, first * (-sin) + second * cos),
+                dim=-1,
+            ).type_as(tensor)
+
+        q = rotate(q).transpose(1, 2).to(cache[0].dtype)
+        k = rotate(k).transpose(1, 2).to(cache[0].dtype)
+        value = value.transpose(1, 2).to(cache[1].dtype)
+        self._write_paged_cache(cache[0], k, cache_addresses)
+        self._write_paged_cache(cache[1], value, cache_addresses)
+        y = flex_attention(
+            q,
+            cache[0],
+            cache[1],
+            block_mask=block_mask,
+            scale=0.12,
+        )
+        y = y.transpose(1, 2).contiguous().view(batch, 1, dim)
+        return attention.proj(y), cache
+
+    def _block_paged_step(
+        self,
+        block: nanogpt_mini_model.Block,
+        x: Tensor,
+        x0: Tensor,
+        cache: tuple[Tensor, Tensor],
+        positions: Tensor,
+        block_mask: BlockMask,
+        cache_addresses: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        del x0
+        attn, cache = self._attention_paged_step(
+            block.attn,
+            block.norm1(x),
+            cache,
+            positions,
+            block_mask,
+            cache_addresses,
+        )
+        x = x + attn
+        return x + block.mlp(block.norm2(x)), cache
 
     @staticmethod
     def _prefill_attention_mask(key_valid: Tensor) -> Tensor:

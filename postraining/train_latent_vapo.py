@@ -148,6 +148,7 @@ from postraining.latent_thought import (
     RENDERER_FEATURES_SCHEMA,
     THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_MEAN_SCHEMA,
+    DecodeRangeMask,
     LatentThoughtModel,
     migrate_legacy_wrapper_checkpoint,
     rollout_policy_schema_for_mode,
@@ -155,8 +156,8 @@ from postraining.latent_thought import (
     validate_renderer_checkpoint,
 )
 from postraining.rollout_scheduler import (
-    TailScheduleStats,
-    rollout_scalar_tail_chunks,
+    ContinuousScheduleStats,
+    rollout_continuous_refill_groups,
 )
 from postraining.model_io import fresh_trunk, load_model
 from postraining.muon import Muon
@@ -414,7 +415,17 @@ def rollout_diagnostics(
     batch: LatentRolloutBatch,
     samples_per_prompt: int,
     stop_ids: tuple[int, ...] = (),
+    *,
+    refreshed_statistics: bool = True,
 ) -> dict[str, float | int]:
+    """Pool-level rollout metrics.
+
+    ``refreshed_statistics`` says whether ``refresh_old_statistics`` filled
+    ``batch.old_values``. It has no default meaning worth guessing: an
+    unrefreshed batch carries zeros there, and reporting their mean as
+    ``old_value_mean`` would publish a hard 0.0 that reads exactly like a
+    critic collapsed to zero. The key is omitted instead.
+    """
     stop_decisions = batch.stop_mask.sum().clamp_min(1)
     stop_set = set(stop_ids)
     # Fraction of rows that terminated themselves (emitted BOS or EOS)
@@ -499,7 +510,6 @@ def rollout_diagnostics(
         "think_runs_per_trajectory": runs.numel() / batch.reward_scalar.numel(),
         "emits_per_trajectory": float(batch.emit_mask.sum(1).mean()),
         "actions_per_trajectory": float(batch.action_mask.sum(1).mean()),
-        "old_value_mean": float(batch.old_values[generated].mean()) if generated.any() else 0.0,
         "continued_thinking_trajectory_fraction": float(
             continued.float().mean()
         ),
@@ -517,6 +527,17 @@ def rollout_diagnostics(
             torch.ones_like(continued)
         ),
         "ended_fraction": sum(ended) / max(len(ended), 1),
+        **(
+            {
+                "old_value_mean": (
+                    float(batch.old_values[generated].mean())
+                    if generated.any()
+                    else 0.0
+                )
+            }
+            if refreshed_statistics
+            else {}
+        ),
     }
 
 
@@ -524,10 +545,18 @@ def aggregate_diagnostics(
     groups: list[LatentRolloutBatch],
     samples_per_prompt: int,
     stop_ids: tuple[int, ...] = (),
+    *,
+    refreshed_statistics: bool = True,
 ) -> dict[str, float | int]:
     """Mean of per-group rollout diagnostics; trajectory counts are summed."""
     per_group = [
-        rollout_diagnostics(group, samples_per_prompt, stop_ids) for group in groups
+        rollout_diagnostics(
+            group,
+            samples_per_prompt,
+            stop_ids,
+            refreshed_statistics=refreshed_statistics,
+        )
+        for group in groups
     ]
     aggregated: dict[str, float | int] = {}
     for key in per_group[0]:
@@ -1763,15 +1792,12 @@ def update_minibatch(
         # Every compaction below therefore has a host-known output shape and
         # uses index_select/index_add without a data-dependent CUDA sync.
         emit_index = shard.emit_index
-        emit_features = wrapper.renderer_features(
+        # Shared with refresh_old_statistics: one compiled artifact for both
+        # keeps the two forwards bit-identical (the age-0 zero-clip canary).
+        compact_token_logprobs = compact_emit_token_logprobs(
+            wrapper,
             compact_slots(stream_inputs, emit_index),
             compact_slots(beliefs, emit_index),
-        )
-        # Shared with refresh_old_statistics: identical chunk boundaries keep
-        # the two eager forwards bit-identical (the age-0 zero-clip canary).
-        compact_token_logprobs = compact_emit_token_logprobs(
-            backbone,
-            emit_features,
             compact_next_slots(microbatch.token_ids, emit_index),
         )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
@@ -2596,6 +2622,7 @@ def measure_post_update_policy_drift(
     replay_bucket: int,
     replay_slot_budget: int | None = None,
     replay_function: Callable = replay_head_inputs,
+    emit_logprob_function: Callable = compact_emit_token_logprobs,
     replay_plans: list[ReplayPlan] | None = None,
 ) -> dict[str, float]:
     """Evaluate the just-updated policy on its behavior trajectories.
@@ -2605,10 +2632,13 @@ def measure_post_update_policy_drift(
     policy. This read-only replay measures the actual post-step drift
     without reusing trajectories for a gradient. It runs only at the explicit
     diagnostic cadence because it costs one additional policy forward.
-    ``replay_function`` deliberately stays eager in the trainer: invoking the
-    grad-enabled training artifact under this function's no-grad context would
-    force Dynamo/AOTAutograd to compile a second guarded graph, while enabling
-    gradients here retains a full replay graph and can exceed peak memory.
+    ``replay_function`` and ``emit_logprob_function`` deliberately stay eager
+    in the trainer: invoking a grad-enabled training artifact under this
+    function's no-grad context would force Dynamo/AOTAutograd to compile a
+    second guarded graph, while enabling gradients here retains a full replay
+    graph and can exceed peak memory. Both are parameters rather than module
+    lookups precisely because the trainer rebinds those globals to compiled
+    artifacts.
     """
     if not batches:
         raise ValueError("post-update drift requires at least one rollout batch")
@@ -2691,22 +2721,13 @@ def measure_post_update_policy_drift(
             token_logprobs = torch.zeros_like(microbatch.old_token_logprobs).float()
             if shard.emit_index.numel():
                 emit_index = shard.emit_index
-                emit_logits = wrapper.backbone.logits_from_features(
-                    wrapper.renderer_features(
-                        compact_slots(stream_inputs, emit_index),
-                        compact_slots(beliefs, emit_index),
-                    )
-                )
-                compact_token_logprobs = (
-                    emit_logits.float()
-                    .log_softmax(-1)
-                    .gather(
-                        -1,
-                        compact_next_slots(
-                            microbatch.token_ids, emit_index
-                        )[..., None],
-                    )
-                    .squeeze(-1)
+                compact_token_logprobs = emit_logprob_function(
+                    wrapper,
+                    compact_slots(stream_inputs, emit_index),
+                    compact_slots(beliefs, emit_index),
+                    compact_next_slots(
+                        microbatch.token_ids, emit_index
+                    ),
                 )
                 scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
             token_log_ratio = (
@@ -3518,7 +3539,9 @@ def main() -> None:
             allow_thought_reverse_kl_migration=(
                 args.migrate_thought_reverse_kl_resume
             ),
-            allow_tail_merge_migration=args.migrate_tail_merge_resume,
+            allow_rollout_scheduler_migration=(
+                args.migrate_rollout_scheduler_resume
+            ),
         ):
             raise ValueError(
                 "resume checkpoint execution schema must be "
@@ -3531,7 +3554,8 @@ def main() -> None:
                 "--migrate-anchored-value-resume; v20 additionally requires "
                 "--migrate-joint-clip-resume; v19 additionally requires "
                 "--migrate-v20-execution-resume; v18 requires all of those "
-                "plus --migrate-reverse-kl-resume."
+                "plus --migrate-reverse-kl-resume. A scheduler change also "
+                "requires --migrate-rollout-scheduler-resume."
             )
         if not resume_replay_schema_compatible(
             payload,
@@ -3723,7 +3747,9 @@ def main() -> None:
     if args.bpb_only or args.bench_only:
         planned_prompt_count = 0
     elif args.rollout_only:
-        planned_prompt_count = args.prompts_per_rollout
+        planned_prompt_count = (
+            args.prompts_per_rollout * args.rollout_only_repeats
+        )
     else:
         warmup_updates = (
             max(args.value_warmup_steps - warmup_step, 0) if start_step == 0 else 0
@@ -3808,8 +3834,15 @@ def main() -> None:
     # as a backstop on the frame's compile id. Under fullgraph=True either
     # raises rather than falling back to eager, so it would kill a long run
     # mid-flight. Deliberately NOT raised: compute_cache_size walks the live
-    # entry list, so invalidated entries do not accumulate there, and the
-    # measured maximum for any frame in this process is 3.
+    # entry list, so invalidated entries do not accumulate there.
+    #
+    # The frame that gets close is step_core, and only under
+    # --rollout-flex-decode: eval's dynamic artifact, the tail graph, and the
+    # dynamic=False rollout artifact all compile that one code object, and the
+    # last of them specializes per (bucketed row count, kv width). That is why
+    # decode_width_grid below caps the width axis at two -- at ~9 row counts
+    # it keeps the total near 20 rather than the ~36 a block-fine width grid
+    # would produce. Without the flag the measured maximum for any frame is 3.
 
     # Rollout and evaluation use the identical dynamic narrow-prefix step.
     # Compile it once: separate wrappers paid the same large cold compilation
@@ -3817,7 +3850,13 @@ def main() -> None:
     # latches an eager fallback, the eval closure below also disables this
     # shared artifact for training before it can be called again.
     compiled_generation_step = None
-    if args.rollout_compile or args.eval_compile:
+    if (
+        args.eval_compile
+        or (
+            args.rollout_compile
+            and args.rollout_scheduler == "lockstep"
+        )
+    ):
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, 64
         )
@@ -3831,9 +3870,61 @@ def main() -> None:
             ),
         )
     rollout_step_core = (
-        compiled_generation_step if args.rollout_compile else None
+        compiled_generation_step
+        if args.rollout_compile and args.rollout_scheduler == "lockstep"
+        else None
     )
+    if rollout_step_core is not None and args.rollout_flex_decode:
+        # Flex decoding needs its OWN artifact: the shared one above is
+        # dynamic=True for eval's arbitrary batches, and under symbolic shapes
+        # Inductor has no flex decode choice to pick at all (measured -- the
+        # lowering fails outright with "no choices exist for backend", and a
+        # dynamic batch alone is enough to do it). The rollout can afford
+        # dynamic=False because it now compacts to bucketed row counts, so
+        # the row count takes a bounded number of values and the KV width is
+        # pinned by the mask. Separate from the paged artifact for the same
+        # reason that one exists.
+        # NOT max-autotune: each bucket specialization compiles lazily, the
+        # first time that row count appears, which is mid-rollout with the
+        # full KV cache set already resident. Exhaustive benchmarking there
+        # allocates candidate workspaces on top of it and spikes the peak --
+        # measured at 24.68 GiB against a 15.0 GiB steady state on the same
+        # config, which is what OOMs the production shape.
+        rollout_step_core = profiler.register_artifact(
+            "flex_generation_step",
+            torch.compile(
+                wrapper.step_core,
+                fullgraph=True,
+                dynamic=False,
+                # Under --rollout-graph-decode the loop holds one row count and
+                # one KV width for the whole run, which is the precondition
+                # capture needs: a single recording, replayed every step. The
+                # caches are marked static and the mask's closed-over buffers
+                # are refilled in place, so no address the recording captured
+                # ever moves.
+                **(
+                    {"mode": "reduce-overhead"}
+                    if args.rollout_graph_decode
+                    else {}
+                ),
+            ),
+        )
     eval_step_core = compiled_generation_step if args.eval_compile else None
+    rollout_paged_step_core = None
+    if args.rollout_scheduler == "continuous_refill":
+        rollout_paged_step_core = profiler.register_artifact(
+            "rollout_paged_step",
+            torch.compile(
+                wrapper.paged_step_core,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=True,
+                # FlexDecoding requires a concrete batch dimension. The
+                # scheduler supplies one full-capacity main bucket plus
+                # power-of-two tail buckets, avoiding a specialization for
+                # every possible survivor count.
+                dynamic=False,
+            ),
+        )
 
     # Static-tail CUDA graph for the fixed-size compacted training tail.
     # The caches are allocated ONCE and live for the whole run: a fresh
@@ -3842,12 +3933,21 @@ def main() -> None:
     # temporary rollout_step_core patch never reaches it), and it only ever
     # runs under the training autocast at one shape, so it stays a single
     # cudagraph specialization.
+    # Flex decoding wants a block-aligned KV width. The boolean tail mask does
+    # not, and rounding for it would only widen the range it scores, so the
+    # alignment follows the flag that needs it.
+    decode_block_size = DecodeRangeMask.DEFAULT_BLOCK_SIZE
+    rollout_cache_width = args.prompt_tokens + max_stream_steps
+    if args.rollout_flex_decode:
+        rollout_cache_width = (
+            -(-rollout_cache_width // decode_block_size) * decode_block_size
+        )
     rollout_tail_caches = None
     rollout_tail_step_core = None
     if args.rollout_tail_graph:
         rollout_tail_caches = wrapper.make_static_generation_cache(
             args.rollout_tail_batch,
-            args.prompt_tokens + max_stream_steps,
+            rollout_cache_width,
             device,
             dtype=torch.bfloat16,
         )
@@ -3861,10 +3961,121 @@ def main() -> None:
             ),
         )
 
-    # Preserve the eager function for infrequent no-grad diagnostics. Calling
-    # the compiled training artifact under no-grad would create a distinct
+    # Flex decoding. A boolean attn_mask disqualifies every fused SDPA backend,
+    # and the v25 kernel profile put the resulting memory-efficient kernel at
+    # 32% of pool device time with 12672 of its 12684 calls coming from this
+    # step. The target is the lockstep MAIN loop, not the tail: at
+    # --rollout-groups 32 the direct call count in NOTES.md:1285 is 2080 main
+    # vs 32 tail, so a tail-only change reaches 1.52% of the decode iterations
+    # and the tail does not even engage until 96.9% of rows have ended.
+    # Inductor lowers flex decoding for fully static shapes alone, so the main
+    # loop rounds its live row count up to a bucket multiple and gives filler
+    # rows an EMPTY key range -- measured to return exactly 0, finite, reading
+    # no KV -- which makes the padding free.
+    #
+    # Masks are owned by the caller, not rebuilt inside the rollout, because
+    # they hold persistent buffers whose addresses a cudagraph would capture.
+    # (They do NOT cost extra compiles: rebuilding per step was measured at
+    # zero additional specializations, so the mask_mod closure is not guarded
+    # on by identity.)
+    rollout_tail_decode_mask = None
+    if args.rollout_flex_decode and not is_nano:
+        # validate_args cannot see the checkpoint. The other accepted family is
+        # PoPE, whose _attention_step scores a complex inner product over a
+        # k_real/k_imag pair rather than one QK product and raises on a block
+        # mask -- at the first tail switch, which is many pools in. Fail here.
+        raise ValueError(
+            f"--rollout-flex-decode needs a single-QK decode step; "
+            f"architecture {backbone.architecture!r} does not have one"
+        )
+    # The KV width is what makes flex decoding expensive in memory. The
+    # boolean path narrows the cache to the written prefix every step; the flex
+    # step reads the whole allocated width, so the width is fixed at
+    # allocation. Pinning it to the args upper bound (prompt_tokens +
+    # max_stream_steps = 2560) instead of the pool's actual padded prompt costs
+    # ~2.2 GiB at the production shape, which is more than a 32 GB card has
+    # spare once two rollout groups' cache sets briefly coexist -- measured as
+    # an OOM at make_generation_cache with 27.09 GiB already allocated. So the
+    # mask is built per chunk width instead, and a pool of short prompts skips
+    # the widest cache entirely.
+    #
+    # The grid is deliberately much coarser than the KV block size. Every
+    # distinct (row count, kv width) pair is its own dynamic=False
+    # specialization of step_core, and eval's artifact and the tail graph
+    # compile the SAME code object, so all three share one cache_size_limit.
+    # Rounding to the 128-wide block would give four widths against the ~9
+    # bucketed row counts -- 36 entries against a limit of 64, and an overflow
+    # under fullgraph=True RAISES rather than falling back to eager, killing a
+    # long run mid-flight. Half the prompt bound caps the width axis at two
+    # while keeping the adaptivity that pays.
+    decode_width_grid = max(
+        decode_block_size,
+        -(-args.prompt_tokens // (2 * decode_block_size)) * decode_block_size,
+    )
+    rollout_decode_masks: dict[int, DecodeRangeMask] = {}
+    rollout_graph_rows = max(args.rollout_groups, 1) * args.samples_per_prompt
+
+    def decode_mask_for(prompt_width: int) -> DecodeRangeMask | None:
+        """Main-loop mask sized for a chunk left-padded to ``prompt_width``."""
+        if not args.rollout_flex_decode or rollout_step_core is None:
+            return None
+        if args.rollout_graph_decode:
+            # One recording for the run means one width for the run, so the
+            # per-chunk adaptivity below is not available: the mask must match
+            # the static cache exactly.
+            width = rollout_cache_width
+        else:
+            width = prompt_width + max_stream_steps
+            width = -(-width // decode_width_grid) * decode_width_grid
+        mask = rollout_decode_masks.get(width)
+        if mask is None:
+            mask = DecodeRangeMask(
+                # --rollout-groups 0 selects the sequential single-prompt
+                # branch, which still rolls out samples_per_prompt rows.
+                rollout_graph_rows,
+                width,
+                device,
+                block_size=decode_block_size,
+            )
+            rollout_decode_masks[width] = mask
+        return mask
+
+    # The captured main loop's arena. Allocated ONCE for the whole run, at the
+    # full row count and the full KV width, because a re-allocation moves the
+    # addresses the recording captured and forces a re-record. It is also the
+    # reason the per-chunk cache churn disappears under this flag: the old path
+    # allocated a fresh cache per chunk and relied on the cyclic collector to
+    # reclaim the previous one before the next expanded.
+    #
+    # That permanence is also its cost: unlike the per-chunk cache it replaces,
+    # it stays resident through the update, so it is charged against peak VRAM
+    # rather than overlapping it. ``planned_prompt_count`` is zero exactly when
+    # no rollout will run (--bpb-only, --bench-only), and those modes must not
+    # pay multiple GiB for an arena they never touch.
+    rollout_graph_caches = None
+    if args.rollout_graph_decode and planned_prompt_count > 0:
+        rollout_graph_caches = wrapper.make_static_generation_cache(
+            rollout_graph_rows,
+            rollout_cache_width,
+            device,
+            dtype=torch.bfloat16,
+        )
+
+    if args.rollout_flex_decode and rollout_tail_caches is not None:
+        rollout_tail_decode_mask = DecodeRangeMask(
+            args.rollout_tail_batch,
+            rollout_cache_width,
+            device,
+            block_size=decode_block_size,
+        )
+
+    # Preserve the eager functions for infrequent no-grad diagnostics. Calling
+    # a compiled training artifact under no-grad would create a distinct
     # AOTAutograd specialization solely because grad mode is a Dynamo guard.
+    # Both the replay head and the readout tail get rebound below, so both
+    # need capturing here.
     diagnostic_replay_head_inputs = replay_head_inputs
+    diagnostic_emit_token_logprobs = compact_emit_token_logprobs
 
     # Replay compilation is independent of rollout. Dynamic B/L plus bounded
     # 64-token buckets lets one artifact cover the length-aware shard plan;
@@ -3911,6 +4122,27 @@ def main() -> None:
         # grad-enabled).
         globals()["replay_head_inputs"] = compiled_replay
         postraining.latent_rollout.replay_head_inputs = compiled_replay
+        # The vocabulary readout tail, for the same reason and by the same
+        # rebinding. Eagerly it is the readout GEMM followed by ~7 separate
+        # passes over a (slots, 50257) fp32 tensor — softcap pow/add/rsqrt/
+        # mul/mul, then log-softmax — to produce one scalar per slot. Fused,
+        # the vocabulary axis stays in registers and only the (slots,) result
+        # is written. Both consumers must land on THIS object: two artifacts
+        # would be free to pick different reduction orders, and refresh minus
+        # update is precisely the age-0 canary.
+        compiled_emit_logprobs = profiler.register_artifact(
+            "compact_emit_token_logprobs",
+            torch.compile(
+                compact_emit_token_logprobs,
+                mode="default",
+                fullgraph=True,
+                dynamic=True,
+            ),
+        )
+        globals()["compact_emit_token_logprobs"] = compiled_emit_logprobs
+        postraining.latent_rollout.compact_emit_token_logprobs = (
+            compiled_emit_logprobs
+        )
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -4063,6 +4295,7 @@ def main() -> None:
         return batch
 
     last_decode_schedule_metrics: dict[str, float] | None = None
+    rollout_paged_cache = None
 
     def _collect(
         refresh_statistics: bool,
@@ -4071,8 +4304,9 @@ def main() -> None:
         scoring_pool: ThreadPoolExecutor | None,
     ) -> list[LatentRolloutBatch]:
         """One rollout: a scored prompt group per sampled DAPO problem."""
-        nonlocal last_decode_schedule_metrics
+        nonlocal last_decode_schedule_metrics, rollout_paged_cache
         last_decode_schedule_metrics = None
+        pool_start_cursor = sampler.cursor
         rollout_rows = sampler.next_rows(prompt_count)
         prompt_budget = args.prompt_tokens - len(answer_prefix_ids)
         with profiler.phase("prompt_encode"):
@@ -4126,8 +4360,15 @@ def main() -> None:
                             else None
                         ),
                         prompt_repeats=args.samples_per_prompt,
+                        caches=(
+                            rollout_graph_caches
+                            if rollout_step_core is not None
+                            else None
+                        ),
                         tail_caches=rollout_tail_caches,
                         tail_step_core=rollout_tail_step_core,
+                        decode_mask=decode_mask_for(len(encoded)),
+                        tail_decode_mask=rollout_tail_decode_mask,
                     )
                 if offload_to_cpu:
                     with profiler.phase("stream_d2h"):
@@ -4241,36 +4482,55 @@ def main() -> None:
             )
             return chunk, prompt_ids, prompt_lengths_cpu
 
-        if args.rollout_scheduler == "tail_merge":
-            # Scalar-position tail handoff requires every chunk to share the
-            # same physical prefix width. This keeps RoPE/PoPE cache positions
-            # aligned, so survivors can merge without per-row KV scatter.
+        if args.rollout_scheduler == "continuous_refill":
+            # One physical lane pool remains full while later prompt groups
+            # are pending. Every admitted request keeps its own logical
+            # position, request-local RNG stream, and paged live KV prefix.
+            # A common prompt width retains the ordinary rollout's left-pad
+            # position convention. One pool-wide prefill bank traverses each
+            # unique prompt once; refill only fans its cached KV/state into
+            # sample lanes.
             common_width = max(len(ids) for _, ids in encoded_rows)
             with profiler.phase("prompt_upload"):
                 uploaded = [
                     upload_chunk(encoded_chunk, common_width)
                     for encoded_chunk in encoded_chunks
                 ]
-            schedule_stats = TailScheduleStats()
+            schedule_stats = ContinuousScheduleStats()
+            if rollout_paged_cache is None:
+                # Static-batch FlexDecoding specializations retain their
+                # first cache inputs. Own that arena explicitly and reuse it
+                # across pools instead of attempting another multi-GiB
+                # allocation. Stale suffixes are unreachable through each
+                # request's live-page mask; every admitted prefix and future
+                # write overwrites the reachable locations.
+                rollout_paged_cache = wrapper.make_paged_generation_cache(
+                    args.rollout_groups * samples,
+                    args.prompt_tokens + max_stream_steps,
+                    device,
+                    dtype=torch.bfloat16,
+                )
             with profiler.phase("decode"):
-                scheduled_batches = rollout_scalar_tail_chunks(
+                scheduled_batches = rollout_continuous_refill_groups(
                     wrapper,
                     [item[1] for item in uploaded],
                     [item[2] for item in uploaded],
                     prompt_repeats=samples,
+                    capacity_rows=args.rollout_groups * samples,
                     max_new_tokens=train_max_new_tokens,
                     max_stream_steps=max_stream_steps,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    tail_rows=args.rollout_tail_batch,
+                    # The sampler cursor is monotonic and checkpointed. Mixed
+                    # with the user seed it gives each pool a reproducible,
+                    # resume-stable request-key namespace.
+                    seed=(args.seed << 32) ^ pool_start_cursor,
                     stop_ids=stop_ids or None,
                     cache_dtype=torch.bfloat16,
-                    tensor_positions=rollout_step_core is not None,
                     pin_emit=pin_emit,
-                    sync_every=args.rollout_sync_every,
-                    compact_dead_ratio=args.rollout_compact_dead_ratio,
                     offload_device=cpu if offload_to_cpu else device,
                     schedule_stats=schedule_stats,
+                    paged_cache=rollout_paged_cache,
                 )
             last_decode_schedule_metrics = schedule_stats.metrics()
             for batch_index, (chunk, _, prompt_lengths_cpu) in enumerate(
@@ -4321,8 +4581,15 @@ def main() -> None:
                         else None
                     ),
                     prompt_repeats=samples,
+                    caches=(
+                        rollout_graph_caches
+                        if rollout_step_core is not None
+                        else None
+                    ),
                     tail_caches=rollout_tail_caches,
                     tail_step_core=rollout_tail_step_core,
+                    decode_mask=decode_mask_for(chunk_width),
+                    tail_decode_mask=rollout_tail_decode_mask,
                 )
             complete_chunk(batched, prompt_lengths_cpu, chunk)
             del batched
@@ -4345,8 +4612,11 @@ def main() -> None:
                 "optimizer minibatches are assembled"
             )
         original_step_core = wrapper.step_core
+        original_paged_step_core = wrapper.paged_step_core
         if rollout_step_core is not None:
             wrapper.step_core = rollout_step_core
+        if rollout_paged_step_core is not None:
+            wrapper.paged_step_core = rollout_paged_step_core
         # Offloaded chunks are host tensors after compact_stream_to_device's
         # barrier, so one worker thread can trim and score chunk N (the
         # tokenizer's decode releases the GIL) while the launch-bound rollout
@@ -4372,6 +4642,7 @@ def main() -> None:
             if scoring_pool is not None:
                 scoring_pool.shutdown(wait=True)
             wrapper.step_core = original_step_core
+            wrapper.paged_step_core = original_paged_step_core
 
     def training_update(*update_args, **update_kwargs):
         with training_autocast():
@@ -4537,12 +4808,63 @@ def main() -> None:
         return
 
     if args.rollout_only:
-        metrics = aggregate_diagnostics(collect(), args.samples_per_prompt, stop_ids)
-        passed = metrics["within_group_reward_std"] >= args.gate_min_within_group_reward_std
-        logger.log(type="rollout_gate", passed=passed, **metrics)
-        print(json.dumps({"passed": bool(passed), **metrics}, sort_keys=True))
+        all_passed = True
+        for repeat in range(args.rollout_only_repeats):
+            torch.cuda.reset_peak_memory_stats()
+            started = time.perf_counter()
+            groups = collect(
+                refresh_statistics=False,
+                offload_to_cpu=True,
+            )
+            torch.cuda.synchronize()
+            # collect(refresh_statistics=False) above: no old_values exist.
+            metrics = aggregate_diagnostics(
+                groups,
+                args.samples_per_prompt,
+                stop_ids,
+                refreshed_statistics=False,
+            )
+            if last_decode_schedule_metrics is None:
+                metrics.update(
+                    lockstep_decode_metrics(
+                        groups, max(args.rollout_groups, 1)
+                    )
+                )
+            else:
+                metrics.update(last_decode_schedule_metrics)
+            metrics["collect_seconds"] = time.perf_counter() - started
+            metrics["peak_vram_bytes"] = torch.cuda.max_memory_allocated()
+            metrics["useful_actions_per_second"] = (
+                metrics["trajectories"]
+                * metrics["actions_per_trajectory"]
+                / metrics["collect_seconds"]
+            )
+            passed = (
+                metrics["within_group_reward_std"]
+                >= args.gate_min_within_group_reward_std
+            )
+            all_passed &= passed
+            logger.log(
+                type="rollout_gate",
+                repeat=repeat,
+                passed=passed,
+                **metrics,
+            )
+            print(
+                json.dumps(
+                    {
+                        "type": "rollout_gate",
+                        "repeat": repeat,
+                        "passed": bool(passed),
+                        **metrics,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            del groups
         tensorboard.close()
-        raise SystemExit(0 if passed else 2)
+        raise SystemExit(0 if all_passed else 2)
 
     if start_step == 0 and (warmup_step == 0 or args.actor_critic_init):
         bpb = teacher_forced_bpb()
@@ -5199,6 +5521,7 @@ def main() -> None:
                             replay_bucket=args.replay_bucket,
                             replay_slot_budget=args.replay_slot_budget,
                             replay_function=diagnostic_replay_head_inputs,
+                            emit_logprob_function=diagnostic_emit_token_logprobs,
                             replay_plans=[device_replay_plan],
                         )
                     if not all(

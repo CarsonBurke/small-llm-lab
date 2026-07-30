@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 import train_gpt as baseline
@@ -546,6 +547,7 @@ class FreshLeJEPAGPT(baseline.GPT):
         cache: tuple[Tensor, Tensor],
         position: int | Tensor,
         key_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """One-token GQA attention step used by post-training rollouts.
 
@@ -557,6 +559,13 @@ class FreshLeJEPAGPT(baseline.GPT):
         mode, and masked cache slots must hold finite values (zero-fill the
         cache once at allocation: masked garbage would still reach the
         softmax as NaN scores).
+
+        ``block_mask`` carries the same full-cache information as a flex
+        decoding block table. It exists because handing SDPA any ``attn_mask``
+        disqualifies its fused backends and drops the step onto the
+        memory-efficient kernel; every mask the rollout builds is one
+        contiguous KV range per row, which flex expresses exactly. One mask
+        serves all layers, so the caller builds it (``DecodeRangeMask``).
         """
         batch, _, dim = x.shape
         q_dim = attention.num_heads * attention.head_dim
@@ -573,6 +582,25 @@ class FreshLeJEPAGPT(baseline.GPT):
         q = baseline.apply_rotary_emb(q, cos, sin)
         k = baseline.apply_rotary_emb(k, cos, sin)
         q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
+        if block_mask is not None:
+            if not torch.is_tensor(position):
+                raise ValueError("block_mask stepping requires a 0-dim tensor position")
+            if key_mask is not None:
+                # The block table already carries the live range; honouring a
+                # boolean mask too would silently pick one and drop the other.
+                raise ValueError("block_mask and key_mask are mutually exclusive")
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, v)
+            y = flex_attention(
+                q,
+                cache[0],
+                cache[1],
+                block_mask=block_mask,
+                enable_gqa=attention.num_kv_heads != attention.num_heads,
+            )
+            y = y.transpose(1, 2).contiguous().view(batch, 1, dim)
+            return attention.proj(y), cache
         attn_mask = None
         if key_mask is not None and key_mask.dim() == 2:
             # Per-row (batch, keys) validity for left-padded batched rollouts:
@@ -629,14 +657,153 @@ class FreshLeJEPAGPT(baseline.GPT):
         cache: tuple[Tensor, Tensor],
         position: int | Tensor,
         key_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         mix = block.resid_mix.to(x.dtype)
         x = mix[0][None, None] * x + mix[1][None, None] * x0
         attn, cache = self._attention_step(
-            block.attn, block.attn_norm(x), cache, position, key_mask
+            block.attn, block.attn_norm(x), cache, position, key_mask, block_mask
         )
         x = x + block.attn_scale.to(x.dtype)[None, None] * attn
         x = x + block.mlp_scale.to(x.dtype)[None, None] * block.mlp(block.mlp_norm(x))
+        return x, cache
+
+    @staticmethod
+    def _write_paged_cache(
+        cache: Tensor,
+        value: Tensor,
+        addresses: Tensor,
+    ) -> None:
+        """Write one value per active lane at its precomputed page address."""
+        packed = value.permute(2, 1, 0, 3).contiguous()
+        cache.index_copy_(2, addresses, packed)
+
+    def _attention_paged_step(
+        self,
+        attention: baseline.CausalSelfAttention,
+        x: Tensor,
+        cache: tuple[Tensor, ...],
+        positions: Tensor,
+        block_mask: BlockMask,
+        cache_addresses: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, ...]]:
+        """One-token ragged decode over recyclable physical pages.
+
+        ``cache_addresses`` carries each row's physical write slot, resolved
+        through the cache's page table, while ``positions`` supplies its
+        independent LOGICAL position for rotary/positional terms. The supplied
+        FlexAttention mask contains only that row's live physical pages, so
+        stale suffixes and every other row are skipped by the fused decode
+        kernel.
+        """
+        batch, _, dim = x.shape
+        q_dim = attention.num_heads * attention.head_dim
+        kv_dim = attention.num_kv_heads * attention.head_dim
+        q, k, value = attention.c_qkv(x).split(
+            [q_dim, kv_dim, kv_dim], dim=-1
+        )
+        q = q.view(
+            batch, 1, attention.num_heads, attention.head_dim
+        ).transpose(1, 2)
+        k = k.view(
+            batch, 1, attention.num_kv_heads, attention.head_dim
+        ).transpose(1, 2)
+        value = value.view(
+            batch, 1, attention.num_kv_heads, attention.head_dim
+        ).transpose(1, 2)
+
+        # PoPE keeps a complex K cache. Paged decode stores the concatenated
+        # real/imaginary representation directly, avoiding a full-cache cat
+        # on every token. Duck typing is intentional: the PoPE experiment
+        # subclasses this backbone without introducing a dependency here.
+        polar = getattr(attention, "polar_inv_freq", None) is not None
+        if polar:
+            polar_frequency = attention.polar_inv_freq.to(device=x.device)
+            theta = (
+                positions[:, None].to(polar_frequency.dtype)
+                * polar_frequency[None]
+            )[:, None, None]
+            delta = attention.delta_c.clamp(-2 * torch.pi, 0).to(theta.dtype)
+            q_theta = theta - delta
+            q_magnitude = F.softplus(q.float())
+            k_magnitude = F.softplus(k.float())
+            gain = attention.q_gain.float()[None, :, None, None]
+            q_real = q_magnitude * q_theta.cos() * gain
+            q_imag = q_magnitude * q_theta.sin() * gain
+            k_real = k_magnitude * theta.cos()
+            k_imag = k_magnitude * theta.sin()
+            query = torch.cat((q_real, q_imag), dim=-1).to(cache[0].dtype)
+            key = torch.cat((k_real, k_imag), dim=-1).to(cache[0].dtype)
+            value = value.to(cache[1].dtype)
+            self._write_paged_cache(
+                cache[0], key, cache_addresses
+            )
+            self._write_paged_cache(
+                cache[1], value, cache_addresses
+            )
+            y = flex_attention(
+                query,
+                cache[0],
+                cache[1],
+                block_mask=block_mask,
+                enable_gqa=attention.num_kv_heads != attention.num_heads,
+                scale=attention.head_dim**-0.5,
+            )
+        else:
+            q = F.rms_norm(q, (q.size(-1),))
+            k = F.rms_norm(k, (k.size(-1),))
+            frequency = (
+                positions[:, None].to(attention.rotary.inv_freq.dtype)
+                * attention.rotary.inv_freq.to(x.device)[None]
+            )
+            cos = frequency.cos()[:, None, None].to(q.dtype)
+            sin = frequency.sin()[:, None, None].to(q.dtype)
+            q = baseline.apply_rotary_emb(q, cos, sin)
+            k = baseline.apply_rotary_emb(k, cos, sin)
+            q = q * attention.q_gain.to(q.dtype)[None, :, None, None]
+            q = q.to(cache[0].dtype)
+            k = k.to(cache[0].dtype)
+            value = value.to(cache[1].dtype)
+            self._write_paged_cache(
+                cache[0], k, cache_addresses
+            )
+            self._write_paged_cache(
+                cache[1], value, cache_addresses
+            )
+            y = flex_attention(
+                q,
+                cache[0],
+                cache[1],
+                block_mask=block_mask,
+                enable_gqa=attention.num_kv_heads != attention.num_heads,
+            )
+        y = y.transpose(1, 2).contiguous().view(batch, 1, dim)
+        return attention.proj(y), cache
+
+    def _block_paged_step(
+        self,
+        block: baseline.Block,
+        x: Tensor,
+        x0: Tensor,
+        cache: tuple[Tensor, ...],
+        positions: Tensor,
+        block_mask: BlockMask,
+        cache_addresses: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, ...]]:
+        mix = block.resid_mix.to(x.dtype)
+        x = mix[0][None, None] * x + mix[1][None, None] * x0
+        attn, cache = self._attention_paged_step(
+            block.attn,
+            block.attn_norm(x),
+            cache,
+            positions,
+            block_mask,
+            cache_addresses,
+        )
+        x = x + block.attn_scale.to(x.dtype)[None, None] * attn
+        x = x + block.mlp_scale.to(x.dtype)[None, None] * block.mlp(
+            block.mlp_norm(x)
+        )
         return x, cache
 
     def generation_step(

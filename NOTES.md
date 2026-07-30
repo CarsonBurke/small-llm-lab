@@ -1749,6 +1749,55 @@ than one: `decode_step_utilization` 0.535-0.583. Still the largest
 unclaimed item on the list, still never attempted, and the 8-pool
 spread makes it a stable target rather than a single-pool artifact.
 
+### Continuous refill implementation (2026-07-26, OPT-IN / REJECTED FOR 5090 TRAINING)
+
+`--rollout-scheduler continuous_refill` now implements the systems path
+behind that measurement: fixed physical decode lanes, per-iteration
+whole-group refill, per-request positions, request-stable Philox streams, and
+block-sparse paged FlexAttention over only each row's live KV pages. Every
+unique prompt in the pool is prefetched in one dense prefix-bank pass; refill
+only scatters cached KV/state into its sample lanes. FlexDecoding retains the
+first cache inputs in its compiled artifact, so the trainer owns and reuses
+one finite-initialized paged arena across pools. Masked partial pages must
+never contain NaN garbage; stale suffixes remain unreachable. No trajectory
+is shortened; the existing token/context limits remain safety semantics.
+
+Production-shape CUDA results:
+
+* g32 rollout-only, repeats 2-7: 5.396 s mean collection vs 8.329 s
+  lockstep, **35.2% lower wall** and **27.4% higher useful-action/s**.
+  Decode utilization rose to ~0.91. However, its ~23.2 GiB persistent arena
+  leaves too little memory for replay: the end-to-end run OOMed.
+* g24 fits (~23.2 GiB update peak) but requires three admission waves. Its
+  warm collection was 19.22 s vs 10.92 s for matched g32 lockstep, and its
+  final pool took 27.12 s vs 19.88 s. Reject.
+* g16 fits but similarly loses to lockstep (20.24 s final pool vs the older
+  18.29 s control).
+
+The implementation stays as a tested opt-in/reference path, but lockstep
+remains the production default on a 32 GiB 5090. The scheduler has real
+decode payoff only at g32; making that trainable needs a materially smaller
+cache representation or freeing the compiled arena before replay, not a
+smaller refill batch.
+
+A streamed 8192-token selected-logprob readout was also tested as a memory
+escape hatch. It let g16 train and reduced refresh, but checkpointed vocab
+recomputation made the matched lockstep pool 19.88 s vs 18.29 s (+8.7%).
+It was removed. The existing slot-budgeted dense readout remains faster.
+
+The resulting dense lockstep v34 run is modestly faster than v33: step-8
+pool wall is 17.47 s vs 18.29 s (-4.5%) while processing 0.5% more actions;
+step 12 is 16.88 s vs 17.44 s (-3.2%) while processing 2.7% more actions.
+That is roughly a 5-6% work-normalized throughput uplift. Job 517 is the
+selected 20,000-step run; AIME and easy-benchmark evaluation cadence is 250.
+
+This replaces the scalar tail-parking experiment. Whole-group admission may
+leave at most 15 lanes unused; one completion/position transfer is the
+per-iteration host boundary. Async/versioned RL and speculative decoding are
+not part of this change: the former adds policy staleness on one shared GPU,
+while the latter has no lossless draft/verifier construction for the joint
+discrete gate/token plus continuous latent action.
+
 ### Compile floor: REACHED (job 445, ten pools)
 
 Zero compilations and zero runtime records in pools 1-9. All seven
@@ -1910,3 +1959,434 @@ head stayed exactly 0.0.
 
 Two real defects came out of the audit anyway; see tasks #11 and #12.
 Neither affects job 448.
+
+## v34 post-training perf: block-table fix, readout fusion, flex decode (2026-07-27)
+
+### Control variance, measured (three replicates, lockstep g32, 44-48 steps)
+
+Arms `bench_ctrl_1`/`bench_ctrl_2`/`ab_ctrl`. Warm pools only (first four
+discarded). This is the yardstick every claim below is held to:
+
+| metric | spread |
+|---|---|
+| `pool_seconds` | 12.02 / 12.85 / 14.63 (+-10%) |
+| `decode_ms_per_action` | 16.10 / 16.35 / 17.72 (+-5%) |
+| `refresh_ms_per_emit` | 3.584 / 3.600 / 3.604 (+-0.3%) |
+| `actions_per_trajectory` | 356.9 / 391.0 / 400.4 (+-6%) |
+
+Two lessons. Raw phase wall is worthless at this spread -- normalize per unit
+of work. And the refresh phase is FAR quieter than decode, which is why the
+readout result below is trustworthy at a fraction of the replicate count.
+Arms must also match on `--steps`: longer runs reach longer streams, and
+`bench_ctrl_1` (48 steps, 10 warm pools) is the slowest of the three for that
+reason alone.
+
+### `kv_range_blocks` emitted a mis-strided partial table (SHIPPED BUG, fixed)
+
+`partial_indices` was 2 wide while `full_indices` was `blocks_per_row` wide.
+The Triton decode kernel derives both from one descriptor -- it offsets
+FULL_KV_IDX by `stride("KV_IDX")` and bounds it by `size("KV_IDX", -1)`
+(`torch/_inductor/kernel/flex/templates/flex_decode.py.jinja:97,135,185`) --
+so a narrower partial table makes it read the full table at the wrong row
+stride. Full blocks skip `mask_mod`, so nothing downstream corrects it: every
+row but row 0 silently attended the wrong keys.
+
+On-device, compiled, against masked SDPA (job 554):
+
+| builder | shipped | fixed | signal |
+|---|---|---|---|
+| `DecodeRangeMask` B16 L2560 | 0.2872 | 4.5e-07 | 0.254 |
+| `PagedGenerationCache` C8 L1024 | - | 1.5e-06 | 0.662 |
+
+The paged row is the one that matters: this affected the shipped
+`continuous_refill` scheduler, not just new code. **Why every test missed it:
+eager `flex_attention` builds its mask from `mask_mod` alone and never reads
+the block tables** (`torch/_higher_order_ops/flex_attention.py:205-215`), so
+CPU tests agree with SDPA no matter how wrong the tables are. Any future
+block-table test must run under `torch.compile` on CUDA to mean anything.
+
+### Readout tail fused into one compiled artifact: KEEP (-52% refresh)
+
+`compact_emit_token_logprobs` now covers renderer features -> readout GEMM ->
+softcap -> fp32 log-softmax -> target gather, compiled once and shared by
+refresh and update. Eagerly that is ~8 passes over a (slots, 50257) fp32
+tensor to produce one scalar per slot.
+
+Two arms vs `bench_ctrl_2`, all at 48 steps:
+
+| metric | ctrl | readout_1 | readout_2 |
+|---|---|---|---|
+| `refresh_ms_per_emit` | 3.584 | 1.727 (-52%) | 1.735 (-52%) |
+| `update_total` | 4.442 | 2.528 (-43%) | 2.510 (-44%) |
+| `pool_seconds` | 12.02 | 9.341 (-22%) | 9.772 (-19%) |
+| `decode_ms_per_action` (control phase) | 16.35 | +0.8% | -0.6% |
+| `peak_vram_bytes` | 2.043e10 | -3.8% | -3.8% |
+
+Decode is flat within +-0.8%, which is what rules out drift. Age-0 zero-clip
+canary is exactly 0.0 across all 12 age-0 rows in both arms, so refresh and
+update stay bit-identical through the shared artifact -- that is why BOTH must
+resolve the same object, and why `measure_post_update_policy_drift` takes the
+eager function as a parameter instead of the rebound global (a no-grad call
+would compile a second artifact, grad mode being a Dynamo guard).
+
+Peak VRAM went DOWN 0.78 GiB, which refutes the prediction that tracing
+refresh grad-enabled would put the vocabulary-wide activations on the peak.
+
+### Flex decoding for the lockstep decode step: NEGATIVE so far, default OFF
+
+Motivation: a boolean `attn_mask` disqualifies every fused SDPA backend and
+lands the step on the memory-efficient cutlass kernel, 32% of pool device time
+in the v25 profile.
+
+Three targeting attempts, two of them wrong, recorded so they are not redone:
+
+1. **Main loop, dynamic shapes.** Fails outright. Inductor lowers flex decode
+   for fully static shapes ONLY -- `NoValidChoicesError: no choices exist for
+   backend`. Job 545: `dynamic=False` lowers; `dynamic=True`, `dynamic=None`,
+   `dynamic=False + mark_dynamic(batch)` and `dynamic=True + mark_static(kv)`
+   all fail. A dynamic BATCH alone is enough to kill it.
+2. **Static tail only.** Lowers, but is INERT. NOTES.md:1285 already had the
+   count: 32 `rollout_tail_step` calls against 2080 `generation_step` calls,
+   1.52% of decode steps. The tail needs >=96.9% ended to engage and
+   `ended_fraction` topped out at 0.948 over 11 pools (job 558). The "~85% of
+   decode iterations" figure at NOTES.md:202 predates `--rollout-groups 32`
+   and does NOT survive it -- do not reuse it.
+3. **Main loop, static power-of-two buckets.** Lowers and is fast in isolation.
+   Rests on one measured fact: an empty KV range costs no read AND returns
+   exactly zero (job 564 -- a zero softmax denominator could as easily have
+   given NaN, which 0-weighted masking would then spread). So surplus rows in
+   a bucket are free, which is what makes rounding survivors UP affordable.
+
+Microbenchmark, production shape (6 layers, 4x128, 2560-key cache, job 562),
+bucketed flex vs the dynamic SDPA step it replaces:
+
+| pos | 128 | 512 | 1024 | 1280 | 1536 | 2047 |
+|---|---|---|---|---|---|---|
+| bucket/sdpa | 0.72x | 0.70x | 0.63x | 0.59x | 0.54x | 0.29x |
+| bucket/exact | 1.02x | 1.00x | 1.01x | 1.06x | 1.01x | 1.19x |
+
+**But it does not show up end to end.** At `--rollout-groups 16`
+(jobs 570/571): `decode_ms_per_action` 19.94 -> 19.48, **-2.3%**, inside the
++-5% control noise. A 30-70% kernel win producing ~0% at pool level means
+attention is a far smaller share of the decode STEP than 32% of device time
+suggests -- the step is substantially launch-bound. Anyone reviving this
+should profile the step's kernel mix FIRST and confirm the attention share at
+the target row count, before optimizing the attention.
+
+### Two KV cache sets coexist across rollout groups (PRE-EXISTING, unfixed)
+
+Instrumented `new_caches` (job 569), g32:
+
+```
+rows=32  length=134   resident=0.83GiB   <- group 1 prefix
+rows=512 length=2560  resident=3.16GiB   <- group 1 expanded (15.0GiB)
+rows=32  length=255   resident=15.91GiB  <- group 2 prefix: group 1 STILL RESIDENT
+rows=512 length=2560  resident=18.34GiB  <- OOM on the second 15GiB
+```
+
+`del batched` is in place and `LatentRolloutBatch` holds no cache reference,
+so this is a cycle the collector has not run on. The shipping config survives
+only because its cache follows the ACTUAL padded prompt width (2182 here, two
+sets = 25.6GiB) rather than a pinned `prompt_tokens + max_stream_steps` (2560,
+two sets = 30GiB). Control peak already reached 22.11GiB of 31.36GiB -- the
+headroom is luck, not design. Worth fixing on its own merits; it is what
+blocks any change that widens the rollout cache.
+
+### Decode is launch-bound, measured (job 606, boolean control path, pool 5)
+
+The suspicion in the flex-decode section above ("the step is substantially
+launch-bound") is now a measurement rather than an inference.
+
+| | |
+|---|---|
+| pool wall | 14.408 s |
+| total device time, all kernels | 9.832 s (**32% of wall has no kernel resident**) |
+| host launch calls | 724,341 per pool |
+| decode steps per pool | 2,080 |
+| **launches per decode step** | **~348** (a SIX-layer model: ~57 per layer) |
+| decode phase | 8.844 s wall = 4.25 ms/step |
+| decode attention (`fmha_cutlassF`) | 4.093 s / 12,492 calls = 328 us each, 6/step |
+
+The tail is mostly work smaller than its own launch:
+
+| kernel | calls/pool | per step | device s | mean |
+|---|---|---|---|---|
+| `triton_poi_fused__to_copy_2` | 73,614 | 35 | 0.087 | **1.2 us** |
+| `triton_poi_fused__to_copy_1` | 58,998 | 28 | 0.123 | 2.1 us |
+| `triton_tem_fused__rms_norm_addmm_view_3` | 49,920 | 24 | 0.210 | 4.2 us |
+| `triton_poi_fused__to_copy_8` | 24,960 | 12 | 0.095 | 3.8 us |
+
+157k launches for 0.305 s of device time. Note the run profiled the BOOLEAN
+path (`fmha_cutlassF` is the memory-efficient SDPA kernel), so the launch
+count is the control's, not flex's.
+
+Blocking host syncs: 336 over the sampled pools (~48/pool), concentrated at
+`latent_rollout.py:808` (132, the compaction active-row count), `:1323` (96),
+and `train_latent_vapo.py:4433` (64). Real but the smaller half; the launch
+bubble is the larger one.
+
+Also from this profile: `rollout_tail_step` compiled and was called **zero**
+times under `--rollout-tail-graph`, so its compile time is pure waste in that
+configuration. Worth understanding before trusting the tail path.
+
+### Flex decode at production shape: NEGATIVE, confirms the g16 result
+
+Job 592, `ab9b_flex` vs `ab9_ctrl` truncated to a matched 250-pool slice:
+`decode_ms_per_action` 27.57 -> 27.32, **-0.9%**, inside control variance. The
+earlier reduced-shape -19.5% badly overstated it. This is the third
+measurement agreeing (g16 -2.3%, production -0.9%) and the profile above says
+why: attention is 46% of decode wall and the step cannot go faster than its
+launch rate.
+
+### The paged tests could not fail (2026-07-27)
+
+`attn.proj.weight` is zero-initialised in every backbone here, so a freshly
+constructed test model's attention branch contributes EXACTLY zero.
+`test_paged_rope/pope_gqa_matches_masked_dense_decode` and
+`test_paged_refill_hides_a_stale_longer_suffix` were therefore passing on a
+model where the KV cache is unreachable -- they asserted parity of a quantity
+neither arm read. Added `_wake_attention()`; with attention awake they
+immediately caught a live ownership bug in the new page-table `mask_mod`.
+
+This compounds the eager/block-table blind spot already recorded above. A
+paged decode test is only meaningful if BOTH hold: attention is awake, and
+either the block tables are walked explicitly or the test runs compiled on
+CUDA.
+
+### Page pool: a free list alone saves nothing (scoping, 2026-07-27)
+
+`capacity_rows * pages_per_lane` remains the worst-case bound however pages
+are handed out, so an allocator only helps if one of two things gives.
+Truncation is out ("no trajectory is shortened"). That leaves DYNAMIC
+ADMISSION: admit while free pages cover every live row's worst-case
+remainder, so concurrency throttles when rows run long and rises when they do
+not. The median row uses ~1/5 of `pages_per_lane`, so the same arena should
+hold roughly 4x the rows on average -- which is the right lever for a
+launch-bound loop, since it multiplies useful work per launch rather than
+reducing launches.
+
+Stage (a) (addressing decoupled from reservation, identity mapping, no
+behaviour change) is landed. Stage (b) is allocator + admission policy, not
+just a free list.
+
+### Static decode arena: short chunks pad up, they do not run narrow (2026-07-27)
+
+`--rollout-graph-decode` hands `rollout_continuations` a caller-owned KV
+arena of `max(rollout_groups,1) * samples_per_prompt` rows so the main decode
+loop holds one shape and `mode="reduce-overhead"` can capture it. The first
+shape of that flag REJECTED any chunk that did not fill the arena exactly,
+which kills every fresh run at its first value-warmup rollout
+(`prompts_per_minibatch` prompts, not `rollout_groups`), plus the final short
+pool and `--consume-all-prompts`.
+
+Short chunks now pad the PROMPT batch up to the arena with copies of the last
+prompt, mark those rows `ended` before step zero (empty key range, `record`
+never writes them), and drop them from the returned batch. The alternative --
+run a row-prefix of the arena -- is compute-optimal but records one graph per
+distinct row count, which is exactly the cost the arena exists to remove.
+
+Known cost, NOT yet measured: at the bench config the warmup rolls 16 prompts
+into a 32-prompt arena, so those steps do ~2x the decode work. Read the A/B on
+steady-state steps, not the aggregate. If capture wins, the fix is to pad to a
+`row_bucket` multiple and slice the arena instead -- 256 and 512 are both
+multiples of 64, so the bench would land on two shapes and zero waste.
+
+Second known cost: the arena is resident through the update, where the
+per-chunk cache it replaces was freed. At the bench config (512 rows x 2560
+width x 6 layers x 2 tensors x 4 heads x 128 head_dim, bf16) that is 15.0 GiB
+held against a 32 GB card for the whole run. Padding adds two more transients
+on a short chunk: the stream tensors are sized at ARENA rows, so `thoughts`
+((rows, stream, 512) fp32) doubles to 2.5 GiB at the warmup shape, and
+`_drop_filler_rows` clones the real prefix while the padded original is still
+live. Peak VRAM is the thing to watch in the A/B, not just decode time.
+
+The bench DOES exercise all of this: `bench.sh` sets `--value-warmup-steps 50`
+and is not `--rollout-only`, so 50 collects of `prompts_per_minibatch = 16`
+prompts run into the 32-prompt arena before the first actor step. Launches per
+step are unaffected by the row count -- same kernels, wider shapes -- so the
+launch-count question the A/B exists to answer is not confounded.
+`decode_ms_per_action` on those pools IS confounded, roughly 2x, because the
+control runs 256 rows where the arena arm runs 512.
+
+RNG is not paired between the two arms: with no explicit generator the trainer
+samples at the padded row count, so a graph run and a non-graph run diverge in
+draws from the first warmup collect. Same class as the existing compaction
+caveat -- the arms are independent samples, not a paired comparison.
+
+Stale KV in a reused arena stays unreachable for the same reason it does
+per-chunk: every slot inside a row's live range `[decode_starts, head]` is
+written this chunk before it is read. That argument covers a non-finite value
+as much as an ordinary stale one, so the arena is deliberately never
+re-zeroed.
+
+### Graph decode A/B round 1: control 631 clean, graph 632 OOM (2026-07-27)
+
+Both arms from one frozen tree, `--steps 40 --rollout-compile
+--rollout-flex-decode`, profiling actor pools 5-6.
+
+`ab10_ctrl` (631) succeeded. Its pools are the flex control this flag has to
+beat, and they are worse than the boolean job-606 profile in the way that
+matters:
+
+| | pool 4 (actor 20) | pool 5 (actor 24) |
+|---|---|---|
+| pool wall | 11.876 s | 30.011 s |
+| total device time | 7.796 s | 7.851 s |
+| host launch calls | 803,493 | 815,404 |
+| decode steps (flex kernel calls / 6 layers) | 2,080 | 2,080 |
+| **launches per decode step** | **386** | **392** |
+| idle wall | 34% | **74%** |
+
+Pool 5 spends 25.3 s of 30.0 s in decode for the same 7.85 s of device work
+as pool 4's 11.9 s pool -- `uneven: collect.decode longest occurrence 21.404 s
+of 25.289 s over 2`. A pool whose chunks are ragged runs its long tail nearly
+empty. Launch rate is the ceiling, and it is 386-392 per step here versus the
+348 measured on the boolean path.
+
+Blocking syncs, 343 over the two pools: 132 at `latent_rollout.py:908` (the
+`int(active.sum())` compaction count), 96 at `:1458`, 64 at
+`train_latent_vapo.py:4477`.
+
+`ab10_graph` (632) OOMed. It got further than the flag's previous shape ever
+did -- `flex_generation_step` ran 2,080 times, one whole padded warmup chunk
+decoded correctly, and cudagraphs captured (248 MiB in private pools) -- then
+died in the FIRST value-warmup update, at `refresh_old_statistics` ->
+`compact_emit_token_logprobs`, needing 590 MiB with 109 MiB free of 31.36 GiB.
+
+That is the predicted failure at the predicted place: 15.0 GiB arena resident
+through the update, plus the warmup's padded stream tensors (16 prompts into
+a 32-prompt arena doubles `thoughts` to 2.5 GiB) plus `_drop_filler_rows`'
+clone. Caveat: the card was shared -- ~1.5 GiB belonged to three of the user's
+concurrent jobs -- so the exact threshold is not reproducible, but the margin
+was ~500 MiB and the padding waste is ~2.5 GiB, so the ordering of the
+conclusion does not depend on the confound.
+
+Next: re-run the pair with `--value-warmup-steps 0`. Every chunk is then
+exactly 32 prompts = 512 rows = the arena, so there is NO padding, no clone,
+and the question reduces to whether the resident arena alone fits. That also
+removes the ~2x confound from `decode_ms_per_action` on warmup pools. If it
+still OOMs, drop to `--rollout-groups 16` (7.5 GiB arena) to get the
+launches-per-step answer at a shape that fits, remembering that a smaller
+batch flatters capture: less work per launch means more of the win is
+available.
+
+### Round 2 (`--value-warmup-steps 0`): control reproduces, graph still OOMs
+
+Jobs 636/637. Control 636 reproduces 631 almost exactly -- pool 4
+382 launches/step at 34% idle, pool 5 389 at 76% idle, against 631's 386/392
+and 34%/74%. The metric is stable run to run, which is what makes it the one
+worth deciding on.
+
+New detail from 636: on the two starved pools the card reports 107-111 W at
+255-690 MHz, against 291-307 W at 2835 MHz on the fast ones. It is not merely
+idle, it is DOWNCLOCKING because it is starved. Direct confirmation of a
+launch-bound decode.
+
+Graph 637 OOMed again, at the first actor update, needing 50 MiB with 137 MiB
+free. Removing the padding recovered ~2.5 GiB and moved the shortfall from
+590 MiB to 50 MiB -- so the padding really was most of the round-1 excess, and
+the resident 15.0 GiB arena alone is still slightly over budget at g32.
+
+Caveat that matters here: ~1.55 GiB belonged to three of the user's
+concurrent jobs both times. On an EMPTY card 637 would very likely have
+passed. The flag is not intrinsically 15 GiB over -- it is marginal, and
+marginal on a shared card means unusable.
+
+Round 3 (jobs 638/639) drops to `--rollout-groups 16`: 256 rows x 2560 = 7.5
+GiB arena, comfortably inside budget. Read the launches-per-step delta there
+and remember it FLATTERS capture -- a smaller batch does less work per launch,
+so a larger share of the step is launch overhead available to remove.
+
+### CUDA-graph decode at g16: LARGE WIN (jobs 638 vs 639, 2026-07-27)
+
+Same frozen tree, `--steps 40 --value-warmup-steps 0 --rollout-groups 16
+--rollout-compile --rollout-flex-decode`, +/- `--rollout-graph-decode`.
+
+| | ctrl pool 4 | graph pool 4 | ctrl pool 5 | graph pool 5 |
+|---|---|---|---|---|
+| **decode phase** | 15.344 s | **7.211 s (-53%)** | 74.453 s | **7.942 s (-89%)** |
+| pool wall | 20.14 s | **11.75 s (-42%)** | 80.47 s | **13.06 s (-84%)** |
+| total device time | 8.63 s | 9.37 s | 9.55 s | 9.78 s |
+| idle wall | 57% | **20%** | 88% | **25%** |
+| host launches | 1,389,139 | 718,858 | 1,395,416 | 732,795 |
+| decode steps | 4,160 | 4,160 | 4,160 | 4,160 |
+| **launches / step** | 334 | **173 (-48%)** | 335 | **176 (-47%)** |
+| decode W mean / min | 176 / 129 | **291 / 253** | 80 / 38 | **262 / 142** |
+
+Device time is UNCHANGED to within 8% -- the same kernels do the same work.
+Everything above is bubble removal. Capture halves the launches per decode
+step and the card stops downclocking: pool 5's decode ran at 80 W mean / 38 W
+min in the control and 262 / 142 under capture.
+
+Pool 5 is the shape of the win. It is the ragged pool whose longest chunk
+outlives the others, and the control ran it at 88% idle for 74 s. Under
+capture it costs 7.9 s. Launch rate was not merely A ceiling on that pool, it
+was ~7x the real work.
+
+Caveats, both real:
+
+1. g16 FLATTERS this. A 256-row step does less work per launch than a 512-row
+   step, so a larger share of it is overhead available to remove. The g32
+   control sits at 382-389 launches/step and 34-76% idle against g16's
+   334-335 and 57-88%, so the g32 win will be smaller. How much smaller is
+   unmeasured.
+2. g32 does not RUN yet: the 15.0 GiB arena OOMs (round 2 above, short by
+   50 MiB on a card also holding ~1.55 GiB of other jobs).
+
+The syncs did NOT move: 487 -> 467 over two pools, still 264 at
+`latent_rollout.py:908` (`int(active.sum())`, the SYNC_EVERY liveness check,
+which runs whether or not compaction is enabled) and 96 at `:1458`. Capture
+removed the launch bubble, not the sync bubble. That is the next lever, and it
+is now the larger remaining one.
+
+**The unblock for g32 is task #4, not more graph work.** The round-2 shortfall
+was 50 MiB. `thoughts` is `(rows, stream, 512)` fp32 = 2.5 GiB per g32 chunk
+with two chunks retained, so storing THINK state sparsely frees GiBs where
+tens of MiB are needed. #4 was scoped as a memory tidy-up; it is now the
+dependency that makes the biggest measured perf win in this line of work
+usable at the production shape.
+
+### KDA 3:1 means mixers, not 24 full transformer blocks (2026-07-29)
+
+The literal 18-KDA + 6-dense full-block implementation was the wrong cost
+model. It has 24 MLPs, 126,688,438 parameters, and measured 3,553 ms/step on
+the 5090. It did fit and complete 20 training steps at MBS 8, but it is 3.2x
+the six-dense baseline's wall time before any quality evidence.
+
+The corrected default keeps the original six complete dense blocks and adds
+18 attention-only KDA residual mixers in `KKKD` x6. It preserves vocab 50,304,
+dimension 512, sequence length 1,024, MBS 8, and global batch 524,288. Static
+facts:
+
+| architecture | parameters | raw params | params + grads + optimizer state |
+|---|---:|---:|---:|
+| 6 dense | 70,470,784 | 219.7 MiB | 806.8 MiB |
+| 6 dense + 18 KDA mixers | 88,884,406 | 289.9 MiB | 1,017.9 MiB |
+| 6 dense + 18 full KDA blocks | 126,688,438 | 434.2 MiB | 1,450.8 MiB |
+
+Thus the mixer design adds 18,413,622 parameters, 70.2 MiB of raw weights,
+and about 211.1 MiB of persistent training state over baseline. A CPU
+construction/initialization check increased process peak RSS by 475 MiB versus
+403 MiB for baseline, only +72 MiB. All 377 trainable tensors have exactly one
+optimizer owner. The six retained dense blocks and global tensors are
+bit-exact with the six-layer baseline at initialization (89/89 comparisons);
+KDA insertions use isolated local RNG streams.
+
+Approximate forward math, including the large vocabulary projection, is 1.41x
+baseline for the mixer design and 2.16x for full KDA blocks. Current kernels
+are much less efficient than that arithmetic suggests. From measured
+1,104 ms dense, 1,407 ms five-KDA replacement, and 3,553 ms 18-full-KDA
+timings, the mixer design is expected around 2.7-3.1 s/step until the KDA
+training path is improved. The exact queued benchmark is job 874.
+
+The full-block model already trained at the production microbatch shape on the
+32 GB card. The mixer removes 37.8M parameters and 18 saved 2,048-wide MLP
+activation paths, so it is safely below that observed bound. Expected peak is
+roughly 8-12 GiB in default compile mode and potentially 10-16 GiB with CUDA
+graph pools; job 874 now logs allocated/reserved VRAM and process RSS to
+replace this estimate.
+
+Job 872 is the corrected CUDA-graph KDA five-layer replacement run to 1,000
+steps. It retains the original full-block replacement architecture explicitly
+for continuity with the prior KDA curve. Job 874 benchmarks the new mixer
+architecture after 872 completes.

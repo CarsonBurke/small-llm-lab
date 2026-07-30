@@ -1,545 +1,506 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
-import postraining.latent_rollout as ordinary_rollout
-import postraining.rollout_scheduler as scheduler
-from postraining.latent_rollout import PAD_SLOT, trim_stream
-from postraining.tests.test_latent_rollout import _deterministic_wrapper
+from postraining.latent_thought import LatentThoughtModel, StepOutput
+from postraining.rollout_scheduler import (
+    ContinuousScheduleStats,
+    _decode_execution_width,
+    rollout_continuous_refill_groups,
+)
+from postraining.tests.test_nano_backbone import _backbone
 
 
-def _chunk(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    long = torch.randint(1, 32, (5,), generator=generator)
-    short = torch.randint(1, 32, (3,), generator=generator)
-    prompts = torch.zeros((2, 5), dtype=torch.long)
-    prompts[0] = long
-    prompts[1, -3:] = short
-    return prompts, torch.tensor([5, 3])
-
-
-def _greedy(logits, *_args, **_kwargs):
-    return logits.argmax(-1)
-
-
-def test_pause_merge_seam_matches_two_unscheduled_deterministic_rollouts(
-    monkeypatch,
-):
-    wrapper = _deterministic_wrapper()
-    monkeypatch.setattr(ordinary_rollout, "top_p_sample", _greedy)
-    monkeypatch.setattr(scheduler, "top_p_sample", _greedy)
-    prompts, lengths = _chunk(11)
-    states = []
-    for origin_id in range(2):
-        state = scheduler.start_decode_state(
-            wrapper,
-            prompts,
-            lengths,
-            origin_id=origin_id,
-            prompt_repeats=2,
-            max_new_tokens=4,
-            max_stream_steps=8,
-            temperature=1.0,
-            top_p=1.0,
-            pin_emit=False,
-            sync_every=1,
-        )
-        # Pause on the mandatory thought input itself.  This exercises the
-        # widest seam (kind + fp32 latent), not merely a token seam.
-        assert not scheduler.advance_decode_state(state, stop_position=5)
-        assert state.position == state.slab.base_position == 5
-        states.append(state)
-
-    merged = scheduler.merge_aligned_decode_states(*states)
-    assert merged.rows == 8
-    assert scheduler.advance_decode_state(merged)
-    results = merged.ledger.finalize(
-        merged.slab, merged.position, cpu=torch.device("cpu")
-    )
-
-    expected = trim_stream(
-        ordinary_rollout.rollout_continuations(
-            wrapper,
-            prompts,
-            max_new_tokens=4,
-            max_stream_steps=8,
-            temperature=1.0,
-            top_p=1.0,
-            prompt_lengths=lengths,
-            prompt_repeats=2,
-        )
-    )
-    for origin_id in range(2):
-        actual = results[origin_id]
-        assert actual.prompt_length == prompts.size(1)
-        for name in (
-            "kind",
-            "token_ids",
-            "thoughts",
-            "actions",
-            "action_mask",
-            "stop_mask",
-            "emit_mask",
-        ):
-            torch.testing.assert_close(
-                getattr(actual, name),
-                getattr(expected, name),
-                rtol=0,
-                atol=0,
-            )
-
-
-def test_tail_pause_keeps_exact_survivors_and_offloads_dense_prefix(
-    monkeypatch,
-):
-    wrapper = _deterministic_wrapper()
-    prompts, lengths = _chunk(13)
-
-    def end_three(logits, *_args, **_kwargs):
-        assert logits.size(0) == 4
-        return torch.tensor([1, 1, 1, 2])
-
-    monkeypatch.setattr(scheduler, "top_p_sample", end_three)
-    state = scheduler.start_decode_state(
-        wrapper,
-        prompts,
-        lengths,
-        origin_id=0,
-        prompt_repeats=2,
-        max_new_tokens=4,
-        max_stream_steps=8,
-        temperature=1.0,
-        top_p=1.0,
-        stop_ids=1,
-        pin_emit=True,
-        sync_every=1,
-    )
-    assert not scheduler.advance_decode_state(state, park_live_rows=1)
-    assert state.rows == 1
-    assert state.slab.rows == 1
-    assert state.slab.base_position == state.position == prompts.size(1)
-    assert state.slab.origin_rows.tolist() == [3]
-    assert all(cache[0].size(0) == 1 for cache in state.caches)
-    assert len(state.ledger.segments) == 1
-    prefix = state.ledger.segments[0]
-    assert prefix.values["kind"].device.type == "cpu"
-    assert prefix.values["kind"].size(0) == 4
-    assert prefix.values["kind"].size(1) == prompts.size(1) + 1
-
-
-def test_scalar_tail_scheduler_merges_at_aligned_position_and_restores_order(
-    monkeypatch,
-):
-    wrapper = _deterministic_wrapper()
-    chunks_and_lengths = [_chunk(17), _chunk(19)]
-    call_rows: list[int] = []
-
-    def scripted_tokens(logits, *_args, **_kwargs):
-        call_rows.append(logits.size(0))
-        if logits.size(0) == 4:
-            return torch.tensor([1, 1, 1, 2])
-        assert logits.size(0) == 2
-        return torch.ones(2, dtype=torch.long)
-
-    monkeypatch.setattr(scheduler, "top_p_sample", scripted_tokens)
-    stats = scheduler.TailScheduleStats()
-    results = scheduler.rollout_scalar_tail_chunks(
-        wrapper,
-        [item[0] for item in chunks_and_lengths],
-        [item[1] for item in chunks_and_lengths],
-        prompt_repeats=2,
-        max_new_tokens=4,
-        max_stream_steps=8,
-        temperature=1.0,
-        top_p=1.0,
-        tail_rows=1,
-        stop_ids=1,
-        pin_emit=True,
-        sync_every=1,
-        schedule_stats=stats,
-    )
-
-    # One step in each original B4 chunk, followed by one merged B2 tail.
-    assert call_rows == [4, 4, 2]
-    assert stats == scheduler.TailScheduleStats(
-        decode_steps=3,
-        row_steps=10,
-        useful_actions=10,
-        lockstep_decode_steps=4,
-        catchup_decode_steps=1,
-        parks=1,
-        merges=1,
-        merge_events=1,
-        cohort_admissions=1,
-        cohort_rollovers=1,
-        cohort_rows_max=2,
-        chunks=2,
-    )
-    assert stats.metrics()["decode_step_utilization"] == 1.0
-    assert stats.metrics()["decode_step_savings_fraction"] == 0.25
-    assert len(results) == 2
-    for result, (prompts, _) in zip(
-        results, chunks_and_lengths, strict=True
-    ):
-        assert result.prompt_length == prompts.size(1)
-        assert result.action_mask.sum(1).tolist() == [1, 1, 1, 2]
-        assert result.token_ids[:, : prompts.size(1)].equal(
-            prompts.repeat_interleave(2, dim=0)
-        )
-        # The survivor owns exactly the post-seam token; no other row gained
-        # a duplicated or missing action while records were stitched.
-        assert result.kind[:3, -1].eq(PAD_SLOT).all()
-        assert result.token_ids[3, -1].item() == 1
-
-
-def test_scalar_tail_scheduler_rejects_different_chunk_widths():
-    wrapper = _deterministic_wrapper()
-    first, first_lengths = _chunk(23)
-    second = first[:, :-1]
-    second_lengths = torch.tensor([4, 3])
-    try:
-        scheduler.rollout_scalar_tail_chunks(
-            wrapper,
-            [first, second],
-            [first_lengths, second_lengths],
-            prompt_repeats=2,
-            max_new_tokens=2,
-            max_stream_steps=4,
-            temperature=1.0,
-            top_p=1.0,
-            pin_emit=True,
-        )
-    except ValueError as error:
-        assert "common prompt width" in str(error)
-    else:
-        raise AssertionError("different physical prompt widths were accepted")
-
-
-def test_three_chunk_scheduler_preserves_repeated_pause_merge_pause_ledgers(
-    monkeypatch,
-):
-    wrapper = _deterministic_wrapper()
-    chunks_and_lengths = [_chunk(seed) for seed in (29, 31, 37)]
-    scripted = iter(
-        (
-            [1, 1, 1, 2],  # origin 0 -> one parked survivor
-            [1, 1, 1, 2],  # origin 1 catches the survivor position
-            [1, 2],        # merged tail parks one row at the next boundary
-            [1, 1, 1, 2],  # origin 2 advances toward that boundary
-            [2],           # origin 2 survivor catches up without ending
-            [1, 1],        # final merged pair ends together
-        )
-    )
-    call_rows: list[int] = []
-
-    def scripted_tokens(logits, *_args, **_kwargs):
-        values = next(scripted)
-        call_rows.append(logits.size(0))
-        assert len(values) == logits.size(0)
-        return torch.tensor(values)
-
-    monkeypatch.setattr(scheduler, "top_p_sample", scripted_tokens)
-    results = scheduler.rollout_scalar_tail_chunks(
-        wrapper,
-        [item[0] for item in chunks_and_lengths],
-        [item[1] for item in chunks_and_lengths],
-        prompt_repeats=2,
-        max_new_tokens=5,
-        max_stream_steps=8,
-        temperature=1.0,
-        top_p=1.0,
-        tail_rows=1,
-        stop_ids=1,
-        pin_emit=True,
-        sync_every=1,
-    )
-
-    assert call_rows == [4, 4, 2, 4, 1, 2]
-    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
-        [1, 1, 1, 2],
-        [1, 1, 1, 3],
-        [1, 1, 1, 3],
-    ]
-    for result, (prompts, _) in zip(
-        results, chunks_and_lengths, strict=True
-    ):
-        assert result.token_ids[:, : prompts.size(1)].equal(
-            prompts.repeat_interleave(2, dim=0)
-        )
-
-
-def test_cohort_defers_zero_step_merges_until_pool_end(monkeypatch):
-    wrapper = _deterministic_wrapper()
-    chunks_and_lengths = [_chunk(seed) for seed in (38, 39, 40)]
-    scripted = iter(
-        (
-            [1, 1, 1, 2],
-            [1, 1, 1, 2],
-            [1, 1, 1, 2],
-            [1, 1, 1],
-        )
-    )
-    call_rows: list[int] = []
-
-    def scripted_tokens(logits, *_args, **_kwargs):
-        values = next(scripted)
-        call_rows.append(logits.size(0))
-        assert len(values) == logits.size(0)
-        return torch.tensor(values)
-
-    monkeypatch.setattr(scheduler, "top_p_sample", scripted_tokens)
-    stats = scheduler.TailScheduleStats()
-    results = scheduler.rollout_scalar_tail_chunks(
-        wrapper,
-        [item[0] for item in chunks_and_lengths],
-        [item[1] for item in chunks_and_lengths],
-        prompt_repeats=2,
-        max_new_tokens=4,
-        max_stream_steps=8,
-        temperature=1.0,
-        top_p=1.0,
-        tail_rows=3,
-        stop_ids=1,
-        pin_emit=True,
-        sync_every=1,
-        schedule_stats=stats,
-    )
-
-    # The three aligned singleton tails stay separate while their union fits
-    # the parked-row budget, then pay one B3 merge and final decode step.
-    assert call_rows == [4, 4, 4, 3]
-    assert stats == scheduler.TailScheduleStats(
-        decode_steps=4,
-        row_steps=15,
-        useful_actions=15,
-        lockstep_decode_steps=6,
-        catchup_decode_steps=2,
-        parks=1,
-        merges=2,
-        merge_events=1,
-        cohort_admissions=2,
-        cohort_rollovers=0,
-        cohort_rows_max=3,
-        chunks=3,
-    )
-    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
-        [1, 1, 1, 2],
-        [1, 1, 1, 2],
-        [1, 1, 1, 2],
-    ]
-
-
-def test_bulk_merge_matches_chronological_pairwise_merges(monkeypatch):
-    monkeypatch.setattr(scheduler, "top_p_sample", _greedy)
-
-    def paused_states(wrapper):
-        states = []
-        for origin_id, seed in enumerate((67, 71, 73)):
-            prompts, lengths = _chunk(seed)
-            state = scheduler.start_decode_state(
-                wrapper,
-                prompts,
-                lengths,
-                origin_id=origin_id,
-                prompt_repeats=2,
-                max_new_tokens=4,
-                max_stream_steps=8,
-                temperature=1.0,
-                top_p=1.0,
-                pin_emit=False,
-                sync_every=1,
-            )
-            assert not scheduler.advance_decode_state(
-                state, stop_position=prompts.size(1)
-            )
-            states.append(state)
-        return states
-
-    bulk_states = paused_states(_deterministic_wrapper())
-    pairwise_states = paused_states(_deterministic_wrapper())
-    bulk = scheduler.merge_aligned_decode_states(*bulk_states)
-    pairwise = scheduler.merge_aligned_decode_states(
-        pairwise_states[0], pairwise_states[1]
-    )
-    pairwise = scheduler.merge_aligned_decode_states(
-        pairwise, pairwise_states[2]
-    )
-
-    for name in ("emitted", "ended", "thinking_active"):
-        torch.testing.assert_close(
-            getattr(bulk, name), getattr(pairwise, name), rtol=0, atol=0
-        )
-    for name in (
-        "belief",
-        "predicted",
-        "thought_log_sigma",
-        "input_latent",
-        "logits",
-    ):
-        torch.testing.assert_close(
-            getattr(bulk.output, name),
-            getattr(pairwise.output, name),
-            rtol=0,
-            atol=0,
-        )
-    for bulk_layer, pairwise_layer in zip(
-        bulk.caches, pairwise.caches, strict=True
-    ):
-        for bulk_cache, pairwise_cache in zip(
-            bulk_layer, pairwise_layer, strict=True
-        ):
-            live_prefix = bulk.position + 1
-            torch.testing.assert_close(
-                bulk_cache[:, :, :live_prefix],
-                pairwise_cache[:, :, :live_prefix],
-                rtol=0,
-                atol=0,
-            )
-
-    assert scheduler.advance_decode_state(bulk)
-    assert scheduler.advance_decode_state(pairwise)
-    bulk_results = bulk.ledger.finalize(
-        bulk.slab, bulk.position, cpu=torch.device("cpu")
-    )
-    pairwise_results = pairwise.ledger.finalize(
-        pairwise.slab, pairwise.position, cpu=torch.device("cpu")
-    )
-    for origin_id in range(3):
-        for name in (
-            "kind",
-            "token_ids",
-            "thoughts",
-            "actions",
-            "action_mask",
-            "stop_mask",
-            "emit_mask",
-        ):
-            torch.testing.assert_close(
-                getattr(bulk_results[origin_id], name),
-                getattr(pairwise_results[origin_id], name),
-                rtol=0,
-                atol=0,
-            )
-
-
-def test_chunk_that_finishes_before_carry_position_does_not_drop_carry(
-    monkeypatch,
-):
-    wrapper = _deterministic_wrapper()
-    chunks_and_lengths = [_chunk(41), _chunk(43)]
-    scripted = iter(
-        (
-            [1, 1, 1, 2],  # origin 0 parks one row at position 5
-            [1, 1, 1, 1],  # origin 1 ends before it can merge there
-            [1],            # parked origin 0 is still resumed and completed
-        )
-    )
-    call_rows: list[int] = []
-
-    def scripted_tokens(logits, *_args, **_kwargs):
-        values = next(scripted)
-        call_rows.append(logits.size(0))
-        assert len(values) == logits.size(0)
-        return torch.tensor(values)
-
-    monkeypatch.setattr(scheduler, "top_p_sample", scripted_tokens)
-    results = scheduler.rollout_scalar_tail_chunks(
-        wrapper,
-        [item[0] for item in chunks_and_lengths],
-        [item[1] for item in chunks_and_lengths],
-        prompt_repeats=2,
-        max_new_tokens=4,
-        max_stream_steps=8,
-        temperature=1.0,
-        top_p=1.0,
-        tail_rows=1,
-        stop_ids=1,
-        pin_emit=True,
-        sync_every=1,
-    )
-
-    assert call_rows == [4, 4, 1]
-    assert results[0].action_mask.sum(1).tolist() == [1, 1, 1, 2]
-    assert results[1].action_mask.sum(1).tolist() == [1, 1, 1, 1]
-
-
-def test_schedule_savings_include_lockstep_sync_grid_waste(monkeypatch):
-    wrapper = _deterministic_wrapper()
-    chunks_and_lengths = [_chunk(47), _chunk(53)]
-    scripted = iter(
-        (
-            [1, 1, 1, 2],
-            [1, 1, 1, 2],
-            [1, 1, 1, 2],
-            [1, 1, 1, 2],
-            [1, 1],
-            [1, 1],
-        )
-    )
-
-    def scripted_tokens(logits, *_args, **_kwargs):
-        values = next(scripted)
-        assert len(values) == logits.size(0)
-        return torch.tensor(values)
-
-    monkeypatch.setattr(scheduler, "top_p_sample", scripted_tokens)
-    stats = scheduler.TailScheduleStats()
-    results = scheduler.rollout_scalar_tail_chunks(
-        wrapper,
-        [item[0] for item in chunks_and_lengths],
-        [item[1] for item in chunks_and_lengths],
-        prompt_repeats=2,
-        max_new_tokens=5,
-        max_stream_steps=8,
-        temperature=1.0,
-        top_p=1.0,
-        tail_rows=1,
-        stop_ids=1,
-        pin_emit=True,
-        sync_every=2,
-        schedule_stats=stats,
-    )
-
-    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
-        [1, 1, 1, 3],
-        [1, 1, 1, 3],
-    ]
-    assert stats.decode_steps == 6
-    # Each independent chunk would pay four calls: three useful actions,
-    # rounded to the next two-step synchronization boundary.
-    assert stats.lockstep_decode_steps == 8
-    assert stats.metrics()["decode_step_savings_fraction"] == 0.25
-
-
-def test_lockstep_counterfactual_never_rounds_past_stream_cap(monkeypatch):
-    wrapper = _deterministic_wrapper()
-    chunks_and_lengths = [_chunk(59), _chunk(61)]
-
-    def never_stop(logits, *_args, **_kwargs):
+class _EmitGate:
+    @staticmethod
+    def stop_logit(belief):
         return torch.full(
-            (logits.size(0),),
-            2,
-            dtype=torch.long,
+            belief.shape[:-1], 40.0, dtype=torch.float32, device=belief.device
         )
 
-    monkeypatch.setattr(scheduler, "top_p_sample", never_stop)
-    stats = scheduler.TailScheduleStats()
-    scheduler.rollout_scalar_tail_chunks(
-        wrapper,
-        [item[0] for item in chunks_and_lengths],
-        [item[1] for item in chunks_and_lengths],
-        prompt_repeats=2,
+
+def test_cuda_decode_execution_width_uses_static_main_and_tail_buckets():
+    assert _decode_execution_width(497, 512, pending_groups=True) == 512
+    assert _decode_execution_width(497, 512, pending_groups=False) == 512
+    assert _decode_execution_width(256, 512, pending_groups=False) == 256
+    assert _decode_execution_width(255, 512, pending_groups=False) == 256
+    assert _decode_execution_width(17, 512, pending_groups=False) == 32
+    assert _decode_execution_width(1, 512, pending_groups=False) == 1
+
+
+class _FakeContinuousModel:
+    """CPU contract model whose first prompt token is the target length."""
+
+    def __init__(self, *, stochastic_tokens: bool = False):
+        self.backbone = SimpleNamespace(
+            tok_emb=SimpleNamespace(embedding_dim=3)
+        )
+        self.gate = _EmitGate()
+        self.stochastic_tokens = stochastic_tokens
+        self.bank_builds = 0
+        self.admission_calls: list[list[list[int]]] = []
+        self.step_calls: list[tuple[list[int], list[int]]] = []
+        self.step_kv_starts: list[list[int]] = []
+        self.padded_widths: list[int] = []
+        self.cache_allocations = 0
+
+    def make_paged_generation_cache(
+        self, capacity, max_length, device, dtype=None
+    ):
+        del dtype
+        self.cache_allocations += 1
+        return SimpleNamespace(
+            target=torch.zeros(capacity, dtype=torch.long, device=device),
+            steps=torch.zeros(capacity, dtype=torch.long, device=device),
+            kv_starts=torch.zeros(
+                capacity, dtype=torch.long, device=device
+            ),
+            capacity=capacity,
+            max_length=max_length,
+        )
+
+    def _output(self, slots, cache):
+        rows = slots.numel()
+        belief = torch.zeros((rows, 3), dtype=torch.float32)
+        predicted = torch.zeros_like(belief)
+        log_sigma = torch.full_like(belief, -2.0)
+        logits = torch.zeros((rows, 4), dtype=torch.float32)
+        if not self.stochastic_tokens:
+            target = cache.target.index_select(0, slots)
+            steps = cache.steps.index_select(0, slots)
+            stop = steps + 1 >= target
+            logits[:, 2] = 40.0
+            logits[stop, 1] = 80.0
+        return StepOutput(
+            belief=belief,
+            predicted=predicted,
+            thought_log_sigma=log_sigma,
+            input_latent=torch.zeros_like(belief),
+            logits=logits,
+            caches=[],
+        )
+
+    def build_prompt_prefix_bank(
+        self,
+        unique_prompt_ids,
+        unique_prompt_lengths,
+        *,
+        dtype=None,
+    ):
+        del dtype
+        self.bank_builds += 1
+        return SimpleNamespace(
+            prompt_ids=unique_prompt_ids,
+            prompt_lengths=unique_prompt_lengths,
+        )
+
+    def admit_prompt_prefixes(
+        self,
+        bank,
+        group_indices,
+        group_slot_ids,
+        paged_cache,
+    ):
+        self.admission_calls.append(group_slot_ids.tolist())
+        slots = group_slot_ids.flatten()
+        selected_prompts = bank.prompt_ids.index_select(0, group_indices)
+        selected_lengths = bank.prompt_lengths.index_select(0, group_indices)
+        targets = selected_prompts[:, 0].repeat_interleave(
+            group_slot_ids.size(1)
+        )
+        paged_cache.target[slots] = targets
+        paged_cache.steps[slots] = 0
+        paged_cache.kv_starts[slots] = (
+            selected_prompts.size(1) - selected_lengths
+        ).repeat_interleave(group_slot_ids.size(1))
+        return self._output(slots, paged_cache)
+
+    def paged_step(
+        self,
+        input_latent,
+        paged_cache,
+        *,
+        slot_ids,
+        positions,
+        live=None,
+    ):
+        del input_latent
+        if live is not None:
+            # Padding rows must be inert. Recording only the live prefix keeps
+            # every existing call assertion meaningful while the padded width
+            # is still exercised end to end.
+            self.padded_widths.append(slot_ids.numel())
+            slot_ids = slot_ids[live]
+            positions = positions[live]
+        self.step_calls.append((slot_ids.tolist(), positions.tolist()))
+        self.step_kv_starts.append(
+            paged_cache.kv_starts.index_select(0, slot_ids).tolist()
+        )
+        paged_cache.steps[slot_ids] += 1
+        return self._output(slot_ids, paged_cache)
+
+    @staticmethod
+    def embed_tokens(token_ids):
+        return token_ids.float()[..., None].expand(*token_ids.shape, 3)
+
+    @staticmethod
+    def thought_input(thought):
+        return thought[:, None]
+
+
+def _chunk(*target_lengths: int):
+    prompts = torch.zeros((len(target_lengths), 3), dtype=torch.long)
+    prompts[:, 0] = torch.tensor(target_lengths)
+    prompts[:, 1:] = 3
+    return prompts, torch.full((len(target_lengths),), 3, dtype=torch.long)
+
+
+def _run(
+    model,
+    chunks,
+    *,
+    repeats=2,
+    capacity=4,
+    max_new_tokens=5,
+    seed=17,
+    stats=None,
+    top_p=1.0,
+    pin_emit=True,
+    replay_storage=True,
+    paged_cache=None,
+    pad_decode_width=None,
+):
+    return rollout_continuous_refill_groups(
+        model,
+        [chunk[0] for chunk in chunks],
+        [chunk[1] for chunk in chunks],
+        prompt_repeats=repeats,
+        capacity_rows=capacity,
+        max_new_tokens=max_new_tokens,
+        max_stream_steps=max_new_tokens + (0 if pin_emit else 1),
+        temperature=1.0,
+        top_p=top_p,
+        seed=seed,
+        stop_ids=1,
+        pin_emit=pin_emit,
+        replay_storage=replay_storage,
+        schedule_stats=stats,
+        paged_cache=paged_cache,
+        pad_decode_width=pad_decode_width,
+    )
+
+
+def test_continuous_refill_reuses_freed_slots_without_censoring():
+    model = _FakeContinuousModel()
+    stats = ContinuousScheduleStats()
+    results = _run(
+        model,
+        [_chunk(1), _chunk(3), _chunk(2)],
+        stats=stats,
+    )
+
+    assert model.bank_builds == 1
+    assert model.admission_calls == [[[0, 1], [2, 3]], [[0, 1]]]
+    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
+        [1, 1],
+        [3, 3],
+        [2, 2],
+    ]
+    # Physical lanes 0/1 restart at the prompt seam when origin 2 refills
+    # them; lanes 2/3 retain their independent logical positions.
+    assert model.step_calls[:3] == [
+        ([0, 1, 2, 3], [3, 3, 3, 3]),
+        ([0, 1, 2, 3], [3, 3, 4, 4]),
+        ([0, 1, 2, 3], [4, 4, 5, 5]),
+    ]
+    assert stats.admitted_groups == 3
+    assert stats.admitted_rows == stats.evicted_rows == 6
+    assert stats.active_rows_max == 4
+    assert stats.metrics()["decode_slot_occupancy"] == 1.0
+
+
+def test_padded_decode_width_changes_nothing_a_live_row_can_observe():
+    """Padding rows are for the compiler's batch bucket, not for the model.
+
+    This runs on CPU only because ``pad_decode_width`` is injectable; the
+    production gate is ``device.type == "cuda"``, so without the override the
+    only code that steps rows outside the logical batch would have no test at
+    all. That code used to reserve a currently-free LANE per padding row,
+    which is safe only while a slot permanently owns one -- precisely the
+    assumption the page table exists to remove.
+    """
+    # Three-row groups in a four-row pool: the batch never lands on a bucket
+    # boundary on its own, so every step is padded.
+    chunks = [_chunk(1), _chunk(3), _chunk(2)]
+    plain = _run(_FakeContinuousModel(), chunks, repeats=3)
+    padded_model = _FakeContinuousModel()
+    padded = _run(padded_model, chunks, repeats=3, pad_decode_width=True)
+
+    assert padded_model.padded_widths, "no step was actually padded"
+    assert max(padded_model.padded_widths) == 4
+    for left, right in zip(plain, padded, strict=True):
+        torch.testing.assert_close(left.actions, right.actions)
+        torch.testing.assert_close(left.action_mask, right.action_mask)
+        torch.testing.assert_close(left.token_ids, right.token_ids)
+
+
+def test_full_capacity_completion_refills_on_the_next_iteration():
+    model = _FakeContinuousModel()
+    results = _run(
+        model,
+        [_chunk(1), _chunk(2)],
+        repeats=2,
+        capacity=2,
+    )
+
+    assert model.admission_calls == [[[0, 1]], [[0, 1]]]
+    assert model.step_calls[:2] == [
+        ([0, 1], [3, 3]),
+        ([0, 1], [3, 3]),
+    ]
+    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
+        [1, 1],
+        [2, 2],
+    ]
+
+
+def test_scheduler_reuses_a_caller_owned_paged_cache():
+    model = _FakeContinuousModel()
+    chunks = [_chunk(1), _chunk(2)]
+    cache = model.make_paged_generation_cache(
+        4, 3 + 5, torch.device("cpu")
+    )
+    assert model.cache_allocations == 1
+
+    results = _run(model, chunks, paged_cache=cache)
+
+    assert model.cache_allocations == 1
+    assert sum(batch.kind.size(0) for batch in results) == 4
+
+
+def test_admission_never_splits_a_prompt_group():
+    model = _FakeContinuousModel()
+    stats = ContinuousScheduleStats()
+    results = _run(
+        model,
+        [_chunk(1), _chunk(1), _chunk(1)],
+        repeats=2,
+        capacity=3,
+        stats=stats,
+    )
+
+    assert model.bank_builds == 1
+    assert model.admission_calls == [[[0, 1]], [[0, 1]], [[0, 1]]]
+    assert stats.active_rows_max == 2
+    assert stats.free_rows_min == 1
+    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
+        [1, 1],
+        [1, 1],
+        [1, 1],
+    ]
+
+
+def test_request_rng_is_stable_across_capacity_and_refill_order():
+    chunks = [_chunk(9), _chunk(9), _chunk(9), _chunk(9)]
+    narrow = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        chunks,
+        repeats=1,
+        capacity=2,
+        max_new_tokens=4,
+        seed=1234,
+    )
+    wide = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        chunks,
+        repeats=1,
+        capacity=4,
+        max_new_tokens=4,
+        seed=1234,
+    )
+
+    for narrow_batch, wide_batch in zip(narrow, wide, strict=True):
+        torch.testing.assert_close(
+            narrow_batch.token_ids, wide_batch.token_ids, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            narrow_batch.actions, wide_batch.actions, rtol=0, atol=0
+        )
+
+
+def test_request_rng_is_stable_across_chunk_partitioning():
+    flat_prompts, flat_lengths = _chunk(9, 9, 9, 9)
+    paired_chunks = [
+        (flat_prompts[:2], flat_lengths[:2]),
+        (flat_prompts[2:], flat_lengths[2:]),
+    ]
+    singleton_chunks = [
+        (flat_prompts[index : index + 1], flat_lengths[index : index + 1])
+        for index in range(4)
+    ]
+    paired = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        paired_chunks,
+        repeats=2,
+        capacity=4,
+        max_new_tokens=4,
+        seed=1234,
+    )
+    singleton = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        singleton_chunks,
+        repeats=2,
+        capacity=2,
+        max_new_tokens=4,
+        seed=1234,
+    )
+    def generated(rows):
+        result = []
+        for batch in rows:
+            for row in range(batch.token_ids.size(0)):
+                count = int(batch.action_mask[row].sum())
+                result.append(
+                    batch.token_ids[
+                        row, batch.prompt_length : batch.prompt_length + count
+                    ].tolist()
+                )
+        return result
+
+    assert generated(paired) == generated(singleton)
+
+
+def test_request_rng_changes_with_pool_seed():
+    chunks = [_chunk(9), _chunk(9)]
+    first = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        chunks,
+        repeats=2,
+        capacity=4,
         max_new_tokens=5,
-        max_stream_steps=5,
+        seed=7,
+    )
+    second = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        chunks,
+        repeats=2,
+        capacity=4,
+        max_new_tokens=5,
+        seed=8,
+    )
+
+    assert any(
+        not left.token_ids.equal(right.token_ids)
+        for left, right in zip(first, second, strict=True)
+    )
+
+
+def test_nucleus_sampling_remains_request_stable():
+    chunks = [_chunk(9), _chunk(9), _chunk(9)]
+    narrow = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        chunks,
+        repeats=1,
+        capacity=1,
+        max_new_tokens=3,
+        seed=99,
+        top_p=0.7,
+    )
+    wide = _run(
+        _FakeContinuousModel(stochastic_tokens=True),
+        chunks,
+        repeats=1,
+        capacity=3,
+        max_new_tokens=3,
+        seed=99,
+        top_p=0.7,
+    )
+    for left, right in zip(narrow, wide, strict=True):
+        torch.testing.assert_close(
+            left.token_ids, right.token_ids, rtol=0, atol=0
+        )
+
+
+def test_latent_rng_is_stable_without_replay_thought_storage():
+    chunks = [_chunk(1), _chunk(1), _chunk(1)]
+    narrow = _run(
+        _FakeContinuousModel(),
+        chunks,
+        repeats=1,
+        capacity=1,
+        max_new_tokens=2,
+        seed=71,
+        pin_emit=False,
+        replay_storage=False,
+    )
+    wide = _run(
+        _FakeContinuousModel(),
+        chunks,
+        repeats=1,
+        capacity=3,
+        max_new_tokens=2,
+        seed=71,
+        pin_emit=False,
+        replay_storage=False,
+    )
+    for left, right in zip(narrow, wide, strict=True):
+        assert left.thoughts.size(-1) == 0
+        torch.testing.assert_close(
+            left.token_ids, right.token_ids, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            left.actions, right.actions, rtol=0, atol=0
+        )
+
+
+def test_left_padding_start_is_carried_across_refill_steps():
+    model = _FakeContinuousModel()
+    prompts, lengths = _chunk(2)
+    prompts[0, 0] = 0
+    lengths[0] = 2
+    _run(model, [(prompts, lengths)], repeats=2, capacity=2)
+
+    assert model.step_kv_starts
+    assert all(starts == [1, 1] for starts in model.step_kv_starts)
+
+
+def test_real_paged_model_runs_refill_with_independent_positions():
+    model = LatentThoughtModel(_backbone()).eval()
+    first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
+    second_prompts = torch.tensor([[3, 17, 19, 23]])
+    stats = ContinuousScheduleStats()
+    results = rollout_continuous_refill_groups(
+        model,
+        [first_prompts, second_prompts],
+        [torch.tensor([2, 3]), torch.tensor([4])],
+        prompt_repeats=2,
+        capacity_rows=4,
+        max_new_tokens=2,
+        max_stream_steps=2,
         temperature=1.0,
         top_p=1.0,
-        tail_rows=1,
-        stop_ids=1,
+        seed=101,
+        cache_dtype=torch.float32,
         pin_emit=True,
-        sync_every=4,
         schedule_stats=stats,
     )
 
-    assert stats.decode_steps == 10
-    assert stats.lockstep_decode_steps == 10
-    assert stats.metrics()["decode_step_savings_fraction"] == 0.0
+    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
+        [2, 2, 2, 2],
+        [2, 2],
+    ]
+    assert all(torch.isfinite(batch.token_ids).all() for batch in results)
+    assert stats.admitted_groups == 3
+    assert stats.evicted_rows == 6
+
+
+def test_scheduler_rejects_capacity_smaller_than_one_group():
+    model = _FakeContinuousModel()
+    chunk = _chunk(1)
+    try:
+        _run(model, [chunk], repeats=2, capacity=1)
+    except ValueError as error:
+        assert "whole prompt group" in str(error)
+    else:
+        raise AssertionError("scheduler accepted a split group capacity")
