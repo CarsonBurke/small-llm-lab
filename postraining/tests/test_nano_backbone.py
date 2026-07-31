@@ -322,6 +322,7 @@ def test_paged_step_core_is_one_full_graph_across_ragged_positions():
             positions,
             block_mask,
             paged.token_addresses(slot_ids, positions),
+            slot_ids,
         )
         assert torch.isfinite(output[-1]).all()
     assert len(compiled_graphs) == 1

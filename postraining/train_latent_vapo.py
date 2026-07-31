@@ -55,6 +55,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 import hashlib
 import json
+import logging
 import math
 import os
 import random
@@ -124,6 +125,7 @@ from postraining.latent_thought import (
 from postraining.rollout_scheduler import (
     ContinuousScheduleStats,
     rollout_continuous_refill_groups,
+    warmup_decode_width_buckets,
 )
 from postraining.model_io import fresh_trunk, load_model
 from postraining.muon import Muon
@@ -165,6 +167,29 @@ RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
 # instead of Minerva-normalizing everything.
 REWARD_SCHEMA = POSTTRAIN_REWARD_SCHEMA
+
+
+class _TileLangCompileCounter(logging.Handler):
+    """Count TileLang JIT kernel compiles via their announcement log line.
+
+    FLA's KDA ops JIT TileLang kernels outside every torch.compile counter,
+    so the only in-process signal is ``tilelang.jit.kernel`` logging
+    "TileLang begins to compile kernel". Attached by logger NAME at import,
+    before tilelang itself is imported — logger objects are process-global
+    singletons, so the handler survives tilelang's own logging setup.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "begins to compile" in record.getMessage():
+            self.count += 1
+
+
+tilelang_compile_counter = _TileLangCompileCounter()
+logging.getLogger("tilelang.jit.kernel").addHandler(tilelang_compile_counter)
 
 
 def math_dataset_identity(path: str | Path, exclude_modules: str) -> str:
@@ -800,11 +825,29 @@ def muon_matrix_parameters(
     Mirrors ``nanogpt_mini_gpt2vocab_train.py`` exactly — embeddings, the
     readout, biases, and norm gains stay under AdamW. Fresh-lineage probes
     live under ``blocks[-1]``, so the exclusion set must be honored here too.
+
+    KDA blocks add the one family of ndim>=2 tensors pretraining kept OUT of
+    Muon: the ``[D, 1, W]`` depthwise conv windows (their own AdamW group,
+    ``KDA_CONV_LR``). Orthogonalizing per-channel windows is not a Muon
+    update, so they stay under AdamW here too — 1-D ``A_log``/``dt_bias``
+    already fall through on ndim.
     """
+    conv_parameter_ids = {
+        id(conv.weight)
+        for block in blocks
+        if getattr(block, "use_kda", False)
+        for conv in (
+            block.attn.q_conv1d,
+            block.attn.k_conv1d,
+            block.attn.v_conv1d,
+        )
+    }
     return [
         parameter
         for parameter in blocks.parameters()
-        if parameter.ndim >= 2 and id(parameter) not in excluded_parameter_ids
+        if parameter.ndim >= 2
+        and id(parameter) not in excluded_parameter_ids
+        and id(parameter) not in conv_parameter_ids
     ]
 
 
@@ -1534,6 +1577,7 @@ def purge_benchmark_reports_after(output: Path, step: int) -> int:
 
 
 def main() -> None:
+    run_started = time.monotonic()
     parser = build_arg_parser()
     args = parser.parse_args()
     validate_args(parser, args)
@@ -1557,6 +1601,14 @@ def main() -> None:
             "predicted-latent probe "
             f"architecture {backbone.architecture!r} is incompatible"
         )
+    # KDA mixers wrap FLA's chunk kernel, which deliberately graph-breaks
+    # under torch.compile: the teacher-forced replay/valuation surfaces can
+    # still be compiled, but not under fullgraph=True. The decode step stays
+    # a pure-PyTorch recurrence, so the rollout step artifacts keep fullgraph
+    # — including paged_step_core, whose recurrent layers are lane-indexed
+    # gather/step/scatter (see kda_backbone._block_paged_step).
+    is_recurrent_trunk = "_kda_" in backbone.architecture
+    trunk_fullgraph = not is_recurrent_trunk
 
     # Backbone-derived context contract: fresh PoPE executes 5x its pretrained
     # window, so RL keeps the full 1024-token prompt plus a 4096-slot stream.
@@ -2298,17 +2350,45 @@ def main() -> None:
     eval_step_core = compiled_generation_step if args.eval_compile else None
     rollout_paged_step_core = None
     if args.rollout_scheduler == "continuous_refill":
+        # One compiled entry per declared width bucket; the default limit
+        # of 8 would silently drop the small tail widths to eager. Raised
+        # here rather than only in the eval/lockstep branch above so the
+        # paged path never depends on --eval-compile being on.
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64
+        )
+        if args.rollout_graph_decode:
+            # Declared shapes, hard errors: a cudagraph skip after the
+            # warmup captured every width is a bug, not a fallback —
+            # surface it as a RuntimeError instead of a silently eager
+            # A/B arm.
+            torch._inductor.config.triton.cudagraph_or_error = True
         rollout_paged_step_core = profiler.register_artifact(
             "rollout_paged_step",
             torch.compile(
                 wrapper.paged_step_core,
-                mode="max-autotune-no-cudagraphs",
                 fullgraph=True,
                 # FlexDecoding requires a concrete batch dimension. The
                 # scheduler supplies one full-capacity main bucket plus
                 # power-of-two tail buckets, avoiding a specialization for
                 # every possible survivor count.
                 dynamic=False,
+                # Under --rollout-graph-decode the bucket set doubles as a
+                # vLLM-style capture list: one CUDA graph per declared
+                # width, replayed as ~one launch per decode step. The mode
+                # is max-autotune (== max-autotune-no-cudagraphs plus
+                # triton.cudagraphs) rather than reduce-overhead, which
+                # would silently drop autotuning and confound the A/B with
+                # a kernel-quality change. The paged arena is
+                # mark_static_address'd at allocation (mutated graph
+                # inputs must hold fixed addresses or inductor skips
+                # capture), and warmup_decode_width_buckets captures every
+                # width before the first real token.
+                mode=(
+                    "max-autotune"
+                    if args.rollout_graph_decode
+                    else "max-autotune-no-cudagraphs"
+                ),
             ),
         )
 
@@ -2486,7 +2566,12 @@ def main() -> None:
                 # repeatedly stalls training to benchmark each new regime;
                 # default Inductor dispatches them to stable cuBLAS kernels.
                 mode="default",
-                fullgraph=True,
+                # trunk_fullgraph: KDA replay traverses the eager FLA chunk
+                # kernel, so the artifact compiles as subgraphs around it.
+                # Age-0 exactness needs one artifact shared by refresh and
+                # update, not zero graph breaks — the rebinding below is
+                # unchanged.
+                fullgraph=trunk_fullgraph,
                 dynamic=True,
             ),
         )
@@ -2495,7 +2580,7 @@ def main() -> None:
             torch.compile(
                 replay_head_inputs,
                 mode="default",
-                fullgraph=True,
+                fullgraph=trunk_fullgraph,
                 dynamic=True,
             ),
         )
@@ -2885,6 +2970,32 @@ def main() -> None:
                     device,
                     dtype=torch.bfloat16,
                 )
+                if args.rollout_graph_decode:
+                    # Graph capture bakes tensor addresses. The arena is
+                    # mutated inside the compiled step (dense K/V writes),
+                    # and inductor refuses to capture graphs whose mutated
+                    # inputs are not statically addressed — without the
+                    # marks it falls back to eager silently. page_home is
+                    # read-only but constant for the run; marking it too
+                    # saves its per-replay copy into the placeholder.
+                    for cache_layer in rollout_paged_cache.layers:
+                        for cache_tensor in cache_layer:
+                            torch._dynamo.mark_static_address(cache_tensor)
+                    torch._dynamo.mark_static_address(
+                        rollout_paged_cache.page_home
+                    )
+                    with profiler.phase("decode_graph_warmup"):
+                        warmed = warmup_decode_width_buckets(
+                            wrapper,
+                            rollout_paged_cache,
+                            args.rollout_groups * samples,
+                        )
+                    print(
+                        "rollout graph decode: warmed width buckets "
+                        f"{warmed}; cudagraph_skips="
+                        f"{torch._dynamo.utils.counters['inductor']['cudagraph_skips']}",
+                        flush=True,
+                    )
             with profiler.phase("decode"):
                 scheduled_batches = rollout_continuous_refill_groups(
                     wrapper,
@@ -3353,6 +3464,19 @@ def main() -> None:
 
     step = start_step
     while step < args.steps:
+        if (
+            args.max_train_hours is not None
+            and time.monotonic() - run_started > args.max_train_hours * 3600
+        ):
+            # Pool-boundary stop: the loop tail below already saves the
+            # final checkpoint, so a deadline exit is an ordinary truncation
+            # of a constant-learning-rate run, resumable like any other.
+            print(
+                f"--max-train-hours {args.max_train_hours} reached at step "
+                f"{step}/{args.steps}; stopping at the pool boundary",
+                flush=True,
+            )
+            break
         previous_step = step
         # Before the clock starts: attaching the profiler's own machinery
         # would otherwise land inside this pool's wall time and inside its
@@ -3824,6 +3948,33 @@ def main() -> None:
                 )
                 actor_dashboard["perf/minibatch_cpu_pack_seconds"] = (
                     minibatch_pack_seconds
+                )
+                # Monotonic process-global gauges, not per-step. Three
+                # separate compile populations can stall a step, and no
+                # single counter sees them all: Dynamo forward graphs
+                # (unique_graphs), AOT backward compiles (aot_autograd
+                # total — invisible to unique_graphs), and TileLang JIT
+                # kernels from FLA's KDA ops (invisible to every dynamo
+                # counter; counted via a logging hook on tilelang's
+                # "begins to compile" line — k3_latent_10h burned 999 s
+                # there while unique_graphs stayed flat). A mid-run delta
+                # in any of them is a compile; the gauges cannot say WHICH
+                # artifact, only that step-time forensics are warranted.
+                actor_dashboard["perf/dynamo_unique_graphs"] = float(
+                    torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                )
+                actor_dashboard["perf/aot_autograd_compiles"] = float(
+                    torch._dynamo.utils.counters["aot_autograd"]["total"]
+                )
+                actor_dashboard["perf/tilelang_kernel_compiles"] = float(
+                    tilelang_compile_counter.count
+                )
+                # A cudagraph skip means a graph-decode arm silently ran
+                # eager; none of the compile gauges above can see it.
+                actor_dashboard["perf/cudagraph_skips"] = float(
+                    torch._dynamo.utils.counters["inductor"][
+                        "cudagraph_skips"
+                    ]
                 )
                 if next_step == 1 or (
                     args.post_update_kl_every > 0

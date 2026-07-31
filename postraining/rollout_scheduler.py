@@ -416,6 +416,68 @@ def _decode_execution_width(
     return min(capacity_rows, 1 << (active_rows - 1).bit_length())
 
 
+@torch.no_grad()
+def warmup_decode_width_buckets(
+    model: ContinuousRefillModel,
+    paged_cache,
+    capacity_rows: int,
+    *,
+    passes: int = 3,
+) -> list[int]:
+    """Drive every declared execution-width bucket through the paged step.
+
+    The width set is exactly the range of ``_decode_execution_width`` — full
+    capacity for the refill main phase plus the power-of-two tail buckets —
+    so after this returns, no live pool can present the compiled paged step
+    with a shape it has not already seen. Under ``mode="reduce-overhead"``
+    that means every CUDA graph is captured before the first real token:
+    shapes are declared up front, never discovered mid-rollout. Largest
+    width first, so later captures reuse the largest activation slab in the
+    shared cudagraph memory pool (the vLLM capture-order rule).
+
+    Every warmup row is dead (``live`` all false): KV reads see an empty
+    range, KV writes land in the scratch pages no slot owns, and recurrent
+    (KDA) lane writes are redirected to the scratch lane rows in
+    ``[capacity, 2 * capacity)`` — so the arena is untouched everywhere a
+    real request can reach. ``no_grad`` is
+    LOAD-BEARING twice over: grad state is a compile guard (a mismatched
+    warmup would specialize a second, never-replayed artifact per width),
+    and inference mode is what lets cudagraph trees end the current
+    execution generation between replays — a grad-enabled artifact with
+    the previous step's output still alive would re-record a fresh child
+    graph every decode step, unbounded. The input latent comes from the
+    model's own token-embedding producer rather than a hardcoded dtype so
+    the warmup call is guard-identical (dtype, stride) to the decode
+    loop's; ``passes`` defaults to 3 because inductor's cudagraph trees
+    run eager warmup calls before recording a shape's graph.
+    """
+    device = paged_cache.page_table.device
+    widths = sorted(
+        {
+            min(capacity_rows, 1 << shift)
+            for shift in range(capacity_rows.bit_length())
+        }
+        | {capacity_rows},
+        reverse=True,
+    )
+    for width in widths:
+        input_latent = model.embed_tokens(
+            torch.zeros((width, 1), dtype=torch.long, device=device)
+        )
+        slot_ids = torch.zeros(width, dtype=torch.long, device=device)
+        positions = torch.zeros(width, dtype=torch.long, device=device)
+        live = torch.zeros(width, dtype=torch.bool, device=device)
+        for _ in range(passes):
+            model.paged_step(
+                input_latent,
+                paged_cache,
+                slot_ids=slot_ids,
+                positions=positions,
+                live=live,
+            )
+    return widths
+
+
 def _cpu_request_random(key_bits: Tensor) -> tuple[Tensor, Tensor]:
     """Isolated CPU reference for tests; production CUDA stays vectorized."""
     rows = key_bits.size(0)

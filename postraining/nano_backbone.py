@@ -332,8 +332,10 @@ class _NanoPostrainingMixin:
         positions: Tensor,
         block_mask: BlockMask,
         cache_addresses: Tensor,
+        lane_rows: Tensor,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        del x0
+        # lane_rows addresses recurrent arenas; a pure-KV block has none.
+        del x0, lane_rows
         attn, cache = self._attention_paged_step(
             block.attn,
             block.norm1(x),

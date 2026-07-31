@@ -4,12 +4,20 @@ from types import SimpleNamespace
 
 import torch
 
-from postraining.latent_rollout import generated_slot_mask, replay_beliefs
+from postraining.latent_rollout import (
+    generated_slot_mask,
+    replay_beliefs,
+    split_rollout_groups,
+)
 from postraining.latent_thought import LatentThoughtModel, StepOutput
 from postraining.rollout_scheduler import (
     ContinuousScheduleStats,
     _decode_execution_width,
     rollout_continuous_refill_groups,
+    warmup_decode_width_buckets,
+)
+from postraining.tests.test_kda_backbone import (
+    _seeded_backbone as _kda_backbone,
 )
 from postraining.tests.test_nano_backbone import _backbone
 
@@ -484,6 +492,39 @@ def test_real_paged_model_runs_refill_with_independent_positions():
     assert stats.evicted_rows == 6
 
 
+def _assert_split_groups_replay_carries(model, results, chunk_lengths, repeats):
+    """Split each chunk batch per group, then check carries against replay.
+
+    Replay parity holds for the batches the trainer actually replays: the
+    per-group, pad-trimmed splits from ``split_rollout_groups``. The raw
+    per-chunk batch is an intermediate — its left-padded rows replay
+    differently on any trunk with live projections, because the rollout
+    excludes pad positions structurally (kv_starts / prefill masking) while
+    the parallel replay only zeroes their inputs, and residual biases
+    re-inflate them from the first block on. The trainer never replays a
+    chunk batch, so neither do these tests.
+    """
+    checked = 0
+    for batch, lengths in zip(results, chunk_lengths, strict=True):
+        expanded = lengths.repeat_interleave(repeats)
+        for group in split_rollout_groups(batch, repeats, expanded):
+            carried = generated_slot_mask(group)
+            assert bool(carried.any())
+            assert group.hiddens.size(-1) == model.backbone.tok_emb.embedding_dim
+            assert float(group.hiddens[~carried].abs().sum()) == 0.0
+            with torch.no_grad():
+                _, beliefs = replay_beliefs(model, group)
+            tail = carried[:, 1:]
+            torch.testing.assert_close(
+                group.hiddens[:, 1:][tail],
+                beliefs[:, :-1][tail],
+                rtol=1e-4,
+                atol=1e-5,
+            )
+            checked += 1
+    assert checked == sum(lengths.numel() for lengths in chunk_lengths)
+
+
 def test_real_paged_model_hidden_carry_matches_dense_replay():
     """Scheduler-stored carries must equal the dense replay reconstruction.
 
@@ -491,20 +532,27 @@ def test_real_paged_model_hidden_carry_matches_dense_replay():
     the stored hidden at slot t is the belief that emitted token t, so it
     must match the replayed belief at t-1 wherever the carry flag is set. A
     live combiner makes the carried content feed back into later beliefs,
-    so a corrupted store shows up as a cascading mismatch, not a no-op.
+    so a corrupted store shows up as a cascading mismatch, not a no-op. The
+    trunk projections are livened too: the fresh init's zeroed outputs make
+    the blocks an identity residual stream, which would vacuously hide any
+    disagreement between the paged rollout and the replay.
     """
     model = LatentThoughtModel(_backbone()).eval()
     with torch.no_grad():
+        for block in model.backbone.blocks:
+            block.attn.proj.weight.normal_(std=0.02)
+            block.mlp.proj.weight.normal_(std=0.02)
         model.combiner.gain.fill_(0.4)
         model.combiner.type_bias.normal_(std=0.02)
         for mlp in model.combiner.mlps:
             mlp.proj.weight.normal_(std=0.02)
     first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
     second_prompts = torch.tensor([[3, 17, 19, 23]])
+    chunk_lengths = [torch.tensor([2, 3]), torch.tensor([4])]
     results = rollout_continuous_refill_groups(
         model,
         [first_prompts, second_prompts],
-        [torch.tensor([2, 3]), torch.tensor([4])],
+        chunk_lengths,
         prompt_repeats=2,
         capacity_rows=4,
         max_new_tokens=3,
@@ -517,20 +565,81 @@ def test_real_paged_model_hidden_carry_matches_dense_replay():
     )
 
     assert results
-    for batch in results:
-        carried = generated_slot_mask(batch)
-        assert bool(carried.any())
-        assert batch.hiddens.size(-1) == model.backbone.tok_emb.embedding_dim
-        assert float(batch.hiddens[~carried].abs().sum()) == 0.0
-        with torch.no_grad():
-            _, beliefs = replay_beliefs(model, batch)
-        tail = carried[:, 1:]
-        torch.testing.assert_close(
-            batch.hiddens[:, 1:][tail],
-            beliefs[:, :-1][tail],
-            rtol=1e-4,
-            atol=1e-5,
-        )
+    _assert_split_groups_replay_carries(model, results, chunk_lengths, 2)
+
+
+def test_real_kda_model_runs_refill_with_independent_positions():
+    """The recurrent hybrid trunk goes through the same scheduler lifecycle.
+
+    Same shape assertions as the dense variant: admission, ragged eviction,
+    and refill must not depend on the cache being KV-addressed. The KDA
+    lanes ride the 4-tuple arenas in the same ``PagedGenerationCache``.
+    """
+    model = LatentThoughtModel(_kda_backbone()).eval()
+    first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
+    second_prompts = torch.tensor([[3, 17, 19, 23]])
+    stats = ContinuousScheduleStats()
+    results = rollout_continuous_refill_groups(
+        model,
+        [first_prompts, second_prompts],
+        [torch.tensor([2, 3]), torch.tensor([4])],
+        prompt_repeats=2,
+        capacity_rows=4,
+        max_new_tokens=2,
+        max_stream_steps=2,
+        temperature=1.0,
+        top_p=1.0,
+        seed=101,
+        cache_dtype=torch.float32,
+        pin_emit=True,
+        schedule_stats=stats,
+    )
+
+    assert [batch.action_mask.sum(1).tolist() for batch in results] == [
+        [2, 2, 2, 2],
+        [2, 2],
+    ]
+    assert all(torch.isfinite(batch.token_ids).all() for batch in results)
+    assert stats.admitted_groups == 3
+    assert stats.evicted_rows == 6
+
+
+def test_real_kda_model_hidden_carry_matches_dense_replay():
+    """Paged recurrent decode must agree with the full-sequence replay.
+
+    The strongest end-to-end statement for the KDA port: the scheduler's
+    decode loop advances lane-gathered conv windows and delta-rule state one
+    token at a time, while ``replay_beliefs`` re-prices the same stream
+    through the parallel reference recurrence. A live combiner feeds stored
+    carries back into later beliefs, so any lane-state corruption cascades
+    into a mismatch instead of cancelling out.
+    """
+    model = LatentThoughtModel(_kda_backbone()).eval()
+    with torch.no_grad():
+        model.combiner.gain.fill_(0.4)
+        model.combiner.type_bias.normal_(std=0.02)
+        for mlp in model.combiner.mlps:
+            mlp.proj.weight.normal_(std=0.02)
+    first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
+    second_prompts = torch.tensor([[3, 17, 19, 23]])
+    chunk_lengths = [torch.tensor([2, 3]), torch.tensor([4])]
+    results = rollout_continuous_refill_groups(
+        model,
+        [first_prompts, second_prompts],
+        chunk_lengths,
+        prompt_repeats=2,
+        capacity_rows=4,
+        max_new_tokens=3,
+        max_stream_steps=3,
+        temperature=1.0,
+        top_p=1.0,
+        seed=101,
+        cache_dtype=torch.float32,
+        pin_emit=False,
+    )
+
+    assert results
+    _assert_split_groups_replay_carries(model, results, chunk_lengths, 2)
 
 
 def test_scheduler_rejects_capacity_smaller_than_one_group():
@@ -542,3 +651,59 @@ def test_scheduler_rejects_capacity_smaller_than_one_group():
         assert "whole prompt group" in str(error)
     else:
         raise AssertionError("scheduler accepted a split group capacity")
+
+
+def test_warmup_decode_width_buckets_covers_and_preserves() -> None:
+    """Warmup must visit every width the scheduler can request, and a
+    warmed arena must produce bit-identical rollouts to a fresh one —
+    dead-row warmup writes may only touch pages no slot owns."""
+    capacity = 4
+    first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
+    second_prompts = torch.tensor([[3, 17, 19, 23]])
+
+    def run(cache):
+        return rollout_continuous_refill_groups(
+            LatentThoughtModel(_backbone()).eval(),
+            [first_prompts, second_prompts],
+            [torch.tensor([2, 3]), torch.tensor([4])],
+            prompt_repeats=2,
+            capacity_rows=capacity,
+            max_new_tokens=2,
+            max_stream_steps=2,
+            temperature=1.0,
+            top_p=1.0,
+            seed=101,
+            cache_dtype=torch.float32,
+            pin_emit=True,
+            paged_cache=cache,
+        )
+
+    model = LatentThoughtModel(_backbone()).eval()
+    cache = model.make_paged_generation_cache(
+        capacity, 4 + 2, torch.device("cpu"), dtype=torch.float32
+    )
+    widths = warmup_decode_width_buckets(model, cache, capacity)
+    assert widths == sorted(widths, reverse=True)
+    assert widths[0] == capacity
+    for active in range(1, capacity + 1):
+        for pending in (False, True):
+            assert (
+                _decode_execution_width(
+                    active, capacity, pending_groups=pending
+                )
+                in widths
+            )
+
+    warmed = run(cache)
+    fresh_model = LatentThoughtModel(_backbone()).eval()
+    fresh = run(
+        fresh_model.make_paged_generation_cache(
+            capacity, 4 + 2, torch.device("cpu"), dtype=torch.float32
+        )
+    )
+    for warmed_batch, fresh_batch in zip(warmed, fresh, strict=True):
+        assert torch.equal(warmed_batch.token_ids, fresh_batch.token_ids)
+        assert torch.equal(
+            warmed_batch.old_token_logprobs, fresh_batch.old_token_logprobs
+        )
+        assert torch.equal(warmed_batch.hiddens, fresh_batch.hiddens)

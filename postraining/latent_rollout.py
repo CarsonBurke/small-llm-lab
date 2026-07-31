@@ -221,6 +221,23 @@ class ReplayPlan:
             )
 
 
+# Recurrent (KDA) layers carry ``(conv_q, conv_k, conv_v, state)`` decode
+# caches. Unlike the dense KV pair / PoPE triple, none of those tensors has a
+# stream-length axis at dim 2 — the conv windows are ``[rows, D, kernel]`` and
+# the delta-rule state is ``[rows, H, Dv, Dk]`` — so every prefix-window slice
+# below must skip them and every "cache width" question must be answered by a
+# dense layer (or not at all, when the trunk is fully recurrent).
+RECURRENT_CACHE_ARITY = 4
+
+
+def _dense_cache_width(caches: "list[tuple[Tensor, ...]]") -> "int | None":
+    """KV width of the first length-addressed layer; None if all recurrent."""
+    for layer in caches:
+        if len(layer) != RECURRENT_CACHE_ARITY:
+            return layer[0].size(2)
+    return None
+
+
 def compact_stream_to_device(
     batch: LatentRolloutBatch, device: torch.device
 ) -> LatentRolloutBatch:
@@ -528,14 +545,19 @@ def rollout_continuations(
     if decode_mask is not None:
         if not tensor_positions:
             raise ValueError("decode_mask requires tensor_positions")
-        if caches is not None and decode_mask.kv_width != caches[0][0].size(2):
+        preallocated_width = (
+            _dense_cache_width(caches) if caches is not None else None
+        )
+        if preallocated_width is not None and (
+            decode_mask.kv_width != preallocated_width
+        ):
             # Preallocated caches are the CUDA-graph path: the block table
             # spans the whole allocated width, so the two must agree exactly
             # rather than the mask merely covering the stream. When the caller
             # owns the caches it owns the width, so this is its error to fix.
             raise ValueError(
                 f"decode_mask width {decode_mask.kv_width} does not match the "
-                f"preallocated cache width {caches[0][0].size(2)}"
+                f"preallocated cache width {preallocated_width}"
             )
         if decode_mask.kv_width < max_stream:
             raise ValueError(
@@ -577,9 +599,10 @@ def rollout_continuations(
     # this the fan-out would prefill every sample separately.
     expansion_target = None
     if preallocated_caches and prompt_repeats > 1:
-        if caches[0][0].size(2) < max_stream:
+        preallocated_width = _dense_cache_width(caches)
+        if preallocated_width is not None and preallocated_width < max_stream:
             raise ValueError(
-                f"preallocated caches are {caches[0][0].size(2)} wide, "
+                f"preallocated caches are {preallocated_width} wide, "
                 f"shorter than prompt+stream {max_stream}"
             )
         expansion_target = caches
@@ -599,10 +622,13 @@ def rollout_continuations(
         )
         key_masks = None
     else:
-        cache_length = caches[0][0].size(2)
-        if cache_length < max_stream:
+        cache_length = _dense_cache_width(caches)
+        if cache_length is None:
+            # A fully recurrent trunk has no KV width to bound the stream.
+            cache_length = max_stream
+        elif cache_length < max_stream:
             raise ValueError(
-                f"preallocated caches ({tuple(caches[0][0].shape)}) do not fit "
+                f"preallocated caches ({cache_length} wide) do not fit "
                 f"stream {max_stream}"
             )
         position_index = torch.zeros((), dtype=torch.long, device=device)
@@ -635,13 +661,15 @@ def rollout_continuations(
             )
         if position_index is None:
             raise ValueError("tail_caches requires tensor_positions")
-        tail_length = tail_caches[0][0].size(2)
+        tail_width = _dense_cache_width(tail_caches)
+        tail_length = tail_width if tail_width is not None else max_stream
         if (
             tail_caches[0][0].size(0) != finished_batch_size
             or tail_length < max_stream
         ):
             raise ValueError(
-                f"tail caches ({tuple(tail_caches[0][0].shape)}) do not fit "
+                f"tail caches ({tail_caches[0][0].size(0)} rows x "
+                f"{tail_length} wide) do not fit "
                 f"tail batch {finished_batch_size} x stream {max_stream}"
             )
         if tail_caches[0][0].dtype != caches[0][0].dtype:
@@ -796,19 +824,25 @@ def rollout_continuations(
         for source_layer, target_layer in zip(
             caches, expanded_caches, strict=True
         ):
+            recurrent_layer = len(source_layer) == RECURRENT_CACHE_ARITY
             for source, target in zip(source_layer, target_layer, strict=True):
                 grouped_target = target.view(
                     prefix_batch,
                     prompt_repeats,
                     *target.shape[1:],
                 )
-                grouped_target[:, :, :, :prompt_length].copy_(
-                    source[:, None].expand(
-                        prefix_batch,
-                        prompt_repeats,
-                        *source.shape[1:],
-                    )
+                expanded = source[:, None].expand(
+                    prefix_batch,
+                    prompt_repeats,
+                    *source.shape[1:],
                 )
+                if recurrent_layer:
+                    # Conv windows and delta-rule states have no length axis;
+                    # the prefill cache and the arena cache are shape-equal,
+                    # so the fan-out copies each tensor whole.
+                    grouped_target.copy_(expanded)
+                else:
+                    grouped_target[:, :, :, :prompt_length].copy_(expanded)
         caches = expanded_caches
 
         def expand_rows(value: Tensor) -> Tensor:
@@ -923,14 +957,22 @@ def rollout_continuations(
                     # exactly like the zero fill at allocation.
                     for layer, cache in enumerate(caches):
                         static_layer = tail_caches[layer]
+                        recurrent_layer = (
+                            len(cache) == RECURRENT_CACHE_ARITY
+                        )
                         for tensor, target in zip(
                             cache, static_layer, strict=True
                         ):
-                            target[:, :, :live_prefix].copy_(
-                                tensor[:, :, :live_prefix].index_select(
-                                    0, keep
+                            if recurrent_layer:
+                                # No length axis: the survivors' whole conv
+                                # window / state moves.
+                                target.copy_(tensor.index_select(0, keep))
+                            else:
+                                target[:, :, :live_prefix].copy_(
+                                    tensor[:, :, :live_prefix].index_select(
+                                        0, keep
+                                    )
                                 )
-                            )
                         # Replace one layer at a time so the dynamic caches
                         # free as the static ones fill.
                         caches[layer] = static_layer
@@ -954,7 +996,19 @@ def rollout_continuations(
                 elif snap_to_tail or finished_batch_size is None:
                     for layer, cache in enumerate(caches):
                         compacted = []
+                        recurrent_layer = (
+                            len(cache) == RECURRENT_CACHE_ARITY
+                        )
                         for tensor in cache:
+                            if recurrent_layer:
+                                # index_select materializes owning storage of
+                                # exactly the survivor rows; there is no
+                                # write-head garbage to zero in a cache with
+                                # no length axis.
+                                compacted.append(
+                                    tensor.index_select(0, keep)
+                                )
+                                continue
                             target = torch.empty(
                                 (compacted_count, *tensor.shape[1:]),
                                 dtype=tensor.dtype,
@@ -989,7 +1043,15 @@ def rollout_continuations(
                     # alias.
                     for layer, cache in enumerate(caches):
                         compacted = []
+                        recurrent_layer = (
+                            len(cache) == RECURRENT_CACHE_ARITY
+                        )
                         for tensor in cache:
+                            if recurrent_layer:
+                                survivors = tensor.index_select(0, keep)
+                                tensor[:compacted_count].copy_(survivors)
+                                compacted.append(tensor[:compacted_count])
+                                continue
                             survivors = tensor[
                                 :, :, :live_prefix
                             ].index_select(0, keep)
@@ -1584,18 +1646,26 @@ def select_trajectory_rows(
 ) -> LatentRolloutBatch:
     """Materialize selected rows at a compact, shared stream length.
 
-    Every stream dimension leaves here WEAKLY marked dynamic — a hint that
-    steers the first trace and still lets a later guard specialize, unlike
-    ``mark_dynamic``, which would raise on a length-1 shard.
-    ``dynamic=True`` alone gives the first trace DUCK-typed sizes, so any
-    input dim that happens to MATCH another gets the same symbol:
-    ``hiddens`` is (rows, stream, model_dim) with model_dim 512, and 512 is
-    a legal ``--replay-bucket`` multiple, so a first shard of bucketed length
-    512 unifies the stream symbol with the hidden width and the combiner's
-    512-wide Linear then specializes it (measured: the NEXT shard length
-    costs a full 18.5 s recompile; with the mark, 9 ms). This is the one path
-    refresh and update share, so marking here is what keeps a mark from
-    drifting between them and splitting their single compiled artifact.
+    Every stream dimension AND the row dimension leave here WEAKLY marked
+    dynamic — a hint that steers the first trace and still lets a later
+    guard specialize, unlike ``mark_dynamic``, which would raise on a
+    length-1 shard. ``dynamic=True`` alone gives the first trace DUCK-typed
+    sizes, so any input dim that happens to MATCH another gets the same
+    symbol: ``hiddens`` is (rows, stream, model_dim) with model_dim 512, and
+    512 is a legal ``--replay-bucket`` multiple, so a first shard of
+    bucketed length 512 unifies the stream symbol with the hidden width and
+    the combiner's 512-wide Linear then specializes it (measured: the NEXT
+    shard length costs a full 18.5 s recompile; with the mark, 9 ms). The
+    dim-0 mark on the row dimension is defensive hygiene for the duck-on
+    configuration only: under the default ``--no-duck-shape``, DUCK and
+    DYNAMIC both allocate a fresh symbol, so unmarked row counts were
+    already dynamic and never the source of mid-run compiles (the ~12 s
+    stalls k3_latent_10h paid per distinct row count were TileLang JIT
+    compiles of FLA's KDA kernels, which bake the batch size into their
+    cache key — fixed at the ``chunk_kda`` call site by the varlen form,
+    not here). This is the one path refresh and update share, so marking
+    here is what keeps a mark from drifting between them and splitting
+    their single compiled artifact.
     """
     if stream_length < batch.prompt_length or stream_length > batch.stream_length:
         raise ValueError("invalid replay stream length")
@@ -1610,9 +1680,11 @@ def select_trajectory_rows(
             and value.size(1) == batch.stream_length
         ):
             value = value[rows, :stream_length]
+            torch._dynamo.maybe_mark_dynamic(value, 0)
             torch._dynamo.maybe_mark_dynamic(value, 1)
         elif isinstance(value, Tensor) and value.dim() >= 1:
             value = value[rows]
+            torch._dynamo.maybe_mark_dynamic(value, 0)
         selected[field.name] = value
     return LatentRolloutBatch(**selected)
 

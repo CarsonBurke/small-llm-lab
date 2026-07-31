@@ -524,6 +524,14 @@ class PagedGenerationCache:
     ``make_paged_generation_cache`` still hands back the contiguous identity
     mapping, which keeps today's behavior exactly; only the addressing is
     decoupled from the reservation.
+
+    Recurrent (KDA) layers opt out of all of the above: their entry in
+    ``layers`` is a 4-tuple of lane-row arenas (three conv windows plus the
+    fp32 delta-rule state) indexed directly by slot on dim 0, with rows
+    ``[capacity, 2 * capacity)`` reserved as per-row scratch sinks for dead
+    decode rows. Pages, addresses, and masks never apply to them; admission
+    overwrites a lane's rows wholesale, which is what stands in for the
+    ``kv_starts`` stale-suffix masking a recurrent state cannot express.
     """
 
     layers: list[tuple[Tensor, ...]]
@@ -839,6 +847,27 @@ class LatentThoughtModel(nn.Module):
                     torch.zeros(key_shape, device=device, dtype=key.dtype),
                     torch.zeros(value_shape, device=device, dtype=value.dtype),
                 )
+            elif len(template) == 4:
+                # Recurrent (KDA) layer: three conv windows plus the fp32
+                # delta-rule state, all indexed by lane on dim 0 — no pages,
+                # no addresses, no length axis. Rows [capacity, 2 * capacity)
+                # are per-row scratch sinks, the recurrent analogue of
+                # ``scratch_addresses``: a padding row's slot_id may name a
+                # LIVE lane (the scheduler pads with slot 0), and unlike a
+                # masked KV read the recurrent step writes its row
+                # unconditionally, so dead rows must be redirected to rows
+                # nobody owns. Distinct sinks matter for the same reason they
+                # do for KV: ``index_copy_`` with a repeated index is
+                # undefined.
+                rows = 2 * capacity
+                layer = tuple(
+                    torch.zeros(
+                        (rows, *tensor.shape[1:]),
+                        device=device,
+                        dtype=tensor.dtype,
+                    )
+                    for tensor in template
+                )
             else:
                 raise ValueError(
                     f"paged decode does not support {len(template)} cache tensors"
@@ -876,6 +905,7 @@ class LatentThoughtModel(nn.Module):
         positions: Tensor,
         block_mask: BlockMask,
         cache_addresses: Tensor,
+        lane_rows: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """Compiled fixed-capacity surface for independently advancing rows."""
         backbone = self.backbone
@@ -890,6 +920,7 @@ class LatentThoughtModel(nn.Module):
                 positions,
                 block_mask,
                 cache_addresses,
+                lane_rows,
             )
             skips.append(x)
         for j in range(backbone.num_decoder_layers):
@@ -906,6 +937,7 @@ class LatentThoughtModel(nn.Module):
                 positions,
                 block_mask,
                 cache_addresses,
+                lane_rows,
             )
         belief = backbone.final_norm(x)
         logits = backbone.logits_from_features(
@@ -937,12 +969,23 @@ class LatentThoughtModel(nn.Module):
             raise ValueError("positions and slot_ids must have the same shape")
         addresses = cache.token_addresses(slot_ids, positions)
         kv_lengths = positions + 1
+        lane_rows = slot_ids
         if live is not None:
             if live.shape != slot_ids.shape:
                 raise ValueError("live and slot_ids must have the same shape")
             kv_lengths = kv_lengths * live
             addresses = torch.where(
                 live, addresses, cache.scratch_addresses[: live.numel()]
+            )
+            # The recurrent analogue of the scratch-address redirect above:
+            # a dead row's slot_id may name a live lane, and a recurrent
+            # layer's step writes its row unconditionally, so dead rows are
+            # sent to the per-row scratch lanes in [capacity, 2 * capacity).
+            lane_rows = torch.where(
+                live,
+                slot_ids,
+                cache.capacity
+                + torch.arange(live.numel(), device=live.device),
             )
         block_mask = cache.block_mask(slot_ids, kv_lengths)
         belief, logits = self.paged_step_core(
@@ -951,6 +994,7 @@ class LatentThoughtModel(nn.Module):
             positions,
             block_mask,
             addresses,
+            lane_rows,
         )
         return StepOutput(
             belief=belief,
@@ -1093,13 +1137,16 @@ class LatentThoughtModel(nn.Module):
                     "each destination slot must appear exactly once"
                 )
 
-        # One address computation for every layer: the prompt window is the
-        # same logical [0, length) span in every one, so its physical
-        # scatter is too.
+        # One address computation for every KV layer: the prompt window is
+        # the same logical [0, length) span in every one, so its physical
+        # scatter is too. Recurrent layers never touch it — their whole
+        # decode continuation is one row per lane. ``bank.prompt_width``
+        # rather than a layer-0 axis: in a hybrid trunk layer 0 may be
+        # recurrent, whose conv window has no KV-length axis.
         prefix_addresses = cache.token_addresses(
             group_slot_ids.flatten()[:, None],
             torch.arange(
-                bank.layers[0][0].size(2), device=group_slot_ids.device
+                bank.prompt_width, device=group_slot_ids.device
             )[None],
         ).flatten()
         if group_indices.device.type != "cuda":
@@ -1121,6 +1168,24 @@ class LatentThoughtModel(nn.Module):
                 tensor.index_select(0, group_indices)
                 for tensor in bank_layer
             )
+            if len(dense_layer) == 4:
+                # Recurrent layer: fan the selected groups' conv windows and
+                # delta-rule state across their destination lanes. The copy
+                # overwrites each admitted lane's rows completely, which is
+                # also what makes lane recycling sound here — a recurrent
+                # layer has no kv_starts window to hide a previous
+                # occupant's stale state behind.
+                for arena, source in zip(
+                    paged_layer, dense_layer, strict=True
+                ):
+                    arena.index_copy_(
+                        0,
+                        flat_slots,
+                        source.repeat_interleave(
+                            group_slot_ids.size(1), dim=0
+                        ).to(arena.dtype),
+                    )
+                continue
             if len(dense_layer) == 3:
                 dense_key = torch.cat(
                     (dense_layer[0], dense_layer[1]), dim=-1

@@ -424,6 +424,23 @@ def test_profiling_is_off_by_default() -> None:
     assert not args.profile
 
 
+def test_max_train_hours_guards() -> None:
+    _, args = _parse()
+    assert args.max_train_hours is None
+    parser, args = _parse("--max-train-hours", "10")
+    validate_args(parser, args)
+    assert args.max_train_hours == 10.0
+    parser, args = _parse("--max-train-hours", "0")
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)
+    # A wall-clock truncation cannot promise the one-pass prompt contract.
+    parser, args = _parse(
+        "--max-train-hours", "10", "--consume-all-prompts"
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)
+
+
 class _Metric:
     """A CompilationMetrics stand-in carrying only the fields the record
     builder reads. Constructed rather than compiled for real because the
@@ -752,3 +769,18 @@ def test_a_withheld_field_renders_as_absent_not_as_zero() -> None:
     )
     assert "2820" in row
     assert row.split()[-5:-1].count("-") == 3
+
+
+def test_graph_decode_scheduler_gating() -> None:
+    # continuous_refill captures its paged step directly: no extra flag.
+    parser, args = _parse(
+        "--rollout-scheduler", "continuous_refill", "--rollout-graph-decode"
+    )
+    validate_args(parser, args)
+    assert args.rollout_graph_decode
+    # The lockstep scheduler's capture rides the flex-decode static arena;
+    # asking for graphs without it must fail at config time, naming the
+    # conflict, rather than degrade at runtime.
+    parser, args = _parse("--rollout-graph-decode")
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)

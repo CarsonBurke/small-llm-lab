@@ -789,7 +789,10 @@ class FreshLeJEPAGPT(baseline.GPT):
         positions: Tensor,
         block_mask: BlockMask,
         cache_addresses: Tensor,
+        lane_rows: Tensor,
     ) -> tuple[Tensor, tuple[Tensor, ...]]:
+        # lane_rows addresses recurrent arenas; a pure-KV block has none.
+        del lane_rows
         mix = block.resid_mix.to(x.dtype)
         x = mix[0][None, None] * x + mix[1][None, None] * x0
         attn, cache = self._attention_paged_step(

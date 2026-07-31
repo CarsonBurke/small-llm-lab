@@ -65,19 +65,33 @@ def _load_nano_model(architecture: str, payload, device: torch.device):
         NanoTiedDotBackbone,
     )
 
-    if any(marker in architecture for marker in ("_kda_", "_gdn2_")):
+    if "_gdn2_" in architecture:
         raise NotImplementedError(
-            f"{architecture} requires the KDA recurrent/convolution cache "
-            "backbone; refusing to construct a dense NanoGPTBackbone"
+            f"{architecture} requires a GDN-2 recurrent backbone; only the "
+            "plain-KDA and dense nano architectures are implemented"
         )
 
-    config = dict(NANO_DEFAULT_MODEL_CONFIG)
-    if isinstance(payload, dict) and "model_config" in payload:
-        config.update(payload["model_config"])
-    if "tieddot" in architecture:
-        model_class = NanoTiedDotBackbone
+    if "_kda_" in architecture:
+        from postraining.kda_backbone import NanoKDABackbone
+
+        # KDA checkpoints always carry their full model_config (mixer layout,
+        # head count, gate rank); there is no sensible default to fall back
+        # on, so a payload without one is refused rather than guessed at.
+        if not (isinstance(payload, dict) and "model_config" in payload):
+            raise ValueError(
+                f"{architecture} checkpoint payload lacks model_config; "
+                "cannot reconstruct the KDA mixer layout"
+            )
+        config = dict(payload["model_config"])
+        model_class = NanoKDABackbone
     else:
-        model_class = NanoGPTBackbone
+        config = dict(NANO_DEFAULT_MODEL_CONFIG)
+        if isinstance(payload, dict) and "model_config" in payload:
+            config.update(payload["model_config"])
+        if "tieddot" in architecture:
+            model_class = NanoTiedDotBackbone
+        else:
+            model_class = NanoGPTBackbone
     model = model_class(**config).to(device)
     model.model_config = config
     model.architecture = architecture

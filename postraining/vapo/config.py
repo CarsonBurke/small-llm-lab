@@ -59,6 +59,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument(
+        "--max-train-hours", type=float, default=None,
+        help="stop training at the first pool boundary after this many hours "
+        "of process wall time and save the final checkpoint; --steps stays "
+        "the step ceiling (learning rates are constant, so an early stop is "
+        "a truncation, not a schedule change)",
+    )
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument(
         "--exclude-modules", default="",
@@ -326,6 +333,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # while costing no attention (the empty range is what makes bucket padding
     # free), so this trades device work for launch overhead and only pays if
     # the launch bubble is the larger of the two. Off until the A/B says so.
+    # Two capture targets share the flag: with the lockstep scheduler it
+    # rides --rollout-flex-decode's static arena; with continuous_refill it
+    # captures the paged step per declared execution-width bucket (full
+    # capacity + power-of-two tails), all recorded up front by
+    # warmup_decode_width_buckets before the first real token.
     parser.add_argument(
         "--rollout-graph-decode",
         action=argparse.BooleanOptionalAction,
@@ -363,19 +375,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--duck-shape", action=argparse.BooleanOptionalAction, default=False
     )
     # Stable length-sorted shards are bounded by B*L^2 attention area rather
-    # than a fixed row count. This admits all 32 normal ~150-token rows and
-    # automatically isolates rare 1K-4K outliers.
+    # than a fixed row count, which automatically isolates rare long
+    # outliers into small shards. The v28 hidden-carry streams are 1x
+    # (prompt + response, ~1.2K slots worst case) where the stochastic
+    # design ran 4x, so the ceilings below are sized for that regime: the
+    # 40-step profiled smoke measured ~27 rows/shard against the old
+    # 32/4M/8192 ceilings with a 5.6 GiB train peak on a 32 GiB card —
+    # pure accumulation overhead with no memory pressure to justify it.
     parser.add_argument("--replay-bucket", type=int, default=64)
-    parser.add_argument("--replay-max-trajectories", type=int, default=32)
+    parser.add_argument("--replay-max-trajectories", type=int, default=128)
     parser.add_argument(
-        "--replay-attention-budget", type=int, default=4 * 1024 * 1024
+        "--replay-attention-budget", type=int, default=16 * 1024 * 1024
     )
     # Bounds the LINEAR per-shard memory term: slots x 50257-wide emit
     # logits (plus their autograd-retained log-softmax, ~6 bytes/element in
-    # the update path). 8192 slots ~= 2.5 GiB retained per shard. Without
-    # this, raising --replay-attention-budget lets short-L shards grow their
-    # slot count unboundedly and the vocabulary head OOMs before attention.
-    parser.add_argument("--replay-slot-budget", type=int, default=8192)
+    # the update path). 24576 slots ~= 7.4 GiB retained per shard worst
+    # case (every slot an action); realistic emit fractions retain ~half.
+    # Without this, raising --replay-attention-budget lets short-L shards
+    # grow their slot count unboundedly and the vocabulary head OOMs
+    # before attention.
+    parser.add_argument("--replay-slot-budget", type=int, default=24576)
     # A chunk decodes at its longest row's length, so rows that finished
     # early keep stepping until the batch is narrowed. Compaction can only
     # fire on a sync boundary, which makes these two the knobs that set how
@@ -399,8 +418,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # Prompt groups rolled out together as one left-padded batch (measured:
     # the sequential per-group rollout is launch-bound at ~140 W, so stepping
-    # groups*samples rows per launch is the utilization lever.
-    parser.add_argument("--rollout-groups", type=int, default=16)
+    # groups*samples rows per launch is the utilization lever. Measured on
+    # the v28 rollout gate (jobs 969/978/979, 1024 trajectories each):
+    # 16 groups 13.2k useful actions/s at 5.5 GiB, 32 groups 42.4k at
+    # 10.4 GiB, 64 groups 41.1k at 20.0 GiB — width saturates at 32.
+    # continuous_refill measured 6.4k/s (job 980): 0.92 step utilization
+    # cannot buy back its per-step paged overhead at this model scale.
+    parser.add_argument("--rollout-groups", type=int, default=32)
     parser.add_argument(
         "--rollout-scheduler",
         choices=("lockstep", "continuous_refill"),
@@ -548,6 +572,13 @@ def validate_args(
     checks stay in main() because they need the loaded model."""
     if args.replay_max_trajectories < 1:
         parser.error("--replay-max-trajectories must be positive")
+    if args.max_train_hours is not None and args.max_train_hours <= 0:
+        parser.error("--max-train-hours must be positive")
+    if args.max_train_hours is not None and args.consume_all_prompts:
+        parser.error(
+            "--max-train-hours truncates the run at a wall-clock deadline "
+            "and cannot guarantee --consume-all-prompts' one-pass contract"
+        )
     if not math.isfinite(args.hidden_carry_gain_init):
         parser.error("--hidden-carry-gain-init must be finite")
     if args.combined_mlp_blocks < 0:
@@ -630,11 +661,21 @@ def validate_args(
     if args.rollout_flex_decode and args.rollout_scheduler != "lockstep":
         # continuous_refill already decodes through flex over paged lanes.
         parser.error("--rollout-flex-decode applies to the lockstep scheduler")
-    if args.rollout_graph_decode and not args.rollout_flex_decode:
+    if (
+        args.rollout_graph_decode
+        and args.rollout_scheduler == "lockstep"
+        and not args.rollout_flex_decode
+    ):
         # Capture needs one static row count, and the empty KV range is what
         # makes holding one affordable when rows finish early. The boolean
-        # mask path has no equivalent: a fully masked SDPA row is NaN.
-        parser.error("--rollout-graph-decode requires --rollout-flex-decode")
+        # mask path has no equivalent: a fully masked SDPA row is NaN. The
+        # continuous_refill scheduler needs no extra flag: its paged step
+        # already decodes through flex over bucketed static widths, so
+        # graph capture applies to it directly.
+        parser.error(
+            "--rollout-graph-decode with --rollout-scheduler lockstep "
+            "requires --rollout-flex-decode"
+        )
     if args.rollout_graph_decode and args.rollout_tail_graph:
         # The tail graph exists to give the compacted remnant a static shape.
         # Under capture the main loop never compacts, so there is no remnant

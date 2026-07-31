@@ -940,9 +940,15 @@ def test_graph_decode_requires_the_flex_path_and_replaces_the_tail_graph(capsys)
     validate_args(parser, parser.parse_args([*base, "--rollout-flex-decode"]))
 
     for argv, message in (
-        # Capture needs one static row count; the empty KV range that makes
-        # holding one affordable exists only on the flex path.
-        ([], "--rollout-graph-decode requires --rollout-flex-decode"),
+        # Capture needs one static row count; on the lockstep scheduler the
+        # empty KV range that makes holding one affordable exists only on
+        # the flex path (continuous_refill needs no extra flag — its paged
+        # step is already bucket-static).
+        (
+            [],
+            "--rollout-graph-decode with --rollout-scheduler lockstep "
+            "requires --rollout-flex-decode",
+        ),
         (
             ["--rollout-flex-decode", "--rollout-tail-graph"],
             "--rollout-tail-graph has nothing left to snap to",

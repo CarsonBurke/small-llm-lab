@@ -16,6 +16,21 @@ curriculum. A new `postraining/base_model.json` should be written only after:
 4. FineWeb plus web/code/math/knowledge validation and the frozen-policy
    rollout gate pass.
 
+The KDA adapter for gate 3 exists: `postraining/kda_backbone.py`
+(`NanoKDABackbone` over the import-safe `nanogpt_mini_kda_model.py`) loads
+`*_kda_*` checkpoints through `model_io.load_model` with zero key mapping.
+Dense MHA layers keep KV caches; KDA mixers carry
+`(conv_q, conv_k, conv_v, state)` decode caches — the delta-rule state is
+always fp32. Rollout decode is a pure-PyTorch recurrence (stays inside the
+fullgraph-compiled step artifact); prefill and teacher-forced replay dispatch
+to FLA's `chunk_kda` on CUDA (the mixer is an eager region, so the replay
+artifacts compile with graph breaks — set automatically). The
+continuous-refill scheduler is KV-address machinery and is refused for KDA;
+use lockstep. CPU parity/integration tests live in
+`postraining/tests/test_kda_backbone.py`; the CUDA parity gate
+(kernel-vs-reference, dense-vs-decode logits, left-pad invariance) is
+`postraining/kda_gpu_parity.py`, run through mlq.
+
 Run every GPU workload through `mlq`. Before a new training campaign, run the
 frozen-policy learnability gate:
 
