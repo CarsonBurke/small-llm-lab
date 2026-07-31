@@ -1,10 +1,15 @@
 numpy
+matplotlib
+pyarrow
 tqdm
 torch
+tensorboard
+transformers
 huggingface-hub
 kernels
 setuptools
 typing-extensions==4.15.0
 datasets
+fla-core==0.5.2
 tiktoken
 sentencepiece
