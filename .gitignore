@@ -4,6 +4,7 @@ data/tokenizers/
 data/manifest.json
 data/docs_selected.jsonl
 data/docs_selected.source_manifest.json
+data/pretraining_sources/
 ablation_results/
 reports/
 

@@ -70,6 +70,14 @@ class GPT2BatchEncoder:
             raise ValueError("GPT2BatchEncoder only encodes to int ids")
         return self._tokenizer(texts)["input_ids"]
 
+    def decode(self, token_batches: list[list[int]]) -> list[str]:
+        """Decode ordinary token IDs without interpreting added specials."""
+        return self._tokenizer.batch_decode(
+            token_batches,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
 # train-easy modules whose answers survive the Minerva-style verifier
 # normalization verbatim (integers, small fractions/decimals, sorted lists,
 # choice letters, True/False) — no unit-bearing measurements, no surds.

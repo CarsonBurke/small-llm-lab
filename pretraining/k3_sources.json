@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "description": "Pinned, text-bearing sources for the K3-inspired four-domain pretraining mix.",
+  "domains": {
+    "web": 0.60,
+    "code": 0.15,
+    "math": 0.15,
+    "knowledge": 0.10
+  },
+  "sources": [
+    {
+      "name": "fineweb",
+      "domain": "web",
+      "weight": 0.20,
+      "kind": "token_shards",
+      "path": "data/datasets/fineweb10B_gpt2",
+      "license": "ODC-By-1.0",
+      "quality": "upstream FineWeb filtering and MinHash deduplication"
+    },
+    {
+      "name": "fineweb_edu_dedup",
+      "domain": "web",
+      "weight": 0.40,
+      "kind": "parquet_text",
+      "repo_id": "HuggingFaceTB/smollm-corpus",
+      "revision": "3ba9d605774198c5868892d7a8deda78031a781f",
+      "files": [
+        "fineweb-edu-dedup/train-00000-of-00234.parquet",
+        "fineweb-edu-dedup/train-00117-of-00234.parquet"
+      ],
+      "full_files": [
+        "fineweb-edu-dedup/train-00000-of-00234.parquet",
+        "fineweb-edu-dedup/train-00058-of-00234.parquet",
+        "fineweb-edu-dedup/train-00117-of-00234.parquet",
+        "fineweb-edu-dedup/train-00175-of-00234.parquet"
+      ],
+      "text_column": "text",
+      "license": "ODC-By-1.0",
+      "quality": "FineWeb-Edu score >= 3 plus upstream deduplication"
+    },
+    {
+      "name": "sci_code",
+      "domain": "code",
+      "weight": 0.10,
+      "kind": "parquet_text",
+      "repo_id": "sci-datasets/sci-code",
+      "revision": "9945e5caf629556f77db803ef66276dc23b5e733",
+      "files": [
+        "data/train-00000-of-00021.parquet",
+        "data/train-00001-of-00021.parquet",
+        "data/train-00002-of-00021.parquet",
+        "data/train-00003-of-00021.parquet",
+        "data/train-00004-of-00021.parquet",
+        "data/train-00005-of-00021.parquet",
+        "data/train-00006-of-00021.parquet",
+        "data/train-00007-of-00021.parquet",
+        "data/train-00008-of-00021.parquet",
+        "data/train-00009-of-00021.parquet",
+        "data/train-00010-of-00021.parquet",
+        "data/train-00011-of-00021.parquet",
+        "data/train-00012-of-00021.parquet",
+        "data/train-00013-of-00021.parquet",
+        "data/train-00014-of-00021.parquet",
+        "data/train-00015-of-00021.parquet",
+        "data/train-00016-of-00021.parquet",
+        "data/train-00017-of-00021.parquet",
+        "data/train-00018-of-00021.parquet",
+        "data/train-00019-of-00021.parquet",
+        "data/train-00020-of-00021.parquet"
+      ],
+      "text_column": "text",
+      "metadata_columns": ["source", "language"],
+      "license": "source-specific; see dataset card",
+      "quality": "merged code sources; v5 applies document heuristics and exact cross-source deduplication"
+    },
+    {
+      "name": "github_code_clean",
+      "domain": "code",
+      "weight": 0.05,
+      "kind": "parquet_text",
+      "repo_id": "codeparrot/github-code-clean",
+      "revision": "c48d40f9e70f0196f8236901ee35807f7d6c44c0",
+      "files": [
+        "data/train-00000-of-00880.parquet",
+        "data/train-00440-of-00880.parquet"
+      ],
+      "full_files": [
+        "data/train-00000-of-00880.parquet",
+        "data/train-00110-of-00880.parquet",
+        "data/train-00220-of-00880.parquet",
+        "data/train-00330-of-00880.parquet",
+        "data/train-00440-of-00880.parquet",
+        "data/train-00550-of-00880.parquet",
+        "data/train-00660-of-00880.parquet",
+        "data/train-00770-of-00880.parquet"
+      ],
+      "text_column": "code",
+      "metadata_columns": ["license", "language"],
+      "allowed_values": {
+        "license": [
+          "0bsd",
+          "apache-2.0",
+          "bsd-2-clause",
+          "bsd-3-clause",
+          "cc0-1.0",
+          "isc",
+          "mit",
+          "unlicense",
+          "zlib"
+        ]
+      },
+      "license": "Apache-2.0",
+      "quality": "upstream code cleaning; v5 keeps a strict permissive-license allowlist, document heuristics, and exact cross-source deduplication"
+    },
+    {
+      "name": "open_web_math",
+      "domain": "math",
+      "weight": 0.04,
+      "kind": "parquet_text",
+      "repo_id": "open-web-math/open-web-math",
+      "revision": "fde8ef8de2300f5e778f56261843dab89f230815",
+      "files": [
+        "data/train-00000-of-00114-5a023365406cb9c4.parquet",
+        "data/train-00037-of-00114-18f228cb81d4f382.parquet",
+        "data/train-00075-of-00114-918d14857d807f1e.parquet"
+      ],
+      "full_files": [
+        "data/train-00000-of-00114-5a023365406cb9c4.parquet",
+        "data/train-00014-of-00114-23a118ee3aaea5c3.parquet",
+        "data/train-00037-of-00114-18f228cb81d4f382.parquet",
+        "data/train-00057-of-00114-f45202cfdbcd2809.parquet",
+        "data/train-00075-of-00114-918d14857d807f1e.parquet",
+        "data/train-00099-of-00114-c587048e642b131a.parquet"
+      ],
+      "text_column": "text",
+      "license": "ODC-By-1.0 database; underlying Common Crawl rights unchanged",
+      "quality": "upstream language, MathScore, perplexity, and SimHash filtering"
+    },
+    {
+      "name": "finemath_4plus",
+      "domain": "math",
+      "weight": 0.04,
+      "kind": "parquet_text",
+      "path": "postraining/data/finemath/finemath-4plus",
+      "glob": "*.parquet",
+      "text_column": "text",
+      "license": "ODC-By-1.0",
+      "quality": "FineMath score >= 4"
+    },
+    {
+      "name": "openmath_instruct",
+      "domain": "math",
+      "weight": 0.04,
+      "kind": "openmath_qa",
+      "path": "postraining/data/openmathinstruct2",
+      "glob": "**/*.parquet",
+      "license": "CC-BY-4.0",
+      "quality": "upstream-provided worked solutions and terminal answers"
+    },
+    {
+      "name": "deepmind_math",
+      "domain": "math",
+      "weight": 0.03,
+      "kind": "deepmind_qa",
+      "path": "postraining/data/mathematics_dataset-v1.0/train-easy",
+      "license": "Apache-2.0",
+      "quality": "programmatically generated exact-answer algebra, arithmetic, calculus, number theory, polynomials, probability, and comparisons"
+    },
+    {
+      "name": "wikipedia_en",
+      "domain": "knowledge",
+      "weight": 0.04,
+      "kind": "parquet_text",
+      "repo_id": "wikimedia/wikipedia",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "files": [
+        "20231101.en/train-00000-of-00041.parquet",
+        "20231101.en/train-00013-of-00041.parquet",
+        "20231101.en/train-00027-of-00041.parquet"
+      ],
+      "full_files": [
+        "20231101.en/train-00000-of-00041.parquet",
+        "20231101.en/train-00010-of-00041.parquet",
+        "20231101.en/train-00013-of-00041.parquet",
+        "20231101.en/train-00020-of-00041.parquet",
+        "20231101.en/train-00027-of-00041.parquet",
+        "20231101.en/train-00035-of-00041.parquet",
+        "20231101.en/train-00040-of-00041.parquet"
+      ],
+      "text_column": "text",
+      "title_column": "title",
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "quality": "encyclopedic source; v5 document heuristics and cross-source deduplication"
+    },
+    {
+      "name": "arxiv_papers",
+      "domain": "knowledge",
+      "weight": 0.02,
+      "kind": "jsonl_text",
+      "repo_id": "common-pile/arxiv_papers",
+      "revision": "963fe980c55b353980653f1a27c1dc0c8a2d7058",
+      "files": [
+        "00000_arxiv-papers.jsonl.gz"
+      ],
+      "full_files": [
+        "00000_arxiv-papers.jsonl.gz",
+        "00011_arxiv-papers.jsonl.gz"
+      ],
+      "text_column": "text",
+      "license": "per-document open licenses",
+      "quality": "research papers; v5 document heuristics and exact cross-source deduplication"
+    },
+    {
+      "name": "cosmopedia_v2",
+      "domain": "knowledge",
+      "weight": 0.04,
+      "kind": "parquet_text",
+      "repo_id": "HuggingFaceTB/smollm-corpus",
+      "revision": "3ba9d605774198c5868892d7a8deda78031a781f",
+      "files": [
+        "cosmopedia-v2/train-00000-of-00104.parquet",
+        "cosmopedia-v2/train-00052-of-00104.parquet"
+      ],
+      "full_files": [
+        "cosmopedia-v2/train-00000-of-00104.parquet",
+        "cosmopedia-v2/train-00026-of-00104.parquet",
+        "cosmopedia-v2/train-00052-of-00104.parquet",
+        "cosmopedia-v2/train-00078-of-00104.parquet"
+      ],
+      "text_column": "text",
+      "license": "ODC-By-1.0",
+      "quality": "synthetic textbooks and explanations from diverse seed data"
+    }
+  ]
+}
