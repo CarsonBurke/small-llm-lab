@@ -2390,3 +2390,261 @@ Job 872 is the corrected CUDA-graph KDA five-layer replacement run to 1,000
 steps. It retains the original full-block replacement architecture explicitly
 for continuity with the prior KDA curve. Job 874 benchmarks the new mixer
 architecture after 872 completes.
+
+## v28 hidden-carry throughput defaults (2026-07-31, jobs 969-981)
+
+Rollout-gate A/B on the mathmix4k checkpoint, 1024 trajectories, latent mode
+(fresh combiner = identity, so numbers hold for all modes):
+- lockstep 16 groups: 13.2k useful actions/s, 5.5 GiB (job 969)
+- lockstep 32 groups: 42.4k, 10.4 GiB (978)  <- new default
+- lockstep 64 groups: 41.1k, 20.0 GiB (979) — width saturates
+- continuous_refill: 6.4k, 7.5 GiB (980) — 0.92 step utilization but the
+  paged per-step overhead loses 6.5x to wide lockstep at this scale
+Replay shard ceilings raised for the 1x-stream regime (32/4M/8192 ->
+128/16M/24576): shards per 4-step pool 76 -> 28, age-0 clip stays exactly 0
+(refresh and update share one shard plan and one compiled artifact).
+Profiled 40-step smokes (jobs 974, 981): steady pool wall 5.78 -> 3.63 s
+(decode 4.51 -> 2.29 s at 201 -> 224 W; still launch-bound, combiner adds
+~12 eager launches/step — fold into step_core if it ever matters). Train
+peak 7.6 GiB, rollout peak ~14.5 GiB on the 32 GiB card. BPB guard default
+is now one 8192-token eval batch (~free); identity gates against recorded
+pretraining val_bpb need --bpb-val-tokens 2097152.
+
+## KDA post-training adapter (2026-07-31, jobs 993-995)
+
+The k3 campaign's checkpoints (`*_kda_kkkdkkkd_mixers_v3`) could not load into
+post-training at all: `model_io` refused `_kda_` architectures. Built the
+adapter while the v8 data build (989) runs:
+
+- `nanogpt_mini_kda_model.py` — import-safe extraction of the KDA training
+  script (byte-matched classes; env config -> constructor args carried by the
+  checkpoint's `model_config`). Carries a pure-PyTorch reference recurrence
+  matching FLA `chunk_kda` under the training flags (l2norm eps INSIDE sqrt,
+  safe gate `-5*sigmoid(exp(A_log)*(g+dt_bias))`, sigmoid beta, v-major
+  fp32 state) plus its own depthwise conv and gated RMSNorm with
+  key-identical parameters.
+- `postraining/kda_backbone.py` — `NanoKDABackbone`: dense layers keep the
+  nano KV step/prefill; KDA layers carry `(conv_q, conv_k, conv_v, state)`
+  caches. Decode step is pure PyTorch (compiles into the fullgraph step
+  artifact); prefill/replay use `chunk_kda` (mixer is an eager region;
+  replay artifacts drop to fullgraph=False for KDA only). Left padding:
+  conv inputs zeroed at pads -> k=0 -> delta-rule writes vanish -> state
+  exactly zero through the pad prefix (asserted, not assumed).
+- `latent_rollout.py` learned that recurrent cache layers (arity 4) have no
+  length axis: fan-out expansion, all three compaction branches, and every
+  cache-width check now branch on it. The old code would have sliced the
+  [B,H,128,128] state's Dv axis by `prompt_length` — silently wrong whenever
+  a prompt was shorter than 128 tokens.
+- Muon partition: conv windows (ndim 3) excluded, matching pretraining's
+  KDA_CONV_LR AdamW group; A_log/dt_bias fall through to AdamW on ndim.
+- continuous_refill is refused for KDA (paged KV addressing has no
+  recurrent analogue); lockstep is the production path anyway.
+
+CPU: 383 tests pass incl. new `test_kda_backbone.py` (stepwise decode ==
+teacher-forced within fp32 tolerance, left-pad invariance exact, age-0
+rollout->replay logprob parity, strict-load via model_io round-trip).
+GPU gates queued through mlq: 993 `kda_gpu_parity` (kernel-vs-reference,
+dense-vs-decode logits on the 986-layout trunk, left-pad through CUDA
+kernels), 994 `kda_train_smoke` (4-step end-to-end on a synthetic random
+`logs/kda_synthetic_random_dev.pt` in the exact 990 payload format), then
+995 `k3_base_rollout_gate` chained --after-success on the real 20k
+checkpoint `logs/k3_quality_20k_ctx8k_final_model.pt`.
+
+Red-team review (independent session) found no correctness bugs; verified
+the recurrence derivation by executing it against FLA's naive_recurrent_kda
+(1.5e-8) and naive_chunk_kda (3.1e-8), traced all four recurrent
+compaction/expansion branches to actual line hits, and confirmed the
+compile posture (step_core fullgraph OK; replay needs graph breaks exactly
+because the mixer is compiler-disabled). Fixes applied from its findings:
+- `nanogpt_mini_kda_model.py` now calls chunk_kda with
+  disable_recompute=False (pretraining ships True for backward speed on
+  8xH100; in grad-enabled replay it would retain per-layer w/u/qg/kg/v_new/h
+  at replay-shard width — roughly a GiB extra across 6 mixers at 24576
+  slots, an OOM risk on the 32 GiB card). Forward values identical.
+- `prefill_belief` cache copies are now zip(strict=True) + shape-checked.
+- `kda_gpu_parity.py` left-pad check compares all four cache tensors, not
+  just the delta state.
+- Pretraining Muon/PerHeadMuon: `state["mu"]` is recreated when missing so
+  resuming a checkpoint that predates tensor-valued mu no longer KeyErrors.
+Known and accepted (documented, not fixed): recurrent-layer detection is
+tuple arity (4), fine for dense pair/PoPE triple/KDA quad but a future
+4-tuple length-addressed cache would need a per-layer flag; the delta state
+assumes Dv == Dk (true for every KDA config here); post-training Muon does
+not reproduce pretraining's PerHeadMuon on q/k/v (deliberate fine-tuning
+choice); left-padded replay differs from rollout by ~0.07 nats on dense AND
+KDA trunks alike (pre-existing: replay's causal attention has no pad mask
+and dense QKV biases emit nonzero K/V at zeroed pads) — PPO age-0 is
+unaffected since refresh and update both price through replay.
+
+Gate results (2026-07-31): 993 kda_gpu_parity PASSED all bounds with wide
+margins (kernel-vs-reference 1.4e-4 out / 1.4e-3 state vs 5e-3 bound; fp32
+prefill/decode vs dense 2.0e-4 / 6.5e-4 vs 2e-3; left-pad 2.3e-4 logits /
+3.7e-4 over all four cache tensors vs 1e-3; bf16 decode 1.6e-2 vs 0.5
+rail). 994 kda_train_smoke PASSED end to end on the synthetic checkpoint:
+rollout + replay + PPO updates + checkpoint save, 0 blocking syncs over the
+profiled pools, steady state roughly 15 s rollout (2048 max-length decode
+steps, random model never EOSes — worst case) + 1.7 s per update.
+
+10-hour run queued as 997 k3_latent_10h (--after-success 995): latent mode
+on logs/k3_quality_20k_ctx8k_final_model.pt, --steps 40000 as an
+unreachable ceiling, stop by the new --max-train-hours 10 flag (pool-
+boundary wall-clock truncation; LRs are constant so early stop is a
+truncation, not a schedule change; refused with --consume-all-prompts).
+Chain: 996 kda_resume_smoke (running) -> 990 pretraining -> 995 rollout
+gate -> 997.
+
+## 2026-07-31: mid-run compile stalls — root cause and fix (varlen chunk_kda)
+
+k3_latent_10h showed sporadic ~12 s full-GPU-idle stalls (95% of early
+wall time, decaying but never gone). First attribution — Dynamo
+specializing on replay-shard row counts — was WRONG, established by
+red-team review:
+
+- Under the default --no-duck-shape, DUCK and DYNAMIC dims both get fresh
+  symbols, so shard dims were already dynamic; the added dim-0
+  maybe_mark_dynamic in select_trajectory_rows is a no-op under defaults
+  (kept as hygiene for the duck-on config, where it also removes the
+  512-collision).
+- Real cause: TileLang JIT compiles of FLA's KDA fwd/bwd kernels. The
+  kernel builders bake batch size B into the JIT cache key (T and seq
+  count are T.dynamic). Every distinct shard row count reaching a KDA
+  replay = fresh ~12 s compile: 85 compiles / 999 s in the first 40 min
+  of job 997 (attempt 813 log). Aggravated by --replay-max-trajectories
+  32 -> 128 (4x wider B space). torch.compile machinery can't see it:
+  KimiDeltaAttention.forward is compiler-disabled, and
+  counters["stats"]["unique_graphs"] counts only Dynamo forward graphs.
+
+Fix (nanogpt_mini_kda_model.py, single chunk_kda call site): varlen form.
+Flatten [B, T] -> [1, B*T] with uniform cu_seqlens (+ cu_seqlens_cpu twin,
+no H2D copy; device arange + CPU arange). Same per-row math — chunking
+and state resets are per sequence — but B == 1 for every shard, so each
+kernel has exactly ONE JIT key for the whole run. No row bucketing, no
+filler rows, no padding waste. final_state comes back [N=B, H, Dv, Dk],
+identical to batched.
+
+Telemetry (train_latent_vapo.py): three monotonic gauges now cover the
+three compile populations — perf/dynamo_unique_graphs (Dynamo fwd),
+perf/aot_autograd_compiles (AOT bwd), perf/tilelang_kernel_compiles
+(logging hook on tilelang.jit.kernel "begins to compile"; the population
+unique_graphs is blind to).
+
+Verification: CPU suite 384 pass (varlen branch is CUDA-only). GPU gates
+queued behind 997: job 1002 kda_parity_varlen (fp32 prefill/decode vs
+dense bounds exercise varlen through the wrapper) and job 1000
+dynamic_rows_gate (60 steps on the real checkpoint; gate criterion is
+perf/tilelang_kernel_compiles plateauing at the per-kernel-type count —
+NOT unique_graphs, which stays flat regardless). 997 left running: its
+key space had saturated (~1 compile/100 steps); fix lands on resume/next
+run.
+
+TRT/vLLM reference takeaways recorded for the graph-decode design: shapes
+declared never discovered; out-of-range = hard error at config time (TRT
+demo refuses cudagraph+dynamic at argparse); persistent buffers copied
+into, never rebound; warmup enqueue before capture; pad up to the bucket
+rather than adding buckets; make "zero compiles this run" assertable
+(error-on-cache-miss analog: the three compile gauges above).
+
+## 2026-07-31: vLLM-style CUDA-graph decode for the continuous scheduler
+
+Reference reports (vllm + TensorRT clones) confirmed the paged path was
+already structurally graph-ready: fixed physical lanes = capture sizes,
+empty-range/scratch-page padding = PAD_SLOT_ID discipline, caller-owned
+arena = bind_kv_cache, slot-indexed lanes = "index rather than move".
+The only gap was the compile mode and capture-before-serve.
+
+Implemented (flag-gated, off by default):
+- --rollout-graph-decode now legal with continuous_refill (config.py);
+  lockstep keeps its flex-decode requirement, TRT-style config-time error.
+- rollout_paged_step_core compiles mode="reduce-overhead" under the flag
+  (one cudagraph per declared execution-width bucket, inductor cudagraph
+  trees share one memory pool).
+- Paged arena tensors mark_static_address'd at allocation (mutated graph
+  inputs must be statically addressed or inductor silently skips capture).
+- warmup_decode_width_buckets (rollout_scheduler.py): drives every
+  declared width (capacity + pow2 tails, largest first, 3 passes, all
+  rows dead -> scratch-page writes only) through the compiled step at
+  arena creation, inside the patch window under no_grad + autocast — all
+  graphs captured before the first real token, shapes declared never
+  discovered.
+- Tests: config gating; warmup covers the exact _decode_execution_width
+  range and a warmed arena reproduces a fresh arena's rollouts
+  bit-identically. Suite: 386 pass.
+
+Queued A/B behind parity gate 1002: jobs 1003 (graph_decode_ab_off) /
+1004 (graph_decode_ab_on), latent rollout-only x3 repeats on the k3
+checkpoint. Decision metric: collect_seconds / decode_step_utilization;
+also check tilelang/aot/dynamo compile gauges stay flat after pool 0.
+Red-team review of the change in flight (cudagraph mutation semantics,
+output lifetime across replays, warmup inertness on the KDA cache, flex
+BlockMask under capture, memory pinned by the capture set).
+
+Red-team of the graph-decode change (torch-source-verified) found 4 real
+issues, all fixed before the A/B:
+1. Warmup captured bf16 graphs but the decode loop feeds fp32
+   (embed_tokens is fp32 under autocast) — every captured graph was dead
+   and the real widths would have compiled+recorded lazily mid-rollout.
+   Fix: warmup builds its input through model.embed_tokens, guard-identical
+   to the loop (dtype AND stride); helper's dtype param removed.
+2. reduce-overhead silently drops max_autotune + coordinate descent vs
+   the control arm -> confounded A/B. Fix: mode="max-autotune" (==
+   max-autotune-no-cudagraphs + triton.cudagraphs) under the flag.
+3. dynamo cache_size_limit (8) < declared width count; only raised in the
+   eval/lockstep branch. Fix: raised at paged-artifact creation.
+4. No signal for a silent cudagraph skip. Fix: perf/cudagraph_skips gauge
+   + torch._inductor.config.triton.cudagraph_or_error=True under the flag
+   (skip -> RuntimeError, declared-shapes doctrine).
+Verified-safe by the review: mutation/static-marks chain (marks are
+load-bearing and sufficient; only cache K/V mutated in-graph), output
+lifetime (scatter_prefix copies immediately; nothing aliases graph
+memory), eager-mutation-between-replays semantics (INFERENCE-mode
+artifact + per-call generation bump; @no_grad on warmup AND rollout is
+load-bearing — documented in the helper docstring), warmup inertness
+(scratch pages only; arena is dense-KV only — KDA + continuous_refill is
+hard-refused upstream), BlockMask (eager per-step inputs, no capture
+conflict), memory (capture set ~0.2-0.4 GiB vs 12.9 GiB arena).
+Also: page_home now static-marked (saves a per-replay copy).
+
+A/B rescheduled on the DENSE checkpoint (jobs 1005/1006 replace
+1003/1004, which would have hard-errored: k3 is a KDA trunk and the
+paged path refuses KDA). Launch-overhead conclusions transfer; wiring
+graph decode into a KDA production run needs either the lockstep+flex
+arm or KDA paged-cache support — future work, gated on the A/B result.
+
+## KDA continuous-refill support (2026-07-31)
+
+Motivation: k3_latent_10h runs lockstep at ~7.7% decode-lane utilization with
+collect = 76% of pool wall time; the dense A/B showed continuous refill reaches
+92.5% step utilization (but ran 6.4x slower eager — hence graph decode, jobs
+1010/1011). KDA trunks were hard-refused on the continuous path. Port done:
+
+- `make_paged_generation_cache` allocates 4-tuple lane arenas for recurrent
+  layers (3 conv windows cache-dtype, fp32 state), 2*capacity rows; rows
+  [capacity, 2*capacity) are per-row scratch sinks — the recurrent analogue of
+  scratch_addresses, needed because the scheduler pads decode batches with
+  slot 0 (a live lane) and KDA step writes are unconditional (index_copy_ with
+  duplicate indices is UB).
+- `paged_step` computes `lane_rows = where(live, slot_ids, capacity+arange)`
+  and threads it through `paged_step_core` to `_block_paged_step`; the KDA
+  implementation is gather -> attn.step (mutates the gathered copies) ->
+  index_copy_ back. Dense/fresh backbones take-and-ignore the new arg.
+- `admit_prompt_prefixes` fans conv/state rows per lane (full-row overwrite is
+  what stands in for kv_starts stale-suffix masking) and reads
+  `bank.prompt_width` instead of a layer-0 axis (layer 0 may be recurrent).
+- Trainer refusal removed; lockstep-only compaction unaffected (continuous
+  scheduler never moves live lanes; assign_pages has no callers).
+
+Found while testing, worth remembering: raw per-chunk scheduler batches with
+left-padded rows are NOT replayable — rollout excludes pads structurally,
+replay only zeroes their inputs, and residual biases re-inflate them from
+block 0 (live dense trunk diverges 0.39, KDA 0.34). Production is unaffected
+because the trainer only replays `split_rollout_groups` output (per-group,
+pad-trimmed). The old dense scheduler test replayed the raw chunk batch and
+passed only because the fresh-init trunk is an identity residual stream; it
+now livens the trunk and splits first, as does the new KDA variant.
+
+Tests: 4 model-level (paged parity vs per-row dense decode incl. 2 steps,
+padding-row lane inertness, lane recycling exactness, fullgraph one-graph) +
+2 scheduler-level (lifecycle, split-group carry-vs-replay parity). 392 CPU
+tests green. GPU validation: queue a k3-checkpoint rollout-only A/B
+(lockstep vs continuous_refill x3) after 1011; graph-decode-on-KDA waits for
+the 1010/1011 verdict.
