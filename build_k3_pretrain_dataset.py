@@ -625,7 +625,22 @@ def token_shard_documents(path: Path) -> Iterator[np.ndarray]:
 def logical_interleave(
     sources: dict[str, Iterator[np.ndarray]],
     budgets: dict[str, int],
+    on_exhausted: str = "error",
 ) -> Iterator[tuple[str, np.ndarray]]:
+    """Interleave sources toward per-source budgets, balanced by fill ratio.
+
+    ``on_exhausted="redistribute"`` moves an exhausted source's unfilled
+    remainder onto the still-active sources, proportional to their remaining
+    budgets with largest-remainder rounding, so the stream always delivers
+    exactly ``sum(budgets)`` tokens (the loader-aligned writer requires the
+    exact total). Sources that already completed their budget are not
+    revisited, and the last active source exhausting still raises. The
+    realized per-source totals land in the dataset manifest as
+    ``source_tokens_written`` alongside the requested budgets.
+    """
+    if on_exhausted not in ("error", "redistribute"):
+        raise ValueError(f"unsupported exhaustion policy {on_exhausted!r}")
+    budgets = dict(budgets)
     written = {name: 0 for name in sources}
     active = list(sources)
     while active:
@@ -635,10 +650,50 @@ def logical_interleave(
             continue
         document = next(sources[name], None)
         if document is None:
-            raise RuntimeError(
-                f"source {name!r} exhausted at {written[name]:,} / "
-                f"{budgets[name]:,} tokens"
+            deficit = budgets[name] - written[name]
+            if on_exhausted == "error" or len(active) == 1:
+                raise RuntimeError(
+                    f"source {name!r} exhausted at {written[name]:,} / "
+                    f"{budgets[name]:,} tokens with no active source to "
+                    "absorb the remainder"
+                    if on_exhausted == "redistribute"
+                    else f"source {name!r} exhausted at {written[name]:,} / "
+                    f"{budgets[name]:,} tokens"
+                )
+            budgets[name] = written[name]
+            active.remove(name)
+            remaining = {
+                other: budgets[other] - written[other] for other in active
+            }
+            total_remaining = sum(remaining.values())
+            if total_remaining <= 0:
+                raise RuntimeError(
+                    f"source {name!r} exhausted with {deficit:,} tokens "
+                    "unfilled and every active source already at budget"
+                )
+            shares = {
+                other: deficit * remaining[other] // total_remaining
+                for other in active
+            }
+            leftover = deficit - sum(shares.values())
+            for other in sorted(
+                active,
+                key=lambda item: (
+                    (deficit * remaining[item]) % total_remaining,
+                    item,
+                ),
+                reverse=True,
+            )[:leftover]:
+                shares[other] += 1
+            for other, share in shares.items():
+                budgets[other] += share
+            print(
+                f"source {name!r} exhausted at {written[name]:,} tokens; "
+                f"redistributed {deficit:,} tokens across "
+                f"{len(active)} active sources",
+                flush=True,
             )
+            continue
         keep = min(document.size, budgets[name] - written[name])
         if keep:
             written[name] += keep
@@ -757,6 +812,15 @@ def main() -> None:
     parser.add_argument("--max-document-chars", type=int, default=DEFAULT_CONTEXT_CHARS)
     parser.add_argument("--max-document-tokens", type=int, default=8192)
     parser.add_argument("--qa-template-fraction", type=float, default=0.20)
+    parser.add_argument(
+        "--on-exhausted",
+        choices=("error", "redistribute"),
+        default="error",
+        help="what to do when a source runs dry before its budget: fail the "
+        "build, or move the remainder onto still-active sources so a long "
+        "build cannot die at the finish line (realized totals are recorded "
+        "in the manifest)",
+    )
     parser.add_argument(
         "--heldout",
         action="append",
@@ -943,12 +1007,22 @@ def main() -> None:
         args.steps_per_shard,
     )
     written = Counter()
-    for source_name, tokens in logical_interleave(source_iterators, budgets):
+    for source_name, tokens in logical_interleave(
+        source_iterators, budgets, args.on_exhausted
+    ):
         writer.append(tokens, source_name)
         written[source_name] += tokens.size
     writer.finish()
-    if dict(written) != budgets:
-        raise AssertionError(f"written source budgets {dict(written)} != {budgets}")
+    if args.on_exhausted == "error":
+        if dict(written) != budgets:
+            raise AssertionError(
+                f"written source budgets {dict(written)} != {budgets}"
+            )
+    elif sum(written.values()) != sum(budgets.values()):
+        raise AssertionError(
+            f"redistributed stream wrote {sum(written.values()):,} tokens "
+            f"against a {sum(budgets.values()):,} token budget"
+        )
 
     validation_sizes = validation.write(output_dir)
     fineweb_config = next(

@@ -1,0 +1,23 @@
+{
+  "name": "quality",
+  "description": "Quality-first one-pass mix for full KDA pretraining. Raw FineWeb is retained only as a small general-web anchor; most web tokens come from the educationally filtered and deduplicated corpus.",
+  "domains": {
+    "web": 0.50,
+    "code": 0.20,
+    "math": 0.15,
+    "knowledge": 0.15
+  },
+  "sources": {
+    "fineweb": 0.05,
+    "fineweb_edu_dedup": 0.45,
+    "sci_code": 0.12,
+    "github_code_clean": 0.08,
+    "open_web_math": 0.057,
+    "finemath_4plus": 0.046,
+    "openmath_instruct": 0.027,
+    "deepmind_math": 0.02,
+    "wikipedia_en": 0.05,
+    "arxiv_papers": 0.04,
+    "cosmopedia_v2": 0.06
+  }
+}

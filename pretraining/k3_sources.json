@@ -30,9 +30,13 @@
       ],
       "full_files": [
         "fineweb-edu-dedup/train-00000-of-00234.parquet",
+        "fineweb-edu-dedup/train-00029-of-00234.parquet",
         "fineweb-edu-dedup/train-00058-of-00234.parquet",
+        "fineweb-edu-dedup/train-00087-of-00234.parquet",
         "fineweb-edu-dedup/train-00117-of-00234.parquet",
-        "fineweb-edu-dedup/train-00175-of-00234.parquet"
+        "fineweb-edu-dedup/train-00146-of-00234.parquet",
+        "fineweb-edu-dedup/train-00175-of-00234.parquet",
+        "fineweb-edu-dedup/train-00204-of-00234.parquet"
       ],
       "text_column": "text",
       "license": "ODC-By-1.0",
@@ -141,8 +145,20 @@
       "domain": "math",
       "weight": 0.04,
       "kind": "parquet_text",
-      "path": "postraining/data/finemath/finemath-4plus",
-      "glob": "*.parquet",
+      "repo_id": "HuggingFaceTB/finemath",
+      "revision": "e92b25a616738fe95dc186b64dfb19f9c8525594",
+      "files": [
+        "finemath-4plus/train-00000-of-00064.parquet",
+        "finemath-4plus/train-00001-of-00064.parquet"
+      ],
+      "full_files": [
+        "finemath-4plus/train-00000-of-00064.parquet",
+        "finemath-4plus/train-00001-of-00064.parquet",
+        "finemath-4plus/train-00016-of-00064.parquet",
+        "finemath-4plus/train-00032-of-00064.parquet",
+        "finemath-4plus/train-00048-of-00064.parquet",
+        "finemath-4plus/train-00063-of-00064.parquet"
+      ],
       "text_column": "text",
       "license": "ODC-By-1.0",
       "quality": "FineMath score >= 4"
@@ -152,8 +168,30 @@
       "domain": "math",
       "weight": 0.04,
       "kind": "openmath_qa",
-      "path": "postraining/data/openmathinstruct2",
-      "glob": "**/*.parquet",
+      "repo_id": "nvidia/OpenMathInstruct-2",
+      "revision": "469216e3f46f4dacf476b382e192485ea51a143e",
+      "files": [
+        "data/train_1M-00000-of-00003.parquet",
+        "data/train_1M-00001-of-00003.parquet",
+        "data/train_1M-00002-of-00003.parquet"
+      ],
+      "full_files": [
+        "data/train_1M-00000-of-00003.parquet",
+        "data/train_1M-00001-of-00003.parquet",
+        "data/train_1M-00002-of-00003.parquet",
+        "data/train-00000-of-00032.parquet",
+        "data/train-00006-of-00032.parquet",
+        "data/train-00012-of-00032.parquet",
+        "data/train-00018-of-00032.parquet",
+        "data/train-00024-of-00032.parquet",
+        "data/train-00031-of-00032.parquet",
+        "data/train-00003-of-00032.parquet",
+        "data/train-00009-of-00032.parquet",
+        "data/train-00015-of-00032.parquet",
+        "data/train-00021-of-00032.parquet",
+        "data/train-00027-of-00032.parquet",
+        "data/train-00030-of-00032.parquet"
+      ],
       "license": "CC-BY-4.0",
       "quality": "upstream-provided worked solutions and terminal answers"
     },

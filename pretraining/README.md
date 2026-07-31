@@ -1,12 +1,20 @@
 # K3-inspired pretraining campaign
 
+This is the longer off-challenge foundation-model campaign intended to produce
+a stronger base for post-training. Its 20,000 updates do not fit the
+Parameter Golf submission's 10-minute training limit; the challenge run
+remains a separate, shorter export recipe.
+
 This campaign translates the text-side parts of Kimi K3 to the measured
 `KKKDKKKD` nano backbone. It is inspired by K3, not a reproduction: the K3
 report names Web, Code, Mathematics, and Knowledge as its text domains but
-does not publish source weights. Our 60/15/15/10 domain hypothesis is chosen
-as the broad-capability arm. The 80/10/7/3 `web80` profile is the
-FineWeb-preserving arm. Both must pass the 2,000-step gate; no mixture is
-selected from intuition alone.
+does not publish source weights.
+
+The full campaign uses `k3_weights_quality.json`: 50% web, 20% code, 15%
+math, and 15% knowledge. Raw FineWeb is only 5% of the stream; 45% is
+quality-filtered and deduplicated FineWeb-Edu. This preserves a small
+challenge-distribution anchor without allowing lower-quality generic web text
+to dominate the base model.
 
 ## Corpus v5
 
@@ -50,54 +58,61 @@ different attribution and redistribution terms; do not redistribute them
 without reviewing the source-level licenses and underlying-content rights
 recorded in the source manifest.
 
-The 2K gates use the sampled source set above. Before an 8K campaign, download
-and build with `--full-source-set`; this expands the large remote corpora from
-13 sampled files to 31 revision-pinned files, in addition to all 21 SciCode
-shards, so the longer run does not just consume more tokens from the same
-narrow slices.
+The short reference runs use the sampled source set above. Full pretraining
+downloads the expanded revision-pinned source set and builds a one-pass
+10.49B-token stream. The checkpointed builder fails rather than cycling if any
+source cannot fill its budget and atomically preserves every completed
+source's preprocessing work.
 
-## Gated ablations
+## Full pretraining
 
-Every change is evaluated for 2,000 steps before combination:
-
-1. unchanged 3-head KDA8 recipe on corpus v5;
-2. full-width KDA (4 x 128 heads);
-3. K3 full-rank KDA output gate;
-4. per-head Muon for Q/K/V;
-5. faithful NoPE Gated MLA in the two global layers;
-6. one training-only future-token prediction head, removed at export;
-7. independently retuned cosine + 1% warmup and weight decay.
-
-FineWeb BPB remains the keep/discard gate. The four domain BPBs diagnose
-whether a FineWeb regression buys real breadth; they do not replace the
-challenge metric.
-
-Prior K3 components are not being revived without evidence. SiTU-GLU finished
-at 1.1745 BPB versus the 1.1734 dense reference, below the 0.005 keep
-threshold. The AttnRes port was stopped at step 300 after reaching 1.5150 BPB
-at step 200 versus 1.4183 for the reference. Earlier GDN2 variants were also
-slower and worse than KDA. The new campaign therefore isolates only the K3
-changes that have not yet received a valid 2,000-step test.
-
-## Longer pretraining
-
-Only the winning 2,000-step combination scales to 8,000 steps. Build the
-4.19B-token corpus with `--training-steps 8000`, then run the curriculum
-inside mlq:
+Build the 20,000-step, 10.49B-token corpus:
 
 ```bash
-mlq submit --name k3_v5_curriculum --cwd "$PWD" --max-parallel-runs 1 -- \
+mlq submit --name k3_quality_sources_full --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  python3 prepare_k3_pretrain_sources.py --full-source-set
+
+mlq submit --name k3_quality_20k_data --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  python3 build_k3_pretrain_dataset_checkpointed.py \
+    --weights pretraining/k3_weights_quality.json \
+    --full-source-set \
+    --training-steps 20000 \
+    --cache-dir data/datasets/k3mix_quality_gpt2_20k.cache \
+    --output data/datasets/k3mix_v7_quality_gpt2_20k
+```
+
+Then run the KKKDKKKD curriculum:
+
+```bash
+mlq submit --name k3_quality_20k_train --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
   /home/marvin/Documents/repositories/parameter-golf/.venv/bin/python \
   run_k3_context_curriculum.py \
-    --data data/datasets/k3mix_v5_gpt2_8k \
-    --run-id k3_v5_winner \
-    --kda-heads 4
+    --data data/datasets/k3mix_v7_quality_gpt2_20k \
+    --run-id k3_quality_20k \
+    --steps 20000 \
+    --kda-heads 3 \
+    --per-head-muon \
+    --lr-schedule cosine
 ```
 
 The curriculum keeps the 524,288-token global batch and 32,768-token
-microbatches fixed while moving from 2K to 4K to 8K context. Stage boundaries
-resume model, optimizer, RNG, and exact corpus position. Exact staged resume
-is intentionally single-GPU only because Muon optimizer state is rank-sharded.
-An optional `--cooldown-data` corpus can replace the broad mix only for the
-last 500 steps, matching K3's high-quality cooldown idea; it is not enabled
-unless a continuation ablation shows a BPB win.
+microbatches fixed while moving from 2K to 4K to 8K context over
+15,000/3,750/1,250 steps. It uses cosine decay with a 1% linear warmup,
+current quintic Newton-Schulz Muon, a 500-step momentum warmup, and per-head
+Muon for Q/K/V. Stage boundaries resume model, optimizer, RNG, and exact
+corpus position. Every update consumes a new part of the stream; no epoch
+wrap occurs. Exact staged resume is intentionally single-GPU only because
+Muon optimizer state is rank-sharded.
+
+If corpus preprocessing is interrupted, submit the same build command again.
+Verified source caches are reused; only the source that was incomplete at the
+time of failure is restarted. Final loader-shard assembly is a cheap
+sequential pass over those caches.
+
+The runner streams all three stages into
+`ablation_results/k3_quality_20k/metrics.jsonl` and
+`tb_logs/k3_quality_20k`, so TensorBoard shows a single continuous 0–20,000
+step curve. Corpus download and construction do not emit TensorBoard metrics.
