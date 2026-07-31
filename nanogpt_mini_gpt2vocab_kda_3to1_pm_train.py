@@ -969,11 +969,13 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # Ensure spectral norm is at most 1
+    # Quintic Newton-Schulz iteration from current Muon/modded-nanoGPT. The
+    # coefficients intentionally do not converge all the way to the polar
+    # factor: the resulting S-shaped singular-value map is both faster and
+    # empirically better behaved than the older 12-step cubic iteration.
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations, not optimizing for wallclock speed
-    a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(5):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -1010,7 +1012,20 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    if "mu" not in state:
+                        # Checkpoints written before mu became tensor-valued
+                        # restore momentum without it; recreate on resume.
+                        state["mu"] = torch.empty(
+                            (), device=p.device, dtype=torch.float32
+                        )
+                    # Tensor-valued momentum keeps the compiled update generic
+                    # across the scalar momentum warmup.
+                    state["mu"].fill_(group["mu"])
+                    update = muon_update(
+                        p.grad,
+                        state["momentum"],
+                        mu=state["mu"],
+                    )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 if world_size > 1:
@@ -1053,11 +1068,18 @@ class PerHeadMuon(Muon):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
+                    if "mu" not in state:
+                        # Checkpoints written before mu became tensor-valued
+                        # restore momentum without it; recreate on resume.
+                        state["mu"] = torch.empty(
+                            (), device=p.device, dtype=torch.float32
+                        )
                     head_shape = (heads, p.size(0) // heads, p.size(1))
+                    state["mu"].fill_(group["mu"])
                     update = muon_update(
                         p.grad.view(head_shape),
                         state["momentum"].view(head_shape),
-                        mu=group["mu"],
+                        mu=state["mu"],
                     ).reshape_as(p)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
@@ -1655,10 +1677,25 @@ for trial in range(num_trials):
         and id(p) not in per_head_param_ids
     ]
     matrix_params.extend(model.mtp_heads.parameters())
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum_warmup_start = float(
+        os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
+    )
+    muon_momentum_warmup_steps = int(
+        os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500)
+    )
+    if not 0 <= muon_momentum_warmup_start <= muon_momentum < 1:
+        raise ValueError(
+            "Muon momentum must satisfy "
+            "0 <= warmup_start <= momentum < 1"
+        )
+    if muon_momentum_warmup_steps < 0:
+        raise ValueError("MUON_MOMENTUM_WARMUP_STEPS must be nonnegative")
     optimizer2 = Muon(
         matrix_params,
         lr=muon_lr,
         weight_decay=muon_weight_decay,
+        mu=muon_momentum_warmup_start,
     )
     optimizers = [optimizer1, optimizer2]
     if per_head_params:
@@ -1667,6 +1704,7 @@ for trial in range(num_trials):
                 per_head_params,
                 lr=muon_lr,
                 weight_decay=muon_weight_decay,
+                mu=muon_momentum_warmup_start,
             )
         )
     owned_parameters = [
@@ -1701,7 +1739,9 @@ for trial in range(num_trials):
         f"embed/proj/conv/scalar/Muon LRs: "
         f"{embed_lr}/{proj_lr}/{delta_conv_lr}/{scalar_lr}/{muon_lr}; "
         f"Adam weight decay: {adam_weight_decay}; "
-        f"Muon weight decay: {muon_weight_decay}",
+        f"Muon weight decay: {muon_weight_decay}; "
+        f"Muon momentum: {muon_momentum_warmup_start}"
+        f"->{muon_momentum} over {muon_momentum_warmup_steps} steps",
         console=True,
     )
 
@@ -1720,6 +1760,17 @@ for trial in range(num_trials):
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
+                if "mu" in group:
+                    momentum_progress = (
+                        min(step / muon_momentum_warmup_steps, 1.0)
+                        if muon_momentum_warmup_steps
+                        else 1.0
+                    )
+                    group["mu"] = (
+                        muon_momentum_warmup_start
+                        + momentum_progress
+                        * (muon_momentum - muon_momentum_warmup_start)
+                    )
 
     start_step = 0
     if resume_checkpoint:
@@ -1769,6 +1820,9 @@ for trial in range(num_trials):
         seq_len=seq_len,
         start_step=start_step,
     )
+    skip_initial_validation = (
+        os.environ.get("SKIP_INITIAL_VALIDATION", "0") == "1"
+    )
     for p in model.parameters():
         dist.broadcast(p.detach(), 0)
     if GRAD_PARITY_OUTPUT:
@@ -1791,7 +1845,9 @@ for trial in range(num_trials):
     for step in range(start_step, stop_after_step + 1):
 
         # --------------- VALIDATION SECTION -----------------
-        if step == stop_after_step or step % val_loss_every == 0:
+        if (
+            step == stop_after_step or step % val_loss_every == 0
+        ) and not (skip_initial_validation and step == start_step):
             # stop the clock
             dist.barrier()
             time_since_last_val = time.perf_counter() - t0
@@ -1961,6 +2017,9 @@ for trial in range(num_trials):
                 "muon_lr": muon_lr,
                 "adam_weight_decay": adam_weight_decay,
                 "muon_weight_decay": muon_weight_decay,
+                "muon_momentum": muon_momentum,
+                "muon_momentum_warmup_start": muon_momentum_warmup_start,
+                "muon_momentum_warmup_steps": muon_momentum_warmup_steps,
                 "global_batch_tokens": batch_size,
                 "microbatch_sequences": mbs,
                 "local_microbatches_per_step": local_microbatches_per_step,
