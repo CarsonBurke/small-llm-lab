@@ -1,4 +1,4 @@
-"""Shared batched evaluation for the latent THINK/EMIT math policy."""
+"""Shared batched evaluation for the hidden-carry latent math policy."""
 
 from __future__ import annotations
 
@@ -14,17 +14,14 @@ from postraining.benchmark_report import (
 )
 from postraining.core import answer_style, encode_prompt, verify_answer
 from postraining.latent_rollout import (
-    THOUGHT_SLOT,
-    TOKEN_SLOT,
-    emitted_token_and_kind_rows,
     emitted_token_rows,
     rollout_continuations,
     trim_stream,
 )
-from postraining.latent_thought import EMIT, THINK, LatentThoughtModel
+from postraining.latent_thought import LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
-LATENT_EVAL_METRIC_SCHEMA = "forced_initial_one_way_stop_policy/v2"
+LATENT_EVAL_METRIC_SCHEMA = "deterministic_hidden_carry_token_actions/v3"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
@@ -80,14 +77,15 @@ def evaluate_latent_math(
 ) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
 
-    ``pin_emit`` evaluates a pinned-EMIT (cot/none reasoning mode) policy:
-    no gate or thought is ever sampled. ``prompt_suffix_ids`` are teacher-forced
-    onto the END of every truncated prompt (the none-mode ``Answer:`` prefix)
-    and rejoin the decoded solution before verification.
+    ``pin_emit`` evaluates a token-only (cot/none reasoning mode) policy: no
+    belief is ever carried between steps. ``prompt_suffix_ids`` are
+    teacher-forced onto the END of every truncated prompt (the none-mode
+    ``Answer:`` prefix) and rejoin the decoded solution before verification.
 
-    Generation runs the gate-conditioned rollout, so the evaluated policy is
-    exactly the trained one — including its latent thinking. RNG state is
-    saved and restored so evaluation never perturbs training reproducibility.
+    Generation runs the deterministic hidden-carry rollout, so the evaluated
+    policy is exactly the trained one — including its latent thinking. RNG
+    state is saved and restored so evaluation never perturbs training
+    reproducibility.
     AIME callers use temperature 1.0 / top-p 0.7 per the VAPO protocol;
     standalone inspection may pass other explicit sampling settings.
 
@@ -165,11 +163,6 @@ def evaluate_latent_math(
     prompt_correct = [0] * len(rows)
     module_correct: dict[str, int] = {}
     module_total: dict[str, int] = {}
-    continue_actions = torch.zeros((), dtype=torch.float32, device=device)
-    stop_decisions = torch.zeros((), dtype=torch.float32, device=device)
-    stopped_trajectories = torch.zeros(
-        (), dtype=torch.float32, device=device
-    )
     emitted_counts: list[int] = []
     stream_action_counts: list[int] = []
     recurrent_steps_per_rollout: list[int] = []
@@ -212,7 +205,6 @@ def evaluate_latent_math(
                     row_start : row_start + groups_per_rollout
                 ]
                 prompt_width = max(len(item[0]) for item in row_chunk)
-                rollout_width = len(row_chunk) * width
                 prompt_ids = torch.zeros(
                     (len(row_chunk), prompt_width),
                     dtype=torch.long,
@@ -271,42 +263,7 @@ def evaluate_latent_math(
                     int(count)
                     for count in batch.action_mask.sum(-1).cpu().tolist()
                 )
-                continue_actions += (
-                    (
-                        (batch.actions == THINK).float()
-                        * batch.stop_mask
-                    ).sum()
-                )
-                stop_decisions += batch.stop_mask.sum()
-                stopped_trajectories += (
-                    ((batch.actions == EMIT) & batch.stop_mask.bool())
-                    .any(-1)
-                    .float()
-                    .sum()
-                )
-                capture_kinds: dict[int, list[int]] = {}
-                capture_members: list[int] = []
-                if (
-                    captured_attempts is not None
-                    and member_start < capture_samples_per_problem
-                ):
-                    capture_members = [
-                        flat_member
-                        for flat_member in range(rollout_width)
-                        if row_chunk[flat_member // width][2]
-                        < capture_problem_count
-                        and member_start + flat_member % width
-                        < capture_samples_per_problem
-                    ]
-                if capture_members:
-                    # One packed transfer per rollout supplies both scoring
-                    # tokens and traces for every captured trajectory.
-                    emitted_rows, kind_rows = emitted_token_and_kind_rows(batch)
-                    capture_kinds = {
-                        member: kind_rows[member] for member in capture_members
-                    }
-                else:
-                    emitted_rows = emitted_token_rows(batch)
+                emitted_rows = emitted_token_rows(batch)
                 for flat_member, emitted in enumerate(emitted_rows):
                     emitted_counts.append(len(emitted))
                     terminated_total += int(
@@ -347,22 +304,6 @@ def evaluate_latent_math(
                             list(prompt_suffix_ids) + emitted
                         )
                         _, parsed_answer = verify_answer(emitted_text, truth, style)
-                        action_trace = "".join(
-                            "T" if kind == THOUGHT_SLOT else "E"
-                            for kind in capture_kinds[flat_member]
-                            if kind in (THOUGHT_SLOT, TOKEN_SLOT)
-                        )
-                        runs: list[int] = []
-                        current_run = 0
-                        for action in action_trace:
-                            if action == "T":
-                                current_run += 1
-                            elif current_run:
-                                runs.append(current_run)
-                                current_run = 0
-                        if current_run:
-                            runs.append(current_run)
-                        total_thoughts = action_trace.count("T")
                         captured_attempts.append(
                             {
                                 "problem_index": original_index,
@@ -380,13 +321,6 @@ def evaluate_latent_math(
                                     emitted[stop_cut] if stop_cut is not None else None
                                 ),
                                 "emitted_token_count": len(emitted),
-                                "initial_thought_count": int(not pin_emit),
-                                "continued_thought_count": (
-                                    total_thoughts - int(not pin_emit)
-                                ),
-                                "total_thought_count": total_thoughts,
-                                "think_run_lengths": runs,
-                                "action_trace": action_trace,
                             }
                         )
             member_start += width
@@ -486,15 +420,6 @@ def evaluate_latent_math(
             math.sqrt((count / samples) * (1.0 - count / samples))
             for count in prompt_correct
         ) / max(len(prompt_correct), 1),
-        "continue_thinking_fraction": float(
-            continue_actions / stop_decisions.clamp_min(1.0)
-        ),
-        "stop_thinking_fraction": float(
-            stopped_trajectories / stop_decisions.clamp_min(1.0)
-        ),
-        "stopped_thinking_trajectory_fraction": float(
-            stopped_trajectories / max(total, 1)
-        ),
         "ended_fraction": terminated_total / max(total, 1),
         **summarize(emitted_counts, "emitted_tokens"),
         **summarize(stream_action_counts, "stream_actions"),

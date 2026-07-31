@@ -27,11 +27,6 @@ def _attempt(problem: int, sample: int) -> dict[str, object]:
         "terminated": sample != 3,
         "termination_token_id": 2 if sample != 3 else None,
         "emitted_token_count": 8,
-        "initial_thought_count": 1,
-        "continued_thought_count": 2,
-        "total_thought_count": 3,
-        "think_run_lengths": [3],
-        "action_trace": "TTTEEEEEEEE",
     }
 
 
@@ -43,8 +38,6 @@ def _payload() -> dict[str, object]:
         "metrics": {
             "accuracy": 0.25,
             "policy_accuracy": 0.25,
-            "continue_thinking_fraction": 0.2,
-            "stopped_thinking_trajectory_fraction": 0.75,
             "prompt_any_correct_fraction": 0.5,
             "prompt_mixed_reward_fraction": 0.125,
             "within_group_reward_std": 0.03125,
@@ -126,16 +119,10 @@ def _sample_json() -> dict[str, object]:
                     {
                         "text": f"work {sample}\nAnswer: {problem}</s>",
                         "emitted_text": f"work\nAnswer: {problem}",
-                        "trace": "tEE" if sample % 2 == 0 else "ttEE",
-                        "thinks": 1 if sample % 2 == 0 else 2,
                         "emits": 2,
                         "correct": sample == 0,
                         "prediction": str(problem),
                         "terminated": sample != 3,
-                        "continued_thought_count": 0 if sample % 2 == 0 else 1,
-                        "think_run_lengths": (
-                            [1] if sample % 2 == 0 else [2]
-                        ),
                     }
                     for sample in range(4)
                 ],
@@ -154,8 +141,7 @@ def test_sample_json_converter_preserves_exact_panel_and_computes_metrics(tmp_pa
     assert payload["metrics"]["accuracy"] == 0.25
     assert payload["metrics"]["policy_accuracy"] == 0.25
     assert payload["metrics"]["policy_samples"] == 16
-    assert payload["metrics"]["continue_thinking_fraction"] == 8 / 24
-    assert payload["attempts"][0]["action_trace"] == "TEE"
+    assert payload["attempts"][0]["emitted_token_count"] == 2
     assert payload["attempts"][-1]["dataset_index"] == 103
 
     source = tmp_path / "samples.json"
@@ -165,26 +151,13 @@ def test_sample_json_converter_preserves_exact_panel_and_computes_metrics(tmp_pa
     assert "What the model answered" in output.read_text()
 
 
-def test_sample_json_converter_reports_no_stop_decisions_for_pinned_emit():
+def test_sample_json_converter_carries_the_pinned_emit_flag():
     sampled = _sample_json()
     sampled["metrics"] = {"pin_emit": True}
-    for record in sampled["records"]:
-        for sample in record["samples"]:
-            sample["trace"] = "EE"
-            sample["thinks"] = 0
-            sample["continued_thought_count"] = 0
-            sample["think_run_lengths"] = []
 
     payload = sample_json_to_report_payload(sampled)
 
     assert payload["metrics"]["pin_emit"] is True
-    assert payload["metrics"]["continue_thinking_fraction"] == 0.0
-    assert payload["metrics"]["stop_thinking_fraction"] == 0.0
-    assert payload["metrics"]["stopped_thinking_trajectory_fraction"] == 0.0
-    assert all(
-        attempt["initial_thought_count"] == 0
-        for attempt in payload["attempts"]
-    )
 
 
 def test_sample_json_converter_supports_full_rectangular_evaluations():

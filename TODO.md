@@ -1,20 +1,21 @@
 # TODO
 
-## One-way latent stopping policy (2026-07-26)
+## Deterministic hidden carry (2026-07-30)
 
-Current latent rollout schema is `forced_initial_think_one_way_stop_gate/v2`:
-every trajectory takes one mandatory Gaussian THINK, then the Bernoulli gate
-chooses CONTINUE_THINK or STOP_AND_EMIT. STOP is absorbing; all later actions
-are token-only EMITs and carry no stop-gate mask or loss. Thus every action
-trace is `T+E*`, `thoughts_per_trajectory` includes the mandatory thought, and
-evaluation no longer has a forced/unforced intervention split. Fresh runs use
-`--init-stop-thinking-probability` (0.99 is the direct successor to the last
-run's 0.01 initial think probability).
+The stochastic Gaussian thought policy and Bernoulli stop gate are deleted
+(execution schema v28, `deterministic_hidden_carry/v1`, no migrations). A
+thought is the post-final-norm belief that produced a generated token; it
+rides back in as a gated residual on that token's embedding through a
+`CombinedEmbedding` (zero-init gain, prenorm-residual relu^2 MLP, identity
+at init). The only actions are tokens, training is standard token-level
+VAPO, and there is no BPTT — stored hiddens are detached behavior data.
+Test-time-read-compute (carrying hiddens for read tokens) is deferred.
 
-The post-training trainer is now decomposed into `vapo/config.py`,
-`vapo/schemas.py`, `vapo/objectives.py`, and `runtime/profiling.py`; the
-orchestration module fell from 7,736 to under 5,000 lines. Next structural
-cuts, only when they can remain behavior-preserving, are metrics/update and
+The post-training trainer is decomposed into `vapo/config.py`,
+`vapo/schemas.py`, and `runtime/profiling.py` (`vapo/objectives.py` was
+deleted with the stochastic thought/gate losses; the surviving token
+objectives live in `postraining/core.py`). Next structural cuts, only when
+they can remain behavior-preserving, are metrics/update and
 collector/evaluation.
 
 ## Posttraining wall-clock (measured Jul 19, v6 run TB wall times)

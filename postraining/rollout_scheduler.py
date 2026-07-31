@@ -23,25 +23,18 @@ from torch.func import _random as stateless_random
 
 from postraining.latent_rollout import (
     PAD_SLOT,
-    THOUGHT_SLOT,
     TOKEN_SLOT,
     LatentRolloutBatch,
 )
-from postraining.latent_thought import EMIT, THINK, StepOutput
+from postraining.latent_thought import StepOutput
 
 
 _STREAM_FIELD_NAMES = (
     "kind",
     "token_ids",
-    "thoughts",
-    "actions",
+    "hiddens",
     "action_mask",
-    "stop_mask",
-    "old_stop_logprobs",
     "old_token_logprobs",
-    "old_thought_logprobs",
-    "old_thought_means",
-    "old_thought_log_sigmas",
     "old_values",
 )
 _UINT64_MASK = (1 << 64) - 1
@@ -51,7 +44,6 @@ class ContinuousRefillModel(Protocol):
     """Model-side paged-cache operations required by the scheduler."""
 
     backbone: object
-    gate: object
 
     def make_paged_generation_cache(
         self,
@@ -89,7 +81,7 @@ class ContinuousRefillModel(Protocol):
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor: ...
 
-    def thought_input(self, thought: Tensor) -> Tensor: ...
+    def combined_input(self, token_ids: Tensor, hidden: Tensor) -> Tensor: ...
 
 
 @dataclass
@@ -227,7 +219,7 @@ class _RecordLedger:
         )
 
     def assemble(
-        self, *, target_device: torch.device
+        self, *, target_device: torch.device, carry_injected: bool = False
     ) -> dict[int, LatentRolloutBatch]:
         result: dict[int, LatentRolloutBatch] = {}
         for origin_id, origin in sorted(self.origins.items()):
@@ -301,7 +293,6 @@ class _RecordLedger:
             action_mask = assembled["action_mask"]
             result[origin_id] = LatentRolloutBatch(
                 **assembled,
-                emit_mask=(assembled["actions"] == EMIT).float() * action_mask,
                 rewards=torch.zeros_like(action_mask),
                 reward_scalar=torch.zeros(
                     origin.rows,
@@ -309,6 +300,7 @@ class _RecordLedger:
                     device=target_device,
                 ),
                 prompt_length=origin.prompt_length,
+                carry_injected=carry_injected,
             )
         return result
 
@@ -325,9 +317,6 @@ class _PendingGroup:
 @dataclass
 class _PolicyBuffers:
     belief: Tensor
-    predicted: Tensor
-    thought_log_sigma: Tensor
-    input_latent: Tensor
     logits: Tensor
 
     @classmethod
@@ -343,22 +332,13 @@ class _PolicyBuffers:
 
         return cls(
             belief=empty_like(output.belief),
-            predicted=empty_like(output.predicted),
-            thought_log_sigma=empty_like(output.thought_log_sigma),
-            input_latent=empty_like(output.input_latent),
             logits=empty_like(output.logits),
         )
 
     def scatter(self, slots: Tensor, output: StepOutput) -> None:
         if output.belief.size(0) != slots.numel():
             raise ValueError("model output rows do not match requested slots")
-        for name in (
-            "belief",
-            "predicted",
-            "thought_log_sigma",
-            "input_latent",
-            "logits",
-        ):
+        for name in ("belief", "logits"):
             getattr(self, name).index_copy_(0, slots, getattr(output, name))
 
     def scatter_prefix(self, slots: Tensor, output: StepOutput) -> None:
@@ -366,13 +346,7 @@ class _PolicyBuffers:
         rows = slots.numel()
         if output.belief.size(0) < rows:
             raise ValueError("model output has fewer rows than requested slots")
-        for name in (
-            "belief",
-            "predicted",
-            "thought_log_sigma",
-            "input_latent",
-            "logits",
-        ):
+        for name in ("belief", "logits"):
             getattr(self, name).index_copy_(
                 0, slots, getattr(output, name)[:rows]
             )
@@ -381,15 +355,12 @@ class _PolicyBuffers:
 def _empty_record_values(
     capacity: int,
     width: int,
-    thought_dim: int,
+    hidden_dim: int,
     *,
     device: torch.device,
 ) -> dict[str, Tensor]:
     action_mask = torch.zeros(
         (capacity, width), dtype=torch.float32, device=device
-    )
-    thoughts = torch.zeros(
-        (capacity, width, thought_dim), dtype=torch.float32, device=device
     )
     return {
         "kind": torch.full(
@@ -398,17 +369,11 @@ def _empty_record_values(
         "token_ids": torch.zeros(
             (capacity, width), dtype=torch.long, device=device
         ),
-        "thoughts": thoughts,
-        "actions": torch.zeros(
-            (capacity, width), dtype=torch.long, device=device
+        "hiddens": torch.zeros(
+            (capacity, width, hidden_dim), dtype=torch.float32, device=device
         ),
         "action_mask": action_mask,
-        "stop_mask": torch.zeros_like(action_mask),
-        "old_stop_logprobs": torch.zeros_like(action_mask),
         "old_token_logprobs": torch.zeros_like(action_mask),
-        "old_thought_logprobs": thoughts.new_zeros((capacity, width, 0)),
-        "old_thought_means": thoughts.new_zeros((capacity, width, 0)),
-        "old_thought_log_sigmas": thoughts.new_zeros((capacity, width, 0)),
         "old_values": torch.zeros_like(action_mask),
     }
 
@@ -451,61 +416,41 @@ def _decode_execution_width(
     return min(capacity_rows, 1 << (active_rows - 1).bit_length())
 
 
-def _cpu_request_random(
-    key_bits: Tensor, thought_dim: int
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def _cpu_request_random(key_bits: Tensor) -> tuple[Tensor, Tensor]:
     """Isolated CPU reference for tests; production CUDA stays vectorized."""
     rows = key_bits.size(0)
-    gate = torch.empty(rows, dtype=torch.float32)
     token = torch.empty(rows, dtype=torch.float32)
-    thought = torch.empty((rows, thought_dim), dtype=torch.float32)
     next_key_bits = key_bits.clone()
     for row in range(rows):
         seed = int(key_bits[row, 0]) & _UINT64_MASK
         counter = int(key_bits[row, 1]) & _UINT64_MASK
         decision = _splitmix64(seed ^ _splitmix64(counter))
-
-        def generator(domain: int) -> torch.Generator:
-            domain_seed = _splitmix64(decision ^ _splitmix64(domain))
-            return torch.Generator().manual_seed(domain_seed & ((1 << 63) - 1))
-
-        gate[row] = torch.rand((), generator=generator(0))
-        token[row] = torch.rand((), generator=generator(1))
-        if thought_dim:
-            thought[row] = torch.randn(
-                thought_dim, generator=generator(2)
-            )
+        generator = torch.Generator().manual_seed(
+            decision & ((1 << 63) - 1)
+        )
+        token[row] = torch.rand((), generator=generator)
         next_key_bits[row, 1] = _signed64(
             (counter + 1) & _UINT64_MASK
         )
-    return gate, token, thought, next_key_bits
+    return token, next_key_bits
 
 
-def _request_random(
-    key_bits: Tensor, thought_dim: int
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """One gate/token/thought draw and successor key per request."""
+def _request_random(key_bits: Tensor) -> tuple[Tensor, Tensor]:
+    """One token-uniform draw and successor key per request.
+
+    The deterministic hidden-carry policy samples nothing but the next
+    token, so this draw order does not reproduce rollouts recorded under
+    the old gate/thought scheme.
+    """
     if key_bits.device.type == "cpu":
-        return _cpu_request_random(key_bits, thought_dim)
+        return _cpu_request_random(key_bits)
     if key_bits.device.type != "cuda":
         raise ValueError("request-stable Philox supports only CPU and CUDA")
     keys = key_bits.view(torch.uint64)
-    gate_key, token_key, thought_key, next_keys = stateless_random.split(
-        keys, 4
-    )
+    token_key, next_keys = stateless_random.split(keys, 2)
     rows = keys.size(0)
-    gate = stateless_random.uniform(gate_key, (rows,), dtype=torch.float32)
     token = stateless_random.uniform(token_key, (rows,), dtype=torch.float32)
-    thought = (
-        stateless_random.normal(
-            thought_key[:, None],
-            (rows, thought_dim),
-            dtype=torch.float32,
-        )
-        if thought_dim
-        else torch.empty((rows, 0), dtype=torch.float32, device=keys.device)
-    )
-    return gate, token, thought, next_keys.view(torch.int64)
+    return token, next_keys.view(torch.int64)
 
 
 def _top_p_from_uniform(
@@ -587,7 +532,7 @@ def rollout_continuous_refill_groups(
         raise ValueError("capacity_rows must fit one whole prompt group")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
-    if max_stream_steps < max_new_tokens + (0 if pin_emit else 1):
+    if max_stream_steps < max_new_tokens:
         raise ValueError("stream budget cannot fit the requested actions")
     widths = {chunk.size(1) for chunk in prompt_chunks}
     if len(widths) != 1:
@@ -641,10 +586,11 @@ def rollout_continuous_refill_groups(
         schedule_stats.chunks = len(prompt_chunks)
 
     max_stream = prompt_width + max_stream_steps
-    latent_dim = (
-        model.backbone.tok_emb.embedding_dim if not pin_emit else 0
+    stored_hidden_dim = (
+        model.backbone.tok_emb.embedding_dim
+        if replay_storage and not pin_emit
+        else 0
     )
-    record_thought_dim = latent_dim if replay_storage else 0
     bank_prompt_ids = torch.stack([group.prompt_ids for group in pending])
     bank_prompt_lengths = torch.tensor(
         [group.prompt_length for group in pending],
@@ -670,11 +616,10 @@ def rollout_continuous_refill_groups(
         if cache_kv_starts.device != device:
             raise ValueError("paged cache and prompts must share a device")
     values = _empty_record_values(
-        capacity_rows, max_stream, record_thought_dim, device=device
+        capacity_rows, max_stream, stored_hidden_dim, device=device
     )
     ledger = _RecordLedger(origins)
     ended = torch.zeros(capacity_rows, dtype=torch.bool, device=device)
-    thinking_active = torch.zeros_like(ended)
     emitted = torch.zeros(capacity_rows, dtype=torch.long, device=device)
     positions = torch.zeros(capacity_rows, dtype=torch.long, device=device)
     origin_ids = [-1] * capacity_rows
@@ -747,7 +692,6 @@ def rollout_continuous_refill_groups(
             repeated_prompts * prompt_valid
         )
         ended[flat_slots] = False
-        thinking_active[flat_slots] = not pin_emit
         emitted[flat_slots] = 0
         positions[flat_slots] = prompt_width - 1
 
@@ -792,14 +736,11 @@ def rollout_continuous_refill_groups(
             )
 
     def active_mask(slots: Tensor) -> Tensor:
-        initial = positions.index_select(0, slots) == prompt_width - 1
-        within_action_cap = emitted.index_select(0, slots) < max_new_tokens
-        forced_initial = thinking_active.index_select(0, slots) & initial
-        within_stream = positions.index_select(0, slots) < max_stream - 1
-        return (
-            ~ended.index_select(0, slots)
-            & (within_action_cap | forced_initial)
-            & within_stream
+        # Every decode step emits one token, so the emitted-token cap alone
+        # bounds the trajectory; the entry validation guarantees the stream
+        # budget can hold max_new_tokens consequence slots.
+        return ~ended.index_select(0, slots) & (
+            emitted.index_select(0, slots) < max_new_tokens
         )
 
     while pending_index < len(pending) or occupied_slots:
@@ -813,91 +754,38 @@ def rollout_continuous_refill_groups(
             raise RuntimeError("admission did not initialize policy state")
 
         slot_positions = positions.index_select(0, slots)
-        initial = slot_positions == prompt_width - 1
         belief = policy.belief.index_select(0, slots)
-        predicted = policy.predicted.index_select(0, slots)
-        log_sigma = policy.thought_log_sigma.index_select(0, slots)
         logits = policy.logits.index_select(0, slots)
         keys = request_key_bits.index_select(0, slots)
-        gate_uniform, token_uniform, thought_noise, next_keys = (
-            _request_random(keys, latent_dim)
-        )
+        token_uniform, next_keys = _request_random(keys)
         request_key_bits.index_copy_(0, slots, next_keys)
 
-        if pin_emit:
-            action = torch.full(
-                (slots.numel(),), EMIT, dtype=torch.long, device=device
-            )
-        else:
-            stop_probability = model.gate.stop_logit(belief).sigmoid()
-            sampled_action = (gate_uniform < stop_probability).long()
-            action = torch.where(
-                initial,
-                sampled_action.new_full((), THINK),
-                torch.where(
-                    thinking_active.index_select(0, slots),
-                    sampled_action,
-                    sampled_action.new_full((), EMIT),
-                ),
-            )
         token = _top_p_from_uniform(
             logits, token_uniform, temperature, top_p
         )
-        thought = (
-            None
-            if pin_emit
-            else predicted.float() + log_sigma.float().exp() * thought_noise
-        )
 
         row_slots = (slots, slot_positions)
-        ones = values["action_mask"].new_ones(())
-        values["action_mask"][row_slots] = ones
-        gate_decision = ~initial & thinking_active.index_select(0, slots)
-        values["stop_mask"][row_slots] = torch.where(
-            gate_decision, ones, values["stop_mask"][row_slots]
-        )
-        values["actions"][row_slots] = action
-        emits = action == EMIT
-        thinks = action == THINK
-        current_thinking = thinking_active.index_select(0, slots)
-        current_thinking &= ~emits
-        thinking_active.index_copy_(0, slots, current_thinking)
-
-        next_kind = torch.where(
-            emits,
-            values["kind"].new_full((slots.numel(),), TOKEN_SLOT),
-            torch.where(
-                thinks,
-                values["kind"].new_full((slots.numel(),), THOUGHT_SLOT),
-                values["kind"].new_full((slots.numel(),), PAD_SLOT),
-            ),
-        )
-        next_token_ids = torch.where(
-            emits, token, token.new_zeros((slots.numel(),))
-        )
+        values["action_mask"][row_slots] = values["action_mask"].new_ones(())
         next_positions = slot_positions + 1
         next_slots = (slots, next_positions)
-        values["kind"][next_slots] = next_kind
-        values["token_ids"][next_slots] = next_token_ids
-        if replay_storage and thought is not None:
-            current = values["thoughts"][next_slots]
-            values["thoughts"][next_slots] = torch.where(
-                thinks[:, None], thought, current
-            )
-        emitted.index_add_(0, slots, emits.long())
+        values["kind"][next_slots] = TOKEN_SLOT
+        values["token_ids"][next_slots] = token
+        if stored_hidden_dim:
+            # The +1 shift: the consequence slot stores the belief that
+            # decided its token, exactly the carry replay will inject there.
+            values["hiddens"][next_slots] = belief.float()
+        emitted.index_add_(0, slots, torch.ones_like(slots))
         if stop_tensor is not None:
-            stopped = emits & torch.isin(token, stop_tensor)
-            ended[slots] |= stopped
+            ended[slots] |= torch.isin(token, stop_tensor)
         positions.index_copy_(0, slots, next_positions)
 
-        if thought is None:
-            next_input = model.embed_tokens(next_token_ids[:, None])
+        if pin_emit:
+            next_input = model.embed_tokens(token[:, None])
         else:
-            next_input = torch.where(
-                (next_kind == THOUGHT_SLOT)[:, None, None],
-                model.thought_input(thought),
-                model.embed_tokens(next_token_ids[:, None]),
-            )
+            # Every fed-back token here was just generated, so the
+            # hasThought flag is implicitly all-ones (combined_input's
+            # contract); prompt tokens enter only through prefix admission.
+            next_input = model.combined_input(token, belief)
         model_slots = slots
         model_positions = next_positions
         model_input = next_input
@@ -998,7 +886,9 @@ def rollout_continuous_refill_groups(
         # needs no per-eviction barrier. Host reconstruction starts only
         # after this single pool-level completion.
         torch.cuda.current_stream(device).synchronize()
-    results = ledger.assemble(target_device=offload_device)
+    results = ledger.assemble(
+        target_device=offload_device, carry_injected=not pin_emit
+    )
     ordered = [results[index] for index in range(len(prompt_chunks))]
     if schedule_stats is not None:
         per_chunk_actions = [

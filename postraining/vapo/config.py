@@ -7,15 +7,16 @@ import math
 from pathlib import Path
 
 from postraining.benchmark_report import CAPTURE_SAMPLES_PER_PROBLEM
-from postraining.latent_thought import (
-    CRITIC_ADAPTER_INIT_KINDS,
-    SIGMA_STATE_INIT_KINDS,
-    THOUGHT_ACTION_TRANSFORM_KINDS,
-    THOUGHT_ADAPTER_KINDS,
-)
 
 
-DEFAULT_BPB_GUARD_TOKENS = 2 * 1024 * 1024
+# One 8-row eval batch at the 1024-token guard sequence length. The guard is
+# a catastrophic-drift canary on a fixed deterministic prefix, and drift is
+# paired against the same tokens every eval, so a small preset detects an LM
+# collapse at ~1/256 the old 2M-token cost (which was 42% of a run's wall
+# time at the pre-v28 cadence). Absolute-BPB comparisons against recorded
+# pretraining values (the init-identity gate) must pass an explicit
+# --bpb-val-tokens 2097152 to reproduce the reference measurement.
+DEFAULT_BPB_GUARD_TOKENS = 8 * 1024
 DEFAULT_BPB_EVAL_EVERY = 150
 DEFAULT_MATH_EVAL_EVERY = 250
 
@@ -65,10 +66,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(module-tagged datasets only); names absent from the data are an error",
     )
     # The reasoning mode fixes the rollout policy family for the whole run:
-    # "latent" samples the THINK/EMIT gate and Gaussian thoughts (current
-    # behavior); "cot" pins every gate decision to EMIT with the full token
-    # budget (token chain of thought); "none" pins EMIT, teacher-forces an
-    # "Answer:" prefix onto the prompt, and budgets only the answer itself.
+    # "latent" carries each generated token's producing belief back into its
+    # input through the gated combined embedding; "cot" is the token-only
+    # control (no hidden carry) with the full token budget; "none" is
+    # token-only, teacher-forces an "Answer:" prefix onto the prompt, and
+    # budgets only the answer itself.
     parser.add_argument(
         "--reasoning-mode",
         choices=("latent", "cot", "none"),
@@ -91,20 +93,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples-per-prompt", type=int, default=16)
     # One pass only: repeated PPO epochs reuse the same generated trajectories.
     parser.add_argument("--ppo-epochs", type=int, default=1)
-    # Total generated-slot budget per trajectory (thinks + emits).  Thinking
-    # is never forcibly interrupted; overthinking costs emitted tokens and
-    # therefore reward. 0 means 4x the emit cap capped to the backbone
-    # context; None derives the backbone default (fresh: the explicit
-    # 4096-slot side of the 1024-prompt + 4096-stream contract; nano: 512).
-    # Pinned-EMIT modes ignore this — every slot is a token, so the stream
-    # budget equals the emit cap.
-    parser.add_argument("--max-stream-steps", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     # One general rate for actor and critic. The fresh-policy experiment starts
     # every actor-side optimizer state empty from the critic-warm checkpoint;
     # using the critic's 3e-4 rate also removes the prior hand-tuned split
-    # between trunk, renderer, gate, adapter, and continuous-policy heads.
+    # between trunk, renderer, and combiner.
     # 5e-5 is the empirically stable RL rate across the latent-VAPO runs;
     # the old 3e-4 default (a pretraining-scale rate) caused behavior-KL
     # spikes and policy collapse when a job omitted --learning-rate.
@@ -173,123 +167,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # which the near-frozen bias (AdamW at 5e-5) then takes ~1e3 steps to
     # unwind through head.weight alone.
     parser.add_argument("--value-prior", type=float, default=0.0)
-    # Initialization only: the central bounded output of the state-dependent
-    # log-sigma head. -2 gives std ~0.135 and expected 512-D noise norm ~3.06.
-    # Its inverse raw bias is only -0.144 in the [-5, 2] tanh map, retaining
-    # 98% of the midpoint's local sensitivity. The orthogonal state map starts
-    # behind a 0.01 gain, so it adds only mild statewise variation while
-    # retaining every input direction.
-    parser.add_argument("--thought-log-sigma-init", type=float, default=-2.0)
-    parser.add_argument(
-        "--thought-sigma-state-init",
-        choices=SIGMA_STATE_INIT_KINDS,
-        default="orthogonal",
-        help=(
-            "fresh log-sigma state map; constant is the zero-weight control, "
-            "orthogonal is the full-rank 0.01-gain treatment"
-        ),
-    )
-    # Initialization only. The orthogonal map gives an RMS-normalized belief
-    # an exactly controlled mean RMS without weakening matrix optimization.
-    parser.add_argument("--thought-mean-gain-init", type=float, default=0.1)
-    parser.add_argument(
-        "--thought-adapter",
-        choices=THOUGHT_ADAPTER_KINDS,
-        default="orthogonal_silu",
-        help=(
-            "deployed thought input map; identity_affine is the v25 control, "
-            "orthogonal_silu adds full-width random mixing and 2*SiLU"
-        ),
-    )
-    parser.add_argument(
-        "--thought-action-transform",
-        choices=THOUGHT_ACTION_TRANSFORM_KINDS,
-        default="identity",
-        help=(
-            "recurrent input transform applied after raw Gaussian sampling; "
-            "likelihoods and replay storage remain in raw action space"
-        ),
-    )
-    parser.add_argument(
-        "--critic-adapter-init",
-        choices=CRITIC_ADAPTER_INIT_KINDS,
-        default="orthogonal",
-        help="fresh critic thought-affine initialization",
-    )
-    # Gradient multiplier for the thought factor inside the joint action log
-    # probability. The forward ratio stays exact; 0 detaches only that factor
-    # as a control arm while token/gate gradients still train the trunk.
-    parser.add_argument("--thought-pg-coef", type=float, default=1.0)
-    # Dreamer4-style reverse KL from the frozen rollout behavior policy to the
-    # current diagonal-Gaussian thought policy. The factorwise k3 estimator is
-    # summed over latent dimensions but divided by ALL policy actions, so 0.3
-    # has action-level scale. 0.3 is Dreamer4's own weight
-    # (dreamer4.py pmpo_kl_div_loss_weight, pmpo_reverse_kl=True): its
-    # kl_div is KL(behavior || current) summed over action dimensions and
-    # masked-meaned over positions, the same direction and normalization
-    # convention as sampled_reverse_kl here.
-    #
-    # THE default trust mechanism as of v24 (it was retired to an ablation
-    # knob in v21). The v23 measurement is why: the mean PROJECTION bounds
-    # only the projected mean inside the surrogate, while the raw acting
-    # policy drifts through the Muon-owned trunk under the LM/gate/renderer
-    # losses. Job 363 ran at a median raw KL of 0.0424 nats with 68% of
-    # updates above 0.03 -- the projection cannot see that channel, and this
-    # penalty is the only term that acts on it directly.
-    #
-    # MUTUALLY EXCLUSIVE with every surrogate-side trust mode. The penalty
-    # and the projection/ratio clip are two different SOLUTIONS to the same
-    # problem, not two layers of one: the penalty prices realized aggregate
-    # divergence of the acting policy, the projection hard-constrains
-    # closed-form mean movement inside the surrogate. Running both makes the
-    # measurement uninterpretable -- neither term's contribution can be
-    # attributed -- so a nonzero coefficient REQUIRES
-    # --thought-clip-mode none, and any other clip mode requires 0 here.
-    parser.add_argument("--thought-reverse-kl-coef", type=float, default=0.5)
-    # v23 default: TRPL-style Mahalanobis mean projection onto the behavior
-    # trust region. The sampled joint ratio of a 512-D Gaussian is
-    # noise-dominated (log-ratio ~ N(-KL, 2*KL), so at any real drift the
-    # v21/v22 'joint' clip decision fired on sampled noise, not on policy
-    # movement, and its unclipped harmful side carried e^3+ importance
-    # weights). The projection measures movement in closed form from stored
-    # behavior means instead. 'joint' and 'per_dim' remain ablation arms.
-    #
-    # 'none' is THE v24 default: it removes the surrogate-side trust
-    # mechanism entirely -- no projection, no ratio band, no tracking
-    # penalty -- leaving --thought-reverse-kl-coef as the only constraint on
-    # THINK drift. The two families bound different things (closed-form mean
-    # movement inside the surrogate vs realized aggregate divergence of the
-    # acting policy) and are alternative solutions, so exactly one is active
-    # in any run; see --thought-reverse-kl-coef for the exclusion rule. The
-    # +/-2 log-ratio guard still applies in 'none': it is a numerical bound
-    # on the 512-D Gaussian tail, not a trust region.
-    parser.add_argument(
-        "--thought-clip-mode",
-        choices=("projected", "joint", "per_dim", "none"),
-        default="none",
-    )
-    # Squared-Mahalanobis trust radius per THINK action, in behavior-sigma
-    # units (= twice the Gaussian KL at frozen sigma; 0.03 ~= 0.015 nats).
-    # The default is the TRPL reference BaseProjectionLayer mean bound
-    # (mean 0.03; its cov bound 1e-3 becomes relevant only once sigma is
-    # unpinned and the covariance projection lands). Movement beyond the
-    # radius is projected back: radial gradients vanish, tangential ones
-    # survive.
-    parser.add_argument("--thought-trust-epsilon", type=float, default=0.03)
-    # TRPL projection penalty: pulls the raw mean toward its (detached)
-    # projection so the rollout policy tracks the trained one. Identically
-    # zero while no projection occurs — this is a constraint hinge, not an
-    # always-on KL penalty.
-    parser.add_argument(
-        "--thought-projection-penalty-coef", type=float, default=1.0
-    )
-    # Head-only Bernoulli entropy bonus, summed over optional gate decisions
-    # and divided by the same all-stream-action denominator as policy
-    # gradients. The old conditional reduction amplified 1e-4 by roughly 50x
-    # at the reference 2% gate density, so 5e-3 preserves that reference-scale
-    # contribution without making the effective coefficient grow when gate
-    # decisions become rare.
-    parser.add_argument("--gate-entropy-coef", type=float, default=5e-3)
+    # Combined-embedding geometry (reasoning mode "latent"). The scalar gain
+    # starts at 0 so the injected carry vanishes and step 0 reproduces the
+    # pretrained token path bit-for-bit; the gain still receives a first-step
+    # gradient through W(h) * dL/dcombined, so it moves as soon as the carry
+    # helps. Nonzero values give the carry signal from the first rollout at
+    # the cost of starting off the pretrained function.
+    parser.add_argument("--hidden-carry-gain-init", type=float, default=0.0)
+    # Prenorm-residual relu^2 MLP blocks applied to the combined embedding at
+    # hasThought positions, identity at init (zeroed proj). 0 is the
+    # pure-gated-residual ablation arm.
+    parser.add_argument("--combined-mlp-blocks", type=int, default=1)
+    # Hidden width of each combiner MLP block; 2048 matches the trunk's own
+    # 4x blocks.
+    parser.add_argument("--combined-mlp-hidden", type=int, default=2048)
     # Length-adaptive GAE lambda (core.length_adaptive_lambda): VAPO's
     # horizon alpha*l with a floor of min(l, 1/alpha).  The raw alpha=0.05
     # formula clamps lambda to 0 at this run's 12-23-action trajectories
@@ -298,13 +189,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # whole-trajectory credit for short answers while keeping VAPO's
     # variance control for long ones.
     parser.add_argument("--gae-lambda-alpha", type=float, default=0.05)
-    # Initial STOP probability via the gate-head bias. The weights remain
-    # zero, so this is belief-independent until learned. A stop-heavy start
-    # preserves the competent token loop after the mandatory first thought
-    # while still sampling multi-thought trajectories for credit assignment.
-    parser.add_argument(
-        "--init-stop-thinking-probability", type=float, default=0.9
-    )
     parser.add_argument(
         "--nearby-reward-max",
         type=float,
@@ -324,8 +208,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bpb-val-tokens", type=int, default=DEFAULT_BPB_GUARD_TOKENS,
         help="deterministic validation-prefix size for the BPB guard "
-        f"(default: {DEFAULT_BPB_GUARD_TOKENS}; 0 = full set); guard values "
-        "remain comparable only within one setting",
+        f"(default: {DEFAULT_BPB_GUARD_TOKENS} = one eval batch; 0 = full "
+        "set); guard values remain comparable only within one setting — "
+        "identity checks against recorded pretraining val_bpb need 2097152",
     )
     parser.add_argument(
         "--bpb-only", action="store_true",
@@ -557,65 +442,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "undersized optimizer minibatch rather than dropping remainder rows",
     )
     parser.add_argument("--resume", default=None)
-    parser.add_argument(
-        "--migrate-reverse-kl-resume",
-        action="store_true",
-        help="explicitly resume a v18 per-dimension-clip checkpoint under "
-        "the reverse-KL objective while preserving all training state; a "
-        "direct v18-to-v20 resume also requires the v20 execution flag",
-    )
-    parser.add_argument(
-        "--migrate-thought-reverse-kl-resume",
-        action="store_true",
-        help="explicitly resume a v23 projection-only checkpoint under the "
-        "v24 objective, which adds the Dreamer4 reverse-KL penalty on the "
-        "raw thought policy; all training state transfers verbatim",
-    )
-    parser.add_argument(
-        "--migrate-v20-execution-resume",
-        action="store_true",
-        help="explicitly resume v19 learning state/cursor under v20 dense "
-        "prefill and survivor-compaction execution; future RNG attribution "
-        "is intentionally not bit-exact",
-    )
-    parser.add_argument(
-        "--migrate-rollout-scheduler-resume",
-        action="store_true",
-        help="explicitly resume learning state at a complete pool boundary "
-        "under continuous-refill scheduling; the objective is unchanged but "
-        "future samples use request-stable rather than global RNG attribution",
-    )
-    parser.add_argument(
-        "--migrate-joint-clip-resume",
-        action="store_true",
-        help="explicitly resume a v20 per-dimension-clip/reverse-KL "
-        "checkpoint under the v21 joint thought clip (no KL) objective "
-        "while preserving all training state; execution is unchanged",
-    )
-    parser.add_argument(
-        "--migrate-anchored-value-resume",
-        action="store_true",
-        help="explicitly resume a v21 unanchored-value checkpoint under the "
-        "v22 anchored support: trunk, adapter, actor, and cursor state "
-        "transfer verbatim, while the value head restarts at the projected "
-        "prior with fresh critic AdamW state (the old head belongs to a "
-        "different grid and cannot be carried over)",
-    )
-    parser.add_argument(
-        "--migrate-projected-thought-resume",
-        action="store_true",
-        help="explicitly resume a v22 joint-clip checkpoint under the v23 "
-        "projected THINK trust region; all training state transfers "
-        "verbatim (the pool and its stored behavior statistics are rebuilt "
-        "on resume)",
-    )
-    parser.add_argument(
-        "--migrate-compact-replay-resume",
-        action="store_true",
-        help="explicitly resume a pre-compact-replay checkpoint under the "
-        "compact THINK-head numerics; policy/optimizer/cursor state transfers "
-        "verbatim and the next rollout pool is rebuilt",
-    )
     parser.add_argument("--seed", type=int, default=1337)
     # Profiling. Off by default and costing nothing when off: every call site
     # runs unconditionally against a disabled profiler whose phase object has
@@ -722,42 +548,12 @@ def validate_args(
     checks stay in main() because they need the loaded model."""
     if args.replay_max_trajectories < 1:
         parser.error("--replay-max-trajectories must be positive")
-    if not math.isfinite(args.gate_entropy_coef) or args.gate_entropy_coef < 0.0:
-        parser.error("--gate-entropy-coef must be finite and nonnegative")
-    if (
-        not math.isfinite(args.thought_reverse_kl_coef)
-        or args.thought_reverse_kl_coef < 0.0
-    ):
-        parser.error(
-            "--thought-reverse-kl-coef must be finite and nonnegative"
-        )
-    # Exactly one THINK trust mechanism per run (biconditional; mirrored in
-    # run_latent_vapo so library callers get the same rule).
-    if args.thought_clip_mode == "none" and args.thought_reverse_kl_coef == 0.0:
-        parser.error(
-            "--thought-clip-mode none removes the surrogate trust region, so "
-            "--thought-reverse-kl-coef must be nonzero"
-        )
-    if args.thought_clip_mode != "none" and args.thought_reverse_kl_coef != 0.0:
-        parser.error(
-            f"--thought-clip-mode {args.thought_clip_mode} and a nonzero "
-            "--thought-reverse-kl-coef are alternative trust mechanisms and "
-            "must never be combined; pass --thought-clip-mode none to use the "
-            "reverse-KL penalty, or --thought-reverse-kl-coef 0 to use the "
-            "surrogate-side mode"
-        )
-    if (
-        not math.isfinite(args.thought_trust_epsilon)
-        or args.thought_trust_epsilon <= 0.0
-    ):
-        parser.error("--thought-trust-epsilon must be finite and positive")
-    if (
-        not math.isfinite(args.thought_projection_penalty_coef)
-        or args.thought_projection_penalty_coef < 0.0
-    ):
-        parser.error(
-            "--thought-projection-penalty-coef must be finite and nonnegative"
-        )
+    if not math.isfinite(args.hidden_carry_gain_init):
+        parser.error("--hidden-carry-gain-init must be finite")
+    if args.combined_mlp_blocks < 0:
+        parser.error("--combined-mlp-blocks must be nonnegative")
+    if args.combined_mlp_hidden < 1:
+        parser.error("--combined-mlp-hidden must be positive")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         parser.error("--learning-rate must be finite and positive")
     if args.critic_learning_rate is None:
@@ -809,8 +605,6 @@ def validate_args(
             "--nearby-reward-max must be finite, nonnegative, and below "
             "the exact-answer reward of 1"
         )
-    if not -5.0 < args.thought_log_sigma_init < 2.0:
-        parser.error("--thought-log-sigma-init must be strictly inside (-5, 2)")
     if args.replay_attention_budget < 1:
         parser.error("--replay-attention-budget must be positive")
     if args.replay_slot_budget < 1:
@@ -891,36 +685,6 @@ def validate_args(
         parser.error("--bench-only-repeats must be positive")
     if args.bench_max_rows < 0:
         parser.error("--bench-max-rows must be nonnegative")
-    if args.migrate_reverse_kl_resume and not args.resume:
-        parser.error("--migrate-reverse-kl-resume requires --resume")
-    if args.migrate_v20_execution_resume and not args.resume:
-        parser.error("--migrate-v20-execution-resume requires --resume")
-    if args.migrate_rollout_scheduler_resume and not args.resume:
-        parser.error("--migrate-rollout-scheduler-resume requires --resume")
-    if args.migrate_joint_clip_resume and not args.resume:
-        parser.error("--migrate-joint-clip-resume requires --resume")
-    if args.migrate_anchored_value_resume and not args.resume:
-        parser.error("--migrate-anchored-value-resume requires --resume")
-    if args.migrate_projected_thought_resume and not args.resume:
-        parser.error("--migrate-projected-thought-resume requires --resume")
-    if args.migrate_compact_replay_resume and not args.resume:
-        parser.error("--migrate-compact-replay-resume requires --resume")
-    if args.migrate_thought_reverse_kl_resume and not args.resume:
-        parser.error("--migrate-thought-reverse-kl-resume requires --resume")
-    if (
-        args.migrate_thought_reverse_kl_resume
-        and args.thought_reverse_kl_coef == 0.0
-    ):
-        parser.error(
-            "--migrate-thought-reverse-kl-resume migrates INTO the v24 "
-            "reverse-KL objective; it cannot combine with "
-            "--thought-reverse-kl-coef 0"
-        )
-    if args.migrate_anchored_value_resume and not args.value_anchored_support:
-        parser.error(
-            "--migrate-anchored-value-resume migrates INTO the anchored "
-            "support; it cannot combine with --no-value-anchored-support"
-        )
     if args.value_bins < 1:
         parser.error("--value-bins must be positive")
     if args.value_margin_bins < 0:

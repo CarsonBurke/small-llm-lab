@@ -1,1 +1,1 @@
-"""VAPO objectives and training orchestration."""
+"""VAPO configuration, schemas, and training orchestration."""

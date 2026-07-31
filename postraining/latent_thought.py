@@ -1,30 +1,26 @@
-"""Latent-thought policy modules layered over the LeJEPA backbone.
+"""Latent-thought policy modules layered over the backbone.
 
-The backbone remains the sequence model. Every latent-policy trajectory first
-consumes one mandatory latent thought. Thereafter a Bernoulli gate can continue
-thinking or stop. Stopping emits the first token and permanently switches the
-row to the pretrained token-only closed loop; the gate is masked out for every
-later token.
+A thought is the deterministic hidden state that produced a generated token:
+the post-final-norm belief, exactly what the CE readout consumes. When a
+generated token is fed back as input, its producing belief rides along as a
+gated residual on the token embedding —
+``combined = embed(x) + has_thought * (g * W(h) + b)`` — followed by a
+prenorm-residual relu^2 MLP stack before the trunk. Prompt (read) tokens carry
+no hidden, and neither does the input of the step that produces the first
+output token: a hidden exists only where the input token was itself generated
+by the model.
 
-The transition policy is a diagonal Gaussian whose mean comes from a fresh
-linear head over the belief and whose per-dimension log-sigma is predicted
-from that same belief. The mean starts as a zero-bias orthogonal map at gain
-0.1, with no initial obligation to imitate a discrete-token embedding.
-Thoughts pass through a separate full-width orthogonal projection and
-``2*SiLU`` after sampling. The factor of two makes the adapter locally
-unit-gain at zero while the nonlinearity gives the policy exclusive processing
-before the shared trunk. The adapter is recurrent policy state, not part of
-the Gaussian likelihood.
+The carried hidden is detached rollout data, so training needs no BPTT and no
+thought-specific objective: the only actions are tokens and the update is
+standard VAPO. The stream has no thought slots — every position is a token
+position, so stream length equals prompt plus emitted tokens.
 
-The renderer is deliberately separated from that thought path: it consumes
-the current stream input and the raw belief, while the fresh mean head is
-reserved for the continuous thought policy. Consequently emitted-token losses
-train the belief/trunk but do not directly train the mean head.
+Deferred by design: test-time-read-compute (carrying hiddens for read
+tokens).
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -32,15 +28,16 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 
-THINK, EMIT = 0, 1
-RENDERER_FEATURES_SCHEMA = "input_latent+belief/v1"
-ROLLOUT_POLICY_SCHEMA = "forced_initial_think_one_way_stop_gate/v2"
-# Pinned-EMIT reasoning modes never sample the gate or a thought: the rollout
-# is a plain token policy. The tag embeds the mode because cot and none differ
-# in their trained emission budgets, so their checkpoints are not one policy.
+import nanogpt_mini_model
+
+RENDERER_FEATURES_SCHEMA = "combined_input+belief/v1"
+ROLLOUT_POLICY_SCHEMA = "deterministic_hidden_carry/v1"
+# Pinned-EMIT reasoning modes never inject a hidden: the rollout is a plain
+# token policy. The tag embeds the mode because cot and none differ in their
+# trained emission budgets, so their checkpoints are not one policy.
 PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS = {
-    "cot": "pinned_emit_token_only_cot/v1",
-    "none": "pinned_emit_token_only_answer_prefix/v1",
+    "cot": "pinned_emit_token_only_cot/v2",
+    "none": "pinned_emit_token_only_answer_prefix/v2",
 }
 
 
@@ -52,92 +49,23 @@ def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
         return PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS[reasoning_mode]
     except KeyError:
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}") from None
-IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA = "fresh_identity_affine/v7"
-ORTHOGONAL_SILU_THOUGHT_INPUT_SCHEMA = "fresh_orthogonal_affine_2silu/v8"
-THOUGHT_INPUT_SCHEMA = ORTHOGONAL_SILU_THOUGHT_INPUT_SCHEMA
-COMPATIBLE_IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMAS = frozenset(
-    {
-        IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA,
-        "fresh_scaled_eye_0.1_affine/v6",
-        "fresh_zero_affine/v5",
-    }
-)
-THOUGHT_ADAPTER_KINDS = ("identity_affine", "orthogonal_silu")
-THOUGHT_ACTION_TRANSFORM_KINDS = ("identity", "tanh")
-THOUGHT_ACTION_TRANSFORM_SCHEMAS = {
-    "identity": "raw_gaussian_recurrent_input/v1",
-    "tanh": "tanh_raw_gaussian_recurrent_input/v1",
-}
-SIGMA_STATE_INIT_KINDS = ("constant", "orthogonal")
-CRITIC_ADAPTER_INIT_KINDS = ("identity", "orthogonal")
-SIGMA_STATE_INIT_SCHEMAS = {
-    "constant": "zero_weight_constant_sigma/v1",
-    "orthogonal": "unit_orthogonal_weight_gain_0.01/v2",
-}
-CRITIC_ADAPTER_INIT_SCHEMAS = {
-    "identity": "identity_affine/v1",
-    "orthogonal": "unit_orthogonal_affine/v2",
-}
-THOUGHT_DISTRIBUTION_SCHEMA = (
-    "state_dependent_diag_tanh_log_sigma_scaled_residual_-5_2/v2"
-)
-THOUGHT_MEAN_SCHEMA = "fresh_linear_learned_output_gain_zero_bias/v3"
-# The initial gain is not part of a trained policy's runtime semantics: its
-# checkpointed scalar completely determines the function. Keep v2 resumable
-# so the currently running policy remains recoverable, while every explicit
-# fresh actor restart is relabeled with the initialization-agnostic schema.
-COMPATIBLE_THOUGHT_MEAN_SCHEMAS = frozenset(
-    {
-        THOUGHT_MEAN_SCHEMA,
-        "fresh_linear_learned_output_gain_0.01_zero_bias/v2",
-    }
-)
-THOUGHT_LOG_SIGMA_MIN = -5.0
-THOUGHT_LOG_SIGMA_MAX = 2.0
 
 
-def thought_input_schema_for_adapter(kind: str) -> str:
-    """Return the deployed actor-adapter schema for an ablation kind."""
-    if kind == "identity_affine":
-        return IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA
-    if kind == "orthogonal_silu":
-        return ORTHOGONAL_SILU_THOUGHT_INPUT_SCHEMA
-    raise ValueError(f"unknown thought adapter kind {kind!r}")
+THOUGHT_INPUT_SCHEMA = "gated_hidden_residual_prenorm_mlp/v1"
 
 
-def transform_thought_action(thought: Tensor, kind: str) -> Tensor:
-    """Map a raw Gaussian action into the recurrent input consumed by a trunk.
+def combiner_init_kwargs_from_checkpoint(payload: dict) -> dict:
+    """Recover combiner geometry before constructing a checkpoint wrapper.
 
-    Rollout storage and policy likelihoods remain in the raw Gaussian space.
-    This transform belongs only at actor/critic stream-input boundaries.
-    """
-    thought = thought.float()
-    if kind == "identity":
-        return thought
-    if kind == "tanh":
-        return thought.tanh()
-    raise ValueError(f"unknown thought action transform {kind!r}")
-
-
-def wrapper_init_kwargs_from_checkpoint(payload: dict) -> dict[str, str]:
-    """Recover policy semantics before constructing a checkpoint wrapper.
-
-    Checkpoints predating the selectable initializations have no matching
-    argument fields and used the identity actor adapter with constant sigma.
-    The tensor layouts match the new treatment, so callers must recover these
-    semantics before strict loading rather than relying on shape checks.
+    The combiner's tensor shapes are fixed by the saved CLI arguments, so a
+    caller must rebuild the wrapper with the recorded geometry before strict
+    loading rather than relying on shape checks.
     """
     saved_args = payload.get("args", {})
     return {
-        "thought_adapter": saved_args.get(
-            "thought_adapter", "identity_affine"
-        ),
-        "sigma_state_init": saved_args.get(
-            "thought_sigma_state_init", "constant"
-        ),
-        "thought_action_transform": saved_args.get(
-            "thought_action_transform", "identity"
-        ),
+        "mlp_hidden": saved_args.get("combined_mlp_hidden"),
+        "num_blocks": saved_args.get("combined_mlp_blocks", 1),
+        "gain_init": saved_args.get("hidden_carry_gain_init", 0.0),
     }
 
 
@@ -145,12 +73,7 @@ def validate_renderer_checkpoint(
     payload: dict,
     checkpoint: str,
     *,
-    allow_transition_reset: bool = False,
     expected_rollout_policy_schema: str = ROLLOUT_POLICY_SCHEMA,
-    expected_thought_input_schema: str = THOUGHT_INPUT_SCHEMA,
-    expected_thought_action_transform_schema: str = (
-        THOUGHT_ACTION_TRANSFORM_SCHEMAS["identity"]
-    ),
 ) -> None:
     """Reject wrapper checkpoints trained with incompatible policy semantics."""
     actual = payload.get("renderer_features_schema")
@@ -158,8 +81,9 @@ def validate_renderer_checkpoint(
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: renderer "
             f"schema is {actual!r}, expected {RENDERER_FEATURES_SCHEMA!r}. "
-            "Old or untagged VAPO checkpoints used predicted-latent renderer "
-            "features and cannot be resumed or evaluated as this policy."
+            "Checkpoints predating deterministic hidden carry (including "
+            "every stochastic-thought policy) cannot be resumed or evaluated "
+            "as this policy."
         )
     rollout_policy = payload.get("rollout_policy_schema")
     if rollout_policy != expected_rollout_policy_schema:
@@ -167,547 +91,115 @@ def validate_renderer_checkpoint(
             f"incompatible latent-policy checkpoint {checkpoint!r}: rollout "
             f"schema is {rollout_policy!r}, expected "
             f"{expected_rollout_policy_schema!r}. The checkpoint was trained "
-            "under a different reasoning mode or forced-initial assignment "
-            "and cannot be resumed or evaluated as this policy."
+            "under a different reasoning mode or deployed policy and cannot "
+            "be resumed or evaluated as this policy."
         )
     thought_input = payload.get("thought_input_schema")
-    thought_input_matches = thought_input == expected_thought_input_schema
-    if (
-        expected_thought_input_schema == IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMA
-        and thought_input
-        in COMPATIBLE_IDENTITY_AFFINE_THOUGHT_INPUT_SCHEMAS
-    ):
-        thought_input_matches = True
-    if not thought_input_matches:
+    if thought_input != THOUGHT_INPUT_SCHEMA:
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
             f"input schema is {thought_input!r}, expected "
-            f"{expected_thought_input_schema!r}. The checkpoint uses a "
-            "different deployed thought adapter and cannot be resumed or "
+            f"{THOUGHT_INPUT_SCHEMA!r}. The checkpoint injected thoughts "
+            "through a different input path and cannot be resumed or "
             "evaluated as this policy."
         )
-    thought_action_transform = payload.get(
-        "thought_action_transform_schema",
-        THOUGHT_ACTION_TRANSFORM_SCHEMAS["identity"],
-    )
-    if thought_action_transform != expected_thought_action_transform_schema:
-        raise ValueError(
-            f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"action transform schema is {thought_action_transform!r}, "
-            f"expected {expected_thought_action_transform_schema!r}. The "
-            "checkpoint recurrently consumed a different action and cannot "
-            "be resumed or evaluated as this policy."
-        )
-    thought_distribution = payload.get("thought_distribution_schema")
-    if (
-        thought_distribution != THOUGHT_DISTRIBUTION_SCHEMA
-        and not allow_transition_reset
-    ):
-        raise ValueError(
-            f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"distribution schema is {thought_distribution!r}, expected "
-            f"{THOUGHT_DISTRIBUTION_SCHEMA!r}. Old or untagged state-sigma "
-            "checkpoints used unbounded log-sigma outputs and cannot be "
-            "loaded without changing their policy."
-        )
-    thought_mean = payload.get("thought_mean_schema")
-    if thought_mean not in COMPATIBLE_THOUGHT_MEAN_SCHEMAS:
-        raise ValueError(
-            f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"mean schema is {thought_mean!r}, expected one of "
-            f"{sorted(COMPATIBLE_THOUGHT_MEAN_SCHEMAS)!r}. Use the explicit "
-            "fresh-mean branch "
-            "migration to replace a legacy pretrained-projector mean; normal "
-            "resume and evaluation cannot change policy semantics."
-        )
 
 
-class FreshThoughtMeanHead(nn.Linear):
-    """Orthogonal belief-to-mean map behind a learned small output gain.
+class CombinedEmbedding(nn.Module):
+    """Token+thought combined-embedding stack shared by actor and critic.
 
-    Storing the initial 0.1 gain directly in every matrix element is
-    functionally equivalent only before optimization. Adam's first 3e-4 step
-    can move each element by an amount comparable to the initialized weight,
-    coherently changing a D-wide output by O(D * lr). Keeping a unit-scale
-    orthogonal map behind one learned 0.1 gain preserves the exact initial
-    function while scaling the functional effect of matrix updates.
+    ``forward`` maps a token latent and its (detached) carried hidden into the
+    stream input the trunk consumes:
+
+        combined = base + gain * W(hidden) + type_bias
+        mixed    = combined + mlp(rms_norm(combined))   (per block)
+        out      = mixed where has_thought else base
+
+    The whole path — injection and MLP stack — applies only at hasThought
+    positions: prompt (read) tokens enter the trunk as plain embeddings in
+    rollout prefill, so replay must give them the identical plain path or the
+    behavior-age-0 exactness contract breaks. The select is a ``torch.where``
+    rather than ``base + flag * (mixed - base)`` because the latter is not
+    bitwise ``mixed`` at flagged positions.
+
+    ``W`` is a unit-orthogonal full-width map behind one learned scalar gain,
+    initialized at zero so a fresh combiner is exactly the pretrained token
+    path; the gain has a first-step gradient through ``W(h) . dL/dcombined``
+    while matrix updates stay scaled by the explicit gain, the same treatment
+    the codebase gives every fresh full-width map. ``type_bias`` is the
+    learned hasThought type embedding: it is gated by the flag but not by the
+    gain, so the "this token was generated" signal can learn independently of
+    the content channel. Each MLP block reuses the pretraining ``MLP``
+    (relu^2) behind a fresh ``RMSNorm`` with a zero-initialized ``proj``, so
+    the whole stack is an exact identity at initialization.
+
+    The injection branch is computed in fp32 and rounded to the base latent's
+    dtype once, before the residual add — the same cast order at rollout and
+    replay, which is what keeps behavior-age-0 PPO ratios exactly one.
     """
-
-    INIT_OUTPUT_GAIN = 0.1
-
-    def __init__(self, model_dim: int):
-        super().__init__(model_dim, model_dim, bias=True)
-        nn.init.orthogonal_(self.weight)
-        nn.init.zeros_(self.bias)
-        self.output_gain = nn.Parameter(torch.tensor(self.INIT_OUTPUT_GAIN))
-
-    def forward(self, belief: Tensor) -> Tensor:
-        low_precision = belief.dtype in (torch.bfloat16, torch.float16)
-        with torch.autocast(
-            device_type=belief.device.type,
-            dtype=belief.dtype if low_precision else None,
-            enabled=low_precision,
-        ):
-            projected = F.linear(belief, self.weight, bias=None)
-        return self.output_gain.float() * projected.float() + self.bias.float()
-
-    def reset_output_gain(self, output_gain: float) -> None:
-        """Set the fresh-policy gain without changing its orthogonal map."""
-        output_gain = float(output_gain)
-        if not math.isfinite(output_gain) or output_gain <= 0.0:
-            raise ValueError("thought mean output gain must be finite and positive")
-        with torch.no_grad():
-            self.output_gain.fill_(output_gain)
-
-
-class StateDependentLogSigmaHead(nn.Linear):
-    """Raw log-sigma bias plus a learned, weak orthogonal state residual."""
-
-    INIT_RESIDUAL_GAIN = 0.01
-
-    def __init__(self, model_dim: int):
-        super().__init__(model_dim, model_dim, bias=True)
-        self.residual_gain = nn.Parameter(
-            torch.tensor(self.INIT_RESIDUAL_GAIN)
-        )
-
-
-class GaussianTransitionHead(nn.Module):
-    """Fresh diagonal-Gaussian thought policy over the current belief.
-
-    A unit-orthogonal mean map sits behind a learned output gain initialized
-    at 0.1. For an RMS-normalized D-wide belief this gives a mean RMS of
-    exactly 0.1 while preserving every input direction and avoiding the
-    retired next-token latent prior. A separate unit-orthogonal linear head
-    predicts per-dimension log-sigma residuals behind a 0.01 output gain around
-    a CLI-initialized bias. The head is therefore mildly state-dependent from
-    its first rollout, while the explicit gain controls both its initial
-    function and Adam's scale-insensitive matrix updates.
-    Callers compute
-    ``predict_log_sigma(belief)`` once per site and pass it to every
-    sampling/scoring method so rollout, refresh, and update always price
-    the same distribution.
-    """
-
-    MEAN_INIT_GAIN = FreshThoughtMeanHead.INIT_OUTPUT_GAIN
 
     def __init__(
         self,
         model_dim: int,
-        log_sigma: float = -2.0,
-        sigma_state_init: str = "orthogonal",
+        mlp_hidden: int | None = None,
+        num_blocks: int = 1,
+        gain_init: float = 0.0,
     ):
         super().__init__()
-        if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
-            raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
-        self.sigma_state_init = sigma_state_init
-        # Keep log-sigma registered first. Legacy v11 actor optimizers stored
-        # this pair as their fifth group; the fresh mean becomes a sixth group
-        # so the one-time branch migration can restore every old Adam state
-        # without positional remapping.
-        self.log_sigma_head = StateDependentLogSigmaHead(model_dim)
-        self.mean_head = FreshThoughtMeanHead(model_dim)
-        self.reset_noise(log_sigma, sigma_state_init)
-
-    def predict_mean(self, belief: Tensor) -> Tensor:
-        """State-dependent mean of the continuous thought action.
-
-        The matrix multiply follows the backbone's low-precision inference
-        policy, while the initially zero FP32 bias is added afterward. This
-        keeps tiny learned offsets representable instead of quantizing them at
-        the scale of the projected mean, and it also makes direct bf16 callers
-        dtype-safe outside an enclosing autocast context.
-        """
-        return self.mean_head(belief)
-
-    def reset_noise(
-        self, log_sigma: float, sigma_state_init: str | None = None
-    ) -> None:
-        """Initialize bounded log-sigma around a CLI-owned statewise mean.
-
-        A unit-orthogonal raw-space map preserves the RMS-one belief geometry.
-        Its explicit 0.01 gain gives only about 0.03 RMS log-sigma variation
-        near the usual initialization range, while retaining full rank and an
-        immediate gradient for the learned gain. The inverse-transformed bias
-        remains the exact center of the bounded distribution. ``constant`` is
-        retained only as the matched zero-weight ablation.
-        """
-        sigma_state_init = sigma_state_init or self.sigma_state_init
-        if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
-            raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
-        self.sigma_state_init = sigma_state_init
-        raw_bias = self.raw_from_log_sigma(log_sigma)
+        if num_blocks < 0:
+            raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
+        self.carry = nn.Linear(model_dim, model_dim, bias=False)
+        nn.init.orthogonal_(self.carry.weight)
+        self.gain = nn.Parameter(torch.tensor(float(gain_init)))
+        self.type_bias = nn.Parameter(torch.zeros(model_dim))
+        self.norms = nn.ModuleList(
+            nanogpt_mini_model.RMSNorm(model_dim) for _ in range(num_blocks)
+        )
+        self.mlps = nn.ModuleList(
+            nanogpt_mini_model.MLP(model_dim, mlp_hidden)
+            for _ in range(num_blocks)
+        )
         with torch.no_grad():
-            if sigma_state_init == "orthogonal":
-                # Linear.__init__ already consumed the same global RNG as the
-                # retired zero-weight head. Draw the new direction without
-                # shifting later fresh modules or the critic's initialization.
-                devices = (
-                    [self.log_sigma_head.weight.device]
-                    if self.log_sigma_head.weight.is_cuda
-                    else []
+            for mlp in self.mlps:
+                # The pretraining init recipe: forward weights at the trunk
+                # scale, projections zeroed so each residual block starts as
+                # an exact identity.
+                mlp.fc.weight.normal_(
+                    std=0.33**0.5 / mlp.fc.weight.size(-1) ** 0.5
                 )
-                with torch.random.fork_rng(devices=devices):
-                    nn.init.orthogonal_(self.log_sigma_head.weight)
-            else:
-                self.log_sigma_head.weight.zero_()
-            self.log_sigma_head.bias.fill_(raw_bias)
-            self.log_sigma_head.residual_gain.fill_(
-                self.log_sigma_head.INIT_RESIDUAL_GAIN
+                mlp.fc.bias.zero_()
+                mlp.proj.weight.zero_()
+                mlp.proj.bias.zero_()
+
+    def inject(self, base: Tensor, hidden: Tensor) -> Tensor:
+        """Add the gated hidden residual to every position densely."""
+        with torch.autocast(device_type=base.device.type, enabled=False):
+            injected = (
+                self.gain.float() * F.linear(hidden.float(), self.carry.weight)
+                + self.type_bias.float()
             )
+        return base + injected.to(base.dtype)
 
-    def set_noise_level(self, log_sigma: float) -> None:
-        """Change only the fresh policy's central log-sigma.
+    def mix(self, combined: Tensor) -> Tensor:
+        """Run the prenorm-residual relu^2 MLP stack over every position."""
+        for norm, mlp in zip(self.norms, self.mlps, strict=True):
+            combined = combined + mlp(norm(combined))
+        return combined
 
-        Construction owns the random orthogonal direction. CLI scale selection
-        must not draw it again: repeated initialization would consume RNG and
-        silently change every later fresh module.
-        """
-        raw_bias = self.raw_from_log_sigma(log_sigma)
-        with torch.no_grad():
-            self.log_sigma_head.bias.fill_(raw_bias)
-
-    @staticmethod
-    def raw_from_log_sigma(log_sigma: float) -> float:
-        """Inverse of the fixed tanh bound for scalar initialization."""
-        log_sigma = float(log_sigma)
-        if not math.isfinite(log_sigma):
-            raise ValueError("log-sigma must be finite")
-        if not THOUGHT_LOG_SIGMA_MIN < log_sigma < THOUGHT_LOG_SIGMA_MAX:
-            raise ValueError(
-                "log-sigma must be strictly inside "
-                f"({THOUGHT_LOG_SIGMA_MIN}, {THOUGHT_LOG_SIGMA_MAX}); "
-                f"got {log_sigma}"
-            )
-        midpoint = (THOUGHT_LOG_SIGMA_MIN + THOUGHT_LOG_SIGMA_MAX) / 2.0
-        half_range = (THOUGHT_LOG_SIGMA_MAX - THOUGHT_LOG_SIGMA_MIN) / 2.0
-        return math.atanh((log_sigma - midpoint) / half_range)
-
-    @staticmethod
-    def bound_raw_log_sigma(raw: Tensor) -> Tensor:
-        """Map unconstrained head output smoothly into the fixed safe range."""
-        midpoint = (THOUGHT_LOG_SIGMA_MIN + THOUGHT_LOG_SIGMA_MAX) / 2.0
-        half_range = (THOUGHT_LOG_SIGMA_MAX - THOUGHT_LOG_SIGMA_MIN) / 2.0
-        return midpoint + half_range * raw.tanh()
-
-    def predict_log_sigma(self, belief: Tensor) -> Tensor:
-        """Per-dimension log-sigma of the thought policy at this state.
-
-        Smoothly bounded to [-5, 2]. Under autocast, the state-dependent matrix
-        multiply uses bf16, but it deliberately excludes the raw-space bias:
-        a small residual near zero retains fine bf16 absolute resolution,
-        then the fp32 bias addition returns fp32 distribution statistics.
-        Including the bias in an autocast linear would quantize early changes
-        around -2 to roughly 0.008 increments.
-        """
-        low_precision = belief.dtype in (torch.bfloat16, torch.float16)
-        with torch.autocast(
-            device_type=belief.device.type,
-            dtype=belief.dtype if low_precision else None,
-            enabled=low_precision,
-        ):
-            residual = F.linear(
-                belief, self.log_sigma_head.weight, bias=None
-            )
-        raw = (
-            self.log_sigma_head.residual_gain.float() * residual.float()
-            + self.log_sigma_head.bias.float()
-        )
-        return self.bound_raw_log_sigma(raw)
-
-    def sample(
-        self,
-        mean: Tensor,
-        log_sigma: Tensor,
-        generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Draw one latent and return it with its (summed) log-probability."""
-        sample = self.sample_latent(mean, log_sigma, generator)
-        return sample, self.log_prob(sample, mean.float(), log_sigma)
-
-    def sample_latent(
-        self,
-        mean: Tensor,
-        log_sigma: Tensor,
-        generator: torch.Generator | None = None,
+    def forward(
+        self, base: Tensor, hidden: Tensor, has_thought: Tensor | None = None
     ) -> Tensor:
-        """Draw one latent without computing a likelihood (evaluation)."""
-        mean = mean.float()
-        noise = torch.randn(
-            mean.shape, device=mean.device, dtype=torch.float32, generator=generator
-        )
-        return mean + log_sigma.float().exp() * noise
+        """Combined stream inputs; ``None`` flag means every position carries.
 
-    def log_prob(self, sample: Tensor, mean: Tensor, log_sigma: Tensor) -> Tensor:
-        return self.per_dim_log_prob(sample, mean, log_sigma).sum(-1)
-
-    def per_dim_log_prob(
-        self, sample: Tensor, mean: Tensor, log_sigma: Tensor
-    ) -> Tensor:
-        """Per-dimension log-density of the thought policy, (…, dim).
-
-        Replay stores these factors individually and clips each dimension's
-        PPO ratio separately while retaining the diagonal Gaussian's summed
-        score gradient. The ratios move with the mean (the trunk) and with
-        the state-dependent sigma; refresh_old_statistics recomputes old
-        factors under the current head, so behavior-age-0 ratios stay exactly
-        1.
+        The dense compute-then-select keeps static shapes (no boolean
+        indexing) while making flagged positions bitwise equal to the
+        all-injected decode path and unflagged positions bitwise equal to the
+        plain token path.
         """
-        log_sigma = log_sigma.float()
-        normalized = (sample.float() - mean.float()) * (-log_sigma).exp()
-        return -0.5 * normalized.square() - log_sigma - 0.5 * math.log(2 * math.pi)
-
-
-def migrate_scalar_log_sigma_state(
-    state_dict: dict, head: GaussianTransitionHead, prefix: str = "transition."
-) -> bool:
-    """Rewrite a legacy scalar-sigma transition state into the head layout.
-
-    The retired policy stored one global ``transition.log_sigma``; a
-    zero-weight head whose inverse-transformed bias carries that scalar is the
-    identical distribution, so old checkpoints stay loadable and
-    behaviorally exact.
-    Returns True when a migration was applied.
-    """
-    key = prefix + "log_sigma"
-    if key not in state_dict:
-        return False
-    scalar = float(state_dict.pop(key))
-    raw_bias = head.raw_from_log_sigma(scalar)
-    state_dict[prefix + "log_sigma_head.weight"] = torch.zeros_like(
-        head.log_sigma_head.weight
-    )
-    state_dict[prefix + "log_sigma_head.bias"] = torch.full_like(
-        head.log_sigma_head.bias, raw_bias
-    )
-    state_dict[prefix + "log_sigma_head.residual_gain"] = (
-        head.log_sigma_head.residual_gain.detach().clone()
-    )
-    return True
-
-
-class StopThinkingGate(nn.Module):
-    """Bernoulli CONTINUE/STOP policy; action 1 means stop and emit."""
-
-    def __init__(self, model_dim: int):
-        super().__init__()
-        self.head = nn.Linear(model_dim, 1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
-
-    def stop_logit(self, belief: Tensor) -> Tensor:
-        with torch.autocast(device_type=belief.device.type, enabled=False):
-            return self.head(belief.float()).squeeze(-1)
-
-    def sample(
-        self, belief: Tensor, generator: torch.Generator | None = None
-    ) -> tuple[Tensor, Tensor]:
-        """Sample actions (STOP=1/CONTINUE=0) and their log-probabilities."""
-        logit = self.stop_logit(belief)
-        probability = logit.sigmoid()
-        uniform = torch.rand(
-            probability.shape,
-            device=probability.device,
-            dtype=probability.dtype,
-            generator=generator,
-        )
-        action = (uniform < probability).long()
-        log_probability = -F.binary_cross_entropy_with_logits(
-            logit, action.float(), reduction="none"
-        )
-        return action, log_probability
-
-    def sample_action(
-        self, belief: Tensor, generator: torch.Generator | None = None
-    ) -> Tensor:
-        """Sample an action without computing its likelihood (evaluation)."""
-        probability = self.stop_logit(belief).sigmoid()
-        uniform = torch.rand(
-            probability.shape,
-            device=probability.device,
-            dtype=probability.dtype,
-            generator=generator,
-        )
-        return (uniform < probability).long()
-
-    def log_prob(self, action: Tensor, belief: Tensor) -> Tensor:
-        logit = self.stop_logit(belief)
-        return -F.binary_cross_entropy_with_logits(
-            logit, action.float(), reduction="none"
-        )
-
-    def entropy(self, belief: Tensor) -> Tensor:
-        logit = self.stop_logit(belief)
-        probability = logit.sigmoid()
-        return F.binary_cross_entropy_with_logits(logit, probability, reduction="none")
-
-
-class AffineThoughtAdapter(nn.Module):
-    """Full-width affine thought embedder with an explicit initialization."""
-
-    def __init__(self, model_dim: int, initialization: str = "orthogonal"):
-        super().__init__()
-        if initialization not in CRITIC_ADAPTER_INIT_KINDS:
-            raise ValueError(
-                f"unknown affine thought-adapter initialization {initialization!r}"
-            )
-        self.initialization = initialization
-        self.projection = nn.Linear(model_dim, model_dim, bias=True)
-        self.reset_affine(initialization)
-
-    def reset_affine(self, initialization: str | None = None) -> None:
-        initialization = initialization or self.initialization
-        if initialization not in CRITIC_ADAPTER_INIT_KINDS:
-            raise ValueError(
-                f"unknown affine thought-adapter initialization {initialization!r}"
-            )
-        self.initialization = initialization
-        with torch.no_grad():
-            if initialization == "orthogonal":
-                # Preserve the global stream left by Linear.__init__, matching
-                # the old identity reset's RNG consumption.
-                devices = (
-                    [self.projection.weight.device]
-                    if self.projection.weight.is_cuda
-                    else []
-                )
-                with torch.random.fork_rng(devices=devices):
-                    nn.init.orthogonal_(self.projection.weight)
-            else:
-                nn.init.eye_(self.projection.weight)
-            nn.init.zeros_(self.projection.bias)
-
-    def forward(self, thought: Tensor) -> Tensor:
-        return self.projection(thought)
-
-
-class ThoughtAdapter(AffineThoughtAdapter):
-    """Policy thought mixer: affine control or orthogonal ``2*SiLU``."""
-
-    def __init__(self, model_dim: int, kind: str = "orthogonal_silu"):
-        if kind not in THOUGHT_ADAPTER_KINDS:
-            raise ValueError(f"unknown thought adapter kind {kind!r}")
-        initialization = (
-            "identity" if kind == "identity_affine" else "orthogonal"
-        )
-        super().__init__(model_dim, initialization=initialization)
-        self.kind = kind
-
-    def forward(self, thought: Tensor) -> Tensor:
-        projected = self.projection(thought)
-        if self.kind == "identity_affine":
-            return projected
-        # SiLU'(0)=1/2, so the factor of two gives a unit-gain nonlinear
-        # interface around the small initial thought distribution.
-        return 2.0 * F.silu(projected)
-
-
-def migrate_legacy_wrapper_checkpoint(
-    payload: dict,
-    wrapper: "LatentThoughtModel",
-    *,
-    initialize_fresh_mean: bool = False,
-    initialize_fresh_adapter: bool = False,
-    initialize_fresh_gate: bool = False,
-) -> tuple[bool, bool, bool]:
-    """Apply exact state-layout migrations before strict validation/loading."""
-    state_dict = payload["model"]
-    adapter_reset = False
-    if initialize_fresh_adapter:
-        # Explicit actor restart: discard any legacy recurrent adapter rather
-        # than silently inheriting its learned latent protocol. The critic-
-        # warm source has an untouched actor optimizer, so no corresponding
-        # Adam state exists to migrate.
-        state_dict.pop("adapter.correction.weight", None)
-        state_dict["adapter.projection.weight"] = (
-            wrapper.adapter.projection.weight.detach().clone()
-        )
-        state_dict["adapter.projection.bias"] = (
-            wrapper.adapter.projection.bias.detach().clone()
-        )
-        state_dict.pop("adapter.interpolation_strength", None)
-        payload["thought_input_schema"] = wrapper.thought_input_schema
-        adapter_reset = True
-    else:
-        if "adapter.correction.weight" in state_dict:
-            raise ValueError(
-                "legacy residual thought adapters cannot be resumed into the "
-                "current thought policy; use an explicit actor restart"
-            )
-    if initialize_fresh_gate:
-        # Critic warmup never deploys or trains the actor. An explicit actor
-        # restart therefore owns the complete Bernoulli policy, including the
-        # CLI-requested initial THINK probability. Strict-loading the warmup
-        # checkpoint without replacing these tensors would silently restore
-        # that source run's zero-weight/bias initialization.
-        state_dict["gate.head.weight"] = (
-            wrapper.gate.head.weight.detach().clone()
-        )
-        state_dict["gate.head.bias"] = (
-            wrapper.gate.head.bias.detach().clone()
-        )
-    sigma_weight_key = "transition.log_sigma_head.weight"
-    sigma_bias_key = "transition.log_sigma_head.bias"
-    sigma_gain_key = "transition.log_sigma_head.residual_gain"
-    if initialize_fresh_mean:
-        # A critic-warm checkpoint has never deployed its actor. Replace the
-        # whole fresh noise head, including the random orthogonal direction,
-        # instead of loading the checkpoint's obsolete untouched init and
-        # drawing a second direction after load.
-        state_dict.pop("transition.log_sigma", None)
-        state_dict[sigma_weight_key] = (
-            wrapper.transition.log_sigma_head.weight.detach().clone()
-        )
-        state_dict[sigma_bias_key] = (
-            wrapper.transition.log_sigma_head.bias.detach().clone()
-        )
-        state_dict[sigma_gain_key] = (
-            wrapper.transition.log_sigma_head.residual_gain.detach().clone()
-        )
-        payload["thought_distribution_schema"] = THOUGHT_DISTRIBUTION_SCHEMA
-        sigma_migrated = True
-    else:
-        sigma_migrated = migrate_scalar_log_sigma_state(
-            state_dict, wrapper.transition
-        )
-    mean_weight_key = "transition.mean_head.weight"
-    mean_bias_key = "transition.mean_head.bias"
-    mean_gain_key = "transition.mean_head.output_gain"
-    present_mean_keys = {
-        key
-        for key in (mean_weight_key, mean_bias_key, mean_gain_key)
-        if key in state_dict
-    }
-    if present_mean_keys and len(present_mean_keys) != 3:
-        raise ValueError(
-            "checkpoint contains a partial fresh thought-mean head: "
-            f"{sorted(present_mean_keys)}"
-        )
-    mean_migrated = False
-    if initialize_fresh_mean:
-        # An explicit actor restart owns the complete fresh thought policy.
-        # Critic-warm checkpoints can already contain an older untouched mean
-        # head, so checking only for missing keys would silently retain that
-        # experiment's initialization instead of the requested one.
-        state_dict[mean_weight_key] = (
-            wrapper.transition.mean_head.weight.detach().clone()
-        )
-        state_dict[mean_bias_key] = (
-            wrapper.transition.mean_head.bias.detach().clone()
-        )
-        state_dict[mean_gain_key] = (
-            wrapper.transition.mean_head.output_gain.detach().clone()
-        )
-        payload["thought_mean_schema"] = THOUGHT_MEAN_SCHEMA
-        mean_migrated = True
-    if sigma_migrated:
-        schema = payload.get("thought_distribution_schema")
-        if schema not in (None, THOUGHT_DISTRIBUTION_SCHEMA):
-            raise ValueError(
-                f"cannot migrate unknown thought distribution schema {schema!r}"
-            )
-        payload["thought_distribution_schema"] = THOUGHT_DISTRIBUTION_SCHEMA
-    return sigma_migrated, mean_migrated, adapter_reset
+        mixed = self.mix(self.inject(base, hidden))
+        if has_thought is None:
+            return mixed
+        return torch.where(has_thought[..., None], mixed, base)
 
 
 def kv_range_blocks(
@@ -975,13 +467,13 @@ class DecodeRangeMask:
 class StepOutput:
     """Everything one stream step exposes to rollout and training code.
 
-    No value: the critic is a separate model that scores stored streams in
-    parallel (``refresh_old_statistics``); the stepwise path never values.
+    ``belief`` is the post-final-norm hidden — the thought the next generated
+    token carries. No value: the critic is a separate model that scores stored
+    streams in parallel (``refresh_old_statistics``); the stepwise path never
+    values.
     """
 
     belief: Tensor
-    predicted: Tensor
-    thought_log_sigma: Tensor
     input_latent: Tensor
     logits: Tensor
     caches: list[tuple[Tensor, ...]]
@@ -1171,48 +663,31 @@ class PagedGenerationCache:
 
 
 class LatentThoughtModel(nn.Module):
-    """Backbone wrapper adding gate, transition noise, and thought injection.
+    """Backbone wrapper adding the combined token+thought input path.
 
-    ``step`` consumes one already-embedded stream input (token latent or
-    injected thought) and mirrors the backbone's block loop.  Its renderer
-    intentionally differs from the pretraining generation helper: vocab
-    logits read the raw belief, not the projected thought mean.
+    ``step`` consumes one already-embedded stream input (the combined
+    embedding) and mirrors the backbone's block loop. The renderer consumes
+    the combined input and the raw temporal belief.
     """
 
     def __init__(
         self,
         backbone: nn.Module,
         *,
-        thought_adapter: str = "orthogonal_silu",
-        sigma_state_init: str = "orthogonal",
-        thought_action_transform: str = "identity",
+        mlp_hidden: int | None = None,
+        num_blocks: int = 1,
+        gain_init: float = 0.0,
     ):
         super().__init__()
         self.backbone = backbone
         model_dim = backbone.tok_emb.embedding_dim
-        self.thought_adapter_kind = thought_adapter
-        self.thought_input_schema = thought_input_schema_for_adapter(
-            thought_adapter
+        self.thought_input_schema = THOUGHT_INPUT_SCHEMA
+        self.combiner = CombinedEmbedding(
+            model_dim,
+            mlp_hidden=mlp_hidden,
+            num_blocks=num_blocks,
+            gain_init=gain_init,
         )
-        if thought_action_transform not in THOUGHT_ACTION_TRANSFORM_KINDS:
-            raise ValueError(
-                f"unknown thought action transform {thought_action_transform!r}"
-            )
-        self.thought_action_transform = thought_action_transform
-        self.thought_action_transform_schema = (
-            THOUGHT_ACTION_TRANSFORM_SCHEMAS[thought_action_transform]
-        )
-        if sigma_state_init not in SIGMA_STATE_INIT_KINDS:
-            raise ValueError(f"unknown sigma state init {sigma_state_init!r}")
-        self.sigma_state_init = sigma_state_init
-        self.sigma_state_init_schema = SIGMA_STATE_INIT_SCHEMAS[
-            sigma_state_init
-        ]
-        self.transition = GaussianTransitionHead(
-            model_dim, sigma_state_init=sigma_state_init
-        )
-        self.gate = StopThinkingGate(model_dim)
-        self.adapter = ThoughtAdapter(model_dim, kind=thought_adapter)
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.backbone.embed_tokens(token_ids)
@@ -1230,19 +705,15 @@ class LatentThoughtModel(nn.Module):
 
     @staticmethod
     def renderer_features(input_latent: Tensor, belief: Tensor) -> Tensor:
-        """Features for vocab rendering, independent of the thought mean.
+        """Features for vocab rendering.
 
-        The policy probe keeps its pretrained 2*model_dim input shape, but its
-        contextual half is the raw temporal belief.
+        The policy probe keeps its pretrained 2*model_dim input shape: the
+        combined stream input beside the raw temporal belief.
         """
         return torch.cat((input_latent, belief), dim=-1)
 
-    def thought_mean(self, belief: Tensor) -> Tensor:
-        """Map a belief into the fresh continuous thought policy's mean."""
-        return self.transition.predict_mean(belief)
-
     def policy_logits(self, input_ids: Tensor) -> Tensor:
-        """Teacher-forced vocab logits under the deployed belief renderer."""
+        """Teacher-forced token-only vocab logits (no hidden injection)."""
         input_latent = self.embed_tokens(input_ids)
         belief = self.backbone.temporal_belief_from_token_latent(input_latent)
         return self.backbone.logits_from_features(
@@ -1405,7 +876,7 @@ class LatentThoughtModel(nn.Module):
         positions: Tensor,
         block_mask: BlockMask,
         cache_addresses: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Compiled fixed-capacity surface for independently advancing rows."""
         backbone = self.backbone
         x = input_latent
@@ -1437,12 +908,10 @@ class LatentThoughtModel(nn.Module):
                 cache_addresses,
             )
         belief = backbone.final_norm(x)
-        predicted = self.thought_mean(belief)
-        thought_log_sigma = self.transition.predict_log_sigma(belief.squeeze(1))
         logits = backbone.logits_from_features(
             self.renderer_features(input_latent, belief)
         ).squeeze(1)
-        return belief.squeeze(1), predicted.squeeze(1), thought_log_sigma, logits
+        return belief.squeeze(1), logits
 
     def paged_step(
         self,
@@ -1476,7 +945,7 @@ class LatentThoughtModel(nn.Module):
                 live, addresses, cache.scratch_addresses[: live.numel()]
             )
         block_mask = cache.block_mask(slot_ids, kv_lengths)
-        belief, predicted, thought_log_sigma, logits = self.paged_step_core(
+        belief, logits = self.paged_step_core(
             input_latent,
             cache.layers,
             positions,
@@ -1485,8 +954,6 @@ class LatentThoughtModel(nn.Module):
         )
         return StepOutput(
             belief=belief,
-            predicted=predicted,
-            thought_log_sigma=thought_log_sigma,
             input_latent=input_latent.squeeze(1),
             logits=logits,
             caches=cache.layers,
@@ -1686,8 +1153,6 @@ class LatentThoughtModel(nn.Module):
 
         return StepOutput(
             belief=select_state(bank.output.belief),
-            predicted=select_state(bank.output.predicted),
-            thought_log_sigma=select_state(bank.output.thought_log_sigma),
             input_latent=select_state(bank.output.input_latent),
             logits=select_state(bank.output.logits),
             caches=cache.layers,
@@ -1725,12 +1190,10 @@ class LatentThoughtModel(nn.Module):
         position: int | Tensor,
         key_mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """The compiled surface: belief, thought mean/log-sigma, and logits.
+    ) -> tuple[Tensor, Tensor]:
+        """The compiled surface: belief and logits.
 
-        Caches are mutated strictly in place. The fresh thought mean is
-        computed densely to preserve the launch-efficient batched path, but it
-        is not a renderer feature: token losses have no graph edge into it.
+        Caches are mutated strictly in place.
 
         ``key_mask`` selects the static full-cache attention path (see
         ``_attention_step``): shapes stay constant across positions, which is
@@ -1773,36 +1236,25 @@ class LatentThoughtModel(nn.Module):
                 block_mask,
             )
         belief = backbone.final_norm(x)
-        predicted = self.thought_mean(belief)
-        thought_log_sigma = self.transition.predict_log_sigma(belief.squeeze(1))
         features = self.renderer_features(input_latent, belief)
         logits = backbone.logits_from_features(features).squeeze(1)
-        return belief.squeeze(1), predicted.squeeze(1), thought_log_sigma, logits
+        return belief.squeeze(1), logits
 
     def prefill_core(
         self,
         input_latent: Tensor,
         caches: list[tuple[Tensor, ...]],
         key_valid: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Densely ingest a deterministic prefix and expose its final state."""
         belief = self.backbone.prefill_belief(
             input_latent, caches, key_valid
         )[:, -1:]
         final_input = input_latent[:, -1:]
-        predicted = self.thought_mean(belief)
-        thought_log_sigma = self.transition.predict_log_sigma(
-            belief.squeeze(1)
-        )
         logits = self.backbone.logits_from_features(
             self.renderer_features(final_input, belief)
         ).squeeze(1)
-        return (
-            belief.squeeze(1),
-            predicted.squeeze(1),
-            thought_log_sigma,
-            logits,
-        )
+        return belief.squeeze(1), logits
 
     def prefill(
         self,
@@ -1812,13 +1264,9 @@ class LatentThoughtModel(nn.Module):
     ) -> StepOutput:
         """Populate prefix caches without running policy heads per token."""
         input_latent = self.embed_tokens(token_ids)
-        belief, predicted, thought_log_sigma, logits = self.prefill_core(
-            input_latent, caches, key_valid
-        )
+        belief, logits = self.prefill_core(input_latent, caches, key_valid)
         return StepOutput(
             belief=belief,
-            predicted=predicted,
-            thought_log_sigma=thought_log_sigma,
             input_latent=input_latent[:, -1],
             logits=logits,
             caches=list(caches),
@@ -1833,13 +1281,11 @@ class LatentThoughtModel(nn.Module):
         block_mask: BlockMask | None = None,
     ) -> StepOutput:
         """Advance one stream position from an embedded input."""
-        belief, predicted, thought_log_sigma, logits = self.step_core(
+        belief, logits = self.step_core(
             input_latent, caches, position, key_mask, block_mask
         )
         return StepOutput(
             belief=belief,
-            predicted=predicted,
-            thought_log_sigma=thought_log_sigma,
             input_latent=input_latent.squeeze(1),
             logits=logits,
             caches=list(caches),
@@ -1861,25 +1307,22 @@ class LatentThoughtModel(nn.Module):
             block_mask,
         )
 
-    def thought_input(self, thought: Tensor) -> Tensor:
-        # The transform and adapter run in fp32 and the result is
-        # rounded to the embedding dtype afterwards — the same cast order as
-        # ``assemble_stream_latents`` — so rollout and replay agree exactly
-        # and the fp32 adapter never sees a low-precision operand.
-        return self.adapt_thought_action(thought)[:, None].to(
-            self.backbone.tok_emb.weight.dtype
-        )
+    def combined_input(self, token_ids: Tensor, hidden: Tensor) -> Tensor:
+        """The decode-side combined embedding for one generated token per row.
 
-    def adapt_thought_action(self, thought: Tensor) -> Tensor:
-        """Transform one raw Gaussian action, then apply the actor adapter."""
-        return self.adapter(
-            transform_thought_action(thought, self.thought_action_transform)
-        )
+        Every decode input past the first generation step feeds back a token
+        the model generated, so the hasThought flag is implicitly all-ones
+        here; pinned modes bypass this method entirely. The injection branch
+        runs in fp32 and is rounded to the base dtype inside the combiner —
+        the same op order as ``assemble_stream_latents`` — so rollout and
+        replay agree exactly.
+        """
+        base = self.embed_tokens(token_ids[:, None])
+        return self.combiner(base, hidden[:, None])
 
     def new_parameters(self):
         """Post-training parameters that do not exist in the pretrained checkpoint."""
-        for module in (self.transition, self.gate, self.adapter):
-            yield from module.parameters()
+        yield from self.combiner.parameters()
 
     def load_backbone_checkpoint(self, state: dict[str, Tensor]) -> None:
         """Strict backbone load: every checkpoint key must land in the backbone."""

@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 CAPTURE_PROBLEMS = 4
 CAPTURE_SAMPLES_PER_PROBLEM = 4
 CAPTURE_ATTEMPTS = CAPTURE_PROBLEMS * CAPTURE_SAMPLES_PER_PROBLEM
-BENCHMARK_ANSWER_SCHEMA = "latent_stop_thinking_answers/v2"
+BENCHMARK_ANSWER_SCHEMA = "deterministic_hidden_carry_answers/v3"
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -85,36 +85,24 @@ def _render_attempt(attempt: Mapping[str, Any]) -> str:
         return html.escape(str(value), quote=True)
 
     state = "correct" if attempt["correct"] else "incorrect"
-    thinking = (
-        f"{int(attempt['continued_thought_count'])} continued thoughts"
-    )
     terminated = "terminated" if attempt["terminated"] else "unterminated"
-    runs = attempt["think_run_lengths"] or []
-    run_text = ", ".join(str(length) for length in runs) if runs else "none"
     return f"""
       <article class="attempt {state}">
         <header>
           <h3>Sample {int(attempt['sample_index']) + 1}</h3>
           <div class="badges">
             <span class="badge {state}">{state}</span>
-            <span class="badge">{esc(thinking)}</span>
             <span class="badge">{esc(terminated)}</span>
           </div>
         </header>
         <dl class="stats">
           <div><dt>Parsed answer</dt><dd>{esc(attempt['parsed_answer'])}</dd></div>
           <div><dt>Grader</dt><dd>{esc(attempt['answer_style'])}</dd></div>
-          <div><dt>Thoughts</dt><dd>{int(attempt['continued_thought_count'])} continued / {int(attempt['total_thought_count'])} total</dd></div>
-          <div><dt>Think runs</dt><dd>{esc(run_text)}</dd></div>
           <div><dt>Emitted tokens</dt><dd>{int(attempt['emitted_token_count'])}</dd></div>
         </dl>
         <details open>
           <summary>Full emitted text</summary>
           <pre>{esc(attempt['emitted_text'])}</pre>
-        </details>
-        <details>
-          <summary>Action trace (T = THINK, E = EMIT)</summary>
-          <pre class="trace">{esc(attempt['action_trace'])}</pre>
         </details>
       </article>"""
 
@@ -199,7 +187,6 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
     dt {{ color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; }}
     dd {{ margin:.1rem 0 0; overflow-wrap:anywhere; }}
     .attempt details + details {{ margin-top:.8rem; }}
-    .trace {{ letter-spacing:.1em; color:#c792ea; }}
     footer {{ margin-top:2rem; color:var(--muted); text-align:center; }}
     @media (max-width:850px) {{ .summary,.attempt-grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} }}
     @media (max-width:500px) {{ main {{ width:min(100% - 1rem,1500px); padding-top:1.5rem; }} .summary,.stats {{ grid-template-columns:1fr; }} .attempt header {{ display:block; }} .badges {{ justify-content:flex-start; margin-top:.6rem; }} }}
@@ -215,15 +202,13 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
   <section class="summary" aria-label="Benchmark summary">
     <div><span>All-rollout accuracy</span><strong>{_percent(metrics['accuracy'])}</strong></div>
     <div><span>Policy accuracy</span><strong>{_percent(metrics['policy_accuracy'])}</strong></div>
-    <div><span>Continue-thinking fraction</span><strong>{_percent(metrics['continue_thinking_fraction'])}</strong></div>
-    <div><span>Stopped-thinking trajectories</span><strong>{_percent(metrics.get('stopped_thinking_trajectory_fraction', 0.0))}</strong></div>
     <div><span>Prompts solved at least once</span><strong>{_percent(metrics.get('prompt_any_correct_fraction', 0.0))}</strong></div>
     <div><span>Mixed-reward prompt groups</span><strong>{_percent(metrics.get('prompt_mixed_reward_fraction', 0.0))}</strong></div>
     <div><span>Mean within-group reward std</span><strong>{float(metrics.get('within_group_reward_std', 0.0)):.4f}</strong></div>
     <div><span>Best constant-answer baseline</span><strong>{_percent(metrics.get('dataset_modal_answer_accuracy', 0.0))}</strong></div>
   </section>
   {''.join(sections)}
-  <footer>Correctness requires explicit BOS/EOS termination · full-dataset modal answer: {html.escape(str(metrics.get('dataset_modal_answer', 'unavailable')))} · reward schema: {html.escape(str(payload.get('reward_schema', 'unspecified')))} · sampling: {html.escape(str(metrics.get('sampling_schema', 'legacy')))} · finished-row compaction: {html.escape(str(metrics.get('finished_compaction', 'legacy')))} · the action trace excludes prompt tokens.</footer>
+  <footer>Correctness requires explicit BOS/EOS termination · full-dataset modal answer: {html.escape(str(metrics.get('dataset_modal_answer', 'unavailable')))} · reward schema: {html.escape(str(payload.get('reward_schema', 'unspecified')))} · sampling: {html.escape(str(metrics.get('sampling_schema', 'legacy')))} · finished-row compaction: {html.escape(str(metrics.get('finished_compaction', 'legacy')))}</footer>
 </main>
 </body>
 </html>
@@ -310,18 +295,6 @@ def sample_json_to_report_payload(
                 f"attempts ({samples_per_problem})"
             )
         for sample_index, sample in enumerate(samples):
-            trace = str(sample["trace"]).upper()
-            total_thoughts = int(sample["thinks"])
-            continued_thoughts = (
-                0
-                if pin_emit
-                else int(
-                    sample.get(
-                        "continued_thought_count",
-                        max(0, total_thoughts - 1),
-                    )
-                )
-            )
             attempts.append(
                 {
                     "problem_index": problem_index,
@@ -330,37 +303,19 @@ def sample_json_to_report_payload(
                     "prompt": record["problem"],
                     "ground_truth": str(record["ground_truth"]),
                     "answer_style": str(record.get("answer_style", "minerva")),
-                    # The marked rendering exposes where latent slots occurred;
-                    # raw emitted text remains in the source JSON.
                     "emitted_text": sample["text"],
                     "parsed_answer": sample["prediction"],
                     "correct": bool(sample["correct"]),
                     "terminated": bool(sample["terminated"]),
                     "termination_token_id": None,
                     "emitted_token_count": int(sample["emits"]),
-                    "initial_thought_count": (
-                        0 if pin_emit else min(total_thoughts, 1)
-                    ),
-                    "continued_thought_count": continued_thoughts,
-                    "total_thought_count": total_thoughts,
-                    "think_run_lengths": list(sample["think_run_lengths"]),
-                    "action_trace": trace,
                 }
             )
 
     total = len(attempts)
-    continued_thoughts = sum(
-        int(attempt["continued_thought_count"]) for attempt in attempts
-    )
-    stopped_trajectories = (
-        0
-        if pin_emit
-        else sum("E" in str(attempt["action_trace"]) for attempt in attempts)
-    )
-    stop_decisions = continued_thoughts + stopped_trajectories
     metrics = {
         "evaluation_metric_schema": (
-            "forced_initial_one_way_stop_policy/v2"
+            "deterministic_hidden_carry_token_actions/v3"
         ),
         "accuracy": sum(int(attempt["correct"]) for attempt in attempts) / total,
         "policy_accuracy": sum(
@@ -368,15 +323,6 @@ def sample_json_to_report_payload(
         )
         / total,
         "policy_samples": total,
-        "continue_thinking_fraction": (
-            continued_thoughts / max(stop_decisions, 1)
-        ),
-        "stop_thinking_fraction": (
-            stopped_trajectories / max(stop_decisions, 1)
-        ),
-        "stopped_thinking_trajectory_fraction": (
-            stopped_trajectories / total
-        ),
         "pin_emit": pin_emit,
         "samples": total,
     }

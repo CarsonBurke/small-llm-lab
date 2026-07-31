@@ -1,9 +1,10 @@
-"""Sample the latent THINK/EMIT policy on demand and inspect its outputs.
+"""Sample the hidden-carry latent policy on demand and inspect its outputs.
 
-Generates through the same gate-conditioned rollout the trainer and the AIME
-eval use, so what you see is exactly the trained policy — including where it
-chose to think.  Works against the pretraining checkpoint alone (untrained
-gate) or with a latent-VAPO checkpoint layered on top.
+Generates through the same deterministic hidden-carry rollout the trainer and
+the AIME eval use, so what you see is exactly the trained policy — every
+generated token's producing belief rides back in on the next input. Works
+against the pretraining checkpoint alone (fresh identity combiner) or with a
+latent-VAPO checkpoint layered on top.
 
     # An AIME problem by index, 4 samples (the base --checkpoint is resolved
     # from the run's manifest.json when omitted):
@@ -32,7 +33,6 @@ from postraining.core import (
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_REWARD_SCHEMA,
     POSTTRAIN_RESPONSE_TOKENS,
-    POSTTRAIN_STREAM_TOKENS,
     answer_style,
     encode_prompt,
     load_posttraining_tokenizer,
@@ -40,95 +40,20 @@ from postraining.core import (
     validate_posttraining_context_budget,
 )
 from postraining.latent_rollout import (
-    THOUGHT_SLOT,
-    TOKEN_SLOT,
     continuation_reward,
-    emitted_token_and_kind_rows,
+    emitted_token_rows,
     rollout_continuations,
     trim_stream,
 )
 from postraining.latent_eval import evaluate_latent_math, verify_terminated_answer
 from postraining.latent_thought import (
     LatentThoughtModel,
-    migrate_legacy_wrapper_checkpoint,
+    combiner_init_kwargs_from_checkpoint,
+    rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
-    wrapper_init_kwargs_from_checkpoint,
 )
 from postraining.model_io import load_model
 from postraining.train_vapo import prompt_text
-
-
-def gate_trace_from_kinds(kinds: list[int]) -> str:
-    """Compact action trace from an already-copied continuation kind row."""
-    symbols = {TOKEN_SLOT: "E", THOUGHT_SLOT: "t"}
-    return "".join(symbols.get(kind, "") for kind in kinds)
-
-
-def think_run_lengths_from_trace(trace: str) -> list[int]:
-    """Lengths of contiguous latent-thought runs in an E/t action trace."""
-    runs: list[int] = []
-    current = 0
-    for action in trace:
-        if action == "t":
-            current += 1
-        elif current:
-            runs.append(current)
-            current = 0
-    if current:
-        runs.append(current)
-    return runs
-
-
-def decode_trace_with_think_markers(
-    tokenizer,
-    emitted: list[int],
-    trace: str,
-    stop_ids: tuple[int, ...] = (),
-) -> str:
-    """CPU-only marked decode from an action trace and emitted token ids."""
-    parts: list[str] = []
-    segment: list[int] = []
-    emitted_index = 0
-    run = 0
-    at_start = True
-
-    def flush_segment() -> None:
-        nonlocal segment, at_start
-        if not segment:
-            return
-        text = tokenizer.decode(segment)
-        if not at_start and tokenizer.id_to_piece(segment[0]).startswith("▁"):
-            text = " " + text
-        parts.append(text)
-        segment = []
-        at_start = False
-
-    for action in trace.upper():
-        if action == "T":
-            flush_segment()
-            run += 1
-            continue
-        if action != "E":
-            continue
-        if run:
-            parts.append(f"{run}🪙")
-            at_start = False
-            run = 0
-        if emitted_index >= len(emitted):
-            raise ValueError("action trace contains more EMITs than token ids")
-        token = emitted[emitted_index]
-        emitted_index += 1
-        if token in stop_ids:
-            flush_segment()
-            parts.append(tokenizer.id_to_piece(token))
-            break
-        segment.append(token)
-    flush_segment()
-    if run:
-        parts.append(f"{run}🪙")
-    if emitted_index != len(emitted):
-        raise ValueError("emitted token ids outnumber action-trace EMITs")
-    return "".join(parts)
 
 
 def main() -> None:
@@ -168,10 +93,6 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
     )
-    # Total generated-slot budget (thinks + emits); 0 = 4x the emit cap.
-    parser.add_argument(
-        "--max-stream-steps", type=int, default=POSTTRAIN_STREAM_TOKENS
-    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument(
@@ -193,14 +114,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--emit-only", action="store_true",
-        help="evaluate the token-only policy with no gate or latent thoughts",
+        help="evaluate the token-only policy with no carried belief",
     )
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
-    stream_steps = args.max_stream_steps or 4 * args.max_new_tokens
+    # Every action is a token under the deterministic hidden carry, so the
+    # stream budget always equals the emitted-token cap.
+    stream_steps = args.max_new_tokens
     validate_posttraining_context_budget(args.prompt_tokens, stream_steps)
     modes = sum(
         value is not None
@@ -229,26 +152,32 @@ def main() -> None:
             args.wrapper_checkpoint, map_location="cpu", weights_only=False
         )
         wrapper = LatentThoughtModel(
-            backbone, **wrapper_init_kwargs_from_checkpoint(payload)
+            backbone, **combiner_init_kwargs_from_checkpoint(payload)
         ).to(device)
-        migrate_legacy_wrapper_checkpoint(payload, wrapper)
+        saved_mode = str(
+            payload.get("args", {}).get("reasoning_mode", "latent")
+        )
         validate_renderer_checkpoint(
             payload,
             args.wrapper_checkpoint,
-            expected_thought_input_schema=wrapper.thought_input_schema,
-            expected_thought_action_transform_schema=(
-                wrapper.thought_action_transform_schema
+            expected_rollout_policy_schema=rollout_policy_schema_for_mode(
+                saved_mode
             ),
         )
         wrapper.load_state_dict(payload["model"], strict=True)
         wrapper_step = payload.get("step")
         print(f"policy: {args.wrapper_checkpoint} (step {payload.get('step')})")
+        if saved_mode != "latent" and not args.emit_only:
+            parser.error(
+                f"checkpoint was trained in reasoning mode {saved_mode!r}; "
+                "sample it with --emit-only"
+            )
     else:
         wrapper = LatentThoughtModel(backbone).to(device)
-        print("policy: untrained heads over the pretraining checkpoint")
+        print("policy: fresh identity combiner over the pretraining checkpoint")
     wrapper.eval()
     if args.emit_only:
-        print("token-only policy: stop gate and latent thoughts bypassed")
+        print("token-only policy: no belief is carried between steps")
 
     tokenizer = load_posttraining_tokenizer(
         backbone.architecture, FreshHyperparameters.tokenizer_path
@@ -272,7 +201,7 @@ def main() -> None:
             batch = trim_stream(
                 rollout_continuations(
                     wrapper, prompt_ids, args.continuation_tokens,
-                    args.max_stream_steps or 4 * args.continuation_tokens,
+                    args.continuation_tokens,
                     args.temperature, args.top_p,
                     replay_storage=False,
                     record_likelihoods=False,
@@ -280,24 +209,19 @@ def main() -> None:
                     pin_emit=args.emit_only,
                 )
             )
-        emitted_rows, kind_rows = emitted_token_and_kind_rows(batch)
+        emitted_rows = emitted_token_rows(batch)
         references = reference_ids.to(device="cpu").tolist()
         prompt_tails = prompt_ids[:, -48:].to(device="cpu").tolist()
         for index, emitted in enumerate(emitted_rows):
             generated = tokenizer.decode(emitted)
             reference = tokenizer.decode(references[index])
             reward = continuation_reward(generated, reference)
-            trace = gate_trace_from_kinds(kind_rows[index])
             if index % args.samples == 0:
                 prompt_tail = tokenizer.decode(prompt_tails[index])
                 print(f"=== prompt {index // args.samples}  (…{prompt_tail!r})")
                 print(f"reference: {reference!r}")
-            marked = decode_trace_with_think_markers(
-                tokenizer, emitted, trace,
-            )
-            print(f"--- sample {index % args.samples}  reward: {reward:.3f}  "
-                  f"(thinks: {trace.count('t')})")
-            print(f"generated: {marked!r}")
+            print(f"--- sample {index % args.samples}  reward: {reward:.3f}")
+            print(f"generated: {generated!r}")
             print()
         return
 
@@ -305,9 +229,6 @@ def main() -> None:
         import random
         rows = load_unique_math_rows(args.math_data)
         picked = random.Random(args.seed).sample(range(len(rows)), args.math_rows)
-        stop_ids = tuple(
-            t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
-        )
         selected_rows = []
         for row_index in picked:
             row = rows[row_index]
@@ -364,24 +285,13 @@ def main() -> None:
             ]
             samples = []
             for attempt in row_attempts:
-                trace = str(attempt["action_trace"]).replace("T", "t")
-                emitted = [int(token) for token in attempt["emitted_token_ids"]]
                 samples.append(
                     {
-                        "text": decode_trace_with_think_markers(
-                            tokenizer, emitted, trace, stop_ids=stop_ids
-                        ),
-                        "emitted_text": attempt["emitted_text"],
-                        "trace": trace,
-                        "thinks": int(attempt["total_thought_count"]),
+                        "text": attempt["emitted_text"],
                         "emits": int(attempt["emitted_token_count"]),
                         "correct": bool(attempt["correct"]),
                         "prediction": attempt["parsed_answer"],
                         "terminated": bool(attempt["terminated"]),
-                        "continued_thought_count": int(
-                            attempt["continued_thought_count"]
-                        ),
-                        "think_run_lengths": list(attempt["think_run_lengths"]),
                     }
                 )
             records.append(
@@ -410,7 +320,7 @@ def main() -> None:
                         f"--- sample {sample_index}  "
                         f"{'CORRECT' if sample['correct'] else 'wrong'} "
                         f"(extracted: {sample['prediction']}, "
-                        f"thinks: {sample['thinks']})"
+                        f"emits: {sample['emits']})"
                     )
                     print(sample["text"])
                 print()
@@ -435,7 +345,6 @@ def main() -> None:
                 "top_p": args.top_p,
                 "samples_per_problem": args.samples,
                 "max_new_tokens": args.max_new_tokens,
-                "max_stream_steps": stream_steps,
                 "eval_batch_trajectories": args.eval_batch_trajectories,
                 "eval_compile_requested": bool(args.eval_compile),
                 "eval_compiled": bool(metrics["compiled"]),
@@ -487,24 +396,17 @@ def main() -> None:
             )
         )
 
-    emitted_rows, kind_rows = emitted_token_and_kind_rows(batch)
-    for index, emitted in enumerate(emitted_rows):
+    for index, emitted in enumerate(emitted_token_rows(batch)):
         cut = next((i for i, t in enumerate(emitted) if t in stop_ids), None)
         if cut is not None:
             emitted = emitted[: cut + 1]
-        trace = gate_trace_from_kinds(kind_rows[index])
-        thinks = trace.count("t")
-        marked = decode_trace_with_think_markers(
-            tokenizer, emitted, trace, stop_ids=stop_ids,
-        )
-        print(f"--- sample {index}  (thinks: {thinks}, emits: {trace.count('E')})")
-        print(f"trace: {trace}")
+        print(f"--- sample {index}  (emits: {len(emitted)})")
         if truth is not None:
             is_correct, prediction = verify_terminated_answer(
                 emitted, truth, tokenizer, stop_ids, "aime"
             )
             print(f"verdict: {'CORRECT' if is_correct else 'wrong'} (extracted: {prediction})")
-        print(marked)
+        print(tokenizer.decode(emitted))
         print()
 
 

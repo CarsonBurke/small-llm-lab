@@ -220,10 +220,7 @@ def test_cpu_built_replay_plan_removes_replay_tail_host_syncs():
     assert not _rollout_sync_lines(sites), sites
 
 
-@pytest.mark.parametrize(
-    "clip_mode, reverse_kl", [("none", 0.5), ("projected", 0.0)]
-)
-def test_the_age_zero_canary_holds_on_cuda(clip_mode, reverse_kl):
+def test_the_age_zero_canary_holds_on_cuda():
     # The property the whole rewrite is constrained by: refresh and the
     # update step must agree to the last bit, so behavior-age-0 ratios are
     # exactly one and nothing clips.
@@ -231,7 +228,7 @@ def test_the_age_zero_canary_holds_on_cuda(clip_mode, reverse_kl):
     critic = _critic()
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.gate.head.weight.normal_(std=0.02)
+        wrapper.combiner.gain.fill_(0.3)
     host_batch = _rollout(
         wrapper, batch=6, prompt=5, new_tokens=4, seed=7
     )
@@ -257,24 +254,12 @@ def test_the_age_zero_canary_holds_on_cuda(clip_mode, reverse_kl):
         batch,
         _optimizers(wrapper, critic, learning_rate=1e-4),
         replay_max_trajectories=2,
-        thought_clip_mode=clip_mode,
-        thought_reverse_kl_coef=reverse_kl,
         replay_plan=replay_plan,
     )
     assert metrics["policy_clip_fraction"] == 0.0
-    assert metrics["gate_behavior_kl"] == 0.0
-    assert metrics["renderer_behavior_kl"] == 0.0
-    assert metrics["thought_behavior_kl_joint"] == 0.0
-    assert metrics["thought_behavior_kl_per_dim"] == 0.0
-    assert metrics["joint_abs_log_ratio_max"] == 0.0
+    assert metrics["token_behavior_kl"] == 0.0
+    assert metrics["token_abs_log_ratio_max"] == 0.0
     assert metrics["harmful_positive_log_ratio_max"] == 0.0
-    if clip_mode == "projected":
-        # The projected arm reads old_thought_means/log_sigmas back through
-        # the same compaction, so its Mahalanobis distance to its own
-        # refresh must be exactly zero and nothing may project.
-        assert metrics["thought_trust_d_mean"] == 0.0
-        assert metrics["thought_trust_d_max"] == 0.0
-        assert metrics["thought_projection_penalty"] == 0.0
 
 
 def test_update_syncs_do_not_scale_past_two_per_shard():

@@ -65,6 +65,12 @@ def _load_nano_model(architecture: str, payload, device: torch.device):
         NanoTiedDotBackbone,
     )
 
+    if any(marker in architecture for marker in ("_kda_", "_gdn2_")):
+        raise NotImplementedError(
+            f"{architecture} requires the KDA recurrent/convolution cache "
+            "backbone; refusing to construct a dense NanoGPTBackbone"
+        )
+
     config = dict(NANO_DEFAULT_MODEL_CONFIG)
     if isinstance(payload, dict) and "model_config" in payload:
         config.update(payload["model_config"])

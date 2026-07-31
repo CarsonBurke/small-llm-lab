@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from postraining.latent_rollout import generated_slot_mask, replay_beliefs
 from postraining.latent_thought import LatentThoughtModel, StepOutput
 from postraining.rollout_scheduler import (
     ContinuousScheduleStats,
@@ -11,14 +12,6 @@ from postraining.rollout_scheduler import (
     rollout_continuous_refill_groups,
 )
 from postraining.tests.test_nano_backbone import _backbone
-
-
-class _EmitGate:
-    @staticmethod
-    def stop_logit(belief):
-        return torch.full(
-            belief.shape[:-1], 40.0, dtype=torch.float32, device=belief.device
-        )
 
 
 def test_cuda_decode_execution_width_uses_static_main_and_tail_buckets():
@@ -37,7 +30,6 @@ class _FakeContinuousModel:
         self.backbone = SimpleNamespace(
             tok_emb=SimpleNamespace(embedding_dim=3)
         )
-        self.gate = _EmitGate()
         self.stochastic_tokens = stochastic_tokens
         self.bank_builds = 0
         self.admission_calls: list[list[list[int]]] = []
@@ -64,8 +56,6 @@ class _FakeContinuousModel:
     def _output(self, slots, cache):
         rows = slots.numel()
         belief = torch.zeros((rows, 3), dtype=torch.float32)
-        predicted = torch.zeros_like(belief)
-        log_sigma = torch.full_like(belief, -2.0)
         logits = torch.zeros((rows, 4), dtype=torch.float32)
         if not self.stochastic_tokens:
             target = cache.target.index_select(0, slots)
@@ -75,8 +65,6 @@ class _FakeContinuousModel:
             logits[stop, 1] = 80.0
         return StepOutput(
             belief=belief,
-            predicted=predicted,
-            thought_log_sigma=log_sigma,
             input_latent=torch.zeros_like(belief),
             logits=logits,
             caches=[],
@@ -146,8 +134,10 @@ class _FakeContinuousModel:
         return token_ids.float()[..., None].expand(*token_ids.shape, 3)
 
     @staticmethod
-    def thought_input(thought):
-        return thought[:, None]
+    def combined_input(token_ids, hidden):
+        return token_ids.float()[..., None, None].expand(
+            *token_ids.shape, 1, 3
+        )
 
 
 def _chunk(*target_lengths: int):
@@ -179,7 +169,7 @@ def _run(
         prompt_repeats=repeats,
         capacity_rows=capacity,
         max_new_tokens=max_new_tokens,
-        max_stream_steps=max_new_tokens + (0 if pin_emit else 1),
+        max_stream_steps=max_new_tokens,
         temperature=1.0,
         top_p=top_p,
         seed=seed,
@@ -241,7 +231,6 @@ def test_padded_decode_width_changes_nothing_a_live_row_can_observe():
     assert padded_model.padded_widths, "no step was actually padded"
     assert max(padded_model.padded_widths) == 4
     for left, right in zip(plain, padded, strict=True):
-        torch.testing.assert_close(left.actions, right.actions)
         torch.testing.assert_close(left.action_mask, right.action_mask)
         torch.testing.assert_close(left.token_ids, right.token_ids)
 
@@ -326,7 +315,7 @@ def test_request_rng_is_stable_across_capacity_and_refill_order():
             narrow_batch.token_ids, wide_batch.token_ids, rtol=0, atol=0
         )
         torch.testing.assert_close(
-            narrow_batch.actions, wide_batch.actions, rtol=0, atol=0
+            narrow_batch.action_mask, wide_batch.action_mask, rtol=0, atol=0
         )
 
 
@@ -422,7 +411,7 @@ def test_nucleus_sampling_remains_request_stable():
         )
 
 
-def test_latent_rng_is_stable_without_replay_thought_storage():
+def test_latent_rng_is_stable_without_replay_hidden_storage():
     chunks = [_chunk(1), _chunk(1), _chunk(1)]
     narrow = _run(
         _FakeContinuousModel(),
@@ -445,12 +434,12 @@ def test_latent_rng_is_stable_without_replay_thought_storage():
         replay_storage=False,
     )
     for left, right in zip(narrow, wide, strict=True):
-        assert left.thoughts.size(-1) == 0
+        assert left.hiddens.size(-1) == 0
         torch.testing.assert_close(
             left.token_ids, right.token_ids, rtol=0, atol=0
         )
         torch.testing.assert_close(
-            left.actions, right.actions, rtol=0, atol=0
+            left.action_mask, right.action_mask, rtol=0, atol=0
         )
 
 
@@ -493,6 +482,55 @@ def test_real_paged_model_runs_refill_with_independent_positions():
     assert all(torch.isfinite(batch.token_ids).all() for batch in results)
     assert stats.admitted_groups == 3
     assert stats.evicted_rows == 6
+
+
+def test_real_paged_model_hidden_carry_matches_dense_replay():
+    """Scheduler-stored carries must equal the dense replay reconstruction.
+
+    The paged decode loop and ``replay_beliefs`` are independent code paths;
+    the stored hidden at slot t is the belief that emitted token t, so it
+    must match the replayed belief at t-1 wherever the carry flag is set. A
+    live combiner makes the carried content feed back into later beliefs,
+    so a corrupted store shows up as a cascading mismatch, not a no-op.
+    """
+    model = LatentThoughtModel(_backbone()).eval()
+    with torch.no_grad():
+        model.combiner.gain.fill_(0.4)
+        model.combiner.type_bias.normal_(std=0.02)
+        for mlp in model.combiner.mlps:
+            mlp.proj.weight.normal_(std=0.02)
+    first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
+    second_prompts = torch.tensor([[3, 17, 19, 23]])
+    results = rollout_continuous_refill_groups(
+        model,
+        [first_prompts, second_prompts],
+        [torch.tensor([2, 3]), torch.tensor([4])],
+        prompt_repeats=2,
+        capacity_rows=4,
+        max_new_tokens=3,
+        max_stream_steps=3,
+        temperature=1.0,
+        top_p=1.0,
+        seed=101,
+        cache_dtype=torch.float32,
+        pin_emit=False,
+    )
+
+    assert results
+    for batch in results:
+        carried = generated_slot_mask(batch)
+        assert bool(carried.any())
+        assert batch.hiddens.size(-1) == model.backbone.tok_emb.embedding_dim
+        assert float(batch.hiddens[~carried].abs().sum()) == 0.0
+        with torch.no_grad():
+            _, beliefs = replay_beliefs(model, batch)
+        tail = carried[:, 1:]
+        torch.testing.assert_close(
+            batch.hiddens[:, 1:][tail],
+            beliefs[:, :-1][tail],
+            rtol=1e-4,
+            atol=1e-5,
+        )
 
 
 def test_scheduler_rejects_capacity_smaller_than_one_group():

@@ -33,17 +33,14 @@ from postraining.core import (
 )
 from postraining.latent_rollout import (
     PAD_SLOT,
-    THOUGHT_SLOT,
-    TOKEN_SLOT,
     rollout_continuations,
     trim_stream,
 )
 from postraining.latent_thought import (
     LatentThoughtModel,
-    migrate_legacy_wrapper_checkpoint,
+    combiner_init_kwargs_from_checkpoint,
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
-    wrapper_init_kwargs_from_checkpoint,
 )
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import fresh_trunk, load_model
@@ -146,18 +143,13 @@ def main() -> None:
     saved_args = payload.get("args", {})
     reasoning_mode = saved_args.get("reasoning_mode", "latent")
     wrapper = LatentThoughtModel(
-        backbone, **wrapper_init_kwargs_from_checkpoint(payload)
+        backbone, **combiner_init_kwargs_from_checkpoint(payload)
     ).to(device)
-    migrate_legacy_wrapper_checkpoint(payload, wrapper)
     validate_renderer_checkpoint(
         payload,
         str(wrapper_path),
         expected_rollout_policy_schema=rollout_policy_schema_for_mode(
             reasoning_mode
-        ),
-        expected_thought_input_schema=wrapper.thought_input_schema,
-        expected_thought_action_transform_schema=(
-            wrapper.thought_action_transform_schema
         ),
     )
     wrapper.load_state_dict(payload["model"], strict=True)
@@ -165,8 +157,7 @@ def main() -> None:
     step = payload.get("step")
     print(f"policy+critic: {wrapper_path} (step {step}, mode {reasoning_mode})")
 
-    # Reconstruct the training run's support geometry: pre-v22 checkpoints
-    # lack the anchored-support args and used the legacy [0, 1]-edge grid.
+    # Reconstruct the training run's support geometry from the saved args.
     if saved_args.get("value_anchored_support", False):
         value_num_bins, value_v_min, value_v_max = anchored_unit_geometry(
             saved_args.get("value_bins", 101),
@@ -182,10 +173,7 @@ def main() -> None:
         v_min=value_v_min,
         v_max=value_v_max,
         prior_value=saved_args.get("value_prior", 0.05),
-        adapter_init=saved_args.get("critic_adapter_init", "identity"),
-        thought_action_transform=saved_args.get(
-            "thought_action_transform", "identity"
-        ),
+        **combiner_init_kwargs_from_checkpoint(payload),
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()
@@ -200,15 +188,8 @@ def main() -> None:
     )
     prompt_budget = saved_args.get("prompt_tokens", 512)
     pin_emit = reasoning_mode != "latent"
-    context_tokens = manifest_payload.get("context_tokens")
-    if context_tokens is None:
-        context_tokens = (
-            getattr(backbone, "train_context_tokens", 1024)
-            if backbone.architecture.startswith("nanogpt_mini")
-            else 5 * 1024
-        )
     response_budget, stream_budget = checkpoint_training_rollout_budget(
-        saved_args, context_tokens=context_tokens
+        saved_args
     )
     solution_prefix_ids: tuple[int, ...] = ()
     if reasoning_mode == "none":
@@ -275,25 +256,16 @@ def main() -> None:
                 slots.append(
                     {
                         "position": position,
-                        "kind": (
-                            "thought" if kind == THOUGHT_SLOT
-                            else "token"
-                        ),
+                        "kind": "token",
                         "action": bool(actions[sample_index, position]),
                         "token_id": token_id,
-                        "text": (
-                            token_display_text(
-                                tokenizer, token_id, unicode_to_byte
-                            )
-                            if kind == TOKEN_SLOT
-                            else "<think>"
+                        "text": token_display_text(
+                            tokenizer, token_id, unicode_to_byte
                         ),
                         "value": float(values[sample_index, position]),
                     }
                 )
-            generated = [
-                s for s in slots if s["action"] and s["kind"] == "token"
-            ]
+            generated = [s for s in slots if s["action"]]
             # Decode the whole sequence at once: multi-byte characters span
             # token boundaries, so per-token decodes cannot be concatenated.
             emitted_text = tokenizer.decode(
@@ -314,16 +286,13 @@ def main() -> None:
             }
             records.append(record)
             generated_values = [s["value"] for s in generated]
-            thought_count = sum(
-                1 for s in slots if s["action"] and s["kind"] == "thought"
-            )
             print(
                 f"prompt {prompt_index:2d} (row {row_index}) "
                 f"reward {record['reward']:.3f} truth {truth!r:>12} | "
                 f"V(start) {record['value_at_prompt_end']:.3f} "
                 f"V(mean) {sum(generated_values) / max(len(generated_values), 1):.3f} "
                 f"V(last) {generated_values[-1] if generated_values else float('nan'):.3f} "
-                f"thinks {thought_count:3d} | {emitted_text!r}"
+                f"| {emitted_text!r}"
             )
 
     out_dir = Path(
@@ -343,34 +312,7 @@ def main() -> None:
     for record in records:
         spans = []
         action_slots = [s for s in record["slots"] if s["action"]]
-        index = 0
-        while index < len(action_slots):
-            slot = action_slots[index]
-            if slot["kind"] == "thought":
-                # Collapse a consecutive THINK run into one labeled span.
-                run = [slot]
-                while (
-                    index + len(run) < len(action_slots)
-                    and action_slots[index + len(run)]["kind"] == "thought"
-                ):
-                    run.append(action_slots[index + len(run)])
-                index += len(run)
-                mean_value = sum(s["value"] for s in run) / len(run)
-                color = value_color(mean_value, low, high)
-                label = (
-                    "&lt;think&gt;" if len(run) == 1
-                    else f"&lt;think ×{len(run)}&gt;"
-                )
-                per_slot = " ".join(f"{s['value']:.3f}" for s in run)
-                spans.append(
-                    f'<span class="tok think" style="background:{color}" '
-                    f'title="think run ×{len(run)}, V mean '
-                    f'{mean_value:.4f}, per-slot [{per_slot}], pos '
-                    f'{run[0]["position"]}-{run[-1]["position"]}">'
-                    f"{label}</span>"
-                )
-                continue
-            index += 1
+        for slot in action_slots:
             color = value_color(slot["value"], low, high)
             label = html.escape(slot["text"]).replace("\n", "\\n") or "·"
             spans.append(
@@ -396,7 +338,6 @@ def main() -> None:
         "max-width:1200px;margin:2rem auto;padding:0 1rem}"
         ".tok{padding:0 .1em;margin:0 1px;border-radius:3px;color:#fff;"
         "white-space:pre-wrap}"
-        ".think{outline:1px dashed #e8edf7;font-style:italic}"
         ".prompt{color:#9aa8bd;font-size:.85em}"
         ".good{color:#47d18c}.bad{color:#ff6b7a}"
         "code{background:#131924;padding:0 .3em;border-radius:3px}"

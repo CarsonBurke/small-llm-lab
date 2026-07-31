@@ -1,11 +1,11 @@
 """Measure a checkpoint's best-case DAPO-Math verifier hit rate.
 
-No-optional-think rollouts (gate pinned to EMIT, with exactly half of every
-prompt group's members forced to start with a latent thought) over many prompts
-and samples; reports verifier hits, within-group reward variance,
-and the extracted-answer distribution.  This is the cheap go/no-go probe
-before an RL run: zero within-group variance means a zero policy gradient,
-so DAPO RL cannot start from that checkpoint.
+Fresh-combiner hidden-carry rollouts (identity at init, so exactly the
+pretrained token policy) over many prompts and samples; reports verifier
+hits, within-group reward variance, and the extracted-answer distribution.
+This is the cheap go/no-go probe before an RL run: zero within-group
+variance means a zero policy gradient, so DAPO RL cannot start from that
+checkpoint.
 
     python3 -m postraining.dapo_hit_rate_probe \
         --checkpoint ablation_results/<run>/pretraining_checkpoint.pt
@@ -24,7 +24,6 @@ from postraining.core import (
     POSTTRAIN_CONTEXT_TOKENS,
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_RESPONSE_TOKENS,
-    POSTTRAIN_STREAM_TOKENS,
     answer_style,
     encode_prompt,
     load_posttraining_tokenizer,
@@ -54,7 +53,6 @@ def main() -> None:
     # nano's half-truncate RoPE has no extrapolation).
     parser.add_argument("--prompt-tokens", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
-    parser.add_argument("--max-stream-steps", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=0)
@@ -78,21 +76,13 @@ def main() -> None:
             if is_nano
             else POSTTRAIN_RESPONSE_TOKENS
         )
-    if args.max_stream_steps is None:
-        args.max_stream_steps = min(
-            4 * args.max_new_tokens if is_nano else POSTTRAIN_STREAM_TOKENS,
-            context_tokens - args.prompt_tokens,
-        )
     validate_posttraining_context_budget(
-        args.prompt_tokens, args.max_stream_steps, context_tokens
+        args.prompt_tokens, args.max_new_tokens, context_tokens
     )
     backbone.eval()
+    # A fresh combiner is an exact identity, so this rollout is the pretrained
+    # token policy with the hidden carry plumbed but inert.
     wrapper = LatentThoughtModel(backbone).to(device).eval()
-    with torch.no_grad():
-        # Zero gate weight + saturated bias: STOP immediately after the
-        # mandatory first thought, isolating the shortest latent policy.
-        wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(30.0)
 
     tokenizer = load_posttraining_tokenizer(
         backbone.architecture, FreshHyperparameters.tokenizer_path
@@ -123,7 +113,7 @@ def main() -> None:
                     wrapper,
                     prompt_ids.expand(args.samples, -1),
                     args.max_new_tokens,
-                    args.max_stream_steps,
+                    args.max_new_tokens,
                     args.temperature,
                     args.top_p,
                     stop_ids=stop_ids or None,

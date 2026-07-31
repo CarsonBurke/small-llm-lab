@@ -7,7 +7,7 @@ from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1Po
 from postraining.hl_gauss import HLGaussSupport, anchored_unit_geometry
 from postraining.latent_rollout import (
     PAD_SLOT,
-    THOUGHT_SLOT,
+    generated_slot_mask,
     rollout_continuations,
     trim_stream,
 )
@@ -120,73 +120,84 @@ def test_anchored_critic_decodes_an_interior_prior_without_bias():
     assert float((values - 0.05).abs().max()) < 1e-3
 
 
-def test_thoughts_reach_the_critic_through_its_own_adapter():
+def test_hiddens_reach_the_critic_through_its_own_combiner():
     critic = _critic()
     with torch.no_grad():
         critic.head.weight.normal_(std=0.05)
+        # A fresh combiner is an exact identity (gain 0, zero type bias), so
+        # give the content channel a live gain before perturbing hiddens.
+        critic.combiner.gain.fill_(0.5)
     batch = _batch()
-    thought_slots = int((batch.kind == 1).sum())
-    if thought_slots == 0:
-        raise AssertionError("rollout produced no thoughts; change the seed")
+    carried_slots = int(generated_slot_mask(batch).sum())
+    if carried_slots == 0:
+        raise AssertionError("rollout stored no carried hiddens; change the seed")
     with torch.no_grad():
         baseline_values = critic.values(batch)
-        batch.thoughts.add_(torch.randn_like(batch.thoughts))
+        batch.hiddens.add_(torch.randn_like(batch.hiddens))
         perturbed_values = critic.values(batch)
     assert not torch.equal(baseline_values, perturbed_values)
 
 
-def test_critic_adapter_starts_orthogonal_and_norm_preserving():
-    critic = _critic()
-    weight = critic.adapter.projection.weight.detach()
-    torch.testing.assert_close(
-        weight @ weight.T,
-        torch.eye(weight.shape[0]),
-        rtol=1e-5,
-        atol=5e-7,
-    )
-    assert torch.count_nonzero(critic.adapter.projection.bias) == 0
-    thoughts = torch.randn(16, weight.shape[0])
-    torch.testing.assert_close(
-        critic.adapter(thoughts).norm(dim=-1),
-        thoughts.norm(dim=-1),
-        rtol=1e-5,
-        atol=1e-6,
-    )
-
-
-def test_critic_dense_masked_inputs_match_compact_routing():
+def test_critic_combiner_is_identity_at_init_on_uncarried_slots():
+    """Prompt slots and the first generation step take the plain token path."""
     critic = _critic()
     batch = _batch()
     token_latent = critic.trunk.embed_tokens(batch.token_ids)
-    thought_mask = batch.kind == THOUGHT_SLOT
-    expected = token_latent.clone()
-    expected[thought_mask] = critic.adapter(
-        batch.thoughts[thought_mask].float()
-    ).to(token_latent.dtype)
-    expected *= (batch.kind != PAD_SLOT)[..., None].to(expected.dtype)
+    pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+    inputs = critic.assemble_inputs(batch)
+    carried = generated_slot_mask(batch)
+    expected_plain = token_latent * pad_scale
+    assert torch.equal(inputs[~carried], expected_plain[~carried])
+    # At init the combiner is an exact identity, so carried slots match too.
+    assert torch.equal(inputs, expected_plain)
 
-    torch.testing.assert_close(critic.assemble_inputs(batch), expected)
 
-
-def test_tanh_critic_transforms_raw_thoughts_before_its_adapter():
+def test_critic_dense_masked_inputs_match_combiner_routing():
     critic = _critic()
-    critic.thought_action_transform = "tanh"
+    with torch.no_grad():
+        critic.combiner.gain.fill_(0.3)
+        critic.combiner.type_bias.normal_(std=0.02)
+        for mlp in critic.combiner.mlps:
+            mlp.proj.weight.normal_(std=0.02)
     batch = _batch()
-    thought_mask = batch.kind == THOUGHT_SLOT
-    batch.thoughts[thought_mask] = 2.5
     token_latent = critic.trunk.embed_tokens(batch.token_ids)
-    expected = token_latent.clone()
-    expected[thought_mask] = critic.adapter(
-        batch.thoughts[thought_mask].float().tanh()
-    ).to(token_latent.dtype)
-    expected *= (batch.kind != PAD_SLOT)[..., None].to(expected.dtype)
+    pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+    expected = critic.combiner(
+        token_latent, batch.hiddens, generated_slot_mask(batch)
+    ) * pad_scale
     torch.testing.assert_close(critic.assemble_inputs(batch), expected)
+
+
+def test_critic_zero_width_hiddens_take_the_plain_token_path():
+    critic = _critic()
+    batch = _batch()
+    batch.hiddens = batch.hiddens[..., :0]
+    # Zero-width storage is legitimate only for pinned token-only rollouts,
+    # which never inject a carry in the first place.
+    batch.carry_injected = False
+    token_latent = critic.trunk.embed_tokens(batch.token_ids)
+    pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+    assert torch.equal(critic.assemble_inputs(batch), token_latent * pad_scale)
+
+
+def test_critic_refuses_a_latent_batch_that_discarded_its_carry():
+    """replay_storage=False keeps carry_injected: valuing it would silently
+    score token inputs the behavior policy never saw."""
+    critic = _critic()
+    batch = _batch()
+    assert batch.carry_injected
+    batch.hiddens = batch.hiddens[..., :0]
+    with pytest.raises(ValueError, match="discarded its carried hiddens"):
+        critic.assemble_inputs(batch)
 
 
 def test_all_critic_parameters_receive_value_gradients():
     critic = _critic()
     with torch.no_grad():
         critic.head.weight.normal_(std=0.05)
+        # gain 0 would zero the gradient into the carry matrix (its update is
+        # scaled by the explicit gain), so test reach at a live gain.
+        critic.combiner.gain.fill_(0.5)
     batch = _batch()
     logits = critic.value_logits(batch)
     targets = torch.full(batch.kind.shape, 0.7)
@@ -197,10 +208,16 @@ def test_all_critic_parameters_receive_value_gradients():
         name for name, parameter in named.items()
         if parameter.grad is not None and float(parameter.grad.abs().sum()) > 0.0
     }
-    # Trunk, adapter, and head must all train; the trunk's unused output
+    # Trunk, combiner, and head must all train; the trunk's unused output
     # heads (probes, lm head paths) legitimately get no gradient.
     assert any(name.startswith("trunk.blocks.0") for name in with_grad)
-    assert "adapter.projection.weight" in with_grad
-    assert "adapter.projection.bias" in with_grad
+    assert "combiner.carry.weight" in with_grad
+    assert "combiner.gain" in with_grad
+    assert "combiner.type_bias" in with_grad
+    # The MLP proj is zero-initialized, so at step 0 the forward weight's
+    # gradient (which flows through proj) is exactly zero; proj itself moves
+    # first and unlocks fc, mirroring the pretraining identity-block recipe.
+    assert "combiner.mlps.0.proj.weight" in with_grad
+    assert "combiner.mlps.0.proj.bias" in with_grad
     assert "head.weight" in with_grad and "head.bias" in with_grad
     assert "trunk.tok_emb.weight" in with_grad

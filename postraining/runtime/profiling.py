@@ -136,6 +136,9 @@ class DisabledProfiler:
     def register_artifact(self, name: str, function):
         return function
 
+    def note_counter(self, name: str, value: float) -> None:
+        pass
+
     def pool_started(self, step: int) -> None:
         pass
 
@@ -592,6 +595,7 @@ class RunProfiler:
         self._worker_spans: list[tuple[str, float, float]] = []
         self._call_counts: dict[str, int] = {}
         self._calls_before_pool: dict[str, int] = {}
+        self._counters: dict[str, float] = {}
         self._compile_seconds: dict[str, float] = {}
         self._runtime_seconds: dict[str, float] = {}
         self._seen_compilations: set[tuple] = set()
@@ -675,10 +679,22 @@ class RunProfiler:
 
         return counted
 
+    def note_counter(self, name: str, value: float) -> None:
+        """Attach a per-pool scalar the phase tree cannot derive on its own.
+
+        The launch-count and phase records answer "how much work"; a counter
+        like the pool's decode step total supplies the denominator, so
+        ratios such as launches per decode step come out of the profile
+        alone instead of a manual join against the metrics stream. Values
+        accumulate within a pool and reset with it.
+        """
+        self._counters[name] = self._counters.get(name, 0.0) + value
+
     def pool_started(self, step: int) -> None:
         self._records.clear()
         self._events.clear()
         self._worker_spans.clear()
+        self._counters.clear()
         self._kernels = None
         # Allocator counters, read as a per-pool delta. An allocation retry
         # flushes the cache and synchronizes every stream, which presents
@@ -967,6 +983,7 @@ class RunProfiler:
                 name: count - self._calls_before_pool.get(name, 0)
                 for name, count in self._call_counts.items()
             },
+            "counters": dict(self._counters),
             "kernels": kernels,
             "allocator": self._allocator_delta(),
             "worker_seconds_total": sum(
@@ -1217,6 +1234,23 @@ def format_profile_summary(summary: dict) -> str:
                 )
         elif kernels:
             lines.append(f"    kernel summary failed: {kernels['error']}")
+        counters = pool.get("counters") or {}
+        if counters:
+            lines.append(
+                "    counters this pool: "
+                + ", ".join(
+                    f"{name}={value:g}"
+                    for name, value in sorted(counters.items())
+                )
+            )
+            decode_steps = counters.get("decode_steps")
+            if decode_steps and kernels and "error" not in kernels:
+                # An upper bound: the pool's launch total includes refresh
+                # and update work, not just the decode loop.
+                lines.append(
+                    "    host launch calls per decode step (upper bound): "
+                    f"{kernels['host_cuda_launch_calls'] / decode_steps:.0f}"
+                )
     outside = summary["compilations_outside_pools"]
     if outside:
         lines.append(

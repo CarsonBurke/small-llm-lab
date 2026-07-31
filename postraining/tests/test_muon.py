@@ -579,13 +579,9 @@ def test_build_optimizers_muon_layout_partitions_exactly():
     assert not (adamw_actor & actual_actor_muon)
     assert {id(p) for p in renderer_parameters(backbone)} <= adamw_actor
     assert id(backbone.embed.weight) in adamw_actor
-    assert {id(p) for p in wrapper.adapter.parameters()} <= adamw_actor
-    assert {
-        id(p) for p in wrapper.transition.log_sigma_head.parameters()
-    } <= adamw_actor
-    assert {
-        id(p) for p in wrapper.transition.mean_head.parameters()
-    } <= adamw_actor
+    # The combiner is not under backbone.blocks, so Muon routing never sees
+    # it: every combiner matrix stays under the actor AdamW.
+    assert {id(p) for p in wrapper.combiner.parameters()} <= adamw_actor
 
     critic_muon = {
         id(p)
@@ -603,7 +599,7 @@ def test_build_optimizers_muon_layout_partitions_exactly():
     assert not (critic_muon & critic_adamw)
     assert critic_muon | critic_adamw == {id(p) for p in critic.parameters()}
     assert id(critic.head.weight) in critic_adamw
-    assert {id(p) for p in critic.adapter.parameters()} <= critic_adamw
+    assert {id(p) for p in critic.combiner.parameters()} <= critic_adamw
 
 
 def test_build_optimizers_adamw_layout_is_unchanged():

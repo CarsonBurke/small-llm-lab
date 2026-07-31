@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import math
 from dataclasses import fields
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,13 +12,11 @@ import train_gpt as baseline
 from fresh_lejepa_train import FreshLeJEPAGPT
 from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.core import (
-    clipped_policy_loss,
     generalized_advantage_estimate,
     nearby_numeric_reward,
 )
 from postraining.latent_rollout import (
     PAD_SLOT,
-    THOUGHT_SLOT,
     TOKEN_SLOT,
     LatentRolloutBatch,
     assemble_stream_latents,
@@ -28,10 +25,10 @@ from postraining.latent_rollout import (
     compact_emit_token_logprobs,
     compact_next_slots,
     compact_slots,
-    compact_thought_actions,
     pack_rollout_groups_for_replay,
     continuation_reward,
     emitted_token_rows,
+    generated_slot_mask,
     iter_length_aware_microbatches,
     iter_planned_replay_microbatches,
     plan_length_aware_shards,
@@ -42,29 +39,22 @@ from postraining.latent_rollout import (
     scatter_slots,
     select_trajectory_rows,
     slot_index,
-    think_slot_mask,
     rollout_continuations,
     split_rollout_groups,
     trim_stream,
 )
 from postraining.latent_thought import (
-    EMIT,
-    THINK,
-    THOUGHT_DISTRIBUTION_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
-    THOUGHT_MEAN_SCHEMA,
     DecodeRangeMask,
     LatentThoughtModel,
 )
 from postraining.nano_backbone import NanoGPTBackbone
-from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import _pope_construction
 from postraining.vapo.config import (
     POLAR_EXPRESS_STEP_COMPENSATION,
     build_arg_parser,
     validate_args,
 )
-from postraining.vapo.objectives import exact_bernoulli_behavior_kl
 from postraining.train_latent_vapo import (
     MathPromptSampler,
     REWARD_SCHEMA,
@@ -75,37 +65,18 @@ from postraining.train_latent_vapo import (
     measure_post_update_policy_drift,
     sample_prompt_batch,
     score_math_rollout,
-    think_run_lengths,
-    rollout_diagnostics,
     save_checkpoint,
     update_minibatch,
-    verify_terminated_answer,
 )
+from postraining.latent_eval import verify_terminated_answer
 from postraining.vapo.schemas import (
     ACTOR_OBJECTIVE_SCHEMA,
     EXECUTION_SCHEMA,
-    IDENTITY_AFFINE_EXECUTION_SCHEMA,
-    JOINT_CLIP_EXECUTION_SCHEMA,
-    NO_THOUGHT_KL_EXECUTION_SCHEMA,
-    PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
-    PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
-    PREVIOUS_EXECUTION_SCHEMA,
     REPLAY_NUMERICS_SCHEMA,
-    UNANCHORED_VALUE_EXECUTION_SCHEMA,
-    ZERO_AFFINE_EXECUTION_SCHEMA,
-    execution_schema_for_adapter,
-    migrate_anchored_value_resume,
+    execution_schema_for_rollout_scheduler,
     resume_execution_schema_compatible,
     resume_replay_schema_compatible,
     value_support_geometry_matches,
-)
-from postraining.vapo.objectives import (
-    joint_action_logprobs,
-    joint_thought_policy_loss,
-    per_dimension_thought_policy_loss,
-    project_thought_means,
-    projected_thought_policy_loss,
-    sampled_reverse_kl,
 )
 from postraining.value_model import SeparateCritic
 
@@ -203,72 +174,10 @@ def test_rollout_emits_exactly_the_requested_tokens():
         assert len(row) == 5
 
 
-def test_emit_only_rollout_still_runs_the_thought_mean_densely():
-    wrapper = _wrapper()
-    with torch.no_grad():
-        wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(100.0)
-    projected_shapes = []
-    handle = wrapper.transition.mean_head.register_forward_pre_hook(
-        lambda _module, inputs: projected_shapes.append(tuple(inputs[0].shape))
-    )
-    try:
-        batch = _rollout(wrapper, batch=3, prompt=4, new_tokens=5)
-    finally:
-        handle.remove()
-    assert all(len(row) == 5 for row in emitted_token_rows(batch))
-    assert projected_shapes
-    assert all(
-        shape == (3, 1, wrapper.backbone.tok_emb.embedding_dim)
-        for shape in projected_shapes
-    )
-
-
-def test_thinking_is_unbounded_and_stream_budget_truncates():
-    wrapper = _wrapper()
-    # Bias the gate hard toward THINK: no watchdog interrupts, so runs grow
-    # past the old 4-think cap and rows exhaust the stream budget instead of
-    # being forced to emit.
-    with torch.no_grad():
-        wrapper.gate.head.bias.fill_(-5.0)
-    stream_steps = 24
-    batch = _rollout(
-        wrapper, batch=2, prompt=4, new_tokens=3, stream_steps=stream_steps
-    )
-    generated = batch.kind[:, batch.prompt_length:]
-    assert int(generated.size(1)) <= stream_steps
-    longest_run = 0
-    for row in range(generated.size(0)):
-        run = 0
-        for slot in generated[row].tolist():
-            run = run + 1 if slot == THOUGHT_SLOT else 0
-            longest_run = max(longest_run, run)
-    assert longest_run > 4
-    # Truncated rows emit fewer than the requested tokens and never more.
-    rows = emitted_token_rows(batch)
-    assert all(len(row) <= 3 for row in rows)
-    assert any(len(row) < 3 for row in rows)
-
-
 def test_stream_budget_smaller_than_emit_cap_is_rejected():
     wrapper = _wrapper()
     with pytest.raises(ValueError):
         rollout_continuations(wrapper, torch.randint(0, 32, (1, 4)), 8, 4, 1.0, 1.0)
-
-
-def test_emit_only_policy_needs_and_uses_one_extra_stream_slot():
-    wrapper = _deterministic_wrapper()
-    prompt_ids = torch.randint(0, 32, (2, 4))
-    with pytest.raises(ValueError, match="mandatory initial thought"):
-        rollout_continuations(
-            wrapper, prompt_ids, 4, 4, 1.0, 1e-6,
-        )
-    batch = rollout_continuations(
-        wrapper, prompt_ids, 4, 5, 1.0, 1e-6,
-    )
-    assert all(len(row) == 4 for row in emitted_token_rows(batch))
-    assert torch.all(batch.action_mask.sum(1) == 5)
-    assert torch.all(batch.stop_mask.sum(1) == 1)
 
 
 def test_stream_storage_is_internally_consistent():
@@ -276,73 +185,24 @@ def test_stream_storage_is_internally_consistent():
     batch = _rollout(wrapper, batch=4)
     prompt = batch.prompt_length
     assert torch.all(batch.kind[:, :prompt] == TOKEN_SLOT)
-    # Every latent-policy trajectory starts with a mandatory thought.
+    # The first action decides at the last prompt slot; its consequence (the
+    # first generated token, with the belief that produced it) lands at the
+    # next slot — the codebase's "+1 shift" convention.
     assert torch.all(batch.action_mask[:, prompt - 1] == 1)
-    assert torch.all(batch.actions[:, prompt - 1] == THINK)
-    assert torch.all(batch.stop_mask[:, prompt - 1] == 0)
-    assert torch.all(batch.kind[:, prompt] == THOUGHT_SLOT)
-    assert torch.all(batch.stop_mask <= batch.action_mask)
-    # Every recorded action produced a next input slot of a matching kind.
+    assert torch.all(batch.kind[:, prompt] == TOKEN_SLOT)
+    # Every recorded action produced a generated-token slot right after it,
+    # which is exactly where the hasThought flag derives from.
     action_positions = batch.action_mask.nonzero()
+    carried = generated_slot_mask(batch)
     for row, position in action_positions.tolist():
-        action = int(batch.actions[row, position])
-        next_kind = int(batch.kind[row, position + 1])
-        assert next_kind == (TOKEN_SLOT if action == EMIT else THOUGHT_SLOT)
-    # PAD slots carry no thoughts, no actions, no rewards.
+        assert int(batch.kind[row, position + 1]) == TOKEN_SLOT
+        assert bool(carried[row, position + 1])
+    # Prompt slots and the first action slot carry no hidden.
+    assert not carried[:, :prompt].any()
+    # PAD slots carry no hiddens, no actions, no rewards.
     pads = batch.kind == PAD_SLOT
     assert float(batch.action_mask[pads].sum()) == 0.0
-    assert float(batch.stop_mask[pads].sum()) == 0.0
-    assert float(batch.thoughts[pads].abs().sum()) == 0.0
-
-
-@pytest.mark.parametrize(("gate_bias", "decision"), ((100.0, EMIT), (-100.0, THINK)))
-def test_first_gate_decision_occurs_after_mandatory_thought(
-    gate_bias: float, decision: int
-):
-    wrapper = _wrapper()
-    with torch.no_grad():
-        wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(gate_bias)
-    prompt_ids = torch.randint(0, 32, (4, 5))
-    batch = rollout_continuations(
-        wrapper,
-        prompt_ids,
-        max_new_tokens=1,
-        max_stream_steps=2,
-        temperature=1.0,
-        top_p=1.0,
-    )
-    boundary = batch.prompt_length - 1
-    assert torch.all(batch.actions[:, boundary] == THINK)
-    assert torch.all(batch.stop_mask[:, boundary] == 0)
-    assert torch.all(batch.actions[:, boundary + 1] == decision)
-    assert torch.all(batch.stop_mask[:, boundary + 1] == 1)
-
-
-def test_stop_is_absorbing_and_masks_every_later_emit():
-    wrapper = _deterministic_wrapper()
-    batch = rollout_continuations(
-        wrapper,
-        torch.randint(0, 32, (3, 5)),
-        max_new_tokens=4,
-        max_stream_steps=5,
-        temperature=1.0,
-        top_p=1e-6,
-    )
-    boundary = batch.prompt_length - 1
-    expected_actions = torch.tensor([THINK, EMIT, EMIT, EMIT, EMIT])
-    assert torch.equal(
-        batch.actions[:, boundary : boundary + 5],
-        expected_actions.expand(3, -1),
-    )
-    expected_stop_mask = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
-    assert torch.equal(
-        batch.stop_mask[:, boundary : boundary + 5],
-        expected_stop_mask.expand(3, -1),
-    )
-    generated = batch.kind[:, batch.prompt_length :]
-    assert torch.all(generated[:, 0] == THOUGHT_SLOT)
-    assert torch.all(generated[:, 1:] == TOKEN_SLOT)
+    assert float(batch.hiddens[pads].abs().sum()) == 0.0
 
 
 def test_emit_token_logprobs_helper_matches_the_explicit_readout():
@@ -355,7 +215,7 @@ def test_emit_token_logprobs_helper_matches_the_explicit_readout():
     """
     wrapper = _wrapper()
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
-    emit_index = slot_index(batch.emit_mask.bool())
+    emit_index = slot_index(batch.action_mask.bool())
     with torch.no_grad():
         stream_inputs, beliefs = replay_beliefs(wrapper, batch)
         emit_inputs = compact_slots(stream_inputs, emit_index)
@@ -389,7 +249,7 @@ def test_compiled_emit_token_logprobs_agrees_with_eager():
     """
     wrapper = _wrapper()
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
-    emit_index = slot_index(batch.emit_mask.bool())
+    emit_index = slot_index(batch.action_mask.bool())
     with torch.no_grad():
         stream_inputs, beliefs = replay_beliefs(wrapper, batch)
         emit_inputs = compact_slots(stream_inputs, emit_index)
@@ -411,54 +271,75 @@ def test_replay_reproduces_rollout_logprobs():
     with torch.no_grad():
         stream_inputs, beliefs = replay_beliefs(wrapper, batch)
         features = wrapper.renderer_features(stream_inputs, beliefs)
-        stop_logprobs = wrapper.gate.log_prob(batch.actions.float(), beliefs)
         logits = backbone.logits_from_features(features).float()
         token_targets = torch.zeros_like(batch.token_ids)
         token_targets[:, :-1] = batch.token_ids[:, 1:]
         token_logprobs = logits.log_softmax(-1).gather(
             -1, token_targets[..., None]
         ).squeeze(-1)
-    mask = batch.stop_mask.bool()
     # The rollout never values: old_values stay zero until the separate
     # critic fills them in refresh_old_statistics.
     assert float(batch.old_values.abs().sum()) == 0.0
+    actions = batch.action_mask.bool()
     torch.testing.assert_close(
-        stop_logprobs[mask], batch.old_stop_logprobs[mask], rtol=2e-4, atol=2e-4
-    )
-    emits = batch.emit_mask.bool()
-    torch.testing.assert_close(
-        token_logprobs[emits], batch.old_token_logprobs[emits], rtol=2e-4, atol=2e-4
+        token_logprobs[actions], batch.old_token_logprobs[actions],
+        rtol=2e-4, atol=2e-4,
     )
 
 
-def test_assembled_latents_zero_pads_and_route_thoughts_through_adapter():
+def test_assembled_latents_zero_pads_and_route_hiddens_through_combiner():
     wrapper = _wrapper()
+    with torch.no_grad():
+        # A fresh combiner is an exact identity; give it a live content
+        # channel so the carried-hidden routing is observable.
+        wrapper.combiner.gain.fill_(0.3)
+        wrapper.combiner.type_bias.normal_(std=0.02)
     batch = _rollout(wrapper)
     with torch.no_grad():
         latents = assemble_stream_latents(wrapper, batch)
     pads = batch.kind == PAD_SLOT
     assert float(latents[pads].abs().sum()) == 0.0
-    thought_slots = batch.kind == THOUGHT_SLOT
-    if thought_slots.any():
-        expected = wrapper.adapt_thought_action(batch.thoughts).to(latents.dtype)
-        torch.testing.assert_close(latents[thought_slots], expected[thought_slots])
-    token_slots = batch.kind == TOKEN_SLOT
-    expected_tokens = wrapper.embed_tokens(batch.token_ids)
-    torch.testing.assert_close(latents[token_slots], expected_tokens[token_slots])
-
-
-def test_tanh_replay_consumes_squashed_thoughts_but_keeps_raw_actions():
-    wrapper = _wrapper()
-    wrapper.thought_action_transform = "tanh"
-    batch = _rollout(wrapper)
-    thought_slots = batch.kind == THOUGHT_SLOT
-    assert thought_slots.any()
+    carried = generated_slot_mask(batch)
+    token_latent = wrapper.embed_tokens(batch.token_ids)
     with torch.no_grad():
-        batch.thoughts[thought_slots] = 2.5
-        latents = assemble_stream_latents(wrapper, batch)
-    expected = wrapper.adapter(batch.thoughts.float().tanh()).to(latents.dtype)
-    torch.testing.assert_close(latents[thought_slots], expected[thought_slots])
-    assert torch.all(batch.thoughts[thought_slots] == 2.5)
+        expected = wrapper.combiner(token_latent, batch.hiddens, carried)
+    torch.testing.assert_close(latents[carried], expected[carried])
+    # Uncarried non-pad slots are bitwise the plain token path.
+    plain = ~carried & (batch.kind != PAD_SLOT)
+    assert torch.equal(latents[plain], token_latent[plain])
+
+
+def test_discarded_carry_batches_refuse_replay():
+    """Zero-width hiddens are replayable only for pinned token-only modes.
+
+    A latent rollout with ``replay_storage=False`` injected carries the
+    stored stream no longer contains; replaying it would silently rebuild
+    plain token inputs the behavior policy never saw, so it must raise.
+    """
+    wrapper = _wrapper()
+    prompt_ids = torch.randint(0, 32, (2, 5))
+    generator = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        discarded = trim_stream(
+            rollout_continuations(
+                wrapper, prompt_ids, 3, 24, 1.0, 1.0,
+                generator=generator, replay_storage=False,
+            )
+        )
+    assert discarded.carry_injected and discarded.hiddens.size(-1) == 0
+    with pytest.raises(ValueError, match="discarded its carried hiddens"):
+        assemble_stream_latents(wrapper, discarded)
+    generator = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        pinned = trim_stream(
+            rollout_continuations(
+                wrapper, prompt_ids, 3, 24, 1.0, 1.0,
+                generator=generator, replay_storage=False, pin_emit=True,
+            )
+        )
+        assert not pinned.carry_injected
+        # Pinned token-only rollouts replay through the plain token path.
+        assemble_stream_latents(wrapper, pinned)
 
 
 def test_terminal_reward_lands_on_the_last_action():
@@ -471,257 +352,6 @@ def test_terminal_reward_lands_on_the_last_action():
         position = int(batch.rewards[row].nonzero()[0])
         assert float(batch.action_mask[row, position]) == 1.0
         assert float(batch.action_mask[row, position + 1 :].sum()) == 0.0
-
-
-def test_forced_initial_think_and_first_emit_both_receive_terminal_credit():
-    wrapper = _deterministic_wrapper()
-    prompt_ids = torch.randint(0, 32, (2, 4))
-    batch = trim_stream(
-        rollout_continuations(
-            wrapper,
-            prompt_ids,
-            max_new_tokens=1,
-            max_stream_steps=2,
-            temperature=1.0,
-            top_p=1e-6,
-            stop_ids=tuple(range(32)),
-        )
-    )
-    assert torch.all(batch.action_mask.sum(1) == 2)
-    assert torch.all(batch.stop_mask.sum(1) == 1)
-    scores = torch.tensor([0.25, 0.75])
-    assign_terminal_rewards(batch, scores)
-    advantages, _ = generalized_advantage_estimate(
-        batch.rewards,
-        batch.old_values,
-        batch.action_mask,
-        torch.ones(2),
-    )
-    for row, score in enumerate(scores):
-        torch.testing.assert_close(
-            advantages[row][batch.action_mask[row].bool()],
-            torch.full((2,), float(score)),
-        )
-
-
-def test_joint_action_logprobs_match_emit_optional_and_forced_think() -> None:
-    new, old = joint_action_logprobs(
-        new_stop_logprobs=torch.tensor([[10.0, 20.0, 30.0]]),
-        old_stop_logprobs=torch.tensor([[1.0, 2.0, 3.0]]),
-        new_token_logprobs=torch.tensor([[100.0, 200.0, 300.0]]),
-        old_token_logprobs=torch.tensor([[4.0, 5.0, 6.0]]),
-        new_thought_logprobs=torch.tensor([[0.0, 2_000.0, 3_000.0]]),
-        old_thought_logprobs=torch.tensor([[0.0, 7.0, 8.0]]),
-        stop_mask=torch.tensor([[1.0, 1.0, 0.0]]),
-        emit_mask=torch.tensor([[1.0, 0.0, 0.0]]),
-    )
-    # EMIT=gate+token; optional THINK=gate+thought; forced THINK=thought only.
-    torch.testing.assert_close(new, torch.tensor([[110.0, 2_020.0, 3_000.0]]))
-    torch.testing.assert_close(old, torch.tensor([[5.0, 9.0, 8.0]]))
-
-
-def test_sampled_reverse_kl_matches_k3_value_and_gradient() -> None:
-    new = torch.tensor([[0.2, -0.4], [0.0, 0.1]], requires_grad=True)
-    old = torch.zeros_like(new)
-    factors = sampled_reverse_kl(new, old)
-    expected = torch.expm1(new.detach()) - new.detach()
-    torch.testing.assert_close(factors, expected)
-
-    coefficient = 0.3
-    action_denominator = 5.0
-    penalty = coefficient * factors.sum() / action_denominator
-    penalty.backward()
-    torch.testing.assert_close(
-        new.grad,
-        coefficient * torch.expm1(new.detach()) / action_denominator,
-    )
-
-
-def test_thought_policy_clips_dimensions_without_joint_ratio_coupling() -> None:
-    # The product 1.2 * 1.2 exceeds the upper clip, but each latent dimension
-    # is individually inside it. Per-dimension clipping therefore preserves
-    # the mean factor ratio instead of clipping their joint product.
-    new_thought = torch.log(torch.tensor([[1.2, 1.2]]))
-    loss, clip_fraction, gate_clip_fraction = per_dimension_thought_policy_loss(
-        new_stop_logprobs=torch.zeros(1),
-        old_stop_logprobs=torch.zeros(1),
-        new_thought_logprobs=new_thought,
-        old_thought_logprobs=torch.zeros_like(new_thought),
-        advantages=torch.ones(1),
-        stop_mask=torch.zeros(1),
-        action_denominator=torch.tensor(1.0),
-    )
-    torch.testing.assert_close(loss, torch.tensor(-1.2))
-    torch.testing.assert_close(clip_fraction, torch.tensor(0.0))
-    torch.testing.assert_close(gate_clip_fraction, torch.tensor(0.0))
-
-
-def test_thought_policy_averages_dimension_credit_and_clip_fraction() -> None:
-    new_thought = torch.log(torch.tensor([[1.5, 0.9]]))
-    loss, clip_fraction, gate_clip_fraction = per_dimension_thought_policy_loss(
-        new_stop_logprobs=torch.zeros(1),
-        old_stop_logprobs=torch.zeros(1),
-        new_thought_logprobs=new_thought,
-        old_thought_logprobs=torch.zeros_like(new_thought),
-        advantages=torch.ones(1),
-        stop_mask=torch.zeros(1),
-        action_denominator=torch.tensor(1.0),
-    )
-    torch.testing.assert_close(loss, torch.tensor(-(1.28 + 0.9) / 2))
-    torch.testing.assert_close(clip_fraction, torch.tensor(0.5))
-    torch.testing.assert_close(gate_clip_fraction, torch.tensor(0.0))
-
-
-def test_optional_think_shared_gate_receives_one_action_gradient() -> None:
-    gate = torch.zeros(1, requires_grad=True)
-    dimensions = torch.zeros(1, 4, requires_grad=True)
-    loss, clip_fraction, gate_clip_fraction = per_dimension_thought_policy_loss(
-        new_stop_logprobs=gate,
-        old_stop_logprobs=torch.zeros_like(gate),
-        new_thought_logprobs=dimensions,
-        old_thought_logprobs=torch.zeros_like(dimensions),
-        advantages=torch.ones(1),
-        stop_mask=torch.ones(1),
-        action_denominator=torch.tensor(1.0),
-    )
-    loss.backward()
-    torch.testing.assert_close(gate.grad, torch.tensor([-1.0]))
-    torch.testing.assert_close(dimensions.grad, -torch.ones_like(dimensions))
-    torch.testing.assert_close(loss, torch.tensor(-1.0))
-    torch.testing.assert_close(clip_fraction, torch.tensor(0.0))
-    torch.testing.assert_close(gate_clip_fraction, torch.tensor(0.0))
-
-
-def test_forced_think_excludes_gate_from_factorwise_policy_gradient() -> None:
-    gate = torch.zeros(1, requires_grad=True)
-    dimensions = torch.zeros(1, 3, requires_grad=True)
-    loss, _, gate_clip_fraction = per_dimension_thought_policy_loss(
-        new_stop_logprobs=gate,
-        old_stop_logprobs=torch.zeros_like(gate),
-        new_thought_logprobs=dimensions,
-        old_thought_logprobs=torch.zeros_like(dimensions),
-        advantages=torch.ones(1),
-        stop_mask=torch.zeros(1),
-        action_denominator=torch.tensor(1.0),
-    )
-    loss.backward()
-    torch.testing.assert_close(gate.grad, torch.zeros_like(gate))
-    torch.testing.assert_close(dimensions.grad, -torch.ones_like(dimensions))
-    torch.testing.assert_close(gate_clip_fraction, torch.tensor(0.0))
-
-
-def test_forced_initial_think_trains_content_but_not_the_gate():
-    wrapper = _wrapper()
-    critic = _critic()
-    batch = rollout_continuations(
-        wrapper,
-        torch.randint(0, 32, (4, 5)),
-        max_new_tokens=0,
-        max_stream_steps=1,
-        temperature=1.0,
-        top_p=1.0,
-        generator=torch.Generator().manual_seed(17),
-    )
-    assert batch.stop_mask.sum() == 0
-    assign_terminal_rewards(batch, torch.tensor([0.1, 0.3, 0.6, 0.9]))
-    refresh_old_statistics(wrapper, critic, batch)
-    gate_before = [parameter.detach().clone() for parameter in wrapper.gate.parameters()]
-    mean_before = [
-        parameter.detach().clone()
-        for parameter in wrapper.transition.mean_head.parameters()
-    ]
-    metrics = update_minibatch(
-        wrapper, critic, batch, _optimizers(wrapper, critic)
-    )
-    assert torch.isfinite(torch.tensor(metrics["policy_loss"]))
-    assert metrics["think_action_count"] == 0.0
-    assert metrics["forced_initial_think_action_count"] == 4.0
-    assert all(
-        torch.equal(before, after)
-        for before, after in zip(gate_before, wrapper.gate.parameters(), strict=True)
-    )
-    assert any(
-        not torch.equal(before, after)
-        for before, after in zip(
-            mean_before,
-            wrapper.transition.mean_head.parameters(),
-            strict=True,
-        )
-    )
-
-
-def test_diagnostics_separate_initial_and_continued_thinking():
-    wrapper = _deterministic_wrapper()
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    batch.reward_scalar.copy_(torch.tensor([0.0, 0.25, 0.5, 1.0]))
-    metrics = rollout_diagnostics(batch, samples_per_prompt=4)
-    assert metrics["continue_thinking_fraction"] == 0.0
-    assert metrics["exact_accuracy"] == 0.25
-    assert metrics["exact_within_group_reward_std"] == pytest.approx(
-        3**0.5 / 4
-    )
-    assert metrics["partial_reward_fraction"] == 0.5
-    assert metrics["initial_thoughts_per_trajectory"] == 1.0
-    assert metrics["thoughts_per_trajectory"] == 1.0
-    assert metrics["stopped_thinking_trajectory_fraction"] == 1.0
-    assert metrics["continued_thinking_trajectory_fraction"] == 0.0
-    assert metrics["reward_mean_stopped_after_initial"] == pytest.approx(
-        0.4375
-    )
-
-
-def test_gate_pg_coef_zero_freezes_the_gate_but_not_the_rest():
-    wrapper = _wrapper()
-    critic = _critic()
-    with torch.no_grad():
-        wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        # Nonzero gate weights so an unfrozen update would visibly move them.
-        wrapper.gate.head.weight.normal_(std=0.02)
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    assign_terminal_rewards(batch, torch.rand(4))
-    refresh_old_statistics(wrapper, critic, batch)
-    gate_weight = wrapper.gate.head.weight.clone()
-    gate_bias = wrapper.gate.head.bias.clone()
-    trunk_before = wrapper.backbone.blocks[0].attn.proj.weight.clone()
-    metrics = update_minibatch(
-        wrapper,
-        critic,
-        batch,
-        _optimizers(wrapper, critic),
-        gate_pg_coef=0.0,
-        gate_entropy_coef=0.2,
-    )
-    assert torch.equal(wrapper.gate.head.weight, gate_weight)
-    assert torch.equal(wrapper.gate.head.bias, gate_bias)
-    # Freezing the gate must not freeze the actor: the trunk still trains
-    # through the renderer/thought terms.
-    assert not torch.equal(wrapper.backbone.blocks[0].attn.proj.weight, trunk_before)
-    assert torch.isfinite(torch.tensor(metrics["policy_loss"]))
-    assert metrics["gate_entropy_bonus"] == 0.0
-
-
-def test_gate_entropy_bonus_has_the_right_normalization():
-    wrapper = _wrapper()
-    critic = _critic()
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    assign_terminal_rewards(batch, torch.rand(4))
-    refresh_old_statistics(wrapper, critic, batch)
-
-    metrics = update_minibatch(
-        wrapper,
-        critic,
-        batch,
-        _optimizers(wrapper, critic),
-        gate_entropy_coef=0.2,
-    )
-
-    assert metrics["gate_entropy_coef"] == 0.2
-    assert metrics["gate_entropy_bonus"] == pytest.approx(
-        0.2
-        * metrics["gate_entropy"]
-        * metrics["gate_action_count"]
-        / metrics["action_count"]
-    )
 
 
 def test_update_minibatch_trains_the_full_policy_model():
@@ -738,7 +368,7 @@ def test_update_minibatch_trains_the_full_policy_model():
     trunk_before = backbone.blocks[0].attn.proj.weight.clone()
     embed_before = backbone.tok_emb.weight.clone()
     critic_trunk_before = critic.trunk.blocks[0].attn.proj.weight.clone()
-    gate_before = wrapper.gate.head.weight.clone()
+    combiner_gain_before = wrapper.combiner.gain.clone()
     frozen_probe_before = backbone.critic_probe.output.weight.clone()
     metrics = update_minibatch(wrapper, critic, batch, _optimizers(wrapper, critic))
     assert all(
@@ -751,7 +381,8 @@ def test_update_minibatch_trains_the_full_policy_model():
     assert not torch.equal(
         critic.trunk.blocks[0].attn.proj.weight, critic_trunk_before
     )
-    assert not torch.equal(wrapper.gate.head.weight, gate_before)
+    # The combiner gain has a first-step gradient through W(h) . dL/dinput.
+    assert not torch.equal(wrapper.combiner.gain, combiner_gain_before)
     # Only the unused backbone critic probe stays frozen.
     assert torch.equal(backbone.critic_probe.output.weight, frozen_probe_before)
     assert metrics["trunk_grad_norm"] > 0.0
@@ -770,16 +401,9 @@ def _decode_group(row_actions: list[int], prompt: int, bucket: int = 1):
     return LatentRolloutBatch(
         kind=torch.full((rows, stream), TOKEN_SLOT, dtype=torch.long),
         token_ids=torch.zeros((rows, stream), dtype=torch.long),
-        thoughts=torch.zeros(rows, stream, 0),
-        actions=torch.full((rows, stream), EMIT, dtype=torch.long),
+        hiddens=torch.zeros(rows, stream, 0),
         action_mask=action_mask,
-        stop_mask=zeros.clone(),
-        emit_mask=zeros.clone(),
-        old_stop_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
-        old_thought_logprobs=torch.zeros(rows, stream, 0),
-        old_thought_means=torch.zeros(rows, stream, 0),
-        old_thought_log_sigmas=torch.zeros(rows, stream, 0),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(rows),
@@ -893,12 +517,9 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
     wrapper = _wrapper()
     critic = _critic()
     with torch.no_grad():
-        # Exercise actual state- and dimension-dependent noise. Zero-init
-        # would let this test pass even if refresh priced the wrong belief.
-        wrapper.transition.log_sigma_head.weight.normal_(std=0.02)
-        wrapper.transition.log_sigma_head.bias.copy_(
-            torch.linspace(-2.4, -1.6, wrapper.backbone.tok_emb.embedding_dim)
-        )
+        # A live combiner makes the carried-hidden path load-bearing; a fresh
+        # identity combiner would let this pass even if refresh dropped it.
+        wrapper.combiner.gain.fill_(0.3)
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
     refresh_old_statistics(wrapper, critic, batch)
     backbone = wrapper.backbone
@@ -907,45 +528,26 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
             wrapper, batch
         )
         values = critic.values(batch).float()
-        stop_logprobs = wrapper.gate.log_prob(batch.actions.float(), beliefs)
-        emit_mask = batch.emit_mask.bool()
-        emit_features = wrapper.renderer_features(
-            stream_inputs[emit_mask], beliefs[emit_mask]
+        action_mask = batch.action_mask.bool()
+        action_features = wrapper.renderer_features(
+            stream_inputs[action_mask], beliefs[action_mask]
         )
         compact_token_logprobs = (
-            backbone.logits_from_features(emit_features)
+            backbone.logits_from_features(action_features)
             .float()
             .log_softmax(-1)
             .gather(
                 -1,
                 compact_next_slots(
-                    batch.token_ids, slot_index(emit_mask)
+                    batch.token_ids, slot_index(action_mask)
                 )[..., None],
             )
             .squeeze(-1)
         )
         token_logprobs = torch.zeros_like(batch.old_token_logprobs)
-        token_logprobs[emit_mask] = compact_token_logprobs
+        token_logprobs[action_mask] = compact_token_logprobs
     assert torch.equal(batch.old_values, values)
-    assert torch.equal(
-        batch.old_stop_logprobs,
-        stop_logprobs.float() * batch.stop_mask,
-    )
     assert torch.equal(batch.old_token_logprobs, token_logprobs)
-    with torch.no_grad():
-        think_mask = think_slot_mask(batch)
-        thought_means, thought_targets = compact_thought_actions(
-            wrapper, batch, beliefs, slot_index(think_mask)
-        )
-        compact_logprobs = wrapper.transition.per_dim_log_prob(
-            thought_targets,
-            thought_means,
-            wrapper.transition.predict_log_sigma(beliefs[think_mask]),
-        )
-        thought_logprobs = torch.zeros_like(batch.old_thought_logprobs)
-        thought_logprobs[think_mask] = compact_logprobs
-    # Epoch-0 thought log-probability factors are identical by construction.
-    assert torch.equal(batch.old_thought_logprobs, thought_logprobs.float())
 
 
 def test_microbatched_refresh_matches_full_group_refresh():
@@ -966,21 +568,14 @@ def test_microbatched_refresh_matches_full_group_refresh():
 
     masks = {
         "old_values": batch.action_mask.bool(),
-        "old_stop_logprobs": batch.stop_mask.bool(),
-        "old_token_logprobs": batch.emit_mask.bool(),
-        "old_thought_logprobs": (
-            (batch.actions == THINK) & batch.action_mask.bool()
-        ),
+        "old_token_logprobs": batch.action_mask.bool(),
     }
     for name, mask in masks.items():
-        # Compact THINK means use a GEMM whose row count follows each shard;
-        # different legal GEMM tilings can differ by a few fp32 ULPs.
-        thought_rtol = 1e-5 if name == "old_thought_logprobs" else 1e-6
         torch.testing.assert_close(
             getattr(microbatched, name)[mask],
             getattr(full, name)[mask],
-            rtol=thought_rtol,
-                atol=1e-6 if name == "old_thought_logprobs" else 1e-7,
+            rtol=1e-6,
+            atol=1e-7,
         )
 
 
@@ -1112,7 +707,6 @@ def test_length_aware_refresh_writes_noncontiguous_parent_rows():
     critic = _critic()
     batch = _rollout(wrapper, batch=6, prompt=6, new_tokens=4)
     batch.old_values.fill_(float("nan"))
-    batch.old_stop_logprobs.fill_(float("nan"))
     batch.old_token_logprobs.fill_(float("nan"))
     refresh_old_statistics(
         wrapper,
@@ -1122,18 +716,13 @@ def test_length_aware_refresh_writes_noncontiguous_parent_rows():
         attention_budget=10**9,
     )
     assert torch.isfinite(batch.old_values[batch.action_mask.bool()]).all()
-    assert torch.isfinite(batch.old_stop_logprobs[batch.stop_mask.bool()]).all()
-    assert torch.isfinite(batch.old_token_logprobs[batch.emit_mask.bool()]).all()
-    think_mask = (batch.actions == THINK) & batch.action_mask.bool()
-    assert torch.isfinite(batch.old_thought_logprobs[think_mask]).all()
+    assert torch.isfinite(
+        batch.old_token_logprobs[batch.action_mask.bool()]
+    ).all()
 
 
 def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
     base_wrapper = _wrapper()
-    with torch.no_grad():
-        # Ensure optional THINK actions as well as the forced action are
-        # represented on both sides of the trajectory-microbatch boundary.
-        base_wrapper.gate.head.bias.fill_(-0.5)
     base_critic = _critic()
     batch = _rollout(
         base_wrapper, batch=6, prompt=5, new_tokens=4, stream_steps=20, seed=19
@@ -1144,21 +733,15 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         base_wrapper, base_critic, batch,
         max_trajectories=batch.kind.size(0), attention_budget=10**9,
     )
-    assert bool(((batch.actions == THINK) & batch.stop_mask.bool()).any())
-    # The stored behavior statistics stay frozen while all three actor
-    # factors move. This makes the shard-invariance check exercise nonzero
-    # KL accumulation rather than the trivial refresh-equals-current case.
+    # The stored behavior statistics stay frozen while the current policy
+    # moves. This makes the shard-invariance check exercise nonzero KL
+    # accumulation rather than the trivial refresh-equals-current case.
     with torch.no_grad():
-        base_wrapper.gate.head.bias.add_(0.01)
         renderer_output = base_wrapper.backbone.policy_probe.output.weight
         renderer_output.add_(
             torch.linspace(
                 -0.01, 0.01, renderer_output.numel()
             ).reshape_as(renderer_output)
-        )
-        thought_bias = base_wrapper.transition.mean_head.bias
-        thought_bias.add_(
-            torch.linspace(-0.01, 0.01, thought_bias.numel())
         )
 
     full_wrapper = copy.deepcopy(base_wrapper)
@@ -1168,12 +751,6 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
     full_optimizers = _optimizers(full_wrapper, full_critic)
     micro_optimizers = _optimizers(micro_wrapper, micro_critic)
 
-    kwargs = dict(
-        thought_pg_coef=0.7,
-        thought_reverse_kl_coef=0.3,
-        gate_pg_coef=0.8,
-        gate_entropy_coef=0.02,
-    )
     full_metrics = update_minibatch(
         full_wrapper,
         full_critic,
@@ -1181,7 +758,6 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         full_optimizers,
         replay_max_trajectories=6,
         replay_attention_budget=10**9,
-        **kwargs,
     )
     micro_metrics = update_minibatch(
         micro_wrapper,
@@ -1190,20 +766,14 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         micro_optimizers,
         replay_max_trajectories=2,
         replay_attention_budget=10**9,
-        **kwargs,
     )
 
     for key in (
         "value_loss",
         "policy_loss",
-        "thought_reverse_kl_penalty",
-        "gate_entropy_bonus",
         "advantage_mean",
         "advantage_std",
-        "gate_behavior_kl",
-        "renderer_behavior_kl",
-        "thought_behavior_kl_joint",
-        "thought_behavior_kl_per_dim",
+        "token_behavior_kl",
         "policy_behavior_kl_per_action",
     ):
         torch.testing.assert_close(
@@ -1229,37 +799,12 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
             micro_parameter, full_parameter, rtol=3e-4, atol=2e-5
         )
 
-    assert full_metrics["gate_behavior_kl"] > 0
-    assert full_metrics["renderer_behavior_kl"] > 0
-    assert full_metrics["thought_behavior_kl_joint"] > 0
-    thought_count = (
-        (batch.actions == THINK).float() * batch.action_mask
-    ).sum()
-    expected_reverse_kl_penalty = (
-        0.3
-        * full_metrics["thought_behavior_kl_joint"]
-        * thought_count
-        / batch.action_mask.sum()
-    )
-    torch.testing.assert_close(
-        torch.tensor(full_metrics["thought_reverse_kl_penalty"]),
-        expected_reverse_kl_penalty,
-    )
-    torch.testing.assert_close(
-        torch.tensor(full_metrics["thought_behavior_kl_joint"]),
-        torch.tensor(full_metrics["thought_behavior_kl_per_dim"])
-        * batch.old_thought_logprobs.size(-1),
-    )
-    gate_count = batch.stop_mask.sum()
-    emit_count = batch.emit_mask.sum()
-    expected_policy_kl = (
-        full_metrics["gate_behavior_kl"] * gate_count
-        + full_metrics["renderer_behavior_kl"] * emit_count
-        + full_metrics["thought_behavior_kl_joint"] * thought_count
-    ) / batch.action_mask.sum()
+    assert full_metrics["token_behavior_kl"] > 0
+    # With tokens as the only actions, the per-action policy KL IS the token
+    # behavior KL (both divide the same sum by the same action count).
     torch.testing.assert_close(
         torch.tensor(full_metrics["policy_behavior_kl_per_action"]),
-        expected_policy_kl,
+        torch.tensor(full_metrics["token_behavior_kl"]),
     )
 
     # Adam must see one full-group update, not one update per replay shard.
@@ -1272,602 +817,10 @@ def test_trajectory_microbatch_update_matches_full_group_objective_and_step():
         assert steps == {1}
 
 
-def test_joint_thought_policy_loss_matches_per_dim_reporting_at_ratio_one():
-    torch.manual_seed(5)
-    actions, dims = 6, 8
-    new_thought = torch.randn(actions, dims, requires_grad=True)
-    old_thought = new_thought.detach().clone()
-    new_gate = torch.randn(actions, requires_grad=True)
-    old_gate = new_gate.detach().clone()
-    advantages = torch.randn(actions)
-    stop_mask = (torch.arange(actions) % 2 == 0).float()
-    denominator = torch.tensor(24.0)
-
-    joint_loss, joint_clip, joint_gate_clip = joint_thought_policy_loss(
-        new_gate, old_gate, new_thought, old_thought,
-        advantages, stop_mask, denominator,
-    )
-    per_dim_loss, per_dim_clip, per_dim_gate_clip = (
-        per_dimension_thought_policy_loss(
-            new_gate, old_gate, new_thought, old_thought,
-            advantages, stop_mask, denominator,
-        )
-    )
-    # At ratio one both objectives report one action's loss (the detached
-    # baseline correction) and nothing clips under either band.
-    torch.testing.assert_close(joint_loss, per_dim_loss)
-    assert float(joint_clip) == 0.0
-    assert float(joint_gate_clip) == 0.0
-    assert float(per_dim_clip) == 0.0
-    assert float(per_dim_gate_clip) == 0.0
-
-
-def test_joint_thought_clip_is_all_or_nothing_where_per_dim_never_binds():
-    # Drift spread thinly across dimensions: 0.01/dim is far inside the
-    # per-dimension band while the summed joint ratio (0.64) is far outside
-    # it. The joint objective must kill the favorable-direction gradient for
-    # the whole action, keep the harmful direction live and unclipped, and
-    # count each out-of-band action once.
-    actions, dims = 2, 64
-    old_thought = torch.zeros(actions, dims)
-    drift = torch.full((actions, dims), 0.01)
-    advantages = torch.tensor([1.0, -1.0])
-    stop_mask = torch.zeros(actions)  # forced thinks: Gaussian factor only
-    old_gate = torch.zeros(actions)
-    denominator = torch.tensor(2.0)
-
-    new_thought = drift.clone().requires_grad_(True)
-    new_gate = torch.zeros(actions, requires_grad=True)
-    joint_loss, joint_clip, joint_gate_clip = joint_thought_policy_loss(
-        new_gate, old_gate, new_thought, old_thought,
-        advantages, stop_mask, denominator,
-    )
-    joint_loss.backward()
-    assert torch.all(new_thought.grad[0] == 0.0)
-    assert torch.all(new_thought.grad[1] != 0.0)
-    assert float(joint_clip) == pytest.approx(1.0)
-    assert float(joint_gate_clip) == 0.0
-
-    per_dim_thought = drift.clone().requires_grad_(True)
-    per_dim_gate = torch.zeros(actions, requires_grad=True)
-    per_dim_loss, per_dim_clip, _ = per_dimension_thought_policy_loss(
-        per_dim_gate, old_gate, per_dim_thought, old_thought,
-        advantages, stop_mask, denominator,
-    )
-    per_dim_loss.backward()
-    assert float(per_dim_clip) == 0.0
-    assert torch.all(per_dim_thought.grad[0] != 0.0)
-
-
-def test_joint_thought_policy_loss_validates_shapes_and_update_mode():
-    new_thought = torch.zeros(3, 4)
-    with pytest.raises(ValueError, match="gate mask"):
-        joint_thought_policy_loss(
-            torch.zeros(3), torch.zeros(3), new_thought, new_thought,
-            torch.zeros(3), torch.zeros(2), torch.tensor(3.0),
-        )
-    with pytest.raises(ValueError, match="must match"):
-        joint_thought_policy_loss(
-            torch.zeros(3), torch.zeros(3), new_thought,
-            torch.zeros(3, 5), torch.zeros(3), torch.zeros(3),
-            torch.tensor(3.0),
-        )
-    wrapper = _wrapper()
-    critic = _critic()
-    batch = _rollout(wrapper)
-    assign_terminal_rewards(batch, torch.rand(2))
-    refresh_old_statistics(wrapper, critic, batch)
-    with pytest.raises(ValueError, match="thought clip mode"):
-        update_minibatch(
-            wrapper, critic, batch, _optimizers(wrapper, critic),
-            thought_clip_mode="bogus",
-        )
-
-
-def test_project_thought_means_is_the_identity_inside_the_trust_region():
-    torch.manual_seed(9)
-    old_means = torch.randn(4, 8)
-    old_log_sigmas = torch.randn(4, 8) * 0.3
-    # Shift each mean by well under sqrt(epsilon) in behavior-sigma units.
-    shift = torch.randn(4, 8)
-    shift = shift / shift.square().sum(-1, keepdim=True).sqrt()
-    new_means = (
-        old_means + 0.1 * shift * old_log_sigmas.exp()
-    ).requires_grad_(True)
-
-    projected, scale, mahalanobis_sq = project_thought_means(
-        new_means, old_means, old_log_sigmas, epsilon=0.3
-    )
-    torch.testing.assert_close(
-        mahalanobis_sq, torch.full((4,), 0.01), atol=1e-5, rtol=1e-5
-    )
-    assert torch.all(scale == 1.0)
-    assert torch.equal(projected, new_means)
-    # Inside the region the map is the identity, so gradients pass through
-    # completely untouched.
-    upstream = torch.randn(4, 8)
-    projected.backward(upstream)
-    torch.testing.assert_close(new_means.grad, upstream)
-
-
-def test_project_thought_means_boundary_jacobian_kills_radial_gradient():
-    # Outside the region the analytic Jacobian is s * (I - u u^T) in
-    # behavior-sigma units: the radial component (which would keep pushing
-    # outward) is annihilated while tangential learning survives, scaled.
-    torch.manual_seed(13)
-    epsilon = 1.0
-    old_means = torch.zeros(1, 3)
-    old_log_sigmas = torch.zeros(1, 3)  # sigma = 1: normalized == raw
-    direction = torch.tensor([[2.0, 0.0, 0.0]])
-
-    radial = direction.clone().requires_grad_(True)
-    projected, scale, mahalanobis_sq = project_thought_means(
-        radial, old_means, old_log_sigmas, epsilon
-    )
-    assert float(mahalanobis_sq.detach()) == pytest.approx(4.0)
-    assert float(scale.detach()) == pytest.approx(0.5)
-    torch.testing.assert_close(projected, torch.tensor([[1.0, 0.0, 0.0]]))
-    projected.backward(torch.tensor([[1.0, 0.0, 0.0]]))  # upstream along u
-    torch.testing.assert_close(
-        radial.grad, torch.zeros(1, 3), atol=1e-6, rtol=0.0
-    )
-
-    tangential = direction.clone().requires_grad_(True)
-    projected, _, _ = project_thought_means(
-        tangential, old_means, old_log_sigmas, epsilon
-    )
-    projected.backward(torch.tensor([[0.0, 1.0, 0.0]]))  # upstream _|_ u
-    torch.testing.assert_close(
-        tangential.grad, torch.tensor([[0.0, 0.5, 0.0]])
-    )
-
-    # Full Jacobian against the closed form on a generic point.
-    generic = torch.randn(1, 3, dtype=torch.float64)
-    generic = generic * (3.0 / generic.norm())
-    jacobian = torch.autograd.functional.jacobian(
-        lambda m: project_thought_means(
-            m, old_means.double(), old_log_sigmas.double(), epsilon
-        )[0],
-        generic,
-    ).reshape(3, 3)
-    unit = (generic / generic.norm()).reshape(3, 1)
-    expected_scale = math.sqrt(epsilon) / generic.norm()
-    torch.testing.assert_close(
-        jacobian,
-        expected_scale * (torch.eye(3, dtype=torch.float64) - unit @ unit.T),
-    )
-
-
-def test_project_thought_means_distance_is_twice_the_frozen_sigma_kl():
-    torch.manual_seed(17)
-    old_means = torch.randn(5, 6)
-    new_means = torch.randn(5, 6)
-    old_log_sigmas = torch.randn(5, 6) * 0.4
-    _, _, mahalanobis_sq = project_thought_means(
-        new_means, old_means, old_log_sigmas, epsilon=0.3
-    )
-    normalized = (new_means - old_means) / old_log_sigmas.exp()
-    torch.testing.assert_close(mahalanobis_sq, normalized.square().sum(-1))
-    # At equal sigmas the Gaussian KL reduces to half the squared
-    # Mahalanobis distance, so epsilon = 0.3 caps KL at 0.15 nats.
-    sigma_sq = (2.0 * old_log_sigmas).exp()
-    kl = 0.5 * ((new_means - old_means).square() / sigma_sq).sum(-1)
-    torch.testing.assert_close(mahalanobis_sq, 2.0 * kl)
-
-    with pytest.raises(ValueError, match="epsilon"):
-        project_thought_means(new_means, old_means, old_log_sigmas, 0.0)
-    with pytest.raises(ValueError, match="must match"):
-        project_thought_means(
-            new_means, old_means[:, :4], old_log_sigmas, 0.3
-        )
-    with pytest.raises(ValueError, match="log sigmas"):
-        project_thought_means(
-            new_means, old_means, old_log_sigmas[:, :4], 0.3
-        )
-
-
-def test_projected_thought_policy_loss_matches_joint_gradient_at_age_zero():
-    # Fresh behavior statistics mean no projection and ratio one, where the
-    # projected surrogate and the joint clip objective are both exactly
-    # A * grad(log pi): identical losses AND identical gradients.
-    torch.manual_seed(21)
-    actions, dims = 6, 8
-    base_thought = torch.randn(actions, dims)
-    advantages = torch.randn(actions)
-    stop_mask = (torch.arange(actions) % 2 == 0).float()
-    base_gate = torch.randn(actions)
-    denominator = torch.tensor(24.0)
-
-    projected_thought = base_thought.clone().requires_grad_(True)
-    projected_gate = base_gate.clone().requires_grad_(True)
-    projected_loss, projection_fraction, projected_gate_clip = (
-        projected_thought_policy_loss(
-            projected_gate, base_gate.clone(),
-            projected_thought, base_thought.clone(),
-            torch.ones(actions), advantages, stop_mask, denominator,
-        )
-    )
-    projected_loss.backward()
-
-    joint_thought = base_thought.clone().requires_grad_(True)
-    joint_gate = base_gate.clone().requires_grad_(True)
-    joint_loss, joint_clip, joint_gate_clip = joint_thought_policy_loss(
-        joint_gate, base_gate.clone(),
-        joint_thought, base_thought.clone(),
-        advantages, stop_mask, denominator,
-    )
-    joint_loss.backward()
-
-    torch.testing.assert_close(projected_loss, joint_loss)
-    torch.testing.assert_close(projected_thought.grad, joint_thought.grad)
-    torch.testing.assert_close(projected_gate.grad, joint_gate.grad)
-    assert float(projection_fraction) == 0.0
-    assert float(joint_clip) == 0.0
-    assert float(projected_gate_clip) == float(joint_gate_clip) == 0.0
-
-
-def test_projected_thought_policy_loss_ratio_guard_and_validation():
-    actions, dims = 2, 4
-    old_thought = torch.zeros(actions, dims)
-    # Joint log-ratios +5 and -5, far beyond the +/-2 numerical guard.
-    new_thought = torch.tensor([[1.25] * dims, [-1.25] * dims])
-    new_thought = new_thought.requires_grad_(True)
-    advantages = torch.tensor([1.0, 1.0])
-    stop_mask = torch.zeros(actions)  # forced thinks: Gaussian factor only
-    gate = torch.zeros(actions)
-    denominator = torch.tensor(2.0)
-
-    loss, _, _ = projected_thought_policy_loss(
-        gate.clone().requires_grad_(True), gate,
-        new_thought, old_thought,
-        torch.ones(actions), advantages, stop_mask, denominator,
-    )
-    expected = -(math.exp(2.0) + math.exp(-2.0)) / 2.0
-    torch.testing.assert_close(loss, torch.tensor(expected))
-    loss.backward()
-    # The clamp is saturated on both rows, so no gradient flows: the guard
-    # only exists to bound the exponential, never to steer learning.
-    torch.testing.assert_close(new_thought.grad, torch.zeros(actions, dims))
-
-    with pytest.raises(ValueError, match="trust scale"):
-        projected_thought_policy_loss(
-            gate, gate, old_thought, old_thought,
-            torch.ones(3), advantages, stop_mask, denominator,
-        )
-    with pytest.raises(ValueError, match="gate advantages"):
-        projected_thought_policy_loss(
-            gate, gate, old_thought, old_thought,
-            torch.ones(actions), advantages, stop_mask, denominator,
-            gate_advantages=torch.zeros(3),
-        )
-    with pytest.raises(ValueError, match="ratio guard"):
-        projected_thought_policy_loss(
-            gate, gate, old_thought, old_thought,
-            torch.ones(actions), advantages, stop_mask, denominator,
-            ratio_guard=0.0,
-        )
-
-
-def test_refresh_stores_behavior_gaussian_parameters_for_projection():
-    wrapper = _wrapper()
-    critic = _critic()
-    with torch.no_grad():
-        # Bias the gate toward THINK so thought actions certainly occur, and
-        # give sigma real state dependence so a head/belief mismatch in the
-        # stored statistics could not slip through zeros.
-        wrapper.gate.head.bias.fill_(-2.0)
-        wrapper.transition.log_sigma_head.weight.normal_(std=0.02)
-        wrapper.transition.log_sigma_head.bias.copy_(
-            torch.linspace(-2.4, -1.6, wrapper.backbone.tok_emb.embedding_dim)
-        )
-    batch = _rollout(wrapper, batch=4, prompt=6, new_tokens=4)
-    assert batch.old_thought_means.size(-1) == 0  # zero-width until refresh
-    assert batch.old_thought_log_sigmas.size(-1) == 0
-    refresh_old_statistics(wrapper, critic, batch)
-
-    with torch.no_grad():
-        beliefs, _ = replay_head_inputs(wrapper, batch)
-        think_mask = think_slot_mask(batch)
-        thought_means, _ = compact_thought_actions(
-            wrapper, batch, beliefs, slot_index(think_mask)
-        )
-        thought_log_sigmas = wrapper.transition.predict_log_sigma(
-            beliefs[think_mask]
-        )
-    assert think_mask.sum() > 0
-    expected_means = torch.zeros_like(batch.old_thought_means)
-    expected_means[think_mask] = thought_means.float()
-    expected_log_sigmas = torch.zeros_like(batch.old_thought_log_sigmas)
-    expected_log_sigmas[think_mask] = thought_log_sigmas.float()
-    assert torch.equal(batch.old_thought_means, expected_means)
-    assert torch.equal(batch.old_thought_log_sigmas, expected_log_sigmas)
-
-    # Age-0 canary: against its own refresh the policy is at distance zero
-    # EXACTLY, so nothing projects and the surrogate sits at ratio one.
-    projected, scale, mahalanobis_sq = project_thought_means(
-        thought_means.float(),
-        batch.old_thought_means[think_mask],
-        batch.old_thought_log_sigmas[think_mask],
-        epsilon=0.3,
-    )
-    assert torch.all(mahalanobis_sq == 0.0)
-    assert torch.all(scale == 1.0)
-    assert torch.equal(projected, thought_means.float())
-
-
-def test_thought_mean_runs_only_on_compact_think_slots():
-    wrapper = _wrapper()
-    with torch.no_grad():
-        wrapper.gate.head.bias.fill_(-2.0)
-    batch = _rollout(wrapper, batch=4, prompt=6, new_tokens=4)
-    beliefs, _ = replay_head_inputs(wrapper, batch)
-    think_index = slot_index(think_slot_mask(batch))
-    assert 0 < think_index.numel() < beliefs.shape[0] * beliefs.shape[1]
-    assert bool(
-        (think_index.remainder(batch.stream_length) < batch.stream_length - 1)
-        .all()
-    )
-
-    mean_input_shapes = []
-    hook = wrapper.transition.mean_head.register_forward_pre_hook(
-        lambda _module, inputs: mean_input_shapes.append(tuple(inputs[0].shape))
-    )
-    try:
-        compact_means, compact_targets = compact_thought_actions(
-            wrapper, batch, beliefs, think_index
-        )
-    finally:
-        hook.remove()
-
-    assert mean_input_shapes == [(think_index.numel(), beliefs.shape[-1])]
-    dense_reference = wrapper.thought_mean(beliefs)
-    torch.testing.assert_close(
-        compact_means, compact_slots(dense_reference, think_index)
-    )
-    dense_targets = torch.zeros_like(batch.thoughts)
-    dense_targets[:, :-1] = batch.thoughts[:, 1:]
-    torch.testing.assert_close(
-        compact_targets, compact_slots(dense_targets, think_index)
-    )
-
-
 def test_compact_next_slots_rejects_a_final_column_action():
     values = torch.arange(6).reshape(2, 3)
     with pytest.raises(IndexError):
         compact_next_slots(values, torch.tensor([2]))
-
-
-def test_refresh_skips_thought_heads_for_a_zero_think_latent_shard(
-    monkeypatch,
-):
-    wrapper = _wrapper()
-    critic = _critic()
-    batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
-    batch.actions[batch.action_mask.bool()] = EMIT
-    assert batch.thoughts.size(-1) > 0
-    assert not bool(think_slot_mask(batch).any())
-
-    def unexpected_mean(*_args, **_kwargs):
-        raise AssertionError("zero-THINK shard evaluated the thought mean")
-
-    monkeypatch.setattr(wrapper, "thought_mean", unexpected_mean)
-    refresh_old_statistics(wrapper, critic, batch)
-    assert torch.count_nonzero(batch.old_thought_logprobs) == 0
-    assert torch.count_nonzero(batch.old_thought_means) == 0
-    assert torch.count_nonzero(batch.old_thought_log_sigmas) == 0
-
-
-def test_thought_pg_gradient_reaches_the_trunk_and_fresh_mean_head():
-    # The thought surrogate alone must backprop through the fresh thought mean
-    # into both that head and its belief-producing trunk.
-    wrapper = _wrapper()
-    critic = _critic()
-    with torch.no_grad():
-        # Bias the gate toward THINK so thought actions certainly occur.
-        wrapper.gate.head.bias.fill_(-2.0)
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    thinks = (batch.actions == THINK).float() * batch.action_mask
-    assert thinks.sum() > 0
-    assign_terminal_rewards(batch, torch.rand(4))
-    refresh_old_statistics(wrapper, critic, batch)
-
-    beliefs, _ = replay_head_inputs(wrapper, batch)
-    think_mask = think_slot_mask(batch)
-    thought_means, thought_targets = compact_thought_actions(
-        wrapper, batch, beliefs, slot_index(think_mask)
-    )
-    new_logprobs = wrapper.transition.per_dim_log_prob(
-        thought_targets,
-        thought_means,
-        wrapper.transition.predict_log_sigma(beliefs[think_mask]),
-    )
-    advantages, _ = generalized_advantage_estimate(
-        batch.rewards, batch.old_values, batch.action_mask, torch.ones(4)
-    )
-    loss, _, _ = clipped_policy_loss(
-        new_logprobs.sum(-1),
-        batch.old_thought_logprobs[think_mask].sum(-1),
-        advantages.detach()[think_mask],
-        torch.ones_like(advantages[think_mask]),
-    )
-    loss.backward()
-    proj_grad = wrapper.backbone.blocks[0].attn.proj.weight.grad
-    assert proj_grad is not None
-    assert float(proj_grad.abs().sum()) > 0.0
-    mean_head_grad = sum(
-        float(parameter.grad.abs().sum())
-        for parameter in wrapper.transition.mean_head.parameters()
-        if parameter.grad is not None
-    )
-    assert mean_head_grad > 0.0
-    assert all(
-        parameter.grad is None
-        for parameter in wrapper.backbone.prediction_projector.parameters()
-    )
-
-
-def test_absent_thought_objective_leaves_mean_and_sigma_grad_none_despite_momentum(
-):
-    wrapper = _wrapper()
-    critic = _critic()
-    optimizers = _optimizers(wrapper, critic)
-    mean_parameters = list(wrapper.transition.mean_head.parameters())
-    sigma_parameters = list(wrapper.transition.log_sigma_head.parameters())
-
-    # Seed Adam state so a spurious zero gradient would move either head
-    # through stale momentum even with weight decay disabled.
-    optimizers["actor"].zero_grad(set_to_none=True)
-    mean_parameters[0].grad = torch.ones_like(mean_parameters[0])
-    sigma_parameters[0].grad = torch.ones_like(sigma_parameters[0])
-    optimizers["actor"].step()
-    optimizers["actor"].zero_grad(set_to_none=True)
-
-    with torch.no_grad():
-        wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(-2.0)
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    think_mask = (batch.actions == THINK) & batch.action_mask.bool()
-    assert bool(think_mask.any())
-    assign_terminal_rewards(batch, torch.rand(4))
-    refresh_old_statistics(wrapper, critic, batch)
-    with torch.no_grad():
-        wrapper.transition.mean_head.bias.add_(0.01)
-    before = [parameter.detach().clone() for parameter in mean_parameters]
-    sigma_before = [parameter.detach().clone() for parameter in sigma_parameters]
-    metrics = update_minibatch(
-        wrapper,
-        critic,
-        batch,
-        optimizers,
-        thought_pg_coef=0.0,
-        # The reverse-KL penalty is itself a THOUGHT objective, so the
-        # "absent objective" premise has to switch it off explicitly now
-        # that it is the shipped default. The trust-mechanism biconditional
-        # then requires a surrogate-side mode; 'projected' contributes
-        # nothing at this drift because the region never binds.
-        thought_clip_mode="projected",
-        thought_reverse_kl_coef=0.0,
-    )
-
-    assert metrics["thought_behavior_kl_joint"] > 0
-    assert all(parameter.grad is None for parameter in mean_parameters)
-    assert all(parameter.grad is None for parameter in sigma_parameters)
-    for parameter, reference in zip(mean_parameters, before, strict=True):
-        torch.testing.assert_close(parameter, reference)
-    for parameter, reference in zip(sigma_parameters, sigma_before, strict=True):
-        torch.testing.assert_close(parameter, reference)
-
-
-def _drifted_think_batch(seed: int = 3):
-    """A refreshed rollout whose thought mean has moved well past the region.
-
-    The 0.02 bias shift is ~0.4 behavior sigma per dimension, so the summed
-    squared Mahalanobis distance clears the 0.03 radius by orders of
-    magnitude and the projection is guaranteed to be active in 'projected'.
-    """
-    wrapper = _wrapper(seed)
-    critic = _critic()
-    with torch.no_grad():
-        wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(-2.0)
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    assert bool(((batch.actions == THINK) & batch.action_mask.bool()).any())
-    assign_terminal_rewards(batch, torch.rand(4))
-    refresh_old_statistics(wrapper, critic, batch)
-    with torch.no_grad():
-        wrapper.transition.mean_head.bias.add_(0.02)
-    return wrapper, critic, batch
-
-
-def test_clip_mode_none_drops_the_projection_but_keeps_drift_telemetry():
-    wrapper, critic, batch = _drifted_think_batch()
-    metrics = update_minibatch(
-        wrapper, critic, batch, _optimizers(wrapper, critic),
-        thought_clip_mode="none",
-        thought_reverse_kl_coef=0.3,
-    )
-    # Nothing is ever projected, so both projection-side readouts are exactly
-    # zero — that is what distinguishes this arm in the dashboard.
-    assert float(metrics["thought_projection_penalty"]) == 0.0
-    assert float(metrics["thought_policy_clip_fraction"]) == 0.0
-    # The closed-form drift measurement survives as telemetry, and at this
-    # shift it is far outside the radius the projected arm would enforce.
-    assert float(metrics["thought_trust_d_mean"]) > 0.03
-    assert float(metrics["thought_behavior_kl_joint"]) > 0.0
-    assert float(metrics["thought_reverse_kl_penalty"]) > 0.0
-
-
-def test_clip_mode_none_and_projected_differ_once_the_region_binds():
-    # The two arms are the only two legal configurations: the trust
-    # mechanisms are mutually exclusive, so 'none' carries the reverse-KL
-    # penalty and 'projected' runs with the coefficient at zero.
-    none_wrapper, none_critic, none_batch = _drifted_think_batch()
-    none_metrics = update_minibatch(
-        none_wrapper, none_critic, none_batch,
-        _optimizers(none_wrapper, none_critic),
-        thought_clip_mode="none", thought_reverse_kl_coef=0.3,
-    )
-    projected_wrapper, projected_critic, projected_batch = (
-        _drifted_think_batch()
-    )
-    projected_metrics = update_minibatch(
-        projected_wrapper, projected_critic, projected_batch,
-        _optimizers(projected_wrapper, projected_critic),
-        thought_clip_mode="projected", thought_reverse_kl_coef=0.0,
-    )
-    # Same rollout, same drift: only the trust mechanism differs. The
-    # projected arm pulls every THINK action back to the boundary and pays
-    # the tracking penalty; 'none' does neither.
-    torch.testing.assert_close(
-        torch.tensor(none_metrics["thought_trust_d_mean"]),
-        torch.tensor(projected_metrics["thought_trust_d_mean"]),
-    )
-    assert float(projected_metrics["thought_policy_clip_fraction"]) > 0.0
-    assert float(projected_metrics["thought_projection_penalty"]) > 0.0
-    assert float(none_metrics["thought_policy_clip_fraction"]) == 0.0
-    assert float(none_metrics["thought_projection_penalty"]) == 0.0
-    assert none_metrics["policy_loss"] != projected_metrics["policy_loss"]
-
-
-def test_clip_mode_none_requires_a_reverse_kl_coefficient():
-    wrapper, critic, batch = _drifted_think_batch()
-    with pytest.raises(ValueError, match="must be nonzero"):
-        update_minibatch(
-            wrapper, critic, batch, _optimizers(wrapper, critic),
-            thought_clip_mode="none",
-            thought_reverse_kl_coef=0.0,
-        )
-
-
-@pytest.mark.parametrize("mode", ["projected", "joint", "per_dim"])
-def test_surrogate_trust_modes_refuse_to_mix_with_the_reverse_kl_penalty(mode):
-    # The projection/ratio clips and the reverse-KL penalty are alternative
-    # solutions to THINK drift, never layers of one: combining them makes
-    # neither term's contribution attributable. Exactly one per run.
-    wrapper, critic, batch = _drifted_think_batch()
-    with pytest.raises(ValueError, match="must never be combined"):
-        update_minibatch(
-            wrapper, critic, batch, _optimizers(wrapper, critic),
-            thought_clip_mode=mode,
-            thought_reverse_kl_coef=0.3,
-        )
-
-
-def test_shipped_defaults_are_the_reverse_kl_only_arm():
-    # The default objective is what the run actually trains under, so pin
-    # it: reverse-KL penalty at 0.5, no surrogate-side trust region. The
-    # library default must track the CLI default or tests silently drift
-    # onto an arm production never runs.
-    signature = inspect.signature(update_minibatch)
-    assert signature.parameters["thought_clip_mode"].default == "none"
-    assert signature.parameters["thought_reverse_kl_coef"].default == 0.5
-
-    cli = build_arg_parser().parse_args(["--checkpoint", "c", "--output", "o"])
-    assert cli.thought_clip_mode == "none"
-    assert cli.thought_reverse_kl_coef == 0.5
-    assert cli.thought_log_sigma_init == -2.0
-    assert cli.thought_action_transform == "identity"
-    assert cli.gate_entropy_coef == 0.005
 
 
 def test_shipped_math_evaluations_share_the_250_step_cadence():
@@ -2004,24 +957,6 @@ def test_graph_decode_requires_the_flex_path_and_replaces_the_tail_graph(capsys)
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["--thought-clip-mode", "projected"], "must never be combined"),
-        (["--thought-clip-mode", "joint"], "must never be combined"),
-        (["--thought-reverse-kl-coef", "0"], "must be nonzero"),
-    ],
-)
-def test_cli_enforces_one_thought_trust_mechanism(argv, expected, capsys):
-    # Mirrors the update_minibatch biconditional at argv level so the run
-    # fails in the first second rather than after loading checkpoints.
-    parser = build_arg_parser()
-    args = parser.parse_args(["--checkpoint", "c", "--output", "o", *argv])
-    with pytest.raises(SystemExit):
-        validate_args(parser, args)
-    assert expected in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    ("argv", "expected"),
-    [
         (["--temperature", "0.8"], "--temperature must be 1"),
         (["--top-p", "0.95"], "--top-p must be 1"),
     ],
@@ -2034,67 +969,6 @@ def test_cli_rejects_sampling_distributions_not_scored_by_ppo(
     with pytest.raises(SystemExit):
         validate_args(parser, args)
     assert expected in capsys.readouterr().err
-
-
-def test_reverse_kl_alone_anchors_the_continuous_thought_policy():
-    wrapper = _wrapper()
-    critic = _critic()
-    with torch.no_grad():
-        wrapper.gate.head.weight.zero_()
-        wrapper.gate.head.bias.fill_(-2.0)
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    assert bool(((batch.actions == THINK) & batch.action_mask.bool()).any())
-    assign_terminal_rewards(batch, torch.rand(4))
-    refresh_old_statistics(wrapper, critic, batch)
-    with torch.no_grad():
-        wrapper.transition.mean_head.bias.add_(0.02)
-    before = [
-        parameter.detach().clone()
-        for parameter in wrapper.transition.mean_head.parameters()
-    ]
-
-    metrics = update_minibatch(
-        wrapper,
-        critic,
-        batch,
-        _optimizers(wrapper, critic),
-        thought_pg_coef=0.0,
-        thought_reverse_kl_coef=0.3,
-        gate_pg_coef=0.0,
-    )
-
-    assert metrics["thought_reverse_kl_penalty"] > 0.0
-    assert any(
-        not torch.equal(parameter, reference)
-        for parameter, reference in zip(
-            wrapper.transition.mean_head.parameters(), before, strict=True
-        )
-    )
-
-
-def test_renderer_reads_belief_without_training_the_thought_mean():
-    wrapper = _wrapper()
-    backbone = wrapper.backbone
-    with torch.no_grad():
-        backbone.policy_probe.output.weight.normal_(std=0.02)
-    batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
-    stream_inputs, beliefs = replay_beliefs(wrapper, batch)
-    predicted = wrapper.thought_mean(beliefs)
-    features = wrapper.renderer_features(stream_inputs, beliefs)
-
-    torch.testing.assert_close(features[..., : beliefs.size(-1)], stream_inputs)
-    torch.testing.assert_close(features[..., beliefs.size(-1) :], beliefs)
-    assert not torch.equal(beliefs, predicted)
-
-    backbone.zero_grad(set_to_none=True)
-    backbone.logits_from_features(features).float().square().mean().backward()
-    trunk_grad = backbone.blocks[0].attn.proj.weight.grad
-    assert trunk_grad is not None
-    assert float(trunk_grad.abs().sum()) > 0.0
-    assert all(
-        parameter.grad is None
-        for parameter in wrapper.transition.mean_head.parameters()
-    )
 
 
 def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
@@ -2115,31 +989,18 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     critic_probe_ids = {id(p) for p in wrapper.backbone.critic_probe.parameters()}
     assert critic_probe_ids
     assert critic_probe_ids.isdisjoint({id(p) for p in actor_params})
-    # Six groups: trunk, Bernoulli gate, recurrent adapter, renderer probe,
-    # learned log-sigma, and fresh thought mean. Every actor component uses
-    # the same general learning rate as the critic.
+    # Three groups: trunk, combiner, renderer probe. Every actor component
+    # uses the same general learning rate as the critic.
     lrs = [group["lr"] for group in optimizers["actor"].param_groups]
-    assert lrs == [1e-3] * 6
+    assert lrs == [1e-3] * 3
     assert optimizers["critic"].param_groups[0]["lr"] == 1e-3
-    gate_group = optimizers["actor"].param_groups[1]["params"]
-    assert {id(p) for p in gate_group} == {
-        id(p) for p in wrapper.gate.parameters()
+    combiner_group = optimizers["actor"].param_groups[1]["params"]
+    assert {id(p) for p in combiner_group} == {
+        id(p) for p in wrapper.combiner.parameters()
     }
-    adapter_group = optimizers["actor"].param_groups[2]["params"]
-    assert {id(p) for p in adapter_group} == {
-        id(p) for p in wrapper.adapter.parameters()
-    }
-    renderer_group = optimizers["actor"].param_groups[3]["params"]
+    renderer_group = optimizers["actor"].param_groups[2]["params"]
     assert {id(p) for p in renderer_group} == {
         id(p) for p in wrapper.backbone.policy_probe.parameters()
-    }
-    sigma_group = optimizers["actor"].param_groups[4]["params"]
-    assert {id(p) for p in sigma_group} == {
-        id(p) for p in wrapper.transition.log_sigma_head.parameters()
-    }
-    mean_group = optimizers["actor"].param_groups[5]["params"]
-    assert {id(p) for p in mean_group} == {
-        id(p) for p in wrapper.transition.mean_head.parameters()
     }
 
 
@@ -2148,8 +1009,6 @@ def test_post_update_drift_measures_the_deployed_policy_move():
     critic = _critic()
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
     refresh_old_statistics(wrapper, critic, batch)
-    grad_modes = []
-    output_requires_grad = []
     diagnostic_replay_calls = 0
 
     def diagnostic_replay(*args, **kwargs):
@@ -2158,125 +1017,36 @@ def test_post_update_drift_measures_the_deployed_policy_move():
         assert not torch.is_grad_enabled()
         return replay_head_inputs(*args, **kwargs)
 
-    def record_grad_mode(_module, _inputs, output):
-        grad_modes.append(torch.is_grad_enabled())
-        output_requires_grad.append(output.requires_grad)
-
-    handle = wrapper.transition.mean_head.register_forward_hook(
-        record_grad_mode
+    unchanged = measure_post_update_policy_drift(
+        wrapper,
+        [batch],
+        replay_max_trajectories=32,
+        replay_attention_budget=4 * 1024 * 1024,
+        replay_bucket=1,
+        replay_function=diagnostic_replay,
     )
-    try:
-        unchanged = measure_post_update_policy_drift(
-            wrapper,
-            [batch],
-            replay_max_trajectories=32,
-            replay_attention_budget=4 * 1024 * 1024,
-            replay_bucket=1,
-            replay_function=diagnostic_replay,
-        )
-        assert unchanged[
-            "gate_same_state/post_update_behavior_continue_probability"
-        ] == pytest.approx(
-            unchanged[
-                "gate_same_state/post_update_current_continue_probability"
-            ]
-        )
-        unchanged_drift = {
-            key: value
-            for key, value in unchanged.items()
-            if "continue_probability" not in key
-        }
-        assert max(abs(value) for value in unchanged_drift.values()) < 1e-7
+    assert max(abs(value) for value in unchanged.values()) < 1e-7
 
-        with torch.no_grad():
-            wrapper.gate.head.bias.add_(0.2)
-
-        drift = measure_post_update_policy_drift(
-            wrapper,
-            [batch],
-            replay_max_trajectories=32,
-            replay_attention_budget=4 * 1024 * 1024,
-            replay_bucket=1,
-            replay_function=diagnostic_replay,
-        )
-    finally:
-        handle.remove()
-
-    assert grad_modes and not any(grad_modes)
-    assert output_requires_grad and not any(output_requires_grad)
-    assert diagnostic_replay_calls == 2
-    assert drift["kl/post_update_gate_behavior"] > 0.0
-    assert drift["kl/post_update_gate_behavior_exact"] > 0.0
-    assert drift["kl/post_update_policy_behavior_per_action"] > 0.0
-    assert drift["ratio/post_update_gate_abs_log_max"] > 0.0
-    assert (
-        drift[
-            "gate_same_state/post_update_stop_probability_abs_delta_max"
-        ]
-        > 0.0
-    )
-    assert drift["ratio/post_update_joint_abs_log_max"] > 0.0
-
-
-def test_exact_bernoulli_kl_recovers_behavior_from_selected_logprob():
-    old_logits = torch.tensor([-1.5, 0.1, 2.0, -0.7])
-    new_logits = torch.tensor([-2.0, 0.4, 1.4, 0.2])
-    actions = torch.tensor([0, 1, 1, 0])
-    old_selected_logprobs = -torch.nn.functional.binary_cross_entropy_with_logits(
-        old_logits,
-        actions.float(),
-        reduction="none",
-    )
-
-    old_probability, new_probability, exact_kl = (
-        exact_bernoulli_behavior_kl(
-            new_logits,
-            actions,
-            old_selected_logprobs,
-        )
-    )
-    expected_old = old_logits.sigmoid()
-    expected_new = new_logits.sigmoid()
-    expected_kl = (
-        expected_old
-        * (expected_old.log() - expected_new.log())
-        + (1.0 - expected_old)
-        * (
-            torch.log1p(-expected_old)
-            - torch.log1p(-expected_new)
-        )
-    )
-    torch.testing.assert_close(old_probability, expected_old)
-    torch.testing.assert_close(new_probability, expected_new)
-    torch.testing.assert_close(exact_kl, expected_kl)
-
-
-def test_post_update_kl_stays_finite_when_joint_thought_ratio_is_huge():
-    wrapper = _wrapper()
-    critic = _critic()
     with torch.no_grad():
-        wrapper.gate.head.bias.fill_(-2.0)
-    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    refresh_old_statistics(wrapper, critic, batch)
-    think_mask = (
-        (batch.actions == THINK) & batch.action_mask.bool()
-    )
-    assert think_mask.any()
-    # Every factor has a benign finite ratio, but their summed joint log-ratio
-    # is 100, whose exponent overflows fp32 in the old joint-k3 diagnostic.
-    latent_dim = batch.old_thought_logprobs.size(-1)
-    batch.old_thought_logprobs[think_mask] -= 100.0 / latent_dim
+        renderer_output = wrapper.backbone.policy_probe.output.weight
+        renderer_output.add_(
+            torch.linspace(
+                -0.02, 0.02, renderer_output.numel()
+            ).reshape_as(renderer_output)
+        )
+
     drift = measure_post_update_policy_drift(
         wrapper,
         [batch],
         replay_max_trajectories=32,
         replay_attention_budget=4 * 1024 * 1024,
         replay_bucket=1,
+        replay_function=diagnostic_replay,
     )
-    assert math.isfinite(drift["kl/post_update_policy_behavior_per_action"])
-    assert drift["kl/post_update_policy_behavior_per_action"] > 0.0
-    assert drift["ratio/post_update_joint_abs_log_max"] >= 99.0
-    assert drift["ratio/post_update_thought_joint_abs_log_max"] >= 99.0
+
+    assert diagnostic_replay_calls == 2
+    assert drift["kl/post_update_token_behavior"] > 0.0
+    assert drift["ratio/post_update_token_abs_log_max"] > 0.0
 
 
 def test_actor_accumulation_defers_the_trunk_step_to_the_caller():
@@ -2286,6 +1056,10 @@ def test_actor_accumulation_defers_the_trunk_step_to_the_caller():
     torch.manual_seed(41)
     wrapper = _wrapper()
     critic = _critic()
+    with torch.no_grad():
+        # A zero-init renderer output blocks the policy gradient's only path
+        # into the trunk at step 0; de-zero it so the banked gradient is real.
+        wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
     optimizers = _optimizers(wrapper, critic)
     batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
     assign_terminal_rewards(batch, torch.rand(2))
@@ -2389,14 +1163,17 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     wrapper = _bf16_wrapper()
     critic = _critic()  # the separate critic always runs fp32
     assert wrapper.backbone.tok_emb.weight.dtype == torch.bfloat16
-    # Zero-init probe/gate outputs would make the clip-fraction assertions
-    # below vacuous (both code paths output exactly zero); randomize them so
-    # the ratio-one property is actually load-bearing.
+    # Zero-init probe output and a fresh identity combiner would make the
+    # clip-fraction assertions below vacuous (both code paths output exactly
+    # zero); randomize/enable them so the ratio-one property is load-bearing.
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.gate.head.weight.normal_(std=0.02)
+        wrapper.combiner.gain.fill_(0.3)
     batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
-    assert batch.thoughts.dtype == torch.float32
+    # The carried hidden is stored fp32 even under a bf16 backbone: the
+    # combiner computes its injection in fp32 and casts once, so storage
+    # must not round the belief first.
+    assert batch.hiddens.dtype == torch.float32
     refresh_old_statistics(wrapper, critic, batch)
     assign_terminal_rewards(batch, torch.rand(2))
     metrics = update_minibatch(
@@ -2409,12 +1186,9 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     # With refreshed old statistics, behavior-age-0 ratios start at exactly
     # one, so nothing clips on the first update.
     assert metrics["policy_clip_fraction"] == 0.0
-    assert metrics["gate_behavior_kl"] == 0.0
-    assert metrics["renderer_behavior_kl"] == 0.0
-    assert metrics["thought_behavior_kl_joint"] == 0.0
-    assert metrics["thought_behavior_kl_per_dim"] == 0.0
+    assert metrics["token_behavior_kl"] == 0.0
     assert metrics["policy_behavior_kl_per_action"] == 0.0
-    assert metrics["joint_abs_log_ratio_max"] == 0.0
+    assert metrics["token_abs_log_ratio_max"] == 0.0
     assert metrics["harmful_positive_log_ratio_max"] == 0.0
 
 
@@ -2423,7 +1197,7 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
     critic = _critic()
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.gate.head.weight.normal_(std=0.02)
+        wrapper.combiner.gain.fill_(0.3)
     first = _rollout(wrapper, batch=4, prompt=5, new_tokens=3, seed=17)
     later = _rollout(wrapper, batch=4, prompt=5, new_tokens=3, seed=19)
     for batch in (first, later):
@@ -2433,9 +1207,7 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
         name: getattr(later, name).clone()
         for name in (
             "old_values",
-            "old_stop_logprobs",
             "old_token_logprobs",
-            "old_thought_logprobs",
         )
     }
 
@@ -2446,7 +1218,7 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
         first,
         optimizers,
     )
-    assert first_metrics["joint_abs_log_ratio_max"] == 0.0
+    assert first_metrics["token_abs_log_ratio_max"] == 0.0
     for name, behavior_tensor in frozen_later.items():
         assert torch.equal(getattr(later, name), behavior_tensor)
 
@@ -2460,8 +1232,7 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
         actor_step=False,
         critic_step=False,
     )
-    assert later_metrics["joint_abs_log_ratio_max"] > 0.0
-    assert later_metrics["thought_joint_abs_log_ratio_max"] > 0.0
+    assert later_metrics["token_abs_log_ratio_max"] > 0.0
     for name, behavior_tensor in frozen_later.items():
         assert torch.equal(getattr(later, name), behavior_tensor)
 
@@ -2563,7 +1334,6 @@ def test_evaluate_aime_latent_scores_through_the_gate_policy(monkeypatch):
         > 0
     )
     assert metrics["recurrent_steps_per_rollout_max"] > 0
-    assert 0.0 <= metrics["continue_thinking_fraction"] <= 1.0
     # The eval must not perturb training RNG state.
     before = torch.get_rng_state()
     evaluate_aime_latent(
@@ -2654,14 +1424,6 @@ def test_evaluate_aime_latent_captures_first_four_problems_in_dataset_order(
         "emitted_token_rows",
         lambda batch: [[5] for _ in range(batch.kind.size(0))],
     )
-    monkeypatch.setattr(
-        evaluator,
-        "emitted_token_and_kind_rows",
-        lambda batch: (
-            [[5] for _ in range(batch.kind.size(0))],
-            batch.kind[:, batch.prompt_length :].tolist(),
-        ),
-    )
     attempts: list[dict[str, object]] = []
     metrics = evaluate_aime_latent(
         wrapper,
@@ -2697,15 +1459,11 @@ def test_evaluate_aime_latent_captures_first_four_problems_in_dataset_order(
         "103",
     ]
     for attempt in attempts:
-        trace = str(attempt["action_trace"])
         assert attempt["terminated"] is True
         assert attempt["correct"] is True
         assert attempt["parsed_answer"] == "42"
-        assert attempt["total_thought_count"] == trace.count("T")
-        assert attempt["initial_thought_count"] == 1
-        assert attempt["continued_thought_count"] == trace.count("T") - 1
-        assert sum(attempt["think_run_lengths"]) == trace.count("T")
         assert attempt["emitted_token_ids"] == [5]
+        assert attempt["emitted_token_count"] == 1
 
     full_capture: list[dict[str, object]] = []
     evaluate_aime_latent(
@@ -2781,7 +1539,7 @@ def test_finished_row_compaction_preserves_original_row_attribution():
         return rollout_continuations(
             wrapper,
             prompt_ids,
-            max_new_tokens=0,
+            max_new_tokens=1,
             max_stream_steps=1,
             temperature=1.0,
             top_p=1e-6,
@@ -2793,10 +1551,8 @@ def test_finished_row_compaction_preserves_original_row_attribution():
     for field in (
         "kind",
         "token_ids",
-        "thoughts",
-        "actions",
+        "hiddens",
         "action_mask",
-        "stop_mask",
     ):
         torch.testing.assert_close(getattr(compact, field), getattr(reference, field))
     boundary = compact.prompt_length - 1
@@ -2823,7 +1579,7 @@ def test_compiled_full_batch_uses_one_fixed_finished_tail_shape(
         tokens = torch.full(
             (logits.size(0),), 6, dtype=torch.long, device=logits.device
         )
-        if calls == 1:
+        if calls == 0:
             # Leave 12 live rows so the fixed B16 tail has to retain four
             # inert fillers, not merely compact to exactly 16 survivors.
             tokens[:116] = 5
@@ -2917,10 +1673,10 @@ def test_progressive_compaction_shrinks_above_the_fixed_tail(monkeypatch):
         tokens = torch.full(
             (logits.size(0),), 6, dtype=torch.long, device=logits.device
         )
-        if calls == 1:
+        if calls == 0:
             # 40 dead of 128 (>=25%, 88 survivors > 16): progressive shrink.
             tokens[:40] = 5
-        elif calls == 17:
+        elif calls == 16:
             # Batch order is now the 88 survivors; leave 12 for the tail.
             tokens[: logits.size(0) - 12] = 5
         calls += 1
@@ -2995,7 +1751,8 @@ def test_finished_row_compaction_preserves_model_dependent_survivor_tokens(
 
     fixed = emitted_token_rows(run(False))
     compacted = emitted_token_rows(run(True))
-    assert compacted[:80] == [[5]] * 80
+    assert all(row[-1] == 5 and len(row) == 2 for row in compacted[:80])
+    assert compacted[:80] == fixed[:80]
     assert compacted[80:] == fixed[80:]
 
 
@@ -3089,14 +1846,7 @@ def _deterministic_nano_wrapper() -> LatentThoughtModel:
     with torch.no_grad():
         backbone.proj.weight.normal_(std=0.05)
         backbone.proj.bias.normal_(std=0.05)
-    wrapper = LatentThoughtModel(backbone)
-    with torch.no_grad():
-        wrapper.gate.head.bias.fill_(40.0)
-    wrapper.transition.sample_latent = MethodType(
-        lambda _self, mean, _log_sigma, generator=None: mean.float(),
-        wrapper.transition,
-    )
-    return wrapper
+    return LatentThoughtModel(backbone)
 
 
 def test_flex_decode_mask_reproduces_the_boolean_row_mask(monkeypatch):
@@ -3446,7 +2196,7 @@ def test_flex_decode_main_loop_matches_the_boolean_rollout(monkeypatch):
     assert torch.equal(flex.action_mask, boolean.action_mask)
     assert torch.equal(flex.kind[mask], boolean.kind[mask])
     assert torch.equal(flex.token_ids[mask], boolean.token_ids[mask])
-    assert torch.isfinite(flex.thoughts).all()
+    assert torch.isfinite(flex.hiddens).all()
 
 
 def test_flex_decode_bucket_rounds_the_survivor_count_up(monkeypatch):
@@ -3669,8 +2419,7 @@ def test_dynamic_compiled_step_accepts_tensor_positions_and_prompt_masks():
         tensor_positions=True,
         replay_storage=False,
     )
-    assert batch.thoughts.shape == (2, 11, 0)
-    assert batch.old_thought_logprobs.shape == (2, 11, 0)
+    assert batch.hiddens.shape == (2, 11, 0)
     assert batch.action_mask.sum() >= 2
     wrapper.step_core = original
 
@@ -3696,14 +2445,11 @@ def test_eval_only_sampling_is_policy_identical_to_replay_rollout():
     for field in (
         "kind",
         "token_ids",
-        "actions",
         "action_mask",
-        "stop_mask",
-        "emit_mask",
     ):
         assert torch.equal(getattr(evaluation, field), getattr(replay, field))
-    assert evaluation.thoughts.shape[-1] == 0
-    assert replay.thoughts.shape[-1] == KWARGS["model_dim"]
+    assert evaluation.hiddens.shape[-1] == 0
+    assert replay.hiddens.shape[-1] == KWARGS["model_dim"]
 
 
 def test_evaluation_compile_failure_restarts_eager_and_restores_capture(monkeypatch):
@@ -3811,23 +2557,6 @@ def test_value_only_update_touches_only_the_critic():
     )
 
 
-def test_think_run_lengths_matches_hand_computation():
-    T, H, P = TOKEN_SLOT, THOUGHT_SLOT, PAD_SLOT
-    kind = torch.tensor(
-        [
-            # Runs of 2 and 1; a trailing think run cut off by padding.
-            [T, T, H, H, T, H, P, P],
-            # No thinks at all.
-            [T, T, T, T, T, T, T, P],
-            # Single run of 3 reaching the stream end.
-            [T, T, T, T, T, H, H, H],
-        ]
-    )
-    lengths = think_run_lengths(kind)
-    assert sorted(lengths.tolist()) == [1.0, 2.0, 3.0]
-    assert think_run_lengths(kind[1:2]).numel() == 0
-
-
 def test_rollout_stops_rows_at_any_stop_token_and_records_nothing_after():
     wrapper = _wrapper()
     stop_ids = (5, 1)
@@ -3927,14 +2656,7 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["replay_numerics_schema"] == REPLAY_NUMERICS_SCHEMA
     assert payload["reward_schema"] == REWARD_SCHEMA
     assert payload["actor_objective_schema"] == ACTOR_OBJECTIVE_SCHEMA
-    assert payload["thought_distribution_schema"] == THOUGHT_DISTRIBUTION_SCHEMA
-    assert payload["thought_mean_schema"] == THOUGHT_MEAN_SCHEMA
-    assert payload["thought_sigma_init_schema"] == wrapper.sigma_state_init_schema
-    assert (
-        payload["thought_action_transform_schema"]
-        == wrapper.thought_action_transform_schema
-    )
-    assert payload["critic_adapter_init_schema"] == critic.adapter_init_schema
+    assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
     assert "torch_adamw" in payload["optimizer_schema"]
 
 
@@ -3983,215 +2705,6 @@ def test_value_support_geometry_matches_compares_args_not_shapes() -> None:
         legacy,
     )
     assert not value_support_geometry_matches({}, legacy)
-
-
-def test_anchored_value_migration_transfers_trunk_and_rebuilds_head() -> None:
-    """v21->v22 critic migration: trunk/adapter verbatim, head at the prior."""
-
-    def anchored_target(seed: int) -> SeparateCritic:
-        num_bins, v_min, v_max = anchored_unit_geometry(17, 3)
-        torch.manual_seed(seed)
-        with _pope_construction():
-            trunk = FreshLeJEPASharedRMSV1PoPE(**KWARGS).eval()
-        return SeparateCritic(
-            trunk,
-            num_bins=num_bins,
-            sigma_ratio=1.0,
-            v_min=v_min,
-            v_max=v_max,
-            prior_value=0.05,
-        ).eval()
-
-    source_critic = _critic(seed=3)
-    source_state = source_critic.state_dict()
-    target_critic = anchored_target(seed=21)
-    provenance = migrate_anchored_value_resume(
-        {"critic": source_state}, target_critic
-    )
-    assert provenance["rebuilt_state"] == [
-        "head.bias",
-        "head.weight",
-        "support.centers",
-        "support.edges",
-    ]
-
-    target_state = target_critic.state_dict()
-    for key, value in source_state.items():
-        if key.startswith(("head.", "support.")):
-            continue
-        torch.testing.assert_close(target_state[key], value, rtol=0, atol=0)
-    # The head keeps its fresh v215 init: zero weights, prior projected into
-    # the bias on the ANCHORED grid.
-    assert float(target_critic.head.weight.detach().abs().max()) == 0.0
-    torch.testing.assert_close(
-        target_critic.head.bias,
-        target_critic.support.project_to_logprobs(
-            torch.tensor(0.05), eps=1e-6
-        ),
-    )
-    assert target_critic.support.edges.numel() == 17 + 1 + 2 * 3 + 1
-
-    # Sources that differ beyond head/support state must fail loudly instead
-    # of silently skipping or shape-crashing later.
-    unexpected = dict(source_state)
-    unexpected["renderer.probe.weight"] = torch.zeros(1)
-    with pytest.raises(ValueError, match="only in head/support"):
-        migrate_anchored_value_resume(
-            {"critic": unexpected}, anchored_target(seed=22)
-        )
-    truncated = {
-        key: value
-        for key, value in source_state.items()
-        if not key.startswith("adapter.")
-    }
-    with pytest.raises(ValueError, match="only in head/support"):
-        migrate_anchored_value_resume(
-            {"critic": truncated}, anchored_target(seed=23)
-        )
-
-
-def test_resume_schema_requires_matching_explicit_migration() -> None:
-    current = {"execution_schema": EXECUTION_SCHEMA}
-    assert resume_execution_schema_compatible(current)
-    for extra_flag in (
-        "allow_reverse_kl_migration",
-        "allow_performance_migration",
-        "allow_joint_clip_migration",
-        "allow_anchored_value_migration",
-        "allow_projected_thought_migration",
-        "allow_thought_reverse_kl_migration",
-        "allow_rollout_scheduler_migration",
-    ):
-        assert not resume_execution_schema_compatible(
-            current, **{extra_flag: True}
-        )
-    continuous_schema = execution_schema_for_adapter(
-        "orthogonal_silu", "identity", "continuous_refill"
-    )
-    assert resume_execution_schema_compatible(
-        {"execution_schema": continuous_schema},
-        expected_execution_schema=continuous_schema,
-    )
-    assert not resume_execution_schema_compatible(
-        current,
-        expected_execution_schema=continuous_schema,
-    )
-    assert resume_execution_schema_compatible(
-        current,
-        expected_execution_schema=continuous_schema,
-        allow_rollout_scheduler_migration=True,
-    )
-    assert not resume_execution_schema_compatible(
-        {"execution_schema": continuous_schema},
-        expected_execution_schema=continuous_schema,
-        allow_rollout_scheduler_migration=True,
-    )
-    tail_schema = execution_schema_for_adapter(
-        "orthogonal_silu", "identity", "tail_merge"
-    )
-    assert resume_execution_schema_compatible(
-        {"execution_schema": tail_schema},
-        expected_execution_schema=continuous_schema,
-        allow_rollout_scheduler_migration=True,
-    )
-    affine = {"execution_schema": IDENTITY_AFFINE_EXECUTION_SCHEMA}
-    assert not resume_execution_schema_compatible(affine)
-    assert resume_execution_schema_compatible(
-        affine,
-        expected_execution_schema=IDENTITY_AFFINE_EXECUTION_SCHEMA,
-    )
-    for old_schema in (
-        ZERO_AFFINE_EXECUTION_SCHEMA,
-        NO_THOUGHT_KL_EXECUTION_SCHEMA,
-        JOINT_CLIP_EXECUTION_SCHEMA,
-        UNANCHORED_VALUE_EXECUTION_SCHEMA,
-        PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
-        PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
-        PREVIOUS_EXECUTION_SCHEMA,
-        "older/v5",
-    ):
-        assert not resume_execution_schema_compatible(
-            {"execution_schema": old_schema}
-        )
-    assert resume_execution_schema_compatible(
-        {"execution_schema": ZERO_AFFINE_EXECUTION_SCHEMA},
-        expected_execution_schema=IDENTITY_AFFINE_EXECUTION_SCHEMA,
-    )
-    migration_cases = (
-        (
-            NO_THOUGHT_KL_EXECUTION_SCHEMA,
-            {"allow_thought_reverse_kl_migration": True},
-        ),
-        (
-            JOINT_CLIP_EXECUTION_SCHEMA,
-            {
-                "allow_thought_reverse_kl_migration": True,
-                "allow_projected_thought_migration": True,
-            },
-        ),
-        (
-            UNANCHORED_VALUE_EXECUTION_SCHEMA,
-            {
-                "allow_thought_reverse_kl_migration": True,
-                "allow_projected_thought_migration": True,
-                "allow_anchored_value_migration": True,
-            },
-        ),
-        (
-            PER_DIM_REVERSE_KL_EXECUTION_SCHEMA,
-            {
-                "allow_thought_reverse_kl_migration": True,
-                "allow_projected_thought_migration": True,
-                "allow_anchored_value_migration": True,
-                "allow_joint_clip_migration": True,
-            },
-        ),
-        (
-            PERFORMANCE_COMPATIBLE_EXECUTION_SCHEMA,
-            {
-                "allow_thought_reverse_kl_migration": True,
-                "allow_projected_thought_migration": True,
-                "allow_anchored_value_migration": True,
-                "allow_joint_clip_migration": True,
-                "allow_performance_migration": True,
-            },
-        ),
-        (
-            PREVIOUS_EXECUTION_SCHEMA,
-            {
-                "allow_thought_reverse_kl_migration": True,
-                "allow_projected_thought_migration": True,
-                "allow_anchored_value_migration": True,
-                "allow_joint_clip_migration": True,
-                "allow_performance_migration": True,
-                "allow_reverse_kl_migration": True,
-            },
-        ),
-    )
-    for old_schema, flags in migration_cases:
-        payload = {"execution_schema": old_schema}
-        assert resume_execution_schema_compatible(
-            payload,
-            expected_execution_schema=IDENTITY_AFFINE_EXECUTION_SCHEMA,
-            **flags,
-        )
-        assert not resume_execution_schema_compatible(payload, **flags)
-
-
-def test_compact_replay_resume_requires_one_explicit_schema_migration():
-    current = {"replay_numerics_schema": REPLAY_NUMERICS_SCHEMA}
-    assert resume_replay_schema_compatible(current)
-    assert not resume_replay_schema_compatible(
-        current, allow_compact_replay_migration=True
-    )
-    assert not resume_replay_schema_compatible({})
-    assert resume_replay_schema_compatible(
-        {}, allow_compact_replay_migration=True
-    )
-    assert not resume_replay_schema_compatible(
-        {"replay_numerics_schema": "unknown/v9"},
-        allow_compact_replay_migration=True,
-    )
 
 
 def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):
@@ -4382,7 +2895,6 @@ def test_key_mask_step_matches_the_narrow_step_over_a_padded_cache():
             prompt_ids[:, position], padded, position_index, key_masks[position]
         )
         torch.testing.assert_close(masked.belief, reference.belief)
-        torch.testing.assert_close(masked.predicted, reference.predicted)
         torch.testing.assert_close(masked.logits, reference.logits)
 
 
@@ -4471,13 +2983,8 @@ def test_static_cache_rollout_matches_the_dynamic_rollout_and_is_reusable():
         assert static.prompt_length == dynamic.prompt_length
         assert torch.equal(static.kind, dynamic.kind)
         assert torch.equal(static.token_ids, dynamic.token_ids)
-        assert torch.equal(static.actions, dynamic.actions)
         assert torch.equal(static.action_mask, dynamic.action_mask)
-        assert torch.equal(static.stop_mask, dynamic.stop_mask)
-        torch.testing.assert_close(static.thoughts, dynamic.thoughts)
-        torch.testing.assert_close(
-            static.old_stop_logprobs, dynamic.old_stop_logprobs
-        )
+        torch.testing.assert_close(static.hiddens, dynamic.hiddens)
         torch.testing.assert_close(
             static.old_token_logprobs, dynamic.old_token_logprobs
         )
@@ -4505,8 +3012,7 @@ def test_explicit_rollout_generator_is_independent_of_global_rng(top_p):
     second = roll(1000)
     assert torch.equal(first.kind, second.kind)
     assert torch.equal(first.token_ids, second.token_ids)
-    assert torch.equal(first.actions, second.actions)
-    torch.testing.assert_close(first.thoughts, second.thoughts)
+    torch.testing.assert_close(first.hiddens, second.hiddens)
 
 
 def test_preallocated_caches_that_do_not_fit_are_rejected():
@@ -4584,7 +3090,7 @@ def test_trim_stream_releases_the_full_capacity_backing_storage():
 
     trimmed = trim_stream(full)
     assert trimmed.stream_length < full.stream_length
-    for name in ("kind", "token_ids", "thoughts", "old_values"):
+    for name in ("kind", "token_ids", "hiddens", "old_values"):
         original = getattr(full, name)
         compact = getattr(trimmed, name)
         assert compact.untyped_storage().data_ptr() != original.untyped_storage().data_ptr(), name
@@ -4598,9 +3104,7 @@ def test_refresh_runs_grad_enabled_but_stores_detached_statistics():
     refresh_old_statistics(wrapper, critic, batch)
     for name in (
         "old_values",
-        "old_stop_logprobs",
         "old_token_logprobs",
-        "old_thought_logprobs",
     ):
         stored = getattr(batch, name)
         assert not stored.requires_grad, name
@@ -4608,19 +3112,8 @@ def test_refresh_runs_grad_enabled_but_stores_detached_statistics():
 
 
 def _deterministic_wrapper() -> LatentThoughtModel:
-    """All-EMIT gate + argmax tokens make trajectories RNG-independent."""
-    wrapper = _wrapper()
-    with torch.no_grad():
-        wrapper.gate.head.bias.fill_(40.0)
-    # Forced latents still sample when every optional gate emits. Bypass only
-    # the test draw so batched and sequential rows can consume different RNG
-    # shapes without changing the actual thought; production sigma is bounded
-    # away from zero by design.
-    wrapper.transition.sample_latent = MethodType(
-        lambda _self, mean, _log_sigma, generator=None: mean.float(),
-        wrapper.transition,
-    )
-    return wrapper
+    """Argmax token draws make trajectories RNG-independent."""
+    return _wrapper()
 
 
 def test_left_padded_batched_rollout_matches_the_sequential_rollouts():
@@ -4661,20 +3154,11 @@ def test_left_padded_batched_rollout_matches_the_sequential_rollouts():
         assert group.stream_length == expected.stream_length
         assert torch.equal(group.kind, expected.kind)
         assert torch.equal(group.token_ids, expected.token_ids)
-        assert torch.equal(group.actions, expected.actions)
         assert torch.equal(group.action_mask, expected.action_mask)
-        assert torch.equal(group.stop_mask, expected.stop_mask)
-        assert torch.equal(group.emit_mask, expected.emit_mask)
-        torch.testing.assert_close(group.thoughts, expected.thoughts)
+        torch.testing.assert_close(group.hiddens, expected.hiddens)
         torch.testing.assert_close(
             group.old_token_logprobs,
             expected.old_token_logprobs,
-            rtol=1e-4,
-            atol=1e-5,
-        )
-        torch.testing.assert_close(
-            group.old_stop_logprobs,
-            expected.old_stop_logprobs,
             rtol=1e-4,
             atol=1e-5,
         )
@@ -4694,7 +3178,6 @@ def test_zero_padding_batched_rollout_is_identical_to_the_plain_path():
     )
     assert torch.equal(plain.kind, padded.kind)
     assert torch.equal(plain.token_ids, padded.token_ids)
-    assert torch.equal(plain.actions, padded.actions)
     torch.testing.assert_close(
         plain.old_token_logprobs, padded.old_token_logprobs, rtol=1e-4, atol=1e-5
     )
@@ -4726,11 +3209,8 @@ def test_combined_replay_batch_right_pads_without_changing_beliefs():
         for name in (
             "kind",
             "token_ids",
-            "thoughts",
-            "actions",
+            "hiddens",
             "action_mask",
-            "stop_mask",
-            "emit_mask",
             "rewards",
         ):
             source = getattr(group, name)
@@ -4755,25 +3235,19 @@ def test_combined_replay_batch_right_pads_without_changing_beliefs():
         actor_step=False,
         critic_step=False,
     )
-    assert metrics["joint_abs_log_ratio_max"] == 0.0
+    assert metrics["token_abs_log_ratio_max"] == 0.0
     assert metrics["policy_clip_fraction"] == 0.0
 
-    combined.old_stop_logprobs.copy_(
-        torch.arange(combined.old_stop_logprobs.numel()).reshape_as(
-            combined.old_stop_logprobs
+    combined.old_token_logprobs.copy_(
+        torch.arange(combined.old_token_logprobs.numel()).reshape_as(
+            combined.old_token_logprobs
         )
     )
-    combined.old_token_logprobs.copy_(combined.old_stop_logprobs + 1)
-    combined.old_values.copy_(combined.old_stop_logprobs + 2)
-    # Rollout storage starts with a zero-width Gaussian-stat field; refresh
-    # expands it to one factor per latent dimension.
-    combined.old_thought_logprobs = combined.thoughts + 3
+    combined.old_values.copy_(combined.old_token_logprobs + 2)
     scatter_replay_statistics(combined, groups)
     repacked = pack_rollout_groups_for_replay(groups)
     for name in (
-        "old_stop_logprobs",
         "old_token_logprobs",
-        "old_thought_logprobs",
         "old_values",
     ):
         expected = getattr(combined, name)
@@ -4956,26 +3430,18 @@ def test_replay_plan_matches_canonical_action_masks_and_targets():
         planned_rows.extend(shard.host_rows)
         torch.testing.assert_close(
             shard.emit_index,
-            slot_index(microbatch.emit_mask.bool()),
+            slot_index(microbatch.action_mask.bool()),
         )
-        torch.testing.assert_close(
-            shard.think_index,
-            slot_index(think_slot_mask(microbatch)),
+        rows = torch.div(
+            shard.emit_index,
+            shard.stream_length,
+            rounding_mode="floor",
         )
-        for action_index, expected_kind in (
-            (shard.emit_index, TOKEN_SLOT),
-            (shard.think_index, THOUGHT_SLOT),
-        ):
-            rows = torch.div(
-                action_index,
-                shard.stream_length,
-                rounding_mode="floor",
-            )
-            columns = action_index.remainder(shard.stream_length)
-            assert torch.all(columns + 1 < shard.stream_length)
-            assert torch.all(
-                microbatch.kind[rows, columns + 1] == expected_kind
-            )
+        columns = shard.emit_index.remainder(shard.stream_length)
+        assert torch.all(columns + 1 < shard.stream_length)
+        assert torch.all(
+            microbatch.kind[rows, columns + 1] == TOKEN_SLOT
+        )
 
     assert sorted(planned_rows) == list(range(batch.kind.size(0)))
     assert len(planned_rows) == len(set(planned_rows))
@@ -5011,8 +3477,7 @@ def test_geometry_only_replay_plan_omits_actor_indices():
     )
     assert not plan.has_action_indices
     assert all(
-        not shard.emit_index.numel() and not shard.think_index.numel()
-        for shard in plan.shards()
+        not shard.emit_index.numel() for shard in plan.shards()
     )
     plan.validate_settings(
         2,
@@ -5057,3 +3522,37 @@ def test_clip_bounds_are_the_same_constants_without_the_host_copy():
                 torch.log(reference.new_tensor(offset)),
                 torch.log(reference.new_full((), offset)),
             )
+
+
+def test_resume_schema_compatibility_is_strict_equality():
+    """v28 has no migrations: every pre-hidden-carry schema is refused."""
+    lockstep = execution_schema_for_rollout_scheduler("lockstep")
+    refill = execution_schema_for_rollout_scheduler("continuous_refill")
+    assert lockstep == EXECUTION_SCHEMA
+    assert refill != lockstep
+    assert resume_execution_schema_compatible({"execution_schema": lockstep})
+    assert resume_execution_schema_compatible(
+        {"execution_schema": refill},
+        expected_execution_schema=refill,
+    )
+    assert not resume_execution_schema_compatible(
+        {"execution_schema": refill}
+    )
+    for stale in (
+        None,
+        "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_"
+        "one_way_stop_reverse_kl_token_clip_anchored_value_general_lr_"
+        "sequential_data/v27",
+    ):
+        assert not resume_execution_schema_compatible(
+            {"execution_schema": stale}
+        )
+    assert resume_replay_schema_compatible(
+        {"replay_numerics_schema": REPLAY_NUMERICS_SCHEMA}
+    )
+    assert not resume_replay_schema_compatible(
+        {"replay_numerics_schema": "per_position_dense/v1"}
+    )
+    assert not resume_replay_schema_compatible({})
+    with pytest.raises(ValueError, match="unknown rollout scheduler"):
+        execution_schema_for_rollout_scheduler("tail_merge")

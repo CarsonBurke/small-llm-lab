@@ -2,8 +2,8 @@
 
 A fresh trunk (same architecture class as the policy backbone, random init,
 fully trainable) that reads the identical rollout stream — prompt and emitted
-tokens through its own embeddings, thought latents through its own
-orthogonal affine embedder — and predicts value alone.  No SIGReg,
+tokens through its own embeddings, carried hiddens through its own
+combined-embedding stack — and predicts value alone.  No SIGReg,
 no next-latent
 prediction, no shared parameters with the policy: its only loss is HL-Gauss
 cross-entropy on [0, 1] value targets (cleanrl iterthink v215 critic recipe:
@@ -22,15 +22,12 @@ import torch
 from torch import Tensor, nn
 
 from postraining.hl_gauss import HLGaussSupport
-from postraining.latent_rollout import PAD_SLOT, THOUGHT_SLOT, LatentRolloutBatch
-from postraining.latent_thought import (
-    CRITIC_ADAPTER_INIT_KINDS,
-    CRITIC_ADAPTER_INIT_SCHEMAS,
-    THOUGHT_ACTION_TRANSFORM_KINDS,
-    THOUGHT_ACTION_TRANSFORM_SCHEMAS,
-    AffineThoughtAdapter,
-    transform_thought_action,
+from postraining.latent_rollout import (
+    PAD_SLOT,
+    LatentRolloutBatch,
+    generated_slot_mask,
 )
+from postraining.latent_thought import CombinedEmbedding
 
 
 class SeparateCritic(nn.Module):
@@ -42,26 +39,18 @@ class SeparateCritic(nn.Module):
         v_min: float = 0.0,
         v_max: float = 1.0,
         prior_value: float = 0.0,
-        adapter_init: str = "orthogonal",
-        thought_action_transform: str = "identity",
+        mlp_hidden: int | None = None,
+        num_blocks: int = 1,
+        gain_init: float = 0.0,
     ):
         super().__init__()
-        if adapter_init not in CRITIC_ADAPTER_INIT_KINDS:
-            raise ValueError(f"unknown critic adapter init {adapter_init!r}")
         model_dim = trunk.tok_emb.embedding_dim
         self.trunk = trunk
-        self.adapter_init = adapter_init
-        self.adapter_init_schema = CRITIC_ADAPTER_INIT_SCHEMAS[adapter_init]
-        if thought_action_transform not in THOUGHT_ACTION_TRANSFORM_KINDS:
-            raise ValueError(
-                f"unknown thought action transform {thought_action_transform!r}"
-            )
-        self.thought_action_transform = thought_action_transform
-        self.thought_action_transform_schema = (
-            THOUGHT_ACTION_TRANSFORM_SCHEMAS[thought_action_transform]
-        )
-        self.adapter = AffineThoughtAdapter(
-            model_dim, initialization=adapter_init
+        self.combiner = CombinedEmbedding(
+            model_dim,
+            mlp_hidden=mlp_hidden,
+            num_blocks=num_blocks,
+            gain_init=gain_init,
         )
         self.support = HLGaussSupport(num_bins, v_min, v_max, sigma_ratio)
         self.head = nn.Linear(model_dim, num_bins)
@@ -78,26 +67,27 @@ class SeparateCritic(nn.Module):
         """The rollout stream in the critic's own latent space.
 
         Mirrors ``assemble_stream_latents`` but through this model's
-        embeddings and adapter — the critic shares no weights with the policy,
-        so it must map the stored stream into its own representation.
+        embeddings and combiner — the critic shares no weights with the
+        policy, so it maps the stored stream (token ids plus the actor's
+        behavior-time hiddens) into its own representation. The carried
+        hidden is stored data here as everywhere: the value loss reaches the
+        critic's combiner, never the actor's forward.
         """
         token_latent = self.trunk.embed_tokens(batch.token_ids)
         pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
-        if batch.thoughts.size(-1) == 0:
-            # Pinned-EMIT rollouts store zero-width thoughts and contain no
-            # THOUGHT slots; the adapter cannot consume a zero-width input.
+        if batch.hiddens.size(-1) == 0:
+            if batch.carry_injected:
+                raise ValueError(
+                    "latent rollout discarded its carried hiddens "
+                    "(replay_storage=False); the stream cannot be valued"
+                )
+            # Pinned-EMIT rollouts store zero-width hiddens and never
+            # inject; the combiner cannot consume a zero-width carry.
             return token_latent * pad_scale
-        think_mask = batch.kind == THOUGHT_SLOT
-        # The kind-select makes dense adapter evaluation exactly equivalent
-        # to compact boolean assignment, while avoiding the latter's
-        # dynamic-shape nonzero graph break inside torch.compile.
-        thought_latent = self.adapter(
-            transform_thought_action(
-                batch.thoughts, self.thought_action_transform
-            )
-        ).to(token_latent.dtype)
-        inputs = torch.where(
-            think_mask[..., None], thought_latent, token_latent
+        # The dense flag-select keeps static shapes, avoiding boolean
+        # indexing's dynamic-shape nonzero graph break inside torch.compile.
+        inputs = self.combiner(
+            token_latent, batch.hiddens, generated_slot_mask(batch)
         )
         return inputs * pad_scale
 
@@ -106,8 +96,7 @@ class SeparateCritic(nn.Module):
         beliefs = self.trunk.temporal_belief_from_token_latent(
             self.assemble_inputs(batch)
         )
-        # Distribution parameters are fp32 statistics even under autocast,
-        # matching the gate and transition heads' convention.
+        # Distribution parameters are fp32 statistics even under autocast.
         with torch.autocast(device_type=beliefs.device.type, enabled=False):
             return self.head(beliefs.float())
 
