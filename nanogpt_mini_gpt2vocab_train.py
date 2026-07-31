@@ -78,7 +78,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
     file_iter = itertools.cycle(files)
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
-        if pos + batch_size + 1 >= len(tokens):
+        if pos + batch_size + 1 > len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)

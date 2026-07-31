@@ -282,6 +282,11 @@ def _run_suite(args: argparse.Namespace) -> None:
     import torch
 
     script = Path(__file__).resolve()
+    selected_configs = tuple(
+        config
+        for config in CONFIGS
+        if not args.kda_only or config[1] == "kda"
+    )
     with tempfile.TemporaryDirectory(prefix="kda_training_bench_") as temp_dir:
         output_dir = Path(temp_dir)
         results = {}
@@ -294,7 +299,7 @@ def _run_suite(args: argparse.Namespace) -> None:
             disable_recompute,
             state_v_first,
             external_gate,
-        ) in CONFIGS:
+        ) in selected_configs:
             artifact_path = output_dir / f"{name}.pt"
             result_path = output_dir / f"{name}.json"
             command = [
@@ -415,28 +420,30 @@ def _run_suite(args: argparse.Namespace) -> None:
         # K-first implementation against the canonical V-first result before
         # selecting whichever is faster.
         layout_comparisons = {}
-        v_first_artifacts = artifacts["gdn2_external_gate_v_first"]
-        k_first_artifacts = artifacts["gdn2_external_gate_k_first"]
-        for seed, v_first in v_first_artifacts.items():
-            seed_errors = {}
-            for field, tolerance in GDN2_TOLERANCES.items():
-                k_first = k_first_artifacts[seed][field]
-                ratio = _error_ratio(v_first[field], k_first)
-                max_abs = (v_first[field] - k_first).abs().max().item()
-                seed_errors[field] = {
-                    "error_ratio": ratio,
-                    "max_abs": max_abs,
-                    "tolerance": tolerance,
-                }
-                if ratio >= tolerance and max_abs > 1e-6:
-                    raise AssertionError(
-                        f"GDN2 state-layout seed {seed} {field}: error ratio "
-                        f"{ratio:.6g} exceeds {tolerance:.6g} "
-                        f"(max abs {max_abs:.6g})"
-                    )
-            layout_comparisons[seed] = seed_errors
+        if not args.kda_only:
+            v_first_artifacts = artifacts["gdn2_external_gate_v_first"]
+            k_first_artifacts = artifacts["gdn2_external_gate_k_first"]
+            for seed, v_first in v_first_artifacts.items():
+                seed_errors = {}
+                for field, tolerance in GDN2_TOLERANCES.items():
+                    k_first = k_first_artifacts[seed][field]
+                    ratio = _error_ratio(v_first[field], k_first)
+                    max_abs = (v_first[field] - k_first).abs().max().item()
+                    seed_errors[field] = {
+                        "error_ratio": ratio,
+                        "max_abs": max_abs,
+                        "tolerance": tolerance,
+                    }
+                    if ratio >= tolerance and max_abs > 1e-6:
+                        raise AssertionError(
+                            f"GDN2 state-layout seed {seed} {field}: error "
+                            f"ratio {ratio:.6g} exceeds {tolerance:.6g} "
+                            f"(max abs {max_abs:.6g})"
+                        )
+                layout_comparisons[seed] = seed_errors
 
         report = {
+            "kda_only": args.kda_only,
             "shape": {
                 "batch_size": args.batch_size,
                 "seq_len": args.seq_len,
@@ -468,6 +475,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-recompute", action="store_true")
     parser.add_argument("--state-v-first", action="store_true")
     parser.add_argument("--external-gate", action="store_true")
+    parser.add_argument(
+        "--kda-only",
+        action="store_true",
+        help="Benchmark KDA configurations without the unrelated GDN-2 cases",
+    )
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--result", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
