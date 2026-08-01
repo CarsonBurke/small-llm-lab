@@ -21,7 +21,7 @@ from postraining.latent_rollout import (
 from postraining.latent_thought import LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
-LATENT_EVAL_METRIC_SCHEMA = "deterministic_hidden_carry_token_actions/v3"
+LATENT_EVAL_METRIC_SCHEMA = "deterministic_hidden_carry_token_actions/v4"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
@@ -404,6 +404,10 @@ def evaluate_latent_math(
         "policy_samples": total,
         "samples": total,
         "prompt_groups": len(prompt_correct),
+        # Raw per-prompt correct counts in ORIGINAL row order, so two
+        # evaluations over the same row panel can be compared with paired
+        # per-prompt statistics instead of only aggregate accuracy.
+        "prompt_correct_counts": list(prompt_correct),
         "prompt_any_correct_fraction": sum(
             count > 0 for count in prompt_correct
         ) / max(len(prompt_correct), 1),

@@ -313,9 +313,14 @@ def sample_json_to_report_payload(
             )
 
     total = len(attempts)
+    prompt_correct_counts = [0] * problem_count
+    for attempt in attempts:
+        prompt_correct_counts[attempt["problem_index"]] += int(
+            attempt["correct"]
+        )
     metrics = {
         "evaluation_metric_schema": (
-            "deterministic_hidden_carry_token_actions/v3"
+            "deterministic_hidden_carry_token_actions/v4"
         ),
         "accuracy": sum(int(attempt["correct"]) for attempt in attempts) / total,
         "policy_accuracy": sum(
@@ -324,6 +329,7 @@ def sample_json_to_report_payload(
         / total,
         "policy_samples": total,
         "pin_emit": pin_emit,
+        "prompt_correct_counts": prompt_correct_counts,
         "samples": total,
     }
     return {
