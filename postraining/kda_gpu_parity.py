@@ -10,6 +10,11 @@ Asserts, on CUDA, the agreements the CPU suite cannot check:
    fp32 tight and bf16-autocast loose — the "dense prefill/decode logits
    match" half of the base-model gate, on random weights.
 3. Left-padded prefill == unpadded prefill through the CUDA kernel path.
+4. Paged continuous-refill decode == per-row dense decode, with dead
+   padding rows in every step (the scratch-lane redirect under CUDA), and
+   the inductor-compiled ``paged_step_core`` == its eager self — the gate
+   ``--rollout-scheduler continuous_refill`` and ``--rollout-graph-decode``
+   stand on for KDA trunks.
 
 Writes ``postraining/runs/kda_gpu_parity/result.json`` and exits nonzero on
 any failed bound, so an mlq failure IS a parity failure.
@@ -182,6 +187,120 @@ def main() -> None:
         )
     check("leftpad_logits", pad_err, 2e-3)
     check("leftpad_state", state_err, 1e-3)
+
+    # ---- 4. paged continuous-refill decode, eager and compiled ------------
+    # Two ragged groups fanned into shuffled lanes of an 8-lane pool, then
+    # 32 decode steps at width 8 with four dead padding rows per step (the
+    # production bucket-padding shape). The dead rows name a LIVE lane, so
+    # every step exercises the recurrent scratch-lane redirect; any leak
+    # compounds through the 32-step recurrence instead of averaging out.
+    torch.manual_seed(2)
+    steps = 32
+    prompt_width = 256
+    pad_prompts = ids[:2, :prompt_width].clone()
+    pad_prompts[0, :64] = 0
+    lengths = torch.tensor([prompt_width - 64, prompt_width], device=device)
+    slots = torch.tensor([[2, 0], [3, 1]], device=device)
+    selected_groups = torch.tensor([1, 0], device=device)
+    step_tokens = torch.randint(0, 512, (steps, 4), device=device)
+
+    def run_paged() -> list[torch.Tensor]:
+        paged = wrapper.make_paged_generation_cache(
+            8, prompt_width + steps, device
+        )
+        bank = wrapper.build_prompt_prefix_bank(pad_prompts, lengths)
+        wrapper.admit_prompt_prefixes(bank, selected_groups, slots, paged)
+        live = torch.tensor([True] * 4 + [False] * 4, device=device)
+        slot_ids = torch.cat(
+            (slots.flatten(), torch.zeros(4, dtype=torch.long, device=device))
+        )
+        logits = []
+        with torch.no_grad():
+            for offset in range(steps):
+                positions = torch.where(
+                    live,
+                    torch.tensor(prompt_width + offset, device=device),
+                    torch.tensor(0, device=device),
+                )
+                tokens = torch.cat(
+                    (
+                        step_tokens[offset],
+                        torch.zeros(4, dtype=torch.long, device=device),
+                    )
+                )
+                stepped = wrapper.token_paged_step(
+                    tokens,
+                    paged,
+                    slot_ids=slot_ids,
+                    positions=positions,
+                    live=live,
+                )
+                logits.append(stepped.logits[:4].clone())
+        return logits
+
+    key_valid = (
+        torch.arange(prompt_width, device=device)[None]
+        >= (prompt_width - lengths)[:, None]
+    )
+    dense_logits = [[] for _ in range(steps)]
+    with torch.no_grad():
+        for group in selected_groups.tolist():
+            for _ in range(2):
+                dense_cache = wrapper.make_generation_cache(
+                    1, prompt_width + steps, device
+                )
+                wrapper.prefill(
+                    pad_prompts[group : group + 1],
+                    dense_cache,
+                    key_valid[group : group + 1],
+                )
+                row = len(dense_logits[0])
+                for offset in range(steps):
+                    mask = torch.cat(
+                        (
+                            key_valid[group : group + 1],
+                            torch.ones(
+                                1,
+                                1 + offset,
+                                dtype=torch.bool,
+                                device=device,
+                            ),
+                        ),
+                        dim=1,
+                    )
+                    stepped = wrapper.token_step(
+                        step_tokens[offset, row : row + 1],
+                        dense_cache,
+                        prompt_width + offset,
+                        mask,
+                    )
+                    dense_logits[offset].append(stepped.logits)
+
+    eager_paged = run_paged()
+    paged_err = max(
+        max_err(paged_step_logits, torch.cat(dense_step_logits))
+        for paged_step_logits, dense_step_logits in zip(
+            eager_paged, dense_logits
+        )
+    )
+    check("fp32_paged_vs_dense", paged_err, 2e-3)
+
+    # The production shadowing pattern: the trainer swaps the bound method
+    # for the compiled artifact, so parity here is parity for the real
+    # decode loop under --rollout-graph-decode's compile flags.
+    original_paged_step_core = wrapper.paged_step_core
+    wrapper.paged_step_core = torch.compile(
+        original_paged_step_core, fullgraph=True, dynamic=False
+    )
+    try:
+        compiled_paged = run_paged()
+    finally:
+        wrapper.paged_step_core = original_paged_step_core
+    compiled_err = max(
+        max_err(compiled_step, eager_step)
+        for compiled_step, eager_step in zip(compiled_paged, eager_paged)
+    )
+    check("fp32_compiled_paged_vs_eager", compiled_err, 2e-3)
 
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULT_PATH.write_text(

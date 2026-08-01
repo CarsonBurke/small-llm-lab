@@ -223,7 +223,9 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
         copies are what ``attn.step`` mutates in place; the scatter is the
         single write back to the arena. ``lane_rows`` is duplicate-free by
         construction (``paged_step`` redirects dead rows to per-row scratch
-        lanes), which is what makes the ``index_copy_`` defined behaviour.
+        lanes and checks uniqueness on CPU), which keeps the ``index_copy_``
+        deterministic — a repeated index would pick a winner
+        nondeterministically.
         """
         del x0
         if block.use_kda:

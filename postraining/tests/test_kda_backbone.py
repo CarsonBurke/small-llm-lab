@@ -497,6 +497,92 @@ def test_recurrent_lane_recycling_overwrites_previous_occupant():
     torch.testing.assert_close(step_recycled.belief, step_fresh.belief)
 
 
+@torch.no_grad()
+def test_dirty_scratch_rows_never_influence_live_rows():
+    """Twenty padded steps: scratch content must be inert, however stale.
+
+    A row that stays dead across steps re-reads its own scratch row each
+    step (the gather has no live gate), so scratch accumulates arbitrary
+    stale recurrent state. Run the identical padded schedule twice — once
+    normally, once scrubbing every recurrent scratch row to zero before
+    each step — and demand bit-identical live logits and live lane
+    storage. Any divergence means scratch content found a path into
+    something a real request can observe. Same batch width on both runs,
+    so bit-equality is a legitimate bar (unlike cross-width comparisons,
+    where BLAS kernel selection alone breaks it).
+    """
+
+    def run(scrub: bool):
+        wrapper = _wrapper().eval()
+        prompts = torch.randint(
+            1, 32, (2, 4), generator=torch.Generator().manual_seed(47)
+        )
+        paged = wrapper.make_paged_generation_cache(
+            4, 32, torch.device("cpu"), dtype=torch.float32, page_size=4
+        )
+        wrapper.prefill_into_paged_slots(
+            prompts,
+            torch.tensor([4, 4]),
+            torch.tensor([[0], [1]]),
+            paged,
+        )
+        logits = []
+        for offset in range(20):
+            if scrub:
+                for layer in paged.layers:
+                    if len(layer) == 4:
+                        for arena in layer:
+                            arena[paged.capacity :] = 0
+            stepped = wrapper.token_paged_step(
+                torch.tensor([7 + offset % 5, 11, 0, 0]),
+                paged,
+                slot_ids=torch.tensor([0, 1, 0, 0]),
+                positions=torch.tensor([4 + offset, 4 + offset, 0, 0]),
+                live=torch.tensor([True, True, False, False]),
+            )
+            logits.append(stepped.logits[:2].clone())
+        lanes = [
+            tuple(tensor[:2].clone() for tensor in layer)
+            for layer in paged.layers
+            if len(layer) == 4
+        ]
+        assert lanes  # the hybrid fixture must have KDA layers
+        return torch.stack(logits), lanes
+
+    dirty_logits, dirty_lanes = run(scrub=False)
+    clean_logits, clean_lanes = run(scrub=True)
+    assert torch.equal(dirty_logits, clean_logits)
+    for dirty_layer, clean_layer in zip(dirty_lanes, clean_lanes, strict=True):
+        for dirty, clean in zip(dirty_layer, clean_layer, strict=True):
+            assert torch.equal(dirty, clean)
+
+
+def test_paged_step_refuses_duplicate_lane_rows_without_live_mask():
+    """The CPU guard: duplicate slot_ids with no live mask must raise.
+
+    A repeated ``index_copy_`` index picks a winner nondeterministically;
+    on the recurrent arena there is no read mask to hide the corruption
+    behind, so the sync-free CPU path validates what CUDA cannot.
+    """
+    wrapper = _wrapper().eval()
+    paged = wrapper.make_paged_generation_cache(
+        4, 12, torch.device("cpu"), dtype=torch.float32, page_size=4
+    )
+    wrapper.prefill_into_paged_slots(
+        torch.randint(1, 32, (1, 3)),
+        torch.tensor([3]),
+        torch.tensor([[0, 1]]),
+        paged,
+    )
+    with pytest.raises(ValueError, match="duplicate-free"):
+        wrapper.token_paged_step(
+            torch.tensor([7, 11]),
+            paged,
+            slot_ids=torch.tensor([0, 0]),
+            positions=torch.tensor([3, 3]),
+        )
+
+
 def test_kda_paged_step_core_is_one_full_graph_across_ragged_positions():
     """The recurrent gather/step/scatter must not break the compiled core."""
     wrapper = _wrapper().eval()
