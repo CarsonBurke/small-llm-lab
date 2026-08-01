@@ -2648,3 +2648,157 @@ padding-row lane inertness, lane recycling exactness, fullgraph one-graph) +
 tests green. GPU validation: queue a k3-checkpoint rollout-only A/B
 (lockstep vs continuous_refill x3) after 1011; graph-decode-on-KDA waits for
 the 1010/1011 verdict.
+
+Red-team follow-up (2026-07-31, second reviewer pass — verdict: no confirmed
+bug, with active verification: inductor-vs-eager parity 4.8e-7, 20-step
+dirty-scratch stress, pad on/off scheduler bit-identity, and confirmation the
+scratch redirect is load-bearing). Actions taken:
+- B3: `paged_step` now validates lane_rows duplicate-free on CPU (sync-free
+  path only, mirroring admission's prefix-address check) + a test that
+  duplicate slot_ids without a live mask raise.
+- B2/C4 comment corrections: index_copy_ with duplicates is NOT UB — it picks
+  a winner nondeterministically (documented PyTorch semantics). Per-row
+  scratch sinks are kept anyway: determinism-mode compliance, and scratch
+  rows ARE re-read (a row dead for several steps gathers its own stale
+  scratch each step — safe because dead outputs are never consumed and
+  admission rewrites lanes wholesale, but a shared sink would make that
+  reread racy). Cost at production shape (~1.77 GiB extra) accepted.
+- B5 tests added: (1) 20-step dirty-scratch soak — same padded schedule run
+  with and without scrubbing scratch rows to zero each step must be
+  bit-identical in live logits and lane storage (same batch width both runs,
+  so bit-equality is legitimate); (2) real-KDA scheduler pad_decode_width
+  on/off — tokens+logprobs bit-identical, stored carries within 1e-5 (B4:
+  cross-width BLAS numerics move beliefs ~7e-7 measured; lane corruption
+  moves them ~0.3 — three orders of separation, so the bound discriminates);
+  (3) KDA warmup_decode_width_buckets preserves arenas bit-exactly.
+- B4 disposition: width-bucket numerics do NOT threaten the age-0 canary —
+  refresh_old_statistics recomputes behavior stats through the replay path,
+  so the canary compares replay-vs-replay; rollout-side wobble is an off-policy
+  perturbation the refresh discipline already absorbs. No code change.
+- B1: kda_gpu_parity.py gained section 4 — paged continuous-refill decode
+  (8-lane pool, shuffled ragged admission, 32 steps with 4 dead padding rows
+  per step) vs per-row dense decode (bound 2e-3 fp32), plus compiled
+  paged_step_core (fullgraph, dynamic=False — the production shadowing
+  pattern) vs eager (bound 2e-3). Queued as job 1012.
+- 396 CPU tests green. Queue: 1012 kda_paged_parity -> 1013
+  kda_sched_ab_lockstep -> 1014 kda_sched_ab_continuous (k3 checkpoint,
+  --rollout-only x3), priority 0 so the user's sffactor jobs (999/1001) go
+  first. Graph-decode-on-KDA still waits for the 1010/1011 verdict AND 1012.
+Deferred: C1 (tuple-arity dispatch hardening) and C2 (skip prefix_addresses
+on fully-recurrent trunks) — no fully-recurrent trunk exists in the lineup;
+revisit if one does.
+
+## Combiner reparameterization: drop the scalar gate (2026-07-31)
+
+Diagnosis (from k3_latent_10h telemetry, user-confirmed direction): the v1
+combiner `base + gain*W(h) + type_bias` (gain zero-init, W orthogonal) is a
+multiplicative saddle. Actor gain oscillated at ~1e-4 for 8k+ steps with W
+frozen at init rms 0.0442; only type_bias trained. Checkpoint forensics
+sharpened it: the CRITIC's gain trained to -0.063 (value CE has no ratio
+gate), so the saddle is starvation of the actor path specifically, and the
+mechanism works when gradient reaches it — evidence the reparameterization,
+not the idea, was the blocker. v2: `base + W(h) + type_bias`, W zero-init
+(ControlNet zero-conv pattern; dL/dW = loss direction outer hidden,
+full-rank from step 1). Schema: zero_init_hidden_residual_prenorm_mlp/v2.
+"Concat after its own linear" (considered): a linear over a concat
+decomposes into a sum of two linears, so under the identity-at-init
+constraint it IS the zero-init additive form; only nonlinear cross-terms in
+the combiner MLP would differ, and nothing implicates those.
+
+Mid-run surgery (postraining/fold_combiner_gain.py): W' := gain*W is
+function-preserving, so the 1008 run's ~2h of trunk/critic training
+carries over. Optimizer remap: drop gain's global index (actor: combiner
+group position 0 — Module.parameters() yields direct Parameters before
+children, so v1 order is [gain, type_bias, carry, ...]), shift higher
+indices, drop carry's Adam moments (accumulated under the gain-scaled
+parameterization; lazily reinitialized). Muon optimizers untouched (no
+combiner params). Verified on a live checkpoint copy: strict model+critic
+loads, all 4 optimizer loads through build_optimizers, fold error 1e-10
+(actor) / 1.2e-7 (critic). 396 CPU tests green after the reparameterization.
+
+Plan: after diff review — cancel 1008 at its rolling checkpoint, fold, and
+resume with --max-train-hours = 7.5 minus 1008's elapsed (same deadline).
+Watch combiner/carry_weight_rms (now starts at the folded near-zero value
+and should GROW if the carry is useful) and combiner/update_rms (was ~1e-5,
+should rise with the ungated gradient).
+
+Surgery executed (2026-07-31 14:17 PDT). Diff review: APPROVED, no blockers
+(reviewer independently caught the same two converter traps fixed during
+development — param ordering and the critic's None-expected-index path — and
+verified: optimizer group sizes, fused-AdamW lazy state init for the
+moment-dropped carry, fold parity 7e-10 on real weights, no stale gain refs
+repo-wide, no compile-cache hazard). Review follow-ups landed: Muon guard
+scans all tensor values (Muon keys "momentum", not "exp_avg"), converter
+refuses source==target, synthetic round-trip test added
+(test_fold_combiner_gain.py — the script is NOT one-shot: the v1
+critic_warmup_checkpoint.pt converts the same way if ever needed for
+--actor-critic-init), doc drift fixed. 1008 cancelled at step ~12152
+(2.49h elapsed); fold: actor gain -4.90e-4 -> carry rms 2.2e-5, critic gain
+-6.42e-2 -> carry rms 3.2e-3. Job 1015 (k3_latent_10h_v2combiner) resumes
+from latent_vapo_checkpoint_v2.pt with --max-train-hours 5.0 (v1 rolling
+checkpoint left untouched). Cancelling 1008 auto-skipped dependents
+1009-1011; resubmitted as 1016 (dynamic_rows_gate) -> 1017/1018
+(graph-decode A/B) behind 1015. The user's 999/1001 took the freed lease
+(they had been waiting); 1015 is the protected next-up job.
+Success criteria for v2: combiner/carry_weight_rms grows off 2.2e-5 and
+combiner/update_rms rises above the saddle-era ~1e-5.
+
+## Carry-ablation deep analysis (2026-07-31, job 1020)
+
+Question (user): is the recurrent hidden actually helping — what does the
+critic read from it, is token use more coherent, why is AIME near zero?
+
+Design (postraining/carry_ablation_eval.py, runs concurrently with 1015
+against the atomic rolling checkpoint; scheduler granted a backfill bypass
+of protected 1012 after bumping 1015's declaration to 2):
+
+- Three behavioral arms on identical panels/seed: full; no_content
+  (carry.weight zeroed — content channel off, type_bias+MLP alive);
+  token_only (pin_emit — whole combiner bypassed, plain-token policy).
+  Panels: 384 DAPO math prompts x 8 samples (the distribution with
+  statistical power; accuracy ~0.25) and AIME-2024 x 16 samples
+  (descriptive only — 30 prompts can't power a paired test).
+- Paired per-prompt stats via new prompt_correct_counts in
+  evaluate_latent_math (schema v4): bootstrap CI + sign-flip permutation
+  test over prompts. The three pairwise comparisons share two degrees of
+  freedom (full-vs-token_only = sum of the other two deltas).
+- Mechanistic probes at the training operating point: roll 32x8
+  trajectories, refresh_old_statistics with stored vs zeroed batch.hiddens
+  (production replay path, no_grad — compile-guard rationale doesn't apply
+  eagerly), diff old_token_logprobs/old_values at action slots; plus
+  rms(W h)/rms(embed) injection scale.
+
+Review (subagent): arm isolation, pairing validity, and stats confirmed
+sound; hard action_mask dtype crash and missing no_grad caught and fixed
+pre-submission; behavioral results now persist before probes so a probe
+OOM can't discard the sweep.
+
+First readout: checkpoint step 23648, actor carry rms 3.91e-3 (still
+growing), math/full accuracy 0.278 avg@8, emitted mean 18.7 tokens.
+
+### Carry-ablation results (job 1020, checkpoint step 23648)
+
+Math panel (384 prompts x 8 avg@k, paired): full 0.2780, no_content 0.2744,
+token_only 0.2754 — no significant accuracy contribution from the carry
+(best delta +0.0036, p=0.15; full-vs-token_only +0.0026, p=0.066). 378/384
+prompts are exact ties across arms; within-group reward std ~0.005 —
+the policy is near-deterministic per prompt (entropy collapse), so GRPO
+advantages are zero on ~98% of prompts and learning has starved.
+
+What the carry DOES do:
+- Termination control: emitted mean 18.7 (full) -> 26.2 (no_content) ->
+  111.9 with p95 1024 and 9.3% never terminating (token_only). Long
+  token_only tails are degenerate repetition loops.
+- Self-consistency: boxed==Answer agreement 28/26/23 of 32 (math) and
+  22/20/17 (aime) across full/no_content/token_only — monotonic.
+- Policy sharpening: zeroing hiddens at replay drops taken-token logprob
+  by 0.073 nats/slot mean (+1.35/sequence); injection rms is 0.75x the
+  token embedding rms — the channel is large and live.
+- Critic reads it weakly: |dV| mean 0.0099, p95 0.037; reward correlation
+  of the critic's hidden-read is -0.16 (not reward-predictive yet).
+
+AIME: 0/480 (full and no_content); token_only 1/480. Degenerate
+16-24-token answer-only responses cannot solve AIME; the RL-entrenched
+brevity actively removes any chance (the rambling token_only arm was the
+only one to score). Root problem is the entropy/mode collapse plus
+partial-credit-dominated reward, not the carry mechanism.
