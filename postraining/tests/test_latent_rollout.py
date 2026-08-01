@@ -292,7 +292,7 @@ def test_assembled_latents_zero_pads_and_route_hiddens_through_combiner():
     with torch.no_grad():
         # A fresh combiner is an exact identity; give it a live content
         # channel so the carried-hidden routing is observable.
-        wrapper.combiner.gain.fill_(0.3)
+        wrapper.combiner.carry.weight.normal_(std=0.02)
         wrapper.combiner.type_bias.normal_(std=0.02)
     batch = _rollout(wrapper)
     with torch.no_grad():
@@ -368,7 +368,7 @@ def test_update_minibatch_trains_the_full_policy_model():
     trunk_before = backbone.blocks[0].attn.proj.weight.clone()
     embed_before = backbone.tok_emb.weight.clone()
     critic_trunk_before = critic.trunk.blocks[0].attn.proj.weight.clone()
-    combiner_gain_before = wrapper.combiner.gain.clone()
+    combiner_carry_before = wrapper.combiner.carry.weight.clone()
     frozen_probe_before = backbone.critic_probe.output.weight.clone()
     metrics = update_minibatch(wrapper, critic, batch, _optimizers(wrapper, critic))
     assert all(
@@ -381,8 +381,9 @@ def test_update_minibatch_trains_the_full_policy_model():
     assert not torch.equal(
         critic.trunk.blocks[0].attn.proj.weight, critic_trunk_before
     )
-    # The combiner gain has a first-step gradient through W(h) . dL/dinput.
-    assert not torch.equal(wrapper.combiner.gain, combiner_gain_before)
+    # The zero-init carry matrix has a full-rank first-step gradient
+    # (loss direction outer hidden), so it must move on the first update.
+    assert not torch.equal(wrapper.combiner.carry.weight, combiner_carry_before)
     # Only the unused backbone critic probe stays frozen.
     assert torch.equal(backbone.critic_probe.output.weight, frozen_probe_before)
     assert metrics["trunk_grad_norm"] > 0.0
@@ -519,7 +520,7 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
     with torch.no_grad():
         # A live combiner makes the carried-hidden path load-bearing; a fresh
         # identity combiner would let this pass even if refresh dropped it.
-        wrapper.combiner.gain.fill_(0.3)
+        wrapper.combiner.carry.weight.normal_(std=0.02)
     batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
     refresh_old_statistics(wrapper, critic, batch)
     backbone = wrapper.backbone
@@ -1174,7 +1175,7 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     # zero); randomize/enable them so the ratio-one property is load-bearing.
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.combiner.gain.fill_(0.3)
+        wrapper.combiner.carry.weight.normal_(std=0.02)
     batch = _rollout(wrapper, batch=2, prompt=5, new_tokens=3)
     # The carried hidden is stored fp32 even under a bf16 backbone: the
     # combiner computes its injection in fp32 and casts once, so storage
@@ -1203,7 +1204,7 @@ def test_later_disjoint_minibatch_keeps_the_pool_behavior_policy_fixed():
     critic = _critic()
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.combiner.gain.fill_(0.3)
+        wrapper.combiner.carry.weight.normal_(std=0.02)
     first = _rollout(wrapper, batch=4, prompt=5, new_tokens=3, seed=17)
     later = _rollout(wrapper, batch=4, prompt=5, new_tokens=3, seed=19)
     for batch in (first, later):

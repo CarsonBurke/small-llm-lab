@@ -228,7 +228,7 @@ def test_the_age_zero_canary_holds_on_cuda():
     critic = _critic()
     with torch.no_grad():
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
-        wrapper.combiner.gain.fill_(0.3)
+        wrapper.combiner.carry.weight.normal_(std=0.02)
     host_batch = _rollout(
         wrapper, batch=6, prompt=5, new_tokens=4, seed=7
     )

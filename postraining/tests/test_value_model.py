@@ -124,9 +124,9 @@ def test_hiddens_reach_the_critic_through_its_own_combiner():
     critic = _critic()
     with torch.no_grad():
         critic.head.weight.normal_(std=0.05)
-        # A fresh combiner is an exact identity (gain 0, zero type bias), so
-        # give the content channel a live gain before perturbing hiddens.
-        critic.combiner.gain.fill_(0.5)
+        # A fresh combiner is an exact identity (zero carry matrix, zero
+        # type bias), so liven the content channel before perturbing hiddens.
+        critic.combiner.carry.weight.normal_(std=0.05)
     batch = _batch()
     carried_slots = int(generated_slot_mask(batch).sum())
     if carried_slots == 0:
@@ -155,7 +155,7 @@ def test_critic_combiner_is_identity_at_init_on_uncarried_slots():
 def test_critic_dense_masked_inputs_match_combiner_routing():
     critic = _critic()
     with torch.no_grad():
-        critic.combiner.gain.fill_(0.3)
+        critic.combiner.carry.weight.normal_(std=0.02)
         critic.combiner.type_bias.normal_(std=0.02)
         for mlp in critic.combiner.mlps:
             mlp.proj.weight.normal_(std=0.02)
@@ -195,9 +195,9 @@ def test_all_critic_parameters_receive_value_gradients():
     critic = _critic()
     with torch.no_grad():
         critic.head.weight.normal_(std=0.05)
-        # gain 0 would zero the gradient into the carry matrix (its update is
-        # scaled by the explicit gain), so test reach at a live gain.
-        critic.combiner.gain.fill_(0.5)
+        # Liven the carry so the trunk sees a nonzero carry contribution
+        # and its gradient reach is exercised too, not just the combiner's.
+        critic.combiner.carry.weight.normal_(std=0.05)
     batch = _batch()
     logits = critic.value_logits(batch)
     targets = torch.full(batch.kind.shape, 0.7)
@@ -212,7 +212,6 @@ def test_all_critic_parameters_receive_value_gradients():
     # heads (probes, lm head paths) legitimately get no gradient.
     assert any(name.startswith("trunk.blocks.0") for name in with_grad)
     assert "combiner.carry.weight" in with_grad
-    assert "combiner.gain" in with_grad
     assert "combiner.type_bias" in with_grad
     # The MLP proj is zero-initialized, so at step 0 the forward weight's
     # gradient (which flows through proj) is exactly zero; proj itself moves

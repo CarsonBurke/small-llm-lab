@@ -542,7 +542,7 @@ def test_real_paged_model_hidden_carry_matches_dense_replay():
         for block in model.backbone.blocks:
             block.attn.proj.weight.normal_(std=0.02)
             block.mlp.proj.weight.normal_(std=0.02)
-        model.combiner.gain.fill_(0.4)
+        model.combiner.carry.weight.normal_(std=0.02)
         model.combiner.type_bias.normal_(std=0.02)
         for mlp in model.combiner.mlps:
             mlp.proj.weight.normal_(std=0.02)
@@ -616,7 +616,7 @@ def test_real_kda_model_hidden_carry_matches_dense_replay():
     """
     model = LatentThoughtModel(_kda_backbone()).eval()
     with torch.no_grad():
-        model.combiner.gain.fill_(0.4)
+        model.combiner.carry.weight.normal_(std=0.02)
         model.combiner.type_bias.normal_(std=0.02)
         for mlp in model.combiner.mlps:
             mlp.proj.weight.normal_(std=0.02)
@@ -640,6 +640,58 @@ def test_real_kda_model_hidden_carry_matches_dense_replay():
 
     assert results
     _assert_split_groups_replay_carries(model, results, chunk_lengths, 2)
+
+
+def test_kda_padded_decode_width_changes_nothing_a_live_row_can_observe():
+    """The recurrent twin of the fake-model padding test.
+
+    The fake model never runs the arena write path, so on a KDA trunk the
+    only thing standing between a padding row and a live lane's delta-rule
+    state is the scratch-lane redirect. A three-row group in a four-row
+    pool pads every decode step; forcing ``pad_decode_width`` on and off
+    must leave tokens and logprobs bit-identical. The stored carries get a
+    tight fp32 closeness bound instead: pad off runs the decode GEMMs at
+    width 3 and pad on at width 4, and BLAS kernel selection alone moves
+    beliefs by ~7e-7 across widths — while a broken scratch redirect moves
+    them by ~0.3 (the measured lane-corruption scale). The combiner is
+    livened so a corrupted carry would compound into later tokens instead
+    of cancelling out.
+    """
+    assert _decode_execution_width(3, 4, pending_groups=False) == 4
+    model = LatentThoughtModel(_kda_backbone()).eval()
+    with torch.no_grad():
+        model.combiner.carry.weight.normal_(std=0.02)
+        model.combiner.type_bias.normal_(std=0.02)
+        for mlp in model.combiner.mlps:
+            mlp.proj.weight.normal_(std=0.02)
+    prompts = torch.tensor([[0, 7, 11, 13], [5, 9, 13, 17], [3, 17, 19, 23]])
+    lengths = torch.tensor([3, 4, 4])
+
+    def run(pad: bool):
+        return rollout_continuous_refill_groups(
+            model,
+            [prompts],
+            [lengths],
+            prompt_repeats=1,
+            capacity_rows=4,
+            max_new_tokens=4,
+            max_stream_steps=4,
+            temperature=1.0,
+            top_p=1.0,
+            seed=101,
+            cache_dtype=torch.float32,
+            pin_emit=False,
+            pad_decode_width=pad,
+        )
+
+    plain = run(False)
+    padded = run(True)
+    for left, right in zip(plain, padded, strict=True):
+        assert torch.equal(left.token_ids, right.token_ids)
+        assert torch.equal(left.old_token_logprobs, right.old_token_logprobs)
+        torch.testing.assert_close(
+            left.hiddens, right.hiddens, rtol=1e-5, atol=1e-5
+        )
 
 
 def test_scheduler_rejects_capacity_smaller_than_one_group():
@@ -698,6 +750,56 @@ def test_warmup_decode_width_buckets_covers_and_preserves() -> None:
     fresh_model = LatentThoughtModel(_backbone()).eval()
     fresh = run(
         fresh_model.make_paged_generation_cache(
+            capacity, 4 + 2, torch.device("cpu"), dtype=torch.float32
+        )
+    )
+    for warmed_batch, fresh_batch in zip(warmed, fresh, strict=True):
+        assert torch.equal(warmed_batch.token_ids, fresh_batch.token_ids)
+        assert torch.equal(
+            warmed_batch.old_token_logprobs, fresh_batch.old_token_logprobs
+        )
+        assert torch.equal(warmed_batch.hiddens, fresh_batch.hiddens)
+
+
+def test_warmup_decode_width_buckets_preserves_kda_arenas() -> None:
+    """Warmup on a recurrent trunk writes state, not just KV.
+
+    Every warmup row is dead, so on a KDA cache each pass exercises the
+    scratch-lane redirect at every width bucket — three unconditional
+    arena writes per recurrent layer per step. A warmed cache must still
+    produce bit-identical rollouts to a fresh one; anything else means a
+    warmup write landed inside ``[0, capacity)``.
+    """
+    capacity = 4
+    model = LatentThoughtModel(_kda_backbone()).eval()
+    first_prompts = torch.tensor([[0, 0, 7, 11], [0, 5, 9, 13]])
+    second_prompts = torch.tensor([[3, 17, 19, 23]])
+
+    def run(cache):
+        return rollout_continuous_refill_groups(
+            model,
+            [first_prompts, second_prompts],
+            [torch.tensor([2, 3]), torch.tensor([4])],
+            prompt_repeats=2,
+            capacity_rows=capacity,
+            max_new_tokens=2,
+            max_stream_steps=2,
+            temperature=1.0,
+            top_p=1.0,
+            seed=101,
+            cache_dtype=torch.float32,
+            pin_emit=True,
+            paged_cache=cache,
+        )
+
+    cache = model.make_paged_generation_cache(
+        capacity, 4 + 2, torch.device("cpu"), dtype=torch.float32
+    )
+    widths = warmup_decode_width_buckets(model, cache, capacity)
+    assert widths and widths[0] == capacity
+    warmed = run(cache)
+    fresh = run(
+        model.make_paged_generation_cache(
             capacity, 4 + 2, torch.device("cpu"), dtype=torch.float32
         )
     )

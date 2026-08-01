@@ -2,7 +2,7 @@
 
 A thought is the belief (post-final-norm hidden) that produced a generated
 token. During decode the model feeds each generated token back as
-``embed(x) + g * W(h) + b`` through the combiner; prompt tokens and the input
+``embed(x) + W(h) + b`` through the combiner; prompt tokens and the input
 of the first generation step carry no hidden. The only actions are tokens.
 
 Everything PPO needs later is stored as replayable *data* (token ids, carried

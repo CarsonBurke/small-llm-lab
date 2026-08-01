@@ -51,7 +51,7 @@ def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}") from None
 
 
-THOUGHT_INPUT_SCHEMA = "gated_hidden_residual_prenorm_mlp/v1"
+THOUGHT_INPUT_SCHEMA = "zero_init_hidden_residual_prenorm_mlp/v2"
 
 
 def combiner_init_kwargs_from_checkpoint(payload: dict) -> dict:
@@ -65,7 +65,6 @@ def combiner_init_kwargs_from_checkpoint(payload: dict) -> dict:
     return {
         "mlp_hidden": saved_args.get("combined_mlp_hidden"),
         "num_blocks": saved_args.get("combined_mlp_blocks", 1),
-        "gain_init": saved_args.get("hidden_carry_gain_init", 0.0),
     }
 
 
@@ -111,7 +110,7 @@ class CombinedEmbedding(nn.Module):
     ``forward`` maps a token latent and its (detached) carried hidden into the
     stream input the trunk consumes:
 
-        combined = base + gain * W(hidden) + type_bias
+        combined = base + W(hidden) + type_bias
         mixed    = combined + mlp(rms_norm(combined))   (per block)
         out      = mixed where has_thought else base
 
@@ -122,16 +121,21 @@ class CombinedEmbedding(nn.Module):
     rather than ``base + flag * (mixed - base)`` because the latter is not
     bitwise ``mixed`` at flagged positions.
 
-    ``W`` is a unit-orthogonal full-width map behind one learned scalar gain,
-    initialized at zero so a fresh combiner is exactly the pretrained token
-    path; the gain has a first-step gradient through ``W(h) . dL/dcombined``
-    while matrix updates stay scaled by the explicit gain, the same treatment
-    the codebase gives every fresh full-width map. ``type_bias`` is the
-    learned hasThought type embedding: it is gated by the flag but not by the
-    gain, so the "this token was generated" signal can learn independently of
-    the content channel. Each MLP block reuses the pretraining ``MLP``
-    (relu^2) behind a fresh ``RMSNorm`` with a zero-initialized ``proj``, so
-    the whole stack is an exact identity at initialization.
+    ``W`` is a zero-initialized full-width map (the ControlNet zero-conv /
+    zero-init-out-proj pattern, and this module's own MLP ``proj`` recipe):
+    exact identity at initialization, and dL/dW is the loss direction outer
+    the carried hidden — full-rank signal from the first step. The v1 form
+    factored this as a unit-orthogonal matrix behind one zero-init scalar
+    gain, which is a multiplicative saddle: the matrix's gradient is scaled
+    by the near-zero gain while the gain's gradient is an inner product with
+    a frozen random projection, so neither factor ever escapes (observed:
+    gain oscillating at ~1e-4 for 8k+ steps, matrix frozen at init).
+    ``type_bias`` is the learned hasThought type embedding, gated by the
+    flag like everything else here, so the "this token was generated" signal
+    can learn independently of the content channel. Each MLP block reuses
+    the pretraining ``MLP`` (relu^2) behind a fresh ``RMSNorm`` with a
+    zero-initialized ``proj``, so the whole stack is an exact identity at
+    initialization.
 
     The injection branch is computed in fp32 and rounded to the base latent's
     dtype once, before the residual add — the same cast order at rollout and
@@ -143,14 +147,13 @@ class CombinedEmbedding(nn.Module):
         model_dim: int,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
-        gain_init: float = 0.0,
     ):
         super().__init__()
         if num_blocks < 0:
             raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
         self.carry = nn.Linear(model_dim, model_dim, bias=False)
-        nn.init.orthogonal_(self.carry.weight)
-        self.gain = nn.Parameter(torch.tensor(float(gain_init)))
+        with torch.no_grad():
+            self.carry.weight.zero_()
         self.type_bias = nn.Parameter(torch.zeros(model_dim))
         self.norms = nn.ModuleList(
             nanogpt_mini_model.RMSNorm(model_dim) for _ in range(num_blocks)
@@ -172,10 +175,10 @@ class CombinedEmbedding(nn.Module):
                 mlp.proj.bias.zero_()
 
     def inject(self, base: Tensor, hidden: Tensor) -> Tensor:
-        """Add the gated hidden residual to every position densely."""
+        """Add the carried-hidden residual to every position densely."""
         with torch.autocast(device_type=base.device.type, enabled=False):
             injected = (
-                self.gain.float() * F.linear(hidden.float(), self.carry.weight)
+                F.linear(hidden.float(), self.carry.weight)
                 + self.type_bias.float()
             )
         return base + injected.to(base.dtype)
@@ -684,7 +687,6 @@ class LatentThoughtModel(nn.Module):
         *,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
-        gain_init: float = 0.0,
     ):
         super().__init__()
         self.backbone = backbone
@@ -694,7 +696,6 @@ class LatentThoughtModel(nn.Module):
             model_dim,
             mlp_hidden=mlp_hidden,
             num_blocks=num_blocks,
-            gain_init=gain_init,
         )
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
@@ -807,7 +808,8 @@ class LatentThoughtModel(nn.Module):
         # K/V here instead of through some free slot's page table, which is
         # only a safe target while a slot permanently owns its lane -- exactly
         # the assumption the page table exists to remove. Distinct sinks
-        # matter: ``index_copy_`` with a repeated index is undefined.
+        # matter: ``index_copy_`` with a repeated index picks a winner
+        # nondeterministically.
         scratch_page = capacity * pages_per_lane
         scratch_pages = (capacity + page_size - 1) // page_size
         physical_length = (scratch_page + scratch_pages) * page_size
@@ -856,9 +858,14 @@ class LatentThoughtModel(nn.Module):
                 # LIVE lane (the scheduler pads with slot 0), and unlike a
                 # masked KV read the recurrent step writes its row
                 # unconditionally, so dead rows must be redirected to rows
-                # nobody owns. Distinct sinks matter for the same reason they
-                # do for KV: ``index_copy_`` with a repeated index is
-                # undefined.
+                # nobody owns. Per-row (rather than shared) sinks because a
+                # repeated ``index_copy_`` index picks a winner
+                # nondeterministically — not unsafe, but it would break
+                # deterministic-algorithms mode and any future reader of
+                # scratch content. Scratch rows ARE re-read: a row that stays
+                # dead for several steps gathers its own stale scratch state
+                # each step, which is fine because a dead row's outputs are
+                # never consumed and admission rewrites the lane wholesale.
                 rows = 2 * capacity
                 layer = tuple(
                     torch.zeros(
@@ -987,6 +994,16 @@ class LatentThoughtModel(nn.Module):
                 cache.capacity
                 + torch.arange(live.numel(), device=live.device),
             )
+        if slot_ids.device.type != "cuda":
+            # Same convention as admission's prefix-address check: content
+            # validation lives where it is sync-free. Duplicate lane rows
+            # make the recurrent scatter nondeterministic by value, and a
+            # recurrent lane has no mask to hide the corruption behind.
+            if lane_rows.unique().numel() != lane_rows.numel():
+                raise ValueError(
+                    "paged decode lane rows must be duplicate-free; pass a "
+                    "live mask so dead rows are redirected to scratch lanes"
+                )
         block_mask = cache.block_mask(slot_ids, kv_lengths)
         belief, logits = self.paged_step_core(
             input_latent,
@@ -1153,7 +1170,8 @@ class LatentThoughtModel(nn.Module):
             # Distinct slots no longer imply distinct addresses: that held only
             # while a slot permanently owned one contiguous lane. What the
             # scatter below actually needs is duplicate-free indices --
-            # ``index_copy_`` with a repeated index is undefined behaviour, and
+            # ``index_copy_`` with a repeated index picks a winner
+            # nondeterministically, and
             # an allocator that handed one page to two slots would corrupt the
             # cache nondeterministically while ``page_home`` still named a
             # single plausible owner, so no mask or parity check would notice.

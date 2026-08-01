@@ -1685,7 +1685,6 @@ def main() -> None:
         backbone,
         mlp_hidden=args.combined_mlp_hidden,
         num_blocks=args.combined_mlp_blocks,
-        gain_init=args.hidden_carry_gain_init,
     ).to(device)
     # No module here behaves differently under train(): pin eval mode once so
     # the training flag (a dynamo guard) never flips between the step-0 evals
@@ -1762,7 +1761,6 @@ def main() -> None:
             ),
             "combined_mlp_hidden": args.combined_mlp_hidden,
             "combined_mlp_blocks": args.combined_mlp_blocks,
-            "hidden_carry_gain_init": args.hidden_carry_gain_init,
         }
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
@@ -1787,7 +1785,6 @@ def main() -> None:
         prior_value=args.value_prior,
         mlp_hidden=args.combined_mlp_hidden,
         num_blocks=args.combined_mlp_blocks,
-        gain_init=args.hidden_carry_gain_init,
     ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if args.actor_critic_init:
@@ -2703,7 +2700,6 @@ def main() -> None:
                     "value_prior": args.value_prior,
                     "combined_mlp_hidden": args.combined_mlp_hidden,
                     "combined_mlp_blocks": args.combined_mlp_blocks,
-                    "hidden_carry_gain_init": args.hidden_carry_gain_init,
                     "parameters": sum(p.numel() for p in critic.parameters()),
                 },
             },
@@ -3904,10 +3900,10 @@ def main() -> None:
                             combiner_parameters, combiner_before, strict=True
                         )
                     ]
-                    # The combiner is the one fresh policy component: its gain
-                    # leaving zero is the first sign the carried belief is
-                    # being used, and a non-finite update here must abort
-                    # before the next rollout deploys it.
+                    # The combiner is the one fresh policy component: its
+                    # carry matrix leaving zero is the first sign the carried
+                    # belief is being used, and a non-finite update here must
+                    # abort before the next rollout deploys it.
                     combiner_updates = scalar_tensors_to_floats(
                         {
                             "combiner/update_rms": (
@@ -3924,7 +3920,6 @@ def main() -> None:
                             "combiner/update_abs_max": torch.stack(
                                 [delta.abs().max() for delta in combiner_deltas]
                             ).max(),
-                            "combiner/gain": wrapper.combiner.gain.detach(),
                             "combiner/carry_weight_rms": (
                                 wrapper.combiner.carry.weight.detach()
                                 .square().mean().sqrt()

@@ -677,18 +677,15 @@ def test_combiner_init_kwargs_recover_saved_geometry():
         "args": {
             "combined_mlp_hidden": 1024,
             "combined_mlp_blocks": 2,
-            "hidden_carry_gain_init": 0.5,
         }
     }
     assert combiner_init_kwargs_from_checkpoint(payload) == {
         "mlp_hidden": 1024,
         "num_blocks": 2,
-        "gain_init": 0.5,
     }
     assert combiner_init_kwargs_from_checkpoint({"args": {}}) == {
         "mlp_hidden": None,
         "num_blocks": 1,
-        "gain_init": 0.0,
     }
 
 
@@ -700,13 +697,14 @@ def test_fresh_combiner_is_bitwise_identity_and_flag_selects_exactly():
     flag = torch.zeros(3, 7, dtype=torch.bool)
     flag[:, 4:] = True
     with torch.no_grad():
-        # Fresh init: gain 0, zero type bias, zero MLP projections — the
-        # combined input IS the token embedding, bit for bit.
+        # Fresh init: zero carry matrix, zero type bias, zero MLP
+        # projections — the combined input IS the token embedding, bit for
+        # bit.
         assert torch.equal(combiner(base, hidden, flag), base)
         assert torch.equal(combiner(base, hidden), base)
         # A live combiner changes exactly the flagged positions and leaves
         # unflagged positions bitwise on the plain token path.
-        combiner.gain.fill_(0.5)
+        combiner.carry.weight.normal_(std=0.05)
         combiner.type_bias.normal_(std=0.1)
         mixed = combiner(base, hidden, flag)
         assert torch.equal(mixed[~flag], base[~flag])
@@ -715,10 +713,10 @@ def test_fresh_combiner_is_bitwise_identity_and_flag_selects_exactly():
         assert torch.equal(mixed[flag], combiner(base, hidden)[flag])
 
 
-def test_combiner_zero_blocks_is_the_pure_gated_residual_ablation():
+def test_combiner_zero_blocks_is_the_pure_residual_ablation():
     combiner = CombinedEmbedding(16, num_blocks=0)
     with torch.no_grad():
-        combiner.gain.fill_(1.0)
+        combiner.carry.weight.normal_(std=0.05)
     base = torch.randn(2, 5, 16)
     hidden = torch.randn(2, 5, 16)
     with torch.no_grad():
@@ -753,7 +751,7 @@ def test_gradient_reaches_combiner_and_trunk_but_not_stored_hiddens():
     wrapper = LatentThoughtModel(backbone, mlp_hidden=64)
     with torch.no_grad():
         backbone.policy_probe.output.weight.normal_(std=0.05)
-        wrapper.combiner.gain.fill_(0.4)
+        wrapper.combiner.carry.weight.normal_(std=0.02)
     base = backbone.embed_tokens(torch.randint(0, 32, (2, 6)))
     hidden = torch.randn(2, 6, 32, requires_grad=True)
     flag = torch.zeros(2, 6, dtype=torch.bool)
@@ -767,8 +765,6 @@ def test_gradient_reaches_combiner_and_trunk_but_not_stored_hiddens():
     ).float().square().mean()
     loss.backward()
     assert hidden.grad is None
-    assert wrapper.combiner.gain.grad is not None
-    assert float(wrapper.combiner.gain.grad.abs()) > 0.0
     assert wrapper.combiner.carry.weight.grad is not None
     assert float(wrapper.combiner.carry.weight.grad.abs().sum()) > 0.0
     assert wrapper.combiner.type_bias.grad is not None

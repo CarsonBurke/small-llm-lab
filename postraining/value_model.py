@@ -41,7 +41,6 @@ class SeparateCritic(nn.Module):
         prior_value: float = 0.0,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
-        gain_init: float = 0.0,
     ):
         super().__init__()
         model_dim = trunk.tok_emb.embedding_dim
@@ -50,7 +49,6 @@ class SeparateCritic(nn.Module):
             model_dim,
             mlp_hidden=mlp_hidden,
             num_blocks=num_blocks,
-            gain_init=gain_init,
         )
         self.support = HLGaussSupport(num_bins, v_min, v_max, sigma_ratio)
         self.head = nn.Linear(model_dim, num_bins)

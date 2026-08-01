@@ -174,13 +174,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # which the near-frozen bias (AdamW at 5e-5) then takes ~1e3 steps to
     # unwind through head.weight alone.
     parser.add_argument("--value-prior", type=float, default=0.0)
-    # Combined-embedding geometry (reasoning mode "latent"). The scalar gain
-    # starts at 0 so the injected carry vanishes and step 0 reproduces the
-    # pretrained token path bit-for-bit; the gain still receives a first-step
-    # gradient through W(h) * dL/dcombined, so it moves as soon as the carry
-    # helps. Nonzero values give the carry signal from the first rollout at
-    # the cost of starting off the pretrained function.
-    parser.add_argument("--hidden-carry-gain-init", type=float, default=0.0)
+    # Combined-embedding geometry (reasoning mode "latent"). The carry matrix
+    # is zero-initialized, so the injected carry vanishes and step 0
+    # reproduces the pretrained token path bit-for-bit while the matrix gets
+    # a full-rank first-step gradient (loss direction outer hidden). No
+    # scalar gate: the v1 gain*W factorization was a multiplicative saddle
+    # neither factor escaped.
     # Prenorm-residual relu^2 MLP blocks applied to the combined embedding at
     # hasThought positions, identity at init (zeroed proj). 0 is the
     # pure-gated-residual ablation arm.
@@ -579,8 +578,6 @@ def validate_args(
             "--max-train-hours truncates the run at a wall-clock deadline "
             "and cannot guarantee --consume-all-prompts' one-pass contract"
         )
-    if not math.isfinite(args.hidden_carry_gain_init):
-        parser.error("--hidden-carry-gain-init must be finite")
     if args.combined_mlp_blocks < 0:
         parser.error("--combined-mlp-blocks must be nonnegative")
     if args.combined_mlp_hidden < 1:

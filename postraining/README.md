@@ -68,23 +68,26 @@ mlq submit \
 `--reasoning-mode latent` trains the hidden-carry policy (execution schema
 v28). A "thought" is the post-final-norm belief that produced a generated
 token; when that token feeds back as input, its producing belief rides along
-as a gated residual on the token embedding:
+as a residual on the token embedding:
 
 ```
-combined = embed(token) + hasThought * (gain * W(belief) + type_bias)
+combined = embed(token) + hasThought * (W(belief) + type_bias)
 input    = combined + MLP(RMSNorm(combined))   # per block, relu^2, identity at init
 ```
 
 `hasThought` is 1 exactly where the input token was model-generated (prompt
-tokens and the first generation step carry no hidden). The gain starts at 0,
-so a fresh run is bit-exact with the pretrained token policy. There is no
+tokens and the first generation step carry no hidden). `W` is
+zero-initialized, so a fresh run is bit-exact with the pretrained token
+policy while `W` gets a full-rank gradient from the first step. (The v1
+form gated an orthogonal `W` behind one zero-init scalar gain — a
+multiplicative saddle neither factor escaped in practice.) There is no
 stochastic thought channel: the only actions are tokens, training is standard
 token-level VAPO (DAPO clip + HL-Gauss critic), and the carried belief is
 detached replay data — no BPTT. The separate critic re-derives combined
 embeddings with its own combiner weights. `cot` and `none` remain token-only
 control modes with zero-width hidden storage. Combiner geometry is set by
-`--combined-mlp-hidden` (default 2048), `--combined-mlp-blocks` (default 1;
-0 ablates to the pure gated residual), and `--hidden-carry-gain-init`.
+`--combined-mlp-hidden` (default 2048) and `--combined-mlp-blocks`
+(default 1; 0 ablates to the pure residual).
 
 Checkpoints from the pre-v28 stochastic thought/gate policy cannot be
 resumed or evaluated; there are no migrations. Test-time-read-compute

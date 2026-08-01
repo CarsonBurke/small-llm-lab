@@ -140,7 +140,7 @@ def test_pin_emit_stream_latents_skip_combiner():
     wrapper = _wrapper()
     with torch.no_grad():
         # Even a live combiner must not touch a zero-width-hidden batch.
-        wrapper.combiner.gain.fill_(0.7)
+        wrapper.combiner.carry.weight.normal_(std=0.05)
         wrapper.combiner.type_bias.normal_(std=0.1)
     torch.manual_seed(13)
     batch = trim_stream(_pinned_rollout(wrapper))
