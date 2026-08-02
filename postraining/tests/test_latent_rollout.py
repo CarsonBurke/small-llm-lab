@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -863,8 +864,264 @@ def test_rollout_only_repeats_are_benchmark_scoped(capsys):
         assert message in capsys.readouterr().err
 
 
+def test_fence_flag_validation(capsys):
+    parser = build_arg_parser()
+    valid = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o",
+         "--think-tokens", "--answer-fence", "--think-min-tokens", "8"]
+    )
+    validate_args(parser, valid)
+
+    for argv, message in (
+        (["--answer-fence"], "--answer-fence requires --think-tokens"),
+        (
+            ["--think-min-tokens", "4"],
+            "--think-min-tokens above 1 requires --think-tokens",
+        ),
+        (["--think-min-tokens", "0"], "--think-min-tokens must be at least 1"),
+        (
+            ["--think-tokens", "--reasoning-mode", "none"],
+            "--think-tokens requires a reasoning mode",
+        ),
+    ):
+        args = parser.parse_args(["--checkpoint", "c", "--output", "o", *argv])
+        with pytest.raises(SystemExit):
+            validate_args(parser, args)
+        assert message in capsys.readouterr().err
+
+
+def test_zero_reward_actor_freeze_flag_defaults_on(capsys):
+    # Round-4 guard: optimizer minibatches whose every trajectory scored
+    # zero carry no policy signal, so the actor optimizer skips them by
+    # default, and a sustained all-zero-pool streak stops the run at the
+    # pool boundary. The freeze condition (reward mean == 0 iff all
+    # rewards zero) relies on rewards being non-negative — pinned by
+    # test_nearby_numeric_reward_is_nonnegative below.
+    parser = build_arg_parser()
+    default = parser.parse_args(["--checkpoint", "c", "--output", "o"])
+    assert default.zero_reward_actor_freeze is True
+    assert default.zero_reward_stop_pools == 8
+    disabled = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o",
+         "--no-zero-reward-actor-freeze",
+         "--zero-reward-stop-pools", "0"]
+    )
+    assert disabled.zero_reward_actor_freeze is False
+    assert disabled.zero_reward_stop_pools == 0
+
+    negative = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o",
+         "--zero-reward-stop-pools", "-1"]
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, negative)
+    assert (
+        "--zero-reward-stop-pools must be nonnegative"
+        in capsys.readouterr().err
+    )
+
+
+def test_nearby_numeric_reward_is_nonnegative():
+    from postraining.core import nearby_numeric_reward
+
+    for prediction in ("-1e300", "-5", "0", "5.0", "1e300", "nan", "x"):
+        assert nearby_numeric_reward(prediction, "7", 0.1) >= 0.0
+
+
+def test_answer_fence_prompt_rewrite():
+    from postraining.core import ANSWER_CLOSE, ANSWER_OPEN, THINK_CLOSE, THINK_OPEN
+    from postraining.math_prompt import (
+        ANSWER_FIELD_INSTRUCTIONS,
+        ANSWER_FENCE_SUFFIX,
+        CHINESE_ANSWER_FIELD_INSTRUCTION,
+    )
+    from postraining.train_latent_vapo import rewrite_prompts_for_answer_fence
+
+    chinese_field = CHINESE_ANSWER_FIELD_INSTRUCTION
+    rows = [
+        {
+            "prompt": [
+                {
+                    "content": (
+                        f"Solve it. {ANSWER_FIELD_INSTRUCTIONS[0]}\n\nWhat is "
+                        f"1+1?{ANSWER_FIELD_INSTRUCTIONS[1]}"
+                    )
+                }
+            ],
+            "reward_model": {"ground_truth": "2"},
+        },
+        # The dapo-math-17k Chinese subset carries a third instruction
+        # alongside the English pair (red-team round 2, finding A).
+        {
+            "prompt": [
+                {
+                    "content": (
+                        f"Solve it. {ANSWER_FIELD_INSTRUCTIONS[0]}\n\n"
+                        f"某数学问题。\n让我们一步一步地思考。{chinese_field}"
+                        f"{ANSWER_FIELD_INSTRUCTIONS[1]}"
+                    )
+                }
+            ],
+            "reward_model": {"ground_truth": "3"},
+        },
+    ]
+    rewritten = rewrite_prompts_for_answer_fence(rows)
+    content = rewritten[0]["prompt"][0]["content"]
+    # Every source-specific copy is removed and exactly one shared contract
+    # is appended after the bare problem.
+    assert content.endswith(ANSWER_FENCE_SUFFIX)
+    for fence in (THINK_OPEN, THINK_CLOSE, ANSWER_OPEN, ANSWER_CLOSE):
+        assert content.count(fence) == 1
+    assert ANSWER_FIELD_INSTRUCTIONS[0] not in content
+    assert ANSWER_FIELD_INSTRUCTIONS[1] not in content
+    chinese_content = rewritten[1]["prompt"][0]["content"]
+    assert chinese_field not in chinese_content
+    assert "Answer:" not in chinese_content
+    assert chinese_content.endswith(ANSWER_FENCE_SUFFIX)
+    assert "让我们一步一步地思考。" not in chinese_content
+    # Canonicalization is idempotent, including already-fenced rows.
+    assert rewrite_prompts_for_answer_fence(rewritten) == rewritten
+    # Originals are never mutated.
+    assert ANSWER_FIELD_INSTRUCTIONS[0] in rows[0]["prompt"][0]["content"]
+    # Fail-closed on prompts with no recognizable instruction: silence
+    # here would train with contradictory framing.
+    with pytest.raises(ValueError, match="no recognized instruction"):
+        rewrite_prompts_for_answer_fence(
+            [{"prompt": [{"content": "free-form question"}]}]
+        )
+    # Fail-closed on a SURVIVING Answer: demand next to a known one
+    # (finding A: replacement counting alone let such rows through).
+    with pytest.raises(ValueError, match="left an Answer: demand"):
+        rewrite_prompts_for_answer_fence(
+            [
+                {
+                    "prompt": [
+                        {
+                            "content": (
+                                f"Solve it. {ANSWER_FIELD_INSTRUCTIONS[0]} "
+                                "Output in the format Answer: \\boxed{x}."
+                            )
+                        }
+                    ]
+                }
+            ]
+        )
+
+
+def test_answer_fence_prompt_rewrite_covers_real_datasets():
+    """Every RL/eval parquet must rewrite with no surviving Answer: demand.
+
+    The synthetic fixture above is built from the rewrite table itself, so
+    it can only ever pass (red-team round 2: 20 real dapo rows carried an
+    unlisted Chinese instruction the fixture could not see).
+    """
+    from postraining.core import load_unique_math_rows
+    from postraining.core import ANSWER_CLOSE, ANSWER_OPEN, THINK_CLOSE, THINK_OPEN
+    from postraining.math_prompt import (
+        ANSWER_FIELD_DEMAND,
+        ANSWER_FENCE_SUFFIX,
+    )
+    from postraining.train_latent_vapo import rewrite_prompts_for_answer_fence
+
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    datasets = [
+        path
+        for path in (
+            data_dir / "dapo-math-17k.parquet",
+            data_dir / "gsm8k_rl_prompts.parquet",
+            data_dir / "aime-2024.parquet",
+            data_dir / "aime-2026.parquet",
+            data_dir / "aime-2026-i.parquet",
+            data_dir / "aime-2026-ii.parquet",
+            data_dir / "deepmind-interpolate-rl.parquet",
+            data_dir / "deepmind-interpolate-rl-full.parquet",
+            # The default --bench-data: a template landing here would hit
+            # every run's bench eval, not just --math-data training.
+            data_dir / "deepmind-interpolate-easy.parquet",
+        )
+        if path.exists()
+    ]
+    if not datasets:
+        pytest.skip("no RL prompt parquets present")
+    for path in datasets:
+        rows = load_unique_math_rows(str(path))
+        rewritten = rewrite_prompts_for_answer_fence(rows)
+        # Same case-insensitive pattern the verifier parses with — a
+        # surviving "answer:" would grade as a field even though a
+        # case-sensitive scan would miss it.
+        assert not any(
+            ANSWER_FIELD_DEMAND.search(message["content"])
+            for row in rewritten
+            for message in row["prompt"]
+        ), f"surviving Answer: demand in {path}"
+        for row in rewritten:
+            content = "".join(message["content"] for message in row["prompt"])
+            assert content.endswith(ANSWER_FENCE_SUFFIX), path
+            for fence in (THINK_OPEN, THINK_CLOSE, ANSWER_OPEN, ANSWER_CLOSE):
+                assert content.count(fence) == 1, (path, fence)
+
+
+def test_answer_fence_prompt_schema_rejects_legacy_offline_evaluation():
+    from postraining.math_prompt import (
+        ANSWER_FENCE_PROMPT_SCHEMA,
+        require_answer_fence_prompt_schema,
+    )
+
+    require_answer_fence_prompt_schema(
+        {}, answer_fence=False, source="plain checkpoint"
+    )
+    require_answer_fence_prompt_schema(
+        {"answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA},
+        answer_fence=True,
+        source="canonical checkpoint",
+    )
+    for metadata in ({}, {"answer_fence_prompt_schema": "legacy/v0"}):
+        with pytest.raises(ValueError, match="silently change"):
+            require_answer_fence_prompt_schema(
+                metadata, answer_fence=True, source="legacy checkpoint"
+            )
+
+
+def test_check_think_floor_against_corpus(capsys):
+    from postraining.train_latent_vapo import check_think_floor_against_corpus
+
+    provenance = {
+        "think_span_token_percentiles": {"min": 8, "p1": 12, "p50": 90}
+    }
+    # Floor at or below the corpus 1st percentile: silent.
+    check_think_floor_against_corpus(provenance, 12)
+    assert "WARNING" not in capsys.readouterr().out
+    # Above p1 but under the median: the shortest taught traces fall
+    # below the floor — warn.
+    check_think_floor_against_corpus(provenance, 64)
+    assert "1st-percentile" in capsys.readouterr().out
+    # Above the median: most of the format prior is below the floor, so
+    # most structurally-gated rewards would be zero — refuse.
+    with pytest.raises(RuntimeError, match="median think-span"):
+        check_think_floor_against_corpus(provenance, 128)
+    # Provenance without the measurement (pre-round-5 SFT checkpoint):
+    # warn rather than block.
+    check_think_floor_against_corpus({}, 64)
+    assert "cannot be checked" in capsys.readouterr().out
+    # The floor's no-op default never prints.
+    check_think_floor_against_corpus({}, 1)
+    assert capsys.readouterr().out == ""
+
+
 def test_critic_learning_rate_defaults_to_constant_actor_rate():
     parser = build_arg_parser()
+    args = parser.parse_args(["--checkpoint", "c", "--output", "o"])
+    validate_args(parser, args)
+    assert args.learning_rate == 2e-5
+    assert args.critic_learning_rate == 2e-5
+    expected_muon_lr = pytest.approx(
+        2e-5
+        * (0.025 / 0.015)
+        * POLAR_EXPRESS_STEP_COMPENSATION
+    )
+    assert args.muon_learning_rate == expected_muon_lr
+    assert args.critic_muon_learning_rate == expected_muon_lr
+
     args = parser.parse_args(
         [
             "--checkpoint", "c", "--output", "o",
@@ -880,16 +1137,15 @@ def test_critic_learning_rate_defaults_to_constant_actor_rate():
             "--checkpoint", "c", "--output", "o",
             "--learning-rate", "2e-5",
             "--critic-learning-rate", "5e-5",
+            "--muon-learning-rate", "6e-5",
+            "--critic-muon-learning-rate", "7e-5",
         ]
     )
     validate_args(parser, args)
     assert args.learning_rate == 2e-5
     assert args.critic_learning_rate == 5e-5
-    assert args.critic_muon_learning_rate == pytest.approx(
-        5e-5
-        * (0.025 / 0.015)
-        * POLAR_EXPRESS_STEP_COMPENSATION
-    )
+    assert args.muon_learning_rate == 6e-5
+    assert args.critic_muon_learning_rate == 7e-5
 
 
 def test_continuous_refill_requires_multiple_compiled_chunks(capsys):
@@ -1416,6 +1672,9 @@ def test_evaluate_aime_latent_captures_first_four_problems_in_dataset_order(
         def decode(self, ids: list[int]) -> str:
             return "work\nAnswer: 42"
 
+        def id_to_piece(self, token_id: int) -> str:
+            return "<|endoftext|>"
+
     rows = [
         {
             "prompt": [{"content": text}],
@@ -1471,6 +1730,17 @@ def test_evaluate_aime_latent_captures_first_four_problems_in_dataset_order(
         assert attempt["parsed_answer"] == "42"
         assert attempt["emitted_token_ids"] == [5]
         assert attempt["emitted_token_count"] == 1
+        # The lone emitted token is the stub's EOS, so the display
+        # segments reduce to its terminal marker (no prefix ids here).
+        assert attempt["emitted_segments"] == [
+            {
+                "kind": "special",
+                "role": "eos",
+                "text": "<|endoftext|>",
+                "token_id": 5,
+                "source": "text",
+            }
+        ]
 
     full_capture: list[dict[str, object]] = []
     evaluate_aime_latent(
@@ -2639,6 +2909,8 @@ def test_math_dataset_identity_binds_bytes_exclusions_and_order(tmp_path):
 
 
 def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
+    from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
+
     wrapper = _wrapper()
     critic = _critic()
     optimizers = _optimizers(wrapper, critic)
@@ -2651,7 +2923,7 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
         critic,
         optimizers,
         step=0,
-        args=SimpleNamespace(value_warmup_steps=50),
+        args=SimpleNamespace(value_warmup_steps=50, answer_fence=True),
         sampler=sampler,
         warmup_step=20,
     )
@@ -2663,6 +2935,7 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["replay_numerics_schema"] == REPLAY_NUMERICS_SCHEMA
     assert payload["reward_schema"] == REWARD_SCHEMA
     assert payload["actor_objective_schema"] == ACTOR_OBJECTIVE_SCHEMA
+    assert payload["answer_fence_prompt_schema"] == ANSWER_FENCE_PROMPT_SCHEMA
     assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
     assert "torch_adamw" in payload["optimizer_schema"]
 
@@ -2784,6 +3057,456 @@ def test_score_math_rollout_uses_only_the_final_answer_for_nearby_reward(
     )
 
 
+class _PositionalTokenizer:
+    """Positionally faithful decode: fences and unknowns vanish, each
+    known token contributes a fixed piece, so text offsets line up with
+    token order (what the positional gate check measures)."""
+
+    PIECES = {
+        1: "hmm",
+        9: "Answer: 42\n",
+        10: "answer : 42\n",  # case/space variant the verifier accepts
+        11: "Answer:",  # instruction echo, no graded value after it
+        12: "42",  # bare value (the fenced-answer form)
+        13: "37",  # bare wrong value
+    }
+
+    def decode(self, ids: list[int]) -> str:
+        return "".join(self.PIECES.get(token, "") for token in ids)
+
+
+def test_score_math_rollout_think_fence_gates_all_reward(monkeypatch):
+    from postraining.train_latent_vapo import think_format_ok
+
+    wrapper = _wrapper()
+    eos, think_open, think_close = 5, 7, 8
+    batch = _rollout(wrapper, batch=7, prompt=4, new_tokens=10)
+    _Tokenizer = _PositionalTokenizer
+
+    import postraining.train_latent_vapo as trainer
+
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [
+            [think_open, 1, think_close, 9, eos],  # well-formed
+            [9, eos],  # bare guess: correct answer, no fence
+            [think_open, 1, 9, eos],  # never closed
+            [think_open, 1, eos, think_close, 9],  # closed only after stop
+            [think_open, think_open, 1, think_close, 9, eos],  # double open
+            [think_open, think_close, 9, eos],  # EMPTY fence ritual
+            [9, think_open, 1, think_close, eos],  # guess first, fence later
+        ],
+    )
+    score_math_rollout(
+        batch,
+        "42",
+        _Tokenizer(),
+        (eos,),
+        nearby_reward_max=0.0,
+        think_fence_ids=(think_open, think_close),
+    )
+    assert batch.reward_scalar.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Gate-zeroed AND verifier-correct: all failing rows except the one
+    # whose visible slice never contains the answer token (closed after
+    # stop cuts the 9 away).
+    assert batch.think_gate_zeroed_correct == 5
+    # Without the fence gate the same rows keep their verifier reward.
+    score_math_rollout(batch, "42", _Tokenizer(), (eos,))
+    assert batch.reward_scalar.tolist() == [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+    fence = (think_open, think_close)
+    tokenizer = _Tokenizer()
+    # The empty fence and the answer-before-close ritual both fail.
+    assert not think_format_ok([think_open, think_close], fence, tokenizer)
+    assert not think_format_ok([9, think_open, 1, think_close], fence, tokenizer)
+    assert not think_format_ok([think_close, 1, think_open], fence, tokenizer)
+    assert think_format_ok([think_open, 1, think_close, 9], fence, tokenizer)
+    # Red-team HIGH: the gate must match the verifier's own pattern —
+    # a case/whitespace variant answer before the fence is still the
+    # graded answer and must fail.
+    assert not think_format_ok(
+        [10, think_open, 1, think_close], fence, tokenizer
+    )
+    # An Answer: echo INSIDE the fence is not the graded (last) match;
+    # zeroing correct rollouts over it would make the gate the problem.
+    assert think_format_ok(
+        [think_open, 11, think_close, 9], fence, tokenizer
+    )
+    # Variant answer before the fence loses to a graded answer after
+    # the close: the LAST match is what the verifier grades.
+    assert think_format_ok(
+        [10, think_open, 1, think_close, 9], fence, tokenizer
+    )
+
+
+def test_think_min_tokens_floor_gates_short_fences(monkeypatch):
+    from postraining.train_latent_vapo import think_format_ok, think_span_tokens
+
+    wrapper = _wrapper()
+    eos, think_open, think_close = 5, 7, 8
+    fence = (think_open, think_close)
+    tokenizer = _PositionalTokenizer()
+    three_inner = [think_open, 1, 2, 3, think_close, 9]
+    assert think_span_tokens(three_inner, fence) == 3
+    assert think_span_tokens([1, 9], fence) is None
+    assert think_span_tokens([think_close, 1, think_open], fence) is None
+    assert think_format_ok(three_inner, fence, tokenizer, min_think_tokens=3)
+    assert not think_format_ok(three_inner, fence, tokenizer, min_think_tokens=4)
+    # min_think_tokens below 1 never readmits the empty-fence ritual.
+    assert not think_format_ok(
+        [think_open, think_close, 9], fence, tokenizer, min_think_tokens=0
+    )
+
+    batch = _rollout(wrapper, batch=2, prompt=4, new_tokens=10)
+    import postraining.train_latent_vapo as trainer
+
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [
+            [think_open, 1, 2, 3, think_close, 9, eos],
+            [think_open, 1, think_close, 9, eos],  # under the floor
+        ],
+    )
+    score_math_rollout(
+        batch,
+        "42",
+        tokenizer,
+        (eos,),
+        nearby_reward_max=0.0,
+        think_fence_ids=fence,
+        min_think_tokens=3,
+    )
+    assert batch.reward_scalar.tolist() == [1.0, 0.0]
+    assert batch.think_gate_zeroed_correct == 1
+
+
+def test_structural_answer_fence_gate(monkeypatch):
+    from postraining.train_latent_vapo import structural_format_ok
+
+    wrapper = _wrapper()
+    eos, think_open, think_close = 5, 7, 8
+    answer_open, answer_close = 15, 16
+    think = (think_open, think_close)
+    answer = (answer_open, answer_close)
+    tokenizer = _PositionalTokenizer()
+
+    # The gate's contract: tokens are the stop-terminated visible slice,
+    # <think> opens the completion, </answer> sits just before the stop.
+    honest = [think_open, 1, think_close, answer_open, 12, answer_close, eos]
+    assert structural_format_ok(honest, think, answer)
+    # Text between </think> and <answer> is admissible (comes after the
+    # paid think budget, so it cannot pre-commit around the floor).
+    assert structural_format_ok(
+        [think_open, 1, think_close, 1, answer_open, 12, answer_close, eos],
+        think, answer,
+    )
+    # Every structural violation fails on token ids alone.
+    assert not structural_format_ok(
+        [think_open, 1, think_close, 12, eos], think, answer
+    )  # no answer fence
+    assert not structural_format_ok(
+        [think_open, 1, think_close, answer_open, answer_close, eos],
+        think, answer,
+    )  # empty answer span
+    assert not structural_format_ok(
+        [answer_open, 12, answer_close, think_open, 1, think_close, eos],
+        think, answer,
+    )  # guess first, think later
+    assert not structural_format_ok(
+        [9, think_open, 1, think_close, answer_open, 12, answer_close, eos],
+        think, answer,
+    )  # red-team: plain-text guess BEFORE <think> — the collapse layout
+    assert not structural_format_ok(
+        [think_open, 1, think_close, answer_open, 12, answer_close, 13, eos],
+        think, answer,
+    )  # red-team: trailing junk after </answer> is not free reward
+    assert not structural_format_ok(
+        [think_open, answer_open, 12, answer_close, 1, think_close, eos],
+        think, answer,
+    )  # answer inside the think span
+    assert not structural_format_ok(
+        [think_open, 1, think_close, answer_open, 12, answer_close,
+         answer_open, 13, answer_close, eos],
+        think, answer,
+    )  # duplicated answer fences: no unambiguous graded span
+    assert not structural_format_ok(
+        honest, think, answer, min_think_tokens=2
+    )  # think floor still applies
+
+    import postraining.train_latent_vapo as trainer
+
+    batch = _rollout(wrapper, batch=6, prompt=4, new_tokens=12)
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [
+            honest,
+            # Decoded-text "Answer: 42" committed before <think> with a
+            # WRONG fenced value: anchor kills it, and the relaxed
+            # counterfactual grades the FENCED 37 (the policy's answer
+            # under fence semantics), so the alarm does not count it.
+            [9, think_open, 1, think_close, answer_open, 13, answer_close,
+             eos],
+            # Correct plain-text answer, no answer fence at all: the
+            # relaxed scan finds nothing, the plain parse counts it.
+            [think_open, 1, think_close, 9, eos],
+            # Fence-native collapse: correct value inside an answer span
+            # with NO think fence. decode strips the fences, so only the
+            # relaxed counterfactual can see the value (red-team: this
+            # read as a clean zero and hid the collapse).
+            [answer_open, 12, answer_close, eos],
+            # Correct fenced value, junk after the close: anchored gate
+            # zeroes it; relaxed counterfactual counts it.
+            [think_open, 1, think_close, answer_open, 12, answer_close, 13,
+             eos],
+            # Unterminated row scores zero before any gate runs.
+            honest[:-1],
+        ],
+    )
+    score_math_rollout(
+        batch,
+        "42",
+        tokenizer,
+        (eos,),
+        nearby_reward_max=0.0,
+        think_fence_ids=think,
+        min_think_tokens=1,
+        answer_fence_ids=answer,
+    )
+    assert batch.reward_scalar.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert batch.think_gate_zeroed_correct == 3
+
+    with pytest.raises(ValueError, match="requires think_fence_ids"):
+        score_math_rollout(
+            batch, "42", tokenizer, (eos,), answer_fence_ids=answer
+        )
+
+
+def test_fenced_answer_window_and_relaxed_extraction(monkeypatch):
+    from postraining.train_latent_vapo import relaxed_fenced_answer_text
+
+    wrapper = _wrapper()
+    eos, think_open, think_close = 5, 7, 8
+    answer_open, answer_close = 15, 16
+    think = (think_open, think_close)
+    answer = (answer_open, answer_close)
+
+    class _LongTokenizer:
+        # 20: 299 chars of leading whitespace then the correct value —
+        # under the verifier's default 300-char tail window the
+        # synthesized "Answer: " prefix falls outside the window and the
+        # row grades [INVALID]; the field pattern's \s* consumes the
+        # padding, so with window=None the value verifies.
+        PIECES = {1: "hmm", 20: " " * 297 + "42"}
+
+        def decode(self, ids: list[int]) -> str:
+            return "".join(self.PIECES.get(token, "") for token in ids)
+
+    tokenizer = _LongTokenizer()
+    import postraining.train_latent_vapo as trainer
+
+    batch = _rollout(wrapper, batch=1, prompt=4, new_tokens=12)
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [
+            [think_open, 1, think_close, answer_open, 20, answer_close, eos],
+        ],
+    )
+    score_math_rollout(
+        batch, "42", tokenizer, (eos,),
+        nearby_reward_max=0.0,
+        think_fence_ids=think,
+        answer_fence_ids=answer,
+    )
+    # Red-team: a structurally valid long answer must not fall off the
+    # verifier's tail window into a silent zero.
+    assert batch.reward_scalar.tolist() == [1.0]
+
+    # Relaxed extraction tolerates duplication (grades the FIRST span),
+    # missing think fences, and unanchored layouts — and only breakage
+    # with no recoverable span returns None.
+    long_piece = _LongTokenizer()
+    assert relaxed_fenced_answer_text(
+        [answer_open, 20, answer_close, answer_open, 1, answer_close],
+        long_piece, answer,
+    ) == " " * 297 + "42"
+    assert relaxed_fenced_answer_text([answer_open, 20], long_piece, answer) is None
+    assert relaxed_fenced_answer_text([20], long_piece, answer) is None
+    assert relaxed_fenced_answer_text(
+        [answer_open, answer_close], long_piece, answer
+    ) is None
+    # Documented over-count: a scratch <answer> span INSIDE the think
+    # span wins over the policy's actual (post-think) answer, so the
+    # gate-zeroed-correct alarm reads approximate, not exact.
+    assert relaxed_fenced_answer_text(
+        [
+            think_open, answer_open, 20, answer_close, think_close,
+            answer_open, 1, answer_close, eos,
+        ],
+        long_piece, answer,
+    ) == " " * 297 + "42"
+
+
+def test_rollout_diagnostics_reports_think_format_fraction(monkeypatch):
+    from postraining.train_latent_vapo import rollout_diagnostics
+
+    wrapper = _wrapper()
+    eos, think_open, think_close = 5, 7, 8
+    batch = _rollout(wrapper, batch=4, prompt=4, new_tokens=8)
+    import postraining.train_latent_vapo as trainer
+
+    class _Tokenizer:
+        def decode(self, ids: list[int]) -> str:
+            return "thinking text"
+
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [
+            [think_open, 1, think_close, eos],
+            [1, 2, eos],
+            # Unterminated rows earn no reward, so a well-formed fence
+            # there is NOT compliant (its length still counts below).
+            [think_open, 1, think_close, 2],
+            # The fence completed after the stop cut is invisible.
+            [think_open, eos, think_close],
+        ],
+    )
+    metrics = rollout_diagnostics(
+        batch,
+        samples_per_prompt=2,
+        stop_ids=(eos,),
+        refreshed_statistics=False,
+        think_fence_ids=(think_open, think_close),
+        tokenizer=_Tokenizer(),
+    )
+    assert metrics["think_format_fraction"] == pytest.approx(0.25)
+    # Inner lengths over structurally intact fences on the visible slice:
+    # rows 1 and 3 have one token inside; row 2 has no fence and the
+    # stop-cut row keeps only an unclosed open. Mean = 1.0.
+    assert metrics["think_tokens_mean"] == pytest.approx(1.0)
+    assert metrics["think_tokens_sum"] == pytest.approx(2.0)
+    assert metrics["think_tokens_count"] == pytest.approx(2.0)
+    # No scorer stamped this batch: absence, not a healthy-looking 0.0.
+    assert "think_gate_zeroed_correct_fraction" not in metrics
+    floored = rollout_diagnostics(
+        batch,
+        samples_per_prompt=2,
+        stop_ids=(eos,),
+        refreshed_statistics=False,
+        think_fence_ids=(think_open, think_close),
+        tokenizer=_Tokenizer(),
+        min_think_tokens=2,
+    )
+    # The same rows fall below a 2-token floor.
+    assert floored["think_format_fraction"] == 0.0
+    assert floored["think_tokens_mean"] == pytest.approx(1.0)
+    without = rollout_diagnostics(
+        batch, samples_per_prompt=2, stop_ids=(eos,), refreshed_statistics=False
+    )
+    assert "think_format_fraction" not in without
+    with pytest.raises(ValueError, match="requires the tokenizer"):
+        rollout_diagnostics(
+            batch,
+            samples_per_prompt=2,
+            stop_ids=(eos,),
+            refreshed_statistics=False,
+            think_fence_ids=(think_open, think_close),
+        )
+
+
+def test_aggregate_diagnostics_tolerates_heterogeneous_gate_state(monkeypatch):
+    from postraining.train_latent_vapo import aggregate_diagnostics
+
+    wrapper = _wrapper()
+    eos, think_open, think_close = 5, 7, 8
+    scored = _rollout(wrapper, batch=2, prompt=4, new_tokens=8)
+    unscored = _rollout(wrapper, batch=2, prompt=4, new_tokens=8)
+    # One group carries a scorer-stamped gate count, the other does not
+    # (its key is conditionally absent). Aggregation must key on the
+    # intersection: per_group[0]-driven indexing would KeyError in this
+    # order and silently drop metrics in the reverse.
+    scored.think_gate_zeroed_correct = 1
+    unscored.think_gate_zeroed_correct = None
+    import postraining.train_latent_vapo as trainer
+
+    class _Tokenizer:
+        def decode(self, ids: list[int]) -> str:
+            return "thinking text"
+
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [[think_open, 1, think_close, eos], [1, eos]],
+    )
+    for order in ((scored, unscored), (unscored, scored)):
+        metrics = aggregate_diagnostics(
+            list(order),
+            samples_per_prompt=2,
+            stop_ids=(eos,),
+            refreshed_statistics=False,
+            think_fence_ids=(think_open, think_close),
+            tokenizer=_Tokenizer(),
+        )
+        assert metrics["trajectories"] == 4
+        assert "think_gate_zeroed_correct_fraction" not in metrics
+        assert metrics["think_format_fraction"] == pytest.approx(0.5)
+
+
+def test_load_posttraining_tokenizer_think_tokens():
+    from postraining.core import load_posttraining_tokenizer
+
+    tokenizer = load_posttraining_tokenizer(
+        "nanogpt_mini_gpt2vocab_kda_kkkdkkkd_mixers_v3", "", think_tokens=True
+    )
+    assert tokenizer.think_open_id == 50257
+    assert tokenizer.think_close_id == 50258
+    assert tokenizer.answer_open_id is None
+    assert tokenizer.answer_close_id is None
+    with pytest.raises(ValueError, match="padded-vocab slack"):
+        load_posttraining_tokenizer("fresh_lejepa", "", think_tokens=True)
+
+
+def test_load_posttraining_tokenizer_answer_tokens():
+    from postraining.core import GPT2BPETokenizer, load_posttraining_tokenizer
+
+    tokenizer = load_posttraining_tokenizer(
+        "nanogpt_mini_gpt2vocab_kda_kkkdkkkd_mixers_v3",
+        "",
+        think_tokens=True,
+        answer_tokens=True,
+    )
+    # Registration order fixes the ids: think pair first, answer pair in
+    # the next two padded-vocab slack rows.
+    assert tokenizer.think_open_id == 50257
+    assert tokenizer.think_close_id == 50258
+    assert tokenizer.answer_open_id == 50259
+    assert tokenizer.answer_close_id == 50260
+    # All four are specials: decode drops them so text parsing never
+    # sees fence markup.
+    row = tokenizer.encode("x") + [50259] + tokenizer.encode("7") + [50260]
+    assert tokenizer.decode(row) == "x7"
+    # Fenced extraction returns exactly the decoded inner span; broken or
+    # empty structures return None.
+    from postraining.core import fenced_answer_text, single_fence_span
+
+    assert single_fence_span(row, (50259, 50260)) == (1, 3)
+    assert fenced_answer_text(row, tokenizer, (50259, 50260)) == "7"
+    assert fenced_answer_text(row + [50260], tokenizer, (50259, 50260)) is None
+    assert fenced_answer_text(
+        [50259, 50260], tokenizer, (50259, 50260)
+    ) is None
+    assert fenced_answer_text([50260, 50259], tokenizer, (50259, 50260)) is None
+    with pytest.raises(ValueError, match="requires think_tokens"):
+        GPT2BPETokenizer(answer_tokens=True)
+    with pytest.raises(ValueError, match="padded-vocab slack"):
+        load_posttraining_tokenizer(
+            "fresh_lejepa", "", think_tokens=True, answer_tokens=True
+        )
+
+
 def test_verify_terminated_answer_rejects_cap_truncation():
     class _Tokenizer:
         def decode(self, ids: list[int]) -> str:
@@ -2796,6 +3519,37 @@ def test_verify_terminated_answer_rejects_cap_truncation():
     )
     assert verify_terminated_answer([1, 5, 3], "42", tokenizer, (5, 4))[0]
     assert verify_terminated_answer([1, 4, 3], "42", tokenizer, (5, 4))[0]
+
+
+def test_verify_terminated_answer_grades_fenced_span():
+    class _Tokenizer:
+        PIECES = {1: "Answer: 37\n", 2: "42"}
+
+        def decode(self, ids: list[int]) -> str:
+            return "".join(self.PIECES.get(token, "") for token in ids)
+
+    tokenizer = _Tokenizer()
+    stop, answer_open, answer_close = 5, 15, 16
+    fence = (answer_open, answer_close)
+    # The fenced span is graded even when misleading plain text precedes
+    # it; the plain-text "Answer: 37" is structurally outside the fence.
+    correct, _ = verify_terminated_answer(
+        [1, answer_open, 2, answer_close, stop], "42", tokenizer, (stop,),
+        answer_fence_ids=fence,
+    )
+    assert correct
+    # No fence: falls back to the plain-text parse so raw correctness
+    # keeps registering (structure enforcement is the RL gate's job).
+    wrong, _ = verify_terminated_answer(
+        [1, stop], "42", tokenizer, (stop,), answer_fence_ids=fence
+    )
+    assert not wrong
+    plain_correct, _ = verify_terminated_answer(
+        [2, stop], "37", tokenizer, (stop,), answer_fence_ids=fence
+    )
+    # "42" alone has no Answer: field — the fallback grades the decoded
+    # text with the standard parser, exactly as a fenceless eval would.
+    assert not plain_correct
 
 
 def test_evaluate_aime_latent_threads_stop_ids_into_the_rollout(monkeypatch):

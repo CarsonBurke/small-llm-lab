@@ -50,7 +50,7 @@ vary within prompt groups before any update is attempted.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 import hashlib
@@ -59,6 +59,7 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from pathlib import Path
 
@@ -74,6 +75,10 @@ from postraining.core import (
     POSTTRAIN_REWARD_SCHEMA,
     JsonlLogger,
     POSTTRAIN_CONTEXT_TOKENS,
+    ANSWER_CLOSE,
+    ANSWER_OPEN,
+    THINK_CLOSE,
+    THINK_OPEN,
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_RESPONSE_TOKENS,
     answer_style,
@@ -81,6 +86,9 @@ from postraining.core import (
     encode_prompt,
     extract_final_answer,
     deterministic_math_subset,
+    fenced_answer_text,
+    single_fence_span,
+    structural_format_ok,
     generalized_advantage_and_return_targets,
     length_adaptive_lambda,
     load_posttraining_tokenizer,
@@ -121,6 +129,10 @@ from postraining.latent_thought import (
     combiner_init_kwargs_from_checkpoint,
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
+)
+from postraining.math_prompt import (
+    ANSWER_FENCE_PROMPT_SCHEMA,
+    canonicalize_answer_fence_rows,
 )
 from postraining.rollout_scheduler import (
     ContinuousScheduleStats,
@@ -315,6 +327,170 @@ def answer_prefix_token_ids(tokenizer) -> tuple[int, ...]:
     return tails[0]
 
 
+def think_span_tokens(
+    tokens: Sequence[int],
+    think_fence_ids: tuple[int, int],
+) -> int | None:
+    """Token count inside the single ``<think>...</think>`` pair, else None.
+
+    None means the fence structure itself is broken (missing, duplicated,
+    or reversed fences), so no inner length exists to measure.
+    """
+    span = single_fence_span(tokens, think_fence_ids)
+    if span is None:
+        return None
+    open_index, close_index = span
+    return close_index - open_index - 1
+
+
+# The verifier's field pattern (core.extract_final_answer): matching
+# anything narrower here reopens the gate — the old literal "Answer:"
+# substring test let a case-variant ``answer: 42`` guess sit in front
+# of an all-filler fence and still collect full reward.
+ANSWER_FIELD_PATTERN = re.compile(r"(?i)answer\s*:")
+
+
+def think_format_ok(
+    tokens: Sequence[int],
+    think_fence_ids: tuple[int, int],
+    tokenizer,
+    min_think_tokens: int = 1,
+    decoded_text: str | None = None,
+) -> bool:
+    """One ``<think>...</think>`` of >= ``min_think_tokens`` tokens, with
+    the GRADED answer field after the close.
+
+    The gate exists to make the bare-guess collapse attractor worth zero,
+    so the degenerate satisfactions matter as much as the honest one: an
+    empty fence (``<think></think>`` appended as ritual) fails, and a
+    fence whose graded answer precedes the close (guess first, fence
+    later) fails. The verifier grades the LAST ``Answer:`` field
+    (``extract_final_answer``), so that match — found with the
+    verifier's own case-insensitive pattern — is the one whose position
+    is checked; earlier matches (e.g. an instruction echo inside the
+    fence) are not graded and do not fail the gate.
+    ``min_think_tokens`` raises the floor from "non-empty" to a compute
+    budget: round 3 showed a 1-token floor collapses to a ~15-token
+    minimal compliant skeleton, so the floor is the lever that forces
+    sequential latent compute to actually happen before the answer.
+    ``decoded_text`` lets a caller that already decoded ``tokens`` skip
+    the second decode (it must be the decode of exactly ``tokens``).
+    """
+    inner = think_span_tokens(tokens, think_fence_ids)
+    if inner is None or inner < max(min_think_tokens, 1):
+        return False
+    _, close_id = think_fence_ids
+    close = next(
+        index for index, token in enumerate(tokens) if token == close_id
+    )
+    text = (
+        tokenizer.decode(list(tokens)) if decoded_text is None
+        else decoded_text
+    )
+    matches = list(ANSWER_FIELD_PATTERN.finditer(text))
+    if not matches:
+        # No answer field anywhere: nothing graded precedes the fence.
+        return True
+    # decode skips the fence specials, so the pre-close prefix length
+    # locates the close inside the decoded text. Byte-level BPE can
+    # split a multi-byte character at the boundary; two characters of
+    # slack absorb the replacement-char wobble without readmitting a
+    # real pre-close answer.
+    prefix_length = len(tokenizer.decode(list(tokens[:close])))
+    return matches[-1].start() >= prefix_length - 2
+
+
+def rewrite_prompts_for_answer_fence(rows: list[dict]) -> list[dict]:
+    """Canonicalize source framing to one shared think/answer contract."""
+
+    return canonicalize_answer_fence_rows(rows)
+
+
+def check_think_floor_against_corpus(
+    sft_provenance: dict, min_think_tokens: int
+) -> None:
+    """Fail loudly when the think floor exceeds what the SFT corpus taught.
+
+    The corpus-shape guard verifies the fence SHAPE, not span length: a
+    corpus of anchored-but-terse traces measures a 1.0 fence fraction yet
+    cannot reach an RL floor above its span lengths, so every
+    structurally-gated reward is zero from step 0 (red-team round 2,
+    finding D; the round-3/4 collapses both started from exactly such a
+    zero-reward desert). A floor above the corpus median is refused; one
+    above the 1st percentile warns.
+    """
+    if min_think_tokens <= 1:
+        return
+    percentiles = sft_provenance.get("think_span_token_percentiles")
+    if not percentiles:
+        print(
+            f"WARNING: --think-min-tokens {min_think_tokens} cannot be "
+            "checked against the SFT corpus (no "
+            "think_span_token_percentiles in provenance; pre-round-5 SFT "
+            "checkpoint?)",
+            flush=True,
+        )
+        return
+    p50 = float(percentiles["p50"])
+    p1 = float(percentiles["p1"])
+    if min_think_tokens > p50:
+        raise RuntimeError(
+            f"--think-min-tokens {min_think_tokens} exceeds the SFT "
+            f"corpus's median think-span length ({p50:.0f} tokens): the "
+            "majority of the format prior falls below the floor, so most "
+            "structurally-gated rewards would be zero"
+        )
+    if min_think_tokens > p1:
+        print(
+            f"WARNING: --think-min-tokens {min_think_tokens} exceeds the "
+            f"SFT corpus's 1st-percentile think-span length ({p1:.0f} "
+            "tokens); the shortest taught traces fall below the floor",
+            flush=True,
+        )
+
+
+def relaxed_fenced_answer_text(
+    tokens: Sequence[int],
+    tokenizer,
+    answer_fence_ids: tuple[int, int],
+) -> str | None:
+    """First ``<answer>``...``</answer>`` span, tolerant of breakage.
+
+    NEVER used for reward. The gate-zeroed-correct alarm asks "was the
+    value right even though the structure was not?", and a fence-native
+    policy expresses its value inside (possibly duplicated, unanchored,
+    or think-less) answer fences that ``decode`` strips — so the strict
+    extractor and the plain-text parse are both blind exactly when the
+    alarm matters most (red-team finding: every fence-native collapse
+    mode read as a clean zero).
+
+    Read the resulting alarm as approximate, not a count: taking the
+    FIRST span means a scratch ``<answer>`` inside the think span wins
+    over the policy's actual answer (over-count), and under duplicated
+    spans a wrong first answer hides a right second one (under-count).
+    """
+    open_id, close_id = answer_fence_ids
+    open_index = next(
+        (index for index, token in enumerate(tokens) if token == open_id),
+        None,
+    )
+    if open_index is None:
+        return None
+    close_index = next(
+        (
+            index
+            for index, token in enumerate(
+                tokens[open_index + 1:], open_index + 1
+            )
+            if token == close_id
+        ),
+        None,
+    )
+    if close_index is None or close_index - open_index < 2:
+        return None
+    return tokenizer.decode(list(tokens[open_index + 1:close_index]))
+
+
 def score_math_rollout(
     batch: LatentRolloutBatch,
     truth: str,
@@ -323,6 +499,9 @@ def score_math_rollout(
     style: str = "minerva",
     nearby_reward_max: float = 0.1,
     solution_prefix_ids: tuple[int, ...] = (),
+    think_fence_ids: tuple[int, int] | None = None,
+    min_think_tokens: int = 1,
+    answer_fence_ids: tuple[int, int] | None = None,
 ) -> None:
     """Exact verifier reward plus bounded final-answer numeric proximity.
 
@@ -330,8 +509,30 @@ def score_math_rollout(
     the end of the prompt (the none-mode ``Answer:`` prefix): the emitted
     continuation alone never contains them, so they rejoin the decode before
     the verifier parses a final answer.
+
+    ``think_fence_ids`` gates ALL reward on a non-empty think fence closed
+    before the answer (see ``think_format_ok``): a bare guess scores zero
+    even when the final answer is right, so the reward-optimal policy
+    cannot drop the thinking channel. Gate-zeroed-but-correct rows are
+    counted on ``batch.think_gate_zeroed_correct`` so telemetry can tell a
+    signal-destroying gate apart from a policy that got worse.
+
+    ``answer_fence_ids`` (requires ``think_fence_ids``) upgrades the gate
+    to ``structural_format_ok`` and grades ONLY the decoded content of the
+    single ``<answer>`` span — no regex over full decoded text remains, so
+    the position-check bypass class is gone. Within the span the field is
+    still located by the verifier's last-``Answer:``-match rule on the
+    reframed string, so a span containing its own ``Answer: x`` line
+    grades ``x`` — a fixed single graded field either way, never extra
+    reward. The gate-zeroed-correct counterfactual prefers a RELAXED span
+    scan over the plain-text parse: "the value was right but the
+    structure was not" must see the value where a fence-native policy
+    puts it, or every fence-native collapse reads as a clean zero.
     """
+    if answer_fence_ids is not None and think_fence_ids is None:
+        raise ValueError("answer_fence_ids requires think_fence_ids")
     scores = []
+    gate_zeroed_correct = 0
     for emitted in emitted_token_rows(batch):
         stop_cut = next(
             (index for index, token in enumerate(emitted) if token in stop_ids),
@@ -340,16 +541,56 @@ def score_math_rollout(
         if stop_cut is None:
             scores.append(0.0)
             continue
-        solution = tokenizer.decode(
-            list(solution_prefix_ids) + emitted[: stop_cut + 1]
+        visible = emitted[: stop_cut + 1]
+        solution = tokenizer.decode(list(solution_prefix_ids) + visible)
+        correct, _ = verify_answer(solution, truth, style)
+        if answer_fence_ids is not None:
+            if not structural_format_ok(
+                visible, think_fence_ids, answer_fence_ids, min_think_tokens
+            ):
+                # The alarm's counterfactual must see the value where a
+                # fence-native policy actually puts it: a relaxed span
+                # scan first (decode strips broken fences, so the plain
+                # parse alone is blind to them), then the plain parse.
+                relaxed = relaxed_fenced_answer_text(
+                    visible, tokenizer, answer_fence_ids
+                )
+                if relaxed is not None:
+                    correct, _ = verify_answer(
+                        "Answer: " + relaxed, truth, style, window=None
+                    )
+                gate_zeroed_correct += bool(correct)
+                scores.append(0.0)
+                continue
+            # The gate guarantees a single non-empty anchored span, so
+            # the graded field is the fenced value re-framed for the
+            # verifier; window=None because the reframe IS the field —
+            # a long value must not push its own prefix out of the
+            # verifier's tail window and grade [INVALID].
+            solution = "Answer: " + fenced_answer_text(
+                visible, tokenizer, answer_fence_ids
+            )
+            correct, _ = verify_answer(solution, truth, style, window=None)
+        elif think_fence_ids is not None and not think_format_ok(
+            visible, think_fence_ids, tokenizer,
+            min_think_tokens,
+            # The solution decode IS the row decode when no prefix is
+            # teacher-forced (always true under the gate: none-mode is
+            # rejected at argument validation).
+            decoded_text=solution if not solution_prefix_ids else None,
+        ):
+            gate_zeroed_correct += bool(correct)
+            scores.append(0.0)
+            continue
+        raw_final_answer = extract_final_answer(
+            solution,
+            window=None if answer_fence_ids is not None else 300,
         )
-        raw_final_answer = extract_final_answer(solution)
         strict_numeric = (
             parse_numeric_answer(raw_final_answer)
             if raw_final_answer is not None
             else None
         )
-        correct, _ = verify_answer(solution, truth, style)
         if correct:
             scores.append(1.0)
         elif strict_numeric is None:
@@ -363,6 +604,11 @@ def score_math_rollout(
                     raw_final_answer, truth, nearby_reward_max
                 )
             )
+    # Unconditional assignment: rescoring without the gate must clear a
+    # stale count rather than leave the old alarm value behind.
+    batch.think_gate_zeroed_correct = (
+        gate_zeroed_correct if think_fence_ids is not None else None
+    )
     assign_terminal_rewards(
         batch, torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device)
     )
@@ -377,6 +623,10 @@ def rollout_diagnostics(
     stop_ids: tuple[int, ...] = (),
     *,
     refreshed_statistics: bool = True,
+    think_fence_ids: tuple[int, int] | None = None,
+    tokenizer=None,
+    min_think_tokens: int = 1,
+    answer_fence_ids: tuple[int, int] | None = None,
 ) -> dict[str, float | int]:
     """Pool-level rollout metrics.
 
@@ -387,12 +637,41 @@ def rollout_diagnostics(
     critic collapsed to zero. The key is omitted instead.
     """
     stop_set = set(stop_ids)
+    emitted_rows = list(emitted_token_rows(batch))
     # Fraction of rows that terminated themselves (emitted BOS or EOS)
     # rather than exhausting the token budget.
     ended = [
         float(any(token in stop_set for token in row))
-        for row in emitted_token_rows(batch)
+        for row in emitted_rows
     ]
+    format_ok: list[float] = []
+    think_lengths: list[int] = []
+    if think_fence_ids is not None:
+        if tokenizer is None:
+            raise ValueError("think_fence_ids requires the tokenizer")
+        for row in emitted_rows:
+            stop_cut = next(
+                (index for index, token in enumerate(row) if token in stop_set),
+                None,
+            )
+            visible = row if stop_cut is None else row[: stop_cut + 1]
+            inner = think_span_tokens(visible, think_fence_ids)
+            if inner is not None:
+                think_lengths.append(inner)
+            # Mirror the scorer: an unterminated row earns no reward
+            # regardless of its fence, so counting it compliant would
+            # let this fraction read high while every reward is zero
+            # (truncation itself is visible in ended_fraction).
+            if answer_fence_ids is not None:
+                compliant = stop_cut is not None and structural_format_ok(
+                    visible, think_fence_ids, answer_fence_ids,
+                    min_think_tokens,
+                )
+            else:
+                compliant = stop_cut is not None and think_format_ok(
+                    visible, think_fence_ids, tokenizer, min_think_tokens
+                )
+            format_ok.append(float(compliant))
     generated = batch.action_mask.bool()
     grouped = batch.reward_scalar.reshape(-1, samples_per_prompt)
     exact = batch.reward_scalar == 1.0
@@ -414,6 +693,49 @@ def rollout_diagnostics(
         "ended_fraction": sum(ended) / max(len(ended), 1),
         **(
             {
+                "think_format_fraction": (
+                    sum(format_ok) / max(len(format_ok), 1)
+                ),
+                # Inner-token sums over structurally intact fences; the
+                # aggregate divides ONCE across groups (a mean-of-means
+                # over varying fence counts would bias low exactly when
+                # many groups have no intact fence). The derived mean —
+                # pinned at the floor, it says the policy pays exactly
+                # the mandated compute — is emitted only when a fence
+                # exists to measure: a published 0.0 would read like
+                # zero-length thinks (same convention as
+                # ``old_value_mean`` below).
+                "think_tokens_sum": float(sum(think_lengths)),
+                "think_tokens_count": float(len(think_lengths)),
+                **(
+                    {
+                        "think_tokens_mean": (
+                            sum(think_lengths) / len(think_lengths)
+                        )
+                    }
+                    if think_lengths
+                    else {}
+                ),
+                # Verifier-correct rows the gate zeroed: nonzero here
+                # means the gate, not the policy, is eating reward
+                # signal. Omitted when no gated scoring stamped the
+                # batch — absence is not a healthy zero.
+                **(
+                    {
+                        "think_gate_zeroed_correct_fraction": (
+                            batch.think_gate_zeroed_correct
+                            / max(batch.reward_scalar.numel(), 1)
+                        )
+                    }
+                    if batch.think_gate_zeroed_correct is not None
+                    else {}
+                ),
+            }
+            if think_fence_ids is not None
+            else {}
+        ),
+        **(
+            {
                 "old_value_mean": (
                     float(batch.old_values[generated].mean())
                     if generated.any()
@@ -432,6 +754,10 @@ def aggregate_diagnostics(
     stop_ids: tuple[int, ...] = (),
     *,
     refreshed_statistics: bool = True,
+    think_fence_ids: tuple[int, int] | None = None,
+    tokenizer=None,
+    min_think_tokens: int = 1,
+    answer_fence_ids: tuple[int, int] | None = None,
 ) -> dict[str, float | int]:
     """Mean of per-group rollout diagnostics; trajectory counts are summed."""
     per_group = [
@@ -440,16 +766,39 @@ def aggregate_diagnostics(
             samples_per_prompt,
             stop_ids,
             refreshed_statistics=refreshed_statistics,
+            think_fence_ids=think_fence_ids,
+            tokenizer=tokenizer,
+            min_think_tokens=min_think_tokens,
+            answer_fence_ids=answer_fence_ids,
         )
         for group in groups
     ]
     aggregated: dict[str, float | int] = {}
+    # Derived per-group keys (currently the conditional think mean) can
+    # be present in some groups and absent in others; they are rebuilt
+    # from their pooled numerators below, never averaged group-wise.
+    derived = {"think_tokens_mean"}
+    # Intersection, not per_group[0]'s keys: conditional keys (the
+    # gate-zeroed fraction depends on per-batch scoring state) may be
+    # present in some groups only, and indexing them into every group
+    # would KeyError — or silently vanish — depending on group order.
+    shared_keys = set(per_group[0])
+    for metrics in per_group[1:]:
+        shared_keys &= set(metrics)
     for key in per_group[0]:
+        if key in derived or key not in shared_keys:
+            continue
         values = [metrics[key] for metrics in per_group]
         if key == "trajectories":
             aggregated[key] = int(sum(values))
+        elif key in ("think_tokens_sum", "think_tokens_count"):
+            aggregated[key] = float(sum(values))
         else:
             aggregated[key] = float(sum(values) / len(values))
+    if aggregated.get("think_tokens_count"):
+        aggregated["think_tokens_mean"] = float(
+            aggregated["think_tokens_sum"] / aggregated["think_tokens_count"]
+        )
     return aggregated
 
 
@@ -650,6 +999,36 @@ def rollout_tensorboard_metrics(metrics: dict[str, float | int]) -> dict[str, fl
         "reward/ended_fraction": float(metrics["ended_fraction"]),
         "behavior/actions_per_trajectory": float(
             metrics["actions_per_trajectory"]
+        ),
+        **(
+            {
+                "reward/think_format_fraction": float(
+                    metrics["think_format_fraction"]
+                ),
+            }
+            if "think_format_fraction" in metrics
+            else {}
+        ),
+        # Conditionally present (their absence means "nothing to
+        # measure", not zero) — publishing a stand-in 0.0 would fake
+        # the very readings these exist to give.
+        **(
+            {
+                "reward/think_gate_zeroed_correct_fraction": float(
+                    metrics["think_gate_zeroed_correct_fraction"]
+                ),
+            }
+            if "think_gate_zeroed_correct_fraction" in metrics
+            else {}
+        ),
+        **(
+            {
+                "behavior/think_tokens_mean": float(
+                    metrics["think_tokens_mean"]
+                ),
+            }
+            if "think_tokens_mean" in metrics
+            else {}
         ),
     }
 
@@ -1521,6 +1900,11 @@ def save_checkpoint(
         "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
         "source_provenance": getattr(args, "source_provenance", None),
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
+        "answer_fence_prompt_schema": (
+            ANSWER_FENCE_PROMPT_SCHEMA
+            if getattr(args, "answer_fence", False)
+            else None
+        ),
         "math_data_identity": sampler.dataset_identity,
         "reward_schema": REWARD_SCHEMA,
         "reasoning_mode": reasoning_mode,
@@ -1568,6 +1952,10 @@ def purge_benchmark_reports_after(output: Path, step: int) -> int:
             payload["metrics"],
             payload["attempts"],
             reward_schema=str(payload.get("reward_schema", REWARD_SCHEMA)),
+            # Keep the source payload's own schema tag: restamping a
+            # pre-segments history as the current version would break
+            # "answers/v4 implies segments" for artifacts on disk.
+            schema=str(payload["schema"]) if payload.get("schema") else None,
         )
     else:
         for path in (history_dir / "latest.json", output / "bench_answers.html"):
@@ -1590,7 +1978,75 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
 
-    backbone = load_model(args.checkpoint, device)
+    checkpoint_payload = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=False
+    )
+    backbone = load_model(args.checkpoint, device, payload=checkpoint_payload)
+    sft_provenance = (
+        (checkpoint_payload.get("sft") or {})
+        if isinstance(checkpoint_payload, dict)
+        else {}
+    )
+    del checkpoint_payload  # drop the CPU weight copy; keep only sft metadata
+    sft_thinks = bool((sft_provenance.get("args") or {}).get("think_tokens"))
+    sft_answers = bool((sft_provenance.get("args") or {}).get("answer_fence"))
+    # Fail before any GPU/optimizer construction: both mismatches produce
+    # runs that LOOK healthy. An untrained fence means every format-gated
+    # reward is zero; a think-SFT base without the flag silently drops the
+    # fence ids in decode and trains with no gate at all.
+    if args.think_tokens and not sft_thinks:
+        raise RuntimeError(
+            "--think-tokens requires a base checkpoint whose SFT stage "
+            "trained the <think>/</think> fence rows (sft.args."
+            "think_tokens); this checkpoint's fence rows are untrained, "
+            "so every format-gated reward would be zero"
+        )
+    if sft_thinks and not args.think_tokens:
+        print(
+            "WARNING: base checkpoint was SFT-trained with think fences "
+            "but --think-tokens is off — the policy will emit fence ids "
+            "the tokenizer silently drops, and no format gate applies. "
+            "Pass --think-tokens unless this is a deliberate ablation.",
+            flush=True,
+        )
+    if args.answer_fence and not sft_answers:
+        raise RuntimeError(
+            "--answer-fence requires a base checkpoint whose SFT stage "
+            "trained the <answer>/</answer> fence rows (sft.args."
+            "answer_fence); this checkpoint's fence rows are untrained, "
+            "so every structurally-gated reward would be zero"
+        )
+    if args.answer_fence:
+        # The flag alone is an operator claim; the stored fraction is a
+        # measurement over the SFT corpus's token ids (red-team round 2:
+        # an --answer-fence SFT run over a fence-less corpus would stamp
+        # the flag while the anchored shape was never a CE target).
+        fence_fraction = sft_provenance.get("answer_fence_document_fraction")
+        if fence_fraction is None or float(fence_fraction) < 0.99:
+            raise RuntimeError(
+                "--answer-fence requires SFT provenance measuring >=99% "
+                "anchored-fence documents (answer_fence_document_fraction "
+                f"= {fence_fraction!r}); this checkpoint cannot have "
+                "learned the structural gate's shape"
+            )
+        prompt_schema = sft_provenance.get("answer_fence_prompt_schema")
+        if prompt_schema != ANSWER_FENCE_PROMPT_SCHEMA:
+            raise RuntimeError(
+                "--answer-fence requires an SFT checkpoint trained with "
+                f"prompt schema {ANSWER_FENCE_PROMPT_SCHEMA!r}; got "
+                f"{prompt_schema!r}. Regenerate the canonical SFT corpus "
+                "and retrain SFT before starting RL."
+            )
+    if sft_answers and not args.answer_fence:
+        print(
+            "WARNING: base checkpoint was SFT-trained with answer fences "
+            "but --answer-fence is off — the policy will emit fence ids "
+            "the tokenizer silently drops, and the decoded-text gate "
+            "will grade text the policy framed for the structural gate. "
+            "Pass --answer-fence unless this is a deliberate ablation.",
+            flush=True,
+        )
+    check_think_floor_against_corpus(sft_provenance, args.think_min_tokens)
     is_nano = backbone.architecture.startswith("nanogpt_mini")
     if not is_nano and not backbone.architecture.endswith(
         "probes_pope_belief_attached_ce_onepass_2k"
@@ -1662,6 +2118,25 @@ def main() -> None:
     # checkout merely to reproduce a checkpoint's rollout policy.
     args.resolved_train_max_new_tokens = train_max_new_tokens
     args.resolved_train_max_stream_steps = max_stream_steps
+    if args.think_tokens:
+        # The gated reward needs the floor, both think fences, room for
+        # the answer (an Answer: line, or the fenced value under
+        # --answer-fence, budgeted by --answer-tokens as a conservative
+        # reserve), and a stop token INSIDE the training budget; a floor
+        # that leaves no such room zeroes every reward while the
+        # truncation early-return keeps think_gate_zeroed_correct at a
+        # healthy-looking 0 (rows die before the gate is consulted).
+        # The answer fence adds two more structural tokens.
+        floor_overhead = (
+            2 + args.answer_tokens + (2 if args.answer_fence else 0)
+        )
+        if args.think_min_tokens + floor_overhead > train_max_new_tokens:
+            parser.error(
+                f"--think-min-tokens {args.think_min_tokens} plus fence "
+                f"and answer overhead ({floor_overhead}) exceeds the "
+                f"training rollout budget ({train_max_new_tokens} new "
+                "tokens): every reward would be zero by truncation"
+            )
     args.resolved_aime_max_new_tokens = aime_max_new_tokens
     args.resolved_aime_max_stream_steps = aime_stream_steps
     args.resolved_bench_max_new_tokens = bench_max_new_tokens
@@ -1703,6 +2178,16 @@ def main() -> None:
             raise ValueError(
                 "initialization checkpoint predates deterministic sequential "
                 "prompt traversal; its cursor cannot prove no prompt reuse"
+            )
+        if (
+            args.answer_fence
+            and actor_init_payload.get("answer_fence_prompt_schema")
+            != ANSWER_FENCE_PROMPT_SCHEMA
+        ):
+            raise ValueError(
+                "initialization checkpoint uses a different answer-fence "
+                "prompt schema; start from a checkpoint trained with "
+                f"{ANSWER_FENCE_PROMPT_SCHEMA!r}"
             )
         if args.actor_critic_init:
             if int(actor_init_payload.get("step", -1)) != 0:
@@ -1787,6 +2272,42 @@ def main() -> None:
         num_blocks=args.combined_mlp_blocks,
     ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
+    if actor_init_payload is not None:
+        # These three apply on EVERY initialization path (--actor-init and
+        # --curriculum-init load the same actor weights): a fence-setting
+        # mismatch means the loaded policy either never trained the fence
+        # rows (all-zero structurally-gated reward) or emits fence ids the
+        # tokenizer silently drops (no gate at all). Red-team round 2: the
+        # guards originally lived under --actor-critic-init only, whose
+        # own error text recommended --actor-init — the unguarded path.
+        init_args = actor_init_payload.get("args", {})
+        if bool(init_args.get("think_tokens")) != bool(args.think_tokens):
+            raise ValueError(
+                "the initialization checkpoint's policy was trained under "
+                "a different --think-tokens setting (checkpoint "
+                f"{bool(init_args.get('think_tokens'))}, got "
+                f"{bool(args.think_tokens)}); the fence gate and the "
+                "policy's emission format must agree"
+            )
+        # The floor moves the same reward distribution (default 1 in old
+        # manifests = the pre-floor gate) — otherwise forgetting the flag
+        # silently drops the floor to 1.
+        if int(init_args.get("think_min_tokens", 1)) != args.think_min_tokens:
+            raise ValueError(
+                "the initialization checkpoint's policy was trained under "
+                "a different --think-min-tokens floor (checkpoint "
+                f"{int(init_args.get('think_min_tokens', 1))}, got "
+                f"{args.think_min_tokens})"
+            )
+        # The structural gate is a different reward function from the
+        # decoded-text gate (default False in old manifests).
+        if bool(init_args.get("answer_fence")) != bool(args.answer_fence):
+            raise ValueError(
+                "the initialization checkpoint's policy was trained under "
+                "a different --answer-fence setting (checkpoint "
+                f"{bool(init_args.get('answer_fence'))}, got "
+                f"{bool(args.answer_fence)})"
+            )
     if args.actor_critic_init:
         init_args = actor_init_payload.get("args", {})
         if not value_support_geometry_matches(init_args, args):
@@ -1856,8 +2377,20 @@ def main() -> None:
         )
 
     tokenizer = load_posttraining_tokenizer(
-        backbone.architecture, FreshHyperparameters.tokenizer_path
+        backbone.architecture,
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=args.think_tokens,
+        answer_tokens=args.answer_fence,
     )
+    think_fence_ids: tuple[int, int] | None = None
+    answer_fence_ids: tuple[int, int] | None = None
+    if args.think_tokens:
+        # Provenance already verified at checkpoint load.
+        think_fence_ids = (tokenizer.think_open_id, tokenizer.think_close_id)
+    if args.answer_fence:
+        answer_fence_ids = (
+            tokenizer.answer_open_id, tokenizer.answer_close_id
+        )
     # dict.fromkeys dedupes while keeping order: GPT-2's single
     # <|endoftext|> token reports as both EOS and BOS.
     stop_ids = tuple(
@@ -1891,16 +2424,22 @@ def main() -> None:
         if args.aime_every > 0 and not args.rollout_only
         else []
     )
+    if args.answer_fence:
+        aime_rows = rewrite_prompts_for_answer_fence(aime_rows)
     aime_modal_baseline = modal_answer_baseline(aime_rows)
     all_bench_rows = (
         load_unique_math_rows(args.bench_data)
         if (args.bench_every > 0 or args.bench_only) and not args.rollout_only
         else []
     )
+    if args.answer_fence:
+        all_bench_rows = rewrite_prompts_for_answer_fence(all_bench_rows)
     bench_rows = deterministic_math_subset(all_bench_rows, args.bench_max_rows)
     bench_dataset_baseline = modal_answer_baseline(all_bench_rows)
     bench_subset_baseline = modal_answer_baseline(bench_rows)
     math_rows = load_unique_math_rows(args.math_data)
+    if args.answer_fence:
+        math_rows = rewrite_prompts_for_answer_fence(math_rows)
     excluded_modules = {
         name for name in args.exclude_modules.split(",") if name
     }
@@ -2100,6 +2639,39 @@ def main() -> None:
             raise ValueError(
                 "resume checkpoint's prompt cursor belongs to different dataset "
                 "bytes, exclusions, or ordering"
+            )
+        if bool(resume_args.get("think_tokens")) != bool(args.think_tokens):
+            raise ValueError(
+                "resume requires the checkpoint's --think-tokens setting: "
+                "the fence gate changes the return distribution the critic "
+                f"was fit to (checkpoint {bool(resume_args.get('think_tokens'))}, "
+                f"got {bool(args.think_tokens)})"
+            )
+        if int(resume_args.get("think_min_tokens", 1)) != args.think_min_tokens:
+            raise ValueError(
+                "resume requires the checkpoint's --think-min-tokens: the "
+                "floor is part of the reward the critic was fit to "
+                f"(checkpoint {int(resume_args.get('think_min_tokens', 1))}, "
+                f"got {args.think_min_tokens})"
+            )
+        if bool(resume_args.get("answer_fence")) != bool(args.answer_fence):
+            raise ValueError(
+                "resume requires the checkpoint's --answer-fence setting: "
+                "the structural gate is part of the reward the critic was "
+                f"fit to (checkpoint {bool(resume_args.get('answer_fence'))}, "
+                f"got {bool(args.answer_fence)})"
+            )
+        if (
+            args.answer_fence
+            and payload.get("answer_fence_prompt_schema")
+            != ANSWER_FENCE_PROMPT_SCHEMA
+        ):
+            raise ValueError(
+                "resume checkpoint answer-fence prompt schema must be "
+                f"{ANSWER_FENCE_PROMPT_SCHEMA!r}; got "
+                f"{payload.get('answer_fence_prompt_schema')!r}. Prompt "
+                "wording is part of the policy environment and cannot "
+                "change across an exact resume."
             )
         resume_seed = resume_args.get("seed")
         if resume_seed is not None and int(resume_seed) != args.seed:
@@ -2656,6 +3228,9 @@ def main() -> None:
                 "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
                 "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
+                "answer_fence_prompt_schema": (
+                    ANSWER_FENCE_PROMPT_SCHEMA if args.answer_fence else None
+                ),
                 "math_data_identity": data_identity,
                 "reward_schema": REWARD_SCHEMA,
                 "reasoning_mode": args.reasoning_mode,
@@ -2671,6 +3246,11 @@ def main() -> None:
                 "base": {
                     "checkpoint": str(args.checkpoint),
                     "architecture": backbone.architecture,
+                    # SFT lineage when the base came out of sft_trace_train
+                    # (plain scalars: schema, traces, args, steps) — the
+                    # think_tokens flag in here is what the startup guards
+                    # key off.
+                    "sft": sft_provenance or None,
                 },
                 "actor_init": actor_init_provenance,
                 "critic": {
@@ -2732,6 +3312,9 @@ def main() -> None:
             answer_style(row),
             args.nearby_reward_max,
             solution_prefix_ids=answer_prefix_ids,
+            think_fence_ids=think_fence_ids,
+            min_think_tokens=args.think_min_tokens,
+            answer_fence_ids=answer_fence_ids,
         )
         # Stepwise rollout and parallel replay disagree numerically at
         # bf16 scale; recompute the stored PPO statistics through the
@@ -3156,6 +3739,7 @@ def main() -> None:
             captured_attempts=captured_attempts,
             pin_emit=pin_emit,
             prompt_suffix_ids=answer_prefix_ids,
+            answer_fence_ids=answer_fence_ids,
         )
         metrics["dataset_modal_answer"] = aime_modal_baseline["answer"]
         metrics["dataset_modal_answer_style"] = "aime"
@@ -3207,6 +3791,7 @@ def main() -> None:
             captured_attempts=captured_attempts,
             pin_emit=pin_emit,
             prompt_suffix_ids=answer_prefix_ids,
+            answer_fence_ids=answer_fence_ids,
         )
         metrics["dataset_modal_answer"] = bench_dataset_baseline["answer"]
         metrics["dataset_modal_answer_style"] = bench_dataset_baseline["style"]
@@ -3295,6 +3880,10 @@ def main() -> None:
                 args.samples_per_prompt,
                 stop_ids,
                 refreshed_statistics=False,
+                think_fence_ids=think_fence_ids,
+                tokenizer=tokenizer,
+                min_think_tokens=args.think_min_tokens,
+                answer_fence_ids=answer_fence_ids,
             )
             if last_decode_schedule_metrics is None:
                 metrics.update(
@@ -3459,7 +4048,31 @@ def main() -> None:
         return interval > 0 and current // interval > previous // interval
 
     step = start_step
+    # Session-local by design: resuming after a desert stop is a deliberate
+    # operator act, so the resumed session gets a fresh
+    # --zero-reward-stop-pools budget rather than stopping immediately.
+    zero_reward_pool_streak = 0
+    zero_reward_frozen_updates = 0
+    stopped_at_pool_boundary = False
     while step < args.steps:
+        if (
+            args.zero_reward_stop_pools > 0
+            and zero_reward_pool_streak >= args.zero_reward_stop_pools
+        ):
+            # A sustained all-zero-reward streak is a dead run: with the
+            # actor frozen it cannot recover, and with the freeze disabled
+            # it is re-entering the round-4 spiral. Pool-boundary stop —
+            # the loop tail below saves the final checkpoint, so the run
+            # truncates resumably instead of burning the remaining budget
+            # on signal-free rollouts.
+            print(
+                f"{zero_reward_pool_streak} consecutive all-zero-reward "
+                f"pools at step {step}/{args.steps}; stopping at the pool "
+                "boundary",
+                flush=True,
+            )
+            stopped_at_pool_boundary = True
+            break
         if (
             args.max_train_hours is not None
             and time.monotonic() - run_started > args.max_train_hours * 3600
@@ -3472,6 +4085,7 @@ def main() -> None:
                 f"{step}/{args.steps}; stopping at the pool boundary",
                 flush=True,
             )
+            stopped_at_pool_boundary = True
             break
         previous_step = step
         # Before the clock starts: attaching the profiler's own machinery
@@ -3509,6 +4123,10 @@ def main() -> None:
                 args.samples_per_prompt,
                 stop_ids,
                 refreshed_statistics=False,
+                think_fence_ids=think_fence_ids,
+                tokenizer=tokenizer,
+                min_think_tokens=args.think_min_tokens,
+                answer_fence_ids=answer_fence_ids,
             )
             if last_decode_schedule_metrics is None:
                 rollout_metrics.update(
@@ -3531,6 +4149,38 @@ def main() -> None:
             )
         if len(minibatch_orders) != pool_updates:
             raise RuntimeError("rollout pool did not produce the planned updates")
+        # Rewards are non-negative (exact 1.0, nearby-numeric partial, else
+        # 0), so a zero reward mean means every trajectory in the window
+        # scored zero. The actual freeze decision is made per optimizer
+        # MINIBATCH below (an update over an all-zero minibatch is the
+        # harmful unit — a single rewarded trajectory elsewhere in the pool
+        # must not unfreeze it); the pool-level statistic here feeds the
+        # rollout log and the consecutive-desert stop. NaN fails closed:
+        # a non-finite mean is a broken pool, not a licence to update.
+        if not math.isfinite(rollout_metrics["reward_mean"]):
+            raise RuntimeError(
+                f"non-finite pool reward_mean "
+                f"{rollout_metrics['reward_mean']} at step {step}"
+            )
+        pool_reward_zero = rollout_metrics["reward_mean"] == 0.0
+        rollout_metrics["zero_reward_actor_frozen"] = float(
+            args.zero_reward_actor_freeze and pool_reward_zero
+        )
+        if pool_reward_zero:
+            zero_reward_pool_streak += 1
+            frozen_note = (
+                f"actor optimizer frozen for its {pool_updates} updates "
+                "(critic continues)"
+                if args.zero_reward_actor_freeze
+                else "freeze disabled by --no-zero-reward-actor-freeze"
+            )
+            print(
+                f"steps {step + 1}..{step + pool_updates}: all-zero-reward "
+                f"pool — {frozen_note}; streak {zero_reward_pool_streak}",
+                flush=True,
+            )
+        else:
+            zero_reward_pool_streak = 0
 
         # Assemble each shuffled optimizer minibatch on CPU with RIGHT tail
         # padding, then refresh all old statistics under the still-frozen
@@ -3861,6 +4511,26 @@ def main() -> None:
                             "refresh/update code paths diverged)",
                             flush=True,
                         )
+                # An update whose every trajectory scored zero is the
+                # harmful unit from the round-4 postmortem: its advantages
+                # are pure critic error whose only coherent direction is
+                # anti-termination. The decision is per MINIBATCH — a
+                # rewarded trajectory elsewhere in the pool must not
+                # unfreeze an all-zero update. Only the actor OPTIMIZER
+                # step is skipped: the forward/backward above already ran,
+                # so behavior-age canaries, gradient telemetry, and the
+                # non-finite checks stay uniform, and skipping the step is
+                # required because Adam momentum from earlier updates moves
+                # weights even on a zero-signal gradient. The critic always
+                # steps so value predictions catch down to the zero
+                # targets. (Rewards are finite here: the pool-level
+                # isfinite raise above covers the same tensors.)
+                minibatch_actor_frozen = (
+                    args.zero_reward_actor_freeze
+                    and metrics["reward"] == 0.0
+                )
+                if minibatch_actor_frozen:
+                    zero_reward_frozen_updates += 1
                 minibatch_metrics = [metrics]
                 # Reading the loss and gradient scalars is where the host
                 # first waits on the backward, so this phase carries the
@@ -3884,7 +4554,8 @@ def main() -> None:
                         f"{nonfinite_gradients}"
                     )
                 with profiler.phase("optimizer_step"):
-                    step_optimizers(optimizers, "actor")
+                    if not minibatch_actor_frozen:
+                        step_optimizers(optimizers, "actor")
                     step_optimizers(optimizers, "critic")
                     # Gradient buffers have already been reduced to scalar
                     # telemetry. Release them before the optional second
@@ -3970,6 +4641,12 @@ def main() -> None:
                     torch._dynamo.utils.counters["inductor"][
                         "cudagraph_skips"
                     ]
+                )
+                actor_dashboard["guard/zero_reward_actor_frozen"] = float(
+                    minibatch_actor_frozen
+                )
+                actor_dashboard["guard/zero_reward_frozen_updates_total"] = (
+                    float(zero_reward_frozen_updates)
                 )
                 if next_step == 1 or (
                     args.post_update_kl_every > 0
@@ -4072,10 +4749,20 @@ def main() -> None:
                 )
         profiler.pool_finished(step, time.perf_counter() - started)
     if args.consume_all_prompts and sampler.cursor != len(math_rows):
-        raise RuntimeError(
-            "--consume-all-prompts completed without exhausting the target "
-            f"dataset: cursor {sampler.cursor}/{len(math_rows)}"
-        )
+        # A pool-boundary stop (deadline or consecutive-desert) is a
+        # deliberate truncation, not a scheduling bug — save the terminal
+        # checkpoint instead of dying on the exhaustion invariant.
+        if stopped_at_pool_boundary:
+            print(
+                "--consume-all-prompts truncated by a pool-boundary stop: "
+                f"cursor {sampler.cursor}/{len(math_rows)}",
+                flush=True,
+            )
+        else:
+            raise RuntimeError(
+                "--consume-all-prompts completed without exhausting the "
+                f"target dataset: cursor {sampler.cursor}/{len(math_rows)}"
+            )
     save_checkpoint(
         output / "latent_vapo_checkpoint.pt", wrapper, critic,
         optimizers, step, args, sampler, warmup_step,

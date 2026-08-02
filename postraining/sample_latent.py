@@ -52,7 +52,9 @@ from postraining.latent_thought import (
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
 )
+from postraining.math_prompt import require_answer_fence_prompt_schema
 from postraining.model_io import load_model
+from postraining.train_latent_vapo import rewrite_prompts_for_answer_fence
 from postraining.train_vapo import prompt_text
 
 
@@ -144,7 +146,17 @@ def main() -> None:
         print(f"base checkpoint (from manifest): {args.checkpoint}")
 
     device = torch.device("cuda")
-    backbone = load_model(args.checkpoint, device)
+    base_payload = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=False
+    )
+    backbone = load_model(args.checkpoint, device, payload=base_payload)
+    sft_provenance = (
+        (base_payload.get("sft") or {})
+        if isinstance(base_payload, dict)
+        else {}
+    )
+    sft_args = sft_provenance.get("args") or {}
+    del base_payload
     backbone.eval()
     wrapper_step = None
     if args.wrapper_checkpoint:
@@ -179,8 +191,29 @@ def main() -> None:
     if args.emit_only:
         print("token-only policy: no belief is carried between steps")
 
+    # Fence flags come from the RL run's saved args when a wrapper
+    # checkpoint is loaded, else from the base checkpoint's SFT
+    # provenance: a fence-trained policy sampled through a fence-less
+    # tokenizer silently decodes its fence ids away and grades near-zero.
+    run_args = (
+        payload.get("args", {}) if args.wrapper_checkpoint else sft_args
+    )
+    run_answer_fence = bool(run_args.get("answer_fence"))
+    require_answer_fence_prompt_schema(
+        payload if args.wrapper_checkpoint else sft_provenance,
+        answer_fence=run_answer_fence,
+        source=args.wrapper_checkpoint or args.checkpoint,
+    )
     tokenizer = load_posttraining_tokenizer(
-        backbone.architecture, FreshHyperparameters.tokenizer_path
+        backbone.architecture,
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=bool(run_args.get("think_tokens")),
+        answer_tokens=run_answer_fence,
+    )
+    answer_fence_ids = (
+        (tokenizer.answer_open_id, tokenizer.answer_close_id)
+        if run_answer_fence
+        else None
     )
 
     if args.fineweb is not None:
@@ -241,6 +274,11 @@ def main() -> None:
                     },
                 }
             )
+        if run_answer_fence:
+            # A fence-trained policy sampled under the plain-text
+            # Answer: instruction is off-distribution; frame the task
+            # exactly as the run did.
+            selected_rows = rewrite_prompts_for_answer_fence(selected_rows)
 
         compiled_step_core = None
         if args.eval_compile:
@@ -276,6 +314,7 @@ def main() -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             pin_emit=args.emit_only,
+            answer_fence_ids=answer_fence_ids,
         )
 
         records = []
@@ -288,6 +327,7 @@ def main() -> None:
                 samples.append(
                     {
                         "text": attempt["emitted_text"],
+                        "segments": attempt.get("emitted_segments", []),
                         "emits": int(attempt["emitted_token_count"]),
                         "correct": bool(attempt["correct"]),
                         "prediction": attempt["parsed_answer"],
@@ -362,6 +402,8 @@ def main() -> None:
     if args.aime_row is not None:
         rows = load_unique_math_rows(args.aime_data)
         row = rows[args.aime_row]
+        if run_answer_fence:
+            row = rewrite_prompts_for_answer_fence([row])[0]
         text = prompt_text(row)
         truth = row["reward_model"]["ground_truth"]
         print(f"AIME row {args.aime_row} (ground truth: {truth})")
@@ -403,7 +445,8 @@ def main() -> None:
         print(f"--- sample {index}  (emits: {len(emitted)})")
         if truth is not None:
             is_correct, prediction = verify_terminated_answer(
-                emitted, truth, tokenizer, stop_ids, "aime"
+                emitted, truth, tokenizer, stop_ids, "aime",
+                answer_fence_ids=answer_fence_ids,
             )
             print(f"verdict: {'CORRECT' if is_correct else 'wrong'} (extracted: {prediction})")
         print(tokenizer.decode(emitted))

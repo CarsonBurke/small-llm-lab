@@ -180,7 +180,10 @@ def test_prompt_correct_counts_keep_original_row_order(monkeypatch):
         },
     ]
 
-    def _by_truth(emitted, truth, tokenizer, stop_ids, style, prefix_ids=()):
+    def _by_truth(
+        emitted, truth, tokenizer, stop_ids, style, prefix_ids=(),
+        answer_fence_ids=None,
+    ):
         return truth == "42", truth
 
     monkeypatch.setattr(latent_eval, "verify_terminated_answer", _by_truth)

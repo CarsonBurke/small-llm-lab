@@ -37,7 +37,9 @@ from postraining.latent_rollout import (
     trim_stream,
 )
 from postraining.latent_thought import LatentThoughtModel
+from postraining.math_prompt import require_answer_fence_prompt_schema
 from postraining.model_io import load_model
+from postraining.train_latent_vapo import rewrite_prompts_for_answer_fence
 from postraining.train_vapo import prompt_text
 
 
@@ -61,7 +63,17 @@ def main() -> None:
         parser.error("--samples must be positive")
 
     device = torch.device("cuda")
-    backbone = load_model(args.checkpoint, device)
+    checkpoint_payload = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=False
+    )
+    backbone = load_model(args.checkpoint, device, payload=checkpoint_payload)
+    sft_provenance = (
+        (checkpoint_payload.get("sft") or {})
+        if isinstance(checkpoint_payload, dict)
+        else {}
+    )
+    sft_args = sft_provenance.get("args") or {}
+    del checkpoint_payload
     is_nano = backbone.architecture.startswith("nanogpt_mini")
     context_tokens = (
         getattr(backbone, "train_context_tokens", 1024)
@@ -84,8 +96,24 @@ def main() -> None:
     # token policy with the hidden carry plumbed but inert.
     wrapper = LatentThoughtModel(backbone).to(device).eval()
 
+    # An SFT base checkpoint may be fence-trained; grading it through a
+    # fence-less tokenizer decodes the fence ids away and reads near-zero.
+    probe_answer_fence = bool(sft_args.get("answer_fence"))
+    require_answer_fence_prompt_schema(
+        sft_provenance,
+        answer_fence=probe_answer_fence,
+        source=args.checkpoint,
+    )
     tokenizer = load_posttraining_tokenizer(
-        backbone.architecture, FreshHyperparameters.tokenizer_path
+        backbone.architecture,
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=bool(sft_args.get("think_tokens")),
+        answer_tokens=probe_answer_fence,
+    )
+    answer_fence_ids = (
+        (tokenizer.answer_open_id, tokenizer.answer_close_id)
+        if probe_answer_fence
+        else None
     )
     # dict.fromkeys dedupes while keeping order: GPT-2's single <|endoftext|>
     # token reports as both EOS and BOS.
@@ -93,6 +121,10 @@ def main() -> None:
         t for t in (tokenizer.eos_id(), tokenizer.bos_id()) if t >= 0
     ))
     rows = load_unique_math_rows(args.math_data)[: args.prompts]
+    if probe_answer_fence:
+        # A fence-trained policy probed under the plain-text Answer:
+        # instruction is off-distribution; frame the task as SFT did.
+        rows = rewrite_prompts_for_answer_fence(rows)
 
     torch.manual_seed(args.seed)
     hits = 0
@@ -122,7 +154,8 @@ def main() -> None:
         group_hits = 0
         for emitted in emitted_token_rows(batch):
             correct, prediction = verify_terminated_answer(
-                emitted, truth, tokenizer, stop_ids, answer_style(row)
+                emitted, truth, tokenizer, stop_ids, answer_style(row),
+                answer_fence_ids=answer_fence_ids,
             )
             extractions[str(prediction)] += 1
             answer_lines += int(

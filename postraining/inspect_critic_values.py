@@ -42,11 +42,13 @@ from postraining.latent_thought import (
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
 )
+from postraining.math_prompt import require_answer_fence_prompt_schema
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import fresh_trunk, load_model
 from postraining.reasoning_modes import checkpoint_training_rollout_budget
 from postraining.train_latent_vapo import (
     answer_prefix_token_ids,
+    rewrite_prompts_for_answer_fence,
     score_math_rollout,
 )
 from postraining.train_vapo import prompt_text
@@ -141,6 +143,11 @@ def main() -> None:
     backbone.eval()
     payload = torch.load(wrapper_path, map_location="cpu", weights_only=False)
     saved_args = payload.get("args", {})
+    require_answer_fence_prompt_schema(
+        payload,
+        answer_fence=bool(saved_args.get("answer_fence")),
+        source=str(wrapper_path),
+    )
     reasoning_mode = saved_args.get("reasoning_mode", "latent")
     wrapper = LatentThoughtModel(
         backbone, **combiner_init_kwargs_from_checkpoint(payload)
@@ -178,8 +185,27 @@ def main() -> None:
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()
 
+    # Rebuild the run's reward exactly: a gate-trained critic compared
+    # against ungated rewards would show spurious value error on every
+    # bare-guess row (and a non-think tokenizer silently decodes the
+    # fence ids away instead of failing).
+    run_thinks = bool(saved_args.get("think_tokens"))
+    run_answer_fence = bool(saved_args.get("answer_fence"))
     tokenizer = load_posttraining_tokenizer(
-        backbone.architecture, FreshHyperparameters.tokenizer_path
+        backbone.architecture,
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=run_thinks,
+        answer_tokens=run_answer_fence,
+    )
+    think_fence_ids = (
+        (tokenizer.think_open_id, tokenizer.think_close_id)
+        if run_thinks
+        else None
+    )
+    answer_fence_ids = (
+        (tokenizer.answer_open_id, tokenizer.answer_close_id)
+        if run_answer_fence
+        else None
     )
     stop_ids = tuple(
         dict.fromkeys(
@@ -196,6 +222,12 @@ def main() -> None:
         solution_prefix_ids = answer_prefix_token_ids(tokenizer)
 
     rows = load_unique_math_rows(args.math_data)
+    if run_answer_fence:
+        # Rebuilding "the run's reward exactly" needs the run's prompts
+        # exactly: the trainer rewrites the Answer: instruction to the
+        # fence contract before every rollout, and a policy rolled out
+        # under the unrewritten prompt is off-distribution.
+        rows = rewrite_prompts_for_answer_fence(rows)
     picked = random.Random(args.seed).sample(range(len(rows)), args.rows)
     generator = torch.Generator(device=device).manual_seed(args.seed)
     unicode_to_byte = (
@@ -241,6 +273,9 @@ def main() -> None:
             batch, truth, tokenizer, stop_ids, answer_style(row),
             saved_args.get("nearby_reward_max", 0.1),
             solution_prefix_ids=solution_prefix_ids,
+            think_fence_ids=think_fence_ids,
+            min_think_tokens=int(saved_args.get("think_min_tokens", 1)),
+            answer_fence_ids=answer_fence_ids,
         )
         kinds = batch.kind.cpu()
         tokens = batch.token_ids.cpu()

@@ -88,8 +88,12 @@ from postraining.latent_thought import (
     rollout_policy_schema_for_mode,
     validate_renderer_checkpoint,
 )
+from postraining.math_prompt import require_answer_fence_prompt_schema
 from postraining.model_io import fresh_trunk, load_model
-from postraining.train_latent_vapo import score_math_rollout
+from postraining.train_latent_vapo import (
+    rewrite_prompts_for_answer_fence,
+    score_math_rollout,
+)
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 
@@ -184,6 +188,7 @@ def run_arm(
     answer_style_override: str | None,
     capture_problems: int,
     capture_samples: int,
+    answer_fence_ids: tuple[int, int] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     """One arm's full-panel evaluation; identical rows/seed across arms."""
     captured: list[dict[str, object]] = []
@@ -209,6 +214,7 @@ def run_arm(
             capture_problem_count=min(capture_problems, len(rows)),
             capture_samples_per_problem=min(capture_samples, samples),
             pin_emit=arm == "token_only",
+            answer_fence_ids=answer_fence_ids,
         )
     return metrics, captured
 
@@ -243,6 +249,19 @@ def hidden_probes(
     max_stream_steps = saved_args["resolved_train_max_stream_steps"]
     prompt_budget = saved_args["prompt_tokens"]
     nearby_reward_max = saved_args.get("nearby_reward_max", 0.1)
+    # These numbers describe the training process, so the reward must be
+    # the training reward: a gate-trained run scored ungated would show
+    # value error on every bare-guess row.
+    think_fence_ids = (
+        (tokenizer.think_open_id, tokenizer.think_close_id)
+        if saved_args.get("think_tokens")
+        else None
+    )
+    answer_fence_ids = (
+        (tokenizer.answer_open_id, tokenizer.answer_close_id)
+        if saved_args.get("answer_fence")
+        else None
+    )
     generator = torch.Generator(device=device).manual_seed(seed)
 
     refresh_budgets = {
@@ -288,6 +307,9 @@ def hidden_probes(
             stop_ids,
             answer_style(row),
             nearby_reward_max,
+            think_fence_ids=think_fence_ids,
+            min_think_tokens=int(saved_args.get("think_min_tokens", 1)),
+            answer_fence_ids=answer_fence_ids,
         )
         action = batch.action_mask.bool()
         with torch.no_grad():
@@ -435,6 +457,11 @@ def main() -> None:
     backbone.eval()
     payload = torch.load(wrapper_path, map_location="cpu", weights_only=False)
     saved_args = payload["args"]
+    require_answer_fence_prompt_schema(
+        payload,
+        answer_fence=bool(saved_args.get("answer_fence")),
+        source=str(wrapper_path),
+    )
     reasoning_mode = saved_args.get("reasoning_mode", "latent")
     if reasoning_mode != "latent":
         raise SystemExit(
@@ -485,7 +512,10 @@ def main() -> None:
     )
 
     tokenizer = load_posttraining_tokenizer(
-        backbone.architecture, FreshHyperparameters.tokenizer_path
+        backbone.architecture,
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=bool(saved_args.get("think_tokens")),
+        answer_tokens=bool(saved_args.get("answer_fence")),
     )
     stop_ids = tuple(
         dict.fromkeys(
@@ -494,8 +524,15 @@ def main() -> None:
     )
 
     all_math_rows = load_unique_math_rows(args.math_data)
-    math_rows = deterministic_math_subset(all_math_rows, args.math_prompts)
     aime_rows = load_unique_math_rows(args.aime_data)
+    if saved_args.get("answer_fence"):
+        # The run rolled out under fence-contract prompts; comparing arms
+        # under the unrewritten Answer: instruction would measure an
+        # off-distribution policy. Rewrite before subsetting, exactly as
+        # the trainer does.
+        all_math_rows = rewrite_prompts_for_answer_fence(all_math_rows)
+        aime_rows = rewrite_prompts_for_answer_fence(aime_rows)
+    math_rows = deterministic_math_subset(all_math_rows, args.math_prompts)
     probe_rows = random.Random(args.seed + 1).sample(
         all_math_rows, min(args.probe_prompts, len(all_math_rows))
     )
@@ -544,6 +581,11 @@ def main() -> None:
                 panel["style_override"],
                 capture_problems=8,
                 capture_samples=4,
+                answer_fence_ids=(
+                    (tokenizer.answer_open_id, tokenizer.answer_close_id)
+                    if saved_args.get("answer_fence")
+                    else None
+                ),
             )
             arm_metrics[panel_name][arm] = metrics
             transcripts[panel_name][arm] = captured

@@ -12,7 +12,14 @@ from postraining.benchmark_report import (
     CAPTURE_PROBLEMS,
     CAPTURE_SAMPLES_PER_PROBLEM,
 )
-from postraining.core import answer_style, encode_prompt, verify_answer
+from postraining.core import (
+    answer_style,
+    emitted_display_segments,
+    encode_prompt,
+    fenced_answer_text,
+    structural_format_ok,
+    verify_answer,
+)
 from postraining.latent_rollout import (
     emitted_token_rows,
     rollout_continuations,
@@ -21,7 +28,7 @@ from postraining.latent_rollout import (
 from postraining.latent_thought import LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
-LATENT_EVAL_METRIC_SCHEMA = "deterministic_hidden_carry_token_actions/v4"
+LATENT_EVAL_METRIC_SCHEMA = "deterministic_hidden_carry_token_actions/v5"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
@@ -34,17 +41,35 @@ def verify_terminated_answer(
     stop_ids: tuple[int, ...],
     style: str = "minerva",
     prefix_ids: tuple[int, ...] = (),
+    answer_fence_ids: tuple[int, int] | None = None,
 ) -> tuple[bool, str]:
     """Verify a response only when it emitted BOS/EOS itself.
 
     ``prefix_ids`` are teacher-forced solution tokens that live in the prompt
     (the none-mode ``Answer:`` prefix): the emitted continuation alone never
     contains them, so they rejoin the decode before parsing.
+
+    ``answer_fence_ids`` grades the decoded content of the single
+    ``<answer>`` span when one exists — matching what the structural RL
+    gate grades. A fenceless completion falls back to the plain-text
+    parse: accuracy keeps meaning "raw correctness" (structure is the RL
+    gate's job, tracked separately by the format fraction), so a policy
+    that answers correctly without the fence still registers here.
     """
     stop_set = set(stop_ids)
     cut = next((i for i, token in enumerate(emitted) if token in stop_set), None)
     if cut is None:
         return False, "[UNTERMINATED]"
+    if answer_fence_ids is not None:
+        fenced = fenced_answer_text(
+            emitted[: cut + 1], tokenizer, answer_fence_ids
+        )
+        if fenced is not None:
+            # window=None: the reframe IS the answer field; a long value
+            # must not push its own prefix out of the tail window.
+            return verify_answer(
+                "Answer: " + fenced, truth, style, window=None
+            )
     return verify_answer(
         tokenizer.decode(list(prefix_ids) + emitted[: cut + 1]), truth, style
     )
@@ -70,10 +95,14 @@ def evaluate_latent_math(
     capture_samples_per_problem: int = CAPTURE_SAMPLES_PER_PROBLEM,
     temperature: float = 1.0,
     top_p: float = 0.7,
+    top_k: int | None = None,
     compact_finished: bool = False,
     compiled_tail_batch: int | None = COMPILED_EVAL_TAIL_BATCH,
     pin_emit: bool = False,
     prompt_suffix_ids: tuple[int, ...] = (),
+    think_fence_ids: tuple[int, int] | None = None,
+    answer_fence_ids: tuple[int, int] | None = None,
+    min_think_tokens: int = 1,
 ) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
 
@@ -159,8 +188,11 @@ def evaluate_latent_math(
             "trajectory termination"
         )
     correct = 0
+    contract_correct = 0
+    structurally_valid = 0
     total = 0
     prompt_correct = [0] * len(rows)
+    prompt_contract_correct = [0] * len(rows)
     module_correct: dict[str, int] = {}
     module_total: dict[str, int] = {}
     emitted_counts: list[int] = []
@@ -254,6 +286,7 @@ def evaluate_latent_math(
                             ),
                             prompt_repeats=width,
                             pin_emit=pin_emit,
+                            top_k=top_k,
                         )
                     )
                 recurrent_steps_per_rollout.append(
@@ -276,8 +309,29 @@ def evaluate_latent_math(
                     is_correct, _ = verify_terminated_answer(
                         emitted, truth, tokenizer, stop_ids, style,
                         prefix_ids=prompt_suffix_ids,
+                        answer_fence_ids=answer_fence_ids,
                     )
+                    stop_cut = next(
+                        (
+                            index
+                            for index, token in enumerate(emitted)
+                            if token in stop_ids
+                        ),
+                        None,
+                    )
+                    if think_fence_ids is not None and answer_fence_ids is not None:
+                        format_ok = stop_cut is not None and structural_format_ok(
+                            emitted[: stop_cut + 1],
+                            think_fence_ids,
+                            answer_fence_ids,
+                            min_think_tokens,
+                        )
+                    else:
+                        format_ok = True
+                    is_contract_correct = is_correct and format_ok
                     correct += int(is_correct)
+                    contract_correct += int(is_contract_correct)
+                    structurally_valid += int(format_ok)
                     total += 1
                     if module:
                         module_correct[module] = (
@@ -287,23 +341,36 @@ def evaluate_latent_math(
                     member = member_start + flat_member % width
                     original_index = row_chunk[group][2]
                     prompt_correct[original_index] += int(is_correct)
+                    prompt_contract_correct[original_index] += int(
+                        is_contract_correct
+                    )
                     if (
                         captured_attempts is not None
                         and original_index < capture_problem_count
                         and member < capture_samples_per_problem
                     ):
-                        stop_cut = next(
-                            (
-                                index
-                                for index, token in enumerate(emitted)
-                                if token in stop_ids
-                            ),
-                            None,
-                        )
                         emitted_text = tokenizer.decode(
                             list(prompt_suffix_ids) + emitted
                         )
-                        _, parsed_answer = verify_answer(emitted_text, truth, style)
+                        # Mirror the grading path so parsed_answer shows
+                        # what verify_terminated_answer actually graded.
+                        fenced = (
+                            fenced_answer_text(
+                                emitted[: stop_cut + 1], tokenizer,
+                                answer_fence_ids,
+                            )
+                            if answer_fence_ids is not None
+                            and stop_cut is not None
+                            else None
+                        )
+                        _, parsed_answer = verify_answer(
+                            "Answer: " + fenced
+                            if fenced is not None
+                            else emitted_text,
+                            truth,
+                            style,
+                            window=None if fenced is not None else 300,
+                        )
                         captured_attempts.append(
                             {
                                 "problem_index": original_index,
@@ -314,9 +381,23 @@ def evaluate_latent_math(
                                 "answer_style": style,
                                 "emitted_token_ids": emitted,
                                 "emitted_text": emitted_text,
+                                # emitted_text mirrors the grading decode,
+                                # which strips fences and EOS; the segments
+                                # keep them for the human-facing report.
+                                "emitted_segments": (
+                                    emitted_display_segments(
+                                        prompt_suffix_ids, tokenizer,
+                                        kind="prefix",
+                                    )
+                                    + emitted_display_segments(
+                                        emitted, tokenizer
+                                    )
+                                ),
                                 "parsed_answer": parsed_answer,
                                 "correct": bool(is_correct),
                                 "terminated": stop_cut is not None,
+                                "structural_format_ok": format_ok,
+                                "contract_correct": is_contract_correct,
                                 "termination_token_id": (
                                     emitted[stop_cut] if stop_cut is not None else None
                                 ),
@@ -366,10 +447,14 @@ def evaluate_latent_math(
             capture_samples_per_problem=capture_samples_per_problem,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             compact_finished=compact_finished,
             compiled_tail_batch=compiled_tail_batch,
             pin_emit=pin_emit,
             prompt_suffix_ids=prompt_suffix_ids,
+            think_fence_ids=think_fence_ids,
+            answer_fence_ids=answer_fence_ids,
+            min_think_tokens=min_think_tokens,
         )
         metrics["compile_fallback"] = True
         return metrics
@@ -400,6 +485,8 @@ def evaluate_latent_math(
     metrics: dict[str, object] = {
         "evaluation_metric_schema": LATENT_EVAL_METRIC_SCHEMA,
         "accuracy": correct / max(total, 1),
+        "contract_accuracy": contract_correct / max(total, 1),
+        "structural_format_fraction": structurally_valid / max(total, 1),
         "policy_accuracy": policy_accuracy,
         "policy_samples": total,
         "samples": total,
@@ -408,6 +495,7 @@ def evaluate_latent_math(
         # evaluations over the same row panel can be compared with paired
         # per-prompt statistics instead of only aggregate accuracy.
         "prompt_correct_counts": list(prompt_correct),
+        "contract_prompt_correct_counts": list(prompt_contract_correct),
         "prompt_any_correct_fraction": sum(
             count > 0 for count in prompt_correct
         ) / max(len(prompt_correct), 1),
@@ -431,6 +519,9 @@ def evaluate_latent_math(
         "compiled": compiled_step_core is not None,
         "compile_fallback": False,
         "pin_emit": pin_emit,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "finished_compaction": (
             f"compiled_tail_b{compiled_tail_batch}"
             if compiled_step_core is not None and compiled_tail_batch is not None

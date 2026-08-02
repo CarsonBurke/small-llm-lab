@@ -106,10 +106,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # every actor-side optimizer state empty from the critic-warm checkpoint;
     # using the critic's 3e-4 rate also removes the prior hand-tuned split
     # between trunk, renderer, and combiner.
-    # 5e-5 is the empirically stable RL rate across the latent-VAPO runs;
-    # the old 3e-4 default (a pretraining-scale rate) caused behavior-KL
-    # spikes and policy collapse when a job omitted --learning-rate.
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    # 2e-5 is the lower-drift rate selected after round 5: 5e-5 drove the
+    # weak SFT policy from ~120 to ~47 think tokens within 100 actor updates
+    # and ultimately concentrated it on a cross-prompt response template.
+    # The old 3e-4 default (a pretraining-scale rate) was still more unstable.
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
     # Constant AdamW rate for the critic's non-Muon parameters. Keeping this
     # independently selectable avoids turning an actor-rate ablation into an
     # accidental critic-warmup ablation. None preserves the shared-rate
@@ -171,7 +172,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # symmetric and untruncated. Measured against the warmup target moments
     # (mean 0.0136, var 0.0068), KL(optimum || project(prior)) is 0.68 nats at
     # 0.0, 1.65 at 0.015 (the target MEAN), and 9.84 at the old 0.05 --
-    # which the near-frozen bias (AdamW at 5e-5) then takes ~1e3 steps to
+    # which the near-frozen bias (AdamW at 2e-5) then takes many steps to
     # unwind through head.weight alone.
     parser.add_argument("--value-prior", type=float, default=0.0)
     # Combined-embedding geometry (reasoning mode "latent"). The carry matrix
@@ -200,6 +201,69 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="maximum reward for a wrong, terminated numeric final answer",
+    )
+    # Requires a base checkpoint whose SFT stage trained the fence rows
+    # (sft_trace_train --think-tokens); enforced at startup. Gating ALL
+    # reward on a completed <think>...</think> makes the bare-guess policy
+    # (the 1024/1025 collapse attractor) worth zero even when correct.
+    parser.add_argument(
+        "--think-tokens",
+        action="store_true",
+        help="decode <think>/</think> as special tokens and gate math "
+        "reward on a well-formed, closed think fence",
+    )
+    # Round 3 (sft2_rl_think_gsm8k_4k) showed the 1-token floor collapses
+    # to a ~15-token minimal compliant skeleton: the fence survives but
+    # carries no compute. The floor mandates a sequential-compute budget
+    # inside the fence; reward is zero below it.
+    parser.add_argument(
+        "--think-min-tokens",
+        type=int,
+        default=1,
+        help="minimum token count inside the think fence for any reward "
+        "(only meaningful with --think-tokens)",
+    )
+    # Requires a base checkpoint whose SFT stage trained the answer fence
+    # rows (sft_trace_train --answer-fence); enforced at startup. With the
+    # answer a token-delimited span, the reward gate and extraction are
+    # purely structural on token ids — the decoded-text regex position
+    # check (and its case/spacing/boundary bypass class) is retired.
+    parser.add_argument(
+        "--answer-fence",
+        action="store_true",
+        help="decode <answer>/</answer> as special tokens; gate reward on "
+        "<think>...</think><answer>...</answer> structure and grade only "
+        "the fenced answer span (requires --think-tokens)",
+    )
+    # Round-4 postmortem (NOTES.md): over an all-zero-reward pool a stale
+    # critic leaves value predictions slightly positive, so every advantage
+    # is uniformly negative and the only coherent policy gradient is
+    # anti-termination — expected length ~1/p_stop explodes into an
+    # absorbing zero-reward desert. Such a pool carries no policy signal
+    # (any nonzero advantage in it is pure critic error), so the actor
+    # optimizer is skipped for its updates while the critic keeps stepping
+    # toward the zero targets that end the spiral.
+    parser.add_argument(
+        "--zero-reward-actor-freeze",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="skip actor optimizer steps for optimizer minibatches whose "
+        "every trajectory earned zero reward; the critic still updates so "
+        "value predictions catch down to the zero targets",
+    )
+    # A sustained all-zero streak is a dead run either way: frozen, the
+    # actor cannot recover; unfrozen, it is re-entering the round-4
+    # spiral. 8 pools = 8192 consecutive zero-reward trajectories at the
+    # default pool size — far beyond sampling noise for any policy with
+    # nontrivial success probability (the SFT base's ~2.7% gate accuracy
+    # makes even ONE all-zero 1024-trajectory pool a ~e^-28 event).
+    parser.add_argument(
+        "--zero-reward-stop-pools",
+        type=int,
+        default=8,
+        help="stop at the pool boundary (saving the final checkpoint) "
+        "after this many consecutive all-zero-reward rollout pools; "
+        "applies regardless of --zero-reward-actor-freeze; 0 disables",
     )
     # VAPO paper: 50 value-pretraining steps before policy updates.
     parser.add_argument("--value-warmup-steps", type=int, default=50)
@@ -633,6 +697,22 @@ def validate_args(
             "--nearby-reward-max must be finite, nonnegative, and below "
             "the exact-answer reward of 1"
         )
+    if args.think_tokens and args.reasoning_mode == "none":
+        # none mode teacher-forces "Answer:" and budgets only the answer
+        # value: no fence can ever be emitted, so every format-gated
+        # reward would be zero and the run trains on nothing.
+        parser.error(
+            "--think-tokens requires a reasoning mode that emits its own "
+            "reasoning; none-mode budgets only the answer value"
+        )
+    if args.think_min_tokens < 1:
+        parser.error("--think-min-tokens must be at least 1")
+    if args.think_min_tokens > 1 and not args.think_tokens:
+        parser.error("--think-min-tokens above 1 requires --think-tokens")
+    if args.answer_fence and not args.think_tokens:
+        parser.error("--answer-fence requires --think-tokens")
+    if args.zero_reward_stop_pools < 0:
+        parser.error("--zero-reward-stop-pools must be nonnegative")
     if args.replay_attention_budget < 1:
         parser.error("--replay-attention-budget must be positive")
     if args.replay_slot_budget < 1:

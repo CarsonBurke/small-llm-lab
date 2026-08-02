@@ -82,6 +82,12 @@ class LatentRolloutBatch:
     replay_layout_token: object = field(
         default_factory=object, repr=False, compare=False
     )
+    # Set by the math scorer when the think-fence gate ran: how many
+    # verifier-correct rows the gate zeroed. None means "no gated scoring
+    # happened", which diagnostics must distinguish from a healthy 0 — a
+    # dynamic-attribute stash would silently read 0 after any ``to()``
+    # rebuild, turning the alarm into a constant all-clear.
+    think_gate_zeroed_correct: int | None = None
 
     def to(
         self, device: torch.device, non_blocking: bool = False
@@ -336,6 +342,7 @@ def rollout_continuations(
     compact_dead_ratio: float = 0.25,
     decode_mask: DecodeRangeMask | None = None,
     tail_decode_mask: DecodeRangeMask | None = None,
+    top_k: int | None = None,
 ) -> LatentRolloutBatch:
     """Roll the hidden-carry token stream forward from a (batch, P) prompt.
 
@@ -386,6 +393,8 @@ def rollout_continuations(
 
     ``record_likelihoods=False`` skips rollout-time token likelihoods
     when the caller will immediately recompute them through parallel replay.
+    ``top_k`` optionally applies the authors' top-k filter before nucleus
+    sampling; None preserves the existing full-vocabulary sampling path.
     ``compact_finished`` removes completed rows and their KV cache entries at
     the existing 16-position synchronization points once at least 25% of the
     current rows have finished. With ``finished_batch_size``, compaction waits
@@ -1071,7 +1080,11 @@ def rollout_continuations(
         # RNG draw order (one token draw per step) is part of the execution
         # schema; every mode consumes it identically.
         token = top_p_sample(
-            output.logits, temperature, top_p, generator=generator
+            output.logits,
+            temperature,
+            top_p,
+            generator=generator,
+            top_k=top_k,
         )
         token_logprob = None
         if record_likelihoods:
@@ -1323,6 +1336,14 @@ def pack_rollout_groups_for_replay(
             # Packing creates a new logical layout; callers that deliberately
             # repack the same optimizer minibatch may replace this fresh token
             # before binding it to an existing plan.
+            continue
+        if field.name == "think_gate_zeroed_correct":
+            # Counts add across scored groups; one unscored group makes
+            # the combined count unknowable (None), never a fake 0.
+            counts = [group.think_gate_zeroed_correct for group in groups]
+            combined[field.name] = (
+                sum(counts) if all(c is not None for c in counts) else None
+            )
             continue
         values = [getattr(group, field.name) for group in groups]
         if not all(isinstance(value, Tensor) for value in values):
