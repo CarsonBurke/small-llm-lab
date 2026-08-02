@@ -106,10 +106,18 @@ def extract_final_answer(solution: str, window: int | None = 300) -> str | None:
 
 
 def verify_answer(
-    solution: str, ground_truth: str, style: str = "minerva"
+    solution: str,
+    ground_truth: str,
+    style: str = "minerva",
+    window: int | None = 300,
 ) -> tuple[bool, str]:
+    """``window`` bounds the tail searched for the ``Answer:`` field (the
+    DAPO contract's 300-char default). Callers that constructed
+    ``solution`` themselves — e.g. the fenced-answer reframe, which IS the
+    answer field — pass None so a long value cannot push its own prefix
+    out of the search window and silently grade [INVALID]."""
     if style == "minerva":
-        extracted = extract_final_answer(solution)
+        extracted = extract_final_answer(solution, window=window)
         prediction = normalize_final_answer(
             "[INVALID]" if extracted is None else extracted
         )
@@ -141,7 +149,7 @@ def verify_answer(
     if style == "aime":
         # AIME answers are integers in [0, 999]; standard graders reject any
         # response whose final answer does not parse as one.
-        extracted = extract_final_answer(solution)
+        extracted = extract_final_answer(solution, window=window)
         prediction = "[INVALID]" if extracted is None else extracted.strip()
         cleaned = prediction.rstrip(".").strip("$ ")
         try:
@@ -315,6 +323,17 @@ def deterministic_math_subset(rows: list[dict], max_rows: int) -> list[dict]:
     return [row for position, row in enumerate(rows) if position in selected]
 
 
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+ANSWER_OPEN = "<answer>"
+ANSWER_CLOSE = "</answer>"
+# The pretraining checkpoints pad the GPT-2 vocab (50257) to 50304 for
+# kernel efficiency, so rows 50257..50303 exist in both the embedding and
+# the readout but were never reachable — free real estate for new special
+# tokens with no re-pretraining and no architecture change.
+PRETRAIN_PADDED_VOCAB = 50304
+
+
 class GPT2BPETokenizer:
     """GPT-2 byte-level BPE behind the SentencePiece surface this stack uses.
 
@@ -323,17 +342,60 @@ class GPT2BPETokenizer:
     document-boundary cue and the only stop signal — so it plays the roles
     SentencePiece splits between BOS and EOS. ``decode`` skips special
     tokens so a terminal ``<|endoftext|>`` never leaks into answer parsing.
+
+    ``think_tokens=True`` registers ``<think>``/``</think>`` as dedicated
+    special tokens in the padded-vocab slack (ids 50257/50258). Two distinct
+    tokens rather than one parity fence: the close token's logit IS the
+    stop-thinking policy — directly measurable, biasable, and rewardable —
+    and a distinct pair cannot desync the think/output parse the way a
+    dropped toggle token would. ``decode`` skips them like every special
+    token, so answer parsing is unaffected.
+
+    ``answer_tokens=True`` additionally registers ``<answer>``/``</answer>``
+    (ids 50259/50260, the R1-Zero template's other half). With the answer a
+    token-delimited span rather than a decoded-text ``Answer:`` field, both
+    the reward gate and the verifier's extraction become purely structural
+    on token ids — the case/spacing/position bypass class of a regex over
+    decoded text cannot exist. Registration order is fixed (think pair
+    first) so ids are stable whether or not either flag is set.
     """
 
     EOT_ID = 50256
 
-    def __init__(self):
+    def __init__(self, think_tokens: bool = False, answer_tokens: bool = False):
         from transformers import GPT2TokenizerFast
 
         self._tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
         # Prompts are encoded in full and tail-truncated afterwards; the
         # 1024-token warning threshold is pretraining trivia here.
         self._tokenizer.model_max_length = 1 << 30
+        self.think_open_id: int | None = None
+        self.think_close_id: int | None = None
+        self.answer_open_id: int | None = None
+        self.answer_close_id: int | None = None
+        if answer_tokens and not think_tokens:
+            # The answer fence only exists to close a think span; ids also
+            # depend on the think pair registering first.
+            raise ValueError("answer_tokens requires think_tokens")
+        if think_tokens:
+            specials = [THINK_OPEN, THINK_CLOSE]
+            if answer_tokens:
+                specials += [ANSWER_OPEN, ANSWER_CLOSE]
+            self._tokenizer.add_special_tokens(
+                {"additional_special_tokens": specials}
+            )
+            ids = [
+                int(self._tokenizer.convert_tokens_to_ids(token))
+                for token in specials
+            ]
+            if max(ids) >= PRETRAIN_PADDED_VOCAB:
+                raise ValueError(
+                    "special tokens fell outside the padded pretraining "
+                    f"vocab: {ids} vs {PRETRAIN_PADDED_VOCAB}"
+                )
+            self.think_open_id, self.think_close_id = ids[0], ids[1]
+            if answer_tokens:
+                self.answer_open_id, self.answer_close_id = ids[2], ids[3]
 
     def encode(self, text: str) -> list[int]:
         return self._tokenizer.encode(text)
@@ -353,13 +415,162 @@ class GPT2BPETokenizer:
         return self._tokenizer.convert_ids_to_tokens(int(token_id))
 
 
-def load_posttraining_tokenizer(architecture: str, sp_model_path: str):
+def load_posttraining_tokenizer(
+    architecture: str,
+    sp_model_path: str,
+    think_tokens: bool = False,
+    answer_tokens: bool = False,
+):
     """The tokenizer family the checkpoint's pretraining data was built with."""
     if "gpt2vocab" in architecture:
-        return GPT2BPETokenizer()
+        return GPT2BPETokenizer(
+            think_tokens=think_tokens, answer_tokens=answer_tokens
+        )
+    if think_tokens or answer_tokens:
+        raise ValueError(
+            "think/answer tokens live in the GPT-2 padded-vocab slack; "
+            f"architecture {architecture!r} has no such rows"
+        )
     import sentencepiece as spm
 
     return spm.SentencePieceProcessor(model_file=sp_model_path)
+
+
+def single_fence_span(
+    tokens, fence_ids: tuple[int, int]
+) -> tuple[int, int] | None:
+    """``(open_index, close_index)`` of exactly one well-ordered fence pair.
+
+    None means the fence structure is broken — missing, duplicated, or
+    reversed fences — so no span exists. Structural gates and extraction
+    both key off this single definition; anything looser reopens a
+    duplicated-fence ambiguity about which span is "the" span.
+    """
+    open_id, close_id = fence_ids
+    opens = [index for index, token in enumerate(tokens) if token == open_id]
+    closes = [index for index, token in enumerate(tokens) if token == close_id]
+    if len(opens) != 1 or len(closes) != 1 or closes[0] < opens[0]:
+        return None
+    return opens[0], closes[0]
+
+
+def structural_format_ok(
+    tokens,
+    think_fence_ids: tuple[int, int],
+    answer_fence_ids: tuple[int, int],
+    min_think_tokens: int = 1,
+) -> bool:
+    """Require one anchored, ordered think/answer pair before terminal EOS."""
+    if len(tokens) < 2:
+        return False
+    think_span = single_fence_span(tokens, think_fence_ids)
+    if think_span is None:
+        return False
+    think_open, think_close = think_span
+    if think_open != 0:
+        return False
+    if think_close - think_open - 1 < max(min_think_tokens, 1):
+        return False
+    answer_span = single_fence_span(tokens, answer_fence_ids)
+    if answer_span is None:
+        return False
+    answer_open, answer_close = answer_span
+    return (
+        think_close < answer_open
+        and answer_close - answer_open >= 2
+        and answer_close == len(tokens) - 2
+    )
+
+
+def fenced_answer_text(
+    tokens, tokenizer, answer_fence_ids: tuple[int, int]
+) -> str | None:
+    """Decoded inner text of the single non-empty ``<answer>`` span.
+
+    None when the fence structure is broken or the span is empty. The
+    returned text is the ONLY thing the verifier grades for a fenced
+    policy — everything outside the span is structurally ungraded, which
+    is what deletes the decoded-text position-check bypass class.
+    """
+    span = single_fence_span(tokens, answer_fence_ids)
+    if span is None:
+        return None
+    open_index, close_index = span
+    if close_index - open_index < 2:
+        return None
+    return tokenizer.decode(list(tokens[open_index + 1:close_index]))
+
+
+def special_token_roles(tokenizer) -> dict[int, str]:
+    """Special token ids the display layer keeps visible, keyed by role.
+
+    Duck-typed over both tokenizer families: fence ids are optional
+    attributes (only ``GPT2BPETokenizer`` registers them), BOS/EOS come
+    from the SentencePiece-surface methods every family exposes. A shared
+    BOS/EOS id (GPT-2's ``<|endoftext|>``) reports as "eos" — terminal is
+    the role a token stream renderer cares about.
+    """
+    roles: dict[int, str] = {}
+    eos = int(tokenizer.eos_id())
+    if eos >= 0:
+        roles[eos] = "eos"
+    bos = int(tokenizer.bos_id())
+    if bos >= 0:
+        roles.setdefault(bos, "bos")
+    for attribute, role in (
+        ("think_open_id", "think_open"),
+        ("think_close_id", "think_close"),
+        ("answer_open_id", "answer_open"),
+        ("answer_close_id", "answer_close"),
+    ):
+        token_id = getattr(tokenizer, attribute, None)
+        if token_id is not None:
+            roles[int(token_id)] = role
+    return roles
+
+
+def emitted_display_segments(
+    tokens, tokenizer, kind: str = "text"
+) -> list[dict[str, object]]:
+    """Lossless display decomposition of a token stream.
+
+    ``decode`` strips special tokens so grading never sees fence markup,
+    but that same stripping blinds human-facing reports to the exact
+    structure the reward gates on. This splits on special token IDS —
+    never by matching decoded text, which model output could fake — into
+    plain-text runs (``kind`` as given, e.g. "prefix" for teacher-forced
+    prompt-suffix tokens) and ``"special"`` markers carrying the token's
+    role and printable piece, so a renderer can show both faithfully.
+    """
+    roles = special_token_roles(tokenizer)
+    segments: list[dict[str, object]] = []
+    run: list[int] = []
+
+    def flush() -> None:
+        if run:
+            segments.append({"kind": kind, "text": tokenizer.decode(list(run))})
+            run.clear()
+
+    for token in tokens:
+        token = int(token)
+        if token in roles:
+            flush()
+            segments.append(
+                {
+                    "kind": "special",
+                    "role": roles[token],
+                    "text": tokenizer.id_to_piece(token),
+                    "token_id": token,
+                    # Special markers keep their provenance too, so a
+                    # teacher-forced fence or BOS in the prompt suffix can
+                    # never render as model-emitted.
+                    "source": kind,
+                }
+            )
+        else:
+            run.append(token)
+    flush()
+    return segments
 
 
 def encode_prompt(tokenizer, text: str, max_tokens: int | None = None) -> list[int]:
@@ -561,6 +772,7 @@ def top_p_sample(
     top_p: float,
     *,
     generator: torch.Generator | None = None,
+    top_k: int | None = None,
 ) -> Tensor:
     logits = logits.float()
     if temperature != 1.0:
@@ -569,14 +781,22 @@ def top_p_sample(
         # a (rows, 50304) fp32 tensor at every rollout step of the training
         # configuration, which samples at temperature 1.0.
         logits = logits / temperature
+    top_indices = None
+    if top_k is not None and 0 < top_k < logits.size(-1):
+        logits, top_indices = logits.topk(top_k, dim=-1)
     if top_p >= 1.0:
         # Nucleus truncation is a no-op at top_p >= 1 (cumsum - probs never
         # exceeds 1), and the same distribution needs no full-vocab sort —
         # which otherwise runs at EVERY rollout step of the top-p-1 training
         # configuration.
-        return torch.multinomial(
+        sampled = torch.multinomial(
             logits.softmax(dim=-1), 1, generator=generator
         ).squeeze(-1)
+        return (
+            sampled
+            if top_indices is None
+            else top_indices.gather(-1, sampled[:, None]).squeeze(-1)
+        )
     sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
     probs = sorted_logits.softmax(dim=-1)
     remove = probs.cumsum(dim=-1) - probs > top_p
@@ -584,7 +804,12 @@ def top_p_sample(
     sampled = torch.multinomial(
         sorted_logits.softmax(dim=-1), 1, generator=generator
     )
-    return sorted_indices.gather(-1, sampled).squeeze(-1)
+    sampled = sorted_indices.gather(-1, sampled).squeeze(-1)
+    return (
+        sampled
+        if top_indices is None
+        else top_indices.gather(-1, sampled[:, None]).squeeze(-1)
+    )
 
 
 @dataclass
