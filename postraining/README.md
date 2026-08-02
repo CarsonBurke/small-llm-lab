@@ -1,13 +1,23 @@
 # Post-training
 
-No base checkpoint is currently selected. The old 6-layer dense
-`mathmix_v4` checkpoint was superseded because its four-source corpus was
-narrow, its 2,000-step run was too short, and it did not provide KDA's
-long-context memory scaling.
+The historical round-5 base is
+`postraining/runs/sft_v3_answer_hfonly/sft_final_model.pt` (the three-epoch
+round-5 trace-SFT run selected by its sampling gate in `NOTES.md`). The
+underlying pretrained checkpoint is
+`logs/k3_quality_20k_ctx8k_final_model.pt`: the measured `KKKDKKKD` KDA
+skeleton trained through the 2K -> 4K -> 8K context curriculum. The selected
+SFT checkpoint retains that architecture/context metadata and records its
+trained `<think>`/`<answer>` tokenizer contract. It predates the canonical
+single-prompt schema and is valid only for already-running legacy-schema
+jobs. The selected canonical replacement is the three-epoch checkpoint at
+`postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt`;
+prompt-schema guards deliberately reject the old checkpoint under the current
+code. Its matched two-epoch arm had materially weaker sampling-gate results.
 
-The replacement campaign uses the measured `KKKDKKKD` KDA skeleton, the
-four-domain `k3mix_v5` corpus, and a measured 2K -> 4K -> 8K context
-curriculum. A new `postraining/base_model.json` should be written only after:
+The older 6-layer dense `mathmix_v4` checkpoint was superseded because its
+four-source corpus was narrow, its 2,000-step run was too short, and it did
+not provide KDA's long-context memory scaling. Selection of any replacement
+base still requires:
 
 1. the 2,000-step data/architecture gates complete;
 2. the winning KDA recipe completes the 8,000-step curriculum;
@@ -41,9 +51,11 @@ mlq submit \
   --max-parallel-runs 1 \
   -- \
   python3 -m postraining.train_latent_vapo \
-    --checkpoint logs/SELECTED_K3_BASE_final_model.pt \
+    --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
     --output postraining/runs/posttrain_base_gate \
     --reasoning-mode cot \
+    --think-tokens \
+    --answer-fence \
     --rollout-groups 4 \
     --rollout-only
 ```
@@ -57,11 +69,28 @@ mlq submit \
   --max-parallel-runs 1 \
   -- \
   python3 -m postraining.train_latent_vapo \
-    --checkpoint logs/SELECTED_K3_BASE_final_model.pt \
+    --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
     --output postraining/runs/posttrain_cot \
     --reasoning-mode cot \
+    --think-tokens \
+    --answer-fence \
     --steps 2000
 ```
+
+With `--answer-fence`, every math family is canonicalized to the same episode
+prompt before SFT, RL, or evaluation:
+
+```text
+{bare problem}
+
+Start your response with <think> and reason until </think>, then end it with only the final answer inside <answer></answer>.
+```
+
+DAPO, DeepMind, AIME, and GSM8K source wrappers are removed rather than
+rewritten one-for-one, so duplicated legacy `Answer:` reminders cannot create
+duplicated fence contracts. The prompt schema is recorded in SFT and RL
+checkpoints and enforced on initialization and exact resume; regenerate the
+canonical SFT corpus and retrain SFT when this schema changes.
 
 ## Latent thinking: deterministic hidden carry
 
@@ -108,3 +137,89 @@ pretraining val_bpb (the init gate) need `--bpb-val-tokens 2097152`.
 TensorBoard events, and exact-resume checkpoints beneath the output directory.
 The base checkpoint file is never overwritten; the trainable actor copy and
 the separate critic state live in the run directory.
+
+## On-policy self-distillation (OPSD)
+
+`train_opsd` is an additional post-training method; it does not change the
+SFT or latent-VAPO objectives or checkpoints. It implements
+[Self-Distilled Reasoner](https://arxiv.org/abs/2601.18734v3) with:
+
+- one on-policy response sampled from the question-conditioned student;
+- the same initialization checkpoint as a frozen step-0 teacher, conditioned
+  on the verified reference solution and the student's response prefix;
+- full-vocabulary forward KL at every response position;
+- pointwise clipping of each vocabulary entry's KL contribution before the
+  vocabulary sum; and
+- gradients through student logits only.
+
+The paper's main 100-step configuration is the CLI default: effective batch
+32, 1024 completion tokens, temperature 1.1, top-p 0.95, top-k 20, AdamW at
+5e-6, gradient norm 0.1, and pointwise clip 0.05. The selected SFT base's
+think/answer fence settings and source trace parquet are inferred from its
+checkpoint provenance. Recurrent rollout decoding uses the same dynamic
+compiled step as the current VAPO production path by default; the eager path
+remains available as `--no-rollout-compile` for compiler diagnosis.
+
+The paper's main Qwen experiments additionally pair a thinking-mode-off
+student with a thinking-mode-on teacher. This KDA backbone has no Qwen-style
+chat-template mode switch, and the selected SFT checkpoint was explicitly
+trained to emit a structural `<think>` span. OPSD therefore preserves that
+checkpoint contract instead of giving the student a contradictory format
+instruction; only the privileged teacher receives the paper's independent
+reasoning transition. Starting from the pretrained checkpoint uses the
+non-fenced student prompt. Loss reduction follows paper Algorithm 1 exactly:
+mean over each response's tokens, then mean over examples (the authors'
+released trainer flattens valid tokens into a global mean when lengths vary).
+
+Static validation can be run without CUDA:
+
+```bash
+CUDA_VISIBLE_DEVICES='' .venv/bin/python -m postraining.train_opsd \
+  --name opsd_v1 \
+  --validate-only
+```
+
+For DAPO, build the deduplicated answer-privilege data and run the frozen
+teacher-uplift gate before authorizing any OPSD updates:
+
+```bash
+.venv/bin/python -m postraining.opsd.prepare_dapo \
+  --sft-corpus postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet
+
+mlq submit \
+  --name opsd_dapo_teacher_uplift_v1 \
+  --cwd "$PWD" \
+  --max-parallel-runs 1 \
+  -- \
+  .venv/bin/python -m postraining.opsd.teacher_uplift \
+    --name opsd_dapo_teacher_uplift_v1 \
+    --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt
+```
+
+The DAPO parquet contains final answers rather than worked reference traces,
+so its teacher prompt explicitly describes privileged final-answer
+information. A deterministic answer-derangement arm controls for generic
+self-distillation and prompt/style effects.
+
+Training is a model workload and must go through `mlq`:
+
+```bash
+mlq submit \
+  --name opsd_v1 \
+  --cwd "$PWD" \
+  --max-parallel-runs 1 \
+  -- \
+  .venv/bin/python -m postraining.train_opsd \
+    --name opsd_v1 \
+    --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
+    --dataset postraining/data/opsd_dapo17k_train.parquet \
+    --reference-column solution \
+    --data-manifest postraining/data/opsd_dapo17k.manifest.json
+```
+
+The run writes versioned step exports, an exact-resume
+`opsd_checkpoint.pt`, the load-model-compatible `opsd_final_model.pt`,
+canonical `metrics.jsonl`, sampled `generations.jsonl`, a manifest, and a
+source snapshot beneath `postraining/runs/<name>/`. An OPSD export preserves
+the input checkpoint's nested `sft` metadata, so it can initialize the current
+VAPO trainer with the same fence-token reconstruction and provenance gates.

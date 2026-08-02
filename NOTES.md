@@ -2802,3 +2802,1278 @@ AIME: 0/480 (full and no_content); token_only 1/480. Degenerate
 brevity actively removes any chance (the rambling token_only arm was the
 only one to score). Root problem is the entropy/mode collapse plus
 partial-credit-dominated reward, not the carry mechanism.
+
+## SFT-from-modern-traces stage (v29 restart plan)
+
+Decision after the carry ablation + R1-Zero analysis: the base policy has
+no samplable multi-step reasoning repertoire, so RL-from-base starves
+(mode collapse, ~zero within-group variance). Instill the repertoire by
+teacher-forced SFT on modern-teacher traces, then restart RL from the
+SFT checkpoint. Teacher constraint (operator): modern models only (Claude
+Opus 4.6/4.7-era); NO R1-family corpora, NO Sonnet 4.6.
+
+### Corpus: postraining/data/sft_traces_v1.parquet
+
+Built by postraining/prepare_sft_traces.py from three HF community sets
+downloaded to postraining/data/modern_traces/. GSM8K-provenance sources
+verified by matching normalized problem text (160-char key) to GSM8K
+canonical answers AND requiring the trace to numerically reach the truth;
+final answer forced to ground truth. Exact-duplicate documents dropped in
+the prep pass.
+
+- 14,029 documents, 13,985 verified (44 unverified opus4647 kept flagged)
+- opus46_10k 7,187 / opus46_ti9k 6,798 / opus4647_8k7 44 (that source is
+  2/3 exact duplicates; 132 pre-dedup)
+- ~7,400 unique problems, ~6,600 with 2+ stylistically distinct traces
+  (useful for sampling diversity); doc tokens p50 167 / p90 433 / max
+  3058, 3.2M total
+- Known gap: corpus is GSM8K difficulty; RL trains on DAPO competition
+  difficulty. API self-distillation over DAPO-17k is flagged as a pending
+  operator decision (costs real money).
+
+### Trainer: postraining/sft_trace_train.py
+
+RL-exact framing (encode_prompt prompt + separately encoded completion),
+whole-document packing into 4096-token rows with single-50256 boundaries
+(pretraining convention) and a trained stop target per document; loss on
+completions only (~2.1M supervised tokens/epoch, 66% of row tokens).
+Pretraining optimizer geometry (Muon matrices + AdamW groups) scaled by
+--lr-scale (default 0.1), wd 0, linear warmup+decay. Holdout split by
+normalized problem identity (256 problems, 485 docs, no variant leakage).
+Success gate = sampling diversity at temp 1.0 / top-p 1.0 through
+evaluate_latent_math with pin_emit=True (pure token policy): accuracy,
+mixed-prompt fraction, within-group reward std, on the held-out panel.
+3 epochs = 291 steps at 8x4096 tokens/step. Checkpoint saved in
+load_model payload shape so the RL trainer can init from it directly.
+
+### SFT trainer review + submission (job 1023)
+
+Red-team review (subagent) found one blocker and two calibration issues,
+all fixed pre-submission:
+- OOM (high): 4x4096 full-vocab grad-enabled logits = 2x the slot budget
+  the replay path OOM'd at on this card. Fixed twice over: readout now
+  gathers supervised positions only (exact — the readout is positionwise;
+  cuts vocab memory 34%) and defaults moved to 2 rows x 4 accum (identical
+  update: loss is normalized by the step-wide supervised count).
+- Muon geometry (medium): postraining Muon (Polar Express, no rectangular
+  scale) realizes a 2-4x smaller trunk step than nominal; the Muon rate now
+  carries POLAR_EXPRESS_STEP_COMPENSATION (1.45) and warms momentum
+  0.85->0.95 over 500 steps as pretraining did. Without this an --lr-scale
+  ablation would mis-attribute its result.
+- Gate contamination (medium-low): 512 gate tokens truncate ~5% of
+  reference-length solutions; truncation registers as "mixed" groups —
+  the exact pass signal. Default now 768 (panel max 674).
+Clean: packing off-by-ones (verified targets==tokens[i+1] over real rows),
+eval call, optimizer partition (65 params exact), split leakage (160-char
+key injective over GSM8K), checkpoint round-trip, tb_watcher schema.
+
+Submitted: job 1023 sft_traces_v1 (queued behind 1015 + KDA chain).
+Gate readout = accuracy / mixed-prompt fraction / within-group reward std
+at temp 1.0 top-p 1.0, avg@8 over 128 held-out problems. If samples skew
+degenerate-short, queue a --min-completion-tokens 30 arm (34% of the
+opus46_10k source is <30 completion tokens).
+
+## KDA chain results (jobs 1012-1018, post-1015)
+
+- 1012 kda_paged_parity: ALL BOUNDS PASSED. Notables: fp32_paged_vs_dense
+  1.4e-4 (bound 2e-3), fp32_compiled_paged_vs_eager 6.0e-7 (bound 2e-3 —
+  compile is numerically exact), bf16_decode_vs_dense 1.6e-2 (bound 0.5),
+  leftpad state 4.0e-4 (bound 1e-3, tightest margin at 2.5x).
+- 1016 dynamic_rows_gate: PASSED. 60 steps from base, exit 0, checkpoint
+  written, step ~0.45s, val_bpb 1.2226 at step 0 (base readiness, 8192-token
+  subsample). Fresh base policy within-group reward std 0.022 (vs 0.003 at
+  1015's collapsed end — the base has usable variance the RL run destroyed).
+- 1013 kda_sched_ab_lockstep: PASSED (3/3 repeats). Warm collect ~7.0s per
+  1024-trajectory rollout (~93k useful actions/s; repeat 0 cold at 45.5s =
+  compile), decode utilization 0.61-0.64, peak VRAM ~6.0GB, stream 1188-1200.
+  Awaiting 1014 (continuous arm) for the A/B; 1017 backfilled ahead of it.
+- 1017 graph_decode_ab_off (continuous_refill, graphs off, mathmix base):
+  PASSED 3/3. Warm collect 6.7-7.4s, ~71-75k useful actions/s, decode
+  utilization 0.87, peak VRAM 12.7GB. Verdict vs 1018 (graphs on) pending.
+- 1014 kda_sched_ab_continuous: PASSED 3/3. Warm collect 7.9-9.0s (~72-80k
+  useful actions/s), decode utilization 0.89-0.90, peak VRAM 9.3GB, cold
+  start 268s (vs lockstep's 45.5s).
+- SCHEDULER A/B VERDICT (1013 vs 1014, k3 base, 1024-trajectory rollout
+  gates): lockstep is 15-25% faster end-to-end (93k vs 72-80k useful
+  actions/s) and uses 35% less VRAM (6.0 vs 9.3GB) despite lower decode
+  utilization (0.62 vs 0.90) — continuous refill's admission machinery and
+  6x worse compile cold-start eat its utilization advantage at this
+  scale. Keep lockstep as the default for k3-base training; revisit only
+  if trajectory lengths get long/ragged enough to starve lockstep chunks.
+- 1018 graph_decode_ab_on: PASSED 3/3. Warm collect 6.4-6.8s (~78k useful
+  actions/s), utilization 0.87-0.88, peak VRAM 21.7GB.
+- GRAPH-DECODE A/B VERDICT (1017 vs 1018, mathmix base, continuous
+  scheduler): graphs on buys only ~5-9% throughput (78k vs 71-75k ua/s)
+  for +9GB VRAM (21.7 vs 12.7). Not worth it — training needs that
+  headroom (1015 training alone peaked 8.5GB). Keep graph decode OFF.
+
+### SFT run progress (job 1023)
+
+Started cleanly: 13,500 train / 485 held-out docs, 291 steps. Holdout
+completion CE: 1.5695 (step 0) -> 1.0180 (25) -> 0.8986 (50).
+
+### SFT results (job 1023) — GATE PASSED on diversity
+
+Holdout completion CE 1.5695 -> 0.7969 over 291 steps. Sampling gate
+(avg@8, temp 1.0, top-p 1.0, 128 held-out problems):
+- accuracy 0.0166 (vs 1015 bench 0.013-0.019 at top-p 0.7)
+- mixed-prompt fraction 0.125 (16/128) — 10x the collapsed RL run's ~1%
+- within-group reward std 0.042 (vs 0.003-0.006 collapsed)
+- all-wrong 112/128, all-correct 0; emitted mean 251 tokens (p95 667)
+Transcripts: both teacher styles sampled on the SAME prompt (terse
+one-liner AND structured numbered derivation, including correct ones);
+termination clean; failures are arithmetic/comprehension (64M model),
+not format. RL restart now has GRPO signal on ~12.5% of prompts.
+
+Next: sft_rl_probe_4k — RL from the SFT checkpoint, 4000 steps, watching
+whether reward climbs and mixed fraction SUSTAINS (vs from-base collapse).
+
+### Think-token pipeline (operator directive, for future runs)
+
+Directive: add think tokens to the vocab (no re-pretraining), stop
+stripping them from traces. Implemented:
+- Free vocab slack: pretraining pads GPT-2's 50257 to 50304, so rows
+  50257-50303 exist untrained in embed+readout. <think>=50257,
+  </think>=50258 — zero architecture change (~0 bytes of budget).
+- TWO distinct tokens, not one parity fence: the </think> logit is the
+  stop-thinking policy (directly measurable/biasable/rewardable — the
+  carry ablation showed termination is THE high-leverage action), and a
+  pair can't desync the parse. <think> opens every completion; only
+  </think> is a load-bearing generated action.
+- core.GPT2BPETokenizer(think_tokens=True) registers the pair (opt-in,
+  default unchanged for the running stack).
+- prepare_sft_traces --think-tags -> sft_traces_v2_think.parquet (built:
+  same 14,029 docs / 13,985 verified, +4 tokens/doc, Answer: line stays
+  OUTSIDE the fence so grading starts where thinking ends).
+- sft_trace_train --think-tokens: registers the pair and zeroes the two
+  readout rows (anti-trained during pretraining: never a CE target, only
+  softmax-denominator pressure). Embedding rows keep pretrained init
+  (RMS-normalized on input anyway).
+Next SFT round should use: --traces postraining/data/sft_traces_v2_think.parquet --think-tokens
+
+### RL probe 1024 diagnosis (mid-run) + fix arms 1025/1026
+
+Operator observation confirmed in metrics: exact accuracy CLIMBS (0.012 ->
+0.06-0.12 on training rollouts — RL is learning 3-6x faster from the SFT
+base) but diversity drains fast (wg reward std 0.044 -> ~0.015-0.02) and
+answers re-shorten. Cause is the same as 1015's post-mortem, now moving
+faster because gradients are stronger: 87-97% of reward mass is PARTIAL
+credit (nearby_reward_max 0.1 dense component), which is optimizable by
+fast answer-guessing without reasoning — RL amplifies the terse SFT style.
+No token-entropy knob exists in the trainer, and none is wanted: fix the
+objective, not the symptom.
+
+Fix arms (single-change ablations, queued behind 1024's finish):
+- 1025 sft_rl_binary_4k: --nearby-reward-max 0 (binary exact reward,
+  R1-style). Isolates partial credit as the collapse driver.
+- 1026 sft_rl_binary_gsm8k_4k: binary AND --math-data
+  postraining/data/gsm8k_rl_prompts.parquet (7,217 GSM8K train prompts in
+  the SFT episode framing, SFT-holdout excluded — built by
+  prepare_gsm8k_rl_prompts.py). Matches the prompt distribution to the
+  band where exact success actually varies (the SFT gate's 12.5% mixed),
+  so binary reward has within-group signal.
+Readout: does wg std SUSTAIN while exact accuracy climbs; emitted length
+should stay in the reasoning regime (100-400 tokens), not re-pin at ~20.
+
+## 2026-07-31: 1024 sft_rl_probe_4k final — baseline arm numbers
+
+Job succeeded at 4000 steps. This run IS the baseline arm for the
+1025/1026 comparison. Full collapse trajectory, quantified:
+
+- Emitted length (actions_per_trajectory, training rollouts):
+  391 (step 4, the SFT policy) -> 13 (step 404) -> 8.1 (step 804) ->
+  pinned at ~8 for the remaining 3200 steps. Collapse is complete in
+  under 800 steps and never recovers.
+- Partial reward fraction: 0.88-0.99 throughout — reward mass is almost
+  entirely the dense nearby component, confirming the diagnosis.
+- Exact accuracy (rollouts): noisy 0.01-0.12 band, no sustained trend
+  once length pins; final 0.078.
+- Within-group reward std: 0.044 (start) -> 0.011-0.020 (mid) -> 0.001
+  at step 4000; exact-reward wg std literally 0.0 at the end (every
+  group fully agrees -> zero GRPO-style signal).
+- Bench avg@1152: 0.007 (step 0) -> peak 0.031 (step 2500) -> DECLINING
+  tail 0.0295 (3500) -> 0.0252 (3752) -> 0.0234 (4000). AIME 0.0000
+  throughout. Bench emitted mean re-pins from 399 tokens at step 0 to
+  ~8 by step 1000.
+- Net vs 1015 (RL from pretrained base): bench roughly doubled
+  (1.3-1.9% -> 2.3-3.1% band), so the SFT base is worth keeping, but
+  the partial-credit objective still eats the reasoning style within
+  ~800 steps.
+
+Pass bar for 1025/1026 stays as pre-registered above; the sharpest
+single signal is actions_per_trajectory at steps 400-1000 (baseline:
+13 -> 8).
+
+## 2026-07-31: 1025 refutes binary reward as the fix; round 3 design
+
+1025 (binary exact reward, DAPO prompts) at step 1100 of 4000:
+- Collapse happened ANYWAY, faster: 382 tokens -> 15.8 by step 112,
+  pinned ~5-8 by step 436. Partial credit was an accelerant, not the
+  root cause.
+- The decisive number: at ~5 emitted tokens exact acc reached 0.081;
+  at 382 tokens (the SFT reasoning style) it was 0.015. At temp 1.0
+  the policy's own long reasoning DERAILS more than it helps —
+  terse guessing is genuinely reward-optimal, so any pure-accuracy
+  objective will prune reasoning. RL is working; the objective is
+  mis-specified for what we want.
+- Then destabilized: step ~1084 length blew up to 519 -> 777, bench
+  acc 0.0 with emitted mean 917 and ended_fraction 0.11 (policy
+  stopped terminating). Cancelled 1025 at 1100; cancelled 1026
+  (same v1 base, superseded).
+
+Root causes now on the SFT side too: sft_traces_v1 contains a strong
+terse mode (opus46_10k half, p50 36 completion tokens, 34% < 30) —
+RL collapses INTO a mode SFT deliberately taught. And nothing marks
+thinking as structurally distinct, so there is no way to reward its
+presence (operator: "isn't thinking").
+
+Round 3 (queued):
+- 1027 sft_think_v2: SFT on sft_traces_v2_think.parquet with
+  --think-tokens (fence rows 50257/50258 registered + trained) and
+  --min-completion-tokens 30 (drops the degenerate-terse tail; the
+  attractor is removed from the base policy, holdout CE still
+  measured on the unfiltered corpus distribution).
+- 1028 sft2_rl_think_gsm8k_4k: RL from that base with binary reward
+  (--nearby-reward-max 0), GSM8K prompts (distribution matching,
+  kept from the 1026 design), and NEW --think-tokens reward gating:
+  score_math_rollout now zeroes ALL reward unless the emitted stream
+  contains exactly one <think> then one </think> before the stop
+  token. The bare-guess attractor is worth 0 even when correct, so
+  the reward-optimal policy must keep the thinking channel; what it
+  does inside the fence is then shaped by accuracy alone.
+- Trainer support added: --think-tokens flag (vapo/config.py),
+  tokenizer plumbed via load_posttraining_tokenizer(think_tokens=),
+  startup check that the base checkpoint's SFT metadata has
+  think_tokens=True (else zero-reward run), think_format_fraction
+  rollout telemetry, think_format_ok gating in score_math_rollout.
+  Tests: test_latent_rollout.py (fence gating, diagnostics fraction,
+  tokenizer loader).
+
+1027 sft_think_v2 gate (2026-07-31): PASSED. accuracy 0.0146 (v1
+0.0166), mixed 10.9% (v1 12.5%), wg std 0.037 (v1 0.042), holdout CE
+0.782 (v1 0.797), emitted mean 276 / p95 768 (at the cap — fence
+overhead + terse filter lengthen completions; a few truncations).
+Fence compliance from gate_transcripts token ids: 61/64 well-formed
+(<think> then </think> before stop), 64/64 opened; the 3 failures are
+budget truncations. The RL format gate therefore starts ~95%
+satisfied — no zero-reward desert.
+
+Red-team review of the think-gate diff (findings, all fixed):
+- HIGH: think_format_ok accepted an EMPTY <think></think> and a fence
+  emitted AFTER the answer — the bare-guess attractor survived at a
+  2-token cost. Now: exactly one open+close, >=1 token between them,
+  and no "Answer:" field decoded before the close.
+- MED: --think-tokens + --reasoning-mode none would silently zero all
+  reward (none mode budgets only the answer) — parser error now.
+- MED: --resume / --actor-critic-init could flip --think-tokens and
+  keep a critic fit to the other return distribution — both refused.
+- LOW: think-SFT base run WITHOUT --think-tokens silently dropped
+  fence ids in decode — loud startup warning (legit as ablation).
+- LOW: think_format_fraction never reached TensorBoard — whitelisted,
+  plus new think_gate_zeroed_correct_fraction (verifier-correct rows
+  the gate zeroed; scorer stashes the count on the batch) to tell a
+  signal-destroying gate from a worsening policy.
+- Provenance guard moved to checkpoint load (fails in seconds), and
+  the RL manifest now records the SFT lineage.
+
+## 2026-07-31: 1028 crash — step-0 bench eval NaN (compile-dependent)
+
+1028 died at bench_eval(0): torch.multinomial device assert
+"probability tensor contains inf/nan". Investigation (scratchpad
+repro_bench_nan.py, jobs 1029-1036):
+- Checkpoint weights all finite; fence embed rows ~24 norm (near
+  init), readout fence rows ~1.2, untrained band ~35 (anti-trained).
+- Think tokenizer encodes all 144 bench prompts byte-identically to
+  the plain tokenizer; no prompt contains a fence string.
+- EAGER full bench eval passes on BOTH v2 (acc 0.0122, emitted 422)
+  and v1 (acc 0.0113, emitted 402) checkpoints under the exact
+  trainer eval parameters (samples 8, 1024/1024, top_p 0.7, seed
+  1337, tail batch 16). The only remaining delta vs the trainer is
+  the compiled step core (max-autotune-no-cudagraphs, dynamic=True).
+- COMPILED full bench eval ALSO passes on both checkpoints in
+  isolation (1035 v2: acc 0.0087, emitted 432; 1036 v1: acc 0.0069,
+  emitted 394). All four {v1,v2} x {eager,compiled} arms are clean.
+Remaining un-reproduced delta: in-process history — in 1028 the same
+dynamic compiled artifact specialized on AIME shapes and made its
+max-autotune benchmark choices before bench ran; autotune picks are
+benchmark-noise-dependent. Operator directive: eager eval is NOT
+acceptable (maximum performance) — fix at the compile level, never
+by degrading eval.
+- 1037 (identical rerun): NaN RECURRED at the same site (bench after
+  AIME passes) — deterministic in the trainer, so not an autotune
+  lottery.
+- 1038 (exact-state repro: AIME 960 rollouts then bench through ONE
+  shared compiled artifact, trainer parity on requires_grad/eval):
+  STILL PASSES. Eval sequence alone is not sufficient.
+- Realization: every repro ran under CUDA_LAUNCH_BLOCKING=1 (set for
+  stack fidelity); the trainer runs without it. If this is a launch-
+  order RACE (async kernel reading a buffer mid-write), blocking
+  hides it — explaining every pass/fail split observed so far.
+- Race test results: 1039 (repro, aime-first, compiled, NO launch
+  blocking) passes. 1040 (THE TRAINER, identical failing config,
+  WITH launch blocking, 60 diag steps) PASSES step-0 bench (0.0078)
+  and completes — the deterministic crash disappears under
+  serialized launches. RACE CONFIRMED: an async launch-order hazard
+  in the compiled eval path; the assert's reported stack (scatter at
+  latent_rollout.py:1110) is a sync point, not the source — the bad
+  values reach torch.multinomial's probs, i.e. NaN logits out of the
+  step path at execution time.
+- v2-sensitivity note: same trainer+kernels pass AIME (960 traj,
+  chunk 32) and crash only in bench (144x8, chunk 8, different
+  compaction/tail geometry), and only with the v2 checkpoint —
+  consistent with a narrow timing window that generation/termination
+  patterns steer into.
+- Standalone repro escalation, ALL PASS (no NaN): 1041 full step-0
+  sequence (BPB guard fwd + AIME + bench, shared artifact, no CLB;
+  bpb 1.4566 matches trainer bit-for-bit); 1042 + transcript capture
+  (the last call-level delta); 1043 + TF32/matmul-precision parity
+  (this DID change kernels — aime 0.0000->0.0010, emitted 401->428 —
+  the earlier repros were exercising different compiled code, now
+  matched). Standalone reproduction exhausted.
+- Bisection moved INTO the trainer (deterministic 2/2 crash there),
+  60-step no-CLB diag runs: 1044 --aime-every 0 (does the crash need
+  AIME-first?), 1045 --bench-max-rows 32 (small-bench crash would
+  give a fast platform for compute-sanitizer initcheck/racecheck).
+  Trainer-only ingredients left: resident critic+optimizers
+  (allocator layout), TensorBoard writer thread, profiler artifact
+  wrapper/CUDA-event phases, logger.
+- Trainer bisection results: 1044 (--aime-every 0) PASSES bench
+  (0.0095); 1045 (--bench-max-rows 32, with AIME) PASSES (0.0117).
+  The window needs AIME-first AND the full 144-row bench AND
+  trainer-resident context AND async launches. Crash matrix so far:
+  only {trainer, AIME, full bench, no CLB} fails — 2/2 determinism
+  there, 0/9 anywhere else.
+- Switched tools: compute-sanitizer initcheck (1046) and memcheck
+  (1047) over the standalone eval (16 bench rows, compiled) —
+  uninitialized/OOB reads are detected value-independently, so a
+  passing run can still expose the bad read the race consumes.
+
+Honest uncertainty: the fence gate forces the CHANNEL to exist, not
+useful content in it — the policy can learn 2-token thinks. If GSM8K
+accuracy from short thinks beats long thinks, length will still
+shrink inside the fence; making thinking PAY is the hidden-carry
+research bet, and think_format_fraction + emitted length + wg std
+will show which way it goes. Watch: think_format_fraction (should
+start ~1.0 from SFT and stay), actions_per_trajectory (reasoning
+regime ~100-400 vs re-pin), within_group_reward_std sustainment.
+
+## 2026-08-01: NaN investigation closed (unreproduced); round 3 verdict; round 4 design
+
+NaN closure:
+- initcheck (1046, 16 bench rows compiled) flagged exactly one site:
+  chunk_gla_fwd_kernel_o at fla/ops/gla/chunk.py:429 reading the
+  uninitialized upper-triangle blocks of Aqk (torch.empty at
+  fla/ops/kda/chunk_intra.py:817; the intra kernels only write the
+  diagonal + lower blocks). VALUE-SAFE: line 430 tl.where(m_s, b_A, 0)
+  selects the garbage away before the dot — a select, not a multiply,
+  so NaN cannot propagate. Known FLA design pattern, not the bug.
+- Found a real per-process nondeterminism source while auditing: this
+  FLA install ships NO config dir (fla/configs missing), so every
+  autotuned kernel (fwd_o 9 configs, fwd_A 8-12, kda intra 3-12)
+  falls back to LIVE Triton autotune — winners picked by noisy timing
+  per process. The trainer can run different kernel variants than any
+  standalone repro, and CUDA_LAUNCH_BLOCKING perturbs the choice.
+  Fits the whole crash matrix, but unproven: the discriminating
+  experiment (TRITON_PRINT_AUTOTUNING diff between failing trainer
+  and passing repro) never got a failing side — job 1048, the exact
+  1037 command, ran the FULL 4000 steps cleanly. Crash record now
+  2 fail / 1 pass on identical configs; sanitizer jobs cancelled.
+- Status: dormant, mechanism unresolved. Mitigation ready if it
+  recurs: pin FLA kernel configs via FLA_CONFIG_DIR (JSON with
+  default_config per kernel) — deterministic kernel choice at full
+  performance, no eager anywhere. Eval stayed compiled throughout.
+
+Round 3 verdict (sft2_rl_think_gsm8k_4k, job 1048, 4000 steps):
+- The format gate did NOT prevent collapse; it changed the target.
+  actions/trajectory 295 -> 24 by step 444 -> ~15 for the rest;
+  emitted p95 = 15 tokens; think_format_fraction 0.83 -> ~1.0.
+  The policy learned a minimal well-formed <think>X</think> skeleton
+  around the same terse guess. gate_zeroed_correct ~0 all run — the
+  gate ate nothing because compliance is 2 tokens cheap.
+- Train-prompt exact_accuracy 0.159 at 4000, but bench DECLINED
+  0.0095 -> ~0.005 and wg reward std fell to 0.006: overfit terse
+  guessing on the train distribution, negative transfer.
+- Conclusion matches rounds 1-2: any reward the policy can reach
+  without paying compute, it will reach without paying compute.
+
+Round 4: think-length floor (--think-min-tokens).
+- Gate now requires >= K tokens INSIDE the fence (default 1 = old
+  behavior; validation refuses K>1 without --think-tokens). Even
+  low-quality filler tokens run sequential latent compute through the
+  hidden-carry channel — the floor mandates the compute budget and
+  RL decides how to spend it. This is the cleanest direct test of
+  the hidden-carry bet: does forced sequential compute beat the
+  15-token attractor at equal steps? Control = round-3 run.
+- New telemetry: behavior/think_tokens_mean (inner tokens over
+  structurally intact fences, stop-cut visible slice) — a mean
+  pinned at K says the policy pays exactly the mandated budget.
+- Arm: --think-min-tokens 64 (SFT think mean 276, p95 768, so the
+  floor is comfortably satisfied at init; 64 forces ~4x the collapsed
+  budget without demanding SFT-length essays).
+
+Red-team pass on the floor gate (all fixed, 418 tests green):
+- HIGH: gate's pre-close check was a case-sensitive literal "Answer:"
+  while the verifier greps (?i)answer\s*: — "answer: 42" before an
+  all-filler fence collected full reward (confirmed live against the
+  real tokenizer+verifier). Gate now uses the verifier's own pattern
+  and checks the position of the LAST match (the graded one) against
+  the close; this also stops zeroing correct rows over instruction
+  echoes inside the fence.
+- Resume/--actor-critic-init now refuse a changed --think-min-tokens
+  (same critic-return-distribution argument as the think_tokens guard).
+- Startup validation: floor + fences + answer must fit the training
+  rollout budget (an oversized floor zeroes every reward by truncation
+  while the gate-zeroed alarm stays at 0).
+- think_tokens_mean now pooled sum/count across groups (mean-of-means
+  biased low when groups lack intact fences) and omitted when there is
+  nothing to measure; think_gate_zeroed_correct promoted to a real
+  batch field (None = never scored) so device moves can't silently
+  reset the alarm; think_format_fraction now mirrors the scorer
+  (unterminated rows are not compliant).
+- inspect_critic_values + carry_ablation_eval reconstruct the gate
+  from saved args (they compared gate-trained critics against ungated
+  rewards and decoded fence ids away silently).
+
+## 2026-08-01: Round-5 direction (user decisions)
+
+- NO decoder-side thinking constraints (budget forcing rejected): the
+  model must OUTPUT its thinking; enforcement stays on the training
+  side (SFT + reward), not the sampler.
+- Distillation is the big lever, sourced from Hugging Face trace
+  datasets — NOT API self-distillation. Teacher quality bar: nothing
+  below Claude Opus 4.6 (Kimi K3 traces explicitly welcome). Many HF
+  trace sets are slop/mislabeled — provenance vetting required; all
+  R1/QwQ/gpt-oss-era corpora (OpenR1-Math, AM-1.4M, Synthetic-1,
+  OpenMathReasoning) are below the bar and excluded.
+- Add <answer></answer> special tokens (GPT-2 slack 50259/50260)
+  alongside the think fence; requires a fresh SFT pass. Makes the
+  reward gate purely structural on token ids (deletes the decoded-text
+  regex position check and its bypass class).
+- Focus: dense token-level supervision from good reasoning traces
+  across varied tasks including math (K3 recipe insight: dense
+  per-token signal beats sparse outcome reward for weak policies).
+
+## 2026-08-01: HF trace-corpus survey verdict (scout + independent spot-checks)
+
+- The frontier-teacher (Opus-4.6+) trace pool on HF is ~38k rows TOTAL,
+  of which <3k is math and only 810 rows are ground-truth-verified
+  (bevangelista/AIME_2000_2026_Kimi_K3 — genuine K3, separated
+  gen_reasoning/gen_answer, 100% answer-verified vs official AIME key,
+  but median 1,619 reasoning tokens and AIME difficulty: wrong band for
+  the 64M student and over the 1,024-token budget). The 50k-500k corpus
+  the round-5 plan assumed DOES NOT EXIST on HF today.
+- Usable-if-supplementary pool (~10-15k rows, mostly non-math):
+  TeichAI/lordx64-claude-opus-4.7-max-cleaned (4,807; real Batch-API
+  extended thinking, separated fields), Crownelius GPT-5.6 Sol/Luna
+  (15,353; agentic coding, tool-ID-fingerprint verified),
+  greghavens/kimi-k3-coding-and-debugging-traces (3,956; verified K3,
+  coding only), TeichAI small sets (~5.5k). Borderline:
+  Jackrong/DeepSeek-V4-Distill-8000x (7,716; teacher is V4-FLASH).
+- CRITICAL: our OWN current SFT corpus (prepare_sft_traces.py sources
+  adapt_opus4647 = angrygiraffe, adapt_trace_inversion = Jackrong
+  TraceInversion, adapt_opus46_10k = Roman1111111) is built from three
+  sets the survey demolished: angrygiraffe's CoT is admitted-synthetic
+  (written into the response, not real thinking) and 4x-duplicated;
+  TraceInversion traces are generated by a Qwen3-4B answer-conditioned
+  rationalizer; Roman1111111 ships NO reasoning traces at all (137-188
+  char answers; ~12% of advertised token volume). Final answers were
+  verified by our pipeline, but the reasoning styles the sft2 models
+  learned are fake/sub-bar CoT. Spot-checked independently via HF
+  datasets-server (row counts + schemas confirmed scout's claims).
+- No teacher top-k logit datasets exist (structural: frontier APIs
+  don't expose logprobs). True token-level vocab distillation would
+  require serving an open-weight teacher (K3 = 2.8T/104B active).
+- Contamination canary: truncated prompt "Your solution must read
+  input from standard input (input())..." with no problem body marks
+  the broken lordx64 lineage; grep any candidate corpus for it.
+- Decision pending (user): strict bar => insufficient math volume.
+  Options: (a) strict + supplement-only, (b) selectively relax bar
+  (V4-Flash), (c) self-generate math core via cheap K3 API using the
+  bevangelista recipe (effort escalation, stop-on-first-correct,
+  verify vs ground truth, <=512-token traces on GSM8K/MATH L1-3) —
+  previously rejected by user, resurfaced with cost evidence (~$25-60
+  for ~20k short verified traces at K3 API rates).
+- sft_trace_train.py: register_think_tokens generalized to
+  register_special_tokens (zeroes readout rows for all registered
+  fences); new --answer-tokens flag (requires --think-tokens).
+
+## 2026-08-01: Round-4 verdict (run 1050, think-floor 64) — catastrophic late collapse
+
+- Through step ~2940 the floor did its job: fence compliance ~0.9+,
+  think ~100 tokens, reward oscillating 0.01-0.11, bench policy
+  accuracy peaked 0.0182 (steps 1500/3000) vs 0.0061 at step 0.
+- Steps 2948-2996: format compliance crashed 0.60 -> 0.00 in ~50 steps
+  during a reward drought; the fence habit broke structurally, so the
+  gate zeroed ALL reward from ~step 3036 onward.
+- Mechanism of the death spiral (from train dashboard): the critic was
+  stale — V_pred +0.02 while targets had already gone to 0 — so every
+  trajectory got a uniformly negative advantage (mean -4.5e-3),
+  punishing the policy's CURRENT behavior including termination.
+  Expected length ~ 1/p_stop, so a small downward nudge on the stop
+  logit exploded actions 100 -> 1000 within ~90 steps (3060-3150);
+  ended_fraction hit 0.00 and reward became identically zero — an
+  absorbing desert with no recovery gradient for the final ~950 steps.
+- Endpoint: bench and AIME policy accuracy 0.0000; teacher-forced
+  val_bpb degraded 1.4566 -> 1.6943; final policy is a degenerate
+  repetition loop ("The dog will *not* be used for the dog." to the
+  1024-token budget) on arithmetic prompts.
+- Verdict vs round 3: WORSE. Round 3 (gate only) collapsed to a
+  working terse guesser (acc ~0.08 train-dist); round 4 (gate + floor)
+  destroyed the policy outright. Together they bracket the diagnosis:
+  pure-accuracy RL prunes the thinking channel; format-gated RL on a
+  weak SFT prior is unstable because reward droughts + stale critic
+  yield anti-termination gradients. RL cannot conjure reasoning this
+  prior does not contain — consistent with the corpus finding that the
+  sft2 prior was trained on fake/sub-bar CoT.
+- Reinforces round-5 plan: dense SFT distillation from genuine traces
+  FIRST; RL only from a strong prior, with the structural answer-fence
+  gate. A critic-staleness/zero-reward guard (freeze policy updates
+  when a rollout window's reward is all-zero) is worth considering in
+  the round-5 trainer, as a diagnosis-backed fix, not a patch.
+- Run preserved at postraining/runs/sft2_rl_think64_gsm8k_4k (final
+  checkpoint only; the 0.0182 mid-run policy was not separately saved).
+
+## 2026-08-01: Structural answer-fence gate (round-5 machinery) + red-team round 2
+
+- Implemented --answer-fence across the stack: purely token-id reward
+  gate (structural_format_ok), fenced-span grading, eval preference for
+  the fenced span with plain-text fallback, SFT/prepare corpus support
+  (--answer-tags => sft_traces_v3_answer.parquet), provenance/resume/
+  init guards, and fence-aware diagnostics tools.
+- Red-team round 2 found 3 HIGH (all fixed): (1) order-only structure
+  admitted a plain-text guess BEFORE <think> — gate now ANCHORED:
+  <think> must open the completion and </answer> must sit immediately
+  before the stop token; SFT compose emits exactly that shape. (2) the
+  flag-trusting provenance guard — SFT now MEASURES the anchored-shape
+  fraction over corpus token ids (answer_fence_document_fraction, >=99%
+  enforced at SFT arg-time and RL load-time), and RL prompts are
+  rewritten from the "Answer:" template sentences to the fence contract
+  (byte-identical to the SFT suffix, fail-closed if absent). (3) the
+  gate-zeroed-correct alarm was blind to fence-native collapse (decode
+  strips broken fences) — counterfactual now uses a relaxed span scan
+  before the plain parse. Also fixed: verify window cliff (>292-char
+  fenced values graded [INVALID]; verify_answer gained window=None for
+  self-constructed reframes), init guards now cover --actor-init and
+  --curriculum-init (not just --actor-critic-init), aggregate key
+  intersection, sample_latent + dapo_hit_rate_probe fence-awareness.
+- 426 tests pass (new: anchored-gate violations incl. the two red-team
+  layouts, relaxed-extraction, window cliff, corpus-shape measurement,
+  prompt rewrite, heterogeneous aggregation, config validation).
+
+## 2026-08-01: Red-team round-2 closure — 8/9 confirmed fixed, 6 new findings, all addressed
+
+Verification pass reproduced the suite and probed the fixes executably.
+Verdicts: 8 CONFIRMED-FIXED, 1 PARTIAL (sample_latent's --math-data path
+still graded plain-text). New findings and what was done:
+
+- A (MED, fixed): the prompt rewrite counted replacements, so 20 unique
+  dapo-math-17k rows kept an unlisted Chinese instruction demanding
+  "Answer: \boxed{...}" — contradicting the fence contract on prompts the
+  trainer believed it had framed. The Chinese template is now in the
+  rewrite table (ANSWER_INSTRUCTION_REWRITES), and the rewrite is
+  genuinely fail-closed: any surviving "Answer:" in a rewritten prompt
+  raises. A new test sweeps ALL real RL/eval parquets through the rewrite
+  and asserts nothing survives (the synthetic fixture was built from the
+  table itself, so it could only ever pass).
+- B (LOW-MED, fixed): SFT suffix and RL rewrite reminder are duplicated
+  literals in two modules with nothing binding them — a one-line parity
+  test now pins INSTRUCTION_SUFFIX_ANSWER == "\n\n" +
+  ANSWER_FENCE_INSTRUCTIONS[1] (and the plain-text pair).
+- C (MED, fixed): all four inspection tools (sample_latent,
+  dapo_hit_rate_probe, inspect_critic_values, carry_ablation_eval) graded
+  fence-aware but SAMPLED under the unrewritten plain-text prompt —
+  off-distribution policy, systematically wrong reconstructed rewards.
+  Each now applies rewrite_prompts_for_answer_fence gated on the saved
+  answer_fence flag. The PARTIAL (sample_latent math-path grading) fixed
+  in the same pass.
+- D (LOW, fixed): the corpus measurement validated shape, never span
+  length — an anchored-but-terse corpus measures 1.0 yet earns all-zero
+  reward at a floor above its spans. SFT now records
+  think_span_token_percentiles {min, p1, p50} in provenance; RL startup
+  refuses a --think-min-tokens floor above the corpus p50, warns above
+  p1, warns (not blocks) on pre-round-5 provenance without the stats.
+- E (LOW, accepted as monitoring note): the floor is a decode-step
+  budget, not an information budget — unregistered padded-vocab ids
+  50261-50303 can pay it while decoding to replacement characters.
+  Signature to watch in round 5: think_tokens_mean pinned exactly at the
+  floor + unreadable think spans in captured transcripts while the gate
+  reports full compliance.
+- F (LOW, fixed): the fence instruction described only the answer half of
+  the anchored contract. Both instruction sentences (and the SFT suffix,
+  in lockstep) now state "start with <think>" as well.
+- Relaxed-counterfactual caveat (documented + pinned by test): first-span
+  extraction means a scratch <answer> inside the think span wins over the
+  real answer (over-count) and a wrong first span hides a right second
+  one (under-count) — read the gate-zeroed-correct alarm as approximate.
+- Training-dynamics note (from the round-2 pass): the instruction suffix
+  itself contains the literal "<answer></answer>", so every prompt
+  carries an EMPTY fence pair as special ids in-context — a pattern the
+  gate rejects. Doesn't reach the gate (prompt slice excluded) but worth
+  remembering when reading early-round format-compliance curves.
+- 430 tests pass. Separator emulation in the corpus measurement was
+  verified faithful against real pack_rows output (every completion-final
+  </answer> is followed by a CE-targeted stop), and fence tokens cannot
+  pay the think floor (single-pair rule + ordering reject every
+  arrangement).
+
+## 2026-08-01: Red-team round 3 — CLOSED. Gate machinery done; two tightenings applied
+
+Round-3 verification: every round-2 item CONFIRMED-FIXED, nothing
+STILL-OPEN. The red-team swept NINE real parquets (incl.
+deepmind-interpolate-rl-full's 179,856 unique rows) through the rewrite:
+zero rows retain any case-insensitive Answer:-field match, no problem
+statement quotes "Answer:" (so the fail-closed post-condition cannot
+false-positive at startup), the Chinese replacement introduces no
+plain-text demand, and no init/resume/rollout path reaches rollouts with
+the think floor unchecked. Applied its two cheap residual tightenings
+immediately:
+
+- Post-condition now uses the verifier's own case-insensitive pattern
+  (ANSWER_FIELD_DEMAND, mirroring core.extract_final_answer) instead of
+  a case-sensitive substring — an unlisted "answer:" template would have
+  slipped a case-sensitive scan yet still parsed as a field at grading.
+- The real-data sweep test now covers all nine parquets, notably
+  deepmind-interpolate-easy (the DEFAULT --bench-data — a template
+  landing there hits every run), and asserts with the same pattern.
+
+Accepted as recorded notes (no code change):
+
+- Prompt-side fence ids are now deliberate: finding F's instruction
+  wording tokenizes to an unpaired <think> plus an EMPTY
+  <answer></answer> pair inside every prompt (single_fence_span over the
+  prompt alone returns a span). Harmless today — every consumer slices
+  ids[prompt_length:] or uses emitted_token_rows — but any FUTURE code
+  running fence extraction over prompt+completion will silently pick up
+  that contaminating pair. Slice first.
+- Floor-vs-policy gap: --actor-init from a run whose POLICY collapsed to
+  short think spans passes the corpus check (it validates the base
+  checkpoint's SFT distribution, not the loaded policy's behavior); the
+  think_min_tokens equality guard on the init path narrows this to
+  near-zero. Practical detector: think_tokens_mean in the first steps.
+- Preexisting, not introduced here: resume does not pin base-checkpoint
+  identity, so resuming with a MORE permissive base (longer-span corpus)
+  passes silently; both restrictive directions fail closed.
+
+430 tests pass. The answer-fence gate stack is closed out; next
+actionable work is the corpus decision (user) and then the round-5
+SFT -> RL sequence on a rebuilt trace corpus.
+
+## 2026-08-01: Corpus decision (user) — source existing K3 traces from HF, no API generation
+
+User: "there's definitely quality k3 traces out there for you to use. No
+need for us to generate our own." So: no API spend, no self-generation
+pipeline. [SUPERSEDED same day — see next section: the K3-exhaustive
+hunt came back negative for math, and the user then approved BOTH
+relaxed-bar HF sourcing AND self-generation.]
+The trace-corpus-scout is re-tasked with a K3-EXHAUSTIVE hunt
+(the first survey was breadth-first across teachers): all K3 naming
+permutations incl. Chinese-community names, recency-sorted (K3 distill
+sets are recent), mixed-teacher datasets with per-row generator tags,
+and README-only teacher attribution. Quality bar unchanged — genuine K3
+provenance (fraud canaries from the first survey still apply), math at
+GSM8K-to-easy-competition difficulty, separable reasoning/final fields,
+verifiable ground truth, reasoning spans mostly under ~1024 GPT-2
+tokens, target 10k+ usable rows. bevangelista's 810 verified AIME K3
+rows stay as a supplement. When the scout reports: rebuild
+prepare_sft_traces adapters (delete the three demolished-source
+adapters), verify + decontaminate, compose with --think-tags
+--answer-tags, SFT with --think-tokens --answer-fence, then round-5 RL
+with --answer-fence.
+
+## 2026-08-01: K3-exhaustive hunt NEGATIVE for math; user approves relaxed bar + self-generation; generation pipeline built
+
+- Scout's K3-exhaustive sweep (run twice, independently): the complete
+  inventory of genuine K3 math on HF is bevangelista's 810 AIME rows
+  (all answer-verified, but olympiad difficulty and only ~330-360 under
+  1,024 GPT-2 tokens). Everything else K3 is coding (greghavens'
+  moonshiner 3,956 rows, endlessly mirrored — Siddh07ETH 15.7k,
+  Accretion, j0no12 are all rehosts/mislabels of it), creative writing,
+  TikZ, or quantization logits. The kimi-k3 tag page is a closed set of
+  11 datasets (independently confirmed via HF API). K3 is ~3 months old;
+  the community math-distillation wave hasn't reached it. The two orgs
+  that DID regenerate GSM8K/MATH-500 from K3 (Inferact/RadixArk DSpark)
+  never published the data.
+- User decision (AskUserQuestion): options 1 AND 3 — relax the teacher
+  bar for the HF math core (K2.5/K2.6/GLM-5.x-tier acceptable; trace
+  correctness/length/difficulty now weigh more than teacher tier) AND
+  self-generation via K3 API is back ON (~$25-60). Scout re-tasked with
+  the relaxed-bar hunt (report pending).
+- Built postraining/generate_k3_traces.py: verified-trace generation
+  over OUR OWN RL problem sources (7,217 GSM8K train + 13,000
+  decontaminated deepmind-interpolate-rl = 20,217 problems), so the SFT
+  prior lands exactly on the RL distribution. Every trace graded by the
+  RL verifier itself (core.verify_answer, per-row answer_style, default
+  window — byte-for-byte RL semantics). bevangelista protocol adapted:
+  effort escalation low,low,high, stop on first verified; truncation
+  retries the same effort with doubled max_tokens (not more effort).
+  Stores BOTH the native reasoning channel and the visible solution;
+  which becomes the <think> span is a compose-time decision
+  (telegraphic-register caveat from the survey).
+- Money-safety (red-team: 3 HIGH, 4 MED, 3 LOW — all fixed, closure
+  verification pending): budget meter fails CLOSED on usage-less
+  responses (ContractError + estimate charge); timeouts/dropped
+  connections charge a conservative estimate (provider may have billed);
+  429/5xx rejections charge nothing; per-style YieldCanary halts a style
+  whose verified yield drops below 20% after 50 resolved (catches the
+  deepmind exact-style canonical-form mismatch class: 37% of ground
+  truths are non-integer — fractions, option letters, comma lists,
+  booleans — so a value-blind EXACT_STYLE_HINT rides the system prompt
+  for style=exact); pool fails fast with cancel_futures; resume
+  tolerates torn trailing lines; --limit pilots interleave sources.
+- Red-team round 2 on the generator: all 10 round-1 findings
+  CONFIRMED-FIXED; 5 new findings, all addressed — (NEW-1) exhausted
+  records now tagged {style, exhausted: "schedule"} and
+  --retry-exhausted regenerates the canary's detection sample after a
+  contract fix instead of burning those rows forever; (NEW-2) zero-yield
+  early trigger fires the canary at half the sample size (deterministic
+  mismatch has exactly zero hits), cutting detection cost ~60%; (NEW-3)
+  canary aborts list their styles in the final summary and exit 2 so
+  queued runs cannot look clean; (NEW-4) null/junk usage values coerce
+  to 0 and land in the charged fail-closed branch instead of crashing
+  uncharged; (NEW-5) pilots below canary coverage print a warning.
+- Reviewer's final pass: everything CONFIRMED-FIXED (verified
+  end-to-end), one dry-run nit applied (--dry-run now forwards
+  --retry-exhausted into its skip-count preview). Operating note: the
+  zero-yield canary trigger has ~1.7% odds of spuriously halting a
+  GENUINELY hard style with real ~15% yield (zero hits in the first
+  min_resolved//2 draws) — recoverable via --retry-exhausted, but
+  remember it if a legitimately hard source ever halts unexpectedly.
+- NOT YET LAUNCHED: needs the user's API key (MOONSHOT_API_KEY, or
+  --base-url/--effort-key for OpenRouter) and provider prices
+  (--price-in-per-mtok/--price-out-per-mtok are deliberately required
+  flags). Plan: --limit ~100 pilot first (validates effort-key surface,
+  usage reporting, exact-style yield), inspect transcripts + register,
+  then full 20k run under --budget-usd.
+- 445 tests pass (15 for the generator).
+
+## 2026-08-02: Relaxed-bar corpus report (scout final) — blend chosen
+
+Scout's ranked finalists, all length/provenance/GT numbers computed from
+datasets-server statistics over full populations (not cards). Its own
+earlier "use the K2.5/GLM million-row math corpora" suggestion was
+SELF-CORRECTED: Jackrong GLM-5.1 Math median 82,868 chars/output, K2.5
+General-Math median 9,616 tokens — the entire long-form class is out
+(same failure as marin OpenThoughts).
+
+Chosen blend (~28k HF rows + K3 generation + gold anchor):
+- nvidia/OpenMathInstruct-2, cc-by-4.0, teacher Llama-3.1-405B:
+  RESTRICT problem_source to augmented_gsm8k + gsm8k (153,311 rows,
+  median 897 chars, 99.7% under 4,082) — the augmented_math 83% majority
+  has ~22% ill-posed problems whose expected_answer matches the boxed
+  value by CONSTRUCTION (internal consistency, not correctness; will
+  pass any boxed-match check). Target ~10k.
+- mlfoundations-dev/a1_math_deepmind, NO LICENSE, teacher deepseek-
+  reasoner over deepmind/math_dataset TRAIN splits only (YAML-pinned;
+  interpolate = TEST is never touched, so no bench contamination). Use
+  the deepseek_solution field (median 814 chars), NOT reasoning/
+  final_reasoning_trace (5-6k). Repairs needed: bytes-literal unwrap
+  (b'...\n' on question/answer in 100/100 rows) + answer verification
+  (23.5% of solutions disagree with the gold answer column — teacher
+  errors; filter on agreement). ~23.9k usable; take ~8k. ONLY source on
+  our RL/bench distribution. License flagged to user.
+- HAD653/GSM8K-OpenMath-MathReason-13k, license placeholder, teacher
+  gpt-oss-120B: median 349 chars, fixed Problem/Reasoning/Answer
+  template, but final_answer is TEACHER-derived. Restrict to rows
+  joinable to GSM8K train gold (~57% verbatim train questions) so GT is
+  independent. ~6k.
+- sxiong/synthetic-math, MIT, GPT-4o problems cross-verified by R1
+  answer agreement: filter L1-L3, use solution field (median 741). ~4k
+  MATH-style coverage.
+- openai/gsm8k socratic train (7,473, MIT, human gold) as style anchor.
+- Swap option (not chosen): codelion/gsm8k-synth — mechanically-executed
+  GT and 0% overlap vs BOTH gsm8k splits, but calculator-annotation
+  register (weak think-span style) + confirmed template redundancy.
+- Rejected with measurements: OpenMathReasoning (median 19k chars, 51%
+  olympiad), Mixture-of-Thoughts math (median 4,936 tok), orca-math (no
+  extractable GT), MetaMathQA (27.8% answer-conditioned FOBAR/SV),
+  NuminaMath-CoT (21% olympiad, no answer column), MathInstruct (40%
+  programs, 34% multiple-choice), tulu-3 math (no GT), whynlp/gsm8k-aug
+  (equation-only), cm00cm K2.7 perfectblend (no GT field, unlabelled
+  ~40-50% math, inherits MetaMathQA answer-conditioning, no decontam),
+  Accretion reasoning rows (lordx64 K2.6 lineage, unverified, count
+  mismatch vs card).
+- Method warning: datasets-server /search is token-based (stopwords
+  dropped) — overstates phrase counts ~100x; never use it for phrase
+  membership.
+
+Next: fetch the five sources locally (postraining/data/relaxed_bar/),
+rebuild prepare_sft_traces (delete the three demolished adapters; new
+adapters with per-source repair + OUR verifier on every row + 8-gram
+decontamination vs GSM8K test / bench sets), then compose --think-tags
+--answer-tags alongside the K3-generated core (pipeline ready, awaiting
+user API key + prices).
+
+## 2026-08-02: prepare_sft_traces rebuilt on the relaxed-bar blend
+
+Deleted the three fraudulent adapters (opus4647_8k7, opus46_ti9k,
+opus46_10k) and their GSM8K-answer-bank verification path. New pipeline:
+six adapters over the local relaxed_bar parquets + the (pending) K3
+JSONL, every kept row verified with core.verify_answer semantics, then
+exact-text + word-8-gram decontamination vs GSM8K test, deepmind-
+interpolate-easy, AIME 2024/2026 (exact match matters: bench problems
+like "Work out 64339656 - 0." are too short for any n-gram).
+
+Built sft_traces_v3_answer.parquet: 36,286 docs, 9.2M GPT-2 tokens,
+p50 219 p99 693 max 3,574 (cap 4,096). Per-source kept: openmath 10,000
+(cap-sampled from ~151k verified; 44 wrong, 1,617 contaminated —
+augmented rewrites of test problems), a1_deepmind 6,000 (sampled from
+16,977 survivors), had653_gold 6,950 (6,815 unjoinable dropped),
+sxiong_l13 5,974, socratic 7,362 (94 contaminated). K3 core absent
+until generation runs; rebuild with --k3-jsonl after.
+
+Measured corrections to the scout's survey:
+- a1_math_deepmind teacher-error rate is ~46%, not 23.5% (hand-checked
+  sample: r(1) for r(h)=h^3-h^2+h answered -18; 70/143 probability
+  answered 9/20). Survivors 16,977/31,600. Composed final = CANONICAL
+  answer string (exact-style RL grading), never the teacher rendering.
+- sxiong has 2 degenerate rows (empty answer + empty \boxed{}) that
+  PASS the Minerva grader empty-vs-empty (regex captures a trailing
+  space); the central empty-field guard drops them (an empty final
+  would compose the zero-width <answer></answer> the anchored gate
+  rejects).
+- deepseek_solution finals need: bytes unwrap, "**Answer:**" statement
+  extraction, \( \) / \[ \] delimiter strip, \dfrac->\frac, "x = v"
+  split, and a symbolic bridge (latex_to_python -> sympy) for
+  Python-syntax truths like -96*a**2 vs LaTeX -96a^2.
+
+Perf lesson (two stalled builds): sympy.simplify AND Expr.equals both
+take unbounded rewriting paths on w**(-3058)-scale exponents; with
+~14.6k genuinely-wrong rows paying that cost before being dropped the
+build ran 26+ min without finishing a1. Replaced with bounded numeric
+probing: evalf(50) at two fixed rational points, relative tolerance
+1e-30, everything non-Expr/undefined/inconclusive dropped. Full a1
+filter: 10s; whole build ~25s.
+
+Tests: postraining/tests/test_prepare_sft_traces.py (15) — synthetic
+adapter contracts + real-parquet slices (schema-drift canaries) +
+decontamination index. Suite 459 passed / 17 skipped. Red-team review
+of the rebuild spawned per standing practice.
+
+## 2026-08-02: prepare rebuild red-team round 1 — FIX-FIRST, all fixed
+
+Findings (agent-verified against the real build) and resolutions:
+1. MAJOR: "verified" was a structural no-op for 60.6% of rows —
+   openmath-augmented boxed==expected_answer BY CONSTRUCTION (0 drops
+   possible), sxiong answer column byte-identical to its own boxed in
+   5,995/5,995, had653 claim identical to gold in all joined rows. FIX:
+   augmented_gsm8k EXCLUDED outright (138,547 rows — same rationale as
+   augmented_math; red-team measured 13.9% decimal finals vs 0.0% in
+   genuine rows + hand-confirmed ill-posed problems with integer
+   labels). openmath now = problem_source "gsm8k" only, verified
+   against OUR local GSM8K gold via the had653 join (61 teacher errors
+   dropped, 100% joinable). sxiong kept, documented honestly (its
+   independent check is upstream GPT-4o x R1 agreement; ours is only
+   an extraction canary).
+2. MAJOR (latent): no fence-string guard — a K3 trace containing a
+   literal "<think>" would compose a gate-failing document undetected.
+   FIX: central screen_candidates() with FENCE_STRINGS guard + a test
+   that composed docs pass structural_format_ok.
+3. MINOR: empty-truth Minerva pathology now fails in graded_correct
+   itself, not just the downstream empty-field guard.
+4. MINOR: deepmind-family SFT framing diverged from RL (missing DAPO
+   header + FENCE0 prefix). FIX: DEEPMIND_PROMPT_PREFIX prepended to
+   the problem column for a1 (and future K3 deepmind keys); byte
+   parity with the RL rewrite pinned by test reconstructing real
+   rewritten prompts. Trainer needs no change (prompt boundary is
+   still problem+suffix).
+5. MINOR: Answer:-field blocks inside think spans (260 docs) — strip
+   now cuts the trailing marker BLOCK (colon required, 4-line scan,
+   loop until stable) across ALL sources: 260 -> 7 residual.
+6. No-change finding: 21% of sxiong/a1 finals are non-numeric — that
+   IS the canonical register for exact-style deepmind RL grading
+   (a1) / deliberate MATH coverage (sxiong); documented.
+Clean surfaces confirmed by the agent: anchored gate 36,286/36,286,
+byte-identical rebuild determinism, decontamination 0 misses under
+stricter-than-pipeline comparison, symbolic_agree 0 false positives
+vs a 6-point 80-digit oracle, no gold-join collisions from the
+160-char normalize_problem truncation.
+
+Rebuilt corpus: same 36,286 total (openmath cap still met from the
+14.5k genuine pool). Suite 464 passed / 17 skipped. Verification pass
+by the red-team pending.
+
+## 2026-08-02: red-team verification pass — SHIP; SFT queued
+
+Verification pass results on the rebuilt corpus (sha 26adfebb...):
+- F1/F2 live: all 10k openmath rows problem_source=gsm8k, finals equal
+  OUR gold 10,000/10,000, filter provably grading (160 rows pass with
+  boxed != gold byte-form; 61 wrong dropped independently recomputed).
+- Anchored gate 36,286/36,286 including deepmind framing; F5 framing
+  verified byte-exact against 4,000 real rewritten deepmind-rl-full
+  prompts (not just the 3 pinned rows).
+- Strip cascade audit: 5,534 a1 rows changed, hand-read worst cases all
+  correct (LaTeX answer-display blocks + post-answer commentary); 0
+  rows lost derivation content, 0 emptied. Residual V3 (cascade
+  bounded by data not construction) fixed post-verdict with
+  MAX_ANSWER_BLOCK_LINES=12 cap + single central application (a1
+  in-adapter strip removed); rebuild remains byte-identical (no real
+  cut approaches the cap), suite 464 passed.
+- Observation V5 (watch): GSM8K-family sources now supply 67% of rows
+  over 7,375 distinct train problems (~3.3 traces/problem) —
+  augmented_gsm8k was the only GSM8K-band problem-diversity source;
+  memorization risk noted, K3 core + a1 + sxiong carry the diversity.
+- Observation V6: 2,565 non-numeric finals retained by design (a1
+  symbolic = canonical exact-style register, now with matching RL
+  framing).
+
+Queued mlq job 1054 sft_v3_answer_hfonly: sft_trace_train --think-tokens
+--answer-fence on sft_traces_v3_answer.parquet (HF-only corpus, K3 core
+still blocked on user API key + prices). Serves as the HF-only reference
+for measuring K3's marginal value when the core lands; check
+answer_fence_document_fraction >= 0.99 and think-span percentiles vs the
+planned RL floor when it finishes.
+
+## 2026-08-02: SFT on v3 corpus (HF-only) — job 1054 done, e2 ablation queued
+
+sft_v3_answer_hfonly (3 epochs, 872 steps, defaults otherwise):
+- answer_fence_document_fraction 1.0; think-span percentiles
+  min 10 / p1 33 / p50 131 recorded in checkpoint metadata (RL floor
+  guard binds against p50=131).
+- Holdout completion CE: trough 0.7479 at step 575 (end of epoch 2),
+  jump to ~0.78 at the epoch-3 boundary, final 0.7684 — epoch 3 looks
+  net-harmful (V5 concentration: ~3.3 traces/problem). Trainer saves
+  FINAL only, no best-holdout tracking.
+- Sampling gate (128 prompts x 8 samples, anchored-gate reward):
+  accuracy 0.0273, mixed prompts 0.172, within-group reward std 0.0616.
+- Queued job 1055 sft_v3_answer_hfonly_e2 (--epochs 2) to A/B the
+  overfit question on gate metrics; pick the better checkpoint for
+  round-5 RL. Both runs are the HF-only reference for measuring the
+  K3 core's marginal value when it lands.
+
+## 2026-08-01: e2 ablation verdict + zero-reward actor-freeze guard
+
+e2 ablation (job 1055, sft_v3_answer_hfonly_e2, --epochs 2): gate
+metrics WORSE than the 3-epoch run — accuracy 0.0254 vs 0.0273, mixed
+prompts 0.133 vs 0.172. Differences are ~1 sigma, so no strong signal
+either way, but nothing supports switching. Verdict: keep
+postraining/runs/sft_v3_answer_hfonly/sft_final_model.pt (3 epochs,
+job 1054) as the round-5 RL base. The epoch-3 holdout-CE rise did not
+translate into worse sampling-gate behavior — the gate metrics are the
+RL-relevant criterion.
+
+Zero-reward actor-freeze guard (round-4 postmortem prescription,
+implemented before any round-5 launch):
+- Mechanism being guarded against: all-zero-reward pool + stale critic
+  (V_pred ~ +0.02 vs zero targets) -> uniformly negative advantages ->
+  anti-termination gradient -> expected length ~ 1/p_stop explosion ->
+  absorbing zero-reward desert (see round-4 postmortem above).
+- Fix (revised after red-team FIX-FIRST): the freeze decision is per
+  optimizer MINIBATCH, not per pool — the harmful unit is an update
+  whose every trajectory scored zero (rewards are non-negative: 1.0
+  exact, [0, 0.1] nearby-numeric partial, else 0 — so mean==0 iff all
+  zero), and during the descent into the desert the pool mean is
+  barely-nonzero while up to 3 of 4 minibatches are already pure
+  desert; a pool-level gate would only engage after full absorption.
+  Gate: training_update's metrics["reward"] == 0.0 skips
+  step_optimizers("actor") for that minibatch. The critic still steps,
+  so value predictions catch down to the zero targets — that is what
+  kills the stale-critic advantage bias. Actor forward/backward still
+  runs (behavior-age-0 clip canary, grad norms, non-finite checks stay
+  uniform); grads are zeroed as usual. Skipping the optimizer STEP is
+  required rather than relying on small grads: AdamW (weight decay 0
+  per ADAMW_ALGORITHM_SCHEMA) still moves weights from stale momentum
+  on a zero-signal step. This is ~unbiased when the critic is
+  calibrated (V ~ 0 on desert prompts -> advantages ~ 0 -> the skipped
+  update was ~0 anyway) and protective exactly when the critic is
+  stale — zero-reward trajectories in MIXED minibatches still
+  contribute their contrastive negative-advantage signal.
+- Consecutive-desert stop (red-team major 2): the freeze can latch —
+  with all reward structurally gated, a collapsed policy produces
+  all-zero pools forever and the run would burn its whole budget on
+  signal-free rollouts. A session-local consecutive all-zero-POOL
+  streak (reset on any rewarded pool) triggers a pool-boundary stop
+  (final checkpoint saved by the loop tail) after
+  --zero-reward-stop-pools pools (default 8 = 8192 consecutive
+  zero-reward trajectories; the SFT base's ~2.7% gate accuracy makes
+  one all-zero 1024-trajectory pool a ~e^-28 event). Applies
+  regardless of the freeze flag; 0 disables.
+- Flags: --zero-reward-actor-freeze (BooleanOptionalAction, default
+  ON), --zero-reward-stop-pools (int, default 8, >=0 validated). No
+  EXECUTION_SCHEMA rev: optimizer stepping policy only, not
+  scheduler-visible rollout/replay semantics; resume across the flags
+  is safe in both directions.
+- NaN fails closed: a non-finite pool reward_mean raises instead of
+  silently disabling the guard (reward_mean == 0.0 is False for NaN).
+- Telemetry: rollout log field zero_reward_actor_frozen (pool-level),
+  per-pool print naming the affected step range (rollout-step
+  convention, red-team nit 6), per-train-step tensorboard series
+  guard/zero_reward_actor_frozen and cumulative
+  guard/zero_reward_frozen_updates_total (distinguishes requested
+  steps from actual actor updates in the next postmortem, red-team
+  minor 4).
+- Declined (red-team minor 5): eliding age>0 clip/KL rows on frozen
+  steps — the guard flag series disambiguates the zero readings, and
+  a frozen step genuinely producing zero drift is itself the canary
+  that the freeze works; a gap would hide that confirmation.
+- Tests: flag defaults/negation + stop-pools validation + reward
+  non-negativity pin (test_latent_rollout.py
+  test_zero_reward_actor_freeze_flag_defaults_on,
+  test_nearby_numeric_reward_is_nonnegative).
+- Verification-pass fix (red-team round 2 NEW-ISSUE, MAJOR): the
+  desert stop made a previously-unreachable tail bug reachable —
+  under --consume-all-prompts any early break hit the
+  dataset-exhaustion RuntimeError before the terminal save_checkpoint
+  (the --max-train-hours break was shielded only by validate_args
+  refusing that flag combo). Fixed with a stopped_at_pool_boundary
+  flag set on both break paths; the exhaustion mismatch downgrades to
+  a printed truncation warning and the tail (final checkpoint, aime
+  eval, closers) runs normally. Session-local streak intentionally
+  grants a fresh stop budget on resume (documented at the
+  initializer).
+
+## 2026-08-01: Round-5 RL launched (job 1056 sft3_rl_answer33_gsm8k_4k)
+
+Guard shipped (red-team round 3: SHIP, all findings closed). Launch is
+a minimal-diff arm against round-4 (job 1050) as control:
+- SAME: --reasoning-mode latent, --steps 4000, --nearby-reward-max 0
+  (binary exact; partial credit proven the round-2 collapse
+  accelerant), --math-data postraining/data/gsm8k_rl_prompts.parquet.
+- CHANGED: base = postraining/runs/sft_v3_answer_hfonly/
+  sft_final_model.pt (v3 verified-trace corpus, 3 epochs, gate acc
+  0.0273 / mixed 0.172); --answer-fence (structural token-id gate,
+  byte-exact SFT<->RL framing via rewrite_prompts_for_answer_fence);
+  --think-min-tokens 33 (= corpus p1, no floor-guard warning; round 4
+  used 64 against an SFT think mean of 276 — 33 sits inside 99% of
+  the new prior's span support while still pricing the ~15-token
+  skeleton attractor out); zero-reward guards default ON
+  (minibatch actor freeze + 8-pool desert stop).
+- Watch: guard/zero_reward_actor_frozen and the desert-stop print;
+  behavior/think_tokens_mean pinning at 33 = paying only the floor;
+  fence compliance around reward droughts (round-4 died at
+  steps 2948-2996); bench avg vs round-4 peak 0.0182.
+
+## 2026-08-02: Round-5 verdict (job 1056 sft3_rl_answer33_gsm8k_4k) — first non-collapsing RL round
+
+Run completed all 4000 steps. Headline: NO collapse — the first RL arm
+to finish with structure intact and bench above its SFT start.
+- Bench avg@1152: 0.0130 (step 0) -> terminal 0.0208 (1.6x base),
+  late-run highs 0.0278 (2752) and 0.0330 (3252, best bench of any RL
+  arm in project history incl. the partial-credit run's 0.031).
+  Noisy band 0.005-0.033 throughout; AIME 0.0000 always.
+- Trajectory: think span compressed from ~57-67 tokens to PINNED at
+  the 33 floor by ~step 3000 (identical attractor to rounds 3/4), but
+  fence compliance held 0.99+, ended_fraction ~1.0, and train reward
+  KEPT CLIMBING (terminal pool 0.075) — the floor+fence priced out
+  the bare-guess and skeleton attractors, and accuracy improved even
+  at the floor. Whether the 33 forced think tokens carry real
+  hidden-carry compute or just habit is unmeasured here (carry
+  ablation eval would answer it).
+- Diversity drain confirmed but non-fatal: opener concentration
+  2/14 -> 10/16 by step 1000; wg reward std thirds 0.066/0.055/0.034.
+  Entropy collapse is the round-6 problem, not a death mode here.
+- Guard postmortem vindication: zero_reward_frozen_updates_total 766
+  (19% of 4000 updates were all-zero minibatches, actor step
+  skipped) vs exactly ONE all-zero pool (steps 3837-3840, streak 1,
+  reset immediately, no stop). The red-team's minibatch-granularity
+  fix did essentially all the work: a pool-level gate would have
+  engaged 4/766 times. No death spiral, no length explosion, no
+  desert absorption — round-4's mechanism arrived (drought windows)
+  and the guard ate it.
+- Teacher-forced val_bpb 1.646 -> 1.842 (+0.196): RL sharpening away
+  from the LM distribution — round 4 paid +0.24 for a destroyed
+  policy; this pays similar drift for a working one. Watch if the
+  guard's do-no-harm framing needs a tighter bound in round 6.
+- Verdict vs round-4 control (peak 0.0182, terminal 0.0000): KEEP
+  every round-5 change (v3 corpus base, answer fence, floor 33,
+  zero-reward guards). Round-6 target: entropy/diversity preservation
+  (KL-to-SFT-prior anchor; DAPO-style dynamic sampling of
+  zero-variance groups under review from paper survey) + K3 core for
+  prior diversity (still user-blocked on API key).
+
+## 2026-08-02: Sampling survey — VAPO / DAPO / GRPO / Dr. GRPO (user-requested)
+
+Question: is rollout sampling (temperature etc.) the diversity
+bottleneck? Survey answer: NO paper touches the sampler to fight
+diversity loss; all manage it in the objective.
+- Training rollout sampling: GRPO "naive nucleus" (params
+  unspecified); DAPO unspecified (eval temp 1.0 / top-p 0.7); VAPO
+  unspecified (eval same as DAPO); Dr. GRPO SPECIFIED: temp 1.0,
+  top-p 1.0, top-k off — byte-identical to our enforced settings.
+- Samples per prompt: GRPO 64, DAPO 16, VAPO 16 (ours: 16), Dr. GRPO 8.
+- KL-to-reference: GRPO YES (0.04, k3 estimator, ref=SFT); DAPO
+  REMOVED (long-CoT divergence is desired); Dr. GRPO REMOVED (beta=0,
+  verifier reward eliminates distribution-shift concern); VAPO
+  formulated but never given a coefficient (effectively absent). The
+  literature majority drops KL for reasoning RL — our KL-to-prior
+  idea is contrarian; their entropy tool is Clip-Higher instead.
+- Entropy: DAPO Clip-Higher eps 0.20/0.28 (we already match);
+  DAPO monitors token entropy and wants a SLOW UPWARD trend — we do
+  not log token entropy at all (gap; only HL-Gauss target entropy).
+- Zero/low-variance groups: DAPO dynamic sampling drops all-correct
+  AND all-wrong groups and oversamples until the batch is full of
+  variance-bearing groups — their single largest ablation gain
+  (42->50 AIME). VAPO (value-based, like us) deliberately does NOT
+  filter: the critic extracts signal from all-wrong groups; instead
+  it adds Positive-Example LM Loss (NLL on correct rollouts, weight
+  0.1) for the low-accuracy regime. Dr. GRPO: GRPO's group-std
+  division UPWEIGHTS near-zero-variance groups (difficulty bias);
+  removing std makes all-wrong groups contribute zero gradient
+  naturally. Our minibatch zero-reward freeze is a middle position;
+  766/4000 frozen updates in run 1056 = 19% of update budget spent
+  on signal-free minibatches that dynamic sampling would have
+  replaced with variance-bearing prompts.
+- Us vs papers: advantages are critic-GAE, no group-std division
+  (Dr. GRPO bias absent); token-level loss semantics already match
+  (denominator covers minibatch); value pretraining 50 steps matches
+  VAPO's; decoupled/length-adaptive GAE present.
+- Round-6 candidates from survey, ranked: (1) token-entropy
+  telemetry (free, diagnosis-grade); (2) VAPO Positive-Example LM
+  Loss weight 0.1 — built for "remarkably low accuracy" tasks like
+  our 3% regime, amplifies rare successes densely; (3) DAPO-style
+  dynamic sampling replacing/augmenting the freeze (recycles the 19%
+  wasted budget; needs care — our all-zero windows also train the
+  critic toward zero, which the freeze design values); (4) KL-to-SFT
+  -prior anchor (contrarian to DAPO/Dr. GRPO, but our failure mode
+  is a WEAK prior collapsing to degenerate phrasing, not a strong
+  model needing room to diverge).
+
+## 2026-08-01: Round-5 semantic-collapse review — lower both model LRs
+
+The structurally intact round-5 policy still collapsed semantically:
+captured cross-problem responses converged on the same unrelated
+"rate / age" skeleton, benchmark coverage contracted from 10 to 4
+prompt groups and 7 to 2 nonzero modules, and aggregate accuracy moved
+only 15/1152 -> 24/1152. Response sampling is the exact categorical
+policy (temperature 1, top-p 1); the failure is not duplicated RNG.
+
+Operator decision: lower the shared actor/critic AdamW default from
+5e-5 to 2e-5. Both derived Muon defaults therefore move from
+1.2083e-4 to 4.8333e-5. This makes the next run a both-model LR arm;
+no training job was launched as part of the config change. Round-5's
+first actor update measured post-update token KL 0.00743 and max token
+log-ratio 4.23, while think length fell ~120 -> ~47 within 100 updates.
+An older policy-schema LR arm at 2e-5 retained materially more benchmark
+length/diversity at 2k, but remains only supporting evidence; the new
+deterministic hidden-carry configuration still needs its own 2k ablation.
+
+## 2026-08-02: Both-model LR 2e-5 ablation — KEEP; semantic prior still weak
+
+Job 1068 `sft3_rl_answer33_gsm8k_lr2e5_2k` completed 2,000 actor
+updates from the same selected v3 three-epoch SFT checkpoint as round 5.
+Only both models' rates changed: actor/critic AdamW 5e-5 -> 2e-5 and
+actor/critic Muon 1.2083e-4 -> 4.8333e-5. Reward, GSM8K data/seed,
+sampling, fence, and 33-token floor were unchanged.
+
+Aligned against round 5 at step 2,000:
+- FineWeb BPB 1.6833 vs 1.7744 (0.0911 less drift).
+- Bench accuracy 0.0148 vs 0.0122 (small/noisy), but prompt coverage
+  11/144 vs 4/144 and nonzero module coverage 5/18 vs 3/18.
+- Bench within-group reward std 0.0292 vs 0.0117; emitted mean 93.1 vs
+  41.6 tokens. The 16 saved transcripts stayed 16/16 unique; normalized
+  cross-problem similarity was 0.397 vs 0.646.
+- Training reward 0.0527 vs 0.0508, within-group std 0.0897 vs 0.0255,
+  think mean 53.4 vs 37.4. Zero-reward actor freezes fell 206 -> 16.
+- New arm's held-out peak was 0.0278 at step 1,752 with 16/144 prompt
+  coverage; old arm's best through 2k was 0.0208 at step 500 with
+  10/144 coverage. AIME remained zero in both.
+
+Verdict: KEEP the lower defaults. This is a clear diversity, coverage,
+and retention win without sacrificing train reward. It does not solve
+semantic reasoning: terminal transcripts remain arithmetically
+nonsensical, just less template-collapsed. LR controlled collapse rate
+and severity; the weak generative prior / terminal-only credit remains.
+
+Launch note: jobs 1066 and 1067 failed before training (wrong entry-point
+import, then system Python missing FLA). Their partial startup artifacts
+were preserved at
+`postraining/runs/sft3_rl_answer33_gsm8k_lr2e5_2k.failed_start_1067`;
+1068 used the same `.venv/bin/python -m ...` entry point as round 5.
+
+## 2026-08-02: Canonical single-contract math prompts
+
+Prompt audit found that the answer-fence rewrite preserved DAPO's duplicated
+formatting mechanically: DAPO/DeepMind/AIME rows carried two legacy Answer:
+directives (20 DAPO rows carried a third Chinese directive), and each became a
+complete think/answer fence instruction. All 6,000 DeepMind-family v3 SFT
+documents therefore taught the contract twice; GSM8K taught it once.
+
+Worse, the 173-character DeepMind SFT prefix exceeded normalize_problem's
+160-character identity window. Every one of the 6,000 DeepMind documents
+collided to one split identity; all landed in training and zero entered the
+256-problem SFT holdout/gate panel.
+
+Fix: one shared `math_prompt` contract now strips every known DAPO/DeepMind/
+AIME/GSM8K wrapper (including old fence rewrites and the Chinese reasoning
+directive) and emits exactly `{bare problem}` plus one full suffix:
+`Start your response with <think> ... <answer></answer>.` SFT stores bare
+problem identities for every family; runtime RL/eval, trace generation,
+future GSM8K parquet generation, and OPSD share the same constants.
+`answer_fence_prompt_schema` is stamped and checked across SFT, RL manifests/
+checkpoints, OPSD, initialization, and resume so wording cannot change
+silently. Existing v3 SFT and the live 40k RL run are legacy-schema artifacts;
+regenerate/retrain SFT before a new canonical-schema RL run. The already-
+running process continues with its in-memory legacy code, but its checkpoint
+must not be resumed under the new prompt implementation.
+
+Verification: all 487 postraining CPU tests passed (17 skipped), including
+real-parquet checks that every canonicalized DAPO, GSM8K, AIME, and DeepMind
+prompt contains exactly one of each fence token and no surviving Answer:
+demand. Source parquets and the live run were not rewritten in place.
+
+## 2026-08-02: Live hidden-carry ablation (job 1072, step 13,536)
+
+Matched evaluation while job 1071 continued: 768 GSM8K-train prompts x 4
+samples per arm, same prompt panel/seed; full policy, carry-content zeroed,
+and complete combiner bypass (`token_only`). This is in-distribution after
+many GSM8K epochs, so it measures whether the learned policy uses hidden
+carry, not held-out reasoning generalization.
+
+- Full 0.3337 vs no-content 0.2233: +0.1104, 95% bootstrap CI
+  [+0.0905, +0.1315], permutation p=0.00005.
+- No-content 0.2233 vs token-only 0.1012: +0.1221, CI
+  [+0.1012, +0.1439], p=0.00005.
+- Full vs token-only: +0.2324, CI [+0.2051, +0.2604], p=0.00005.
+- Full/no-content lengths were identical (41.9/41.8 mean), so the carry-
+  content accuracy gain is not a termination-length artifact. Token-only
+  length rose to 59.4 and its occasional tail reached 1024.
+- Mechanistic probe: hidden injection RMS = 0.245x token-embedding RMS;
+  zeroing hidden changed taken-token log probability by 0.112 nats/action
+  absolute mean and critic value by 0.102 absolute mean. The critic hidden-
+  read delta correlated 0.690 with reward.
+- AIME stayed 0/120 in all arms.
+
+Verdict: the current combiner is decisively live and both components matter
+on the memorized GSM8K training distribution: hidden content contributes
+~11 points and the type-bias/MLP pathway another ~12. This overturns the old
+collapsed-policy ablation's accuracy-neutral result, but does not establish
+transfer; a held-out matched arm is still required.
+
+## 2026-08-02: Canonical-v4 SFT selected + DAPO OPSD data built
+
+The immutable HF-only canonical corpus contains 36,286 verified documents
+(9.3M GPT-2 tokens) with the expected source mix. Full CPU tokenization
+validated 35,812 train / 474 held-out documents over 256 held-out problems;
+all completion fences are structurally valid. The corrected held-out set now
+contains 79 DeepMind traces rather than zero. Corpus SHA256:
+`ac398fc38e4db4d5d53cd03594850b96d3be79425fc80f963f326e23f99e8007`.
+
+The first e2/e3 submissions (jobs 1074/1075) failed before training and
+exposed 76 rows whose stored problem retained boundary whitespace while the
+composed document used stripped bytes. The builder now stores the exact
+canonical bare problem; the failed empty run directories and invalid corpus
+artifacts were removed and regenerated. Successful matched arms:
+
+- 1079 e2, 586 steps: holdout completion CE 0.6253.
+- 1080 e3, 879 steps: holdout completion CE 0.6359.
+
+The training-time gates accidentally graded all sources as Minerva and used a
+one-token think minimum. Immutable-checkpoint reruns 1085/1086 corrected the
+79 DeepMind rows to exact style and enforced the corpus p1 think-span floor of
+33 tokens. Corrected e2/e3 metrics respectively were: strict contract
+accuracy 0.0127/0.0332, mixed prompts 0.0859/0.2031, within-group reward std
+0.0300/0.0728, structural format 0.9414/0.9658, and termination
+0.9521/0.9785.
+
+Verdict: select e3. Its slightly worse teacher-forced CE is outweighed by a
+large win on every rollout-learnability and structural metric.
+
+The immutable DAPO OPSD adapter validated 1,791,700 physical rows as 17,917
+conflict-free logical examples, dropped 10 prompts over the 1,024-token
+student cap, and created 17,651 train plus 256 SFT-decontaminated gate rows.
+The wrong-answer control is a deterministic, split-local,
+multiset-preserving answer derangement with no numerically equivalent or self
+donors. Thus train and gate both preserve their own exact answer-frequency
+distribution without borrowing donors across the split. The OPSD loader fully
+audited all 17,651 correct-reference rows with zero runtime rejections. OPSD
+now refuses an explicit answer arm unless its training bytes, held-out gate,
+split schema, and source SFT hash match the immutable DAPO build manifest.
