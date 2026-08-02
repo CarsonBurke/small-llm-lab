@@ -1,0 +1,57 @@
+{
+  "answer_fence_prompt_schema": "bare_problem_single_think_answer_contract/v1",
+  "args": {
+    "answer_tags": true,
+    "k3_jsonl": "",
+    "k3_think_channel": "visible",
+    "output": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+    "seed": 0,
+    "think_tags": true
+  },
+  "doc_tokens": {
+    "maximum": 3582,
+    "total": 9323445
+  },
+  "documents": 36286,
+  "inputs": {
+    "postraining/data/relaxed_bar/a1_math_deepmind.parquet": "4109a20efc985cd119284936cde1fdbec844ca36561112da6b962d055eacedaf",
+    "postraining/data/relaxed_bar/gsm8k_main_train.parquet": "b06b6cf9766f3bb0a47807bb21538f9596d4a8703a6e91dbc6f443541a54ec6a",
+    "postraining/data/relaxed_bar/gsm8k_socratic_train.parquet": "f8a87ab13cf95187080579d849d371f6d9713a381270f86ceb2ff5377f04887d",
+    "postraining/data/relaxed_bar/gsm8k_test_questions.parquet": "13da55c6b95b4e977e36d723476c97b95b5229fa077143f121a2772738f5154a",
+    "postraining/data/relaxed_bar/had653_gsm8k_openmath.parquet": "3180a1a68cbdb83f2a07b8346125396bbbd27ebc80ddeeeefb64d519d1edd30e",
+    "postraining/data/relaxed_bar/openmathinstruct2_gsm8k_band.parquet": "8ff81a9c93a81da1b7d96b600a85ccc5c50a04656285addb58da7e7d7f0093cd",
+    "postraining/data/relaxed_bar/sxiong_synthetic_math.parquet": "48db28c380d66402ab525626b97259c86de697cfe7a69c1eb2fc56eb25c194b4"
+  },
+  "output": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+  "output_sha256": "ac398fc38e4db4d5d53cd03594850b96d3be79425fc80f963f326e23f99e8007",
+  "schema": "verified_math_sft_corpus/v1",
+  "source_counts": {
+    "a1_deepmind": 6000,
+    "gsm8k_socratic": 7362,
+    "had653_gold": 6950,
+    "openmath_gsm8k": 10000,
+    "sxiong_l13": 5974
+  },
+  "stats": {
+    "a1_deepmind/cap_sampled_out": 10977,
+    "a1_deepmind/disagrees_dropped": 14623,
+    "a1_deepmind/kept": 6000,
+    "gsm8k_socratic/contaminated_dropped": 94,
+    "gsm8k_socratic/inconclusive_dropped": 17,
+    "gsm8k_socratic/kept": 7362,
+    "had653_gold/contaminated_dropped": 91,
+    "had653_gold/kept": 6950,
+    "had653_gold/malformed_cot_dropped": 1,
+    "had653_gold/no_gold_join_dropped": 6815,
+    "openmath_gsm8k/augmented_excluded": 138547,
+    "openmath_gsm8k/cap_sampled_out": 4515,
+    "openmath_gsm8k/contaminated_dropped": 188,
+    "openmath_gsm8k/kept": 10000,
+    "openmath_gsm8k/wrong_dropped": 61,
+    "sxiong_l13/contaminated_dropped": 18,
+    "sxiong_l13/duplicate_dropped": 1,
+    "sxiong_l13/kept": 5974,
+    "sxiong_l13/level_excluded": 4415,
+    "sxiong_l13/wrong_dropped": 2
+  }
+}

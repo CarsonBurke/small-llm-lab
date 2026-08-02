@@ -1,0 +1,9 @@
+{
+  "openmathinstruct2_gsm8k_band.parquet": 153311,
+  "a1_math_deepmind.parquet": 31600,
+  "had653_gsm8k_openmath.parquet": 13857,
+  "sxiong_synthetic_math.parquet": 10410,
+  "gsm8k_socratic_train.parquet": 7473,
+  "gsm8k_main_train.parquet": 7473,
+  "gsm8k_test_questions.parquet": 1319
+}
