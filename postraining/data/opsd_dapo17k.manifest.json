@@ -1,0 +1,35 @@
+{
+  "answer_fence_prompt_schema": "bare_problem_single_think_answer_contract/v1",
+  "args": {
+    "context_tokens": 8192,
+    "gate_rows": 256,
+    "max_completion_length": 1024,
+    "max_prompt_length": 1024,
+    "output_prefix": "postraining/data/opsd_dapo17k",
+    "seed": 42,
+    "sft_corpus": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+    "source": "postraining/data/dapo-math-17k.parquet"
+  },
+  "clean_gate_candidates": 15376,
+  "eligible_rows": 17907,
+  "gate": "postraining/data/opsd_dapo17k_gate.parquet",
+  "gate_ids_sha256": "07d3cf5b68e5d7ba3c7d0a899ccf45923fbf326ab283c28da5d728b78a80445f",
+  "gate_rows": 256,
+  "gate_sha256": "6f646a172e5f7e7af71ad953decfe7fc4d8ec6ba9e765706a0c6f87b51b1bbcf",
+  "physical_rows": 1791700,
+  "rejections": {
+    "gate_8gram_sft_overlap": 2530,
+    "gate_exact_sft_overlap": 1,
+    "student_prompt_overflow": 10
+  },
+  "schema": "dapo_opsd_final_answer_privilege/v1",
+  "sft_corpus": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+  "sft_corpus_sha256": "ac398fc38e4db4d5d53cd03594850b96d3be79425fc80f963f326e23f99e8007",
+  "source": "postraining/data/dapo-math-17k.parquet",
+  "source_sha256": "534375d6bb8630d22ab46a56e11f2ffec1d288d8f7d04099bc82d68948705941",
+  "split_schema": "sha256_clean_gate_then_split_local_answer_derangement/v2",
+  "train": "postraining/data/opsd_dapo17k_train.parquet",
+  "train_rows": 17651,
+  "train_sha256": "278c49b9f236cc3dae812ebaec6e67254ec6bf9eda7a5ce444e697557282876a",
+  "unique_rows": 17917
+}
