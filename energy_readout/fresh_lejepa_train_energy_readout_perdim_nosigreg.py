@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import fresh_lejepa_train_v4 as v4
+from pretraining.fresh_lejepa import fresh_lejepa_train_v4 as v4
 import train_gpt as baseline
 import energy_readout.fresh_lejepa_train_energy_readout_perdim as perdim
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ablation import REFERENCE_WARMDOWN_ITERS, build_run_env
+from scripts.ablation import REFERENCE_WARMDOWN_ITERS, build_run_env
 
 
 def test_ablation_uses_reference_warmdown_instead_of_ambient_value(monkeypatch) -> None:

@@ -1,7 +1,7 @@
 """Energy readout with a per-dimension (diagonal-precision) inverse-temperature.
 
 Builds on the BatchNorm-projector arm
-(``fresh_lejepa_train_energy_readout_bnproj.py``).  The scalar global
+(``energy_readout/fresh_lejepa_train_energy_readout_bnproj.py``).  The scalar global
 inverse-temperature ``s = exp(log_s)`` becomes a length-``model_dim`` vector
 ``s_d = exp(log_s_d)``, giving the codebook-energy head a learned diagonal
 precision instead of a single isotropic temperature:
@@ -35,8 +35,8 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 from torch import Tensor, nn
 
-import fresh_lejepa_train as v1
-import fresh_lejepa_train_v1_probe_shared_rms_pope as pope
+from pretraining.fresh_lejepa import fresh_lejepa_train as v1
+from pretraining.fresh_lejepa import fresh_lejepa_train_v1_probe_shared_rms_pope as pope
 import train_gpt as baseline
 import energy_readout.fresh_lejepa_train_energy_readout as energy
 from energy_readout.fresh_lejepa_train_energy_readout_bnproj import (
@@ -171,7 +171,7 @@ def main() -> None:
             codebook = base.energy_codebook().detach().float()
             norm_mean = float(codebook.norm(dim=-1).mean())
             pairdist_mean = float(torch.cdist(codebook, codebook).mean())
-        # churn_stats is ablation.py's stepless fold channel: emitted before
+        # churn_stats is scripts/ablation.py's stepless fold channel: emitted before
         # baseline.main prints the val line, so these keys land inside that val
         # entry in metrics.jsonl and stream to TensorBoard.  Fixed-point
         # formatting is required — the extras parser rejects scientific

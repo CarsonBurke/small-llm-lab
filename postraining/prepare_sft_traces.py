@@ -83,7 +83,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from fresh_lejepa_train import FreshHyperparameters  # noqa: F401 (env parity)
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters  # noqa: F401 (env parity)
 from postraining.core import (
     ANSWER_CLOSE,
     ANSWER_OPEN,

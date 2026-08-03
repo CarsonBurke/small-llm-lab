@@ -8,8 +8,8 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import sparse_learned_xlayer_train_gpt as learned
-from sparse_persistent_xlayer_train_gpt import graph_indices
+from xlayer.sparse import sparse_learned_xlayer_train_gpt as learned
+from xlayer.sparse.sparse_persistent_xlayer_train_gpt import graph_indices
 import train_gpt
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/Triton required")
@@ -80,8 +80,8 @@ def _reference_forward(q, k, v, idx, valid, bias, gate, null_bias, scale):
 
 @cuda_only
 def test_zero_bias_matches_unbiased_kernel_exactly() -> None:
-    from sparse_entmax_kernel import _sparse_entmax_attn_fwd
-    from sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
+    from xlayer.sparse.sparse_entmax_kernel import _sparse_entmax_attn_fwd
+    from xlayer.sparse.sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
 
     q, k, v, idx, valid, _, null = _random_case()
     bias = torch.zeros(q.size(1), idx.size(-1), device=q.device)
@@ -119,7 +119,7 @@ def test_zero_bias_matches_unbiased_kernel_exactly() -> None:
 
 @cuda_only
 def test_biased_gated_forward_matches_fp64_reference() -> None:
-    from sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
+    from xlayer.sparse.sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
 
     q, k, v, idx, valid, bias, null = _random_case(bias_scale=2.0, seed=3)
     gate = 1.0 + 0.3 * torch.randn_like(bias)
@@ -132,7 +132,7 @@ def test_biased_gated_forward_matches_fp64_reference() -> None:
 
 @cuda_only
 def test_dbias_matches_finite_differences() -> None:
-    from sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
+    from xlayer.sparse.sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
 
     q, k, v, idx, valid, bias, null = _random_case(
         bsz=1, heads=2, seqlen=8, kb=8, bias_scale=1.5, seed=5
@@ -162,7 +162,7 @@ def test_dbias_matches_finite_differences() -> None:
 
 @cuda_only
 def test_dgate_matches_finite_differences() -> None:
-    from sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
+    from xlayer.sparse.sparse_wire_bias_kernel import _sparse_entmax_bias_attn_fwd
 
     q, k, v, idx, valid, bias, null = _random_case(
         bsz=1, heads=2, seqlen=8, kb=8, bias_scale=1.5, seed=9
@@ -194,7 +194,7 @@ def test_dgate_matches_finite_differences() -> None:
 
 @cuda_only
 def test_xlayer_bias_list_wrapper_matches_flat_bank() -> None:
-    from sparse_wire_bias_kernel import (
+    from xlayer.sparse.sparse_wire_bias_kernel import (
         _sparse_entmax_bias_attn_fwd,
         xlayer_entmax_bias_attention_stats,
     )

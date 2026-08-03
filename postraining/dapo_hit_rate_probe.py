@@ -19,7 +19,7 @@ import collections
 import torch
 
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import (
     POSTTRAIN_CONTEXT_TOKENS,
     POSTTRAIN_PROMPT_TOKENS,

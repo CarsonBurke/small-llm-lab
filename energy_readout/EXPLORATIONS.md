@@ -86,7 +86,7 @@ autoregressive BPB. A win here would be novel and must be earned by ablation.
 ## Part 3 — What we adopt
 
 Ranked by expected BPB-per-engineering-hour; status maps to the
-implementation in `fresh_lejepa_train_energy_readout.py`.
+implementation in `energy_readout/fresh_lejepa_train_energy_readout.py`.
 
 1. **Energy readout with contrastive hygiene** — log-space temperature with a
    straight-through **clamp** on the scale (`ENERGY_SCALE_MIN`/

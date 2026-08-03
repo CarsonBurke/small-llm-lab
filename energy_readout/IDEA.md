@@ -98,7 +98,7 @@ explicit-MSE anchor can be restored as a fallback ablation without a new fork.
 
 ## What Is Deliberately Different From the Parent
 
-Parent: `fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached.py` — the
+Parent: `pretraining/fresh_lejepa/fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached.py` — the
 latest lejepa-ce variant (1.4009 BPB @ 2k on `mathmix_v4_sp1024`). This is the
 **only** in-repo reference for this family; no other experiment in the repo is
 used as a basis or comparison.
@@ -121,7 +121,7 @@ replacement for the current-token shortcut channel the probe had via its
 ## Scope
 
 Per project owner direction, this family is derived **only** from the current
-lejepa-ce model (`fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached.py`
+lejepa-ce model (`pretraining/fresh_lejepa/fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached.py`
 and the modules it inherits from). No other experiment in this repo is used as
 a reference, basis, or evidence source. If the pure energy readout loses at
 2k, the first fallback is `ENERGY_BIGRAM_TABLE=1` (restores the cheapest form
@@ -191,7 +191,7 @@ FineWeb-only. Trunk shape is already matched by construction —
 `FreshHyperparameters` subclasses the baseline `Hyperparameters`, inheriting
 9 layers × 512 dim × 8 heads (4 KV) × mlp_mult 2, seq 1024, 524,288 batch
 tokens, vocab 1024 (same SP tokenizer), same `fineweb_val` shard. Dataset
-`fineweb_onepass_sp1024` (built by `build_math_mix_dataset.py` with
+`fineweb_onepass_sp1024` (built by `scripts/build_math_mix_dataset.py` with
 `--fineweb-fraction 1.0`, zero-fraction sources now skippable) reshapes the
 baseline's own FineWeb tokens into the strict deterministic one-pass layout
 the belief-attached family requires.
@@ -548,7 +548,7 @@ Superseded by user directive: skip the 10k run. Instead, after the
    Hypothesis: the energy head transfers — it should beat the mini
    baseline's tied softmax if implemented correctly.
 
-### nanogpt-mini baseline (`nanogpt_mini_train.py`)
+### nanogpt-mini baseline (`pretraining/nanogpt_mini/nanogpt_mini_train.py`)
 
 Fork of `modded-nanogpt/records/track_3_optimization/train_gpt_simple.py`
 (the fixed-arch 124M-class optimization-track baseline, per user), NOT the
@@ -573,7 +573,7 @@ comparable to the family's 2k-protocol numbers (different val window,
 schedule, batch — see the fork docstring); the ONLY valid comparison is
 job 255 on this same protocol.
 
-### nanogpt-mini + energy head (`nanogpt_mini_energy_train.py`)
+### nanogpt-mini + energy head (`pretraining/nanogpt_mini/nanogpt_mini_energy_train.py`)
 
 Self-contained fork of the mini baseline (files stay standalone, upstream
 convention). Trunk/loop/optimizer/data/val verbatim; the swap: input path
@@ -643,7 +643,7 @@ the port must keep sum semantics or retune nothing.
 `nanogpt_mini_energy_famreg_1k`: identical to job 255 except the head
 and codebook training regime is restored to the family's — env
 `EMBED_LR=0.05 EMBED_WD=0 EMBED_INIT_STD=0.005 HEAD_SCALAR_LR=0.04
-HEAD_WD=0` (new knobs in `nanogpt_mini_energy_train.py`; defaults
+HEAD_WD=0` (new knobs in `pretraining/nanogpt_mini/nanogpt_mini_energy_train.py`; defaults
 reproduce job 255 bit-for-bit; `scale_min` added to the val canaries).
 
 Motivation (post-H16 dual review): the parity audit found the head CODE
@@ -699,7 +699,7 @@ steepest at the horizon boundary — a 1900-step famreg-vs-baseline pair
 (data ceiling ~1992) is the one run that could still overturn
 non-adoption; not queued, needs a fresh registration if wanted.
 
-`nanogpt_mini_tieddot_1k`, script `nanogpt_mini_tieddot_train.py`: the
+`nanogpt_mini_tieddot_1k`, script `pretraining/nanogpt_mini/nanogpt_mini_tieddot_train.py`: the
 baseline with ONLY the attachment factor changed — untied `proj` head
 replaced by a tied attached dot readout, codebook =
 `rms_norm(embed.weight)` (no stop-grad), logits = softcap_15(s·(z·c_k)
@@ -848,8 +848,8 @@ baseline_2k — the mini sandbox has done its job.
 
 ## Challenge-Lineage: PowerCool Tail (registered before results)
 
-`powercool_2k`, script `powercool_train_gpt.py` (full-file fork of
-train_gpt.py; `diff train_gpt.py powercool_train_gpt.py` shows exactly
+`powercool_2k`, script `ablations/baseline/powercool_train_gpt.py` (full-file fork of
+train_gpt.py; `diff train_gpt.py ablations/baseline/powercool_train_gpt.py` shows exactly
 the schedule hunk + knob + docstring): the linear warmdown
 `scale = remaining/warmdown` becomes `scale = (remaining/warmdown)^p`,
 p = POWERCOOL_P (default 1.2), applied in both the step-based and
@@ -943,7 +943,7 @@ result in the repo.
 
 ## Mini-Lineage: June-19 Record Port (registered before results)
 
-`nanogpt_mini_cwd_2k`, script `nanogpt_mini_cwd_train.py`: per user
+`nanogpt_mini_cwd_2k`, script `pretraining/nanogpt_mini/nanogpt_mini_cwd_train.py`: per user
 direction ("fully aligned with the June 19th version, except for our
 parameter changes"), the mini's tuned-baseline training system is
 replaced WHOLESALE by record #46's
@@ -997,7 +997,7 @@ decomposition), H32 (EMBED_LR 0.7), H33 (tieddot head on the port).
 
 ## Mini-Lineage: GPT-2 Vocab Probe (registered before results)
 
-`nanogpt_mini_gpt2vocab_2k`, script `nanogpt_mini_gpt2vocab_train.py`
+`nanogpt_mini_gpt2vocab_2k`, script `pretraining/nanogpt_mini/nanogpt_mini_gpt2vocab_train.py`
 (user request: "a run with Nano GPT's vocab and embedder"): the mini
 recipe VERBATIM (same trunk 6L×512d, same optimizers/LRs/schedule/init)
 with vocab 50,304 GPT-2 BPE, trained on modded-nanogpt's fineweb10B
@@ -1034,7 +1034,7 @@ compatible question is INTERMEDIATE vocab → sp8192 probe (H34).
 ## Mini-Lineage: sp8192 Vocab Probe (registered before results)
 
 `nanogpt_mini_sp8192_2k`: mini recipe verbatim via new env knobs on
-`nanogpt_mini_train.py` (VOCAB_SIZE, defaults preserve 1024 semantics)
+`pretraining/nanogpt_mini/nanogpt_mini_train.py` (VOCAB_SIZE, defaults preserve 1024 semantics)
 with vocab 8192, fineweb10B_sp8192 shards (2B train tokens, 40.5M val)
 + fineweb_8192_bpe tokenizer. VAL_TOKENS=40,501,248 (largest
 65536-multiple in the val shard; ~134M bytes at ~3.3 bytes/token —
@@ -1070,7 +1070,7 @@ composition run H35.
 ## Mini-Lineage: sp8192 × Record Port + Tied Head (registered before results)
 
 `nanogpt_mini_cwd_tieddot_sp8192_2k`: the H35 composition — record
-port system (`nanogpt_mini_cwd_tieddot_train.py`, tied rms-normed dot
+port system (`pretraining/nanogpt_mini/nanogpt_mini_cwd_tieddot_train.py`, tied rms-normed dot
 head, job 294 = 1.2688 at sp1024) with new VOCAB_SIZE knob (default
 1024 preserves semantics) at vocab 8192, fineweb10B_sp8192 shards,
 VAL_TOKENS=40,501,248. Params ≈ 19.96M − 2·0.52M + 4.19M ≈ 23.1M —
@@ -1130,7 +1130,7 @@ question remain open on paper only.
 ## Mini-Lineage: Machinery-Free Energy Head (registered before results)
 
 `nanogpt_mini_tiedenergy_fullval_2k`, script
-`nanogpt_mini_tiedenergy_train.py` (user direction: "energy only based
+`pretraining/nanogpt_mini/nanogpt_mini_tiedenergy_train.py` (user direction: "energy only based
 on NanoGPT Mini" — the energy score WITHOUT the lejepa machinery whose
 cost/regularization, not the energy form itself, plausibly sank the old
 line): TiedEnergyGPT = logits_k = s·(−½‖norm2(trunk) − e_k‖²) + b_k,
@@ -1172,7 +1172,7 @@ attached-head lineage continues on the DOT form (tieddot, H33).
 
 ## Mini-Lineage: Record-Port Decomposition Probes (registered before results)
 
-Base for both: `nanogpt_mini_cwd_train.py`, anchor = cwd port **1.2692**
+Base for both: `pretraining/nanogpt_mini/nanogpt_mini_cwd_train.py`, anchor = cwd port **1.2692**
 @ 2000 full-val (job 275). Env knobs default to record values, so the
 reference semantics are unchanged.
 
@@ -1229,7 +1229,7 @@ base (sub-bar deltas are within run-to-run noise until replicated).
 
 ## Mini-Lineage: Tieddot Head on the Record Port (registered before results)
 
-`nanogpt_mini_cwd_tieddot_2k`, script `nanogpt_mini_cwd_tieddot_train.py`
+`nanogpt_mini_cwd_tieddot_2k`, script `pretraining/nanogpt_mini/nanogpt_mini_cwd_tieddot_train.py`
 (fork of the cwd port; head-local deltas only — see docstring). Combines
 the two winners: record training system (1.2692) x attached tied dot
 readout (+0.0039 on the mini recipe). Readout scale/bias route to the
@@ -1255,13 +1255,13 @@ BUDGET: tieddot deletes the 0.53M-param untied head at equal BPB, and
 head params scale with vocab — at sp8192 the untied head alone is
 4.2M params, so IF H34 makes 8192 the direction, the tied head is how
 it fits in 16MB. Decision: keep the untied port (1.2692) as the sp1024
-reference base; carry `nanogpt_mini_cwd_tieddot_train.py` as the
+reference base; carry `pretraining/nanogpt_mini/nanogpt_mini_cwd_tieddot_train.py` as the
 param-lean equal-performance variant for vocab rebalancing.
 
 ## Program Note: Attached-Target Line Continues (user direction, 2026-07-22)
 
 The attached-target (tieddot) direction is to be REVISITED, not closed:
-future head iterations are built on top of `nanogpt_mini_tieddot_train.py`
+future head iterations are built on top of `pretraining/nanogpt_mini/nanogpt_mini_tieddot_train.py`
 and ablated against `nanogpt_mini_tieddot_1k` = 1.3451 @ 1k as the mini
 reference (the best param-lean arm; wide-tieddot excluded per user —
 no param increase). I.e., the question shifts from "does attachment
@@ -1273,7 +1273,7 @@ the challenge transfer (tieddot_2k, H25) corroborates at 2k.
 
 ## Challenge-Lineage: Muon Geometry Pack (registered before results)
 
-`muon_geom_2k`, script `muon_geom_train_gpt.py` (full-file fork): the
+`muon_geom_2k`, script `ablations/baseline/muon_geom_train_gpt.py` (full-file fork): the
 CHEAP tier of record #46's Muon levers, grafted into the challenge
 Muon's apply loop in the record's exact order — radial split-scale
 (outward 0.5), per-row u/w floor (target 0.3825, rho 1.0), first-order
@@ -1308,7 +1308,7 @@ genuinely scale-free).
 
 ## Challenge-Lineage: Full Tieddot Head (registered before results)
 
-`tieddot_2k`, script `tieddot_train_gpt.py` (import-and-patch fork like
+`tieddot_2k`, script `ablations/baseline/tieddot_train_gpt.py` (import-and-patch fork like
 tied_bias): the full mini winning head transferred, not just its bias —
 `logits = softcap·tanh((s·(x @ rms_norm(tok_emb).T) + b)/softcap)`.
 Codebook rows rms-normalized (norms stop carrying frequency), zero-init
@@ -1333,7 +1333,7 @@ at 0 → uniform), by design. Single seed, standard 2k protocol.
 
 ## Challenge-Lineage: Tail-EMA Readout (registered before results)
 
-`ema_2k`, script `ema_train_gpt.py` (full-file fork; diff = 4 hunks):
+`ema_2k`, script `ablations/baseline/ema_train_gpt.py` (full-file fork; diff = 4 hunks):
 from warmdown onset (step 800 on the 2k protocol; EMA_START knob) an
 fp32 shadow tracks the weights with decay EMA_BETA (default 0.99, ~100
 step horizon); every val swaps the EMA in and back out; the FINAL step
@@ -1376,7 +1376,7 @@ if readout tricks come back into scope.
 
 ## Challenge-Lineage Transfer: Tied-Head Bias (registered before results)
 
-`tied_bias_2k`, script `tied_bias_train_gpt.py` (import-and-patch fork;
+`tied_bias_2k`, script `ablations/baseline/tied_bias_train_gpt.py` (import-and-patch fork;
 train_gpt.py untouched): the challenge baseline's tied readout —
 `softcap·tanh(x @ tok_emb.T / softcap)`, which already HAS the
 attachment property the mini program isolated — gains the one component
@@ -1409,7 +1409,7 @@ the powercool_2k run (bit-identical to baseline until step 800) read
 at a step where the fork cannot differ. tied_bias read +0.024 at the
 same step. The reference is STALE: baseline_2k was recorded 2026-04-12,
 train_gpt.py's Q/K/V fusion landed 2026-04-15 (e5b90a7; different Muon
-geometry → different trajectory), and until 2026-07-19 ablation.py
+geometry → different trajectory), and until 2026-07-19 scripts/ablation.py
 forced WARMDOWN_ITERS=0 (flat LR) while the current protocol decays
 from step 800 (the half-finished baseline_matched_2k of 2026-04-18 was
 evidently a re-anchor attempt after the fusion). Consequences: (1) the
@@ -1497,7 +1497,7 @@ cost a transient and at best reached parity. Canaries ≈ control. The
 
 `energy_readout_b512_nosigreg_fineweb_2k`: identical to the B512 arm
 (same script) except `FRESH_LEJEPA_SIGREG_WEIGHT=0` (native knob,
-fresh_lejepa_train.py:165, propagates to `sigreg_loss_weight` at import).
+pretraining/fresh_lejepa/fresh_lejepa_train.py:165, propagates to `sigreg_loss_weight` at import).
 Deliberately weight-0 rather than encode-removed: the pooled encode, its
 BN running-stat updates, and the RNG projection draws all still execute
 identically to job 245, so the ONLY difference is the sigreg gradient —
@@ -1573,7 +1573,7 @@ regression.
 
 ## Implementation Notes (from red-team review)
 
-Script: `fresh_lejepa_train_energy_readout.py`. Tests:
+Script: `energy_readout/fresh_lejepa_train_energy_readout.py`. Tests:
 `test_energy_readout.py` (CPU-only, run directly).
 
 - **Parameter registration.** `energy_log_scale` (0-d) and `energy_bias` (1-d)

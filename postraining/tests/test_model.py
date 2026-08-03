@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from fresh_lejepa_train import FreshLeJEPAGPT, SIGReg
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshLeJEPAGPT, SIGReg
 
 
 def tiny_model():

@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 
-import nanogpt_mini_model
+from pretraining.nanogpt_mini import nanogpt_mini_model
 
 RENDERER_FEATURES_SCHEMA = "combined_input+belief/v1"
 ROLLOUT_POLICY_SCHEMA = "deterministic_hidden_carry/v1"

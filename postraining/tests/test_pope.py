@@ -7,11 +7,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fresh_lejepa_train_v1_probe_shared_rms_pope import PolarCausalSelfAttention
-from fresh_lejepa_train_v1_probe_shared_rms_pope_zero import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope import PolarCausalSelfAttention
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_zero import (
     ZeroPhasePolarCausalSelfAttention,
 )
-from fresh_lejepa_train_v1_probe_shared_rms_pope_zero_flash import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_zero_flash import (
     ZeroPhaseFlashPolarCausalSelfAttention,
 )
 

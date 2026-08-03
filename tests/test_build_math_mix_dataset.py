@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import build_math_mix_dataset as builder
-from fresh_lejepa_train import (
+from scripts import build_math_mix_dataset as builder
+from pretraining.fresh_lejepa.fresh_lejepa_train import (
     OnePassTokenStream,
     cumulative_training_step,
     required_stream_tokens,

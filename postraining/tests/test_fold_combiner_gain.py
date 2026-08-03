@@ -17,7 +17,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-import nanogpt_mini_model
+from pretraining.nanogpt_mini import nanogpt_mini_model
 from postraining.fold_combiner_gain import (
     fold_model_state,
     remap_optimizer_state,

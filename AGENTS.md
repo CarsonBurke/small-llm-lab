@@ -55,32 +55,34 @@ Ablation-driven development. Every change must show measurable BPB improvement a
 
 1. Hypothesis: "X should improve BPB because Y"
 2. Implement: fork a script, make the change
-3. Ablate: `mlq submit --name <descriptive_name> --cwd "$PWD" --max-parallel-runs 1 -- python3 ablation.py --steps 2000 --name <descriptive_name> --script <script>`
-4. Compare: check TensorBoard and run `python3 ablation.py --compare`
+3. Ablate: `mlq submit --name <descriptive_name> --cwd "$PWD" --max-parallel-runs 1 -- python3 scripts/ablation.py --steps 2000 --name <descriptive_name> --script <script>`
+4. Compare: check TensorBoard and run `python3 scripts/ablation.py --compare`
 5. Keep or discard based on results
 
 ## Key Files
 
 - `train_gpt.py` — baseline training script (do not modify for experiments)
-- `sota_train_gpt.py` — decompressed #1 submission, patched for SDPA (no FA3)
-- `ablation.py` — ablation runner
-- `plot_ablations.py` — compare runs visually
-- `tb_watcher.py` — live TensorBoard from `metrics.jsonl`
+- `ablations/sota_train_gpt.py` — decompressed #1 submission, patched for SDPA (no FA3)
+- `scripts/ablation.py` — ablation runner
+- `scripts/plot_ablations.py` — compare runs visually
+- `scripts/tb_watcher.py` — live TensorBoard from `metrics.jsonl`
 - `NOTES.md` — working notes, reference numbers, and time estimates
 
 ## Commands
 
 ```bash
-mlq submit --name <name> --cwd "$PWD" --max-parallel-runs 1 -- python3 ablation.py --steps 2000 --name <name>
-mlq submit --name sota_2k --cwd "$PWD" --max-parallel-runs 1 -- python3 ablation.py --script sota_train_gpt.py --name sota_2k
-mlq submit --name lr_sweep --cwd "$PWD" --max-parallel-runs 1 -- python3 ablation.py --sweep lr --steps 2000
-python3 ablation.py --compare
-mlq submit --name <name> --cwd "$PWD" --max-parallel-runs 1 -- python3 ablation.py --name <name> --env KEY=VALUE
+mlq submit --name <name> --cwd "$PWD" --max-parallel-runs 1 -- python3 scripts/ablation.py --steps 2000 --name <name>
+mlq submit --name sota_2k --cwd "$PWD" --max-parallel-runs 1 -- python3 scripts/ablation.py --script ablations/sota_train_gpt.py --name sota_2k
+mlq submit --name lr_sweep --cwd "$PWD" --max-parallel-runs 1 -- python3 scripts/ablation.py --sweep lr --steps 2000
+python3 scripts/ablation.py --compare
+mlq submit --name <name> --cwd "$PWD" --max-parallel-runs 1 -- python3 scripts/ablation.py --name <name> --env KEY=VALUE
 ```
 
 ## Conventions
 
-- Experiment scripts go in the repo root and are named descriptively
+- Operational entry points go in `scripts/`
+- Baseline forks go in `ablations/baseline/`; experiment families stay in their domain folders
+- Versioned pretraining lineages go in `pretraining/<lineage>/`
 - Never modify `train_gpt.py` (upstream baseline); fork it for experiments
 - Metrics go in `ablation_results/<run_name>/metrics.jsonl`
 - Summaries go in `ablation_results/<run_name>/result.json`

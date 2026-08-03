@@ -16,7 +16,7 @@ import math
 import pytest
 import torch
 
-import nanogpt_mini_kda_model as kda_model
+from pretraining.nanogpt_mini import nanogpt_mini_kda_model as kda_model
 from postraining.kda_backbone import NanoKDABackbone
 from postraining.latent_thought import LatentThoughtModel
 from postraining.latent_rollout import (

@@ -5,8 +5,8 @@ import json
 import numpy as np
 import pytest
 
-import build_k3_pretrain_dataset as base
-import build_k3_pretrain_dataset_checkpointed as checkpointed
+from scripts import build_k3_pretrain_dataset as base
+from scripts import build_k3_pretrain_dataset_checkpointed as checkpointed
 
 
 def test_token_cache_round_trip(tmp_path):

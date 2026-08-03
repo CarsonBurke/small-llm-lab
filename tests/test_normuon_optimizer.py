@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-import normuon_train_gpt as normuon
+from ablations.baseline import normuon_train_gpt as normuon
 
 
 def _trading_bot_newton_schulz(

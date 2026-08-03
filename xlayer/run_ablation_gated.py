@@ -1,10 +1,10 @@
-"""Run ablation.py, then exit with the TRAINING script's recorded returncode.
+"""Run scripts/ablation.py, then exit with the TRAINING script's recorded returncode.
 
-ablation.py always exits 0 once it has written result.json, even when the
+scripts/ablation.py always exits 0 once it has written result.json, even when the
 training subprocess failed — which silently satisfies mlq --after-success
 dependency chains.  This wrapper re-reads result.json and propagates the
 recorded returncode so "after-success" means the training actually trained.
-Usage: identical arguments to ablation.py (must include --name).
+Usage: identical arguments to scripts/ablation.py (must include --name).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def main() -> int:
         print("run_ablation_gated: --name is required", file=sys.stderr)
         return 2
     name = args[args.index("--name") + 1]
-    rc = subprocess.call([sys.executable, "ablation.py", *args], cwd=ROOT)
+    rc = subprocess.call([sys.executable, "scripts/ablation.py", *args], cwd=ROOT)
     if rc:
         return rc
     result_path = ROOT / "ablation_results" / name / "result.json"

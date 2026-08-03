@@ -61,7 +61,7 @@ import torch.utils.checkpoint
 from torch import Tensor, nn
 
 import train_gpt as baseline
-from sparse_entmax_attn_train_gpt import MASKED_LOGIT
+from xlayer.sparse.sparse_entmax_attn_train_gpt import MASKED_LOGIT
 
 MAX_LAYERS = 32
 _LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))

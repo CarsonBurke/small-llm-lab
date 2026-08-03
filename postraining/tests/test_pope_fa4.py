@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("flash_attn.cute")
 
-from fresh_lejepa_train_v1_probe_shared_rms_pope_zero_fa4 import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_zero_fa4 import (
     ZeroPhaseFA4PolarCausalSelfAttention,
 )
 

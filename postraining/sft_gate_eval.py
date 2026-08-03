@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import load_posttraining_tokenizer
 from postraining.math_prompt import require_answer_fence_prompt_schema
 from postraining.model_io import load_model

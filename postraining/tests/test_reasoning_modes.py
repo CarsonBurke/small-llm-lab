@@ -8,7 +8,7 @@ import pytest
 import sentencepiece as spm
 import torch
 
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 
 from postraining.latent_rollout import (
     PAD_SLOT,

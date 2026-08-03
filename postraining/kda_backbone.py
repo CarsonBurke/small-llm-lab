@@ -43,7 +43,7 @@ import math
 import torch
 from torch import Tensor
 
-import nanogpt_mini_kda_model as kda_model
+from pretraining.nanogpt_mini import nanogpt_mini_kda_model as kda_model
 from postraining.nano_backbone import _NanoPostrainingMixin
 
 

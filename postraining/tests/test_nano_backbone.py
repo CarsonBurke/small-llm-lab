@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import nanogpt_mini_model
+from pretraining.nanogpt_mini import nanogpt_mini_model
 from postraining.latent_thought import LatentThoughtModel
 from postraining.model_io import fresh_trunk, load_model
 from postraining.nano_backbone import NanoGPTBackbone, NanoTiedDotBackbone

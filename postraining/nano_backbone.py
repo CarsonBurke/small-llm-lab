@@ -33,7 +33,7 @@ Conventions chosen for the latent-thought family:
   ``fresh_trunk`` critics start nano-native with an identity-like residual
   stream instead of PyTorch defaults.
 
-The stepwise/prefill attention mirrors fresh_lejepa_train.py's
+The stepwise/prefill attention mirrors pretraining/fresh_lejepa/fresh_lejepa_train.py's
 ``_attention_step``/``_attention_prefill`` branch-for-branch (int position
 slice-copy; 0-dim tensor position ``index_copy_`` + narrow; 1-D full-cache
 key mask; 2-D per-row left-pad key mask), with the nano deltas: separate
@@ -48,7 +48,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
-import nanogpt_mini_model
+from pretraining.nanogpt_mini import nanogpt_mini_model
 
 NANO_DEFAULT_MODEL_CONFIG = {
     "vocab_size": 1024,

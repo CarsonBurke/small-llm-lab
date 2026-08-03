@@ -63,4 +63,4 @@ echo "Train with:"
 echo "  DATA_PATH=./${dataset_dir} python3 train_gpt.py"
 echo
 echo "Optional math-mix corpus (requires FineWeb above plus math sources under postraining/data/):"
-echo "  python3 build_math_mix_dataset.py --output data/datasets/mathmix_v4_sp1024"
+echo "  python3 scripts/build_math_mix_dataset.py --output data/datasets/mathmix_v4_sp1024"

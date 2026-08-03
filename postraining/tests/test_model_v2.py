@@ -4,17 +4,17 @@ import copy
 
 import torch
 
-from fresh_lejepa_train_v2 import ARCHITECTURE, FreshLeJEPAGPTV2
-from fresh_lejepa_train_v3 import ARCHITECTURE as V3_ARCHITECTURE, FreshLeJEPAGPTV3
-from fresh_lejepa_train_v5_jedi_denoising import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v2 import ARCHITECTURE, FreshLeJEPAGPTV2
+from pretraining.fresh_lejepa.fresh_lejepa_train_v3 import ARCHITECTURE as V3_ARCHITECTURE, FreshLeJEPAGPTV3
+from pretraining.fresh_lejepa.fresh_lejepa_train_v5_jedi_denoising import (
     ARCHITECTURE as JEDI_ARCHITECTURE,
     FreshLeJEPAV5JEDIDenoising,
 )
-from fresh_lejepa_train_v9_belief_transition_jedi import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v9_belief_transition_jedi import (
     ARCHITECTURE as V9_ARCHITECTURE,
     FreshLeJEPAV9BeliefTransition,
 )
-from fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
     ARCHITECTURE as BELIEF_ATTACHED_ARCHITECTURE,
     FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
 )

@@ -10,8 +10,8 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import sparse_persistent_xlayer_train_gpt as persistent
-from ablation import MetricsWriter, parse_log_line
+from xlayer.sparse import sparse_persistent_xlayer_train_gpt as persistent
+from scripts.ablation import MetricsWriter, parse_log_line
 from train_gpt import dequantize_state_dict_int8, quantize_state_dict_int8
 
 
@@ -299,7 +299,7 @@ def test_graph_buffer_value_change_does_not_recompile() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/Triton required")
 def test_actual_graph_and_custom_op_value_change_does_not_recompile() -> None:
-    from sparse_xlayer_kernel import xlayer_entmax_attention_stats
+    from xlayer.sparse.sparse_xlayer_kernel import xlayer_entmax_attention_stats
     from torch._dynamo.testing import CompileCounter
 
     class SparseGraphReader(torch.nn.Module):
@@ -386,8 +386,8 @@ def test_eval_forward_keeps_graph_and_utility_fixed(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/Triton required")
 def test_xlayer_list_wrapper_forward_backward_matches_flat_bank() -> None:
-    from sparse_entmax_kernel import sparse_entmax_attention_stats
-    from sparse_xlayer_kernel import xlayer_entmax_attention_stats
+    from xlayer.sparse.sparse_entmax_kernel import sparse_entmax_attention_stats
+    from xlayer.sparse.sparse_xlayer_kernel import xlayer_entmax_attention_stats
 
     torch.manual_seed(7)
     device = torch.device("cuda")

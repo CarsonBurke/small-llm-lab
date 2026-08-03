@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-from fresh_lejepa_train_v1_probe_shared_rms_yarn import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_yarn import (
     FixedTargetYarnRotary,
     FreshLeJEPASharedRMSV1FixedYarn,
 )

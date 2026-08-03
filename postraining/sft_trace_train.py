@@ -66,7 +66,7 @@ import torch
 import torch.nn.functional as F
 
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import (
     GPT2BPETokenizer,
     encode_prompt,
@@ -86,7 +86,7 @@ from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
 
 SFT_CHECKPOINT_SCHEMA = "sft_trace_train/v1"
 
-# Pretraining AdamW/Muon rates (nanogpt_mini_gpt2vocab_kda_3to1_pm_train.py);
+# Pretraining AdamW/Muon rates (pretraining/nanogpt_mini/nanogpt_mini_gpt2vocab_kda_3to1_pm_train.py);
 # --lr-scale multiplies all of them uniformly. The Muon rate additionally
 # carries POLAR_EXPRESS_STEP_COMPENSATION: postraining's Muon orthogonalizes
 # with Polar Express and drops the rectangular scale, which shrinks the

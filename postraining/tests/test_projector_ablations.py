@@ -2,61 +2,61 @@ from __future__ import annotations
 
 import torch
 
-import fresh_lejepa_train as v1_module
-import fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached as belief_attached_module
-import fresh_lejepa_train_v4_predicted_only as v4_predicted_module
-import fresh_lejepa_train_v4_predictor_dropout as v4_dropout_module
-from fresh_lejepa_train_v2_sigreg_projector import FreshLeJEPAV2SIGRegProjector
-from fresh_lejepa_train_v2_shared_projector import FreshLeJEPAV2SharedProjector
-from fresh_lejepa_train_v2_predicted_only import FreshLeJEPAV2PredictedOnly
-from fresh_lejepa_train_v1_probe_shared_projector import (
+from pretraining.fresh_lejepa import fresh_lejepa_train as v1_module
+from pretraining.fresh_lejepa import fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached as belief_attached_module
+from pretraining.fresh_lejepa import fresh_lejepa_train_v4_predicted_only as v4_predicted_module
+from pretraining.fresh_lejepa import fresh_lejepa_train_v4_predictor_dropout as v4_dropout_module
+from pretraining.fresh_lejepa.fresh_lejepa_train_v2_sigreg_projector import FreshLeJEPAV2SIGRegProjector
+from pretraining.fresh_lejepa.fresh_lejepa_train_v2_shared_projector import FreshLeJEPAV2SharedProjector
+from pretraining.fresh_lejepa.fresh_lejepa_train_v2_predicted_only import FreshLeJEPAV2PredictedOnly
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_projector import (
     FreshLeJEPASharedProjectorV1Probes,
 )
-from fresh_lejepa_train import ResidualProbe
-from fresh_lejepa_train_v1_probe_shared_rms_projector import (
+from pretraining.fresh_lejepa.fresh_lejepa_train import ResidualProbe
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_projector import (
     FreshLeJEPASharedRMSProjectorV1Probes,
     RMSTokenProjector,
 )
-from fresh_lejepa_train_v1_probe_shared_rms_pope import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope import (
     FreshLeJEPASharedRMSV1PoPE,
 )
-from fresh_lejepa_train_v1_probe_shared_rms_pope_attached import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_attached import (
     FreshLeJEPASharedRMSV1PoPEAttachedCE,
 )
-from fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
     FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
 )
-from fresh_lejepa_train_v4 import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v4 import (
     FreshLeJEPAV4,
     LearnedOutputCriticProbe,
     LearnedOutputPolicyProbe,
     _install_configurable_accumulation,
 )
-from fresh_lejepa_train_v4_predicted_only import FreshLeJEPAV4PredictedOnly
-from fresh_lejepa_train_v4_predictor_dropout import FreshLeJEPAV4PredictorDropout
-from fresh_lejepa_train_v5_swiglu import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v4_predicted_only import FreshLeJEPAV4PredictedOnly
+from pretraining.fresh_lejepa.fresh_lejepa_train_v4_predictor_dropout import FreshLeJEPAV4PredictorDropout
+from pretraining.fresh_lejepa.fresh_lejepa_train_v5_swiglu import (
     FreshLeJEPAV5SwiGLU,
     PreNormSwiGLUBlock,
     SwiGLUCriticProbe,
     SwiGLUPolicyProbe,
 )
-from fresh_lejepa_train_v5_dropout_only import FreshLeJEPAV5DropoutOnly
-from fresh_lejepa_train_v5_belief_only import FreshLeJEPAV5BeliefOnly
-from fresh_lejepa_train_v5_jedi_denoising import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v5_dropout_only import FreshLeJEPAV5DropoutOnly
+from pretraining.fresh_lejepa.fresh_lejepa_train_v5_belief_only import FreshLeJEPAV5BeliefOnly
+from pretraining.fresh_lejepa.fresh_lejepa_train_v5_jedi_denoising import (
     FreshLeJEPAV5JEDIDenoising,
     edm_coefficients,
 )
-from fresh_lejepa_train_v6_belief_dropout import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v6_belief_dropout import (
     BeliefOnlyCriticProbe,
     BeliefOnlyPolicyProbe,
     FreshLeJEPAV6BeliefDropout,
 )
-from fresh_lejepa_train_v7_preproj_belief import FreshLeJEPAV7PreProjBelief
-from fresh_lejepa_train_v8_token_swiglu import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v7_preproj_belief import FreshLeJEPAV7PreProjBelief
+from pretraining.fresh_lejepa.fresh_lejepa_train_v8_token_swiglu import (
     FreshLeJEPAV8TokenSwiGLU,
     SharedTokenEncoder,
 )
-from fresh_lejepa_train_v9_belief_transition_jedi import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v9_belief_transition_jedi import (
     FreshLeJEPAV9BeliefTransition,
 )
 

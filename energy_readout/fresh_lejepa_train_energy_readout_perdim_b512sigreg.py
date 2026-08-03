@@ -1,7 +1,7 @@
 """Per-dim energy readout with one pooled B=512 SIGReg statistic per step.
 
 Builds on the per-dimension scale arm
-(``fresh_lejepa_train_energy_readout_perdim.py``).  The paired scheme computes
+(``energy_readout/fresh_lejepa_train_energy_readout_perdim.py``).  The paired scheme computes
 four B=128 statistics per optimizer step (one per microbatch pair); le-wm
 computes exactly ONE statistic per step on its whole batch.  This module is the
 fully aligned version: all eight B=64 microbatches of a step are re-encoded in
@@ -43,7 +43,7 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 from torch import Tensor
 
-import fresh_lejepa_train_v4 as v4
+from pretraining.fresh_lejepa import fresh_lejepa_train_v4 as v4
 import train_gpt as baseline
 import energy_readout.fresh_lejepa_train_energy_readout_perdim as perdim
 

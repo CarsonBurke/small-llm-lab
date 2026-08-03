@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import energy_readout.fresh_lejepa_train_energy_readout as energy
-from fresh_lejepa_train_v2_sigreg_projector import TokenProjector
+from pretraining.fresh_lejepa.fresh_lejepa_train_v2_sigreg_projector import TokenProjector
 
 ARCHITECTURE = "energy_readout_lejepa_tied_codebook_bnproj_onepass_2k"
 

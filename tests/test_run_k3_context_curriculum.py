@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from run_k3_context_curriculum import (
+from scripts.run_k3_context_curriculum import (
     curriculum_stages,
     relay_stage_output,
     validate_training_manifest,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.hl_gauss import HLGaussSupport, anchored_unit_geometry
 from postraining.latent_rollout import (
     PAD_SLOT,

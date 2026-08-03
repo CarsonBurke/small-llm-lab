@@ -15,10 +15,10 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 
-import fresh_lejepa_train as v1
+from pretraining.fresh_lejepa import fresh_lejepa_train as v1
 import train_gpt as baseline
 import energy_readout.fresh_lejepa_train_energy_readout_perdim_nosigreg as nosig
-from fresh_lejepa_train_v2_sigreg_projector import TokenProjector
+from pretraining.fresh_lejepa.fresh_lejepa_train_v2_sigreg_projector import TokenProjector
 
 VOCAB, LAYERS, DIM, HEADS, KV_HEADS = 64, 2, 64, 2, 1
 BATCH, SEQ = 2, 16
@@ -132,7 +132,7 @@ def test_install_signature_matches_v4_installer() -> None:
     """pope.main calls the installer by keyword; signatures must match."""
     import inspect as _inspect
 
-    import fresh_lejepa_train_v4 as v4
+    from pretraining.fresh_lejepa import fresh_lejepa_train_v4 as v4
 
     v4_params = _inspect.signature(v4._install_configurable_accumulation).parameters
     nosig_params = _inspect.signature(nosig._install_nosigreg_accumulation).parameters

@@ -34,10 +34,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-import fresh_lejepa_train as v1
-import fresh_lejepa_train_v1_probe_shared_rms_pope as pope
+from pretraining.fresh_lejepa import fresh_lejepa_train as v1
+from pretraining.fresh_lejepa import fresh_lejepa_train_v1_probe_shared_rms_pope as pope
 import train_gpt as baseline
-from fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
+from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
     FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
 )
 
@@ -287,7 +287,7 @@ def main() -> None:
             codebook = base.energy_codebook().detach().float()
             norm_mean = float(codebook.norm(dim=-1).mean())
             pairdist_mean = float(torch.cdist(codebook, codebook).mean())
-        # churn_stats is ablation.py's stepless fold channel: emitted before
+        # churn_stats is scripts/ablation.py's stepless fold channel: emitted before
         # baseline.main prints the val line, so these keys land inside that
         # val entry in metrics.jsonl and stream to TensorBoard.  Fixed-point
         # formatting is required — the extras parser rejects scientific

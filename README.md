@@ -26,6 +26,15 @@ The challenge runs from March 18th to April 30th.
 
 Happy training!
 
+## Repository layout
+
+- `train_gpt.py` and `train_gpt_mlx.py` are the untouched upstream entry points.
+- `scripts/` contains ablation, data-building, plotting, benchmarking, and validation commands.
+- `ablations/` contains experimental baseline forks and reference implementations.
+- `pretraining/` contains versioned model lineages and corpus configuration.
+- `postraining/`, `energy_readout/`, and `xlayer/` keep domain-specific code together.
+- `tests/` and `postraining/tests/` contain the unit test suites; `records/` is immutable submission history.
+
 ## Leaderboard
 
 | Run | Score | Author | Summary | Date | Info |

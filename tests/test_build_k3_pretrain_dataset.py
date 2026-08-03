@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from build_k3_pretrain_dataset import (
+from scripts.build_k3_pretrain_dataset import (
     DocumentDeduplicator,
     LoaderAlignedShardWriter,
     RawDocument,

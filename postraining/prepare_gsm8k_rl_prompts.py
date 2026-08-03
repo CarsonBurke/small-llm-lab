@@ -25,7 +25,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import load_dataset
 
-from fresh_lejepa_train import FreshHyperparameters  # noqa: F401 (env parity)
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters  # noqa: F401 (env parity)
 from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX, normalize_problem
 from postraining.sft_trace_train import load_documents, split_holdout
 

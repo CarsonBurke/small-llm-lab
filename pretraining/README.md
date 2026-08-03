@@ -37,16 +37,16 @@ Remote data and corpus construction are ML preprocessing workloads:
 
 ```bash
 mlq submit --name k3_sources --cwd "$PWD" --max-parallel-runs 1 -- \
-  python3 prepare_k3_pretrain_sources.py
+  python3 scripts/prepare_k3_pretrain_sources.py
 
 mlq submit --name k3mix_v5_gpt2_2k --cwd "$PWD" --max-parallel-runs 1 -- \
-  python3 build_k3_pretrain_dataset.py \
+  python3 scripts/build_k3_pretrain_dataset.py \
     --output data/datasets/k3mix_v5_gpt2_2k \
     --training-steps 2000
 
 mlq submit --name k3mix_v5_web80_gpt2_2k --cwd "$PWD" \
   --max-parallel-runs 1 -- \
-  python3 build_k3_pretrain_dataset.py \
+  python3 scripts/build_k3_pretrain_dataset.py \
     --weights pretraining/k3_weights_web80.json \
     --output data/datasets/k3mix_v5_web80_gpt2_2k \
     --training-steps 2000 \
@@ -71,11 +71,11 @@ Build the 20,000-step, 10.49B-token corpus:
 ```bash
 mlq submit --name k3_quality_sources_full --cwd "$PWD" \
   --max-parallel-runs 1 -- \
-  python3 prepare_k3_pretrain_sources.py --full-source-set
+  python3 scripts/prepare_k3_pretrain_sources.py --full-source-set
 
 mlq submit --name k3_quality_20k_data --cwd "$PWD" \
   --max-parallel-runs 1 -- \
-  python3 build_k3_pretrain_dataset_checkpointed.py \
+  python3 scripts/build_k3_pretrain_dataset_checkpointed.py \
     --weights pretraining/k3_weights_quality.json \
     --full-source-set \
     --training-steps 20000 \
@@ -89,7 +89,7 @@ Then run the KKKDKKKD curriculum:
 mlq submit --name k3_quality_20k_train --cwd "$PWD" \
   --max-parallel-runs 1 -- \
   /home/marvin/Documents/repositories/parameter-golf/.venv/bin/python \
-  run_k3_context_curriculum.py \
+  scripts/run_k3_context_curriculum.py \
     --data data/datasets/k3mix_v7_quality_gpt2_20k \
     --run-id k3_quality_20k \
     --steps 20000 \

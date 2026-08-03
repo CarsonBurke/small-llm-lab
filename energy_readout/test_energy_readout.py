@@ -17,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 import torch.nn.functional as F
 
-import fresh_lejepa_train as v1
+from pretraining.fresh_lejepa import fresh_lejepa_train as v1
 import energy_readout.fresh_lejepa_train_energy_readout as energy
 
 VOCAB, LAYERS, DIM, HEADS, KV_HEADS = 64, 2, 64, 2, 1
