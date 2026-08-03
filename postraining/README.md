@@ -27,7 +27,7 @@ base still requires:
    rollout gate pass.
 
 The KDA adapter for gate 3 exists: `postraining/kda_backbone.py`
-(`NanoKDABackbone` over the import-safe `nanogpt_mini_kda_model.py`) loads
+(`NanoKDABackbone` over the import-safe `pretraining/nanogpt_mini/nanogpt_mini_kda_model.py`) loads
 `*_kda_*` checkpoints through `model_io.load_model` with zero key mapping.
 Dense MHA layers keep KV caches; KDA mixers carry
 `(conv_q, conv_k, conv_v, state)` decode caches — the delta-rule state is
@@ -187,19 +187,49 @@ teacher-uplift gate before authorizing any OPSD updates:
   --sft-corpus postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet
 
 mlq submit \
-  --name opsd_dapo_teacher_uplift_v1 \
+  --name opsd_dapo_teacher_uplift_contractlast_512_v3 \
   --cwd "$PWD" \
   --max-parallel-runs 1 \
   -- \
   .venv/bin/python -m postraining.opsd.teacher_uplift \
-    --name opsd_dapo_teacher_uplift_v1 \
-    --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt
+    --name opsd_dapo_teacher_uplift_contractlast_512_v3 \
+    --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
+    --gate-data postraining/data/opsd_dapo17k_contractlast_gate.parquet \
+    --data-manifest postraining/data/opsd_dapo17k_contractlast.manifest.json \
+    --rows 512
 ```
 
-The DAPO parquet contains final answers rather than worked reference traces,
-so its teacher prompt explicitly describes privileged final-answer
-information. A deterministic answer-derangement arm controls for generic
-self-distillation and prompt/style effects.
+The paper's main method conditions the frozen teacher on a worked reference
+solution; its teacher does not generate another trace. DAPO contains only
+verified final answers, so applying OPSD to DAPO is an explicit answer-only
+extension rather than a reproduction of Algorithm 1. The development gate
+tests the released code's optional explicit-rationalization idea without
+importing traces from another model: the frozen SFT checkpoint generates
+separate question-only, correct-answer, and permuted-answer think prefixes,
+and only those fixed prefixes condition teacher scoring. They are never SFT
+targets. Each prefix is mechanically filtered, stripped to think content,
+and cut to one fixed token budget; the rationale sample is different from
+the frozen student response being scored.
+
+A deterministic answer-derangement arm controls for generic self-distillation
+and prompt/style effects. Correct and permuted donors are matched by encoded
+answer length, and every rationale arm uses the same token budget, so all
+compared teacher logits begin at identical positions. The direct incremental
+control combines the correct answer with an independent question-only
+self-rationale. This distinguishes useful answer-conditioned derivation from
+the effect of merely revealing the final answer.
+
+OPSD authorization requires two frozen gates. The generation gate checks
+strict fenced correctness, format, termination, repetition, and loops. The
+paired-logit gate scores exactly the same question-only response tokens under
+all teacher contexts. Its primary endpoints require the correct-rationale
+teacher to outperform both the permuted-rationale control and the direct
+correct-answer control on answer-masked, pre-conclusion think tokens. The
+advantage must survive the exact pointwise-clipped OPSD update and comprise a
+material fraction of its gradient. Final-answer likelihood alone is only a
+copying sanity check and cannot authorize training. Panels already inspected
+during design are development-only; only a fresh sealed panel can produce an
+authorization artifact.
 
 Training is a model workload and must go through `mlq`:
 
@@ -212,9 +242,11 @@ mlq submit \
   .venv/bin/python -m postraining.train_opsd \
     --name opsd_v1 \
     --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
-    --dataset postraining/data/opsd_dapo17k_train.parquet \
+    --dataset postraining/data/opsd_dapo17k_contractlast_train.parquet \
     --reference-column solution \
-    --data-manifest postraining/data/opsd_dapo17k.manifest.json
+    --data-manifest postraining/data/opsd_dapo17k_contractlast.manifest.json \
+    --authorization \
+      postraining/runs/opsd_dapo_contractlast_512_authorization_v3/results.json
 ```
 
 The run writes versioned step exports, an exact-resume

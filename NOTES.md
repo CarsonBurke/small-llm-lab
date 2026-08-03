@@ -30,7 +30,7 @@ Post-quantization submission score: **1.2244 BPB**
 - Metrics JSONL: `ablation_results/<run>/metrics.jsonl`
 - Tensorboard: `http://localhost:6006` (logs in `tb_logs/`)
 - Results JSON: `ablation_results/<run>/result.json`
-- Plot: `python3 plot_ablations.py`
+- Plot: `python3 scripts/plot_ablations.py`
 
 ## Time Estimates (RTX 5090)
 | Steps | Time |
@@ -43,25 +43,25 @@ Post-quantization submission score: **1.2244 BPB**
 ## Commands
 ```bash
 # Quick ablation (2000 steps, default)
-python3 ablation.py
+python3 scripts/ablation.py
 
 # Custom step count
-python3 ablation.py --steps 2000 --name baseline_2k
+python3 scripts/ablation.py --steps 2000 --name baseline_2k
 
 # Sweep learning rates
-python3 ablation.py --sweep lr --steps 2000
+python3 scripts/ablation.py --sweep lr --steps 2000
 
 # Compare results
-python3 ablation.py --compare
+python3 scripts/ablation.py --compare
 
 # Plot
-python3 plot_ablations.py
+python3 scripts/plot_ablations.py
 
 # Full baseline (match official)
-python3 ablation.py --steps 13780 --name baseline_full
+python3 scripts/ablation.py --steps 13780 --name baseline_full
 
 # Manual single run with env overrides
-python3 ablation.py --steps 2000 --name my_test --env MODEL_DIM=640 NUM_HEADS=10
+python3 scripts/ablation.py --steps 2000 --name my_test --env MODEL_DIM=640 NUM_HEADS=10
 ```
 
 ## Post-training: Nano GPT backbones + reasoning modes (2026-07-22)
@@ -81,7 +81,7 @@ fresh 5120/1024/1024/4096 (ctx/prompt/response/stream), nano 1024/512/256/512
 via mode-tagged rollout policy schemas, so cross-mode resume fails loudly.
 
 Nano pretraining scripts save `logs/<RUN_ID>_final_model.pt` (model classes extracted
-to `nanogpt_mini_model.py`). RL prerequisite: pretrain on `mathmix_v4_sp1024`
+to `pretraining/nanogpt_mini/nanogpt_mini_model.py`). RL prerequisite: pretrain on `mathmix_v4_sp1024`
 (`DATA_PATH` env), then gate with `python3 -m postraining.dapo_hit_rate_probe
 --checkpoint <ckpt>` (needs ≥1 positive group + within-group reward variance).
 
@@ -112,7 +112,7 @@ cot stream — jobs 296-302 rebuild the sp1024 mathmix bases at 4096 and re-gate
   `<|endoftext|>`=50256 is both BOS and EOS, so stop ids dedupe to (50256,).
 - BPB guard: `data/tokenizers/gpt2_byte_lut.pt` + zeroed correction tables fed
   to `eval_val` = direct LUT byte sum; val default `data/datasets/fineweb10B_gpt2`.
-- `build_math_mix_dataset.py --tokenizer gpt2` builds the same mix under GPT-2
+- `scripts/build_math_mix_dataset.py --tokenizer gpt2` builds the same mix under GPT-2
   BPE (QA docs drop their final EOS: the next doc's leading token terminates
   the last answer; keeping both would pretrain a doubled stop token).
 
@@ -2416,7 +2416,7 @@ The k3 campaign's checkpoints (`*_kda_kkkdkkkd_mixers_v3`) could not load into
 post-training at all: `model_io` refused `_kda_` architectures. Built the
 adapter while the v8 data build (989) runs:
 
-- `nanogpt_mini_kda_model.py` — import-safe extraction of the KDA training
+- `pretraining/nanogpt_mini/nanogpt_mini_kda_model.py` — import-safe extraction of the KDA training
   script (byte-matched classes; env config -> constructor args carried by the
   checkpoint's `model_config`). Carries a pure-PyTorch reference recurrence
   matching FLA `chunk_kda` under the training flags (l2norm eps INSIDE sqrt,
@@ -2456,7 +2456,7 @@ the recurrence derivation by executing it against FLA's naive_recurrent_kda
 compaction/expansion branches to actual line hits, and confirmed the
 compile posture (step_core fullgraph OK; replay needs graph breaks exactly
 because the mixer is compiler-disabled). Fixes applied from its findings:
-- `nanogpt_mini_kda_model.py` now calls chunk_kda with
+- `pretraining/nanogpt_mini/nanogpt_mini_kda_model.py` now calls chunk_kda with
   disable_recompute=False (pretraining ships True for backward speed on
   8xH100; in grad-enabled replay it would retain per-layer w/u/qg/kg/v_new/h
   at replay-shard width — roughly a GiB extra across 6 mixers at 24576
@@ -2514,7 +2514,7 @@ red-team review:
   KimiDeltaAttention.forward is compiler-disabled, and
   counters["stats"]["unique_graphs"] counts only Dynamo forward graphs.
 
-Fix (nanogpt_mini_kda_model.py, single chunk_kda call site): varlen form.
+Fix (pretraining/nanogpt_mini/nanogpt_mini_kda_model.py, single chunk_kda call site): varlen form.
 Flatten [B, T] -> [1, B*T] with uniform cu_seqlens (+ cu_seqlens_cpu twin,
 no H2D copy; device arange + CPU arange). Same per-row math — chunking
 and state resets are per sequence — but B == 1 for every shard, so each
@@ -4077,3 +4077,44 @@ distribution without borrowing donors across the split. The OPSD loader fully
 audited all 17,651 correct-reference rows with zero runtime rejections. OPSD
 now refuses an explicit answer arm unless its training bytes, held-out gate,
 split schema, and source SFT hash match the immutable DAPO build manifest.
+
+## 2026-08-02: Answer-only self-rationalized OPSD development gate
+
+Paper/source audit used arXiv 2601.18734v3 and the authors' repository at
+commit `7448751f307a9cdbcc1246dd1565a1a605b443df`. Algorithm 1 conditions the
+frozen teacher on a worked reference solution and does not sample a teacher
+trace. The released `reason_first` option does sample one, but is disabled in
+the main reproduction and expects a worked reference. DAPO has only verified
+final answers, so the experiment below is explicitly a same-model,
+answer-only extension—not a paper reproduction.
+
+The development gate reused the already inspected 512-prompt panel and is
+therefore ineligible for authorization. For each of 4,096 frozen
+question-only responses, the rationale source used sample `(j + 1) mod 8` so
+the scored response never conditioned its own teacher. Question, correct-
+answer, and permuted-answer rationales came only from the frozen v4 SFT
+checkpoint, were stripped to think content, symmetrically filtered, and cut
+to exactly 96 tokens. Correct/permuted/direct teacher response positions were
+identical. The direct control paired the correct answer with the independent
+question-only rationale. Primary scoring excluded answer-equivalent spans and
+the last think quartile.
+
+Job 1171 result (`opsd_dapo_self_rationalized_dev96_v3`): underpowered and no
+evidence of a correctness-directed OPSD update. It retained 2,540/4,096
+rationale triplets (62.0%), leaving 27 correct and 2,316 incorrect structured
+responses across 23 mixed prompts. Correct-rationale AUC uplift was +0.0371
+versus both direct and permuted controls, with both confidence intervals
+crossing zero and permutation p >= 0.31. Exact clipped-update correctness
+contrast was +0.00029 versus direct (CI crosses zero, p=0.813) and -0.00045
+versus permuted (CI crosses zero, p=0.692). Answer-token sanity was also not
+robustly positive.
+
+The contexts changed the gradient substantially—correct/control gradient
+delta was roughly 1.25-1.38x the correct-teacher gradient norm—but that change
+did not align with response correctness. Mean pre-conclusion forward KL was
+0.154 for correct and permuted rationales versus 0.141 for the direct control;
+correct/permuted gradient cosine was 0.567. This is dense context/style signal,
+not demonstrated mathematical supervision. Verdict: do not create a sealed
+authorization panel and do not train this answer-only self-rationalized OPSD
+variant. A fresh panel would only be justified by a new mechanism that first
+shows a material correctness-directed update on development data.
