@@ -44,6 +44,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "solution and permuted-solution arms."
         ),
     )
+    parser.add_argument(
+        "--authorization",
+        default=None,
+        help=(
+            "Dual frozen-gate pass artifact. Required for explicit DAPO "
+            "solution and permuted-solution training arms."
+        ),
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--effective-batch-size", type=int, default=32)

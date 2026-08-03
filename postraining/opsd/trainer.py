@@ -11,17 +11,20 @@ from pathlib import Path
 
 import torch
 
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import load_posttraining_tokenizer
 from postraining.latent_rollout import emitted_token_rows, rollout_continuations
 from postraining.latent_thought import LatentThoughtModel
 from postraining.model_io import load_model
 from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
 from postraining.opsd.config import resolved_distillation_temperature
+from postraining.opsd.authorize import OPSD_AUTHORIZATION_SCHEMA
 from postraining.opsd.data import (
     ShuffledExampleSampler,
+    TEACHER_PROMPT_SCHEMA,
     file_sha256,
     load_examples,
+    resolve_reference_column,
     tokenize_example,
 )
 from postraining.opsd.loss import backward_opsd_example
@@ -44,6 +47,7 @@ _RESUME_EXACT_FIELDS = (
     "dataset",
     "reference_column",
     "data_manifest",
+    "authorization",
     "effective_batch_size",
     "rollout_batch_size",
     "max_completion_length",
@@ -63,9 +67,9 @@ _RESUME_EXACT_FIELDS = (
     "answer_fence",
 )
 
-_DAPO_MANIFEST_SCHEMA = "dapo_opsd_final_answer_privilege/v1"
+_DAPO_MANIFEST_SCHEMA = "dapo_opsd_final_answer_privilege/v2"
 _DAPO_SPLIT_SCHEMA = (
-    "sha256_clean_gate_then_split_local_answer_derangement/v2"
+    "sha256_clean_gate_then_split_local_token_length_answer_derangement/v3"
 )
 
 
@@ -86,6 +90,10 @@ def validate_data_manifest(args, payload: dict) -> dict[str, object] | None:
         raise ValueError(
             "OPSD data manifest lacks the split-local permutation contract"
         )
+    if manifest.get("teacher_prompt_schema") != TEACHER_PROMPT_SCHEMA:
+        raise ValueError("OPSD data manifest has a different teacher prompt")
+    if manifest.get("opsd_prompt_schema") != OPSD_PROMPT_SCHEMA:
+        raise ValueError("OPSD data manifest has a different OPSD prompt schema")
     dataset_sha256 = file_sha256(args.dataset)
     if dataset_sha256 != manifest.get("train_sha256"):
         raise ValueError("OPSD dataset does not match manifest train bytes")
@@ -107,6 +115,40 @@ def validate_data_manifest(args, payload: dict) -> dict[str, object] | None:
         "train_sha256": manifest["train_sha256"],
         "gate_sha256": manifest["gate_sha256"],
         "sft_corpus_sha256": manifest["sft_corpus_sha256"],
+    }
+
+
+def validate_authorization(
+    args, payload: dict, data_manifest: dict[str, object] | None
+) -> dict[str, object] | None:
+    controlled_columns = {"solution", "permuted_solution"}
+    if args.authorization is None:
+        if args.reference_column in controlled_columns:
+            raise ValueError(
+                "--authorization is required for explicit final-answer OPSD arms"
+            )
+        return None
+    if data_manifest is None:
+        raise ValueError("OPSD authorization requires a validated data manifest")
+    path = Path(args.authorization)
+    authorization = json.loads(path.read_text())
+    if authorization.get("schema") != OPSD_AUTHORIZATION_SCHEMA:
+        raise ValueError("OPSD authorization has an incompatible schema")
+    if authorization.get("decision") != "pass":
+        raise ValueError("OPSD authorization decision is not pass")
+    if authorization.get("checkpoint_sha256") != file_sha256(args.checkpoint):
+        raise ValueError("OPSD authorization used different checkpoint bytes")
+    if authorization.get("data_manifest_sha256") != data_manifest["sha256"]:
+        raise ValueError("OPSD authorization used a different data manifest")
+    if authorization.get("gate_sha256") != data_manifest["gate_sha256"]:
+        raise ValueError("OPSD authorization used different held-out gate bytes")
+    return {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "schema": authorization["schema"],
+        "checkpoint_sha256": authorization["checkpoint_sha256"],
+        "data_manifest_sha256": authorization["data_manifest_sha256"],
+        "gate_sha256": authorization["gate_sha256"],
     }
 
 
@@ -161,6 +203,12 @@ def infer_source_contract(args, payload: dict) -> None:
 
 def validate_source_contract(args, payload: dict) -> dict[str, object]:
     """Static compatibility gate used by both --validate-only and training."""
+    # Resolve the effective arm before validating its manifest/authorization.
+    # Otherwise ``auto`` on DAPO silently resolves to the controlled
+    # ``solution`` arm only after those fail-closed gates have been skipped.
+    args.reference_column = resolve_reference_column(
+        args.dataset, args.reference_column
+    )
     architecture = payload.get("architecture")
     model_config = payload.get("model_config")
     if not architecture or not isinstance(model_config, dict):
@@ -185,6 +233,7 @@ def validate_source_contract(args, payload: dict) -> dict[str, object]:
         answer_tokens=args.answer_fence,
     )
     data_manifest = validate_data_manifest(args, payload)
+    authorization = validate_authorization(args, payload, data_manifest)
     examples = load_examples(
         args.dataset,
         answer_fence=args.answer_fence,
@@ -229,6 +278,7 @@ def validate_source_contract(args, payload: dict) -> dict[str, object]:
         ),
         "dataset": args.dataset,
         "data_manifest": data_manifest,
+        "authorization": authorization,
     }
 
 
@@ -295,6 +345,7 @@ def _export_payload(
     source_sha256: str,
     dataset_sha256: str,
     data_manifest_sha256: str | None = None,
+    authorization_sha256: str | None = None,
 ) -> dict:
     is_permuted_control = getattr(args, "reference_column", None) == (
         "permuted_solution"
@@ -333,6 +384,8 @@ def _export_payload(
         "dataset_sha256": dataset_sha256,
         "data_manifest": getattr(args, "data_manifest", None),
         "data_manifest_sha256": data_manifest_sha256,
+        "authorization": getattr(args, "authorization", None),
+        "authorization_sha256": authorization_sha256,
         "args": vars(args),
         "parent_opsd": source_payload.get("opsd"),
     }
@@ -360,6 +413,8 @@ class OPSDTrainer:
     def __init__(self, args, source_payload: dict):
         if not torch.cuda.is_available():
             raise RuntimeError("OPSD training requires CUDA; submit it through mlq")
+        data_manifest_contract = validate_data_manifest(args, source_payload)
+        validate_authorization(args, source_payload, data_manifest_contract)
         self.args = args
         # Keep lineage metadata, not a third long-lived CPU copy of the base
         # weights. The two GPU roles are constructed from ``source_payload``
@@ -376,6 +431,9 @@ class OPSDTrainer:
         self.dataset_sha256 = file_sha256(args.dataset)
         self.data_manifest_sha256 = (
             file_sha256(args.data_manifest) if args.data_manifest else None
+        )
+        self.authorization_sha256 = (
+            file_sha256(args.authorization) if args.authorization else None
         )
         self.context_tokens = int(source_payload.get("train_seq_len", 1024))
 
@@ -449,6 +507,8 @@ class OPSDTrainer:
             raise ValueError("resume checkpoint has an incompatible schema")
         if payload.get("objective_schema") != OPSD_OBJECTIVE_SCHEMA:
             raise ValueError("resume checkpoint has a different objective")
+        if payload.get("prompt_schema") != OPSD_PROMPT_SCHEMA:
+            raise ValueError("resume checkpoint has a different prompt schema")
         if (
             self.args.answer_fence
             and payload.get("answer_fence_prompt_schema")
@@ -470,6 +530,8 @@ class OPSDTrainer:
             raise ValueError("OPSD dataset bytes changed since the run began")
         if payload.get("data_manifest_sha256") != self.data_manifest_sha256:
             raise ValueError("OPSD data manifest changed since the run began")
+        if payload.get("authorization_sha256") != self.authorization_sha256:
+            raise ValueError("OPSD authorization changed since the run began")
         self.student.load_state_dict(payload["model"], strict=True)
         self.teacher.load_state_dict(payload["teacher_model"], strict=True)
         self.optimizer.load_state_dict(payload["optimizer"])
@@ -575,10 +637,12 @@ class OPSDTrainer:
             source_sha256=self.source_sha256,
             dataset_sha256=self.dataset_sha256,
             data_manifest_sha256=self.data_manifest_sha256,
+            authorization_sha256=self.authorization_sha256,
         )
         resume_payload = {
             "schema": OPSD_CHECKPOINT_SCHEMA,
             "objective_schema": OPSD_OBJECTIVE_SCHEMA,
+            "prompt_schema": OPSD_PROMPT_SCHEMA,
             "optimizer_schema": OPSD_OPTIMIZER_SCHEMA,
             "data_order_schema": OPSD_DATA_ORDER_SCHEMA,
             "answer_fence_prompt_schema": (
@@ -598,6 +662,7 @@ class OPSDTrainer:
             "source_checkpoint_sha256": self.source_sha256,
             "dataset_sha256": self.dataset_sha256,
             "data_manifest_sha256": self.data_manifest_sha256,
+            "authorization_sha256": self.authorization_sha256,
             "args": vars(self.args),
         }
         checkpoint_dir = self.output / "checkpoints"
@@ -776,6 +841,8 @@ class OPSDTrainer:
             "dataset_sha256": self.dataset_sha256,
             "data_manifest": self.args.data_manifest,
             "data_manifest_sha256": self.data_manifest_sha256,
+            "authorization": self.args.authorization,
+            "authorization_sha256": self.authorization_sha256,
             "rejections": dict(self.rejection_counts),
             "args": vars(self.args),
         }

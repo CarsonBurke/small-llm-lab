@@ -19,9 +19,11 @@ GPU workload -- submit through mlq:
         --name opsd_v1 \
         --checkpoint \
           postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
-        --dataset postraining/data/opsd_dapo17k_train.parquet \
+        --dataset postraining/data/opsd_dapo17k_contractlast_train.parquet \
         --reference-column solution \
-        --data-manifest postraining/data/opsd_dapo17k.manifest.json
+        --data-manifest postraining/data/opsd_dapo17k_contractlast.manifest.json \
+        --authorization \
+          postraining/runs/opsd_dapo_contractlast_512_authorization_v3/results.json
 
 Static compatibility validation is CPU-only and may run directly:
 

@@ -10,6 +10,8 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from postraining.core import encode_prompt
+from postraining.math_prompt import strip_math_prompt_framing
+from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
 from postraining.prepare_sft_traces import (
     INSTRUCTION_SUFFIX,
     INSTRUCTION_SUFFIX_ANSWER,
@@ -23,12 +25,14 @@ TEACHER_TRANSITION = (
     "problem. Work step by step, explore alternatives when useful, and "
     "backtrack if an approach fails."
 )
+TEACHER_PROMPT_SCHEMA = OPSD_PROMPT_SCHEMA
 
 
 @dataclass(frozen=True)
 class OPSDExample:
     problem: str
     student_prompt: str
+    instruction_suffix: str
     reference_solution: str
     reference_kind: str
     source: str
@@ -46,11 +50,20 @@ def prompt_suffix(answer_fence: bool) -> str:
 
 
 def build_teacher_prompt(
-    student_prompt: str,
+    problem: str,
     reference_solution: str,
     reference_kind: str = "solution",
+    instruction_suffix: str = INSTRUCTION_SUFFIX_ANSWER,
 ) -> str:
-    """Paper prompt: privileged truth, then a fresh independent solve."""
+    """Put privilege first and preserve the exact student response contract."""
+    if not problem or not instruction_suffix:
+        raise ValueError("teacher prompt requires a problem and response contract")
+    try:
+        bare_problem, removed = strip_math_prompt_framing(problem)
+    except ValueError as error:
+        raise ValueError("teacher prompt requires a bare problem") from error
+    if removed or bare_problem != problem.strip():
+        raise ValueError("teacher prompt requires a bare problem, not a student prompt")
     if reference_kind == "solution":
         privilege = (
             "Here is a verified reference solution to the problem:\n"
@@ -72,10 +85,7 @@ def build_teacher_prompt(
         )
     else:
         raise ValueError(f"unknown OPSD reference kind {reference_kind!r}")
-    return (
-        f"{student_prompt}\n\n{privilege}\n\n"
-        "Begin the new solution now:"
-    )
+    return f"{problem}\n\n{privilege}\n\nBegin the new solution now:{instruction_suffix}"
 
 
 def load_examples(
@@ -90,10 +100,7 @@ def load_examples(
     columns = set(table.schema.names)
     if "problem" not in columns:
         raise ValueError(f"{path} lacks a problem column")
-    if reference_column == "auto":
-        reference_column = "document" if "document" in columns else "solution"
-    if reference_column not in columns:
-        raise ValueError(f"{path} needs a document or solution column")
+    reference_column = resolve_reference_column(path, reference_column)
     if "verified" not in columns:
         raise ValueError(
             f"{path} lacks the required boolean verified column; OPSD "
@@ -134,6 +141,7 @@ def load_examples(
             OPSDExample(
                 problem=problem,
                 student_prompt=student_prompt,
+                instruction_suffix=suffix,
                 reference_solution=reference,
                 reference_kind=reference_kind,
                 source=str(row.get("source", "unknown")),
@@ -142,6 +150,19 @@ def load_examples(
     if not examples:
         raise ValueError(f"{path} contains no verified, prompt-compatible rows")
     return examples
+
+
+def resolve_reference_column(
+    path: str | Path, reference_column: str
+) -> str:
+    """Resolve ``auto`` before applying final-answer data safety gates."""
+    columns = set(pq.read_schema(path).names)
+    resolved = reference_column
+    if resolved == "auto":
+        resolved = "document" if "document" in columns else "solution"
+    if resolved not in columns:
+        raise ValueError(f"{path} lacks reference column {resolved!r}")
+    return resolved
 
 
 def tokenize_example(
@@ -160,9 +181,10 @@ def tokenize_example(
         encode_prompt(
             tokenizer,
             build_teacher_prompt(
-                example.student_prompt,
+                example.problem,
                 example.reference_solution,
                 example.reference_kind,
+                example.instruction_suffix,
             ),
         )
     )

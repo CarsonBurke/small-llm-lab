@@ -35,6 +35,17 @@ def classify(
         reasons.append("correct OPSD termination regressed by over 0.02")
     if correct["terminal_loop_fraction"] > 0.01:
         reasons.append("correct OPSD terminal loops exceed 0.01")
+    if correct["repeated_4gram_fraction_mean"] > 0.25:
+        reasons.append("correct OPSD repeated 4-grams exceed 0.25")
+    if (
+        correct["repeated_4gram_fraction_mean"]
+        > baseline["repeated_4gram_fraction_mean"] + 0.02
+    ):
+        reasons.append("correct OPSD repetition regressed by over 0.02")
+    if correct["all_samples_identical_prompt_fraction"] > 0.10:
+        reasons.append("correct OPSD identical groups exceed 0.10")
+    if correct["unique_transcript_fraction"] < 0.50:
+        reasons.append("correct OPSD unique transcript fraction below 0.50")
     if not reasons:
         return "beneficial", []
     versus_baseline = comparisons["correct_vs_baseline"]

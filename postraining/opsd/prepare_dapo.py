@@ -23,19 +23,20 @@ from postraining.math_prompt import (
     answer_fence_prompt,
     strip_math_prompt_framing,
 )
-from postraining.opsd.data import build_teacher_prompt
-from postraining.prepare_sft_traces import word_ngrams
+from postraining.opsd.data import TEACHER_PROMPT_SCHEMA, build_teacher_prompt
+from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
+from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX_ANSWER, word_ngrams
 
 
-DAPO_OPSD_DATA_SCHEMA = "dapo_opsd_final_answer_privilege/v1"
+DAPO_OPSD_DATA_SCHEMA = "dapo_opsd_final_answer_privilege/v2"
 DAPO_OPSD_SPLIT_SCHEMA = (
-    "sha256_clean_gate_then_split_local_answer_derangement/v2"
+    "sha256_clean_gate_then_split_local_token_length_answer_derangement/v3"
 )
 DEFAULT_SOURCE = Path("postraining/data/dapo-math-17k.parquet")
 DEFAULT_SFT = Path(
     "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet"
 )
-DEFAULT_OUTPUT_PREFIX = Path("postraining/data/opsd_dapo17k")
+DEFAULT_OUTPUT_PREFIX = Path("postraining/data/opsd_dapo17k_contractlast")
 
 
 def file_sha256(path: Path) -> str:
@@ -110,8 +111,29 @@ def canonical_dapo_record(row: dict) -> dict:
     }
 
 
-def deranged_answer_donors(records: list[dict], seed: int) -> dict[str, dict]:
+def deranged_answer_donors(
+    records: list[dict],
+    seed: int,
+    *,
+    bucket_key=None,
+) -> dict[str, dict]:
     """Return a deterministic multiset-preserving wrong-answer assignment."""
+    if bucket_key is None:
+        bucket_key = lambda record: None
+    buckets: dict[object, list[dict]] = defaultdict(list)
+    for record in records:
+        buckets[bucket_key(record)].append(record)
+    donors_by_id = {}
+    for bucket in sorted(buckets, key=str):
+        donors_by_id.update(
+            _deranged_answer_donors_one_bucket(buckets[bucket], seed, bucket)
+        )
+    return donors_by_id
+
+
+def _deranged_answer_donors_one_bucket(
+    records: list[dict], seed: int, bucket: object
+) -> dict[str, dict]:
     groups: dict[object, list[dict]] = defaultdict(list)
     for record in records:
         value = parse_numeric_answer(record["solution"])
@@ -124,7 +146,7 @@ def deranged_answer_donors(records: list[dict], seed: int) -> dict[str, dict]:
 
     def rank(record: dict) -> bytes:
         return hashlib.sha256(
-            f"{DAPO_OPSD_DATA_SCHEMA}:{seed}:{record['example_id']}".encode()
+            f"{DAPO_OPSD_DATA_SCHEMA}:{seed}:{bucket}:{record['example_id']}".encode()
         ).digest()
 
     ordered = [
@@ -144,6 +166,19 @@ def deranged_answer_donors(records: list[dict], seed: int) -> dict[str, dict]:
                 for record, donor in zip(ordered, donors, strict=True)
             }
     raise ValueError("could not construct a value-distinct answer derangement")
+
+
+def nonderangeable_bucket_keys(records: list[dict], bucket_key) -> set[object]:
+    """Buckets whose answer-value majority makes derangement impossible."""
+    buckets: dict[object, Counter] = defaultdict(Counter)
+    for record in records:
+        value = parse_numeric_answer(record["solution"])
+        buckets[bucket_key(record)][value] += 1
+    return {
+        bucket
+        for bucket, counts in buckets.items()
+        if not counts or max(counts.values()) * 2 > sum(counts.values())
+    }
 
 
 def sft_decontamination_index(path: Path) -> tuple[set[str], set[tuple[str, ...]]]:
@@ -209,10 +244,24 @@ def build(args: argparse.Namespace) -> dict:
     for record in records:
         student_prompt = answer_fence_prompt(record["problem"])
         teacher_prompt = build_teacher_prompt(
-            student_prompt, record["solution"], "final_answer"
+            record["problem"],
+            record["solution"],
+            "final_answer",
+            INSTRUCTION_SUFFIX_ANSWER,
         )
         student_tokens = len(encode_prompt(tokenizer, student_prompt))
         teacher_tokens = len(encode_prompt(tokenizer, teacher_prompt))
+        answer_slot_tokens = len(
+            encode_prompt(
+                tokenizer,
+                build_teacher_prompt(
+                    "Length-control problem.",
+                    record["solution"],
+                    "final_answer",
+                    INSTRUCTION_SUFFIX_ANSWER,
+                ),
+            )
+        )
         if student_tokens > args.max_prompt_length:
             rejection_counts["student_prompt_overflow"] += 1
             continue
@@ -224,7 +273,10 @@ def build(args: argparse.Namespace) -> dict:
                 **record,
                 "student_prompt_tokens": student_tokens,
                 "teacher_prompt_tokens": teacher_tokens,
+                "answer_slot_tokens": answer_slot_tokens,
                 "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
+                "teacher_prompt_schema": TEACHER_PROMPT_SCHEMA,
+                "opsd_prompt_schema": OPSD_PROMPT_SCHEMA,
             }
         )
         problem_ngrams = word_ngrams(record["problem"])
@@ -249,14 +301,53 @@ def build(args: argparse.Namespace) -> dict:
             f"only {len(clean_gate_candidates)} clean rows for "
             f"--gate-rows {args.gate_rows}"
         )
-    gate_base = clean_gate_candidates[: args.gate_rows]
+    globally_bad_gate_buckets = nonderangeable_bucket_keys(
+        clean_gate_candidates,
+        lambda record: record["answer_slot_tokens"],
+    )
+    excluded_gate_buckets = set(globally_bad_gate_buckets)
+    while True:
+        gate_base = [
+            record
+            for record in clean_gate_candidates
+            if record["answer_slot_tokens"] not in excluded_gate_buckets
+        ][: args.gate_rows]
+        if len(gate_base) < args.gate_rows:
+            raise ValueError(
+                "not enough clean rows after exact-position control filtering"
+            )
+        bad = nonderangeable_bucket_keys(
+            gate_base, lambda record: record["answer_slot_tokens"]
+        )
+        if not bad:
+            break
+        excluded_gate_buckets.update(bad)
+    rejection_counts["gate_answer_position_bucket_excluded"] += sum(
+        record["answer_slot_tokens"] in excluded_gate_buckets
+        for record in clean_gate_candidates
+    )
     gate_ids = {record["example_id"] for record in gate_base}
-    train_base = [
+    train_candidates = [
         record for record in eligible_base if record["example_id"] not in gate_ids
     ]
+    bad_train_buckets = nonderangeable_bucket_keys(
+        train_candidates, lambda record: record["answer_slot_tokens"]
+    )
+    train_base = [
+        record
+        for record in train_candidates
+        if record["answer_slot_tokens"] not in bad_train_buckets
+    ]
+    rejection_counts["train_answer_position_bucket_excluded"] += (
+        len(train_candidates) - len(train_base)
+    )
 
     def attach_split_derangement(split: list[dict], split_seed: int) -> list[dict]:
-        donors = deranged_answer_donors(split, split_seed)
+        donors = deranged_answer_donors(
+            split,
+            split_seed,
+            bucket_key=lambda record: record["answer_slot_tokens"],
+        )
         enriched = []
         split_ids = {record["example_id"] for record in split}
         for record in split:
@@ -264,6 +355,21 @@ def build(args: argparse.Namespace) -> dict:
             donor_truth = donor["solution"]
             if donor["example_id"] not in split_ids:
                 raise AssertionError("answer donor escaped its data split")
+            permuted_teacher_tokens = len(
+                encode_prompt(
+                    tokenizer,
+                    build_teacher_prompt(
+                        record["problem"],
+                        donor_truth,
+                        "final_answer",
+                        INSTRUCTION_SUFFIX_ANSWER,
+                    ),
+                )
+            )
+            if permuted_teacher_tokens != record["teacher_prompt_tokens"]:
+                raise AssertionError(
+                    "correct and permuted teacher response positions differ"
+                )
             if verify_answer(
                 "Answer: " + donor_truth,
                 record["ground_truth"],
@@ -278,6 +384,7 @@ def build(args: argparse.Namespace) -> dict:
                     **record,
                     "permuted_solution": donor_truth,
                     "permuted_donor_id": donor["example_id"],
+                    "permuted_teacher_prompt_tokens": permuted_teacher_tokens,
                 }
             )
         if Counter(record["solution"] for record in enriched) != Counter(
@@ -300,6 +407,8 @@ def build(args: argparse.Namespace) -> dict:
         "schema": DAPO_OPSD_DATA_SCHEMA,
         "split_schema": DAPO_OPSD_SPLIT_SCHEMA,
         "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
+        "teacher_prompt_schema": TEACHER_PROMPT_SCHEMA,
+        "opsd_prompt_schema": OPSD_PROMPT_SCHEMA,
         "source": str(source),
         "source_sha256": file_sha256(source),
         "sft_corpus": str(sft_corpus),

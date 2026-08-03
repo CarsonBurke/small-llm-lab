@@ -12,7 +12,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import torch
 
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import answer_style, load_posttraining_tokenizer
 from postraining.latent_eval import evaluate_latent_math, verify_terminated_answer
 from postraining.latent_thought import LatentThoughtModel
@@ -22,11 +22,17 @@ from postraining.math_prompt import (
     require_answer_fence_prompt_schema,
 )
 from postraining.model_io import load_model
-from postraining.opsd.data import build_teacher_prompt
-from postraining.opsd.prepare_dapo import file_sha256
+from postraining.opsd.data import TEACHER_PROMPT_SCHEMA, build_teacher_prompt
+from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX_ANSWER
+from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
+from postraining.opsd.prepare_dapo import (
+    DAPO_OPSD_DATA_SCHEMA,
+    DAPO_OPSD_SPLIT_SCHEMA,
+    file_sha256,
+)
 
 
-TEACHER_UPLIFT_SCHEMA = "opsd_frozen_teacher_uplift/v1"
+TEACHER_UPLIFT_SCHEMA = "opsd_frozen_teacher_uplift/v3"
 ARMS = ("question_only", "correct_answer", "permuted_answer")
 
 
@@ -94,11 +100,17 @@ def arm_rows(rows: list[dict], arm: str) -> list[dict]:
             prompt = student
         elif arm == "correct_answer":
             prompt = build_teacher_prompt(
-                student, str(row["solution"]), "final_answer"
+                str(row["problem"]),
+                str(row["solution"]),
+                "final_answer",
+                INSTRUCTION_SUFFIX_ANSWER,
             )
         elif arm == "permuted_answer":
             prompt = build_teacher_prompt(
-                student, str(row["permuted_solution"]), "final_answer"
+                str(row["problem"]),
+                str(row["permuted_solution"]),
+                "final_answer",
+                INSTRUCTION_SUFFIX_ANSWER,
             )
         else:
             raise ValueError(f"unknown uplift arm {arm!r}")
@@ -137,6 +149,11 @@ def summarize_attempts(
     hashes_by_prompt: dict[int, list[str]] = defaultdict(list)
     for attempt in attempts:
         tokens = [int(token) for token in attempt["emitted_token_ids"]]
+        stop_cut = next(
+            (index for index, token in enumerate(tokens) if token in stop_ids),
+            len(tokens),
+        )
+        content_tokens = tokens[:stop_cut]
         prompt_index = int(attempt["problem_index"])
         donor_answer, reward_style = donor_by_index[prompt_index]
         correct, _ = verify_terminated_answer(
@@ -148,8 +165,8 @@ def summarize_attempts(
             answer_fence_ids=answer_fence_ids,
         )
         donor_correct += int(correct and attempt["structural_format_ok"])
-        repetitions.append(repeated_ngram_fraction(tokens))
-        loops += int(terminal_loop(tokens))
+        repetitions.append(repeated_ngram_fraction(content_tokens))
+        loops += int(terminal_loop(content_tokens))
         hashes_by_prompt[prompt_index].append(
             hashlib.sha256(bytes(str(tokens), "utf-8")).hexdigest()
         )
@@ -157,7 +174,7 @@ def summarize_attempts(
             correct and attempt["structural_format_ok"]
         )
         attempt["repeated_4gram_fraction"] = repetitions[-1]
-        attempt["terminal_loop"] = terminal_loop(tokens)
+        attempt["terminal_loop"] = terminal_loop(content_tokens)
     total = max(len(attempts), 1)
     all_identical = sum(
         len(set(hashes)) == 1 for hashes in hashes_by_prompt.values()
@@ -200,6 +217,8 @@ def gate_decision(
         reasons.append("correct-answer termination regressed by over 0.02")
     if correct["terminal_loop_fraction"] > 0.01:
         reasons.append("correct-answer terminal loops exceed 0.01")
+    if correct["repeated_4gram_fraction_mean"] > 0.25:
+        reasons.append("correct-answer repeated 4-grams exceed 0.25")
     if (
         correct["repeated_4gram_fraction_mean"]
         > question["repeated_4gram_fraction_mean"] + 0.02
@@ -210,6 +229,10 @@ def gate_decision(
         > question["all_samples_identical_prompt_fraction"] + 0.10
     ):
         reasons.append("correct-answer identical groups regressed by over 0.10")
+    if correct["all_samples_identical_prompt_fraction"] > 0.10:
+        reasons.append("correct-answer identical groups exceed 0.10")
+    if correct["unique_transcript_fraction"] < 0.50:
+        reasons.append("correct-answer unique transcript fraction below 0.50")
     if not reasons:
         return "pass", []
     return "fail", reasons
@@ -226,10 +249,12 @@ def main() -> None:
     parser.add_argument("--name", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
-        "--gate-data", default="postraining/data/opsd_dapo17k_gate.parquet"
+        "--gate-data",
+        default="postraining/data/opsd_dapo17k_contractlast_gate.parquet",
     )
     parser.add_argument(
-        "--data-manifest", default="postraining/data/opsd_dapo17k.manifest.json"
+        "--data-manifest",
+        default="postraining/data/opsd_dapo17k_contractlast.manifest.json",
     )
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--samples", type=int, default=8)
@@ -259,7 +284,12 @@ def main() -> None:
 
     checkpoint_path = Path(args.checkpoint)
     gate_path = Path(args.gate_data)
-    manifest = json.loads(Path(args.data_manifest).read_text())
+    manifest_path = Path(args.data_manifest)
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("schema") != DAPO_OPSD_DATA_SCHEMA:
+        parser.error("data manifest uses a different DAPO schema")
+    if manifest.get("split_schema") != DAPO_OPSD_SPLIT_SCHEMA:
+        parser.error("data manifest uses a different DAPO split schema")
     if file_sha256(gate_path) != manifest.get("gate_sha256"):
         parser.error("gate parquet does not match its manifest hash")
     if args.rows != manifest.get("gate_rows"):
@@ -267,6 +297,10 @@ def main() -> None:
             "rows must equal the full manifest gate size so the split-local "
             "permutation control preserves the answer multiset"
         )
+    if manifest.get("teacher_prompt_schema") != TEACHER_PROMPT_SCHEMA:
+        parser.error("data manifest uses a different teacher prompt schema")
+    if manifest.get("opsd_prompt_schema") != OPSD_PROMPT_SCHEMA:
+        parser.error("data manifest uses a different OPSD prompt schema")
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     sft = payload.get("sft") or {}
     require_answer_fence_prompt_schema(
@@ -356,11 +390,14 @@ def main() -> None:
             "uplift arms did not share one stable execution mode; rerun all "
             "arms with --no-rollout-compile"
         )
+    attempt_paths = {}
     for arm, attempts in attempts_by_arm.items():
+        attempt_path = output / f"{arm}_attempts.json"
         atomic_json(
             {"schema": TEACHER_UPLIFT_SCHEMA, "arm": arm, "attempts": attempts},
-            output / f"{arm}_attempts.json",
+            attempt_path,
         )
+        attempt_paths[arm] = attempt_path
 
     comparisons = {
         "correct_vs_question": paired_prompt_stats(
@@ -385,6 +422,12 @@ def main() -> None:
         "checkpoint_sha256": file_sha256(checkpoint_path),
         "gate_data": str(gate_path),
         "gate_sha256": manifest["gate_sha256"],
+        "data_manifest_sha256": file_sha256(manifest_path),
+        "attempts_sha256": {
+            arm: file_sha256(path) for arm, path in attempt_paths.items()
+        },
+        "teacher_prompt_schema": TEACHER_PROMPT_SCHEMA,
+        "opsd_prompt_schema": OPSD_PROMPT_SCHEMA,
         "arms": arm_results,
         "comparisons": comparisons,
         "args": vars(args),

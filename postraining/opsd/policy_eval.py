@@ -9,7 +9,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import torch
 
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import load_posttraining_tokenizer
 from postraining.latent_eval import evaluate_latent_math
 from postraining.latent_thought import LatentThoughtModel
@@ -31,10 +31,12 @@ def main() -> None:
     parser.add_argument("--name", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
-        "--gate-data", default="postraining/data/opsd_dapo17k_gate.parquet"
+        "--gate-data",
+        default="postraining/data/opsd_dapo17k_contractlast_gate.parquet",
     )
     parser.add_argument(
-        "--data-manifest", default="postraining/data/opsd_dapo17k.manifest.json"
+        "--data-manifest",
+        default="postraining/data/opsd_dapo17k_contractlast.manifest.json",
     )
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--samples", type=int, default=8)

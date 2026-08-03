@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch import nn
 
-from postraining.core import top_p_sample
+from postraining.core import parse_numeric_answer, top_p_sample
 from postraining.model_io import load_model
 from postraining.nano_backbone import NanoGPTBackbone
 from postraining.opsd.config import build_arg_parser, validate_args
@@ -22,23 +22,28 @@ from postraining.opsd.data import (
     ShuffledExampleSampler,
     build_teacher_prompt,
     load_examples,
+    resolve_reference_column,
     tokenize_example,
 )
 from postraining.opsd.loss import (
     backward_opsd_example,
     pointwise_clipped_forward_kl,
+    response_features,
 )
 from postraining.opsd.prepare_dapo import (
     canonical_dapo_record,
     deduplicate_dapo,
     deranged_answer_donors,
+    nonderangeable_bucket_keys,
     require_fresh_outputs,
 )
 from postraining.opsd.schemas import OPSD_EXPORT_SCHEMA
 from postraining.opsd.trainer import (
+    OPSDTrainer,
     _export_payload,
     _purge_jsonl_after,
     infer_source_contract,
+    validate_authorization,
     validate_data_manifest,
 )
 from postraining.opsd.teacher_uplift import (
@@ -47,7 +52,20 @@ from postraining.opsd.teacher_uplift import (
     summarize_attempts,
     terminal_loop,
 )
-from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX_ANSWER
+from postraining.opsd.teacher_logit_gate import (
+    auc,
+    build_self_rationalized_prompt_arms,
+    clipped_observed_update,
+    extract_fixed_think_prefix,
+    numeric_equivalent_mask,
+    response_features_batch,
+    response_features_varied_batch,
+    response_regions,
+)
+from postraining.prepare_sft_traces import (
+    INSTRUCTION_SUFFIX,
+    INSTRUCTION_SUFFIX_ANSWER,
+)
 
 
 class _Tokenizer:
@@ -148,19 +166,116 @@ def test_chunked_backward_is_objective_and_gradient_invariant():
         assert torch.allclose(left, right, atol=2e-7, rtol=2e-6)
 
 
+def test_logit_gate_batched_response_features_match_training_alignment():
+    torch.manual_seed(5)
+    model = _ToyBackbone()
+    prompt = [1, 2, 3]
+    responses = [[4, 5, 6], [7, 8]]
+    batched, lengths = response_features_batch(
+        model, prompt, responses, torch.device("cpu")
+    )
+    expected = torch.cat(
+        [
+            response_features(
+                model,
+                torch.tensor(prompt),
+                torch.tensor(response),
+            )
+            for response in responses
+        ]
+    )
+    assert lengths == [3, 2]
+    assert torch.allclose(batched, expected)
+
+
+def test_logit_gate_varied_prompts_match_training_alignment():
+    torch.manual_seed(6)
+    model = _ToyBackbone()
+    prompts = [[1, 2, 3], [1, 9, 10, 11, 12]]
+    responses = [[4, 5, 6], [7, 8]]
+    batched, lengths = response_features_varied_batch(
+        model, prompts, responses, torch.device("cpu")
+    )
+    expected = torch.cat(
+        [
+            response_features(
+                model,
+                torch.tensor(prompt),
+                torch.tensor(response),
+            )
+            for prompt, response in zip(prompts, responses, strict=True)
+        ]
+    )
+    assert lengths == [3, 2]
+    assert torch.allclose(batched, expected)
+
+
+def test_self_rationalized_context_uses_fixed_clean_position_matched_prefixes():
+    attempt = {
+        "emitted_token_ids": [10, *range(100, 140), 11, 12, 7, 13, 99],
+        "terminated": True,
+        "structural_format_ok": True,
+    }
+    rationale, reason = extract_fixed_think_prefix(
+        attempt,
+        think_ids=(10, 11),
+        forbidden_ids={7, 10, 11, 12, 13, 99},
+        rationale_tokens=32,
+        max_repeated_4gram_fraction=0.35,
+    )
+    assert reason is None
+    assert rationale == list(range(100, 132))
+    prompts = build_self_rationalized_prompt_arms(
+        correct_base=[1, 2],
+        permuted_base=[1, 3],
+        question_rationale=rationale,
+        correct_rationale=[token + 100 for token in rationale],
+        permuted_rationale=[token + 200 for token in rationale],
+        transition_ids=[4, 5],
+        response_tokens=9,
+        context_tokens=64,
+    )
+    assert {len(prompt) for prompt in prompts.values()} == {36}
+    assert prompts["direct"][2:34] == rationale
+
+    short = {**attempt, "emitted_token_ids": [10, 100, 11, 99]}
+    assert extract_fixed_think_prefix(
+        short,
+        think_ids=(10, 11),
+        forbidden_ids={7, 10, 11, 12, 13, 99},
+        rationale_tokens=32,
+        max_repeated_4gram_fraction=0.35,
+    )[1] == "short_think"
+
+
 def test_teacher_prompt_places_reference_before_independent_solve():
     prompt = "Problem?" + INSTRUCTION_SUFFIX_ANSWER
     teacher = build_teacher_prompt(
-        prompt, "<think>proof</think><answer>3</answer>"
+        "Problem?", "<think>proof</think><answer>3</answer>"
     )
-    assert teacher.startswith(prompt)
+    assert teacher.startswith("Problem?")
     assert teacher.index("proof") < teacher.index("Do not copy")
-    assert teacher.endswith("Begin the new solution now:")
+    assert teacher.index("Do not copy") < teacher.index("Begin the new solution")
+    assert teacher.endswith(INSTRUCTION_SUFFIX_ANSWER)
+    assert teacher.count(INSTRUCTION_SUFFIX_ANSWER) == 1
+    assert prompt == "Problem?" + INSTRUCTION_SUFFIX_ANSWER
+
+    with pytest.raises(ValueError, match="bare problem"):
+        build_teacher_prompt(prompt, "reference")
+    with pytest.raises(ValueError, match="bare problem"):
+        build_teacher_prompt(prompt + "\n", "reference")
+    with pytest.raises(ValueError, match="bare problem"):
+        build_teacher_prompt("Problem?" + INSTRUCTION_SUFFIX, "reference")
+
+    plain = build_teacher_prompt(
+        "Problem?", "reference", instruction_suffix=INSTRUCTION_SUFFIX
+    )
+    assert plain.endswith(INSTRUCTION_SUFFIX)
+    assert plain.count(INSTRUCTION_SUFFIX) == 1
 
 
 def test_final_answer_teacher_prompt_does_not_claim_a_solution_trace():
-    prompt = "Problem?" + INSTRUCTION_SUFFIX_ANSWER
-    teacher = build_teacher_prompt(prompt, "34", "final_answer")
+    teacher = build_teacher_prompt("Problem?", "34", "final_answer")
     assert "verified final answer" in teacher.lower()
     assert "reference solution" not in teacher.lower()
     assert "every step" not in teacher.lower()
@@ -248,6 +363,17 @@ def test_explicit_reference_column_selects_true_or_permuted_answer(tmp_path):
     assert correct.reference_kind == control.reference_kind == "final_answer"
 
 
+def test_auto_reference_resolves_to_controlled_solution_arm(tmp_path):
+    path = tmp_path / "dapo.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"problem": "P?", "solution": "3", "verified": True}]
+        ),
+        path,
+    )
+    assert resolve_reference_column(path, "auto") == "solution"
+
+
 def _dapo_row(example_id: str, problem: str, truth: str) -> dict:
     return {
         "data_source": "math_dapo",
@@ -300,7 +426,30 @@ def test_dapo_canonicalization_and_answer_derangement():
         donors[record["example_id"]]["solution"] != record["solution"]
         for record in records
     )
+    assert nonderangeable_bucket_keys(
+        [
+            {"solution": "1", "bucket": 0},
+            {"solution": "1", "bucket": 0},
+            {"solution": "2", "bucket": 0},
+        ],
+        lambda record: record["bucket"],
+    ) == {0}
     assert records[0]["problem"] == "P0?"
+
+    bucketed = [
+        {**record, "bucket": index // 4}
+        for index, record in enumerate(records + records[:2])
+    ]
+    for index, record in enumerate(bucketed):
+        record["example_id"] = f"bucket-{index}"
+    bucket_donors = deranged_answer_donors(
+        bucketed, seed=11, bucket_key=lambda record: record["bucket"]
+    )
+    assert all(
+        donor["bucket"] == record["bucket"]
+        for record in bucketed
+        for donor in [bucket_donors[record["example_id"]]]
+    )
 
 
 def test_dapo_outputs_are_immutable(tmp_path):
@@ -324,9 +473,16 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
     manifest.write_text(
         json.dumps(
             {
-                "schema": "dapo_opsd_final_answer_privilege/v1",
+                "schema": "dapo_opsd_final_answer_privilege/v2",
                 "split_schema": (
-                    "sha256_clean_gate_then_split_local_answer_derangement/v2"
+                    "sha256_clean_gate_then_split_local_token_length_"
+                    "answer_derangement/v3"
+                ),
+                "teacher_prompt_schema": (
+                    "privilege_then_shared_terminal_response_contract/v2"
+                ),
+                "opsd_prompt_schema": (
+                    "privilege_then_shared_terminal_response_contract/v2"
                 ),
                 "train_sha256": sha256(train),
                 "gate": str(gate),
@@ -339,6 +495,7 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
         dataset=str(train),
         data_manifest=str(manifest),
         reference_column="solution",
+        authorization=None,
     )
     validated = validate_data_manifest(
         args, {"sft": {"traces_sha256": "sft-hash"}}
@@ -347,6 +504,28 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
     assert validated["train_sha256"] == sha256(train)
     assert validated["gate_sha256"] == sha256(gate)
 
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    authorization = tmp_path / "authorization.json"
+    from postraining.opsd.authorize import OPSD_AUTHORIZATION_SCHEMA
+
+    authorization.write_text(
+        json.dumps(
+            {
+                "schema": OPSD_AUTHORIZATION_SCHEMA,
+                "decision": "pass",
+                "checkpoint_sha256": sha256(checkpoint),
+                "data_manifest_sha256": sha256(manifest),
+                "gate_sha256": sha256(gate),
+            }
+        )
+    )
+    args.checkpoint = str(checkpoint)
+    args.authorization = str(authorization)
+    authorized = validate_authorization(args, {}, validated)
+    assert authorized is not None
+    assert authorized["sha256"] == sha256(authorization)
+
     train.write_bytes(b"changed")
     with pytest.raises(ValueError, match="train bytes"):
         validate_data_manifest(
@@ -354,6 +533,7 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
         )
 
     args.data_manifest = None
+    args.authorization = None
     with pytest.raises(ValueError, match="data-manifest"):
         validate_data_manifest(args, {"sft": {}})
 
@@ -377,7 +557,7 @@ def test_uplift_donor_diagnostic_resolves_dapo_reward_style(monkeypatch):
     )
     attempts = [
         {
-            "emitted_token_ids": [7],
+            "emitted_token_ids": [9, 8] * 20 + [7],
             "problem_index": 0,
             "structural_format_ok": True,
         }
@@ -388,8 +568,9 @@ def test_uplift_donor_diagnostic_resolves_dapo_reward_style(monkeypatch):
             "reward_style": "rule-lighteval/MATH_v2",
         }
     ]
-    summarize_attempts(attempts, rows, None, (7,), (8, 9))
+    summary = summarize_attempts(attempts, rows, None, (7,), (8, 9))
     assert styles == ["minerva"]
+    assert summary["terminal_loop_fraction"] == 1.0
 
 
 def test_uplift_gate_pass_and_uncertain_failure_decisions():
@@ -399,6 +580,7 @@ def test_uplift_gate_pass_and_uncertain_failure_decisions():
         "terminal_loop_fraction": 0.0,
         "repeated_4gram_fraction_mean": 0.02,
         "all_samples_identical_prompt_fraction": 0.1,
+        "unique_transcript_fraction": 0.9,
     }
     correct = {
         **question,
@@ -440,6 +622,9 @@ def test_opsd_policy_classification_requires_causal_and_absolute_uplift():
         "structural_format_fraction": 0.95,
         "ended_fraction": 0.98,
         "terminal_loop_fraction": 0.0,
+        "repeated_4gram_fraction_mean": 0.02,
+        "all_samples_identical_prompt_fraction": 0.0,
+        "unique_transcript_fraction": 0.9,
     }
     arms = {
         "baseline": baseline,
@@ -467,6 +652,47 @@ def test_opsd_policy_classification_requires_causal_and_absolute_uplift():
     decision, reasons = classify(arms, comparisons)
     assert decision == "neutral_or_inconclusive"
     assert reasons
+
+
+def test_teacher_logit_gate_auc_and_regions_exclude_answer_leakage():
+    assert auc([2.0], [1.0]) == 1.0
+    assert auc([1.0], [1.0]) == 0.5
+    tokens = [10, 20, 1, 2, 3, 4, 5, 6, 21, 30, 7, 31]
+    regions = response_regions(tokens, (10, 21), (30, 31), {(3, 4)})
+    assert regions["answer"] == [10]
+    assert 3 not in regions["prethink"]
+    assert 4 not in regions["prethink"]
+    assert len(regions["prethink"]) < len(regions["think_q1"] + regions["think_q2"] + regions["think_q3"])
+
+    class NumericTokenizer:
+        def decode(self, token_ids):
+            return "".join({40: "1,", 41: "000"}[token] for token in token_ids)
+
+    numeric_mask = numeric_equivalent_mask(
+        [40, 41], NumericTokenizer(), {parse_numeric_answer("1000")}, halo=0
+    )
+    assert numeric_mask == [True, True]
+
+
+def test_clipped_observed_update_matches_autograd():
+    temperature = 1.1
+    clip = 0.05
+    student_logits = torch.tensor([[0.2, -0.4, 0.7]], requires_grad=True)
+    teacher_logits = torch.tensor([[1.0, 0.1, -0.3]])
+    student_logp = (student_logits / temperature).log_softmax(-1)
+    teacher_logp = (teacher_logits / temperature).log_softmax(-1)
+    contributions = teacher_logp.exp() * (teacher_logp - student_logp)
+    loss = contributions.clamp(max=clip).sum()
+    loss.backward()
+    expected = -student_logits.grad[0, 2]
+    observed, _ = clipped_observed_update(
+        student_logp.detach(),
+        teacher_logp,
+        torch.tensor([2]),
+        temperature=temperature,
+        pointwise_clip=clip,
+    )
+    assert observed[0] == pytest.approx(float(expected), abs=1e-7)
 
 
 def test_resume_cleanup_discards_only_a_torn_final_jsonl_record(tmp_path):
@@ -562,9 +788,32 @@ def test_export_round_trips_through_project_model_loader(tmp_path):
         dataset_sha256="b",
     )
     assert payload["opsd"]["schema"] == OPSD_EXPORT_SCHEMA
+    assert payload["opsd"]["prompt_schema"].endswith("/v2")
     assert payload["sft"] == {"schema": "unit"}
     path = tmp_path / "opsd.pt"
     torch.save(payload, path)
     loaded = load_model(path, torch.device("cpu"))
     for key, value in model.state_dict().items():
         assert torch.equal(loaded.state_dict()[key], value)
+
+
+def test_resume_rejects_missing_or_stale_prompt_schema(tmp_path):
+    from postraining.opsd.schemas import (
+        OPSD_CHECKPOINT_SCHEMA,
+        OPSD_OBJECTIVE_SCHEMA,
+    )
+
+    trainer = OPSDTrainer.__new__(OPSDTrainer)
+    trainer.args = Namespace(answer_fence=True)
+    for index, prompt_schema in enumerate((None, "stale/v1")):
+        path = tmp_path / f"resume-{index}.pt"
+        torch.save(
+            {
+                "schema": OPSD_CHECKPOINT_SCHEMA,
+                "objective_schema": OPSD_OBJECTIVE_SCHEMA,
+                "prompt_schema": prompt_schema,
+            },
+            path,
+        )
+        with pytest.raises(ValueError, match="prompt schema"):
+            trainer._restore(path)
