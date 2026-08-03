@@ -280,8 +280,23 @@ def modal_answer_baseline(rows: list[dict]) -> dict[str, str | float]:
 
 
 def load_unique_math_rows(path: str | Path) -> list[dict]:
-    """Load and deduplicate DAPO's physically repeated parquet rows."""
-    columns = ["prompt", "reward_model", "extra_info"]
+    """Load and deduplicate verifier rows, including optional test metadata."""
+    available = set(pq.read_schema(path).names)
+    required = {"prompt", "reward_model", "extra_info"}
+    if not required <= available:
+        raise ValueError(f"{path} lacks verifier columns {sorted(required - available)}")
+    columns = [
+        name
+        for name in (
+            "prompt",
+            "reward_model",
+            "extra_info",
+            "verification_info",
+            "data_source",
+            "ability",
+        )
+        if name in available
+    ]
     unique: dict[str, dict] = {}
     parquet = pq.ParquetFile(path)
     for batch in parquet.iter_batches(batch_size=8192, columns=columns):

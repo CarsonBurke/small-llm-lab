@@ -52,7 +52,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
+from dataclasses import fields, replace
 import hashlib
 import json
 import logging
@@ -67,7 +67,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 import train_gpt as baseline
-from fresh_lejepa_train import FreshHyperparameters
+from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 import postraining.latent_rollout
 from postraining.latent_eval import evaluate_latent_math
 from postraining.benchmark_report import write_benchmark_report
@@ -156,6 +156,16 @@ from postraining.runtime.profiling import (
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
 from postraining.vapo.config import build_arg_parser, validate_args
+from postraining.vapo.code_reward import (
+    PYTHON_REWARD_SCHEMA,
+    PYTHON_RESULT_CODES,
+    batch_python_test_results,
+)
+from postraining.vapo.mixture import (
+    MixedPromptSampler,
+    load_mixture_manifest,
+    mixture_identity,
+)
 from postraining.vapo.schemas import (
     ACTOR_OBJECTIVE_SCHEMA,
     PROMPT_ORDER_SCHEMA,
@@ -179,6 +189,68 @@ RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
 # instead of Minerva-normalizing everything.
 REWARD_SCHEMA = POSTTRAIN_REWARD_SCHEMA
+SOURCE_SIGNAL_MASK_SCHEMA = "per_source_zero_reward_actor_mask/v1"
+RESUME_ARG_CONTRACT_SCHEMA = "vapo_exact_environment_objective_args/v1"
+RESUME_EXACT_ARG_FIELDS = (
+    "reasoning_mode",
+    "answer_tokens",
+    "prompt_tokens",
+    "continuation_tokens",
+    "prompts_per_rollout",
+    "prompts_per_minibatch",
+    "samples_per_prompt",
+    "ppo_epochs",
+    "temperature",
+    "top_p",
+    "value_bins",
+    "value_anchored_support",
+    "value_margin_bins",
+    "value_sigma_ratio",
+    "value_prior",
+    "combined_mlp_blocks",
+    "combined_mlp_hidden",
+    "gae_lambda_alpha",
+    "nearby_reward_max",
+    "think_tokens",
+    "think_min_tokens",
+    "answer_fence",
+    "zero_reward_actor_freeze",
+    "zero_reward_stop_pools",
+    "value_warmup_steps",
+    "rollout_tail_batch",
+    "rollout_compile",
+    "rollout_tail_graph",
+    "rollout_flex_decode",
+    "rollout_graph_decode",
+    "compile_replay",
+    "duck_shape",
+    "replay_bucket",
+    "replay_max_trajectories",
+    "replay_attention_budget",
+    "replay_slot_budget",
+    "rollout_sync_every",
+    "rollout_compact_dead_ratio",
+    "rollout_groups",
+    "rollout_scheduler",
+    "consume_all_prompts",
+    "seed",
+)
+
+
+def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> None:
+    mismatches = [
+        (name, saved.get(name), getattr(current, name))
+        for name in RESUME_EXACT_ARG_FIELDS
+        if saved.get(name) != getattr(current, name)
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{name}: checkpoint={before!r}, current={after!r}"
+            for name, before, after in mismatches
+        )
+        raise ValueError(
+            "exact resume changed environment/objective arguments: " + details
+        )
 
 
 class _TileLangCompileCounter(logging.Handler):
@@ -614,6 +686,55 @@ def score_math_rollout(
     )
 
 
+def score_python_rollout(
+    batch: LatentRolloutBatch,
+    verification_info: dict,
+    tokenizer,
+    stop_ids: tuple[int, ...],
+    think_fence_ids: tuple[int, int],
+    answer_fence_ids: tuple[int, int],
+    min_think_tokens: int,
+) -> None:
+    """Binary all-tests-pass reward over the strict fenced code span."""
+    if verification_info.get("schema") != PYTHON_REWARD_SCHEMA:
+        raise ValueError("Python row uses an incompatible verifier schema")
+    answers: list[str] = []
+    eligible_indices: list[int] = []
+    emitted_rows = emitted_token_rows(batch)
+    scores = [0.0] * len(emitted_rows)
+    statuses = [PYTHON_RESULT_CODES["format_ineligible"]] * len(emitted_rows)
+    for index, emitted in enumerate(emitted_rows):
+        stop_cut = next(
+            (position for position, token in enumerate(emitted) if token in stop_ids),
+            None,
+        )
+        if stop_cut is None:
+            continue
+        visible = emitted[: stop_cut + 1]
+        if not structural_format_ok(
+            visible,
+            think_fence_ids,
+            answer_fence_ids,
+            min_think_tokens,
+        ):
+            continue
+        answers.append(fenced_answer_text(visible, tokenizer, answer_fence_ids))
+        eligible_indices.append(index)
+    if answers:
+        results = batch_python_test_results(answers, verification_info)
+        for index, result in zip(eligible_indices, results, strict=True):
+            scores[index] = float(result == "pass")
+            statuses[index] = PYTHON_RESULT_CODES[result]
+    batch.verifier_status = torch.tensor(
+        statuses, dtype=torch.long, device=batch.rewards.device
+    )
+    batch.think_gate_zeroed_correct = 0
+    assign_terminal_rewards(
+        batch,
+        torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device),
+    )
+
+
 evaluate_aime_latent = evaluate_latent_math
 
 
@@ -691,6 +812,16 @@ def rollout_diagnostics(
         ),
         "actions_per_trajectory": float(batch.action_mask.sum(1).mean()),
         "ended_fraction": sum(ended) / max(len(ended), 1),
+        **(
+            {
+                f"verifier_{name}_fraction": float(
+                    (batch.verifier_status == code).float().mean()
+                )
+                for name, code in PYTHON_RESULT_CODES.items()
+            }
+            if batch.verifier_status is not None
+            else {}
+        ),
         **(
             {
                 "think_format_fraction": (
@@ -800,6 +931,55 @@ def aggregate_diagnostics(
             aggregated["think_tokens_sum"] / aggregated["think_tokens_count"]
         )
     return aggregated
+
+
+def source_group_id(group: LatentRolloutBatch) -> int:
+    """Return the one source represented by a prompt group, fail closed."""
+    if group.source_id is None or group.source_id.numel() != group.kind.size(0):
+        raise ValueError("multi-source rollout group has missing source labels")
+    labels = group.source_id.unique()
+    if labels.numel() != 1:
+        raise ValueError("one prompt group cannot contain multiple sources")
+    return int(labels.item())
+
+
+def source_diagnostics(
+    groups: list[LatentRolloutBatch],
+    source_names: list[str],
+    samples_per_prompt: int,
+    stop_ids: tuple[int, ...] = (),
+    *,
+    refreshed_statistics: bool = True,
+    think_fence_ids: tuple[int, int] | None = None,
+    tokenizer=None,
+    min_think_tokens: int = 1,
+    answer_fence_ids: tuple[int, int] | None = None,
+) -> dict[str, dict[str, float | int]]:
+    """Compute the same rollout diagnostics independently for every source."""
+    by_source: dict[int, list[LatentRolloutBatch]] = {
+        source_id: [] for source_id in range(len(source_names))
+    }
+    for group in groups:
+        source_id = source_group_id(group)
+        if source_id not in by_source:
+            raise ValueError(f"rollout carries unknown source id {source_id}")
+        by_source[source_id].append(group)
+    missing = [source_names[index] for index, rows in by_source.items() if not rows]
+    if missing:
+        raise ValueError(f"rollout pool omitted configured sources: {missing}")
+    return {
+        source_names[source_id]: aggregate_diagnostics(
+            source_groups,
+            samples_per_prompt,
+            stop_ids,
+            refreshed_statistics=refreshed_statistics,
+            think_fence_ids=think_fence_ids,
+            tokenizer=tokenizer,
+            min_think_tokens=min_think_tokens,
+            answer_fence_ids=answer_fence_ids,
+        )
+        for source_id, source_groups in by_source.items()
+    }
 
 
 def lockstep_decode_metrics(
@@ -1063,6 +1243,61 @@ def optimizer_minibatch_orders(
     return minibatches
 
 
+def stratified_optimizer_minibatch_orders(
+    groups: list[LatentRolloutBatch],
+    groups_per_minibatch: int,
+    source_quotas: list[int],
+    generator: torch.Generator | None = None,
+) -> list[list[int]]:
+    """Partition one complete mixture cycle with identical source shares.
+
+    Every optimizer step sees the same source composition, preventing an
+    unlucky shuffle from turning one domain into an all-zero minibatch while
+    another domain supplies all of the policy signal.
+    """
+    group_count = len(groups)
+    if group_count < 1 or group_count % groups_per_minibatch:
+        raise ValueError("a stratified pool must contain complete minibatches")
+    if sum(source_quotas) != group_count:
+        raise ValueError("source quotas must exactly describe the rollout pool")
+    minibatch_count = group_count // groups_per_minibatch
+    if any(quota % minibatch_count for quota in source_quotas):
+        raise ValueError(
+            "each source quota must divide across all optimizer minibatches"
+        )
+    indices_by_source = [[] for _ in source_quotas]
+    for index, group in enumerate(groups):
+        source_id = source_group_id(group)
+        if not 0 <= source_id < len(source_quotas):
+            raise ValueError(f"rollout carries unknown source id {source_id}")
+        indices_by_source[source_id].append(index)
+    observed = [len(indices) for indices in indices_by_source]
+    if observed != source_quotas:
+        raise ValueError(
+            f"rollout source counts {observed} do not match quotas {source_quotas}"
+        )
+    for indices in indices_by_source:
+        permutation = torch.randperm(len(indices), generator=generator).tolist()
+        indices[:] = [indices[position] for position in permutation]
+
+    minibatches = [[] for _ in range(minibatch_count)]
+    for source_id, quota in enumerate(source_quotas):
+        per_minibatch = quota // minibatch_count
+        for minibatch_index in range(minibatch_count):
+            start = minibatch_index * per_minibatch
+            minibatches[minibatch_index].extend(
+                indices_by_source[source_id][start : start + per_minibatch]
+            )
+    for minibatch in minibatches:
+        if len(minibatch) != groups_per_minibatch:
+            raise AssertionError("stratified optimizer minibatch has wrong size")
+        permutation = torch.randperm(
+            len(minibatch), generator=generator
+        ).tolist()
+        minibatch[:] = [minibatch[position] for position in permutation]
+    return minibatches
+
+
 def plan_one_pass_training(
     *,
     dataset_rows: int,
@@ -1110,6 +1345,30 @@ def actor_minibatch_action_denominator(
     return torch.stack(
         [groups[index].action_mask.sum() for index in indices]
     ).sum()
+
+
+def source_actor_signal_mask(
+    source_ids: torch.Tensor | None,
+    reward_scalar: torch.Tensor,
+) -> torch.Tensor:
+    """Activate actor rows only when their source has an exact success.
+
+    In a mixed minibatch, aggregate reward can hide an entirely zero-reward
+    source. Its critic targets remain useful calibration data, but its actor
+    advantages are pure baseline error and push away arbitrary sampled text.
+    The pairwise formulation avoids a device-to-host sync for source counts.
+    """
+    if source_ids is None:
+        return torch.ones_like(reward_scalar, dtype=torch.bool)
+    if source_ids.shape != reward_scalar.shape:
+        raise ValueError("source ids and scalar rewards must have identical shape")
+    same_source = source_ids[:, None] == source_ids[None, :]
+    source_max_reward = torch.where(
+        same_source,
+        reward_scalar[None, :],
+        reward_scalar.new_full((), float("-inf")),
+    ).amax(1)
+    return source_max_reward > 0
 
 
 def write_actor_tensorboard_metrics(
@@ -1201,7 +1460,7 @@ def muon_matrix_parameters(
 ) -> list[torch.nn.Parameter]:
     """The pretraining Muon partition: block matrices with ndim >= 2.
 
-    Mirrors ``nanogpt_mini_gpt2vocab_train.py`` exactly — embeddings, the
+    Mirrors ``pretraining/nanogpt_mini/nanogpt_mini_gpt2vocab_train.py`` exactly — embeddings, the
     readout, biases, and norm gains stay under AdamW. Fresh-lineage probes
     live under ``blocks[-1]``, so the exclusion set must be honored here too.
 
@@ -1486,7 +1745,11 @@ def update_minibatch(
     )
     advantages = advantages.detach()
     value_targets = value_targets.detach()
-
+    actor_signal_rows = source_actor_signal_mask(
+        batch.source_id, batch.reward_scalar
+    )
+    if not value_only:
+        advantages = advantages * actor_signal_rows[:, None]
     if replay_plan is None:
         replay_plan = build_replay_plan(
             batch,
@@ -1714,6 +1977,7 @@ def update_minibatch(
         "advantage_mean": advantage_mean,
         "advantage_std": advantage_variance.sqrt(),
         "action_count": batch.action_mask.sum(),
+        "actor_active_trajectory_fraction": actor_signal_rows.float().mean(),
     }
     if value_only:
         metric_tensors["critic_grad_norm"] = gradient_norm_tensor(
@@ -1885,7 +2149,7 @@ def save_checkpoint(
     optimizers: dict[str, torch.optim.Optimizer],
     step: int,
     args: argparse.Namespace,
-    sampler: MathPromptSampler,
+    sampler: MathPromptSampler | MixedPromptSampler,
     warmup_step: int,
     actor_init_provenance: dict | None = None,
 ) -> None:
@@ -1897,6 +2161,17 @@ def save_checkpoint(
             getattr(args, "rollout_scheduler", "lockstep")
         ),
         "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
+        "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
+        "source_signal_mask_schema": (
+            SOURCE_SIGNAL_MASK_SCHEMA
+            if getattr(args, "rl_mixture_manifest", None)
+            else None
+        ),
+        "python_reward_schema": (
+            PYTHON_REWARD_SCHEMA
+            if getattr(args, "rl_mixture_manifest", None)
+            else None
+        ),
         "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
         "source_provenance": getattr(args, "source_provenance", None),
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
@@ -1906,6 +2181,12 @@ def save_checkpoint(
             else None
         ),
         "math_data_identity": sampler.dataset_identity,
+        "base_checkpoint_sha256": getattr(
+            args, "base_checkpoint_sha256", None
+        ),
+        "initialization_checkpoint_sha256": getattr(
+            args, "initialization_checkpoint_sha256", None
+        ),
         "reward_schema": REWARD_SCHEMA,
         "reasoning_mode": reasoning_mode,
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
@@ -1969,6 +2250,10 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
     validate_args(parser, args)
+    args.base_checkpoint_sha256 = file_sha256(args.checkpoint)
+    args.resume_checkpoint_sha256 = (
+        file_sha256(args.resume) if args.resume else None
+    )
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -2170,6 +2455,9 @@ def main() -> None:
     initialization_path = (
         args.actor_critic_init or args.actor_init or args.curriculum_init
     )
+    args.initialization_checkpoint_sha256 = (
+        file_sha256(initialization_path) if initialization_path else None
+    )
     if initialization_path:
         actor_init_payload = torch.load(
             initialization_path, map_location="cpu", weights_only=False
@@ -2229,6 +2517,7 @@ def main() -> None:
         wrapper.load_state_dict(actor_init_payload["model"], strict=True)
         actor_init_provenance = {
             "checkpoint": str(initialization_path),
+            "checkpoint_sha256": args.initialization_checkpoint_sha256,
             "critic_initialized": bool(args.actor_critic_init),
             "curriculum_transition": bool(args.curriculum_init),
             "source_step": actor_init_payload.get("step"),
@@ -2437,9 +2726,51 @@ def main() -> None:
     bench_rows = deterministic_math_subset(all_bench_rows, args.bench_max_rows)
     bench_dataset_baseline = modal_answer_baseline(all_bench_rows)
     bench_subset_baseline = modal_answer_baseline(bench_rows)
-    math_rows = load_unique_math_rows(args.math_data)
+    mixture_manifest = None
+    mixture_sources = None
+    if args.rl_mixture_manifest:
+        math_rows, mixture_sources, mixture_manifest = load_mixture_manifest(
+            args.rl_mixture_manifest
+        )
+        if (
+            mixture_manifest.get("answer_fence_prompt_schema")
+            != ANSWER_FENCE_PROMPT_SCHEMA
+        ):
+            raise ValueError("mixture uses a different answer-fence prompt schema")
+        if mixture_manifest.get("python_reward_schema") != PYTHON_REWARD_SCHEMA:
+            raise ValueError("mixture uses a different Python reward schema")
+        if (
+            sft_provenance.get("traces_sha256")
+            != mixture_manifest.get("sft_corpus_sha256")
+        ):
+            raise ValueError(
+                "base SFT checkpoint trace bytes do not match the mixture's "
+                "bound SFT corpus"
+            )
+        if int(mixture_manifest["groups_per_cycle"]) != args.prompts_per_rollout:
+            raise ValueError(
+                "mixture groups_per_cycle must equal --prompts-per-rollout"
+            )
+        if any(
+            source.verifier == "python_mbpp" for source in mixture_sources
+        ) and not (args.think_tokens and args.answer_fence):
+            raise ValueError(
+                "Python rewards require --think-tokens and --answer-fence"
+            )
+    else:
+        math_rows = load_unique_math_rows(args.math_data)
     if args.answer_fence:
         math_rows = rewrite_prompts_for_answer_fence(math_rows)
+        if mixture_sources is not None:
+            by_source: dict[str, list[dict]] = {
+                source.name: [] for source in mixture_sources
+            }
+            for row in math_rows:
+                by_source[row["_rl_source"]].append(row)
+            mixture_sources = [
+                replace(source, rows=tuple(by_source[source.name]))
+                for source in mixture_sources
+            ]
     excluded_modules = {
         name for name in args.exclude_modules.split(",") if name
     }
@@ -2463,10 +2794,15 @@ def main() -> None:
             flush=True,
         )
         math_rows = kept_rows
-    math_modal_baseline = modal_answer_baseline(math_rows)
+    numeric_reward_rows = [
+        row
+        for row in math_rows
+        if row.get("_verifier_kind", "math") == "math"
+    ]
+    math_modal_baseline = modal_answer_baseline(numeric_reward_rows)
     modal_solution = f"Answer: {math_modal_baseline['answer']}"
     modal_shaped_rewards = []
-    for row in math_rows:
+    for row in numeric_reward_rows:
         truth = str(row["reward_model"]["ground_truth"])
         correct, _ = verify_answer(
             modal_solution, truth, answer_style(row)
@@ -2485,10 +2821,21 @@ def main() -> None:
         if modal_shaped_rewards
         else 0.0
     )
-    data_identity = math_dataset_identity(args.math_data, args.exclude_modules)
-    sampler = MathPromptSampler(
-        math_rows, args.seed, dataset_identity=data_identity
-    )
+    if mixture_manifest is None:
+        data_identity = math_dataset_identity(args.math_data, args.exclude_modules)
+        sampler = MathPromptSampler(
+            math_rows, args.seed, dataset_identity=data_identity
+        )
+    else:
+        data_identity = mixture_identity(
+            args.rl_mixture_manifest, mixture_manifest
+        )
+        assert mixture_sources is not None
+        sampler = MixedPromptSampler(
+            mixture_sources,
+            args.seed,
+            dataset_identity=data_identity,
+        )
     if actor_init_payload is not None:
         if args.curriculum_init:
             print(
@@ -2584,6 +2931,16 @@ def main() -> None:
         )
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         resume_args = payload.get("args", {})
+        if payload.get("resume_arg_contract_schema") != RESUME_ARG_CONTRACT_SCHEMA:
+            raise ValueError(
+                "resume checkpoint predates the exact environment/objective "
+                "argument contract"
+            )
+        validate_resume_arg_contract(resume_args, args)
+        if payload.get("base_checkpoint_sha256") != args.base_checkpoint_sha256:
+            raise ValueError(
+                "resume uses different base checkpoint bytes than the saved run"
+            )
         saved_combiner = combiner_init_kwargs_from_checkpoint(payload)
         if (
             saved_combiner["mlp_hidden"],
@@ -2634,6 +2991,27 @@ def main() -> None:
                 f"{payload.get('actor_objective_schema')!r}. Use "
                 "--actor-init for an initialization restart under the "
                 "current objective."
+            )
+        expected_source_mask_schema = (
+            SOURCE_SIGNAL_MASK_SCHEMA if args.rl_mixture_manifest else None
+        )
+        if (
+            payload.get("source_signal_mask_schema")
+            != expected_source_mask_schema
+        ):
+            raise ValueError(
+                "resume checkpoint source-signal mask schema must be "
+                f"{expected_source_mask_schema!r}; got "
+                f"{payload.get('source_signal_mask_schema')!r}"
+            )
+        expected_python_reward_schema = (
+            PYTHON_REWARD_SCHEMA if args.rl_mixture_manifest else None
+        )
+        if payload.get("python_reward_schema") != expected_python_reward_schema:
+            raise ValueError(
+                "resume checkpoint Python reward schema must be "
+                f"{expected_python_reward_schema!r}; got "
+                f"{payload.get('python_reward_schema')!r}"
             )
         if payload.get("math_data_identity") != data_identity:
             raise ValueError(
@@ -3185,7 +3563,41 @@ def main() -> None:
         )
 
     output = Path(args.output)
+    if output.exists() and any(output.iterdir()):
+        if not args.resume:
+            raise ValueError(
+                f"refusing to start a fresh run in nonempty output {output}; "
+                "use a new directory or pass a compatible --resume checkpoint"
+            )
+        if Path(args.resume).resolve().parent != output.resolve():
+            raise ValueError(
+                "a nonempty resume output must be the resume checkpoint's "
+                "own run directory"
+            )
+        existing_manifest_path = output / "manifest.json"
+        if not existing_manifest_path.is_file():
+            raise ValueError("nonempty resume output has no run manifest")
+        existing_manifest = json.loads(existing_manifest_path.read_text())
+        if (
+            existing_manifest.get("math_data_identity") != data_identity
+            or (existing_manifest.get("base") or {}).get("checkpoint_sha256")
+            != args.base_checkpoint_sha256
+        ):
+            raise ValueError(
+                "nonempty resume output manifest belongs to a different run"
+            )
     output.mkdir(parents=True, exist_ok=True)
+    source_names = (
+        [str(entry["name"]) for entry in mixture_manifest["sources"]]
+        if mixture_manifest is not None
+        else ["math"]
+    )
+    source_ids = {name: index for index, name in enumerate(source_names)}
+    mixture_source_quotas = (
+        [int(entry["quota"]) for entry in mixture_manifest["sources"]]
+        if mixture_manifest is not None
+        else None
+    )
     source_provenance = capture_source_provenance(
         output / "provenance", Path(__file__).resolve().parents[1]
     )
@@ -3215,7 +3627,11 @@ def main() -> None:
     (output / "manifest.json").write_text(
         json.dumps(
             {
-                "phase": "latent_vapo_dapo",
+                "phase": (
+                    "latent_vapo_verifiable_mixture"
+                    if mixture_manifest is not None
+                    else "latent_vapo_math"
+                ),
                 # Top level, not buried in args: a profiled run's timings are
                 # perturbed by the profiler and must not be quoted as this
                 # configuration's cost.
@@ -3226,12 +3642,25 @@ def main() -> None:
                     args.rollout_scheduler
                 ),
                 "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
+                "source_signal_mask_schema": SOURCE_SIGNAL_MASK_SCHEMA,
+                "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
                 "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
                 "answer_fence_prompt_schema": (
                     ANSWER_FENCE_PROMPT_SCHEMA if args.answer_fence else None
                 ),
                 "math_data_identity": data_identity,
+                "rl_mixture_manifest": mixture_manifest,
+                "rl_source_ids": source_ids,
+                "python_reward_schema": (
+                    PYTHON_REWARD_SCHEMA
+                    if mixture_manifest is not None
+                    and any(
+                        entry["verifier"] == "python_mbpp"
+                        for entry in mixture_manifest["sources"]
+                    )
+                    else None
+                ),
                 "reward_schema": REWARD_SCHEMA,
                 "reasoning_mode": args.reasoning_mode,
                 "context_tokens": context_tokens,
@@ -3245,6 +3674,7 @@ def main() -> None:
                 "args": vars(args),
                 "base": {
                     "checkpoint": str(args.checkpoint),
+                    "checkpoint_sha256": args.base_checkpoint_sha256,
                     "architecture": backbone.architecture,
                     # SFT lineage when the base came out of sft_trace_train
                     # (plain scalars: schema, traces, args, steps) — the
@@ -3307,14 +3737,36 @@ def main() -> None:
         refresh_statistics: bool,
     ) -> LatentRolloutBatch:
         batch = trim_stream(batch, multiple=trim_multiple)
-        score_math_rollout(
-            batch, row["reward_model"]["ground_truth"], tokenizer, stop_ids,
-            answer_style(row),
-            args.nearby_reward_max,
-            solution_prefix_ids=answer_prefix_ids,
-            think_fence_ids=think_fence_ids,
-            min_think_tokens=args.think_min_tokens,
-            answer_fence_ids=answer_fence_ids,
+        verifier_kind = row.get("_verifier_kind", "math")
+        if verifier_kind == "math":
+            score_math_rollout(
+                batch, row["reward_model"]["ground_truth"], tokenizer, stop_ids,
+                answer_style(row),
+                args.nearby_reward_max,
+                solution_prefix_ids=answer_prefix_ids,
+                think_fence_ids=think_fence_ids,
+                min_think_tokens=args.think_min_tokens,
+                answer_fence_ids=answer_fence_ids,
+            )
+        elif verifier_kind == "python_mbpp":
+            assert think_fence_ids is not None and answer_fence_ids is not None
+            score_python_rollout(
+                batch,
+                row["verification_info"],
+                tokenizer,
+                stop_ids,
+                think_fence_ids,
+                answer_fence_ids,
+                args.think_min_tokens,
+            )
+        else:
+            raise ValueError(f"unsupported verifier kind {verifier_kind!r}")
+        source_name = str(row.get("_rl_source", "math"))
+        batch.source_id = torch.full(
+            (batch.kind.size(0),),
+            source_ids[source_name],
+            dtype=torch.long,
+            device=batch.kind.device,
         )
         # Stepwise rollout and parallel replay disagree numerically at
         # bf16 scale; recompute the stored PPO statistics through the
@@ -3900,6 +4352,21 @@ def main() -> None:
                 * metrics["actions_per_trajectory"]
                 / metrics["collect_seconds"]
             )
+            per_source = (
+                source_diagnostics(
+                    groups,
+                    source_names,
+                    args.samples_per_prompt,
+                    stop_ids,
+                    refreshed_statistics=False,
+                    think_fence_ids=think_fence_ids,
+                    tokenizer=tokenizer,
+                    min_think_tokens=args.think_min_tokens,
+                    answer_fence_ids=answer_fence_ids,
+                )
+                if mixture_manifest is not None
+                else None
+            )
             passed = (
                 metrics["within_group_reward_std"]
                 >= args.gate_min_within_group_reward_std
@@ -3909,6 +4376,7 @@ def main() -> None:
                 type="rollout_gate",
                 repeat=repeat,
                 passed=passed,
+                source_metrics=per_source,
                 **metrics,
             )
             print(
@@ -3917,6 +4385,7 @@ def main() -> None:
                         "type": "rollout_gate",
                         "repeat": repeat,
                         "passed": bool(passed),
+                        "source_metrics": per_source,
                         **metrics,
                     },
                     sort_keys=True,
@@ -4139,14 +4608,39 @@ def main() -> None:
             profiler.note_counter(
                 "decode_steps", rollout_metrics.get("decode_steps_total", 0.0)
             )
-            minibatch_orders = optimizer_minibatch_orders(
-                len(groups),
-                args.prompts_per_minibatch,
-                allow_partial_final=(
-                    args.consume_all_prompts
-                    and sampler.cursor == len(math_rows)
-                ),
+            source_rollout_metrics = (
+                source_diagnostics(
+                    groups,
+                    source_names,
+                    args.samples_per_prompt,
+                    stop_ids,
+                    refreshed_statistics=False,
+                    think_fence_ids=think_fence_ids,
+                    tokenizer=tokenizer,
+                    min_think_tokens=args.think_min_tokens,
+                    answer_fence_ids=answer_fence_ids,
+                )
+                if mixture_manifest is not None
+                else None
             )
+            if (
+                mixture_source_quotas is not None
+                and len(groups) == sum(mixture_source_quotas)
+            ):
+                minibatch_orders = stratified_optimizer_minibatch_orders(
+                    groups,
+                    args.prompts_per_minibatch,
+                    mixture_source_quotas,
+                )
+            else:
+                minibatch_orders = optimizer_minibatch_orders(
+                    len(groups),
+                    args.prompts_per_minibatch,
+                    allow_partial_final=(
+                        args.consume_all_prompts
+                        and sampler.cursor == len(math_rows)
+                    ),
+                )
         if len(minibatch_orders) != pool_updates:
             raise RuntimeError("rollout pool did not produce the planned updates")
         # Rewards are non-negative (exact 1.0, nearby-numeric partial, else
@@ -4391,6 +4885,7 @@ def main() -> None:
                 pool_updates=pool_updates,
                 pool_trajectories=pool_prompt_count * args.samples_per_prompt,
                 peak_vram_bytes=rollout_peak_vram_bytes,
+                source_metrics=source_rollout_metrics,
                 **rollout_metrics,
             )
             tensorboard.add_scalar(
@@ -4433,6 +4928,22 @@ def main() -> None:
             )
             for tag, value in rollout_dashboard.items():
                 tensorboard.add_scalar(tag, value, rollout_step)
+            if source_rollout_metrics is not None:
+                for source_name, source_metrics in source_rollout_metrics.items():
+                    for metric_name in (
+                        "reward_mean",
+                        "exact_accuracy",
+                        "within_group_reward_std",
+                        "ended_fraction",
+                        "think_format_fraction",
+                        "actions_per_trajectory",
+                    ):
+                        if metric_name in source_metrics:
+                            tensorboard.add_scalar(
+                                f"source/{source_name}/{metric_name}",
+                                source_metrics[metric_name],
+                                rollout_step,
+                            )
 
         for behavior_age, minibatch_order in enumerate(minibatch_orders):
             # Actor and critic each take one optimizer step over the same

@@ -68,6 +68,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument(
+        "--rl-mixture-manifest",
+        default=None,
+        help="immutable multi-source verifier manifest; when set, its exact "
+        "source quotas replace --math-data",
+    )
+    parser.add_argument(
         "--exclude-modules", default="",
         help="comma-separated extra_info.module names to drop from --math-data "
         "(module-tagged datasets only); names absent from the data are an error",
@@ -820,6 +826,10 @@ def validate_args(
         )
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
+    if args.rl_mixture_manifest and args.exclude_modules:
+        parser.error("--exclude-modules is not supported with an RL mixture")
+    if args.rl_mixture_manifest and args.consume_all_prompts:
+        parser.error("--consume-all-prompts is not defined for cyclic mixtures")
     if args.prompts_per_minibatch < 1:
         parser.error("--prompts-per-minibatch must be positive")
     if args.prompts_per_rollout % args.prompts_per_minibatch:

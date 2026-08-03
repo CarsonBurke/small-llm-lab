@@ -127,7 +127,10 @@ def canonicalize_answer_fence_rows(rows: list[dict]) -> list[dict]:
             removed += count
             if content:
                 last_nonempty = index
-        if not removed:
+        bare_contract = (row.get("extra_info") or {}).get(
+            "prompt_contract"
+        ) == "bare"
+        if not removed and not bare_contract:
             preview = prompt[0]["content"][:120] if prompt else ""
             raise ValueError(
                 "answer-fence prompt canonicalization found no recognized "

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,8 +13,12 @@ from postraining.train_latent_vapo import (
     optimizer_minibatch_orders,
     plan_one_pass_training,
     rollout_tensorboard_metrics,
+    source_actor_signal_mask,
+    stratified_optimizer_minibatch_orders,
+    validate_resume_arg_contract,
     write_actor_tensorboard_metrics,
 )
+from postraining.train_latent_vapo import RESUME_EXACT_ARG_FIELDS
 
 
 def test_optimizer_minibatch_orders_are_disjoint_and_complete() -> None:
@@ -47,6 +54,55 @@ def test_optimizer_minibatch_orders_allow_one_shuffled_terminal_partial() -> Non
         torch.Generator().manual_seed(11),
         allow_partial_final=True,
     )
+
+
+def test_stratified_optimizer_minibatches_preserve_every_source_quota() -> None:
+    source_quotas = [28, 20, 8, 8]
+    groups = []
+    for source_id, quota in enumerate(source_quotas):
+        groups.extend(
+            SimpleNamespace(
+                kind=torch.zeros(16, 1),
+                source_id=torch.full((16,), source_id, dtype=torch.long),
+            )
+            for _ in range(quota)
+        )
+    batches = stratified_optimizer_minibatch_orders(
+        groups, 16, source_quotas, torch.Generator().manual_seed(9)
+    )
+    assert len(batches) == 4
+    for batch in batches:
+        assert Counter(int(groups[index].source_id[0]) for index in batch) == {
+            0: 7,
+            1: 5,
+            2: 2,
+            3: 2,
+        }
+    assert sorted(index for batch in batches for index in batch) == list(range(64))
+
+
+def test_source_actor_mask_fails_closed_only_for_zero_reward_source() -> None:
+    sources = torch.tensor([0, 0, 1, 1, 2], dtype=torch.long)
+    rewards = torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0])
+    assert source_actor_signal_mask(sources, rewards).tolist() == [
+        True,
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert source_actor_signal_mask(None, rewards).all()
+
+
+def test_exact_resume_contract_rejects_reward_change_but_allows_step_ceiling() -> None:
+    values = {name: 1 for name in RESUME_EXACT_ARG_FIELDS}
+    current = SimpleNamespace(**values, steps=40_000)
+    validate_resume_arg_contract(values, current)
+    current.steps = 80_000
+    validate_resume_arg_contract(values, current)
+    current.nearby_reward_max = 0.1
+    with pytest.raises(ValueError, match="nearby_reward_max"):
+        validate_resume_arg_contract(values, current)
 
 
 def test_one_pass_plan_consumes_all_dapo_rows_once_including_tail() -> None:

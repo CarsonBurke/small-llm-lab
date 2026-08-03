@@ -88,6 +88,14 @@ class LatentRolloutBatch:
     # dynamic-attribute stash would silently read 0 after any ``to()``
     # rebuild, turning the alarm into a constant all-clear.
     think_gate_zeroed_correct: int | None = None
+    # Optional integer source label for multi-domain RL. It is stamped only
+    # after a prompt group is scored and follows row transforms/packing like
+    # reward_scalar. None preserves source-agnostic evaluation rollouts.
+    source_id: Tensor | None = None
+    # Optional per-trajectory verifier outcome code. Multi-source Python
+    # rewards use this to distinguish policy failures from infrastructure
+    # failures instead of hiding an inactive verifier behind reward zero.
+    verifier_status: Tensor | None = None
 
     def to(
         self, device: torch.device, non_blocking: bool = False
@@ -1344,6 +1352,18 @@ def pack_rollout_groups_for_replay(
             combined[field.name] = (
                 sum(counts) if all(c is not None for c in counts) else None
             )
+            continue
+        if field.name in ("source_id", "verifier_status"):
+            values = [getattr(group, field.name) for group in groups]
+            if all(value is None for value in values):
+                combined[field.name] = None
+            elif all(isinstance(value, Tensor) for value in values):
+                rows = torch.cat(values)
+                combined[field.name] = rows.pin_memory() if pin else rows
+            else:
+                raise ValueError(
+                    f"cannot pack partially labeled {field.name} groups"
+                )
             continue
         values = [getattr(group, field.name) for group in groups]
         if not all(isinstance(value, Tensor) for value in values):
