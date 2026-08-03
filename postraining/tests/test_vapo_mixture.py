@@ -12,6 +12,7 @@ from postraining.vapo.code_reward import (
     PYTHON_REWARD_SCHEMA,
     normalize_python_answer,
     python_candidate_allowed,
+    python_test_result,
     python_tests_pass,
 )
 from postraining.vapo.mixture import (
@@ -143,6 +144,23 @@ except Exception as error:
     assert python_candidate_allowed(
         "import math\nfrom sys import maxsize\ndef f(x): return math.sqrt(x) + maxsize"
     )
+    assert python_test_result(
+        "def add(a, b): return a + b", verification
+    ) == "pass"
+    assert python_test_result(
+        "raise SystemExit(0)", verification
+    ) == "policy_rejected"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap is unavailable")
+def test_python_fixture_runs_after_candidate_definitions() -> None:
+    verification = {
+        "schema": PYTHON_REWARD_SCHEMA,
+        "test_setup": ["root = Node(3)"],
+        "tests": ["assert value(root) == 3"],
+    }
+    code = "class Node:\n    def __init__(self, x): self.x = x\ndef value(n): return n.x"
+    assert python_tests_pass(code, verification)
     assert normalize_python_answer("```python\ndef f():\n    pass\n```") == (
         "def f():\n    pass"
     )

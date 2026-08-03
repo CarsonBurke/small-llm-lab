@@ -3964,10 +3964,15 @@ def test_combined_replay_batch_right_pads_without_changing_beliefs():
         group.source_id = torch.full(
             (samples,), source_id, dtype=torch.long
         )
+        group.verifier_status = torch.full(
+            (samples,), source_id + 1, dtype=torch.long
+        )
 
     combined = pack_rollout_groups_for_replay(groups)
     assert combined.source_id is not None
     assert combined.source_id.tolist() == [0, 0, 1, 1, 2, 2]
+    assert combined.verifier_status is not None
+    assert combined.verifier_status.tolist() == [1, 1, 2, 2, 3, 3]
     assert combined.prompt_length == 4
     assert combined.stream_length == max(group.stream_length for group in groups)
     row_start = 0
