@@ -13,3 +13,4 @@ datasets
 fla-core==0.5.2
 tiktoken
 sentencepiece
+scipy
