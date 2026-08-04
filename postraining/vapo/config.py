@@ -58,7 +58,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--steps", type=int, default=2000)
+    # The selected production regime is a 40K-update Delightful Policy
+    # Gradient campaign. Shorter runs remain explicit ablations rather than
+    # the behavior of an otherwise production-shaped invocation.
+    parser.add_argument("--steps", type=int, default=40_000)
     parser.add_argument(
         "--max-train-hours", type=float, default=None,
         help="stop training at the first pool boundary after this many hours "
@@ -69,9 +72,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument(
         "--rl-mixture-manifest",
-        default=None,
-        help="immutable multi-source verifier manifest; when set, its exact "
-        "source quotas replace --math-data",
+        default="postraining/data/vapo_broad_v5.manifest.json",
+        help="immutable multi-source verifier manifest whose exact source "
+        "quotas replace --math-data (pass an empty string for a single "
+        "--math-data source)",
     )
     parser.add_argument(
         "--exclude-modules", default="",
@@ -96,16 +100,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # backbone default after the checkpoint loads: fresh PoPE 1024, nano 512.
     parser.add_argument("--prompt-tokens", type=int, default=None)
     parser.add_argument("--continuation-tokens", type=int, default=None)
-    # Compute-scaled VAPO topology: sample n=16 responses for 64 prompts under
-    # one frozen behavior policy, then shuffle prompt groups once and take four
-    # disjoint B256 optimizer minibatches. This activates PPO's behavior-policy
-    # clipping without trajectory reuse. VAPO uses the same n=16 but a larger
-    # 512-prompt / 8192-trajectory pool and B512 minibatches.
-    parser.add_argument("--prompts-per-rollout", type=int, default=64)
-    parser.add_argument("--prompts-per-minibatch", type=int, default=16)
+    # Selected DG topology: collect one fresh 24-prompt x 16-sample batch from
+    # the current policy and consume it in exactly one update. The equality of
+    # rollout and minibatch prompt counts is an objective constraint for the
+    # on-policy estimator, not merely a throughput setting. The opt-out VAPO
+    # control can still request a wider frozen pool explicitly.
+    parser.add_argument("--prompts-per-rollout", type=int, default=24)
+    parser.add_argument("--prompts-per-minibatch", type=int, default=24)
     parser.add_argument("--samples-per-prompt", type=int, default=16)
     # One pass only: repeated PPO epochs reuse the same generated trajectories.
     parser.add_argument("--ppo-epochs", type=int, default=1)
+    parser.add_argument(
+        "--delightful-policy-gradient",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="replace the clipped VAPO/PPO actor objective with Delightful "
+        "Policy Gradient (Osband, 2026), using eta=1 current-token "
+        "surprisal and no importance ratios",
+    )
+    parser.add_argument(
+        "--target-policy-optimization",
+        action="store_true",
+        help="replace the actor estimator with action-only token TPO: each "
+        "executed token is grouped with sampled, unexecuted comparison "
+        "tokens; only on-trajectory GAE scores the executed action and the "
+        "actor trains solely by target cross-entropy",
+    )
+    parser.add_argument(
+        "--tpo-candidates",
+        type=int,
+        default=8,
+        help="candidate token slots per action, including the executed token",
+    )
+    parser.add_argument(
+        "--tpo-eta",
+        type=float,
+        default=1.0,
+        help="temperature applied after active-token advantage RMS scaling",
+    )
+    parser.add_argument(
+        "--allow-dg-topology-migration",
+        action="store_true",
+        help="explicitly allow an exact Delightful resume to change the "
+        "equal prompts-per-rollout/prompts-per-minibatch topology; model, "
+        "optimizer, RNG, step, and sampler state are still restored",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     # One general rate for actor and critic. The fresh-policy experiment starts
@@ -205,7 +244,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--nearby-reward-max",
         type=float,
-        default=0.1,
+        default=0.0,
         help="maximum reward for a wrong, terminated numeric final answer",
     )
     # Requires a base checkpoint whose SFT stage trained the fence rows
@@ -214,7 +253,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # (the 1024/1025 collapse attractor) worth zero even when correct.
     parser.add_argument(
         "--think-tokens",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="decode <think>/</think> as special tokens and gate math "
         "reward on a well-formed, closed think fence",
     )
@@ -225,9 +265,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--think-min-tokens",
         type=int,
-        default=1,
+        default=None,
         help="minimum token count inside the think fence for any reward "
-        "(only meaningful with --think-tokens)",
+        "(default: 33 with --think-tokens, 1 otherwise)",
     )
     # Requires a base checkpoint whose SFT stage trained the answer fence
     # rows (sft_trace_train --answer-fence); enforced at startup. With the
@@ -236,7 +276,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # check (and its case/spacing/boundary bypass class) is retired.
     parser.add_argument(
         "--answer-fence",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="decode <answer>/</answer> as special tokens; gate reward on "
         "<think>...</think><answer>...</answer> structure and grade only "
         "the fenced answer span (requires --think-tokens)",
@@ -257,16 +298,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "every trajectory earned zero reward; the critic still updates so "
         "value predictions catch down to the zero targets",
     )
-    # A sustained all-zero streak is a dead run either way: frozen, the
-    # actor cannot recover; unfrozen, it is re-entering the round-4
-    # spiral. 8 pools = 8192 consecutive zero-reward trajectories at the
-    # default pool size — far beyond sampling noise for any policy with
-    # nontrivial success probability (the SFT base's ~2.7% gate accuracy
-    # makes even ONE all-zero 1024-trajectory pool a ~e^-28 event).
+    # The actor freeze is the actual safety intervention. A stop based only on
+    # consecutive zero-reward prompt windows is unsound for a heterogeneous
+    # sparse-reward mixture: the frozen actor is unchanged, but later prompts
+    # can be easier. Keep the optional operational circuit breaker available
+    # without making it part of the selected production regime.
     parser.add_argument(
         "--zero-reward-stop-pools",
         type=int,
-        default=8,
+        default=0,
         help="stop at the pool boundary (saving the final checkpoint) "
         "after this many consecutive all-zero-reward rollout pools; "
         "applies regardless of --zero-reward-actor-freeze; 0 disables",
@@ -639,6 +679,16 @@ def validate_args(
 ) -> None:
     """Argv-level guards that need no checkpoint. Backbone-dependent
     checks stay in main() because they need the loaded model."""
+    # TPO is an explicit replacement for the default DG estimator. Resolve
+    # that precedence once so every downstream objective/schema check sees
+    # exactly one actor mode, while ordinary invocations retain the shipped
+    # DG default.
+    if args.target_policy_optimization:
+        args.delightful_policy_gradient = False
+    if args.tpo_candidates < 2:
+        parser.error("--tpo-candidates must be at least 2")
+    if not math.isfinite(args.tpo_eta) or args.tpo_eta <= 0.0:
+        parser.error("--tpo-eta must be finite and positive")
     if args.replay_max_trajectories < 1:
         parser.error("--replay-max-trajectories must be positive")
     if args.max_train_hours is not None and args.max_train_hours <= 0:
@@ -694,6 +744,8 @@ def validate_args(
             parser.error(f"{name} must be finite and positive")
     if args.reset_optimizers_on_resume and not args.resume:
         parser.error("--reset-optimizers-on-resume requires --resume")
+    if args.allow_dg_topology_migration and not args.resume:
+        parser.error("--allow-dg-topology-migration requires --resume")
     if (
         not math.isfinite(args.nearby_reward_max)
         or args.nearby_reward_max < 0.0
@@ -711,6 +763,8 @@ def validate_args(
             "--think-tokens requires a reasoning mode that emits its own "
             "reasoning; none-mode budgets only the answer value"
         )
+    if args.think_min_tokens is None:
+        args.think_min_tokens = 33 if args.think_tokens else 1
     if args.think_min_tokens < 1:
         parser.error("--think-min-tokens must be at least 1")
     if args.think_min_tokens > 1 and not args.think_tokens:
@@ -836,6 +890,15 @@ def validate_args(
         parser.error(
             "--prompts-per-rollout must be divisible by --prompts-per-minibatch"
         )
+    if (
+        (args.delightful_policy_gradient or args.target_policy_optimization)
+        and args.prompts_per_rollout != args.prompts_per_minibatch
+    ):
+        parser.error(
+            "the selected on-policy actor estimator "
+            "requires --prompts-per-minibatch to equal --prompts-per-rollout "
+            "so a frozen rollout pool produces exactly one actor update"
+        )
     if args.ppo_epochs != 1:
         parser.error("--ppo-epochs must be 1; trajectory reuse is disabled")
     if args.bpb_val_tokens < 0:
@@ -876,10 +939,9 @@ def validate_args(
         )
     if args.samples_per_prompt < 1:
         parser.error("--samples-per-prompt must be positive")
-    if args.prompts_per_minibatch * args.samples_per_prompt != 256:
-        parser.error(
-            "optimizer minibatches must contain exactly 256 trajectories"
-        )
+    # Replay is token-normalized and memory-sharded, so trajectory batch size
+    # is an actual optimization choice rather than a shape invariant. The
+    # selected DG regime uses 24 x 16 = 384 fresh trajectories per update.
     for name, samples in (
         ("--aime-samples", args.aime_samples),
         ("--bench-samples", args.bench_samples),

@@ -15,6 +15,14 @@ PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 ACTOR_OBJECTIVE_SCHEMA = (
     "vapo_token_clip_no_positive_example_lm_token_denominator/v3"
 )
+DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
+    "delightful_policy_gradient_current_token_surprisal_eta1_"
+    "detached_gate_no_importance_ratio/v1"
+)
+TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA = (
+    "target_policy_action_only_unique_token_candidates_executed_gae_"
+    "rms_utility_old_policy_anchor_cross_entropy_no_pg_aux/v2"
+)
 REPLAY_NUMERICS_SCHEMA = "compact_token_logprob_next_slot_targets/v2"
 ADAMW_ALGORITHM_SCHEMA = (
     "torch_adamw_betas0.9_0.999_eps1e-8_amsgrad_false_weight_decay0/v1"
@@ -37,6 +45,22 @@ def optimizer_schema_for_trunk_optimizer(kind: str) -> str:
     if kind == "muon":
         return f"{MUON_ALGORITHM_SCHEMA}+{ADAMW_ALGORITHM_SCHEMA}"
     raise ValueError(f"unknown trunk optimizer {kind!r}")
+
+
+def actor_objective_schema(
+    delightful_policy_gradient: bool = False,
+    target_policy_optimization: bool = False,
+) -> str:
+    """Exact actor estimator selected for checkpoint provenance."""
+    if delightful_policy_gradient and target_policy_optimization:
+        raise ValueError("actor objectives are mutually exclusive")
+    if target_policy_optimization:
+        return TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA
+    return (
+        DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA
+        if delightful_policy_gradient
+        else ACTOR_OBJECTIVE_SCHEMA
+    )
 
 
 def resume_execution_schema_compatible(

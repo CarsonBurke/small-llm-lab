@@ -1,0 +1,48 @@
+{
+  "answer_fence_prompt_schema": "bare_problem_single_think_answer_contract/v1",
+  "groups_per_cycle": 64,
+  "mbpp_source": {
+    "official_url": "https://raw.githubusercontent.com/google-research/google-research/master/mbpp/mbpp.jsonl",
+    "path": "postraining/data/vapo_broad_v5_mbpp_source.jsonl",
+    "sha256": "ccf64ceae9c5403bf50a044cb6d505bfd2a2963ee58338ba268fd65beab92a9f",
+    "split": "task_id_601_974"
+  },
+  "python_reward_schema": "bwrap_python_positive_ast_all_tests_binary/v5",
+  "schema": "vapo_verifiable_mixture/v1",
+  "sft_corpus": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+  "sft_corpus_sha256": "ac398fc38e4db4d5d53cd03594850b96d3be79425fc80f963f326e23f99e8007",
+  "sources": [
+    {
+      "name": "dapo",
+      "path": "postraining/data/dapo-math-17k.parquet",
+      "quota": 28,
+      "rows": 17917,
+      "sha256": "534375d6bb8630d22ab46a56e11f2ffec1d288d8f7d04099bc82d68948705941",
+      "verifier": "math"
+    },
+    {
+      "name": "deepmind",
+      "path": "postraining/data/deepmind-interpolate-rl-full.parquet",
+      "quota": 20,
+      "rows": 179856,
+      "sha256": "90d222e0d395b7fe7d7413ffae2736647d4ab81142b04796eaa150ff64a78513",
+      "verifier": "math"
+    },
+    {
+      "name": "gsm8k",
+      "path": "postraining/data/gsm8k_rl_prompts.parquet",
+      "quota": 8,
+      "rows": 7217,
+      "sha256": "64a5e2cbc65ca9096a042a775db5aff5defd434d1f918c0ee70f9abe93ef4a25",
+      "verifier": "math"
+    },
+    {
+      "name": "mbpp",
+      "path": "postraining/data/vapo_broad_v5_mbpp_train.parquet",
+      "quota": 8,
+      "rows": 374,
+      "sha256": "83fafdacdedf6a0627cc9d4252d2e245ad35e24f8a9c0cc6f85e409c1d5273d7",
+      "verifier": "python_mbpp"
+    }
+  ]
+}

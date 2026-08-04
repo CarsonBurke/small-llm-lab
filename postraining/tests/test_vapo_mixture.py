@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -10,6 +12,7 @@ import pytest
 
 from postraining.vapo.code_reward import (
     PYTHON_REWARD_SCHEMA,
+    batch_python_test_results,
     normalize_python_answer,
     python_candidate_allowed,
     python_test_result,
@@ -17,10 +20,12 @@ from postraining.vapo.code_reward import (
 )
 from postraining.vapo.mixture import (
     VAPO_MIXTURE_SCHEMA,
+    MixtureSource,
     MixedPromptSampler,
     file_sha256,
     load_mixture_manifest,
     mixture_identity,
+    rollout_window_source_quotas,
 )
 from postraining.math_prompt import (
     ANSWER_FENCE_INSTRUCTION,
@@ -97,6 +102,59 @@ def test_mixture_manifest_binds_bytes_and_sampler_is_exact_and_resumable(
         load_mixture_manifest(manifest_path)
 
 
+def test_rollout_windows_preserve_exact_source_composition() -> None:
+    def source(name: str, quota: int) -> MixtureSource:
+        return MixtureSource(name, Path(f"{name}.parquet"), quota, "math", ())
+
+    balanced = [source("a", 2), source("b", 2)]
+    assert rollout_window_source_quotas(balanced, 2) == [1, 1]
+    assert rollout_window_source_quotas(balanced, 4) == [2, 2]
+
+    broad = [
+        source("dapo", 28),
+        source("deepmind", 20),
+        source("gsm8k", 8),
+        source("mbpp", 8),
+    ]
+    assert rollout_window_source_quotas(broad, 16) == [7, 5, 2, 2]
+    with pytest.raises(ValueError, match="identical source quotas"):
+        rollout_window_source_quotas(broad, 24)
+    assert (
+        rollout_window_source_quotas(
+            broad, 24, allow_balanced_rotation=True, start_cursor=32
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="sampler cursor 3"):
+        rollout_window_source_quotas(
+            broad, 24, allow_balanced_rotation=True, start_cursor=3
+        )
+    broad_sampler = MixedPromptSampler(
+        broad, seed=3, dataset_identity="test"
+    )
+    assert broad_sampler.source_counts(0, 24) == {
+        "dapo": 10, "deepmind": 8, "gsm8k": 3, "mbpp": 3,
+    }
+    assert broad_sampler.source_counts(24, 24) == {
+        "dapo": 11, "deepmind": 7, "gsm8k": 3, "mbpp": 3,
+    }
+
+    uneven = [source("a", 3), source("b", 1)]
+    with pytest.raises(ValueError, match="identical source quotas"):
+        rollout_window_source_quotas(uneven, 2)
+    with pytest.raises(ValueError, match="identical source quotas"):
+        rollout_window_source_quotas(balanced, 3)
+
+    shifted = [source("a", 2), source("b", 2), source("c", 8)]
+    shifted_quotas = rollout_window_source_quotas(shifted, 6)
+    assert shifted_quotas == [1, 1, 4]
+    shifted_sampler = MixedPromptSampler(
+        shifted, seed=3, dataset_identity="test", cursor=4
+    )
+    with pytest.raises(ValueError, match="sampler cursor 4"):
+        shifted_sampler.validate_next_source_quotas(shifted_quotas)
+
+
 def test_explicit_bare_prompt_gets_one_canonical_contract() -> None:
     row = _row("7")
     canonical = canonicalize_answer_fence_rows([row])[0]
@@ -141,6 +199,29 @@ except Exception as error:
     assert not python_candidate_allowed(alias_theft)
     getattr_alias = "g = getattr\ng(object(), '__class__')"
     assert not python_candidate_allowed(getattr_alias)
+    magic_equality = """\
+class AlwaysEqual:
+    def __eq__(self, other):
+        return True
+def add(a, b):
+    return AlwaysEqual()
+"""
+    assert not python_candidate_allowed(magic_equality)
+    assert not python_tests_pass(magic_equality, verification)
+    generator_frame = """\
+g = None
+def gen():
+    yield g.gi_frame.f_back
+g = gen()
+frame = next(g)
+"""
+    assert not python_candidate_allowed(generator_frame)
+    magic_assignment = """\
+class AlwaysContains:
+    pass
+AlwaysContains.__contains__ = lambda self, value: True
+"""
+    assert not python_candidate_allowed(magic_assignment)
     assert python_candidate_allowed(
         "import math\nfrom sys import maxsize\ndef f(x): return math.sqrt(x) + maxsize"
     )
@@ -159,8 +240,29 @@ def test_python_fixture_runs_after_candidate_definitions() -> None:
         "test_setup": ["root = Node(3)"],
         "tests": ["assert value(root) == 3"],
     }
-    code = "class Node:\n    def __init__(self, x): self.x = x\ndef value(n): return n.x"
+    code = (
+        "class Node:\n    def __init__(self, x): self.data = x\n"
+        "def value(n): return n.data"
+    )
     assert python_tests_pass(code, verification)
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap is unavailable")
+def test_nested_python_scoring_respects_global_sandbox_capacity() -> None:
+    verification = {
+        "schema": PYTHON_REWARD_SCHEMA,
+        "test_setup": [],
+        "tests": ["assert identity(3) == 3"],
+    }
+    answers = ["def identity(x): return x"] * 8
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        nested = list(
+            pool.map(
+                lambda _: batch_python_test_results(answers, verification),
+                range(4),
+            )
+        )
+    assert nested == [["pass"] * 8] * 4
     assert normalize_python_answer("```python\ndef f():\n    pass\n```") == (
         "def f():\n    pass"
     )

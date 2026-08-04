@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from postraining.latent_rollout import (
+    TOKEN_SLOT,
     generated_slot_mask,
     replay_beliefs,
     split_rollout_groups,
@@ -13,6 +14,7 @@ from postraining.latent_thought import LatentThoughtModel, StepOutput
 from postraining.rollout_scheduler import (
     ContinuousScheduleStats,
     _decode_execution_width,
+    _top_p_from_uniform,
     rollout_continuous_refill_groups,
     warmup_decode_width_buckets,
 )
@@ -169,6 +171,7 @@ def _run(
     replay_storage=True,
     paged_cache=None,
     pad_decode_width=None,
+    tpo_candidates=0,
 ):
     return rollout_continuous_refill_groups(
         model,
@@ -187,6 +190,7 @@ def _run(
         schedule_stats=stats,
         paged_cache=paged_cache,
         pad_decode_width=pad_decode_width,
+        tpo_candidates=tpo_candidates,
     )
 
 
@@ -217,6 +221,36 @@ def test_continuous_refill_reuses_freed_slots_without_censoring():
     assert stats.admitted_rows == stats.evicted_rows == 6
     assert stats.active_rows_max == 4
     assert stats.metrics()["decode_slot_occupancy"] == 1.0
+
+
+def test_continuous_refill_tpo_executes_only_candidate_zero():
+    results = _run(
+        _FakeContinuousModel(),
+        [_chunk(2), _chunk(3)],
+        tpo_candidates=4,
+    )
+    for batch in results:
+        assert batch.tpo_candidate_ids is not None
+        assert batch.old_tpo_candidate_logprobs is not None
+        for row, position in batch.action_mask.nonzero().tolist():
+            candidates = batch.tpo_candidate_ids[row, position]
+            assert (
+                candidates[0]
+                == batch.token_ids[row, position + 1]
+            )
+            assert candidates.unique().numel() == candidates.numel()
+        # K candidates still create exactly one consequence slot per action.
+        assert batch.action_mask.sum() == batch.kind[:, batch.prompt_length:].eq(
+            TOKEN_SLOT
+        ).sum()
+
+
+def test_continuous_tpo_zero_uniform_skips_zeroed_candidate_mass():
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+    uniforms = torch.tensor([[0.1, 0.0, 0.2, 0.3]])
+    candidates = _top_p_from_uniform(logits, uniforms, 1.0, 1.0)
+    assert candidates[0, 0] == 0
+    assert candidates.unique().numel() == candidates.numel()
 
 
 def test_padded_decode_width_changes_nothing_a_live_row_can_observe():

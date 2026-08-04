@@ -777,6 +777,148 @@ def clipped_policy_loss(
     return loss, clip_fraction, approximate_kl
 
 
+def delightful_policy_loss(
+    logprobs: Tensor,
+    advantages: Tensor,
+    mask: Tensor,
+    temperature: float = 1.0,
+    denominator: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Delightful Policy Gradient for discrete token actions.
+
+    Implements Algorithm 1 of Osband (2026): every score term is weighted by
+    ``sigmoid(advantage * surprisal / temperature)``, where surprisal is the
+    negative log probability of the sampled token under the *current* policy.
+    The gate is deliberately detached. DG specifies a gradient estimator, not
+    the gradient of the scalar expression used to construct its gate; allowing
+    autograd through the sigmoid would add an unprescribed second-order term.
+
+    No behavior-policy importance ratio or PPO clipping appears in this
+    objective. ``denominator`` may span multiple replay shards, just as in
+    :func:`clipped_policy_loss`.
+    """
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("delight temperature must be finite and positive")
+    active = mask.bool()
+    detached_advantages = advantages.detach()
+    surprisal = -logprobs.detach()
+    delight = detached_advantages * surprisal
+    gate = torch.sigmoid(delight / temperature).detach()
+    denom = (
+        mask.sum() if denominator is None else denominator.to(mask.device)
+    ).clamp_min(1)
+    loss_terms = -gate * detached_advantages * logprobs * mask
+    loss = loss_terms.sum() / denom
+
+    positive = active & (detached_advantages > 0)
+    negative = active & (detached_advantages < 0)
+    diagnostics = {
+        "gate_sum": gate.masked_fill(~active, 0.0).sum(),
+        "positive_gate_sum": gate.masked_fill(~positive, 0.0).sum(),
+        "positive_count": positive.sum(),
+        "negative_gate_sum": gate.masked_fill(~negative, 0.0).sum(),
+        "negative_count": negative.sum(),
+        "delight_sum": delight.masked_fill(~active, 0.0).sum(),
+        "surprisal_sum": surprisal.masked_fill(~active, 0.0).sum(),
+        # These detached scalar contributions explain the sign of the
+        # autograd surrogate. They are not exploration/exploitation metrics:
+        # positive-advantage terms reinforce sampled actions, while negative-
+        # advantage terms suppress them.
+        "positive_loss_sum": loss_terms.detach().masked_fill(
+            ~positive, 0.0
+        ).sum(),
+        "negative_loss_sum": loss_terms.detach().masked_fill(
+            ~negative, 0.0
+        ).sum(),
+    }
+    return loss, diagnostics
+
+
+def target_policy_loss(
+    candidate_logprobs: Tensor,
+    old_candidate_logprobs: Tensor,
+    advantages: Tensor,
+    advantage_rms: Tensor,
+    *,
+    eta: float = 1.0,
+    denominator: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Action-only token TPO on one executed and K-1 comparison actions.
+
+    Candidate zero is the action actually followed by the behavior policy.
+    Its on-trajectory GAE is the only scored utility; comparison actions are
+    left at the neutral utility zero.  This is the sampled-action construction
+    analyzed in TPO Appendix C, with one deliberate adaptation for a learned
+    critic: RMS scaling preserves advantage magnitude instead of within-group
+    z-scoring ``[A, 0, ...]`` down to its sign.
+
+    The old-policy anchor and target are detached.  No policy-gradient term,
+    importance ratio, clipping, or counterfactual value estimate appears in
+    this loss.
+    """
+    if candidate_logprobs.ndim != 2:
+        raise ValueError("candidate log probabilities must be [actions, K]")
+    if old_candidate_logprobs.shape != candidate_logprobs.shape:
+        raise ValueError("old and current candidate log probabilities must align")
+    if advantages.shape != candidate_logprobs.shape[:1]:
+        raise ValueError("advantages must contain one value per candidate group")
+    if candidate_logprobs.size(1) < 2:
+        raise ValueError("TPO requires an executed action and at least one comparison")
+    if not math.isfinite(eta) or eta <= 0.0:
+        raise ValueError("TPO eta must be finite and positive")
+    if advantage_rms.numel() != 1:
+        raise ValueError("advantage RMS must be scalar")
+
+    detached_advantages = advantages.detach().float()
+    detached_rms = advantage_rms.detach().float()
+    scaled_advantages = torch.where(
+        detached_rms > 0,
+        detached_advantages / detached_rms,
+        torch.zeros_like(detached_advantages),
+    )
+    utilities = torch.zeros_like(candidate_logprobs, dtype=torch.float32)
+    utilities[:, 0] = scaled_advantages / eta
+
+    old_group_logprobs = old_candidate_logprobs.detach().float().log_softmax(-1)
+    target_logprobs = (old_group_logprobs + utilities).log_softmax(-1).detach()
+    targets = target_logprobs.exp()
+    current_group_logprobs = candidate_logprobs.float().log_softmax(-1)
+    cross_entropy = -(targets * current_group_logprobs).sum(-1)
+    denom = (
+        cross_entropy.new_tensor(cross_entropy.numel())
+        if denominator is None
+        else denominator.to(cross_entropy.device)
+    ).clamp_min(1)
+    loss = cross_entropy.sum() / denom
+
+    old_group_probs = old_group_logprobs.exp()
+    target_shift = targets[:, 0] - old_group_probs[:, 0]
+    positive = detached_advantages > 0
+    negative = detached_advantages < 0
+    diagnostics = {
+        "cross_entropy_sum": cross_entropy.detach().sum(),
+        "target_entropy_sum": (-(targets * target_logprobs).sum(-1)).sum(),
+        "target_kl_sum": (
+            targets * (target_logprobs - old_group_logprobs)
+        ).sum(),
+        "target_l1_shift_sum": (targets - old_group_probs).abs().sum(),
+        "executed_old_mass_sum": old_group_probs[:, 0].sum(),
+        "executed_target_mass_sum": targets[:, 0].sum(),
+        "executed_positive_shift_sum": target_shift.masked_fill(
+            ~positive, 0.0
+        ).sum(),
+        "executed_negative_shift_sum": target_shift.masked_fill(
+            ~negative, 0.0
+        ).sum(),
+        "positive_count": positive.sum(),
+        "negative_count": negative.sum(),
+        "neutral_count": (detached_advantages == 0).sum(),
+        "utility_abs_sum": scaled_advantages.abs().sum(),
+        "utility_square_sum": scaled_advantages.square().sum(),
+    }
+    return loss, diagnostics
+
+
 def masked_token_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
@@ -788,7 +930,20 @@ def top_p_sample(
     *,
     generator: torch.Generator | None = None,
     top_k: int | None = None,
+    num_samples: int = 1,
 ) -> Tensor:
+    if num_samples < 1:
+        raise ValueError("num_samples must be positive")
+    candidate_support = (
+        top_k
+        if top_k is not None and 0 < top_k < logits.size(-1)
+        else logits.size(-1)
+    )
+    if num_samples > candidate_support:
+        raise ValueError(
+            f"cannot draw {num_samples} unique samples from "
+            f"support of size {candidate_support}"
+        )
     logits = logits.float()
     if temperature != 1.0:
         # Dividing by exactly 1.0 is the identity in IEEE arithmetic, so the
@@ -805,26 +960,30 @@ def top_p_sample(
         # which otherwise runs at EVERY rollout step of the top-p-1 training
         # configuration.
         sampled = torch.multinomial(
-            logits.softmax(dim=-1), 1, generator=generator
-        ).squeeze(-1)
-        return (
-            sampled
-            if top_indices is None
-            else top_indices.gather(-1, sampled[:, None]).squeeze(-1)
+            logits.softmax(dim=-1), num_samples,
+            replacement=False,
+            generator=generator,
         )
+        if top_indices is not None:
+            sampled = top_indices.gather(-1, sampled)
+        return sampled.squeeze(-1) if num_samples == 1 else sampled
     sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
     probs = sorted_logits.softmax(dim=-1)
     remove = probs.cumsum(dim=-1) - probs > top_p
     sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
     sampled = torch.multinomial(
-        sorted_logits.softmax(dim=-1), 1, generator=generator
+        sorted_logits.softmax(dim=-1), num_samples,
+        replacement=False,
+        generator=generator,
     )
     sampled = sorted_indices.gather(-1, sampled).squeeze(-1)
-    return (
-        sampled
-        if top_indices is None
-        else top_indices.gather(-1, sampled[:, None]).squeeze(-1)
-    )
+    if top_indices is not None:
+        sampled = top_indices.gather(
+            -1, sampled[..., None] if num_samples == 1 else sampled
+        )
+        if num_samples == 1:
+            sampled = sampled.squeeze(-1)
+    return sampled
 
 
 @dataclass

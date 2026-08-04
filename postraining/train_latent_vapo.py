@@ -1,4 +1,4 @@
-"""Latent-thought VAPO: token-level PPO over a deterministic hidden carry.
+"""Latent-thought policy gradients over a deterministic hidden carry.
 
 The WHOLE deployed policy path trains at RL time — no frozen trunk. The only
 actions are tokens; latent thinking is deterministic function structure, not
@@ -12,11 +12,16 @@ a stochastic action channel.
   The carried belief is detached replay data — gradients reach the trunk,
   embeddings, and combiner through the teacher-forced pass, never backward
   through time.
-- PPO is standard token-level VAPO: one differentiable teacher-forced replay
-  produces per-token log probabilities; the DAPO-style asymmetric clip
-  applies to the token ratio; there is no gate factor, thought surrogate,
-  reverse-KL penalty, or trust projection because there is no stochastic
-  thought policy to constrain.
+- The default actor is Delightful Policy Gradient: one differentiable
+  teacher-forced replay applies Osband's sigmoid gate to advantage times
+  current-token surprisal, with eta=1 and no importance ratio or clipping.
+  ``--no-delightful-policy-gradient`` selects the historical token-level VAPO
+  control with DAPO's asymmetric token-ratio clip.
+  ``--target-policy-optimization`` instead samples a local token candidate
+  group at every behavior state, always follows candidate zero, scores only
+  that executed action with RMS-scaled critic GAE, and fits the anchored TPO
+  target by cross-entropy. It has no PG auxiliary and never values or rolls
+  out the comparison candidates. In every mode, tokens are the only actions.
 - The critic is a SEPARATE from-scratch model (same architecture class,
   fresh weights, fully trainable, no SIGReg or latent prediction) trained
   purely by HL-Gauss cross-entropy on [0, 1] value targets. It re-derives
@@ -34,10 +39,11 @@ a stochastic action channel.
 Deferred by design: test-time-read-compute (carrying hiddens for read/prompt
 tokens) is out of scope for this policy schema.
 
-Prompts are DAPO-Math-17K. An EOS-terminated, verifier-correct final Answer:
-field receives reward 1; a wrong but strictly numeric final field receives
-bounded distance shaping of at most 0.1. Malformed or unterminated responses
-receive zero. AIME 2024 avg@k is the eval. Prompt groups roll out and replay
+The default broad-v5 prompt cycle is stratified across DAPO-Math-17K,
+DeepMind Mathematics, GSM8K train, and MBPP train. Rewards are binary exact
+and grade only a structurally valid ``<answer>...</answer>`` span after at
+least 33 tokens inside ``<think>...</think>``. AIME 2024 avg@k and held-out
+DeepMind Mathematics are the evaluations. Prompt groups roll out and replay
 separately because their lengths differ, then accumulate into the shared
 actor/critic optimizer minibatch. ``--rollout-only`` reports whether rewards
 vary within prompt groups before any update is attempted.
@@ -83,6 +89,8 @@ from postraining.core import (
     POSTTRAIN_RESPONSE_TOKENS,
     answer_style,
     clipped_policy_loss,
+    delightful_policy_loss,
+    target_policy_loss,
     encode_prompt,
     extract_final_answer,
     deterministic_math_subset,
@@ -163,13 +171,15 @@ from postraining.vapo.code_reward import (
 )
 from postraining.vapo.mixture import (
     MixedPromptSampler,
+    file_sha256,
     load_mixture_manifest,
     mixture_identity,
+    rollout_window_source_quotas,
 )
 from postraining.vapo.schemas import (
-    ACTOR_OBJECTIVE_SCHEMA,
     PROMPT_ORDER_SCHEMA,
     REPLAY_NUMERICS_SCHEMA,
+    actor_objective_schema,
     execution_schema_for_rollout_scheduler,
     optimizer_schema_for_trunk_optimizer,
     resume_execution_schema_compatible,
@@ -196,8 +206,6 @@ RESUME_EXACT_ARG_FIELDS = (
     "answer_tokens",
     "prompt_tokens",
     "continuation_tokens",
-    "prompts_per_rollout",
-    "prompts_per_minibatch",
     "samples_per_prompt",
     "ppo_epochs",
     "temperature",
@@ -215,7 +223,6 @@ RESUME_EXACT_ARG_FIELDS = (
     "think_min_tokens",
     "answer_fence",
     "zero_reward_actor_freeze",
-    "zero_reward_stop_pools",
     "value_warmup_steps",
     "rollout_tail_batch",
     "rollout_compile",
@@ -235,12 +242,57 @@ RESUME_EXACT_ARG_FIELDS = (
     "consume_all_prompts",
     "seed",
 )
+TPO_RESUME_EXACT_ARG_FIELDS = (
+    "target_policy_optimization",
+    "tpo_candidates",
+    "tpo_eta",
+)
 
 
 def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> None:
+    saved_rollout = int(saved.get("prompts_per_rollout", -1))
+    saved_minibatch = int(saved.get("prompts_per_minibatch", -1))
+    current_rollout = int(current.prompts_per_rollout)
+    current_minibatch = int(current.prompts_per_minibatch)
+    topology_changed = (saved_rollout, saved_minibatch) != (
+        current_rollout,
+        current_minibatch,
+    )
+    if topology_changed:
+        if not (
+            (
+                bool(saved.get("delightful_policy_gradient"))
+                or bool(saved.get("target_policy_optimization"))
+            )
+            and (
+                bool(getattr(current, "delightful_policy_gradient", False))
+                or bool(getattr(current, "target_policy_optimization", False))
+            )
+            and saved_rollout == saved_minibatch
+            and current_rollout == current_minibatch
+        ):
+            raise ValueError(
+                "exact resume changed rollout/minibatch topology outside the "
+                "one-fresh-batch Delightful regime: checkpoint="
+                f"{saved_rollout}/{saved_minibatch}, current="
+                f"{current_rollout}/{current_minibatch}"
+            )
+        if not bool(getattr(current, "allow_dg_topology_migration", False)):
+            raise ValueError(
+                "exact Delightful resume changed rollout/minibatch topology "
+                f"from {saved_rollout}/{saved_minibatch} to "
+                f"{current_rollout}/{current_minibatch}; pass "
+                "--allow-dg-topology-migration to acknowledge the change"
+            )
+    exact_fields = RESUME_EXACT_ARG_FIELDS
+    if (
+        bool(saved.get("target_policy_optimization"))
+        or bool(getattr(current, "target_policy_optimization", False))
+    ):
+        exact_fields += TPO_RESUME_EXACT_ARG_FIELDS
     mismatches = [
         (name, saved.get(name), getattr(current, name))
-        for name in RESUME_EXACT_ARG_FIELDS
+        for name in exact_fields
         if saved.get(name) != getattr(current, name)
     ]
     if mismatches:
@@ -251,6 +303,59 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
         raise ValueError(
             "exact resume changed environment/objective arguments: " + details
         )
+
+
+def resume_topology_history(
+    existing_manifest: dict | None,
+    saved_args: dict | None,
+    current: argparse.Namespace,
+    *,
+    checkpoint: str | None,
+    checkpoint_sha256: str | None,
+    step: int,
+    sampler_cursor: int,
+) -> list[dict]:
+    """Preserve and extend the auditable rollout-topology history."""
+    history = list((existing_manifest or {}).get("topology_history") or [])
+    if not saved_args or not checkpoint:
+        return history
+    before = {
+        "prompts_per_rollout": int(saved_args.get("prompts_per_rollout", -1)),
+        "prompts_per_minibatch": int(
+            saved_args.get("prompts_per_minibatch", -1)
+        ),
+    }
+    after = {
+        "prompts_per_rollout": int(current.prompts_per_rollout),
+        "prompts_per_minibatch": int(current.prompts_per_minibatch),
+    }
+    if before == after:
+        return history
+    transition = {
+        "source_checkpoint": str(checkpoint),
+        "source_checkpoint_sha256": checkpoint_sha256,
+        "source_step": int(step),
+        "source_sampler_cursor": int(sampler_cursor),
+        "before": before,
+        "after": after,
+    }
+    transition_identity = {
+        key: transition[key]
+        for key in (
+            "source_checkpoint_sha256",
+            "source_step",
+            "source_sampler_cursor",
+            "before",
+            "after",
+        )
+    }
+    already_recorded = any(
+        all(entry.get(key) == value for key, value in transition_identity.items())
+        for entry in history
+    )
+    if not already_recorded:
+        history.append(transition)
+    return history
 
 
 class _TileLangCompileCounter(logging.Handler):
@@ -680,6 +785,12 @@ def score_math_rollout(
     # stale count rather than leave the old alarm value behind.
     batch.think_gate_zeroed_correct = (
         gate_zeroed_correct if think_fence_ids is not None else None
+    )
+    batch.verifier_status = torch.full(
+        (batch.kind.size(0),),
+        PYTHON_RESULT_CODES["not_applicable"],
+        dtype=torch.long,
+        device=batch.rewards.device,
     )
     assign_terminal_rewards(
         batch, torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device)
@@ -1132,7 +1243,7 @@ def aggregate_actor_tensorboard_metrics(
     # optimizer minibatch, so its loss is a contribution to be summed rather
     # than another independently normalized minibatch mean.
     policy_contribution = sum(metric["policy_loss"] for metric in metrics)
-    return {
+    dashboard = {
         "loss/policy": policy_contribution,
         "loss/actor_total": policy_contribution,
         "value/token_weighted_excess_ce": value["excess_ce"],
@@ -1164,6 +1275,93 @@ def aggregate_actor_tensorboard_metrics(
         "grad/combiner": last["combiner_grad_norm"],
         "grad/critic": last["critic_grad_norm"],
     }
+    if "delightful_gate_mean" in last:
+        dashboard.pop("clip/policy")
+        dashboard.pop("ratio/harmful_positive_log_max")
+        dashboard.update(
+            {
+                "delightful/gate_mean": _weighted_metric_mean(
+                    metrics, "delightful_gate_mean", "action_count"
+                ),
+                "delightful/positive_gate_mean": _weighted_metric_mean(
+                    metrics,
+                    "delightful_positive_gate_mean",
+                    "delightful_positive_count",
+                ),
+                "delightful/negative_gate_mean": _weighted_metric_mean(
+                    metrics,
+                    "delightful_negative_gate_mean",
+                    "delightful_negative_count",
+                ),
+                "delightful/delight_mean": _weighted_metric_mean(
+                    metrics, "delightful_delight_mean", "action_count"
+                ),
+                "delightful/surprisal_mean": _weighted_metric_mean(
+                    metrics, "delightful_surprisal_mean", "action_count"
+                ),
+                "delightful/reinforce_positive_advantage": sum(
+                    metric["delightful_positive_loss_contribution"]
+                    for metric in metrics
+                ),
+                "delightful/suppress_negative_advantage": sum(
+                    metric["delightful_negative_loss_contribution"]
+                    for metric in metrics
+                ),
+            }
+        )
+    if "tpo_target_kl" in last:
+        dashboard.pop("clip/policy")
+        dashboard.pop("ratio/harmful_positive_log_max")
+        dashboard.update(
+            {
+                "ratio/tpo_candidate_abs_log_max": max(
+                    metric["tpo_candidate_abs_log_ratio_max"]
+                    for metric in metrics
+                ),
+                "tpo/advantage_rms": _weighted_metric_mean(
+                    metrics, "tpo_advantage_rms", "action_count"
+                ),
+                "tpo/target_entropy": _weighted_metric_mean(
+                    metrics, "tpo_target_entropy", "action_count"
+                ),
+                "tpo/target_kl": _weighted_metric_mean(
+                    metrics, "tpo_target_kl", "action_count"
+                ),
+                "tpo/target_l1_shift": _weighted_metric_mean(
+                    metrics, "tpo_target_l1_shift", "action_count"
+                ),
+                "tpo/executed_old_mass": _weighted_metric_mean(
+                    metrics, "tpo_executed_old_mass", "action_count"
+                ),
+                "tpo/executed_target_mass": _weighted_metric_mean(
+                    metrics, "tpo_executed_target_mass", "action_count"
+                ),
+                "tpo/positive_executed_shift": _weighted_metric_mean(
+                    metrics, "tpo_positive_executed_shift", "tpo_positive_count"
+                ),
+                "tpo/negative_executed_shift": _weighted_metric_mean(
+                    metrics, "tpo_negative_executed_shift", "tpo_negative_count"
+                ),
+                "tpo/utility_abs_mean": _weighted_metric_mean(
+                    metrics, "tpo_utility_abs_mean", "action_count"
+                ),
+                "tpo/utility_rms": _weighted_metric_mean(
+                    metrics, "tpo_utility_rms", "action_count"
+                ),
+                "tpo/effective_candidates": _weighted_metric_mean(
+                    metrics, "tpo_effective_candidates", "action_count"
+                ),
+                "tpo/duplicate_fraction": _weighted_metric_mean(
+                    metrics, "tpo_duplicate_fraction", "action_count"
+                ),
+                "tpo/behavior_duplicate_fraction": _weighted_metric_mean(
+                    metrics,
+                    "tpo_behavior_duplicate_fraction",
+                    "action_count",
+                ),
+            }
+        )
+    return dashboard
 
 
 def rollout_tensorboard_metrics(metrics: dict[str, float | int]) -> dict[str, float]:
@@ -1356,7 +1554,10 @@ def source_actor_signal_mask(
     In a mixed minibatch, aggregate reward can hide an entirely zero-reward
     source. Its critic targets remain useful calibration data, but its actor
     advantages are pure baseline error and push away arbitrary sampled text.
-    The pairwise formulation avoids a device-to-host sync for source counts.
+    This is deliberately not per-prompt reward-variance filtering: failed
+    prompt groups inside a source with successes retain dense critic-GAE
+    credit. The pairwise formulation avoids a device-to-host sync for source
+    counts.
     """
     if source_ids is None:
         return torch.ones_like(reward_scalar, dtype=torch.bool)
@@ -1380,10 +1581,18 @@ def write_actor_tensorboard_metrics(
         "kl/policy_behavior_per_action",
         "clip/policy",
         "ratio/token_abs_log_max",
+        "ratio/tpo_candidate_abs_log_max",
         "ratio/harmful_positive_log_max",
     )
     if behavior_age == 0:
-        refresh_drift = max(dashboard[tag] for tag in fresh_behavior_tags)
+        refresh_drift = max(
+            (
+                dashboard[tag]
+                for tag in fresh_behavior_tags
+                if tag in dashboard
+            ),
+            default=0.0,
+        )
         tensorboard.add_scalar(
             "debug/behavior_refresh_max_drift", refresh_drift, step
         )
@@ -1679,6 +1888,9 @@ def update_minibatch(
     replay_bucket: int = 1,
     replay_slot_budget: int | None = None,
     replay_plan: ReplayPlan | None = None,
+    delightful_policy_gradient: bool = False,
+    target_policy_optimization: bool = False,
+    tpo_eta: float = 1.0,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -1703,6 +1915,8 @@ def update_minibatch(
         raise ValueError("replay max trajectories must be positive")
     if replay_attention_budget < 1:
         raise ValueError("replay attention budget must be positive")
+    if delightful_policy_gradient and target_policy_optimization:
+        raise ValueError("actor objectives are mutually exclusive")
     if not value_only and not batch.statistics_refreshed:
         # An unrefreshed batch carries zeros in ``old_token_logprobs`` and
         # ``old_values``; nothing about the tensor shapes can express "not
@@ -1728,6 +1942,20 @@ def update_minibatch(
             "residual_sum", "residual_square_sum",
             "token_abs_log_ratio_max",
             "harmful_positive_log_ratio_max",
+            "delightful_gate_sum", "delightful_positive_gate_sum",
+            "delightful_positive_count", "delightful_negative_gate_sum",
+            "delightful_negative_count", "delightful_delight_sum",
+            "delightful_surprisal_sum", "delightful_positive_loss_sum",
+            "delightful_negative_loss_sum",
+            "tpo_cross_entropy_sum", "tpo_target_entropy_sum",
+            "tpo_target_kl_sum", "tpo_target_l1_shift_sum",
+            "tpo_executed_old_mass_sum", "tpo_executed_target_mass_sum",
+            "tpo_executed_positive_shift_sum",
+            "tpo_executed_negative_shift_sum", "tpo_positive_count",
+            "tpo_negative_count", "tpo_neutral_count",
+            "tpo_utility_abs_sum", "tpo_utility_square_sum",
+            "tpo_unique_candidate_sum", "tpo_behavior_duplicate_count",
+            "tpo_candidate_abs_log_ratio_max",
         )
     }
 
@@ -1750,6 +1978,20 @@ def update_minibatch(
     )
     if not value_only:
         advantages = advantages * actor_signal_rows[:, None]
+    actor_active_mask = (
+        batch.action_mask * actor_signal_rows[:, None]
+        if not value_only
+        else batch.action_mask
+    )
+    active_action_count = actor_active_mask.sum()
+    advantage_rms = torch.where(
+        active_action_count > 0,
+        (
+            (advantages.float().square() * actor_active_mask).sum()
+            / active_action_count.clamp_min(1)
+        ).sqrt(),
+        torch.zeros_like(active_action_count),
+    )
     if replay_plan is None:
         replay_plan = build_replay_plan(
             batch,
@@ -1857,23 +2099,130 @@ def update_minibatch(
         emit_index = shard.emit_index
         # Shared with refresh_old_statistics: one compiled artifact for both
         # keeps the two forwards bit-identical (the age-0 zero-clip canary).
-        compact_token_logprobs = compact_emit_token_logprobs(
-            wrapper,
-            compact_slots(stream_inputs, emit_index),
-            compact_slots(beliefs, emit_index),
-            compact_next_slots(microbatch.token_ids, emit_index),
-        )
+        emit_inputs = compact_slots(stream_inputs, emit_index)
+        emit_beliefs = compact_slots(beliefs, emit_index)
+        if target_policy_optimization:
+            if (
+                microbatch.tpo_candidate_ids is None
+                or microbatch.old_tpo_candidate_logprobs is None
+            ):
+                raise RuntimeError("TPO update requires sampled candidate groups")
+            compact_candidate_ids = compact_slots(
+                microbatch.tpo_candidate_ids, emit_index
+            )
+            compact_candidate_logprobs = compact_emit_token_logprobs(
+                wrapper,
+                emit_inputs,
+                emit_beliefs,
+                compact_candidate_ids,
+            )
+            compact_token_logprobs = compact_candidate_logprobs[:, 0]
+        else:
+            compact_candidate_ids = None
+            compact_candidate_logprobs = None
+            compact_token_logprobs = compact_emit_token_logprobs(
+                wrapper,
+                emit_inputs,
+                emit_beliefs,
+                compact_next_slots(microbatch.token_ids, emit_index),
+            )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
 
-        weighted_policy_loss, weighted_policy_clip, _ = clipped_policy_loss(
-            new_token_logprobs,
-            microbatch.old_token_logprobs,
-            micro_advantages,
-            microbatch.action_mask,
-            denominator=policy_action_denominator,
-            estimate_kl=False,
-        )
+        if target_policy_optimization:
+            compact_advantages = compact_slots(
+                micro_advantages, emit_index
+            )
+            old_candidate_logprobs = compact_slots(
+                microbatch.old_tpo_candidate_logprobs, emit_index
+            )
+            totals["tpo_candidate_abs_log_ratio_max"] = torch.maximum(
+                totals["tpo_candidate_abs_log_ratio_max"],
+                (
+                    compact_candidate_logprobs
+                    - old_candidate_logprobs
+                ).abs().max(),
+            )
+            weighted_policy_loss, tpo = target_policy_loss(
+                compact_candidate_logprobs,
+                old_candidate_logprobs,
+                compact_advantages,
+                advantage_rms,
+                eta=tpo_eta,
+                denominator=policy_action_denominator,
+            )
+            weighted_policy_clip = weighted_policy_loss.detach().new_zeros(())
+            for source_name, total_name in (
+                ("cross_entropy_sum", "tpo_cross_entropy_sum"),
+                ("target_entropy_sum", "tpo_target_entropy_sum"),
+                ("target_kl_sum", "tpo_target_kl_sum"),
+                ("target_l1_shift_sum", "tpo_target_l1_shift_sum"),
+                ("executed_old_mass_sum", "tpo_executed_old_mass_sum"),
+                ("executed_target_mass_sum", "tpo_executed_target_mass_sum"),
+                (
+                    "executed_positive_shift_sum",
+                    "tpo_executed_positive_shift_sum",
+                ),
+                (
+                    "executed_negative_shift_sum",
+                    "tpo_executed_negative_shift_sum",
+                ),
+                ("positive_count", "tpo_positive_count"),
+                ("negative_count", "tpo_negative_count"),
+                ("neutral_count", "tpo_neutral_count"),
+                ("utility_abs_sum", "tpo_utility_abs_sum"),
+                ("utility_square_sum", "tpo_utility_square_sum"),
+            ):
+                totals[total_name] += tpo[source_name]
+            sorted_candidates = compact_candidate_ids.sort(-1).values
+            unique_counts = 1 + (
+                sorted_candidates[:, 1:] != sorted_candidates[:, :-1]
+            ).sum(-1)
+            totals["tpo_unique_candidate_sum"] += unique_counts.sum()
+            totals["tpo_behavior_duplicate_count"] += (
+                compact_candidate_ids[:, 1:]
+                == compact_candidate_ids[:, :1]
+            ).any(-1).sum()
+        elif delightful_policy_gradient:
+            weighted_policy_loss, delightful = delightful_policy_loss(
+                new_token_logprobs,
+                micro_advantages,
+                microbatch.action_mask,
+                denominator=policy_action_denominator,
+            )
+            weighted_policy_clip = weighted_policy_loss.detach().new_zeros(())
+            totals["delightful_gate_sum"] += delightful["gate_sum"]
+            totals["delightful_positive_gate_sum"] += delightful[
+                "positive_gate_sum"
+            ]
+            totals["delightful_positive_count"] += delightful[
+                "positive_count"
+            ]
+            totals["delightful_negative_gate_sum"] += delightful[
+                "negative_gate_sum"
+            ]
+            totals["delightful_negative_count"] += delightful[
+                "negative_count"
+            ]
+            totals["delightful_delight_sum"] += delightful["delight_sum"]
+            totals["delightful_surprisal_sum"] += delightful[
+                "surprisal_sum"
+            ]
+            totals["delightful_positive_loss_sum"] += delightful[
+                "positive_loss_sum"
+            ]
+            totals["delightful_negative_loss_sum"] += delightful[
+                "negative_loss_sum"
+            ]
+        else:
+            weighted_policy_loss, weighted_policy_clip, _ = clipped_policy_loss(
+                new_token_logprobs,
+                microbatch.old_token_logprobs,
+                micro_advantages,
+                microbatch.action_mask,
+                denominator=policy_action_denominator,
+                estimate_kl=False,
+            )
         actor_total = weighted_policy_loss
         finite_guards.append(
             (
@@ -2026,6 +2375,91 @@ def update_minibatch(
         reward=batch.reward_scalar.mean(),
         **grad_norms,
     )
+    if target_policy_optimization:
+        positive_count = totals["tpo_positive_count"]
+        negative_count = totals["tpo_negative_count"]
+        candidate_count = batch.tpo_candidate_ids.size(-1)
+        metric_tensors.update(
+            tpo_advantage_rms=advantage_rms,
+            tpo_candidate_abs_log_ratio_max=(
+                totals["tpo_candidate_abs_log_ratio_max"]
+            ),
+            tpo_target_entropy=(totals["tpo_target_entropy_sum"] / action_denom),
+            tpo_target_kl=(totals["tpo_target_kl_sum"] / action_denom),
+            tpo_target_l1_shift=(
+                totals["tpo_target_l1_shift_sum"] / action_denom
+            ),
+            tpo_executed_old_mass=(
+                totals["tpo_executed_old_mass_sum"] / action_denom
+            ),
+            tpo_executed_target_mass=(
+                totals["tpo_executed_target_mass_sum"] / action_denom
+            ),
+            tpo_positive_executed_shift=torch.where(
+                positive_count > 0,
+                totals["tpo_executed_positive_shift_sum"]
+                / positive_count.clamp_min(1),
+                torch.zeros_like(positive_count),
+            ),
+            tpo_negative_executed_shift=torch.where(
+                negative_count > 0,
+                totals["tpo_executed_negative_shift_sum"]
+                / negative_count.clamp_min(1),
+                torch.zeros_like(negative_count),
+            ),
+            tpo_utility_abs_mean=(totals["tpo_utility_abs_sum"] / action_denom),
+            tpo_utility_rms=(
+                totals["tpo_utility_square_sum"] / action_denom
+            ).sqrt(),
+            tpo_effective_candidates=(
+                totals["tpo_unique_candidate_sum"] / action_denom
+            ),
+            tpo_duplicate_fraction=(
+                1.0
+                - totals["tpo_unique_candidate_sum"]
+                / (action_denom * candidate_count)
+            ),
+            tpo_behavior_duplicate_fraction=(
+                totals["tpo_behavior_duplicate_count"] / action_denom
+            ),
+            tpo_positive_count=positive_count,
+            tpo_negative_count=negative_count,
+            tpo_neutral_count=totals["tpo_neutral_count"],
+        )
+    elif delightful_policy_gradient:
+        positive_count = totals["delightful_positive_count"]
+        negative_count = totals["delightful_negative_count"]
+        metric_tensors.update(
+            delightful_gate_mean=(
+                totals["delightful_gate_sum"] / action_denom
+            ),
+            delightful_positive_gate_mean=torch.where(
+                positive_count > 0,
+                totals["delightful_positive_gate_sum"]
+                / positive_count.clamp_min(1),
+                torch.zeros_like(positive_count),
+            ),
+            delightful_negative_gate_mean=torch.where(
+                negative_count > 0,
+                totals["delightful_negative_gate_sum"]
+                / negative_count.clamp_min(1),
+                torch.zeros_like(negative_count),
+            ),
+            delightful_delight_mean=(
+                totals["delightful_delight_sum"] / action_denom
+            ),
+            delightful_surprisal_mean=(
+                totals["delightful_surprisal_sum"] / action_denom
+            ),
+            delightful_positive_loss_contribution=(
+                totals["delightful_positive_loss_sum"] / action_denom
+            ),
+            delightful_negative_loss_contribution=(
+                totals["delightful_negative_loss_sum"] / action_denom
+            ),
+            delightful_positive_count=positive_count,
+            delightful_negative_count=negative_count,
+        )
     return scalar_tensors_to_floats(metric_tensors)
 
 
@@ -2152,6 +2586,7 @@ def save_checkpoint(
     sampler: MathPromptSampler | MixedPromptSampler,
     warmup_step: int,
     actor_init_provenance: dict | None = None,
+    zero_reward_frozen_updates: int = 0,
 ) -> None:
     reasoning_mode = getattr(args, "reasoning_mode", "latent")
     payload = {
@@ -2160,7 +2595,10 @@ def save_checkpoint(
         "execution_schema": execution_schema_for_rollout_scheduler(
             getattr(args, "rollout_scheduler", "lockstep")
         ),
-        "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
+        "actor_objective_schema": actor_objective_schema(
+            getattr(args, "delightful_policy_gradient", False),
+            getattr(args, "target_policy_optimization", False),
+        ),
         "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
         "source_signal_mask_schema": (
             SOURCE_SIGNAL_MASK_SCHEMA
@@ -2200,6 +2638,7 @@ def save_checkpoint(
         "optimizers": {name: opt.state_dict() for name, opt in optimizers.items()},
         "args": vars(args),
         "sampler_cursor": sampler.cursor,
+        "zero_reward_frozen_updates": int(zero_reward_frozen_updates),
         "cpu_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
         "python_rng": random.getstate(),
@@ -2209,6 +2648,35 @@ def save_checkpoint(
     tmp_path = path.with_suffix(".tmp")
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+
+
+def logged_zero_reward_frozen_updates(
+    metrics_path: str | Path, through_step: int
+) -> int:
+    """Recover the cumulative freeze count from retained per-step telemetry.
+
+    Older checkpoints predate the persisted counter. Keeping the last record
+    for each actor step also makes this robust to a previously interrupted
+    append followed by an exact resume.
+    """
+    path = Path(metrics_path)
+    if not path.is_file():
+        return 0
+    frozen_by_step: dict[int, bool] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            record = json.loads(line)
+            if record.get("type") != "train" or "step" not in record:
+                continue
+            step = int(record["step"])
+            if step > through_step:
+                continue
+            dashboard = record.get("dashboard") or {}
+            if "guard/zero_reward_actor_frozen" in dashboard:
+                frozen_by_step[step] = bool(
+                    dashboard["guard/zero_reward_actor_frozen"]
+                )
+    return sum(frozen_by_step.values())
 
 
 def purge_benchmark_reports_after(output: Path, step: int) -> int:
@@ -2728,6 +3196,7 @@ def main() -> None:
     bench_subset_baseline = modal_answer_baseline(bench_rows)
     mixture_manifest = None
     mixture_sources = None
+    mixture_rollout_source_quotas = None
     if args.rl_mixture_manifest:
         math_rows, mixture_sources, mixture_manifest = load_mixture_manifest(
             args.rl_mixture_manifest
@@ -2746,10 +3215,6 @@ def main() -> None:
             raise ValueError(
                 "base SFT checkpoint trace bytes do not match the mixture's "
                 "bound SFT corpus"
-            )
-        if int(mixture_manifest["groups_per_cycle"]) != args.prompts_per_rollout:
-            raise ValueError(
-                "mixture groups_per_cycle must equal --prompts-per-rollout"
             )
         if any(
             source.verifier == "python_mbpp" for source in mixture_sources
@@ -2925,6 +3390,8 @@ def main() -> None:
 
     start_step = 0
     warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
+    resume_args = None
+    resumed_zero_reward_frozen_updates = None
     if args.resume:
         target_execution_schema = execution_schema_for_rollout_scheduler(
             args.rollout_scheduler
@@ -2984,10 +3451,17 @@ def main() -> None:
                 f"resume checkpoint reward schema must be {REWARD_SCHEMA!r}; "
                 f"got {payload.get('reward_schema')!r}"
             )
-        if payload.get("actor_objective_schema") != ACTOR_OBJECTIVE_SCHEMA:
+        expected_actor_objective_schema = actor_objective_schema(
+            args.delightful_policy_gradient,
+            args.target_policy_optimization,
+        )
+        if (
+            payload.get("actor_objective_schema")
+            != expected_actor_objective_schema
+        ):
             raise ValueError(
                 "resume checkpoint actor objective schema must be "
-                f"{ACTOR_OBJECTIVE_SCHEMA!r}; got "
+                f"{expected_actor_objective_schema!r}; got "
                 f"{payload.get('actor_objective_schema')!r}. Use "
                 "--actor-init for an initialization restart under the "
                 "current objective."
@@ -3112,6 +3586,9 @@ def main() -> None:
         # reasserted over the loaded optimizer state.
         reassert_learning_rates(optimizers, args)
         start_step = int(payload["step"])
+        resumed_zero_reward_frozen_updates = payload.get(
+            "zero_reward_frozen_updates"
+        )
         warmup_step = int(
             payload.get(
                 "value_warmup_step",
@@ -3128,6 +3605,17 @@ def main() -> None:
         torch.set_rng_state(actor_init_payload["cpu_rng"])
         torch.cuda.set_rng_state_all(actor_init_payload["cuda_rng"])
         random.setstate(actor_init_payload["python_rng"])
+
+    if mixture_sources is not None:
+        mixture_rollout_source_quotas = rollout_window_source_quotas(
+            mixture_sources,
+            args.prompts_per_rollout,
+            allow_balanced_rotation=(
+                args.delightful_policy_gradient
+                or args.target_policy_optimization
+            ),
+            start_cursor=sampler.cursor,
+        )
 
     if args.bpb_only or args.bench_only:
         planned_prompt_count = 0
@@ -3563,6 +4051,7 @@ def main() -> None:
         )
 
     output = Path(args.output)
+    existing_manifest = None
     if output.exists() and any(output.iterdir()):
         if not args.resume:
             raise ValueError(
@@ -3593,9 +4082,26 @@ def main() -> None:
         else ["math"]
     )
     source_ids = {name: index for index, name in enumerate(source_names)}
+    topology_history = resume_topology_history(
+        existing_manifest,
+        resume_args,
+        args,
+        checkpoint=args.resume,
+        checkpoint_sha256=args.resume_checkpoint_sha256,
+        step=start_step,
+        sampler_cursor=sampler.cursor,
+    )
+    # A DG rollout is consumed in one optimizer update, so it needs no
+    # within-pool source stratification. This also permits the deterministic
+    # 24-prompt rotation (10/8/3/3, then 11/7/3/3) while preserving the exact
+    # broad-v5 ratio over its eight-update cursor phase cycle.
     mixture_source_quotas = (
-        [int(entry["quota"]) for entry in mixture_manifest["sources"]]
+        mixture_rollout_source_quotas
         if mixture_manifest is not None
+        and not (
+            args.delightful_policy_gradient
+            or args.target_policy_optimization
+        )
         else None
     )
     source_provenance = capture_source_provenance(
@@ -3638,10 +4144,14 @@ def main() -> None:
                 "profiled": bool(args.profile),
                 "profile_schema": PROFILE_SCHEMA if args.profile else None,
                 "source_provenance": source_provenance,
+                "topology_history": topology_history,
                 "execution_schema": execution_schema_for_rollout_scheduler(
                     args.rollout_scheduler
                 ),
-                "actor_objective_schema": ACTOR_OBJECTIVE_SCHEMA,
+                "actor_objective_schema": actor_objective_schema(
+                    args.delightful_policy_gradient,
+                    args.target_policy_optimization,
+                ),
                 "source_signal_mask_schema": SOURCE_SIGNAL_MASK_SCHEMA,
                 "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
                 "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
@@ -3798,6 +4308,12 @@ def main() -> None:
         nonlocal last_decode_schedule_metrics, rollout_paged_cache
         last_decode_schedule_metrics = None
         pool_start_cursor = sampler.cursor
+        if (
+            mixture_source_quotas is not None
+            and prompt_count == args.prompts_per_rollout
+        ):
+            assert isinstance(sampler, MixedPromptSampler)
+            sampler.validate_next_source_quotas(mixture_source_quotas)
         rollout_rows = sampler.next_rows(prompt_count)
         prompt_budget = args.prompt_tokens - len(answer_prefix_ids)
         with profiler.phase("prompt_encode"):
@@ -3860,6 +4376,11 @@ def main() -> None:
                         tail_step_core=rollout_tail_step_core,
                         decode_mask=decode_mask_for(len(encoded)),
                         tail_decode_mask=rollout_tail_decode_mask,
+                        tpo_candidates=(
+                            args.tpo_candidates
+                            if args.target_policy_optimization
+                            else 0
+                        ),
                     )
                 if offload_to_cpu:
                     with profiler.phase("stream_d2h"):
@@ -4048,6 +4569,11 @@ def main() -> None:
                     offload_device=cpu if offload_to_cpu else device,
                     schedule_stats=schedule_stats,
                     paged_cache=rollout_paged_cache,
+                    tpo_candidates=(
+                        args.tpo_candidates
+                        if args.target_policy_optimization
+                        else 0
+                    ),
                 )
             last_decode_schedule_metrics = schedule_stats.metrics()
             for batch_index, (chunk, _, prompt_lengths_cpu) in enumerate(
@@ -4107,6 +4633,11 @@ def main() -> None:
                     tail_step_core=rollout_tail_step_core,
                     decode_mask=decode_mask_for(chunk_width),
                     tail_decode_mask=rollout_tail_decode_mask,
+                    tpo_candidates=(
+                        args.tpo_candidates
+                        if args.target_policy_optimization
+                        else 0
+                    ),
                 )
             complete_chunk(batched, prompt_lengths_cpu, chunk)
             del batched
@@ -4521,7 +5052,17 @@ def main() -> None:
     # operator act, so the resumed session gets a fresh
     # --zero-reward-stop-pools budget rather than stopping immediately.
     zero_reward_pool_streak = 0
-    zero_reward_frozen_updates = 0
+    if resumed_zero_reward_frozen_updates is None:
+        zero_reward_frozen_updates = logged_zero_reward_frozen_updates(
+            output / "metrics.jsonl", start_step
+        )
+    else:
+        zero_reward_frozen_updates = int(resumed_zero_reward_frozen_updates)
+        if not 0 <= zero_reward_frozen_updates <= start_step:
+            raise ValueError(
+                "resume checkpoint has invalid zero-reward freeze counter: "
+                f"{zero_reward_frozen_updates} at actor step {start_step}"
+            )
     stopped_at_pool_boundary = False
     while step < args.steps:
         if (
@@ -5009,13 +5550,34 @@ def main() -> None:
                         replay_bucket=args.replay_bucket,
                         replay_slot_budget=args.replay_slot_budget,
                         replay_plan=device_replay_plan,
+                        delightful_policy_gradient=(
+                            args.delightful_policy_gradient
+                        ),
+                        target_policy_optimization=(
+                            args.target_policy_optimization
+                        ),
+                        tpo_eta=args.tpo_eta,
                     )
                 # The first minibatch runs against refresh-computed behavior
                 # statistics with the actor untouched. Later disjoint minibatches
                 # intentionally have behavior age 1..N.
                 if behavior_age == 0:
-                    guard = "policy_clip_fraction"
+                    guard = (
+                        "tpo_candidate_abs_log_ratio_max"
+                        if args.target_policy_optimization
+                        else (
+                            "token_abs_log_ratio_max"
+                            if args.delightful_policy_gradient
+                            else "policy_clip_fraction"
+                        )
+                    )
                     if metrics[guard] > 1e-6:
+                        if args.target_policy_optimization:
+                            raise RuntimeError(
+                                f"step {next_step}: behavior-age-0 {guard}="
+                                f"{metrics[guard]:.3e}; all-K TPO refresh and "
+                                "update replay paths diverged"
+                            )
                         print(
                             f"WARNING step {next_step}: behavior-age-0 {guard}="
                             f"{metrics[guard]:.3e} (expected exactly 0; "
@@ -5251,7 +5813,7 @@ def main() -> None:
                 save_checkpoint(
                     output / "latent_vapo_checkpoint.pt", wrapper, critic,
                     optimizers, step, args, sampler, warmup_step,
-                    actor_init_provenance,
+                    actor_init_provenance, zero_reward_frozen_updates,
                 )
                 save_seconds = time.perf_counter() - save_started
                 logger.log(type="checkpoint", step=step, seconds=save_seconds)
@@ -5277,7 +5839,7 @@ def main() -> None:
     save_checkpoint(
         output / "latent_vapo_checkpoint.pt", wrapper, critic,
         optimizers, step, args, sampler, warmup_step,
-        actor_init_provenance,
+        actor_init_provenance, zero_reward_frozen_updates,
     )
     if (
         aime_rows

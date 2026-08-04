@@ -13,8 +13,10 @@ import train_gpt as baseline
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshLeJEPAGPT
 from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope import FreshLeJEPASharedRMSV1PoPE
 from postraining.core import (
+    delightful_policy_loss,
     generalized_advantage_estimate,
     nearby_numeric_reward,
+    target_policy_loss,
 )
 from postraining.latent_rollout import (
     PAD_SLOT,
@@ -62,6 +64,7 @@ from postraining.train_latent_vapo import (
     build_optimizers,
     evaluate_aime_latent,
     lockstep_decode_metrics,
+    logged_zero_reward_frozen_updates,
     math_dataset_identity,
     measure_post_update_policy_drift,
     sample_prompt_batch,
@@ -72,8 +75,11 @@ from postraining.train_latent_vapo import (
 from postraining.latent_eval import verify_terminated_answer
 from postraining.vapo.schemas import (
     ACTOR_OBJECTIVE_SCHEMA,
+    DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA,
     EXECUTION_SCHEMA,
     REPLAY_NUMERICS_SCHEMA,
+    TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA,
+    actor_objective_schema,
     execution_schema_for_rollout_scheduler,
     resume_execution_schema_compatible,
     resume_replay_schema_compatible,
@@ -140,12 +146,21 @@ def _critic(seed: int = 11) -> SeparateCritic:
     return critic
 
 
-def _rollout(wrapper, batch=2, prompt=5, new_tokens=4, stream_steps=None, seed=7):
+def _rollout(
+    wrapper,
+    batch=2,
+    prompt=5,
+    new_tokens=4,
+    stream_steps=None,
+    seed=7,
+    **rollout_kwargs,
+):
     prompt_ids = torch.randint(0, 32, (batch, prompt))
     generator = torch.Generator().manual_seed(seed)
     result = rollout_continuations(
         wrapper, prompt_ids, new_tokens, stream_steps or 8 * new_tokens,
         1.0, 1.0, generator=generator,
+        **rollout_kwargs,
     )
     return trim_stream(result)
 
@@ -353,6 +368,236 @@ def test_terminal_reward_lands_on_the_last_action():
         position = int(batch.rewards[row].nonzero()[0])
         assert float(batch.action_mask[row, position]) == 1.0
         assert float(batch.action_mask[row, position + 1 :].sum()) == 0.0
+
+
+def test_delightful_policy_loss_matches_algorithm_one_and_detaches_gate():
+    logprobs = torch.tensor(
+        [-math.log(2.0), -math.log(4.0), -math.log(8.0)],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    advantages = torch.tensor([1.0, -1.0, 100.0], dtype=torch.float64)
+    mask = torch.tensor([1.0, 1.0, 0.0], dtype=torch.float64)
+
+    loss, diagnostics = delightful_policy_loss(logprobs, advantages, mask)
+    expected_gate = torch.sigmoid(
+        advantages[:2] * -logprobs.detach()[:2]
+    )
+    expected_loss = -(
+        expected_gate * advantages[:2] * logprobs[:2]
+    ).sum() / 2
+    torch.testing.assert_close(loss, expected_loss)
+
+    loss.backward()
+    expected_gradient = torch.tensor(
+        [-expected_gate[0] / 2, expected_gate[1] / 2, 0.0],
+        dtype=torch.float64,
+    )
+    # This is the paper's gated score estimator. If the gate were not
+    # detached, differentiating surprisal would add another term here.
+    torch.testing.assert_close(logprobs.grad, expected_gradient)
+    assert diagnostics["positive_gate_sum"] > 0.5
+    assert diagnostics["negative_gate_sum"] < 0.5
+    assert diagnostics["gate_sum"] == pytest.approx(float(expected_gate.sum()))
+    assert diagnostics["positive_loss_sum"] > 0.0
+    assert diagnostics["negative_loss_sum"] < 0.0
+    assert (
+        diagnostics["positive_loss_sum"] + diagnostics["negative_loss_sum"]
+        == pytest.approx(float(expected_loss.detach() * 2))
+    )
+
+
+def test_delightful_update_bypasses_behavior_ratios_and_reports_gate_metrics():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    assign_terminal_rewards(batch, torch.tensor([1.0, 0.0, 1.0, 0.0]))
+    refresh_old_statistics(wrapper, critic, batch)
+    # Make PPO/VAPO clip every token. DG must ignore these behavior
+    # likelihoods in its objective while retaining them for drift telemetry.
+    batch.old_token_logprobs.sub_(10.0)
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        actor_step=False,
+        critic_step=False,
+        delightful_policy_gradient=True,
+    )
+    assert metrics["policy_clip_fraction"] == 0.0
+    assert metrics["token_abs_log_ratio_max"] == pytest.approx(10.0)
+    assert 0.0 < metrics["delightful_gate_mean"] < 1.0
+    assert metrics["delightful_positive_gate_mean"] >= 0.5
+    assert metrics["delightful_negative_gate_mean"] <= 0.5
+    assert metrics["delightful_surprisal_mean"] > 0.0
+
+
+def test_target_policy_loss_builds_detached_anchored_targets():
+    old = torch.tensor(
+        [
+            [-0.2, -1.2, -2.2],
+            [-0.7, -0.8, -1.3],
+            [-1.1, -0.9, -0.4],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    current = old.detach().clone().requires_grad_(True)
+    advantages = torch.tensor(
+        [2.0, -1.0, 0.0], dtype=torch.float32, requires_grad=True
+    )
+    rms = torch.tensor(2.0, dtype=torch.float32, requires_grad=True)
+    loss, diagnostics = target_policy_loss(
+        current, old, advantages, rms, eta=1.0
+    )
+
+    old_group_logprobs = old.detach().log_softmax(-1)
+    utilities = torch.tensor(
+        [[1.0, 0.0, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    target_logprobs = (old_group_logprobs + utilities).log_softmax(-1)
+    targets = target_logprobs.exp()
+    expected = -(targets * current.log_softmax(-1)).sum(-1).mean()
+    torch.testing.assert_close(loss, expected)
+
+    loss.backward()
+    torch.testing.assert_close(
+        current.grad,
+        (current.detach().softmax(-1) - targets) / current.size(0),
+    )
+    # Target construction is stop-gradient; only the current policy is fit.
+    assert old.grad is None
+    assert advantages.grad is None
+    assert rms.grad is None
+    # A zero advantage leaves q=p_old and therefore has zero age-0 gradient.
+    torch.testing.assert_close(
+        current.grad[2], torch.zeros_like(current.grad[2]), atol=1e-7, rtol=0
+    )
+    assert diagnostics["target_kl_sum"] > 0
+    assert diagnostics["positive_count"] == 1
+    assert diagnostics["negative_count"] == 1
+    assert diagnostics["neutral_count"] == 1
+
+
+def test_target_policy_loss_is_invariant_to_replay_sharding():
+    torch.manual_seed(31)
+    current_full = torch.randn(11, 8, requires_grad=True)
+    current_sharded = current_full.detach().clone().requires_grad_(True)
+    old = torch.randn(11, 8)
+    advantages = torch.randn(11)
+    rms = advantages.square().mean().sqrt()
+
+    full, _ = target_policy_loss(
+        current_full, old, advantages, rms, denominator=torch.tensor(11.0)
+    )
+    full.backward()
+    sharded = current_sharded.new_zeros(())
+    for rows in (slice(0, 3), slice(3, 8), slice(8, 11)):
+        contribution, _ = target_policy_loss(
+            current_sharded[rows],
+            old[rows],
+            advantages[rows],
+            rms,
+            denominator=torch.tensor(11.0),
+        )
+        sharded = sharded + contribution
+    sharded.backward()
+    torch.testing.assert_close(sharded, full)
+    torch.testing.assert_close(current_sharded.grad, current_full.grad)
+
+
+def test_tpo_rollout_executes_candidate_zero_without_branching():
+    wrapper = _wrapper()
+    batch = _rollout(
+        wrapper, batch=4, prompt=5, new_tokens=4, tpo_candidates=8
+    )
+    assert batch.tpo_candidate_ids is not None
+    assert batch.old_tpo_candidate_logprobs is not None
+    actions = slot_index(batch.action_mask.bool())
+    candidates = compact_slots(batch.tpo_candidate_ids, actions)
+    executed = compact_next_slots(batch.token_ids, actions)
+    assert candidates.shape == (actions.numel(), 8)
+    assert torch.equal(candidates[:, 0], executed)
+    sorted_candidates = candidates.sort(-1).values
+    assert bool((sorted_candidates[:, 1:] != sorted_candidates[:, :-1]).all())
+    old_candidates = compact_slots(batch.old_tpo_candidate_logprobs, actions)
+    old_executed = compact_slots(batch.old_token_logprobs, actions)
+    torch.testing.assert_close(old_candidates[:, 0], old_executed)
+    # K candidates still produce exactly one consequence slot per action.
+    assert batch.action_mask.sum() == batch.kind[:, batch.prompt_length:].eq(
+        TOKEN_SLOT
+    ).sum()
+
+
+def test_tpo_candidates_survive_pack_refresh_and_scatter():
+    wrapper = _wrapper()
+    critic = _critic()
+    groups = [
+        _rollout(wrapper, batch=2, prompt=5, new_tokens=2, tpo_candidates=8),
+        _rollout(wrapper, batch=2, prompt=7, new_tokens=4, tpo_candidates=8),
+    ]
+    packed = pack_rollout_groups_for_replay(groups)
+    refresh_old_statistics(wrapper, critic, packed)
+    actions = slot_index(packed.action_mask.bool())
+    candidates = compact_slots(packed.tpo_candidate_ids, actions)
+    executed = compact_next_slots(packed.token_ids, actions)
+    assert torch.equal(candidates[:, 0], executed)
+    candidate_logprobs = compact_slots(
+        packed.old_tpo_candidate_logprobs, actions
+    )
+    token_logprobs = compact_slots(packed.old_token_logprobs, actions)
+    torch.testing.assert_close(candidate_logprobs[:, 0], token_logprobs)
+    beliefs, stream_inputs = replay_head_inputs(wrapper, packed)
+    replayed_candidate_logprobs = compact_emit_token_logprobs(
+        wrapper,
+        compact_slots(stream_inputs, actions),
+        compact_slots(beliefs, actions),
+        candidates,
+    )
+    torch.testing.assert_close(
+        replayed_candidate_logprobs, candidate_logprobs
+    )
+
+    scatter_replay_statistics(packed, groups)
+    assert all(group.statistics_refreshed for group in groups)
+    for group in groups:
+        group_actions = slot_index(group.action_mask.bool())
+        old_candidates = compact_slots(
+            group.old_tpo_candidate_logprobs, group_actions
+        )
+        old_tokens = compact_slots(group.old_token_logprobs, group_actions)
+        torch.testing.assert_close(old_candidates[:, 0], old_tokens)
+
+
+def test_tpo_update_uses_gae_only_for_executed_candidate():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(
+        wrapper, batch=4, prompt=5, new_tokens=3, tpo_candidates=8
+    )
+    assign_terminal_rewards(batch, torch.tensor([1.0, 0.0, 1.0, 0.0]))
+    refresh_old_statistics(wrapper, critic, batch)
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        actor_step=False,
+        critic_step=False,
+        target_policy_optimization=True,
+    )
+    assert metrics["policy_clip_fraction"] == 0.0
+    assert metrics["token_abs_log_ratio_max"] == 0.0
+    assert metrics["tpo_candidate_abs_log_ratio_max"] == 0.0
+    assert metrics["tpo_advantage_rms"] > 0.0
+    assert metrics["tpo_target_kl"] > 0.0
+    assert metrics["tpo_effective_candidates"] == 8.0
+    assert metrics["tpo_duplicate_fraction"] == 0.0
+    assert metrics["tpo_behavior_duplicate_fraction"] == 0.0
+    assert metrics["tpo_positive_count"] > 0
+    assert metrics["tpo_negative_count"] > 0
 
 
 def test_update_minibatch_trains_the_full_policy_model():
@@ -835,6 +1080,131 @@ def test_shipped_math_evaluations_share_the_250_step_cadence():
     assert cli.rollout_scheduler == "lockstep"
 
 
+def test_default_cli_selects_current_delightful_broad_regime():
+    parser = build_arg_parser()
+    cli = parser.parse_args(["--checkpoint", "c", "--output", "o"])
+    validate_args(parser, cli)
+
+    assert cli.steps == 40_000
+    assert cli.rl_mixture_manifest == "postraining/data/vapo_broad_v5.manifest.json"
+    assert cli.reasoning_mode == "latent"
+    assert cli.delightful_policy_gradient
+    assert not cli.allow_dg_topology_migration
+    assert cli.prompts_per_rollout == 24
+    assert cli.prompts_per_minibatch == 24
+    assert cli.samples_per_prompt == 16
+    assert cli.learning_rate == pytest.approx(2e-5)
+    assert cli.critic_learning_rate == pytest.approx(2e-5)
+    assert cli.nearby_reward_max == 0.0
+    assert cli.think_tokens
+    assert cli.think_min_tokens == 33
+    assert cli.answer_fence
+    assert cli.zero_reward_stop_pools == 0
+    assert cli.actor_critic_init is None
+
+
+def test_dg_topology_migration_requires_resume(capsys):
+    parser = build_arg_parser()
+    cli = parser.parse_args(
+        [
+            "--checkpoint", "c", "--output", "o",
+            "--allow-dg-topology-migration",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, cli)
+    assert (
+        "--allow-dg-topology-migration requires --resume"
+        in capsys.readouterr().err
+    )
+
+
+def test_delightful_cli_requires_one_on_policy_update_per_rollout(capsys):
+    parser = build_arg_parser()
+    stale_pool = parser.parse_args(
+        [
+            "--checkpoint", "c", "--output", "o",
+            "--prompts-per-rollout", "64",
+            "--prompts-per-minibatch", "16",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, stale_pool)
+    assert "exactly one actor update" in capsys.readouterr().err
+
+    on_policy = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o"]
+    )
+    validate_args(parser, on_policy)
+    assert on_policy.delightful_policy_gradient
+    assert on_policy.prompts_per_minibatch == on_policy.prompts_per_rollout
+    assert on_policy.samples_per_prompt == 16
+
+
+def test_current_defaults_have_explicit_control_opt_outs():
+    parser = build_arg_parser()
+    control = parser.parse_args(
+        [
+            "--checkpoint", "c", "--output", "o",
+            "--no-delightful-policy-gradient",
+            "--no-think-tokens",
+            "--no-answer-fence",
+            "--rl-mixture-manifest", "",
+        ]
+    )
+    validate_args(parser, control)
+    assert not control.delightful_policy_gradient
+    assert not control.think_tokens
+    assert not control.answer_fence
+    assert control.rl_mixture_manifest == ""
+
+
+def test_tpo_cli_replaces_dg_and_preserves_the_production_topology():
+    parser = build_arg_parser()
+    tpo = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o", "--target-policy-optimization"]
+    )
+    validate_args(parser, tpo)
+    assert tpo.target_policy_optimization
+    assert not tpo.delightful_policy_gradient
+    assert tpo.tpo_candidates == 8
+    assert tpo.tpo_eta == 1.0
+    assert tpo.prompts_per_rollout == tpo.prompts_per_minibatch == 24
+    assert tpo.samples_per_prompt == 16
+
+
+def test_tpo_cli_rejects_stale_pool_and_invalid_target_geometry(capsys):
+    parser = build_arg_parser()
+    for extra, message in (
+        (
+            ["--prompts-per-rollout", "48", "--prompts-per-minibatch", "24"],
+            "exactly one actor update",
+        ),
+        (["--tpo-candidates", "1"], "--tpo-candidates must be at least 2"),
+        (["--tpo-eta", "0"], "--tpo-eta must be finite and positive"),
+    ):
+        args = parser.parse_args(
+            [
+                "--checkpoint", "c", "--output", "o",
+                "--target-policy-optimization", *extra,
+            ]
+        )
+        with pytest.raises(SystemExit):
+            validate_args(parser, args)
+        assert message in capsys.readouterr().err
+
+
+def test_actor_objective_schema_distinguishes_vapo_dg_and_tpo():
+    assert actor_objective_schema(False) == ACTOR_OBJECTIVE_SCHEMA
+    assert actor_objective_schema(True) == DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA
+    assert (
+        actor_objective_schema(False, True)
+        == TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        actor_objective_schema(True, True)
+
+
 def test_rollout_only_repeats_are_benchmark_scoped(capsys):
     parser = build_arg_parser()
     valid = parser.parse_args(
@@ -873,9 +1243,12 @@ def test_fence_flag_validation(capsys):
     validate_args(parser, valid)
 
     for argv, message in (
-        (["--answer-fence"], "--answer-fence requires --think-tokens"),
         (
-            ["--think-min-tokens", "4"],
+            ["--no-think-tokens", "--answer-fence"],
+            "--answer-fence requires --think-tokens",
+        ),
+        (
+            ["--no-think-tokens", "--no-answer-fence", "--think-min-tokens", "4"],
             "--think-min-tokens above 1 requires --think-tokens",
         ),
         (["--think-min-tokens", "0"], "--think-min-tokens must be at least 1"),
@@ -890,17 +1263,16 @@ def test_fence_flag_validation(capsys):
         assert message in capsys.readouterr().err
 
 
-def test_zero_reward_actor_freeze_flag_defaults_on(capsys):
+def test_zero_reward_actor_freeze_defaults_on_without_a_desert_stop(capsys):
     # Round-4 guard: optimizer minibatches whose every trajectory scored
     # zero carry no policy signal, so the actor optimizer skips them by
-    # default, and a sustained all-zero-pool streak stops the run at the
-    # pool boundary. The freeze condition (reward mean == 0 iff all
-    # rewards zero) relies on rewards being non-negative — pinned by
-    # test_nearby_numeric_reward_is_nonnegative below.
+    # default. Heterogeneous prompt windows can produce a zero streak without
+    # proving the frozen policy is dead, so the optional pool stop defaults
+    # off. The freeze condition relies on non-negative rewards.
     parser = build_arg_parser()
     default = parser.parse_args(["--checkpoint", "c", "--output", "o"])
     assert default.zero_reward_actor_freeze is True
-    assert default.zero_reward_stop_pools == 8
+    assert default.zero_reward_stop_pools == 0
     disabled = parser.parse_args(
         ["--checkpoint", "c", "--output", "o",
          "--no-zero-reward-actor-freeze",
@@ -1153,6 +1525,9 @@ def test_continuous_refill_requires_multiple_compiled_chunks(capsys):
     valid = parser.parse_args(
         [
             "--checkpoint", "c", "--output", "o",
+            "--no-delightful-policy-gradient",
+            "--prompts-per-rollout", "64",
+            "--prompts-per-minibatch", "16",
             "--rollout-scheduler", "continuous_refill",
             "--rollout-groups", "32",
         ]
@@ -1182,6 +1557,9 @@ def test_continuous_refill_requires_multiple_compiled_chunks(capsys):
         args = parser.parse_args(
             [
                 "--checkpoint", "c", "--output", "o",
+                "--no-delightful-policy-gradient",
+                "--prompts-per-rollout", "64",
+                "--prompts-per-minibatch", "16",
                 "--rollout-scheduler", "continuous_refill",
                 *argv,
             ]
@@ -2938,6 +3316,78 @@ def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):
     assert payload["answer_fence_prompt_schema"] == ANSWER_FENCE_PROMPT_SCHEMA
     assert payload["thought_input_schema"] == THOUGHT_INPUT_SCHEMA
     assert "torch_adamw" in payload["optimizer_schema"]
+    assert payload["zero_reward_frozen_updates"] == 0
+
+    delightful_checkpoint = tmp_path / "delightful.pt"
+    args = SimpleNamespace(
+        value_warmup_steps=50,
+        answer_fence=True,
+        delightful_policy_gradient=True,
+    )
+    save_checkpoint(
+        delightful_checkpoint,
+        wrapper,
+        critic,
+        optimizers,
+        step=0,
+        args=args,
+        sampler=sampler,
+        warmup_step=20,
+    )
+    delightful_payload = torch.load(
+        delightful_checkpoint, map_location="cpu", weights_only=False
+    )
+    assert (
+        delightful_payload["actor_objective_schema"]
+        == DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA
+    )
+
+    tpo_checkpoint = tmp_path / "tpo.pt"
+    tpo_args = SimpleNamespace(
+        value_warmup_steps=50,
+        answer_fence=True,
+        delightful_policy_gradient=False,
+        target_policy_optimization=True,
+    )
+    save_checkpoint(
+        tpo_checkpoint,
+        wrapper,
+        critic,
+        optimizers,
+        step=0,
+        args=tpo_args,
+        sampler=sampler,
+        warmup_step=20,
+    )
+    tpo_payload = torch.load(
+        tpo_checkpoint, map_location="cpu", weights_only=False
+    )
+    assert (
+        tpo_payload["actor_objective_schema"]
+        == TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA
+    )
+
+
+def test_logged_zero_reward_frozen_updates_recovers_unique_steps(tmp_path):
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        "\n".join(
+            [
+                '{"type":"train","step":1,"dashboard":'
+                '{"guard/zero_reward_actor_frozen":1}}',
+                '{"type":"rollout","step":2,"zero_reward_actor_frozen":1}',
+                '{"type":"train","step":2,"dashboard":'
+                '{"guard/zero_reward_actor_frozen":0}}',
+                '{"type":"train","step":3,"dashboard":'
+                '{"guard/zero_reward_actor_frozen":1}}',
+                '{"type":"train","step":3,"dashboard":'
+                '{"guard/zero_reward_actor_frozen":1}}',
+            ]
+        )
+        + "\n"
+    )
+    assert logged_zero_reward_frozen_updates(metrics, through_step=2) == 1
+    assert logged_zero_reward_frozen_updates(metrics, through_step=3) == 2
 
 
 def test_value_support_geometry_matches_compares_args_not_shapes() -> None:
@@ -3973,6 +4423,7 @@ def test_combined_replay_batch_right_pads_without_changing_beliefs():
     assert combined.source_id.tolist() == [0, 0, 1, 1, 2, 2]
     assert combined.verifier_status is not None
     assert combined.verifier_status.tolist() == [1, 1, 2, 2, 3, 3]
+
     assert combined.prompt_length == 4
     assert combined.stream_length == max(group.stream_length for group in groups)
     row_start = 0
@@ -4041,6 +4492,19 @@ def test_combined_replay_batch_right_pads_without_changing_beliefs():
             atol=2e-5,
         )
         row_start = row_end
+
+
+def test_pack_rejects_only_truly_partial_verifier_status_labels():
+    first = _decode_group([2, 2], prompt=2)
+    second = _decode_group([2, 2], prompt=2)
+    first.verifier_status = torch.zeros(2, dtype=torch.long)
+    second.verifier_status = torch.ones(2, dtype=torch.long)
+    assert pack_rollout_groups_for_replay(
+        [first, second]
+    ).verifier_status.tolist() == [0, 0, 1, 1]
+    second.verifier_status = None
+    with pytest.raises(ValueError, match="verifier_status"):
+        pack_rollout_groups_for_replay([first, second])
 
 
 def test_pack_rollout_groups_rejects_empty_input():

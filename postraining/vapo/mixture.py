@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 from collections import Counter
 from dataclasses import dataclass
@@ -139,6 +140,76 @@ def mixture_identity(path: str | Path, manifest: dict) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def rollout_window_source_quotas(
+    sources: list[MixtureSource],
+    groups_per_rollout: int,
+    *,
+    allow_balanced_rotation: bool = False,
+    start_cursor: int = 0,
+) -> list[int] | None:
+    """Validate source balance across sequential rollout windows.
+
+    A manifest binds a complete source cycle, but an on-policy learner may
+    collect several independently updated rollout windows within that cycle.
+    VAPO's multiple optimizer minibatches require identical integer quotas.
+    A one-update DG rollout may instead use the closest integer compositions
+    in a deterministic rotation, provided every source varies by at most one
+    prompt and the complete cursor phase cycle preserves the manifest ratio.
+
+    Validation begins at the restored sampler cursor, because changing the
+    rollout width can change which phases are reachable after a resume.
+    Returns the common integer quotas when every window is identical, or
+    ``None`` for an accepted balanced rotation.
+    """
+    if groups_per_rollout < 1:
+        raise ValueError("groups per rollout must be positive")
+    if start_cursor < 0:
+        raise ValueError("sampler cursor must be nonnegative")
+    schedule = _balanced_schedule(
+        {source.name: source.quota for source in sources}
+    )
+    if groups_per_rollout > len(schedule):
+        raise ValueError(
+            f"rollout window of {groups_per_rollout} groups exceeds the "
+            f"mixture cycle of {len(schedule)}"
+        )
+    phase_count = len(schedule) // math.gcd(len(schedule), groups_per_rollout)
+    starts = [
+        (start_cursor + index * groups_per_rollout) % len(schedule)
+        for index in range(phase_count)
+    ]
+    windows = [
+        Counter(
+            schedule[(start + offset) % len(schedule)]
+            for offset in range(groups_per_rollout)
+        )
+        for start in starts
+    ]
+    expected = windows[0]
+    if all(window == expected for window in windows[1:]):
+        return [expected[source.name] for source in sources]
+    if not allow_balanced_rotation:
+        raise ValueError(
+            f"mixture cycle does not give every {groups_per_rollout}-group "
+            "rollout window identical source quotas from sampler cursor "
+            f"{start_cursor}"
+        )
+    for source in sources:
+        counts = [window[source.name] for window in windows]
+        if max(counts) - min(counts) > 1:
+            raise ValueError(
+                f"rotating {groups_per_rollout}-group rollout windows vary "
+                f"source {source.name!r} by more than one prompt from sampler "
+                f"cursor {start_cursor}: {counts}"
+            )
+        expected_total = source.quota * groups_per_rollout // math.gcd(
+            len(schedule), groups_per_rollout
+        )
+        if sum(counts) != expected_total:
+            raise AssertionError("rotating rollout windows changed source ratio")
+    return None
+
+
 class MixedPromptSampler:
     """Exact-quota source cycle with independent, resumable row streams."""
 
@@ -205,3 +276,19 @@ class MixedPromptSampler:
                 for position in range(start, start + count)
             )
         )
+
+    def validate_next_source_quotas(self, quotas: list[int]) -> None:
+        """Fail before rollout if the restored cursor changes batch mixture."""
+        if len(quotas) != len(self.sources):
+            raise ValueError("rollout source quotas do not match mixture sources")
+        expected = {
+            name: quota
+            for name, quota in zip(self.sources, quotas, strict=True)
+            if quota
+        }
+        observed = self.source_counts(self.cursor, sum(quotas))
+        if observed != expected:
+            raise ValueError(
+                f"next rollout at sampler cursor {self.cursor} has source "
+                f"counts {observed}, expected {expected}"
+            )

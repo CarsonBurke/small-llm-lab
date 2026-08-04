@@ -8,17 +8,18 @@ import os
 import secrets
 import shutil
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 
 
-PYTHON_REWARD_SCHEMA = "bwrap_python_safe_ast_all_tests_binary/v2"
+PYTHON_REWARD_SCHEMA = "bwrap_python_positive_ast_all_tests_binary/v5"
 PYTHON_RESULT_CODES = {
-    "format_ineligible": 0,
-    "pass": 1,
-    "policy_rejected": 2,
-    "tests_failed": 3,
-    "timeout": 4,
+    "not_applicable": 0,
+    "format_ineligible": 1,
+    "pass": 2,
+    "policy_rejected": 3,
+    "tests_failed": 4,
+    "timeout": 5,
 }
 
 SAFE_IMPORT_ROOTS = {
@@ -46,28 +47,28 @@ FORBIDDEN_NAMES = {
     "globals",
     "locals",
     "open",
+    "property",
     "quit",
     "setattr",
+    "staticmethod",
+    "classmethod",
     "delattr",
+    "type",
     "vars",
 }
-FORBIDDEN_ATTRIBUTES = {
-    "__class__",
-    "__code__",
-    "__dict__",
-    "__getattribute__",
-    "__globals__",
-    "__mro__",
-    "__subclasses__",
-    "exit",
-    "modules",
-    "setprofile",
-    "settrace",
-    "stderr",
-    "stdin",
-    "stdout",
+SAFE_ATTRIBUTES = {
+    "ChainMap", "__add__", "__contains__", "a", "add", "append", "b",
+    "bisect_left", "bisect_right", "ceil", "clear", "compile", "count",
+    "data", "date", "e", "elements", "end", "extend", "findall",
+    "finditer", "floor", "from_iterable", "get", "groupby", "heapify",
+    "heappop", "heappush", "intersection", "isalpha", "isdigit",
+    "islower", "issubset", "isupper", "items", "join", "keys", "left",
+    "log", "log10", "log2", "lower", "match", "maxsize", "merge",
+    "most_common", "nlargest", "nsmallest", "pattern", "pi", "pop", "pow",
+    "re", "remove", "replace", "right", "search", "setdefault", "sort",
+    "split", "sqrt", "start", "strip", "sub", "upper", "values",
 }
-SAFE_DUNDER_ATTRIBUTES = {"__add__", "__contains__"}
+_SANDBOX_SLOTS = threading.BoundedSemaphore(8)
 
 
 def normalize_python_answer(answer: str) -> str:
@@ -117,48 +118,15 @@ def python_candidate_allowed(code: str) -> bool:
         elif isinstance(node, ast.Name):
             if node.id in FORBIDDEN_NAMES or node.id.startswith("__"):
                 return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("__") and node.name != "__init__":
+                return False
         elif isinstance(node, ast.Attribute):
-            if (
-                (
-                    node.attr.startswith("_")
-                    and node.attr not in SAFE_DUNDER_ATTRIBUTES
-                )
-                or node.attr in FORBIDDEN_ATTRIBUTES
-                or (
-                    isinstance(node.value, ast.Name)
-                    and node.value.id == "sys"
-                    and node.attr != "maxsize"
-                )
+            if node.attr not in SAFE_ATTRIBUTES or (
+                isinstance(node.ctx, ast.Store) and node.attr.startswith("__")
             ):
                 return False
     return True
-
-
-@lru_cache(maxsize=1)
-def _nproc_limit() -> int:
-    """Allow a small sandbox budget above this busy user's current threads."""
-    uid = os.getuid()
-    tasks = 0
-    with os.scandir("/proc") as processes:
-        for process in processes:
-            if not process.name.isdigit():
-                continue
-            try:
-                with open(
-                    f"/proc/{process.name}/status", encoding="utf-8"
-                ) as status_file:
-                    status = status_file.read()
-                real_uid = int(
-                    next(
-                        line for line in status.splitlines()
-                        if line.startswith("Uid:")
-                    ).split()[1]
-                )
-                if real_uid == uid:
-                    tasks += len(os.listdir(f"/proc/{process.name}/task"))
-            except (FileNotFoundError, PermissionError, StopIteration, ValueError):
-                continue
-    return tasks + 64
 
 
 def python_test_result(code: str, verification_info: dict) -> str:
@@ -215,7 +183,6 @@ def python_test_result(code: str, verification_info: dict) -> str:
         f"--as={384 << 20}:{384 << 20}",
         f"--fsize={1 << 20}:{1 << 20}",
         "--nofile=32:32",
-        f"--nproc={_nproc_limit()}:{_nproc_limit()}",
         "--",
         bwrap,
         "--unshare-all",
@@ -237,14 +204,15 @@ def python_test_result(code: str, verification_info: dict) -> str:
         program,
     ]
     try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=3.0,
-            check=False,
-        )
+        with _SANDBOX_SLOTS:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3.0,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         return "timeout"
     except OSError as error:

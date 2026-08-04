@@ -62,6 +62,13 @@ class LatentRolloutBatch:
     rewards: Tensor
     reward_scalar: Tensor  # (batch,)
     prompt_length: int
+    # Optional TPO candidate groups aligned to action slots. Candidate zero
+    # is always the token actually emitted into the next stream slot; the
+    # remaining candidates are sampled comparisons and are never executed.
+    # Behavior log probabilities are refreshed through the same replay head
+    # as ``old_token_logprobs`` before an actor update.
+    tpo_candidate_ids: Tensor | None = None
+    old_tpo_candidate_logprobs: Tensor | None = None
     # Set by refresh_old_statistics: old_values/old_token_logprobs have been
     # recomputed through the update-step replay path. The actor update
     # refuses unrefreshed batches; a tensor-width proxy cannot express this
@@ -351,6 +358,7 @@ def rollout_continuations(
     decode_mask: DecodeRangeMask | None = None,
     tail_decode_mask: DecodeRangeMask | None = None,
     top_k: int | None = None,
+    tpo_candidates: int = 0,
 ) -> LatentRolloutBatch:
     """Roll the hidden-carry token stream forward from a (batch, P) prompt.
 
@@ -792,6 +800,8 @@ def rollout_continuations(
             mask = mask | (pad_lengths[:, None] > position)
         return step_position_value, mask, None
 
+    if tpo_candidates not in (0,) and tpo_candidates < 2:
+        raise ValueError("TPO requires at least two candidates per action")
     kind = torch.full((batch, max_stream), PAD_SLOT, dtype=torch.long, device=device)
     token_ids = torch.zeros((batch, max_stream), dtype=torch.long, device=device)
     stored_hidden_dim = model_dim if replay_storage and not pin_emit else 0
@@ -805,6 +815,24 @@ def rollout_continuations(
     # Stays zero through the rollout; refresh_old_statistics fills it from
     # the separate critic before anything consumes it.
     old_values = torch.zeros_like(action_mask)
+    tpo_candidate_ids = (
+        torch.zeros(
+            (batch, max_stream, tpo_candidates),
+            dtype=torch.long,
+            device=device,
+        )
+        if tpo_candidates
+        else None
+    )
+    old_tpo_candidate_logprobs = (
+        torch.zeros(
+            (batch, max_stream, tpo_candidates),
+            dtype=torch.float32,
+            device=device,
+        )
+        if tpo_candidates
+        else None
+    )
 
     if valid_slots is None:
         kind[:, :prompt_length] = TOKEN_SLOT
@@ -1087,21 +1115,44 @@ def rollout_continuations(
 
         # RNG draw order (one token draw per step) is part of the execution
         # schema; every mode consumes it identically.
-        token = top_p_sample(
-            output.logits,
-            temperature,
-            top_p,
-            generator=generator,
-            top_k=top_k,
-        )
-        token_logprob = None
-        if record_likelihoods:
-            token_logprob = (
-                output.logits.float()
-                .log_softmax(-1)
-                .gather(-1, token[:, None])
-                .squeeze(-1)
+        if tpo_candidates:
+            sampled_tokens = top_p_sample(
+                output.logits,
+                temperature,
+                top_p,
+                generator=generator,
+                top_k=top_k,
+                num_samples=tpo_candidates,
             )
+        else:
+            # Keep the legacy call signature and RNG path exact for VAPO/DG
+            # resumes; TPO has its own objective and execution provenance.
+            sampled_tokens = top_p_sample(
+                output.logits,
+                temperature,
+                top_p,
+                generator=generator,
+                top_k=top_k,
+            )
+        if tpo_candidates:
+            candidate_tokens = sampled_tokens
+            token = candidate_tokens[:, 0]
+        else:
+            candidate_tokens = None
+            token = sampled_tokens
+        token_logprob = None
+        candidate_logprobs = None
+        if record_likelihoods:
+            behavior_logprobs = output.logits.float().log_softmax(-1)
+            if candidate_tokens is not None:
+                candidate_logprobs = behavior_logprobs.gather(
+                    -1, candidate_tokens
+                )
+                token_logprob = candidate_logprobs[:, 0]
+            else:
+                token_logprob = behavior_logprobs.gather(
+                    -1, token[:, None]
+                ).squeeze(-1)
 
         # Stream writes address rows through the dense ``live_rows`` index
         # tensor and select participants with ``torch.where``, never with a
@@ -1123,6 +1174,18 @@ def rollout_continuations(
             old_token_logprobs[row_slots] = torch.where(
                 record, token_logprob.float(), old_token_logprobs[row_slots]
             )
+        if candidate_tokens is not None:
+            assert tpo_candidate_ids is not None
+            tpo_candidate_ids[row_slots] = torch.where(
+                record[:, None], candidate_tokens, tpo_candidate_ids[row_slots]
+            )
+            if candidate_logprobs is not None:
+                assert old_tpo_candidate_logprobs is not None
+                old_tpo_candidate_logprobs[row_slots] = torch.where(
+                    record[:, None],
+                    candidate_logprobs.float(),
+                    old_tpo_candidate_logprobs[row_slots],
+                )
 
         next_kind = kind[next_slots]
         kind[next_slots] = torch.where(
@@ -1206,6 +1269,8 @@ def rollout_continuations(
         rewards=torch.zeros_like(action_mask),
         reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
         prompt_length=prompt_length,
+        tpo_candidate_ids=tpo_candidate_ids,
+        old_tpo_candidate_logprobs=old_tpo_candidate_logprobs,
         carry_injected=not pin_emit,
     )
     return rolled if not filler_rows else _drop_filler_rows(rolled, filler_rows)
@@ -1366,6 +1431,17 @@ def pack_rollout_groups_for_replay(
                 )
             continue
         values = [getattr(group, field.name) for group in groups]
+        if field.name in (
+            "tpo_candidate_ids",
+            "old_tpo_candidate_logprobs",
+        ):
+            if all(value is None for value in values):
+                combined[field.name] = None
+                continue
+            if any(value is None for value in values):
+                raise ValueError(
+                    f"cannot pack partially populated {field.name} groups"
+                )
         if not all(isinstance(value, Tensor) for value in values):
             raise TypeError(f"unexpected non-tensor rollout field {field.name}")
         first = values[0]
@@ -1429,10 +1505,18 @@ def scatter_replay_statistics(
     target_device = groups[0].kind.device
     if any(group.kind.device != target_device for group in groups):
         raise ValueError("rollout groups must share one device")
-    statistic_names = (
-        "old_token_logprobs",
-        "old_values",
-    )
+    statistic_names = ["old_token_logprobs", "old_values"]
+    candidate_presence = {
+        group.old_tpo_candidate_logprobs is not None for group in groups
+    }
+    if len(candidate_presence) != 1:
+        raise ValueError("cannot scatter partially populated TPO statistics")
+    if packed.old_tpo_candidate_logprobs is not None:
+        if candidate_presence != {True}:
+            raise ValueError("packed TPO statistics do not match source groups")
+        statistic_names.append("old_tpo_candidate_logprobs")
+    elif candidate_presence != {False}:
+        raise ValueError("packed batch discarded source TPO statistics")
     row_start = 0
     for group in groups:
         row_end = row_start + group.kind.size(0)
@@ -1593,7 +1677,7 @@ def replay_head_inputs(
 def compact_emit_token_logprobs(
     wrapper, emit_inputs: Tensor, emit_beliefs: Tensor, emit_targets: Tensor
 ) -> Tensor:
-    """log P(target token) at each compact EMIT slot.
+    """log P(target token or token group) at each compact EMIT slot.
 
     Refresh and the trainer's update step both come through this one helper
     so their forwards stay bit-identical (the behavior-age-0 zero-clip
@@ -1612,12 +1696,12 @@ def compact_emit_token_logprobs(
     """
     features = wrapper.renderer_features(emit_inputs, emit_beliefs)
     logits = wrapper.backbone.logits_from_features(features)
-    return (
-        logits.float()
-        .log_softmax(-1)
-        .gather(-1, emit_targets[..., None])
-        .squeeze(-1)
-    )
+    logprobs = logits.float().log_softmax(-1)
+    if emit_targets.ndim == 1:
+        return logprobs.gather(-1, emit_targets[:, None]).squeeze(-1)
+    if emit_targets.ndim == 2:
+        return logprobs.gather(-1, emit_targets)
+    raise ValueError("emit targets must be [actions] or [actions, candidates]")
 
 
 def slot_index(mask: Tensor) -> Tensor:
@@ -2066,18 +2150,45 @@ def refresh_old_statistics(
         # — need not match the update step's. That is exactly the drift the
         # behavior-age-0 canary exists to catch. The graph is discarded
         # immediately; the cost is one forward's saved activations.
-        compact_token_logprobs = compact_emit_token_logprobs(
-            wrapper,
-            compact_slots(stream_inputs, emit_index),
-            compact_slots(beliefs, emit_index),
-            compact_next_slots(microbatch.token_ids, emit_index),
-        ).detach()
+        emit_inputs = compact_slots(stream_inputs, emit_index)
+        emit_beliefs = compact_slots(beliefs, emit_index)
+        if microbatch.tpo_candidate_ids is not None:
+            compact_candidate_logprobs = compact_emit_token_logprobs(
+                wrapper,
+                emit_inputs,
+                emit_beliefs,
+                compact_slots(microbatch.tpo_candidate_ids, emit_index),
+            ).detach()
+            compact_token_logprobs = compact_candidate_logprobs[:, 0]
+        else:
+            compact_candidate_logprobs = None
+            compact_token_logprobs = compact_emit_token_logprobs(
+                wrapper,
+                emit_inputs,
+                emit_beliefs,
+                compact_next_slots(microbatch.token_ids, emit_index),
+            ).detach()
         token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
+        if compact_candidate_logprobs is not None:
+            if microbatch.old_tpo_candidate_logprobs is None:
+                raise RuntimeError("TPO candidates have no behavior statistics")
+            candidate_logprobs = torch.zeros_like(
+                microbatch.old_tpo_candidate_logprobs
+            )
+            scatter_slots(
+                candidate_logprobs, emit_index, compact_candidate_logprobs
+            )
         with torch.no_grad():
             # Advanced row indexing materializes a copy, so assignment must
             # target the parent explicitly (``view.copy_`` would update only
             # the temporary).
             batch.old_values[rows, :stream_length] = values
             batch.old_token_logprobs[rows, :stream_length] = token_logprobs
+            if compact_candidate_logprobs is not None:
+                if batch.old_tpo_candidate_logprobs is None:
+                    raise RuntimeError("packed TPO batch lost candidate statistics")
+                batch.old_tpo_candidate_logprobs[
+                    rows, :stream_length
+                ] = candidate_logprobs
     batch.statistics_refreshed = True

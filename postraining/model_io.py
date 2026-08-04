@@ -52,6 +52,17 @@ DEFAULT_MODEL_CONFIG = {
 }
 
 
+def _checkpoint_train_context(payload) -> int:
+    """Read pretraining context from current and legacy payload layouts."""
+    if not isinstance(payload, dict):
+        return 1024
+    if "train_seq_len" in payload:
+        return int(payload["train_seq_len"])
+    metadata = payload.get("metadata", {})
+    optimizer = metadata.get("optimizer", {}) if isinstance(metadata, dict) else {}
+    return int(optimizer.get("train_seq_len", 1024))
+
+
 def _load_nano_model(architecture: str, payload, device: torch.device):
     """Construct and strict-load a nanogpt-mini backbone.
 
@@ -98,11 +109,7 @@ def _load_nano_model(architecture: str, payload, device: torch.device):
     # RoPE positions seen in pretraining bound the usable RL context: the
     # half-truncate rotary has no extrapolation. Old checkpoints predate the
     # field and were all trained on 1024-token windows.
-    model.train_context_tokens = (
-        int(payload.get("train_seq_len", 1024))
-        if isinstance(payload, dict)
-        else 1024
-    )
+    model.train_context_tokens = _checkpoint_train_context(payload)
     state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
     # The checkpoint stores a bf16 embedding; the backbone keeps fp32 masters
     # (bf16 -> fp32 is value-exact, and load_state_dict casts on copy).
@@ -219,7 +226,56 @@ def load_model(
         model_class = FreshLeJEPAV2PredictedOnly
     construction = nullcontext()
     if "_pope_" in architecture:
-        if architecture.endswith("probes_pope_belief_attached_ce_onepass_2k"):
+        if architecture.endswith(
+            "distributional_kernel_mean_perdim_nosigreg_onepass_2k"
+        ):
+            from energy_readout.fresh_lejepa_train_distributional_kernel_jepa import (
+                DistributionalKernelLeJEPA,
+            )
+
+            model_class = DistributionalKernelLeJEPA
+            state = (
+                payload["model"]
+                if isinstance(payload, dict) and "model" in payload
+                else payload
+            )
+            frequency = None
+            if isinstance(state, dict):
+                frequency = next(
+                    (
+                        value
+                        for key, value in state.items()
+                        if key.endswith(".kernel_frequencies_q16")
+                    ),
+                    None,
+                )
+            if torch.is_tensor(frequency):
+                config["kernel_features"] = 2 * int(frequency.shape[0])
+        elif architecture.endswith(
+            "pope_shared_point_energy_onepass_2k"
+        ):
+            from energy_readout.fresh_lejepa_train_shared_point_energy import (
+                SharedPointEnergyLeJEPA,
+            )
+
+            model_class = SharedPointEnergyLeJEPA
+        elif architecture.endswith(
+            "pope_unified_energy_barycenter_onepass_2k"
+        ):
+            from energy_readout.fresh_lejepa_train_unified_energy_barycenter import (
+                UnifiedEnergyBarycenterLeJEPA,
+            )
+
+            model_class = UnifiedEnergyBarycenterLeJEPA
+        elif architecture.endswith(
+            "pope_jepa_owned_geometry_rbf_decoder_onepass_2k"
+        ):
+            from energy_readout.fresh_lejepa_train_jepa_rbf_decoder import (
+                GeometryPreservingRBFLeJEPA,
+            )
+
+            model_class = GeometryPreservingRBFLeJEPA
+        elif architecture.endswith("probes_pope_belief_attached_ce_onepass_2k"):
             from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope_belief_attached import (
                 FreshLeJEPASharedRMSV1PoPEBeliefAttachedCE,
             )
@@ -253,14 +309,25 @@ def load_model(
         model = model_class(**config).to(device)
         model.model_config = config
         model.architecture = architecture
+        model.train_context_tokens = _checkpoint_train_context(payload)
     state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
     model.load_state_dict(state, strict=True)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    for parameter in model.policy_probe.parameters():
-        parameter.requires_grad_(True)
-    for parameter in model.critic_probe.parameters():
-        parameter.requires_grad_(True)
+    if hasattr(model, "policy_probe"):
+        for parameter in model.policy_probe.parameters():
+            parameter.requires_grad_(True)
+    if hasattr(model, "critic_probe"):
+        for parameter in model.critic_probe.parameters():
+            parameter.requires_grad_(True)
+    if hasattr(model.blocks[-1], "rbf_token_bias"):
+        for name, parameter in model.blocks[-1].named_parameters():
+            if name.startswith("rbf_"):
+                parameter.requires_grad_(True)
+    if hasattr(model.blocks[-1], "energy_bias"):
+        for name, parameter in model.blocks[-1].named_parameters():
+            if name.startswith("energy_"):
+                parameter.requires_grad_(True)
     return model
 
 

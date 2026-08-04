@@ -13,6 +13,7 @@ from postraining.train_latent_vapo import (
     optimizer_minibatch_orders,
     plan_one_pass_training,
     rollout_tensorboard_metrics,
+    resume_topology_history,
     source_actor_signal_mask,
     stratified_optimizer_minibatch_orders,
     validate_resume_arg_contract,
@@ -96,13 +97,87 @@ def test_source_actor_mask_fails_closed_only_for_zero_reward_source() -> None:
 
 def test_exact_resume_contract_rejects_reward_change_but_allows_step_ceiling() -> None:
     values = {name: 1 for name in RESUME_EXACT_ARG_FIELDS}
-    current = SimpleNamespace(**values, steps=40_000)
-    validate_resume_arg_contract(values, current)
+    saved = {
+        **values,
+        "prompts_per_rollout": 16,
+        "prompts_per_minibatch": 16,
+        "delightful_policy_gradient": True,
+        "zero_reward_stop_pools": 8,
+    }
+    current = SimpleNamespace(
+        **saved, steps=40_000, allow_dg_topology_migration=False
+    )
+    validate_resume_arg_contract(saved, current)
     current.steps = 80_000
-    validate_resume_arg_contract(values, current)
+    validate_resume_arg_contract(saved, current)
+    current.prompts_per_rollout = current.prompts_per_minibatch = 24
+    current.zero_reward_stop_pools = 0
+    with pytest.raises(ValueError, match="--allow-dg-topology-migration"):
+        validate_resume_arg_contract(saved, current)
+    current.allow_dg_topology_migration = True
+    validate_resume_arg_contract(saved, current)
     current.nearby_reward_max = 0.1
     with pytest.raises(ValueError, match="nearby_reward_max"):
-        validate_resume_arg_contract(values, current)
+        validate_resume_arg_contract(saved, current)
+
+
+def test_exact_resume_rejects_vapo_rollout_topology_change() -> None:
+    values = {name: 1 for name in RESUME_EXACT_ARG_FIELDS}
+    saved = {
+        **values,
+        "prompts_per_rollout": 64,
+        "prompts_per_minibatch": 16,
+        "delightful_policy_gradient": False,
+    }
+    current = SimpleNamespace(
+        **values,
+        prompts_per_rollout=32,
+        prompts_per_minibatch=16,
+        delightful_policy_gradient=False,
+    )
+    with pytest.raises(ValueError, match="outside the one-fresh-batch"):
+        validate_resume_arg_contract(saved, current)
+
+
+def test_resume_topology_history_preserves_and_appends_transition() -> None:
+    prior = {"topology_history": [{"source_step": 100}]}
+    saved = {"prompts_per_rollout": 16, "prompts_per_minibatch": 16}
+    current = SimpleNamespace(
+        prompts_per_rollout=24, prompts_per_minibatch=24
+    )
+    history = resume_topology_history(
+        prior,
+        saved,
+        current,
+        checkpoint="run/latent_vapo_checkpoint.pt",
+        checkpoint_sha256="sha256:checkpoint",
+        step=774,
+        sampler_cursor=13_184,
+    )
+    assert history[0] == {"source_step": 100}
+    assert history[1] == {
+        "source_checkpoint": "run/latent_vapo_checkpoint.pt",
+        "source_checkpoint_sha256": "sha256:checkpoint",
+        "source_step": 774,
+        "source_sampler_cursor": 13_184,
+        "before": {
+            "prompts_per_rollout": 16,
+            "prompts_per_minibatch": 16,
+        },
+        "after": {
+            "prompts_per_rollout": 24,
+            "prompts_per_minibatch": 24,
+        },
+    }
+    assert resume_topology_history(
+        {"topology_history": history},
+        saved,
+        current,
+        checkpoint="copied-run/latent_vapo_checkpoint.pt",
+        checkpoint_sha256="sha256:checkpoint",
+        step=774,
+        sampler_cursor=13_184,
+    ) == history
 
 
 def test_one_pass_plan_consumes_all_dapo_rows_once_including_tail() -> None:
@@ -250,6 +325,61 @@ def test_actor_dashboard_has_only_the_authoritative_policy_loss() -> None:
     assert "loss/gate_weighted" not in dashboard
     assert "loss/renderer" not in dashboard
     assert "loss/thought_weighted" not in dashboard
+
+
+def test_delightful_dashboard_reports_gates_and_drops_ppo_only_metrics() -> None:
+    first = _actor_metrics(
+        action_count=10.0,
+        delightful_gate_mean=0.4,
+        delightful_positive_gate_mean=0.8,
+        delightful_negative_gate_mean=0.2,
+        delightful_positive_count=2.0,
+        delightful_negative_count=8.0,
+        delightful_delight_mean=-0.3,
+        delightful_surprisal_mean=3.0,
+        delightful_positive_loss_contribution=1.3,
+        delightful_negative_loss_contribution=-0.3,
+    )
+    last = _actor_metrics(
+        action_count=30.0,
+        delightful_gate_mean=0.6,
+        delightful_positive_gate_mean=0.9,
+        delightful_negative_gate_mean=0.1,
+        delightful_positive_count=18.0,
+        delightful_negative_count=12.0,
+        delightful_delight_mean=0.1,
+        delightful_surprisal_mean=5.0,
+        delightful_positive_loss_contribution=1.2,
+        delightful_negative_loss_contribution=-0.2,
+    )
+    dashboard = aggregate_actor_tensorboard_metrics([first, last])
+    assert dashboard["delightful/gate_mean"] == pytest.approx(0.55)
+    assert dashboard["delightful/positive_gate_mean"] == pytest.approx(0.89)
+    assert dashboard["delightful/negative_gate_mean"] == pytest.approx(0.14)
+    assert dashboard["delightful/delight_mean"] == pytest.approx(0.0)
+    assert dashboard["delightful/surprisal_mean"] == pytest.approx(4.5)
+    assert dashboard["delightful/reinforce_positive_advantage"] == pytest.approx(
+        2.5
+    )
+    assert dashboard["delightful/suppress_negative_advantage"] == pytest.approx(
+        -0.5
+    )
+    assert "clip/policy" not in dashboard
+    assert "ratio/harmful_positive_log_max" not in dashboard
+
+    class Writer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float, int]] = []
+
+        def add_scalar(self, tag: str, value: float, step: int) -> None:
+            self.calls.append((tag, value, step))
+
+    writer = Writer()
+    write_actor_tensorboard_metrics(writer, dashboard, behavior_age=0, step=1)
+    tags = {tag for tag, _, _ in writer.calls}
+    assert "debug/behavior_refresh_max_drift" in tags
+    assert "delightful/gate_mean" in tags
+    assert "clip/policy" not in tags
 
 
 def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:

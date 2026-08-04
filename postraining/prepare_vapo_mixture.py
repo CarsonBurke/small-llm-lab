@@ -17,7 +17,7 @@ from postraining.vapo.code_reward import PYTHON_REWARD_SCHEMA, python_tests_pass
 from postraining.vapo.mixture import VAPO_MIXTURE_SCHEMA, file_sha256
 
 
-DEFAULT_OUTPUT = Path("postraining/data/vapo_broad_v1")
+DEFAULT_OUTPUT = Path("postraining/data/vapo_broad_v5")
 DEFAULT_SFT = Path(
     "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet"
 )
@@ -77,6 +77,8 @@ def load_mbpp_train(path: Path) -> list[dict]:
             "Your final answer must be a complete executable Python module. "
             "Use deterministic in-process Python only: no filesystem, process, "
             "network, reflection, dynamic execution, or interactive I/O. "
+            "Use only ordinary task data fields and collection/string/math "
+            "methods; interpreter and frame attributes are unavailable. "
             "Imports are limited to bisect, cmath, collections, datetime, "
             "heapq, itertools, math, re, sys.maxsize, and operator.eq. "
             "It must define the requested function and pass this fixture and "
