@@ -60,21 +60,19 @@ mlq submit \
     --rollout-only
 ```
 
-Then start a run with an explicit output directory:
+Then start the selected 40K DG broad-mixture regime with an explicit output
+directory. Its objective, data mixture, exact-only reward, fenced thinking,
+and 24 x 16 fresh-batch topology are defaults:
 
 ```bash
 mlq submit \
-  --name posttrain_cot \
+  --name posttrain_dg_broad \
   --cwd "$PWD" \
   --max-parallel-runs 1 \
   -- \
   python3 -m postraining.train_latent_vapo \
     --checkpoint postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
-    --output postraining/runs/posttrain_cot \
-    --reasoning-mode cot \
-    --think-tokens \
-    --answer-fence \
-    --steps 2000
+    --output postraining/runs/posttrain_dg_broad
 ```
 
 With `--answer-fence`, every math family is canonicalized to the same episode
@@ -110,8 +108,8 @@ zero-initialized, so a fresh run is bit-exact with the pretrained token
 policy while `W` gets a full-rank gradient from the first step. (The v1
 form gated an orthogonal `W` behind one zero-init scalar gain — a
 multiplicative saddle neither factor escaped in practice.) There is no
-stochastic thought channel: the only actions are tokens, training is standard
-token-level VAPO (DAPO clip + HL-Gauss critic), and the carried belief is
+stochastic thought channel: the only actions are tokens, training defaults to
+token-level DG with an HL-Gauss critic, and the carried belief is
 detached replay data — no BPTT. The separate critic re-derives combined
 embeddings with its own combiner weights. `cot` and `none` remain token-only
 control modes with zero-width hidden storage. Combiner geometry is set by
@@ -137,6 +135,101 @@ pretraining val_bpb (the init gate) need `--bpb-val-tokens 2097152`.
 TensorBoard events, and exact-resume checkpoints beneath the output directory.
 The base checkpoint file is never overwritten; the trainable actor copy and
 the separate critic state live in the run directory.
+
+### Delightful Policy Gradient
+
+`train_latent_vapo` defaults to the discrete-action [Delightful Policy
+Gradient](../papers/delightful_policy_gradient_2603.14608v1.pdf) from Osband
+(2026). A new production run therefore needs only its checkpoint and output
+paths:
+
+```bash
+python3 -m postraining.train_latent_vapo \
+  --checkpoint <base-sft-checkpoint> \
+  --output postraining/runs/<name>
+```
+
+The default immutable broad-v5 manifest and MBPP verifier corpus are rebuilt
+with `python3 -m postraining.prepare_vapo_mixture`; the builder defaults to the
+same `postraining/data/vapo_broad_v5` prefix consumed by training.
+
+Each emitted token is one action. Its actor score term is gated by
+`sigmoid(advantage * -current_token_log_probability)` with the paper's fixed
+temperature eta=1. The gate is stop-gradient, and this mode uses neither PPO
+importance ratios nor clipping. The critic, tokenwise GAE, verifier rewards,
+and hidden-carry replay are unchanged.
+
+DG is an on-policy estimator. The trainer therefore rejects configurations
+where one frozen rollout pool would feed multiple sequential actor updates;
+`--prompts-per-minibatch` must equal `--prompts-per-rollout`. The selected
+24-prompt windows alternate between 10/8/3/3 and 11/7/3/3 groups from
+DAPO/DeepMind/GSM8K/MBPP. This is the nearest integer rotation to broad-v5's
+7/5/2/2 ratio and recovers that ratio exactly over the eight-update cursor
+phase cycle. Each fresh optimizer batch therefore contains 24 prompts x 16
+samples = 384 trajectories. The historical VAPO control remains
+available explicitly with `--no-delightful-policy-gradient`; wider frozen
+rollout pools must likewise be requested explicitly. `--no-think-tokens`,
+`--no-answer-fence`, and an empty `--rl-mixture-manifest` preserve explicit
+control configurations. Checkpoints and run manifests bind the selected
+actor-objective schema, so exact resume cannot silently switch between VAPO
+and DG. A DG exact resume may deliberately change only the equal rollout and
+minibatch prompt counts while preserving actor, critic, optimizer, RNG, and
+prompt cursor state. That change requires the explicit
+`--allow-dg-topology-migration` acknowledgement. The run manifest records the
+checkpoint step, sampler cursor, and before/after topology so the earlier
+segment cannot be mistaken for the resumed segment. The zero-reward actor
+freeze remains enabled, while the
+heterogeneous-mixture desert stop defaults off because hard prompt windows do
+not prove that a frozen policy cannot succeed on later prompts.
+
+### Action-only Target Policy Optimization
+
+`--target-policy-optimization` selects the pure TPO actor objective from
+[Target Policy Optimization](../papers/2604.06159v1.pdf) while retaining the
+existing critic and tokenwise GAE. It overrides the default DG flag; there is
+no policy-gradient auxiliary, importance ratio, or PPO clip.
+
+At each visited prefix, one logits vector supplies eight distinct token
+candidates by ordered sampling without replacement. Candidate zero retains the
+ordinary behavior-policy marginal and is always the only candidate fed back
+into the autoregressive stream. The other seven are stored comparison token
+IDs: they receive no critic evaluation, verifier reward, KV cache,
+continuation, or environment interaction. Distinct identities matter because
+the executed token cannot coherently carry both its observed GAE and a neutral
+comparison utility. The real rollout topology therefore stays 24 prompts x 16
+trajectories rather than multiplying by eight.
+
+After the completed trajectories are scored, the executed candidate receives
+its on-trajectory GAE advantage and every comparison candidate receives
+utility zero. Active-token advantage RMS supplies the fixed reward scale
+without mean subtraction, preserving the semantic neutral point at advantage
+zero. This deliberately replaces Appendix C's within-group z-score: for a
+score vector `[A, 0, ...]`, that transform keeps only the sign and amplifies
+arbitrarily small critic residuals to full-strength targets. The actor fits
+`q = softmax(log p_old + utility / eta)` by cross-entropy over the sampled
+candidate slots, with `eta=1` by default. Candidate targets and the old-policy
+anchor are stop-gradient.
+
+The existing source-success mask is intentionally retained rather than adding
+GRPO-style per-prompt variance filtering. A source with no successes supplies
+critic calibration but no actor update; within an active source, all-fail
+prompt groups may still contribute dense critic-GAE credit. This is a
+critic-compatible TPO variant, not the paper's fully scored counterfactual
+construction. An age-zero guard checks replay equality for all eight candidate
+log probabilities and aborts before an optimizer step if the behavior anchor
+is stale.
+
+```bash
+python3 -m postraining.train_latent_vapo \
+  --checkpoint <base-sft-checkpoint> \
+  --output postraining/runs/<name> \
+  --target-policy-optimization
+```
+
+TensorBoard exposes target KL/entropy and mass shift, utility scale, effective
+unique candidate count, duplicate canaries, and all-candidate behavior drift.
+TPO checkpoints use a distinct actor-objective schema and cannot silently
+resume as DG or VAPO.
 
 ## On-policy self-distillation (OPSD)
 

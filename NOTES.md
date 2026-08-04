@@ -4118,3 +4118,324 @@ not demonstrated mathematical supervision. Verdict: do not create a sealed
 authorization panel and do not train this answer-only self-rationalized OPSD
 variant. A fresh panel would only be justified by a new mechanism that first
 shows a material correctness-directed update on development data.
+
+## 2026-08-02: Broad verifier-mixed VAPO launched from canonical-v4 SFT
+
+The immutable v5 mixture cycles 64 prompt groups as 28 deduplicated DAPO,
+20 module-stratified DeepMind Mathematics, 8 GSM8K-train, and 8 official MBPP
+train tasks. Every 16-group optimizer step is stratified 7/5/2/2. Rewards are
+binary exact only, structurally grade only the registered answer span, and
+use no nearby/partial math reward. An all-zero source contributes critic
+targets but its actor rows are masked until that source produces an exact
+success. Source-level reward/format/termination and typed Python verifier
+outcomes are logged to JSONL and TensorBoard.
+
+The Python verifier is `bwrap_python_positive_ast_all_tests_binary/v5`: a
+disclosed deterministic subset, bubblewrap network/filesystem isolation,
+CPU/address-space/file/FD limits, global eight-sandbox concurrency, and a
+completion sentinel emitted only after every test. Its positive AST policy
+blocks process, reflection, frame/code access, dynamic execution, and magic
+comparison hooks. All 374 official reference solutions pass a mandatory
+build-time preflight. Earlier v1-v4 attempts are invalid preserved artifacts:
+red-team review found early-exit/sentinel/frame bypasses, a fixture-order bug,
+mixed-status packing failure, and an unreliable per-user process limit. No
+actor update from those attempts is part of the v5 lineage.
+
+The v5 frozen-policy gate passed at aggregate exact accuracy 0.0205: DAPO
+0.0179, DeepMind 0.0281, GSM8K 0.0312, MBPP 0.0000. MBPP therefore starts
+actor-masked, not as negative policy evidence. The first production pools
+completed without verifier infrastructure failures; at rollout step 64 the
+source accuracies were DAPO 0.0201, DeepMind 0.0688, GSM8K 0.0391, MBPP 0,
+with 0 Python timeouts. Job 1189 targets 40,000 actor steps in
+`postraining/runs/sft4_vapo_broad_v5` from the byte-hashed canonical-v4 SFT.
+
+Scope qualification: 7,123/7,217 GSM8K RL rows exactly overlap the v4 SFT
+corpus (mostly `gsm8k_socratic`), so GSM8K reward is not novel-domain
+evidence. DAPO has one exact SFT overlap and DeepMind none. The RL sources have
+zero exact overlap with AIME-2024; DeepMind RL-full has zero exact overlap with
+the 144-row DeepMind-easy benchmark.
+
+## 2026-08-02: LeJEPA answer-encoder v1 failed; reference-regime rerun queued
+
+Job 1196 (`answer_lejepa_v1_2k`) completed 2,000 steps and failed the
+behavioral reward gate. Deterministic validation projection rank fell from
+16.92 at initialization to 1.23, validation SIGReg rose to 26.09, and the
+mean view cosine reached 0.9933. The learned geometry was not semantic:
+`airplane` scored above `kitten` against `cat`, a negated statement scored
+above its valid paraphrase, and reordered versus buggy functions differed by
+only 0.00057 cosine. Backbone-space probes also failed.
+
+Direct numerical comparison against `../lejepa` showed exactly equal SIGReg
+values for identical inputs and random slices (1.01120496 in both
+implementations). The Epps-Pulley statistic and tensor axes were therefore
+not the bug. The recipe was misapplied: v1 used the BatchNorm projection head
+as a deployable reward even though LeJEPA discards it downstream, used only
+32 samples for a 128-dimensional distribution, and forced invariance across
+four often-disjoint 5-30% text crops. Train-mode projection rank was only
+10.24 at step 2,000; an isotropic 32x128 Gaussian sample is expected near
+27.4 effective rank.
+
+Job 1201 will quantify live-batch versus stored BatchNorm statistics on the
+preserved v1 checkpoint. Job 1202 (`answer_lejepa_reference_2k`) is the
+corrected baseline: backbone reward, exact reference MLP defaults, batch 256,
+projection dimension 16, four full-text weakly masked views, no encoder
+dropout, and learning rate 0.002. Both are queued behind the active v5 VAPO
+workload; no success claim is made before their measured results.
+
+## 2026-08-02: Direct-CLS LeJEPA answer encoder fixes SIGReg, fails semantics
+
+The v1 diagnostic (job 1201) confirmed a severe stored-BatchNorm mismatch:
+FineWeb projection effective rank was 1.28 with stored statistics versus 5.98
+with current-batch statistics. The reference-regime v2 run (job 1202) fixed
+the projected distribution (15.6/16 train and 11.82/16 validation effective
+rank) but still failed the semantic gate. A source audit then found that
+14,839 of 25,000 answer rows were one token, only 9,779 token sequences were
+unique, and the chunk-mean encoder could not express the intended within-chunk
+function-order invariance test.
+
+Job 1209 (`answer_lejepa_cls_v3_2k`) removed those confounds. Each token is a
+ViT-style patch in one bidirectional Transformer; a learned CLS token attends
+the full sequence and its normalized final state is the answer embedding.
+There is no token or chunk mean. Dynamic sinusoidal positions retain token
+order, while invariance must be learned from views. Transformer blocks are
+initialized independently. The corpus contains 25,000 unique truncated token
+sequences (23,750 train, 1,250 held out, zero overlap; median 256 tokens), and
+uses four full-length 30%-masked views, batch 256, exact reference projector
+and SIGReg, mixed-corpus validation, gradient scaling, and the reference
+nonzero learning-rate floor.
+
+The 2,000-step run completed in 283 seconds. Optimization and SIGReg worked:
+held-out loss was 0.03329, projected effective rank was 14.92/16, projected
+dimension standard deviation was 1.001, and view-center cosine was 0.99836.
+The deployable backbone cosine nevertheless failed all four semantic checks.
+Backbone effective rank was only 5.05/256; function reorder minus semantic bug
+was -0.000010, numeric equivalents minus non-equivalents was -0.004873,
+paraphrase minus negation was -0.000436, and taxonomy-related minus unrelated
+was -0.000119. Verdict: the projected LeJEPA objective no longer mechanically
+collapses, but same-document token masking did not produce a usable raw-cosine
+backbone reward. This run used no block-shuffle views, so it does not test
+explicitly learned function-order invariance; projected-space behavior and a
+targeted reorder augmentation remain separate diagnostics. Do not integrate
+this checkpoint into RL.
+
+Reviewer red-team narrowed the next causal test to job 1212
+(`answer_lejepa_cls_direct_sigreg_v4_2k`), which kept v3's seed, data, masking,
+and disabled block shuffling but applied invariance and SIGReg directly to the
+256-dimensional CLS backbone used for reward. It completed 2,000 steps with
+held-out loss 0.12238 and raised deployed effective rank from 5.05 to 23.62.
+This confirms that v3's nonlinear projector had absorbed much of SIGReg.
+
+The higher-rank representation still failed three of four semantic checks.
+Numeric equivalents minus non-equivalents was -0.007447, paraphrase minus
+negation was -0.005271, and function reorder minus semantic bug was -0.000504;
+only taxonomy-related minus unrelated was positive (+0.003476). The v3
+projected-space diagnostic (job 1211) also failed all checks, including a
+-0.689 numeric-equivalence margin because `10.0` was far below `100`.
+Verdict: direct reward-space regularization improves diversity but does not
+recover semantic correctness. Missing cross-answer equivalence views are now
+the leading explanation. Do not integrate v4 into RL or spend another run on
+the same masked-view objective. Block shuffling can test function order only;
+it cannot repair the independently observed numeric and negation failures.
+
+## 2026-08-03: Multi-crop projected answer encoder queued
+
+The v3/v4 manifests exposed the central adaptation error: both used four
+full-length views, no local views, no block shuffling, and only independent
+token masking. They therefore did not test the analogue of LeJEPA's strongly
+different patch grids. V5 changes the view orbit to two global 30-100% crops
+and six local 5-30% crops with 10% masking. A 256-sample FineWeb audit found
+eight unique views for 255 samples (mean 7.996); global crops averaged about
+93 tokens and local crops about 26.
+
+The standard projected invariance plus SIGReg objective is restored, and the
+same projector is the deployed target/answer embedding. Because that head is
+retained rather than discarded, its hidden normalization is per-example
+LayerNorm; reference BatchNorm would train on crop-batch statistics but deploy
+on single full answers with stored statistics. Model, corpus, batch, optimizer,
+and seed otherwise remain fixed. The focused suite passes 28 tests and an
+independent review found no fresh-run blocker. Job 1215
+(`answer_lejepa_multicrop_v5_2k`) is queued at concurrency 1 behind the active
+shared-GPU workloads; no result claim is made before its full 2,000 steps.
+
+Job 1215 subsequently completed successfully. Held-out view-center cosine was
+0.78821, projected effective rank was 11.76/16, SIGReg was 16.47, and total
+validation loss was 0.51664. The much lower view cosine confirms that v5 no
+longer solved invariance with nearly identical inputs. It also produced the
+first material positive taxonomy relation: the minimum of `cat`/`kitten` and
+`cat`/`dog` exceeded `cat`/unrelated by 0.05882 cosine.
+
+The overall behavioral gate still failed. Numeric equivalence margin was
+-0.38541 (`10.0` and `10.1` both near 0.614 cosine while `50` and `100` were
+above 0.999), paraphrase minus negation was -0.29811, and function reorder
+minus semantic bug was -0.00683. Verdict: the multi-crop fix materially changes
+and improves the representation, but the 2,000-step v5 checkpoint is not an
+RL reward model. Do not integrate it.
+
+## 2026-08-03: Masked latent-prediction LeJEPA learns patches, still fails semantics
+
+Job 1219 (`answer_lejepa_masked_latent_v6_2k`) tested the faithful
+missing-patch formulation without CE. A shared bidirectional encoder processes
+one complete sequence and one position-aligned context with 30% contiguous
+span masking. A training-only 256 -> 1024 -> 256 predictor maps masked-context
+token and CLS states toward the corresponding complete-view states; both sides
+then use the same attached 256 -> 2048 -> 2048 -> 16 LayerNorm projector.
+There is no EMA target or stop-gradient. Patch and CLS populations each use
+the exact two-view LeJEPA center MSE plus SIGReg and are averaged, so token
+count cannot drown out the deployed CLS objective. A one-token answer is fully
+masked in the context while its original token remains attached on the target
+side. The focused suite passes 54 tests, including original-token gradients,
+alignment/padding, exact MSE scaling, sampler resume, and reference diagnostic
+cosine. Independent review found no queue blocker.
+
+The 2,000-step run completed in 190 seconds. Held-out masked fraction was
+0.30023 (45.53 predicted patches per sample). Target/predicted patch effective
+ranks reached 15.93/16 and 15.92/16 with 0.99034 direct cosine. The deployed
+target CLS projection reached rank 15.50/16; global prediction cosine was
+0.99860 and backbone rank was 19.94/256. The intended latent-prediction problem
+therefore trained successfully without representation collapse.
+
+The reward gate nevertheless passed only taxonomy. Numeric equivalence margin
+was -0.11033: against `10`, `10.0` scored 0.88805 and `ten` 0.99770, while
+`9`, `50`, and `100` scored 0.99791, 0.99838, and 0.99788. Paraphrase minus
+negation was -0.01179 (0.98192 versus 0.99371), and function reorder minus
+semantic bug was -0.000018 (0.999981 versus 1.000000). Taxonomy passed by
++0.00182. These are large improvements over v5's -0.38541, -0.29811, and
+-0.00683 failing margins, but the signs remain wrong. Moreover, numeric
+equivalence worsened during training from -0.00522 at step 100 to -0.11033 at
+step 2,000 while patch prediction steadily improved. This is evidence that
+objective convergence alone does not produce the requested cosine ordering in
+the present setup. Do not integrate v6 into RL.
+
+## 2026-08-03: Variable-cardinality masked JEPA queued
+
+V7 removes masked patches from the context entirely. The compacted visible
+tokens retain their original positions, and a two-layer Transformer predictor
+uses learned position-conditioned patch queries plus a global query to predict
+the complete target patch latents and CLS. Query self-attention is
+bidirectional; cross-attention sees only the compacted attached context
+encoder states. Predictions and attached complete-target states then pass
+through the same LayerNorm projector before the unchanged two-view center MSE
+and separate 50/50 patch/global SIGReg objectives. Padded query outputs never
+enter either loss population. The inference checkpoint retains only the
+shared encoder and projector.
+
+The focused suite passes 61 tests, including original-position preservation,
+unequal missing-patch counts, fully deleted single-token contexts, isolated
+context gradients, padding/batch-neighbor invariance, independent predictor
+layer initialization, exact MSE scaling, and valid-only SIGReg populations.
+Independent review found no queue blocker.
+
+Job 1221 (`answer_lejepa_variable_cardinality_v7_2k`) completed the full 2,000
+steps in 196 seconds. Held-out visible/masked fractions were 0.69977/0.30023.
+Target and predicted patch ranks were 15.91/16 and 15.92/16 with 0.99039 patch
+cosine. The projected target CLS rank was 15.30/16; global prediction cosine
+was 0.96451, versus 0.99860 for the same-length v6 predictor. This confirms
+that deletion creates a genuinely harder complete-state prediction problem
+without representation collapse.
+
+The reward gate failed 0/4. Numeric equivalence margin improved from v6's
+-0.11033 to -0.05279, but `10.0` remained only 0.94599 cosine from `10` while
+`9`, `50`, and `100` were all about 0.999. Paraphrase minus negation was
+-0.01401, function reorder minus semantic bug was -0.000013, and taxonomy
+related minus unrelated was -0.00226. At step 100 the numeric equivalence
+margin was already negative (-0.00420) and it worsened to -0.05279 while the
+objective and rank improved. V7 is a faithful variable-cardinality JEPA, but
+its projected CLS remains unusable as a correctness reward. Do not integrate
+v7 into RL.
+
+## 2026-08-04: V7 projected patch-set matching rejected
+
+Job 1223 (`answer_lejepa_v7_patch_set_probe`) evaluated exact Hungarian
+matching over v7's normalized projected contextual token patches. The report
+includes the same-checkpoint CLS baseline, matched-only normalization, and a
+cardinality-aware variant that assigns zero reward to unmatched patches. The
+first attempt failed before model execution because the standalone script did
+not add the repository root to `sys.path`; the standard entry-point bootstrap
+and an outside-repository subprocess regression test fixed it. Attempt two
+completed successfully; the focused suite passes 65 tests.
+
+Matched-only patch scoring improved numeric equivalence from the CLS margin
+of -0.05279 to -0.02507, taxonomy from -0.00226 to +0.00400, and paraphrase
+versus negation from -0.01401 to -0.01083. All except taxonomy still fail.
+Function reorder versus semantic bug worsened from -0.000013 to -0.000068:
+reordered cosine was 0.999926 while the bug was 0.999993. Cardinality-aware
+matching produced -1.34098 numeric and -0.32874 paraphrase margins because it
+mostly measured GPT-2 token-count differences. Verdict: CLS pooling is not
+the cause of the missing function-bug distinction, and existing token patches
+do not contain a useful localized program-semantic signal. Do not replace the
+CLS reward with this patch-set readout.
+
+## 2026-08-04: Pretrained Qwen baseline and CLS-only v8
+
+Job 1228 (`qwen3_embedding_8b_answer_reward_probe_v2`) evaluated the frozen
+Qwen3-Embedding-8B checkpoint at 16, 256, 1024, and 4096 dimensions using
+plain symmetric, symmetrically instructed, and documented retrieval-style
+target-instructed scoring. The 16-dimensional result is explicitly an
+unsupported extrapolation below Qwen's advertised 32-dimensional MRL minimum.
+The audit contains the original four probes, five graded semantic/code/math
+cases, and 41 systematic numeric targets; semantic and numeric families are
+reported separately so the numeric sweep cannot dominate the conclusion.
+
+The intended plain symmetric 256-dimensional readout passed all four small
+behavioral checks: numeric equivalence +0.02593, taxonomy +0.16650,
+paraphrase versus negation +0.13591, and function reorder versus bug +0.04981.
+Across the five curated semantic/code/math cases it achieved 0.7808 mean
+Spearman and 0.8654 pairwise ordering accuracy. Numerical sweeps achieved
+0.7795 mean Spearman and 0.8628 pairwise accuracy. Dimensionality was not the
+main limitation: 1024-D and 4096-D plain scoring were similar.
+
+The strict correct-versus-incorrect margin remained negative. For the linear
+equation, the correct answer-only `5` scored 0.36450 while a lexically similar
+arithmetic slip ending in `x = 4` scored 0.88509. For factorial, an off-by-one
+loop scored 0.98139 while an equivalent `math.prod` implementation scored
+0.83686. Thus Qwen provides a substantially better coarse, often monotonic
+semantic reward than any trained answer JEPA here, but raw cosine can strongly
+prefer a near-copy bug over a behaviorally correct rewrite. Use it as a frozen
+baseline or shaping component, not as the sole correctness reward. The
+canonical report is
+`ablation_results/qwen3_embedding_8b_answer_reward_probe/result.json`.
+
+Job 1229 (`answer_lejepa_global_cls_v8_2k`) then tested one deployed
+256-dimensional projected CLS with no patch queries, losses, SIGReg samples,
+or inference readout. A training-only global Transformer query predicts the
+complete-answer CLS from compact, original-position contexts; predicted and
+target CLS states use the same attached LayerNorm projector and exact
+two-view center MSE plus SIGReg.
+
+The full 2,000-step run completed successfully but failed all four behavioral
+checks. Projected effective rank was only 8.55/256 and backbone rank was
+3.45/256; global prediction cosine was 0.95557. Numeric equivalence improved
+from v7's -0.05279 to -0.04306 and paraphrase/negation from -0.01401 to
+-0.00863, while taxonomy worsened from -0.00226 to -0.01053 and function
+reorder/bug worsened from -0.000013 to -0.000087. `10`, `50`, and `100`
+remain nearly identical (1.00000, 0.99509, and 0.99914). Verdict: changing to
+one larger CLS is architecturally cleaner but does not solve the missing
+cross-answer correctness geometry. Do not integrate v8 into RL.
+
+## 2026-08-04: Action-only token TPO implementation
+
+Implemented a pure Target Policy Optimization actor mode behind
+`--target-policy-optimization`. Each behavior state samples K=8 distinct
+candidate token IDs without replacement from one logits vector; the first draw
+keeps the behavior policy's ordinary marginal, slot zero is always the sole
+autoregressive action, and the other slots are never valued, verified, cached,
+or continued. Uniqueness prevents one token identity from receiving both the
+executed GAE and a contradictory neutral utility.
+After the real trajectory completes, only slot zero receives its tokenwise
+critic-GAE utility. The target is anchored to frozen behavior probabilities
+and fit by cross-entropy; there is no PG auxiliary, ratio, clipping, or
+counterfactual critic branch.
+
+The paper's Appendix-C `[A, 0, ...]` construction is retained, but its
+within-group z-score is deliberately replaced by active-token RMS scaling
+without centering. Exact z-scoring would erase magnitude and give every tiny
+nonzero critic residual the same roughly 20.6x slot-zero tilt at K=8; the
+paper itself flags this low-variance amplification. The current unit-reward
+critic has a semantic zero, so RMS scaling preserves both zero and relative
+magnitude. The 24-prompt x 16-trajectory topology stays unchanged. We retain
+the existing source-success actor mask: an entirely unsuccessful source is
+critic-only, but all-fail prompt groups inside an active source keep dense
+critic-GAE signal rather than being removed by GRPO-style group-variance
+filtering. Added target KL/entropy/mass-shift, utility, effective-candidate,
+duplicate-canary, and all-K freshness diagnostics plus a distinct checkpoint
+objective schema; an age-zero all-K mismatch is fatal before stepping.
