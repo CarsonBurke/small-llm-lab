@@ -241,6 +241,7 @@ def test_score_math_rollout_prepends_answer_prefix():
         hiddens=torch.zeros(1, stream, 0),
         action_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
         old_token_logprobs=zeros.clone(),
+        old_token_log_odds=zeros.clone(),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(1),

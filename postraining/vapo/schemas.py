@@ -9,7 +9,7 @@ EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_deterministic_hidden_carry_token_clip_anchored_value_general_lr_sequential_data/v28"
 )
 CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX = (
-    "+request_stable_continuous_refill_paged_flex_attention/v1"
+    "+request_stable_continuous_refill_paged_flex_attention_cdf_right/v2"
 )
 PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 ACTOR_OBJECTIVE_SCHEMA = (
@@ -20,10 +20,12 @@ DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
     "detached_gate_no_importance_ratio/v1"
 )
 TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA = (
-    "target_policy_action_only_unique_token_candidates_executed_gae_"
-    "rms_utility_old_policy_anchor_cross_entropy_no_pg_aux/v2"
+    "target_policy_intra_trajectory_executed_token_raw_gae_"
+    "old_policy_odds_target_global_token_mean_eta_controlled_no_pg_aux/v6"
 )
-REPLAY_NUMERICS_SCHEMA = "compact_token_logprob_next_slot_targets/v2"
+REPLAY_NUMERICS_SCHEMA = (
+    "compact_token_logprob_and_target_vs_rest_logodds_next_slot_targets/v3"
+)
 ADAMW_ALGORITHM_SCHEMA = (
     "torch_adamw_betas0.9_0.999_eps1e-8_amsgrad_false_weight_decay0/v1"
 )

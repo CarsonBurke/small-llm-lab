@@ -467,6 +467,7 @@ def test_nano_critic_smoke():
         hiddens=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
         action_mask=torch.zeros(batch_size, stream, dtype=torch.bool),
         old_token_logprobs=zeros.clone(),
+        old_token_log_odds=zeros.clone(),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(batch_size),

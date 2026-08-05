@@ -835,86 +835,147 @@ def delightful_policy_loss(
 
 
 def target_policy_loss(
-    candidate_logprobs: Tensor,
-    old_candidate_logprobs: Tensor,
+    new_log_odds: Tensor,
+    old_log_odds: Tensor,
     advantages: Tensor,
-    advantage_rms: Tensor,
+    mask: Tensor,
     *,
-    eta: float = 1.0,
+    eta: float = 2.0,
     denominator: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Action-only token TPO on one executed and K-1 comparison actions.
+    """Fit an intra-trajectory target on executed-token-versus-rest odds.
 
-    Candidate zero is the action actually followed by the behavior policy.
-    Its on-trajectory GAE is the only scored utility; comparison actions are
-    left at the neutral utility zero.  This is the sampled-action construction
-    analyzed in TPO Appendix C, with one deliberate adaptation for a learned
-    critic: RMS scaling preserves advantage magnitude instead of within-group
-    z-scoring ``[A, 0, ...]`` down to its sign.
+    At each visited prefix, raw detached GAE shifts the behavior policy's
+    executed-token log odds by ``A / eta``.  This defines a normalized and
+    feasible local Bernoulli target over the partition {executed token, every
+    other token}.  Binary cross entropy fits the current executed-token
+    probability to that target, and its isolated gradient extinguishes there.
+    Targets from repeated identical prefixes can conflict across sampled
+    tokens, in which case the shared categorical policy fits their compromise.
+    This is the discrete counterpart of the old-policy-anchored intra-
+    trajectory target used by ``ppo_continuous_action_tpo_intra_beta_v2.py``.
 
-    The old-policy anchor and target are detached.  No policy-gradient term,
-    importance ratio, clipping, or counterfactual value estimate appears in
-    this loss.
+    Advantages are deliberately neither centered nor normalized here.  The
+    verifier return and critic targets both live on [0, 1], and with gamma=1
+    their lambda-GAE stays on that meaningful native scale (up to the critic
+    support's narrow margin bins).  ``eta`` is the target-space trust control:
+    it limits the requested odds move relative to the frozen rollout policy,
+    though it does not impose a hard bound on the optimizer's realized KL.
+    There is no policy-gradient auxiliary,
+    counterfactual action value, sampled comparison action, or PPO clip.
+
+    Every active token is one transition, matching the CleanRL intra-TPO
+    reference and the existing VAPO actor reduction. ``denominator`` may span
+    complete replay shards and prompt groups, so memory partitioning does not
+    alter the global token mean.
     """
-    if candidate_logprobs.ndim != 2:
-        raise ValueError("candidate log probabilities must be [actions, K]")
-    if old_candidate_logprobs.shape != candidate_logprobs.shape:
-        raise ValueError("old and current candidate log probabilities must align")
-    if advantages.shape != candidate_logprobs.shape[:1]:
-        raise ValueError("advantages must contain one value per candidate group")
-    if candidate_logprobs.size(1) < 2:
-        raise ValueError("TPO requires an executed action and at least one comparison")
+    if new_log_odds.shape != old_log_odds.shape:
+        raise ValueError("old and current token log odds must align")
+    if advantages.shape != new_log_odds.shape or mask.shape != new_log_odds.shape:
+        raise ValueError("TPO log odds, advantages, and mask must align")
     if not math.isfinite(eta) or eta <= 0.0:
         raise ValueError("TPO eta must be finite and positive")
-    if advantage_rms.numel() != 1:
-        raise ValueError("advantage RMS must be scalar")
 
-    detached_advantages = advantages.detach().float()
-    detached_rms = advantage_rms.detach().float()
-    scaled_advantages = torch.where(
-        detached_rms > 0,
-        detached_advantages / detached_rms,
-        torch.zeros_like(detached_advantages),
+    active = mask.bool()
+    token_mask = mask.float()
+    current_log_odds = torch.where(
+        active,
+        new_log_odds.float(),
+        torch.zeros_like(new_log_odds, dtype=torch.float32),
     )
-    utilities = torch.zeros_like(candidate_logprobs, dtype=torch.float32)
-    utilities[:, 0] = scaled_advantages / eta
+    behavior_log_odds = torch.where(
+        active,
+        old_log_odds.detach().float(),
+        torch.zeros_like(old_log_odds, dtype=torch.float32),
+    )
+    raw_advantages = advantages.detach().float()
+    target_log_odds_shift = torch.where(
+        active,
+        raw_advantages / eta,
+        torch.zeros_like(raw_advantages),
+    )
 
-    old_group_logprobs = old_candidate_logprobs.detach().float().log_softmax(-1)
-    target_logprobs = (old_group_logprobs + utilities).log_softmax(-1).detach()
-    targets = target_logprobs.exp()
-    current_group_logprobs = candidate_logprobs.float().log_softmax(-1)
-    cross_entropy = -(targets * current_group_logprobs).sum(-1)
+    target_log_odds = behavior_log_odds + target_log_odds_shift
+    target_probability = torch.sigmoid(target_log_odds).detach()
+
+    def endpoint_safe_binary_cross_entropy(
+        logits: Tensor, targets: Tensor
+    ) -> Tensor:
+        positive_loss = F.softplus(-logits)
+        negative_loss = F.softplus(logits)
+        interior_loss = (
+            targets * positive_loss + (1.0 - targets) * negative_loss
+        )
+        return torch.where(
+            targets == 1.0,
+            positive_loss,
+            torch.where(targets == 0.0, negative_loss, interior_loss),
+        )
+
+    loss_terms = endpoint_safe_binary_cross_entropy(
+        current_log_odds, target_probability
+    )
     denom = (
-        cross_entropy.new_tensor(cross_entropy.numel())
+        token_mask.sum()
         if denominator is None
-        else denominator.to(cross_entropy.device)
+        else denominator.to(mask.device)
     ).clamp_min(1)
-    loss = cross_entropy.sum() / denom
+    loss = (loss_terms * token_mask).sum() / denom
 
-    old_group_probs = old_group_logprobs.exp()
-    target_shift = targets[:, 0] - old_group_probs[:, 0]
-    positive = detached_advantages > 0
-    negative = detached_advantages < 0
+    current_probability = torch.sigmoid(current_log_odds)
+    old_probability = torch.sigmoid(behavior_log_odds)
+    residual = current_probability - target_probability
+    target_entropy = (
+        torch.special.entr(target_probability)
+        + torch.special.entr(1.0 - target_probability)
+    )
+    fit_kl = loss_terms - target_entropy
+    target_behavior_kl = (
+        endpoint_safe_binary_cross_entropy(
+            behavior_log_odds, target_probability
+        )
+        - target_entropy
+    )
+    positive = (raw_advantages > 0) & active
+    negative = (raw_advantages < 0) & active
+    neutral = (raw_advantages == 0) & active
+    positive_mask = token_mask.masked_fill(~positive, 0.0)
+    negative_mask = token_mask.masked_fill(~negative, 0.0)
+    neutral_mask = token_mask.masked_fill(~neutral, 0.0)
     diagnostics = {
-        "cross_entropy_sum": cross_entropy.detach().sum(),
-        "target_entropy_sum": (-(targets * target_logprobs).sum(-1)).sum(),
-        "target_kl_sum": (
-            targets * (target_logprobs - old_group_logprobs)
+        "active_count": token_mask.sum(),
+        "loss_sum": (loss_terms.detach() * token_mask).sum(),
+        "fit_kl_sum": (fit_kl.detach() * token_mask).sum(),
+        "target_behavior_kl_sum": (target_behavior_kl * token_mask).sum(),
+        "old_probability_sum": (old_probability * token_mask).sum(),
+        "current_probability_sum": (
+            current_probability.detach() * token_mask
         ).sum(),
-        "target_l1_shift_sum": (targets - old_group_probs).abs().sum(),
-        "executed_old_mass_sum": old_group_probs[:, 0].sum(),
-        "executed_target_mass_sum": targets[:, 0].sum(),
-        "executed_positive_shift_sum": target_shift.masked_fill(
-            ~positive, 0.0
+        "target_probability_sum": (target_probability * token_mask).sum(),
+        "target_move_abs_sum": (
+            (target_probability - old_probability).abs()
+            * token_mask
         ).sum(),
-        "executed_negative_shift_sum": target_shift.masked_fill(
-            ~negative, 0.0
+        "target_log_odds_shift_abs_sum": (
+            target_log_odds_shift.abs() * token_mask
         ).sum(),
-        "positive_count": positive.sum(),
-        "negative_count": negative.sum(),
-        "neutral_count": (detached_advantages == 0).sum(),
-        "utility_abs_sum": scaled_advantages.abs().sum(),
-        "utility_square_sum": scaled_advantages.square().sum(),
+        "target_log_odds_shift_square_sum": (
+            target_log_odds_shift.square() * token_mask
+        ).sum(),
+        "residual_sum": (residual.detach() * token_mask).sum(),
+        "residual_abs_sum": (residual.detach().abs() * token_mask).sum(),
+        "residual_square_sum": (
+            residual.detach().square() * token_mask
+        ).sum(),
+        "positive_count": positive_mask.sum(),
+        "negative_count": negative_mask.sum(),
+        "neutral_count": neutral_mask.sum(),
+        "positive_target_probability_sum": (
+            target_probability * positive_mask
+        ).sum(),
+        "negative_target_probability_sum": (
+            target_probability * negative_mask
+        ).sum(),
     }
     return loss, diagnostics
 

@@ -121,22 +121,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-policy-optimization",
         action="store_true",
-        help="replace the actor estimator with action-only token TPO: each "
-        "executed token is grouped with sampled, unexecuted comparison "
-        "tokens; only on-trajectory GAE scores the executed action and the "
-        "actor trains solely by target cross-entropy",
-    )
-    parser.add_argument(
-        "--tpo-candidates",
-        type=int,
-        default=8,
-        help="candidate token slots per action, including the executed token",
+        help="replace the actor estimator with intra-trajectory token TPO: "
+        "raw critic GAE shifts executed-token-versus-rest odds from the "
+        "rollout policy, with no PG auxiliary",
     )
     parser.add_argument(
         "--tpo-eta",
         type=float,
-        default=1.0,
-        help="temperature applied after active-token advantage RMS scaling",
+        default=2.0,
+        help="old-policy target temperature applied directly to raw GAE",
     )
     parser.add_argument(
         "--allow-dg-topology-migration",
@@ -685,8 +678,6 @@ def validate_args(
     # DG default.
     if args.target_policy_optimization:
         args.delightful_policy_gradient = False
-    if args.tpo_candidates < 2:
-        parser.error("--tpo-candidates must be at least 2")
     if not math.isfinite(args.tpo_eta) or args.tpo_eta <= 0.0:
         parser.error("--tpo-eta must be finite and positive")
     if args.replay_max_trajectories < 1:

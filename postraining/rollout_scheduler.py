@@ -351,7 +351,6 @@ def _empty_record_values(
     hidden_dim: int,
     *,
     device: torch.device,
-    tpo_candidates: int = 0,
 ) -> dict[str, Tensor]:
     action_mask = torch.zeros(
         (capacity, width), dtype=torch.float32, device=device
@@ -368,19 +367,9 @@ def _empty_record_values(
         ),
         "action_mask": action_mask,
         "old_token_logprobs": torch.zeros_like(action_mask),
+        "old_token_log_odds": torch.zeros_like(action_mask),
         "old_values": torch.zeros_like(action_mask),
     }
-    if tpo_candidates:
-        values["tpo_candidate_ids"] = torch.zeros(
-            (capacity, width, tpo_candidates),
-            dtype=torch.long,
-            device=device,
-        )
-        values["old_tpo_candidate_logprobs"] = torch.zeros(
-            (capacity, width, tpo_candidates),
-            dtype=torch.float32,
-            device=device,
-        )
     return values
 
 
@@ -484,14 +473,10 @@ def warmup_decode_width_buckets(
     return widths
 
 
-def _cpu_request_random(
-    key_bits: Tensor, samples: int = 1
-) -> tuple[Tensor, Tensor]:
+def _cpu_request_random(key_bits: Tensor) -> tuple[Tensor, Tensor]:
     """Isolated CPU reference for tests; production CUDA stays vectorized."""
     rows = key_bits.size(0)
-    token = torch.empty(
-        rows if samples == 1 else (rows, samples), dtype=torch.float32
-    )
+    token = torch.empty(rows, dtype=torch.float32)
     next_key_bits = key_bits.clone()
     for row in range(rows):
         seed = int(key_bits[row, 0]) & _UINT64_MASK
@@ -500,18 +485,14 @@ def _cpu_request_random(
         generator = torch.Generator().manual_seed(
             decision & ((1 << 63) - 1)
         )
-        token[row] = torch.rand(
-            () if samples == 1 else (samples,), generator=generator
-        )
+        token[row] = torch.rand((), generator=generator)
         next_key_bits[row, 1] = _signed64(
             (counter + 1) & _UINT64_MASK
         )
     return token, next_key_bits
 
 
-def _request_random(
-    key_bits: Tensor, samples: int = 1
-) -> tuple[Tensor, Tensor]:
+def _request_random(key_bits: Tensor) -> tuple[Tensor, Tensor]:
     """One token-uniform draw and successor key per request.
 
     The deterministic hidden-carry policy samples nothing but the next
@@ -519,15 +500,14 @@ def _request_random(
     the old gate/thought scheme.
     """
     if key_bits.device.type == "cpu":
-        return _cpu_request_random(key_bits, samples)
+        return _cpu_request_random(key_bits)
     if key_bits.device.type != "cuda":
         raise ValueError("request-stable Philox supports only CPU and CUDA")
     keys = key_bits.view(torch.uint64)
     token_key, next_keys = stateless_random.split(keys, 2)
-    rows = keys.size(0)
     token = stateless_random.uniform(
         token_key,
-        (rows,) if samples == 1 else (rows, samples),
+        (keys.size(0),),
         dtype=torch.float32,
     )
     return token, next_keys.view(torch.int64)
@@ -541,10 +521,7 @@ def _top_p_from_uniform(
 ) -> Tensor:
     """Inverse-CDF token sampling driven by request-local uniforms.
 
-    A vector of uniforms draws an ordered sample without replacement.  The
-    first column therefore retains the behavior policy's ordinary categorical
-    marginal, while comparison candidates cannot duplicate the executed token
-    and receive a contradictory neutral utility in action-only TPO.
+    Each request supplies one scalar uniform for its next-token draw.
     """
     logits = logits.float()
     if temperature != 1.0:
@@ -559,39 +536,16 @@ def _top_p_from_uniform(
     else:
         probabilities = logits.softmax(dim=-1)
         indices = None
-    if uniform.ndim == 1:
-        sampled = torch.searchsorted(
-            probabilities.cumsum(dim=-1).contiguous(),
-            uniform[:, None].contiguous(),
-            right=False,
-        ).squeeze(-1)
-    elif uniform.ndim == 2:
-        if uniform.size(1) > probabilities.size(1):
-            raise ValueError(
-                f"cannot draw {uniform.size(1)} unique samples from "
-                f"support of size {probabilities.size(1)}"
-            )
-        remaining = probabilities.clone()
-        columns = []
-        for candidate_index in range(uniform.size(1)):
-            cdf = remaining.cumsum(dim=-1)
-            total = cdf[:, -1]
-            threshold = uniform[:, candidate_index] * total
-            column = torch.searchsorted(
-                cdf.contiguous(), threshold[:, None].contiguous(), right=True
-            ).squeeze(-1)
-            column.clamp_max_(remaining.size(-1) - 1)
-            columns.append(column)
-            remaining.scatter_(1, column[:, None], 0.0)
-        sampled = torch.stack(columns, dim=-1)
-    else:
-        raise ValueError("request-local uniforms must be [rows] or [rows, K]")
+    if uniform.ndim != 1:
+        raise ValueError("request-local uniforms must be [rows]")
+    sampled = torch.searchsorted(
+        probabilities.cumsum(dim=-1).contiguous(),
+        uniform[:, None].contiguous(),
+        right=False,
+    ).squeeze(-1)
     sampled.clamp_max_(probabilities.size(-1) - 1)
     if indices is not None:
-        gather_index = sampled[:, None] if sampled.ndim == 1 else sampled
-        sampled = indices.gather(-1, gather_index)
-        if uniform.ndim == 1:
-            sampled = sampled.squeeze(-1)
+        sampled = indices.gather(-1, sampled[:, None]).squeeze(-1)
     return sampled
 
 
@@ -626,7 +580,6 @@ def rollout_continuous_refill_groups(
     schedule_stats: ContinuousScheduleStats | None = None,
     paged_cache: object | None = None,
     pad_decode_width: bool | None = None,
-    tpo_candidates: int = 0,
 ) -> list[LatentRolloutBatch]:
     """Continuously refill fixed physical lanes with whole prompt groups.
 
@@ -647,8 +600,6 @@ def rollout_continuous_refill_groups(
         raise ValueError("max_new_tokens must be positive")
     if max_stream_steps < max_new_tokens:
         raise ValueError("stream budget cannot fit the requested actions")
-    if tpo_candidates not in (0,) and tpo_candidates < 2:
-        raise ValueError("TPO requires at least two candidates per action")
     widths = {chunk.size(1) for chunk in prompt_chunks}
     if len(widths) != 1:
         raise ValueError("all chunks must use one common prompt width")
@@ -735,7 +686,6 @@ def rollout_continuous_refill_groups(
         max_stream,
         stored_hidden_dim,
         device=device,
-        tpo_candidates=tpo_candidates,
     )
     ledger = _RecordLedger(origins)
     ended = torch.zeros(capacity_rows, dtype=torch.bool, device=device)
@@ -876,25 +826,16 @@ def rollout_continuous_refill_groups(
         belief = policy.belief.index_select(0, slots)
         logits = policy.logits.index_select(0, slots)
         keys = request_key_bits.index_select(0, slots)
-        token_uniform, next_keys = _request_random(
-            keys, max(tpo_candidates, 1)
-        )
+        token_uniform, next_keys = _request_random(keys)
         request_key_bits.index_copy_(0, slots, next_keys)
 
         sampled_tokens = _top_p_from_uniform(
             logits, token_uniform, temperature, top_p
         )
-        if tpo_candidates:
-            candidate_tokens = sampled_tokens
-            token = candidate_tokens[:, 0]
-        else:
-            candidate_tokens = None
-            token = sampled_tokens
+        token = sampled_tokens
 
         row_slots = (slots, slot_positions)
         values["action_mask"][row_slots] = values["action_mask"].new_ones(())
-        if candidate_tokens is not None:
-            values["tpo_candidate_ids"][row_slots] = candidate_tokens
         next_positions = slot_positions + 1
         next_slots = (slots, next_positions)
         values["kind"][next_slots] = TOKEN_SLOT

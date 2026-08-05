@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -380,6 +381,66 @@ def test_delightful_dashboard_reports_gates_and_drops_ppo_only_metrics() -> None
     assert "debug/behavior_refresh_max_drift" in tags
     assert "delightful/gate_mean" in tags
     assert "clip/policy" not in tags
+
+
+def test_tpo_dashboard_reports_discrete_target_fit_without_ppo_metrics() -> None:
+    first = _actor_metrics(
+        action_count=10.0,
+        tpo_active_count=2.0,
+        tpo_loss=0.3,
+        tpo_pre_update_fit_kl=0.03,
+        tpo_target_behavior_kl=0.03,
+        tpo_old_probability_mean=0.4,
+        tpo_pre_update_probability_mean=0.4,
+        tpo_target_probability_mean=0.45,
+        tpo_target_move_abs_mean=0.1,
+        tpo_target_log_odds_shift_abs_mean=0.08,
+        tpo_target_log_odds_shift_square_mean=0.01,
+        tpo_pre_update_probability_residual_mean=-0.05,
+        tpo_pre_update_probability_residual_abs_mean=0.05,
+        tpo_pre_update_probability_residual_square_mean=0.004,
+        tpo_positive_target_probability_mean=0.5,
+        tpo_negative_target_probability_mean=0.3,
+        tpo_positive_count=1.0,
+        tpo_negative_count=1.0,
+    )
+    last = _actor_metrics(
+        action_count=30.0,
+        tpo_active_count=6.0,
+        tpo_loss=0.5,
+        tpo_pre_update_fit_kl=0.07,
+        tpo_target_behavior_kl=0.07,
+        tpo_old_probability_mean=0.5,
+        tpo_pre_update_probability_mean=0.5,
+        tpo_target_probability_mean=0.55,
+        tpo_target_move_abs_mean=0.3,
+        tpo_target_log_odds_shift_abs_mean=0.24,
+        tpo_target_log_odds_shift_square_mean=0.09,
+        tpo_pre_update_probability_residual_mean=-0.1,
+        tpo_pre_update_probability_residual_abs_mean=0.1,
+        tpo_pre_update_probability_residual_square_mean=0.016,
+        tpo_positive_target_probability_mean=0.6,
+        tpo_negative_target_probability_mean=0.4,
+        tpo_positive_count=3.0,
+        tpo_negative_count=3.0,
+    )
+    dashboard = aggregate_actor_tensorboard_metrics([first, last])
+    assert dashboard["tpo/loss"] == pytest.approx(0.45)
+    assert dashboard["tpo/target_probability_mean"] == pytest.approx(0.525)
+    assert dashboard["tpo/target_log_odds_shift_rms"] == pytest.approx(
+        math.sqrt(0.07)
+    )
+    assert dashboard["tpo/pre_update_probability_residual_rms"] == pytest.approx(
+        math.sqrt(0.013)
+    )
+    assert dashboard["tpo/positive_target_probability_mean"] == pytest.approx(
+        0.575
+    )
+    assert dashboard["tpo/negative_target_probability_mean"] == pytest.approx(
+        0.375
+    )
+    assert "clip/policy" not in dashboard
+    assert "ratio/harmful_positive_log_max" not in dashboard
 
 
 def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:

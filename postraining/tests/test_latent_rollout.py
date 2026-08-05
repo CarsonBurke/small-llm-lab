@@ -25,6 +25,7 @@ from postraining.latent_rollout import (
     assemble_stream_latents,
     assign_terminal_rewards,
     build_replay_plan,
+    compact_emit_token_log_odds,
     compact_emit_token_logprobs,
     compact_next_slots,
     compact_slots,
@@ -137,7 +138,11 @@ def _critic(seed: int = 11) -> SeparateCritic:
     torch.manual_seed(seed)
     with _pope_construction():
         trunk = FreshLeJEPASharedRMSV1PoPE(**KWARGS).eval()
-    critic = SeparateCritic(trunk, num_bins=17, sigma_ratio=2.0).eval()
+    critic = SeparateCritic(
+        trunk,
+        num_bins=17,
+        sigma_ratio=2.0,
+    ).eval()
     # The v215 head init (zero weight, prior bias) makes every value the
     # constant prior; de-zero the weight so values are input-dependent and
     # the exactness assertions below carry weight.
@@ -278,6 +283,33 @@ def test_compiled_emit_token_logprobs_agrees_with_eager():
             compact_emit_token_logprobs, fullgraph=True, dynamic=True
         )(wrapper, emit_inputs, emit_beliefs, targets)
     torch.testing.assert_close(compiled, eager, rtol=1e-5, atol=1e-6)
+
+
+def test_compact_emit_token_log_odds_matches_target_versus_rest_partition():
+    wrapper = _wrapper()
+    batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
+    emit_index = slot_index(batch.action_mask.bool())
+    with torch.no_grad():
+        stream_inputs, beliefs = replay_beliefs(wrapper, batch)
+        emit_inputs = compact_slots(stream_inputs, emit_index)
+        emit_beliefs = compact_slots(beliefs, emit_index)
+        targets = compact_next_slots(batch.token_ids, emit_index)
+        logits = wrapper.backbone.logits_from_features(
+            wrapper.renderer_features(emit_inputs, emit_beliefs)
+        ).float()
+        vocabulary = torch.arange(logits.size(-1))
+        rest = torch.where(
+            vocabulary[None, :] == targets[:, None],
+            torch.full_like(logits, float("-inf")),
+            logits,
+        )
+        expected = logits.gather(-1, targets[:, None]).squeeze(-1) - (
+            rest.logsumexp(-1)
+        )
+        actual = compact_emit_token_log_odds(
+            wrapper, emit_inputs, emit_beliefs, targets
+        )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_replay_reproduces_rollout_logprobs():
@@ -433,52 +465,81 @@ def test_delightful_update_bypasses_behavior_ratios_and_reports_gate_metrics():
     assert metrics["delightful_surprisal_mean"] > 0.0
 
 
-def test_target_policy_loss_builds_detached_anchored_targets():
-    old = torch.tensor(
-        [
-            [-0.2, -1.2, -2.2],
-            [-0.7, -0.8, -1.3],
-            [-1.1, -0.9, -0.4],
-        ],
+def test_target_policy_loss_uses_raw_detached_gae_odds_targets():
+    old_probability = torch.tensor(
+        [[0.8, 0.3, 0.1], [0.6, 0.4, 0.2]],
         dtype=torch.float32,
         requires_grad=True,
     )
+    old = torch.logit(old_probability.detach()).requires_grad_(True)
     current = old.detach().clone().requires_grad_(True)
     advantages = torch.tensor(
-        [2.0, -1.0, 0.0], dtype=torch.float32, requires_grad=True
+        [[1.0, -0.5, 0.0], [0.25, -1.0, 0.5]],
+        dtype=torch.float32,
+        requires_grad=True,
     )
-    rms = torch.tensor(2.0, dtype=torch.float32, requires_grad=True)
+    weights = torch.ones_like(current)
     loss, diagnostics = target_policy_loss(
-        current, old, advantages, rms, eta=1.0
+        current, old, advantages, weights, eta=2.0
     )
 
-    old_group_logprobs = old.detach().log_softmax(-1)
-    utilities = torch.tensor(
-        [[1.0, 0.0, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
-        dtype=torch.float32,
+    old_probability = torch.sigmoid(old.detach())
+    target_probability = torch.sigmoid(
+        old.detach() + advantages.detach() / 2.0
     )
-    target_logprobs = (old_group_logprobs + utilities).log_softmax(-1)
-    targets = target_logprobs.exp()
-    expected = -(targets * current.log_softmax(-1)).sum(-1).mean()
-    torch.testing.assert_close(loss, expected)
+    expected_terms = torch.nn.functional.binary_cross_entropy_with_logits(
+        old.detach(), target_probability, reduction="none"
+    )
+    torch.testing.assert_close(loss, expected_terms.mean())
 
     loss.backward()
     torch.testing.assert_close(
         current.grad,
-        (current.detach().softmax(-1) - targets) / current.size(0),
+        (old_probability - target_probability) / current.numel(),
     )
-    # Target construction is stop-gradient; only the current policy is fit.
+    # The behavior anchor and critic signal are replay constants.
     assert old.grad is None
     assert advantages.grad is None
-    assert rms.grad is None
-    # A zero advantage leaves q=p_old and therefore has zero age-0 gradient.
     torch.testing.assert_close(
-        current.grad[2], torch.zeros_like(current.grad[2]), atol=1e-7, rtol=0
+        diagnostics["target_probability_sum"], target_probability.sum()
     )
-    assert diagnostics["target_kl_sum"] > 0
-    assert diagnostics["positive_count"] == 1
-    assert diagnostics["negative_count"] == 1
+    assert diagnostics["positive_count"] == 3
+    assert diagnostics["negative_count"] == 2
     assert diagnostics["neutral_count"] == 1
+
+
+def test_target_policy_loss_extinguishes_at_the_requested_ratio():
+    old_probability = torch.linspace(0.05, 0.95, 12).reshape(3, 4)
+    old = torch.logit(old_probability)
+    advantages = torch.linspace(-1.0, 1.0, 12).reshape(3, 4)
+    target_probability = torch.sigmoid(
+        torch.logit(old_probability) + advantages / 2.0
+    )
+    current = torch.logit(target_probability).requires_grad_(True)
+    loss, diagnostics = target_policy_loss(
+        current,
+        old,
+        advantages,
+        torch.ones_like(current),
+        eta=2.0,
+    )
+    loss.backward()
+    assert loss > 0
+    torch.testing.assert_close(
+        current.grad, torch.zeros_like(current), atol=2e-7, rtol=0
+    )
+    torch.testing.assert_close(
+        diagnostics["residual_abs_sum"],
+        torch.zeros_like(diagnostics["residual_abs_sum"]),
+        atol=2e-7,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        diagnostics["fit_kl_sum"],
+        torch.zeros_like(diagnostics["fit_kl_sum"]),
+        atol=5e-7,
+        rtol=0,
+    )
 
 
 def test_target_policy_loss_is_invariant_to_replay_sharding():
@@ -486,11 +547,15 @@ def test_target_policy_loss_is_invariant_to_replay_sharding():
     current_full = torch.randn(11, 8, requires_grad=True)
     current_sharded = current_full.detach().clone().requires_grad_(True)
     old = torch.randn(11, 8)
-    advantages = torch.randn(11)
-    rms = advantages.square().mean().sqrt()
+    advantages = torch.rand(11, 8) * 2.0 - 1.0
+    mask = torch.ones(11, 8)
 
     full, _ = target_policy_loss(
-        current_full, old, advantages, rms, denominator=torch.tensor(11.0)
+        current_full,
+        old,
+        advantages,
+        mask,
+        denominator=torch.tensor(88.0),
     )
     full.backward()
     sharded = current_sharded.new_zeros(())
@@ -499,8 +564,8 @@ def test_target_policy_loss_is_invariant_to_replay_sharding():
             current_sharded[rows],
             old[rows],
             advantages[rows],
-            rms,
-            denominator=torch.tensor(11.0),
+            mask[rows],
+            denominator=torch.tensor(88.0),
         )
         sharded = sharded + contribution
     sharded.backward()
@@ -508,77 +573,77 @@ def test_target_policy_loss_is_invariant_to_replay_sharding():
     torch.testing.assert_close(current_sharded.grad, current_full.grad)
 
 
-def test_tpo_rollout_executes_candidate_zero_without_branching():
-    wrapper = _wrapper()
-    batch = _rollout(
-        wrapper, batch=4, prompt=5, new_tokens=4, tpo_candidates=8
+def test_target_policy_loss_masks_inactive_stale_policy_tokens():
+    old = torch.randn(4, 8)
+    current = torch.randn(4, 8, requires_grad=True)
+    advantages = torch.rand(4, 8) * 2.0 - 1.0
+    active = torch.tensor([True, False, True, False])[:, None].expand_as(old)
+    loss, _ = target_policy_loss(
+        current,
+        old,
+        advantages,
+        active.float(),
+        denominator=torch.tensor(32.0),
     )
-    assert batch.tpo_candidate_ids is not None
-    assert batch.old_tpo_candidate_logprobs is not None
-    actions = slot_index(batch.action_mask.bool())
-    candidates = compact_slots(batch.tpo_candidate_ids, actions)
-    executed = compact_next_slots(batch.token_ids, actions)
-    assert candidates.shape == (actions.numel(), 8)
-    assert torch.equal(candidates[:, 0], executed)
-    sorted_candidates = candidates.sort(-1).values
-    assert bool((sorted_candidates[:, 1:] != sorted_candidates[:, :-1]).all())
-    old_candidates = compact_slots(batch.old_tpo_candidate_logprobs, actions)
-    old_executed = compact_slots(batch.old_token_logprobs, actions)
-    torch.testing.assert_close(old_candidates[:, 0], old_executed)
-    # K candidates still produce exactly one consequence slot per action.
-    assert batch.action_mask.sum() == batch.kind[:, batch.prompt_length:].eq(
-        TOKEN_SLOT
-    ).sum()
-
-
-def test_tpo_candidates_survive_pack_refresh_and_scatter():
-    wrapper = _wrapper()
-    critic = _critic()
-    groups = [
-        _rollout(wrapper, batch=2, prompt=5, new_tokens=2, tpo_candidates=8),
-        _rollout(wrapper, batch=2, prompt=7, new_tokens=4, tpo_candidates=8),
-    ]
-    packed = pack_rollout_groups_for_replay(groups)
-    refresh_old_statistics(wrapper, critic, packed)
-    actions = slot_index(packed.action_mask.bool())
-    candidates = compact_slots(packed.tpo_candidate_ids, actions)
-    executed = compact_next_slots(packed.token_ids, actions)
-    assert torch.equal(candidates[:, 0], executed)
-    candidate_logprobs = compact_slots(
-        packed.old_tpo_candidate_logprobs, actions
-    )
-    token_logprobs = compact_slots(packed.old_token_logprobs, actions)
-    torch.testing.assert_close(candidate_logprobs[:, 0], token_logprobs)
-    beliefs, stream_inputs = replay_head_inputs(wrapper, packed)
-    replayed_candidate_logprobs = compact_emit_token_logprobs(
-        wrapper,
-        compact_slots(stream_inputs, actions),
-        compact_slots(beliefs, actions),
-        candidates,
-    )
+    loss.backward()
+    assert current.grad[active].abs().sum() > 0
     torch.testing.assert_close(
-        replayed_candidate_logprobs, candidate_logprobs
+        current.grad[~active], torch.zeros_like(current.grad[~active])
     )
 
-    scatter_replay_statistics(packed, groups)
-    assert all(group.statistics_refreshed for group in groups)
-    for group in groups:
-        group_actions = slot_index(group.action_mask.bool())
-        old_candidates = compact_slots(
-            group.old_tpo_candidate_logprobs, group_actions
-        )
-        old_tokens = compact_slots(group.old_token_logprobs, group_actions)
-        torch.testing.assert_close(old_candidates[:, 0], old_tokens)
+
+def test_target_policy_loss_weights_every_active_token_equally():
+    old = torch.full((2, 10), math.log(0.4 / 0.6))
+    current = old.clone().requires_grad_(True)
+    advantages = torch.ones_like(old)
+    mask = torch.tensor(
+        [[1] + [0] * 9, [1] * 10], dtype=torch.float32
+    )
+    loss, diagnostics = target_policy_loss(
+        current,
+        old,
+        advantages,
+        mask,
+        denominator=torch.tensor(11.0),
+    )
+    loss.backward()
+
+    assert loss > 0
+    assert diagnostics["active_count"] == pytest.approx(11.0)
+    torch.testing.assert_close(
+        current.grad[1].sum(), 10.0 * current.grad[0].sum()
+    )
 
 
-def test_tpo_update_uses_gae_only_for_executed_candidate():
+@pytest.mark.parametrize(
+    ("log_odds", "advantage"),
+    [(float("inf"), 1.0), (float("-inf"), -1.0)],
+)
+def test_target_policy_loss_is_finite_at_probability_endpoints(
+    log_odds, advantage
+):
+    old = torch.tensor([[log_odds]])
+    current = old.clone().requires_grad_(True)
+    loss, diagnostics = target_policy_loss(
+        current,
+        old,
+        torch.tensor([[advantage]]),
+        torch.ones_like(old),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(current.grad).all()
+    assert all(torch.isfinite(value) for value in diagnostics.values())
+
+
+def test_tpo_update_uses_raw_gae_without_candidates_or_action_q():
     wrapper = _wrapper()
     critic = _critic()
-    batch = _rollout(
-        wrapper, batch=4, prompt=5, new_tokens=3, tpo_candidates=8
-    )
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
     assign_terminal_rewards(batch, torch.tensor([1.0, 0.0, 1.0, 0.0]))
-    refresh_old_statistics(wrapper, critic, batch)
+    refresh_old_statistics(
+        wrapper, critic, batch, target_policy_optimization=True
+    )
     metrics = update_minibatch(
         wrapper,
         critic,
@@ -590,14 +655,37 @@ def test_tpo_update_uses_gae_only_for_executed_candidate():
     )
     assert metrics["policy_clip_fraction"] == 0.0
     assert metrics["token_abs_log_ratio_max"] == 0.0
-    assert metrics["tpo_candidate_abs_log_ratio_max"] == 0.0
-    assert metrics["tpo_advantage_rms"] > 0.0
-    assert metrics["tpo_target_kl"] > 0.0
-    assert metrics["tpo_effective_candidates"] == 8.0
-    assert metrics["tpo_duplicate_fraction"] == 0.0
-    assert metrics["tpo_behavior_duplicate_fraction"] == 0.0
-    assert metrics["tpo_positive_count"] > 0
-    assert metrics["tpo_negative_count"] > 0
+    assert metrics["tpo_active_count"] == metrics["action_count"]
+    assert metrics["tpo_target_log_odds_shift_abs_mean"] > 0.0
+    assert metrics["tpo_target_log_odds_shift_abs_mean"] <= 0.5
+    assert metrics["tpo_pre_update_probability_residual_abs_mean"] > 0.0
+    assert metrics["tpo_target_behavior_kl"] > 0.0
+    assert metrics["renderer_grad_norm"] > 0.0
+
+
+def test_tpo_zero_reward_source_freezes_stale_actor_target():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    batch.source_id = torch.zeros(4, dtype=torch.long)
+    assign_terminal_rewards(batch, torch.zeros(4))
+    refresh_old_statistics(
+        wrapper, critic, batch, target_policy_optimization=True
+    )
+    batch.old_token_logprobs.sub_(1.0)
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        actor_step=False,
+        critic_step=False,
+        target_policy_optimization=True,
+    )
+    assert metrics["actor_active_trajectory_fraction"] == 0.0
+    assert metrics["tpo_active_count"] == 0.0
+    assert metrics["tpo_target_move_abs_mean"] == 0.0
+    assert metrics["renderer_grad_norm"] == pytest.approx(0.0, abs=1e-7)
 
 
 def test_update_minibatch_trains_the_full_policy_model():
@@ -651,6 +739,7 @@ def _decode_group(row_actions: list[int], prompt: int, bucket: int = 1):
         hiddens=torch.zeros(rows, stream, 0),
         action_mask=action_mask,
         old_token_logprobs=zeros.clone(),
+        old_token_log_odds=zeros.clone(),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(rows),
@@ -1167,20 +1256,18 @@ def test_tpo_cli_replaces_dg_and_preserves_the_production_topology():
     validate_args(parser, tpo)
     assert tpo.target_policy_optimization
     assert not tpo.delightful_policy_gradient
-    assert tpo.tpo_candidates == 8
-    assert tpo.tpo_eta == 1.0
+    assert tpo.tpo_eta == 2.0
     assert tpo.prompts_per_rollout == tpo.prompts_per_minibatch == 24
     assert tpo.samples_per_prompt == 16
 
 
-def test_tpo_cli_rejects_stale_pool_and_invalid_target_geometry(capsys):
+def test_tpo_cli_rejects_stale_pool_and_invalid_eta(capsys):
     parser = build_arg_parser()
     for extra, message in (
         (
             ["--prompts-per-rollout", "48", "--prompts-per-minibatch", "24"],
             "exactly one actor update",
         ),
-        (["--tpo-candidates", "1"], "--tpo-candidates must be at least 2"),
         (["--tpo-eta", "0"], "--tpo-eta must be finite and positive"),
     ):
         args = parser.parse_args(
@@ -1649,7 +1736,10 @@ def test_post_update_drift_measures_the_deployed_policy_move():
     wrapper = _wrapper()
     critic = _critic()
     batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
-    refresh_old_statistics(wrapper, critic, batch)
+    assign_terminal_rewards(batch, torch.tensor([1.0, 0.0, 1.0, 0.0]))
+    refresh_old_statistics(
+        wrapper, critic, batch, target_policy_optimization=True
+    )
     diagnostic_replay_calls = 0
 
     def diagnostic_replay(*args, **kwargs):
@@ -1683,11 +1773,16 @@ def test_post_update_drift_measures_the_deployed_policy_move():
         replay_attention_budget=4 * 1024 * 1024,
         replay_bucket=1,
         replay_function=diagnostic_replay,
+        target_policy_optimization=True,
+        tpo_eta=2.0,
     )
 
     assert diagnostic_replay_calls == 2
     assert drift["kl/post_update_token_behavior"] > 0.0
     assert drift["ratio/post_update_token_abs_log_max"] > 0.0
+    assert drift["tpo/post_update_fit_kl"] >= 0.0
+    assert drift["tpo/post_update_probability_residual_abs_mean"] > 0.0
+    assert drift["tpo/post_update_probability_residual_rms"] > 0.0
 
 
 def test_actor_accumulation_defers_the_trunk_step_to_the_caller():

@@ -17,11 +17,10 @@ a stochastic action channel.
   current-token surprisal, with eta=1 and no importance ratio or clipping.
   ``--no-delightful-policy-gradient`` selects the historical token-level VAPO
   control with DAPO's asymmetric token-ratio clip.
-  ``--target-policy-optimization`` instead samples a local token candidate
-  group at every behavior state, always follows candidate zero, scores only
-  that executed action with RMS-scaled critic GAE, and fits the anchored TPO
-  target by cross-entropy. It has no PG auxiliary and never values or rolls
-  out the comparison candidates. In every mode, tokens are the only actions.
+  ``--target-policy-optimization`` instead uses raw critic GAE at every
+  visited prefix to shift behavior-anchored executed-token-versus-rest odds.
+  It has no PG auxiliary, comparison actions, or action-Q critic. In every
+  mode, tokens are the only actions.
 - The critic is a SEPARATE from-scratch model (same architecture class,
   fresh weights, fully trainable, no SIGReg or latent prediction) trained
   purely by HL-Gauss cross-entropy on [0, 1] value targets. It re-derives
@@ -70,6 +69,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 import train_gpt as baseline
@@ -115,6 +115,7 @@ from postraining.latent_rollout import (
     ReplayPlan,
     assign_terminal_rewards,
     build_replay_plan,
+    compact_emit_token_log_odds,
     compact_emit_token_logprobs,
     compact_next_slots,
     compact_slots,
@@ -244,7 +245,6 @@ RESUME_EXACT_ARG_FIELDS = (
 )
 TPO_RESUME_EXACT_ARG_FIELDS = (
     "target_policy_optimization",
-    "tpo_candidates",
     "tpo_eta",
 )
 
@@ -1309,55 +1309,86 @@ def aggregate_actor_tensorboard_metrics(
                 ),
             }
         )
-    if "tpo_target_kl" in last:
+    if "tpo_target_probability_mean" in last:
         dashboard.pop("clip/policy")
         dashboard.pop("ratio/harmful_positive_log_max")
+        target_log_odds_shift_rms = math.sqrt(
+            max(
+                0.0,
+                _weighted_metric_mean(
+                    metrics,
+                    "tpo_target_log_odds_shift_square_mean",
+                    "tpo_active_count",
+                ),
+            )
+        )
+        pre_update_residual_rms = math.sqrt(
+            max(
+                0.0,
+                _weighted_metric_mean(
+                    metrics,
+                    "tpo_pre_update_probability_residual_square_mean",
+                    "tpo_active_count",
+                ),
+            )
+        )
         dashboard.update(
             {
-                "ratio/tpo_candidate_abs_log_max": max(
-                    metric["tpo_candidate_abs_log_ratio_max"]
-                    for metric in metrics
+                "tpo/loss": _weighted_metric_mean(
+                    metrics, "tpo_loss", "tpo_active_count"
                 ),
-                "tpo/advantage_rms": _weighted_metric_mean(
-                    metrics, "tpo_advantage_rms", "action_count"
+                "tpo/pre_update_fit_kl": _weighted_metric_mean(
+                    metrics, "tpo_pre_update_fit_kl", "tpo_active_count"
                 ),
-                "tpo/target_entropy": _weighted_metric_mean(
-                    metrics, "tpo_target_entropy", "action_count"
+                "tpo/target_behavior_kl": _weighted_metric_mean(
+                    metrics, "tpo_target_behavior_kl", "tpo_active_count"
                 ),
-                "tpo/target_kl": _weighted_metric_mean(
-                    metrics, "tpo_target_kl", "action_count"
+                "tpo/old_probability_mean": _weighted_metric_mean(
+                    metrics, "tpo_old_probability_mean", "tpo_active_count"
                 ),
-                "tpo/target_l1_shift": _weighted_metric_mean(
-                    metrics, "tpo_target_l1_shift", "action_count"
-                ),
-                "tpo/executed_old_mass": _weighted_metric_mean(
-                    metrics, "tpo_executed_old_mass", "action_count"
-                ),
-                "tpo/executed_target_mass": _weighted_metric_mean(
-                    metrics, "tpo_executed_target_mass", "action_count"
-                ),
-                "tpo/positive_executed_shift": _weighted_metric_mean(
-                    metrics, "tpo_positive_executed_shift", "tpo_positive_count"
-                ),
-                "tpo/negative_executed_shift": _weighted_metric_mean(
-                    metrics, "tpo_negative_executed_shift", "tpo_negative_count"
-                ),
-                "tpo/utility_abs_mean": _weighted_metric_mean(
-                    metrics, "tpo_utility_abs_mean", "action_count"
-                ),
-                "tpo/utility_rms": _weighted_metric_mean(
-                    metrics, "tpo_utility_rms", "action_count"
-                ),
-                "tpo/effective_candidates": _weighted_metric_mean(
-                    metrics, "tpo_effective_candidates", "action_count"
-                ),
-                "tpo/duplicate_fraction": _weighted_metric_mean(
-                    metrics, "tpo_duplicate_fraction", "action_count"
-                ),
-                "tpo/behavior_duplicate_fraction": _weighted_metric_mean(
+                "tpo/pre_update_probability_mean": _weighted_metric_mean(
                     metrics,
-                    "tpo_behavior_duplicate_fraction",
-                    "action_count",
+                    "tpo_pre_update_probability_mean",
+                    "tpo_active_count",
+                ),
+                "tpo/target_probability_mean": _weighted_metric_mean(
+                    metrics,
+                    "tpo_target_probability_mean",
+                    "tpo_active_count",
+                ),
+                "tpo/target_move_abs_mean": _weighted_metric_mean(
+                    metrics, "tpo_target_move_abs_mean", "tpo_active_count"
+                ),
+                "tpo/target_log_odds_shift_abs_mean": _weighted_metric_mean(
+                    metrics,
+                    "tpo_target_log_odds_shift_abs_mean",
+                    "tpo_active_count",
+                ),
+                "tpo/target_log_odds_shift_rms": target_log_odds_shift_rms,
+                "tpo/pre_update_probability_residual_mean": (
+                    _weighted_metric_mean(
+                        metrics,
+                        "tpo_pre_update_probability_residual_mean",
+                        "tpo_active_count",
+                    )
+                ),
+                "tpo/pre_update_probability_residual_abs_mean": _weighted_metric_mean(
+                    metrics,
+                    "tpo_pre_update_probability_residual_abs_mean",
+                    "tpo_active_count",
+                ),
+                "tpo/pre_update_probability_residual_rms": (
+                    pre_update_residual_rms
+                ),
+                "tpo/positive_target_probability_mean": _weighted_metric_mean(
+                    metrics,
+                    "tpo_positive_target_probability_mean",
+                    "tpo_positive_count",
+                ),
+                "tpo/negative_target_probability_mean": _weighted_metric_mean(
+                    metrics,
+                    "tpo_negative_target_probability_mean",
+                    "tpo_negative_count",
                 ),
             }
         )
@@ -1581,7 +1612,6 @@ def write_actor_tensorboard_metrics(
         "kl/policy_behavior_per_action",
         "clip/policy",
         "ratio/token_abs_log_max",
-        "ratio/tpo_candidate_abs_log_max",
         "ratio/harmful_positive_log_max",
     )
     if behavior_age == 0:
@@ -1890,7 +1920,7 @@ def update_minibatch(
     replay_plan: ReplayPlan | None = None,
     delightful_policy_gradient: bool = False,
     target_policy_optimization: bool = False,
-    tpo_eta: float = 1.0,
+    tpo_eta: float = 2.0,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -1924,6 +1954,10 @@ def update_minibatch(
         raise RuntimeError(
             "actor update requires refresh_old_statistics after rollout"
         )
+    if target_policy_optimization and not batch.tpo_statistics_refreshed:
+        raise RuntimeError(
+            "TPO update requires a log-odds refresh of old statistics"
+        )
 
     denominators = {
         "action": batch.action_mask.sum().clamp_min(1),
@@ -1947,15 +1981,18 @@ def update_minibatch(
             "delightful_negative_count", "delightful_delight_sum",
             "delightful_surprisal_sum", "delightful_positive_loss_sum",
             "delightful_negative_loss_sum",
-            "tpo_cross_entropy_sum", "tpo_target_entropy_sum",
-            "tpo_target_kl_sum", "tpo_target_l1_shift_sum",
-            "tpo_executed_old_mass_sum", "tpo_executed_target_mass_sum",
-            "tpo_executed_positive_shift_sum",
-            "tpo_executed_negative_shift_sum", "tpo_positive_count",
+            "tpo_active_count", "tpo_loss_sum", "tpo_fit_kl_sum",
+            "tpo_target_behavior_kl_sum", "tpo_old_probability_sum",
+            "tpo_current_probability_sum", "tpo_target_probability_sum",
+            "tpo_target_move_abs_sum",
+            "tpo_target_log_odds_shift_abs_sum",
+            "tpo_target_log_odds_shift_square_sum",
+            "tpo_probability_residual_sum",
+            "tpo_probability_residual_abs_sum",
+            "tpo_probability_residual_square_sum", "tpo_positive_count",
             "tpo_negative_count", "tpo_neutral_count",
-            "tpo_utility_abs_sum", "tpo_utility_square_sum",
-            "tpo_unique_candidate_sum", "tpo_behavior_duplicate_count",
-            "tpo_candidate_abs_log_ratio_max",
+            "tpo_positive_target_probability_sum",
+            "tpo_negative_target_probability_sum",
         )
     }
 
@@ -1982,15 +2019,6 @@ def update_minibatch(
         batch.action_mask * actor_signal_rows[:, None]
         if not value_only
         else batch.action_mask
-    )
-    active_action_count = actor_active_mask.sum()
-    advantage_rms = torch.where(
-        active_action_count > 0,
-        (
-            (advantages.float().square() * actor_active_mask).sum()
-            / active_action_count.clamp_min(1)
-        ).sqrt(),
-        torch.zeros_like(active_action_count),
     )
     if replay_plan is None:
         replay_plan = build_replay_plan(
@@ -2032,18 +2060,19 @@ def update_minibatch(
         value_logits = critic.value_logits(microbatch)
         value_ce = critic.support.cross_entropy(value_logits, micro_value_targets)
         local_value_numerator = (value_ce * microbatch.action_mask).sum()
-        weighted_value_loss = (
+        emit_index = shard.emit_index if not value_only else None
+        weighted_critic_loss = (
             local_value_numerator / value_action_denominator.clamp_min(1)
         )
         finite_guards.append(
             (
                 shard_index,
                 "value",
-                weighted_value_loss.detach(),
+                weighted_critic_loss.detach(),
                 {},
             )
         )
-        weighted_value_loss.backward()
+        weighted_critic_loss.backward()
         with torch.no_grad():
             values = critic.support.to_expected_scalar(value_logits)
             # During critic pretraining there is no actor objective, but the
@@ -2096,93 +2125,76 @@ def update_minibatch(
         # The CPU replay plan has already found every compact action slot.
         # Every compaction below therefore has a host-known output shape and
         # uses index_select/index_add without a data-dependent CUDA sync.
-        emit_index = shard.emit_index
+        assert emit_index is not None
         # Shared with refresh_old_statistics: one compiled artifact for both
         # keeps the two forwards bit-identical (the age-0 zero-clip canary).
         emit_inputs = compact_slots(stream_inputs, emit_index)
         emit_beliefs = compact_slots(beliefs, emit_index)
+        emit_targets = compact_next_slots(microbatch.token_ids, emit_index)
         if target_policy_optimization:
-            if (
-                microbatch.tpo_candidate_ids is None
-                or microbatch.old_tpo_candidate_logprobs is None
-            ):
-                raise RuntimeError("TPO update requires sampled candidate groups")
-            compact_candidate_ids = compact_slots(
-                microbatch.tpo_candidate_ids, emit_index
+            compact_token_log_odds = compact_emit_token_log_odds(
+                wrapper, emit_inputs, emit_beliefs, emit_targets
             )
-            compact_candidate_logprobs = compact_emit_token_logprobs(
-                wrapper,
-                emit_inputs,
-                emit_beliefs,
-                compact_candidate_ids,
-            )
-            compact_token_logprobs = compact_candidate_logprobs[:, 0]
+            compact_token_logprobs = F.logsigmoid(compact_token_log_odds)
         else:
-            compact_candidate_ids = None
-            compact_candidate_logprobs = None
             compact_token_logprobs = compact_emit_token_logprobs(
-                wrapper,
-                emit_inputs,
-                emit_beliefs,
-                compact_next_slots(microbatch.token_ids, emit_index),
+                wrapper, emit_inputs, emit_beliefs, emit_targets
             )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
 
         if target_policy_optimization:
-            compact_advantages = compact_slots(
-                micro_advantages, emit_index
+            new_token_log_odds = torch.zeros_like(
+                microbatch.old_token_log_odds
             )
-            old_candidate_logprobs = compact_slots(
-                microbatch.old_tpo_candidate_logprobs, emit_index
-            )
-            totals["tpo_candidate_abs_log_ratio_max"] = torch.maximum(
-                totals["tpo_candidate_abs_log_ratio_max"],
-                (
-                    compact_candidate_logprobs
-                    - old_candidate_logprobs
-                ).abs().max(),
+            scatter_slots(
+                new_token_log_odds, emit_index, compact_token_log_odds
             )
             weighted_policy_loss, tpo = target_policy_loss(
-                compact_candidate_logprobs,
-                old_candidate_logprobs,
-                compact_advantages,
-                advantage_rms,
+                new_token_log_odds,
+                microbatch.old_token_log_odds,
+                micro_advantages,
+                actor_active_mask[rows, :stream_length],
                 eta=tpo_eta,
                 denominator=policy_action_denominator,
             )
             weighted_policy_clip = weighted_policy_loss.detach().new_zeros(())
             for source_name, total_name in (
-                ("cross_entropy_sum", "tpo_cross_entropy_sum"),
-                ("target_entropy_sum", "tpo_target_entropy_sum"),
-                ("target_kl_sum", "tpo_target_kl_sum"),
-                ("target_l1_shift_sum", "tpo_target_l1_shift_sum"),
-                ("executed_old_mass_sum", "tpo_executed_old_mass_sum"),
-                ("executed_target_mass_sum", "tpo_executed_target_mass_sum"),
+                ("active_count", "tpo_active_count"),
+                ("loss_sum", "tpo_loss_sum"),
+                ("fit_kl_sum", "tpo_fit_kl_sum"),
+                ("target_behavior_kl_sum", "tpo_target_behavior_kl_sum"),
+                ("old_probability_sum", "tpo_old_probability_sum"),
+                ("current_probability_sum", "tpo_current_probability_sum"),
+                ("target_probability_sum", "tpo_target_probability_sum"),
+                ("target_move_abs_sum", "tpo_target_move_abs_sum"),
                 (
-                    "executed_positive_shift_sum",
-                    "tpo_executed_positive_shift_sum",
+                    "target_log_odds_shift_abs_sum",
+                    "tpo_target_log_odds_shift_abs_sum",
                 ),
                 (
-                    "executed_negative_shift_sum",
-                    "tpo_executed_negative_shift_sum",
+                    "target_log_odds_shift_square_sum",
+                    "tpo_target_log_odds_shift_square_sum",
+                ),
+                ("residual_sum", "tpo_probability_residual_sum"),
+                ("residual_abs_sum", "tpo_probability_residual_abs_sum"),
+                (
+                    "residual_square_sum",
+                    "tpo_probability_residual_square_sum",
                 ),
                 ("positive_count", "tpo_positive_count"),
                 ("negative_count", "tpo_negative_count"),
                 ("neutral_count", "tpo_neutral_count"),
-                ("utility_abs_sum", "tpo_utility_abs_sum"),
-                ("utility_square_sum", "tpo_utility_square_sum"),
+                (
+                    "positive_target_probability_sum",
+                    "tpo_positive_target_probability_sum",
+                ),
+                (
+                    "negative_target_probability_sum",
+                    "tpo_negative_target_probability_sum",
+                ),
             ):
                 totals[total_name] += tpo[source_name]
-            sorted_candidates = compact_candidate_ids.sort(-1).values
-            unique_counts = 1 + (
-                sorted_candidates[:, 1:] != sorted_candidates[:, :-1]
-            ).sum(-1)
-            totals["tpo_unique_candidate_sum"] += unique_counts.sum()
-            totals["tpo_behavior_duplicate_count"] += (
-                compact_candidate_ids[:, 1:]
-                == compact_candidate_ids[:, :1]
-            ).any(-1).sum()
         elif delightful_policy_gradient:
             weighted_policy_loss, delightful = delightful_policy_loss(
                 new_token_logprobs,
@@ -2378,49 +2390,53 @@ def update_minibatch(
     if target_policy_optimization:
         positive_count = totals["tpo_positive_count"]
         negative_count = totals["tpo_negative_count"]
-        candidate_count = batch.tpo_candidate_ids.size(-1)
+        tpo_active_count = totals["tpo_active_count"]
+        tpo_denom = tpo_active_count.clamp_min(1)
         metric_tensors.update(
-            tpo_advantage_rms=advantage_rms,
-            tpo_candidate_abs_log_ratio_max=(
-                totals["tpo_candidate_abs_log_ratio_max"]
+            tpo_active_count=tpo_active_count,
+            tpo_loss=totals["tpo_loss_sum"] / tpo_denom,
+            tpo_pre_update_fit_kl=totals["tpo_fit_kl_sum"] / tpo_denom,
+            tpo_target_behavior_kl=(
+                totals["tpo_target_behavior_kl_sum"] / tpo_denom
             ),
-            tpo_target_entropy=(totals["tpo_target_entropy_sum"] / action_denom),
-            tpo_target_kl=(totals["tpo_target_kl_sum"] / action_denom),
-            tpo_target_l1_shift=(
-                totals["tpo_target_l1_shift_sum"] / action_denom
+            tpo_old_probability_mean=(
+                totals["tpo_old_probability_sum"] / tpo_denom
             ),
-            tpo_executed_old_mass=(
-                totals["tpo_executed_old_mass_sum"] / action_denom
+            tpo_pre_update_probability_mean=(
+                totals["tpo_current_probability_sum"] / tpo_denom
             ),
-            tpo_executed_target_mass=(
-                totals["tpo_executed_target_mass_sum"] / action_denom
+            tpo_target_probability_mean=(
+                totals["tpo_target_probability_sum"] / tpo_denom
             ),
-            tpo_positive_executed_shift=torch.where(
+            tpo_target_move_abs_mean=(
+                totals["tpo_target_move_abs_sum"] / tpo_denom
+            ),
+            tpo_target_log_odds_shift_abs_mean=(
+                totals["tpo_target_log_odds_shift_abs_sum"] / tpo_denom
+            ),
+            tpo_target_log_odds_shift_square_mean=(
+                totals["tpo_target_log_odds_shift_square_sum"] / tpo_denom
+            ),
+            tpo_pre_update_probability_residual_mean=(
+                totals["tpo_probability_residual_sum"] / tpo_denom
+            ),
+            tpo_pre_update_probability_residual_abs_mean=(
+                totals["tpo_probability_residual_abs_sum"] / tpo_denom
+            ),
+            tpo_pre_update_probability_residual_square_mean=(
+                totals["tpo_probability_residual_square_sum"] / tpo_denom
+            ),
+            tpo_positive_target_probability_mean=torch.where(
                 positive_count > 0,
-                totals["tpo_executed_positive_shift_sum"]
+                totals["tpo_positive_target_probability_sum"]
                 / positive_count.clamp_min(1),
                 torch.zeros_like(positive_count),
             ),
-            tpo_negative_executed_shift=torch.where(
+            tpo_negative_target_probability_mean=torch.where(
                 negative_count > 0,
-                totals["tpo_executed_negative_shift_sum"]
+                totals["tpo_negative_target_probability_sum"]
                 / negative_count.clamp_min(1),
                 torch.zeros_like(negative_count),
-            ),
-            tpo_utility_abs_mean=(totals["tpo_utility_abs_sum"] / action_denom),
-            tpo_utility_rms=(
-                totals["tpo_utility_square_sum"] / action_denom
-            ).sqrt(),
-            tpo_effective_candidates=(
-                totals["tpo_unique_candidate_sum"] / action_denom
-            ),
-            tpo_duplicate_fraction=(
-                1.0
-                - totals["tpo_unique_candidate_sum"]
-                / (action_denom * candidate_count)
-            ),
-            tpo_behavior_duplicate_fraction=(
-                totals["tpo_behavior_duplicate_count"] / action_denom
             ),
             tpo_positive_count=positive_count,
             tpo_negative_count=negative_count,
@@ -2474,7 +2490,11 @@ def measure_post_update_policy_drift(
     replay_slot_budget: int | None = None,
     replay_function: Callable = replay_head_inputs,
     emit_logprob_function: Callable = compact_emit_token_logprobs,
+    emit_log_odds_function: Callable = compact_emit_token_log_odds,
     replay_plans: list[ReplayPlan] | None = None,
+    target_policy_optimization: bool = False,
+    tpo_eta: float = 2.0,
+    gae_lambda_alpha: float = 0.05,
 ) -> dict[str, float]:
     """Evaluate the just-updated policy on its behavior trajectories.
 
@@ -2501,6 +2521,11 @@ def measure_post_update_policy_drift(
         "token_kl": zero.clone(),
         "token_abs_log_ratio_max": zero.clone(),
         "action_count": zero.clone(),
+        "tpo_active_count": zero.clone(),
+        "tpo_fit_kl": zero.clone(),
+        "tpo_probability_residual": zero.clone(),
+        "tpo_probability_residual_abs": zero.clone(),
+        "tpo_probability_residual_square": zero.clone(),
     }
     for batch_index, stored_batch in enumerate(batches):
         # Actor behavior pools live in ordinary CPU memory so a 64-prompt
@@ -2531,6 +2556,20 @@ def measure_post_update_policy_drift(
             replay_slot_budget,
             require_action_indices=True,
         )
+        if target_policy_optimization:
+            action_counts = batch.action_mask.sum(1)
+            advantages, _ = generalized_advantage_and_return_targets(
+                batch.rewards,
+                batch.old_values,
+                batch.action_mask,
+                length_adaptive_lambda(action_counts, gae_lambda_alpha),
+            )
+            actor_signal_rows = source_actor_signal_mask(
+                batch.source_id, batch.reward_scalar
+            )
+            actor_active_mask = (
+                batch.action_mask * actor_signal_rows[:, None]
+            )
         for microbatch, shard in iter_planned_replay_microbatches(
             batch, replay_plan
         ):
@@ -2538,16 +2577,31 @@ def measure_post_update_policy_drift(
                 wrapper, microbatch
             )
             token_logprobs = torch.zeros_like(microbatch.old_token_logprobs).float()
+            if target_policy_optimization:
+                token_log_odds = torch.zeros_like(
+                    microbatch.old_token_log_odds
+                ).float()
             if shard.emit_index.numel():
                 emit_index = shard.emit_index
-                compact_token_logprobs = emit_logprob_function(
-                    wrapper,
-                    compact_slots(stream_inputs, emit_index),
-                    compact_slots(beliefs, emit_index),
-                    compact_next_slots(
-                        microbatch.token_ids, emit_index
-                    ),
+                emit_inputs = compact_slots(stream_inputs, emit_index)
+                emit_beliefs = compact_slots(beliefs, emit_index)
+                emit_targets = compact_next_slots(
+                    microbatch.token_ids, emit_index
                 )
+                if target_policy_optimization:
+                    compact_token_log_odds = emit_log_odds_function(
+                        wrapper, emit_inputs, emit_beliefs, emit_targets
+                    )
+                    compact_token_logprobs = F.logsigmoid(
+                        compact_token_log_odds
+                    )
+                    scatter_slots(
+                        token_log_odds, emit_index, compact_token_log_odds
+                    )
+                else:
+                    compact_token_logprobs = emit_logprob_function(
+                        wrapper, emit_inputs, emit_beliefs, emit_targets
+                    )
                 scatter_slots(token_logprobs, emit_index, compact_token_logprobs)
             token_log_ratio = (
                 token_logprobs - microbatch.old_token_logprobs.float()
@@ -2562,18 +2616,52 @@ def measure_post_update_policy_drift(
                 * action_mask
             ).sum()
             totals["action_count"] += action_mask.sum()
+            if target_policy_optimization:
+                rows = shard.rows
+                stream_length = shard.stream_length
+                _, tpo = target_policy_loss(
+                    token_log_odds,
+                    microbatch.old_token_log_odds,
+                    advantages[rows, :stream_length],
+                    actor_active_mask[rows, :stream_length],
+                    eta=tpo_eta,
+                )
+                totals["tpo_active_count"] += tpo["active_count"]
+                totals["tpo_fit_kl"] += tpo["fit_kl_sum"]
+                totals["tpo_probability_residual"] += tpo["residual_sum"]
+                totals["tpo_probability_residual_abs"] += tpo[
+                    "residual_abs_sum"
+                ]
+                totals["tpo_probability_residual_square"] += tpo[
+                    "residual_square_sum"
+                ]
         del batch
 
-    return scalar_tensors_to_floats(
-        {
-            "kl/post_update_token_behavior": (
-                totals["token_kl"] / totals["action_count"].clamp_min(1)
-            ),
-            "ratio/post_update_token_abs_log_max": totals[
-                "token_abs_log_ratio_max"
-            ],
-        }
-    )
+    diagnostics = {
+        "kl/post_update_token_behavior": (
+            totals["token_kl"] / totals["action_count"].clamp_min(1)
+        ),
+        "ratio/post_update_token_abs_log_max": totals[
+            "token_abs_log_ratio_max"
+        ],
+    }
+    if target_policy_optimization:
+        tpo_denom = totals["tpo_active_count"].clamp_min(1)
+        diagnostics.update(
+            {
+                "tpo/post_update_fit_kl": totals["tpo_fit_kl"] / tpo_denom,
+                "tpo/post_update_probability_residual_mean": (
+                    totals["tpo_probability_residual"] / tpo_denom
+                ),
+                "tpo/post_update_probability_residual_abs_mean": (
+                    totals["tpo_probability_residual_abs"] / tpo_denom
+                ),
+                "tpo/post_update_probability_residual_rms": (
+                    totals["tpo_probability_residual_square"] / tpo_denom
+                ).sqrt(),
+            }
+        )
+    return scalar_tensors_to_floats(diagnostics)
 
 
 def save_checkpoint(
@@ -3977,6 +4065,7 @@ def main() -> None:
     # need capturing here.
     diagnostic_replay_head_inputs = replay_head_inputs
     diagnostic_emit_token_logprobs = compact_emit_token_logprobs
+    diagnostic_emit_token_log_odds = compact_emit_token_log_odds
 
     # Replay compilation is independent of rollout. Dynamic B/L plus bounded
     # 64-token buckets lets one artifact cover the length-aware shard plan;
@@ -4049,6 +4138,20 @@ def main() -> None:
         postraining.latent_rollout.compact_emit_token_logprobs = (
             compiled_emit_logprobs
         )
+        if args.target_policy_optimization:
+            compiled_emit_log_odds = profiler.register_artifact(
+                "compact_emit_token_log_odds",
+                torch.compile(
+                    compact_emit_token_log_odds,
+                    mode="default",
+                    fullgraph=True,
+                    dynamic=True,
+                ),
+            )
+            globals()["compact_emit_token_log_odds"] = compiled_emit_log_odds
+            postraining.latent_rollout.compact_emit_token_log_odds = (
+                compiled_emit_log_odds
+            )
 
     output = Path(args.output)
     existing_manifest = None
@@ -4292,6 +4395,7 @@ def main() -> None:
                 attention_budget=args.replay_attention_budget,
                 bucket_multiple=args.replay_bucket,
                 slot_budget=args.replay_slot_budget,
+                target_policy_optimization=args.target_policy_optimization,
             )
         return batch
 
@@ -4376,11 +4480,6 @@ def main() -> None:
                         tail_step_core=rollout_tail_step_core,
                         decode_mask=decode_mask_for(len(encoded)),
                         tail_decode_mask=rollout_tail_decode_mask,
-                        tpo_candidates=(
-                            args.tpo_candidates
-                            if args.target_policy_optimization
-                            else 0
-                        ),
                     )
                 if offload_to_cpu:
                     with profiler.phase("stream_d2h"):
@@ -4569,11 +4668,6 @@ def main() -> None:
                     offload_device=cpu if offload_to_cpu else device,
                     schedule_stats=schedule_stats,
                     paged_cache=rollout_paged_cache,
-                    tpo_candidates=(
-                        args.tpo_candidates
-                        if args.target_policy_optimization
-                        else 0
-                    ),
                 )
             last_decode_schedule_metrics = schedule_stats.metrics()
             for batch_index, (chunk, _, prompt_lengths_cpu) in enumerate(
@@ -4633,11 +4727,6 @@ def main() -> None:
                     tail_step_core=rollout_tail_step_core,
                     decode_mask=decode_mask_for(chunk_width),
                     tail_decode_mask=rollout_tail_decode_mask,
-                    tpo_candidates=(
-                        args.tpo_candidates
-                        if args.target_policy_optimization
-                        else 0
-                    ),
                 )
             complete_chunk(batched, prompt_lengths_cpu, chunk)
             del batched
@@ -5325,6 +5414,9 @@ def main() -> None:
                             bucket_multiple=args.replay_bucket,
                             slot_budget=args.replay_slot_budget,
                             replay_plan=device_replay_plan,
+                            target_policy_optimization=(
+                                args.target_policy_optimization
+                            ),
                         )
                     packed_batch_bytes = sum(
                         value.numel() * value.element_size()
@@ -5563,19 +5655,18 @@ def main() -> None:
                 # intentionally have behavior age 1..N.
                 if behavior_age == 0:
                     guard = (
-                        "tpo_candidate_abs_log_ratio_max"
-                        if args.target_policy_optimization
-                        else (
-                            "token_abs_log_ratio_max"
-                            if args.delightful_policy_gradient
-                            else "policy_clip_fraction"
+                        "token_abs_log_ratio_max"
+                        if (
+                            args.target_policy_optimization
+                            or args.delightful_policy_gradient
                         )
+                        else "policy_clip_fraction"
                     )
                     if metrics[guard] > 1e-6:
                         if args.target_policy_optimization:
                             raise RuntimeError(
                                 f"step {next_step}: behavior-age-0 {guard}="
-                                f"{metrics[guard]:.3e}; all-K TPO refresh and "
+                                f"{metrics[guard]:.3e}; TPO refresh and "
                                 "update replay paths diverged"
                             )
                         print(
@@ -5736,7 +5827,15 @@ def main() -> None:
                             replay_slot_budget=args.replay_slot_budget,
                             replay_function=diagnostic_replay_head_inputs,
                             emit_logprob_function=diagnostic_emit_token_logprobs,
+                            emit_log_odds_function=(
+                                diagnostic_emit_token_log_odds
+                            ),
                             replay_plans=[device_replay_plan],
+                            target_policy_optimization=(
+                                args.target_policy_optimization
+                            ),
+                            tpo_eta=args.tpo_eta,
+                            gae_lambda_alpha=args.gae_lambda_alpha,
                         )
                     if not all(
                         math.isfinite(value) for value in post_update_drift.values()

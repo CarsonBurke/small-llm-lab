@@ -182,42 +182,46 @@ freeze remains enabled, while the
 heterogeneous-mixture desert stop defaults off because hard prompt windows do
 not prove that a frozen policy cannot succeed on later prompts.
 
-### Action-only Target Policy Optimization
+### Intra-trajectory Target Policy Optimization
 
-`--target-policy-optimization` selects the pure TPO actor objective from
-[Target Policy Optimization](../papers/2604.06159v1.pdf) while retaining the
-existing critic and tokenwise GAE. It overrides the default DG flag; there is
-no policy-gradient auxiliary, importance ratio, or PPO clip.
+`--target-policy-optimization` selects the intra-trajectory target-matching
+actor used by the local CleanRL HalfCheetah experiment while retaining the
+existing state critic and dense GAE credit. It overrides the default DG flag;
+there is no policy-gradient auxiliary, importance ratio, PPO clip, sampled
+comparison action, or action-Q head.
 
-At each visited prefix, one logits vector supplies eight distinct token
-candidates by ordered sampling without replacement. Candidate zero retains the
-ordinary behavior-policy marginal and is always the only candidate fed back
-into the autoregressive stream. The other seven are stored comparison token
-IDs: they receive no critic evaluation, verifier reward, KV cache,
-continuation, or environment interaction. Distinct identities matter because
-the executed token cannot coherently carry both its observed GAE and a neutral
-comparison utility. The real rollout topology therefore stays 24 prompts x 16
-trajectories rather than multiplying by eight.
+Every visited prefix is its own target-fitting problem. For the executed token,
+raw detached critic GAE `A` shifts the rollout policy's log odds by `A / eta`.
+If the executed token had rollout probability `p_old`, its target is
+`sigmoid(logit(p_old) + A / eta)`. This normalized target is feasible as a
+local executed-token-versus-rest marginal. Binary cross entropy over that
+partition has zero gradient when the current executed-token probability reaches
+the target. If repeated trajectories visit an identical prefix and request
+incompatible targets for different tokens, the shared categorical policy fits
+a compromise; zero aggregate residual is not guaranteed. The default `eta=2`
+controls the size of the old-policy-anchored target move. Log odds are computed
+directly from finite vocabulary logits, so probabilities rounded to zero or one
+cannot create endpoint NaNs.
 
-After the completed trajectories are scored, the executed candidate receives
-its on-trajectory GAE advantage and every comparison candidate receives
-utility zero. Active-token advantage RMS supplies the fixed reward scale
-without mean subtraction, preserving the semantic neutral point at advantage
-zero. This deliberately replaces Appendix C's within-group z-score: for a
-score vector `[A, 0, ...]`, that transform keeps only the sign and amplifies
-arbitrarily small critic residuals to full-strength targets. The actor fits
-`q = softmax(log p_old + utility / eta)` by cross-entropy over the sampled
-candidate slots, with `eta=1` by default. Candidate targets and the old-policy
-anchor are stop-gradient.
+Advantages are not whitened, centered, RMS-scaled, or transformed. Rewards and
+critic targets are in [0, 1]; with the deployed gamma=1 recurrence, lambda-GAE
+therefore stays on that meaningful native scale, apart from the critic
+support's narrow margin bins. At eta=2, an advantage magnitude of one changes
+the target odds by a factor of `exp(0.5)` or `exp(-0.5)`. The frozen rollout
+policy is the anchor. This is the paper-style target trust control, not a hard
+bound on the optimizer's realized KL; no hard KL guard or controller is added.
+
+Every active token is one transition and the actor loss is divided by the
+complete minibatch's action-token count. This matches both the CleanRL intra-
+TPO reference, which flattens its fixed rollout into a transition batch, and
+the existing VAPO reduction. There is no separate trajectory-length weighting.
 
 The existing source-success mask is intentionally retained rather than adding
 GRPO-style per-prompt variance filtering. A source with no successes supplies
 critic calibration but no actor update; within an active source, all-fail
-prompt groups may still contribute dense critic-GAE credit. This is a
-critic-compatible TPO variant, not the paper's fully scored counterfactual
-construction. An age-zero guard checks replay equality for all eight candidate
-log probabilities and aborts before an optimizer step if the behavior anchor
-is stale.
+prompt groups may still contribute dense critic-GAE credit. An age-zero guard
+checks the executed-token replay probability and aborts before an optimizer
+step if the behavior anchor is stale.
 
 ```bash
 python3 -m postraining.train_latent_vapo \
@@ -226,10 +230,12 @@ python3 -m postraining.train_latent_vapo \
   --target-policy-optimization
 ```
 
-TensorBoard exposes target KL/entropy and mass shift, utility scale, effective
-unique candidate count, duplicate canaries, and all-candidate behavior drift.
-TPO checkpoints use a distinct actor-objective schema and cannot silently
-resume as DG or VAPO.
+TensorBoard exposes old and target probabilities, requested odds shift, target
+KL, and pre-update fit diagnostics. At the post-update replay cadence it also
+reports the actual target-fit KL and signed/absolute/RMS probability residuals,
+beside achieved behavior KL. TPO checkpoints use a distinct v6 actor-objective
+schema and cannot silently resume as DG, VAPO, candidate TPO, or an earlier
+executed-action objective.
 
 ## On-policy self-distillation (OPSD)
 
