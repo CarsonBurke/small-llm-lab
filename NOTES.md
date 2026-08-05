@@ -4412,30 +4412,48 @@ remain nearly identical (1.00000, 0.99509, and 0.99914). Verdict: changing to
 one larger CLS is architecturally cleaner but does not solve the missing
 cross-answer correctness geometry. Do not integrate v8 into RL.
 
-## 2026-08-04: Action-only token TPO implementation
+## 2026-08-04: Intra-trajectory token TPO replaces candidate TPO
 
-Implemented a pure Target Policy Optimization actor mode behind
-`--target-policy-optimization`. Each behavior state samples K=8 distinct
-candidate token IDs without replacement from one logits vector; the first draw
-keeps the behavior policy's ordinary marginal, slot zero is always the sole
-autoregressive action, and the other slots are never valued, verified, cached,
-or continued. Uniqueness prevents one token identity from receiving both the
-executed GAE and a contradictory neutral utility.
-After the real trajectory completes, only slot zero receives its tokenwise
-critic-GAE utility. The target is anchored to frozen behavior probabilities
-and fit by cross-entropy; there is no PG auxiliary, ratio, clipping, or
-counterfactual critic branch.
+The K=8 candidate construction collapsed while Adam/Muon turned tiny target
+gradients into policy moves millions of times larger than the nominal target
+KL. Candidate diversity also decayed toward one token. That implementation did
+not have a learned action-Q head: it assigned the executed candidate critic GAE
+and zero utility to the other candidates. All candidate rollout, storage, and
+replay machinery has been removed rather than retained as a dormant option.
 
-The paper's Appendix-C `[A, 0, ...]` construction is retained, but its
-within-group z-score is deliberately replaced by active-token RMS scaling
-without centering. Exact z-scoring would erase magnitude and give every tiny
-nonzero critic residual the same roughly 20.6x slot-zero tilt at K=8; the
-paper itself flags this low-variance amplification. The current unit-reward
-critic has a semantic zero, so RMS scaling preserves both zero and relative
-magnitude. The 24-prompt x 16-trajectory topology stays unchanged. We retain
-the existing source-success actor mask: an entirely unsuccessful source is
-critic-only, but all-fail prompt groups inside an active source keep dense
-critic-GAE signal rather than being removed by GRPO-style group-variance
-filtering. Added target KL/entropy/mass-shift, utility, effective-candidate,
-duplicate-canary, and all-K freshness diagnostics plus a distinct checkpoint
-objective schema; an age-zero all-K mismatch is fatal before stepping.
+`--target-policy-optimization` now ports the successful local CleanRL
+HalfCheetah intra-trajectory objective. Every executed token receives raw
+detached critic GAE `A`. For categorical tokens, the continuous-density ratio
+formula is replaced by its normalized executed-token-versus-rest counterpart:
+`target_p = sigmoid(logit(old_p) + A / eta)`. Binary cross entropy fits the
+current executed-token marginal to that locally feasible target and
+self-extinguishes there in isolation. Repeated identical prefixes can request
+incompatible marginals for different sampled tokens, so the shared categorical
+policy may fit a compromise. Stable target-versus-rest log odds are computed
+directly from full-vocabulary logits rather than reconstructed from rounded
+softmax probabilities. There is no PG auxiliary, counterfactual score,
+comparison token, or PPO clip.
+
+Unlike the HalfCheetah run, advantages are not whitened: binary verifier
+returns and unit-range value targets already define a meaningful scale. With
+gamma=1, GAE remains on approximately [-1, 1], apart from the critic support's
+narrow margin bins; default eta=2 therefore shifts old-policy odds by roughly
+[exp(-0.5), exp(0.5)] for advantage magnitude at most one. This eta-controlled
+old-policy anchor is the target-space trust control used here. It does not
+mathematically bound the realized optimizer step, and no hard KL guard or
+adaptive KL controller changes the update.
+
+The actor objective uses the ordinary transition occupancy measure: every
+active token contributes once and the complete optimizer minibatch's action-
+token count is the denominator. This matches the CleanRL reference's flattened
+fixed-step rollout and the existing VAPO path. There is no trajectory-length
+reweighting; replay shards are memory partitions only.
+
+The source-success actor mask remains. An entirely unsuccessful source is
+critic-only even when an older behavior batch has become stale; active sources
+retain dense intra-trajectory critic credit. Telemetry now reports target and
+old probabilities, target log-odds shift, target move and target KL. The
+read-only post-update replay reports actual target-fit KL and probability
+residuals alongside achieved behavior KL. The actor objective schema is v6,
+preventing silent resume from candidate TPO or the infeasible density-ratio
+port.
