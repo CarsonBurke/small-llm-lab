@@ -178,7 +178,8 @@ prompt cursor state. That change requires the explicit
 `--allow-dg-topology-migration` acknowledgement. The run manifest records the
 checkpoint step, sampler cursor, and before/after topology so the earlier
 segment cannot be mistaken for the resumed segment. The zero-reward actor
-freeze remains enabled, while the
+freeze remains enabled. The separate custom per-source success gate is off by
+default and available only through `--source-success-actor-gate`, while the
 heterogeneous-mixture desert stop defaults off because hard prompt windows do
 not prove that a frozen policy cannot succeed on later prompts.
 
@@ -216,12 +217,14 @@ complete minibatch's action-token count. This matches both the CleanRL intra-
 TPO reference, which flattens its fixed rollout into a transition batch, and
 the existing VAPO reduction. There is no separate trajectory-length weighting.
 
-The existing source-success mask is intentionally retained rather than adding
-GRPO-style per-prompt variance filtering. A source with no successes supplies
-critic calibration but no actor update; within an active source, all-fail
-prompt groups may still contribute dense critic-GAE credit. An age-zero guard
-checks the executed-token replay probability and aborts before an optimizer
-step if the behavior anchor is stale.
+The custom source-success actor mask is disabled by default. Every source keeps
+its critic-GAE actor signal even when its current minibatch has no successful
+trajectory; the whole-minibatch zero-reward actor freeze remains a separate
+safety mechanism. `--source-success-actor-gate` restores the legacy behavior
+that zeroes an entire source until it has one positive-reward trajectory. This
+is an opt-in local heuristic, not a VAPO or DAPO paper component. An age-zero
+guard checks the executed-token replay probability and aborts before an
+optimizer step if the behavior anchor is stale.
 
 ```bash
 python3 -m postraining.train_latent_vapo \
@@ -329,6 +332,13 @@ material fraction of its gradient. Final-answer likelihood alone is only a
 copying sanity check and cannot authorize training. Panels already inspected
 during design are development-only; only a fresh sealed panel can produce an
 authorization artifact.
+
+The trainer remains fail-closed by default. A deliberately experimental run
+requested despite a failed gate must supply both the immutable failed artifact
+and `--allow-failed-authorization`. The run contract records the failed
+decision and that the override was applied; this flag never converts a failure
+into a pass and must not be used as evidence that the privileged teacher is
+effective.
 
 Training is a model workload and must go through `mlq`:
 

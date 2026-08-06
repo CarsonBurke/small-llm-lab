@@ -83,17 +83,20 @@ def test_stratified_optimizer_minibatches_preserve_every_source_quota() -> None:
     assert sorted(index for batch in batches for index in batch) == list(range(64))
 
 
-def test_source_actor_mask_fails_closed_only_for_zero_reward_source() -> None:
+def test_source_actor_mask_is_disabled_by_default_and_opt_in() -> None:
     sources = torch.tensor([0, 0, 1, 1, 2], dtype=torch.long)
     rewards = torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0])
-    assert source_actor_signal_mask(sources, rewards).tolist() == [
+    assert source_actor_signal_mask(sources, rewards).all()
+    assert source_actor_signal_mask(
+        sources, rewards, enabled=True
+    ).tolist() == [
         True,
         True,
         False,
         False,
         True,
     ]
-    assert source_actor_signal_mask(None, rewards).all()
+    assert source_actor_signal_mask(None, rewards, enabled=True).all()
 
 
 def test_exact_resume_contract_rejects_reward_change_but_allows_step_ceiling() -> None:

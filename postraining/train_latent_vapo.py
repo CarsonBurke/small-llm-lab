@@ -201,7 +201,7 @@ RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
 # instead of Minerva-normalizing everything.
 REWARD_SCHEMA = POSTTRAIN_REWARD_SCHEMA
 SOURCE_SIGNAL_MASK_SCHEMA = "per_source_zero_reward_actor_mask/v1"
-RESUME_ARG_CONTRACT_SCHEMA = "vapo_exact_environment_objective_args/v1"
+RESUME_ARG_CONTRACT_SCHEMA = "vapo_exact_environment_objective_args/v2"
 RESUME_EXACT_ARG_FIELDS = (
     "reasoning_mode",
     "answer_tokens",
@@ -223,6 +223,7 @@ RESUME_EXACT_ARG_FIELDS = (
     "think_tokens",
     "think_min_tokens",
     "answer_fence",
+    "source_success_actor_gate",
     "zero_reward_actor_freeze",
     "value_warmup_steps",
     "rollout_tail_batch",
@@ -1579,18 +1580,23 @@ def actor_minibatch_action_denominator(
 def source_actor_signal_mask(
     source_ids: torch.Tensor | None,
     reward_scalar: torch.Tensor,
+    *,
+    enabled: bool = False,
 ) -> torch.Tensor:
-    """Activate actor rows only when their source has an exact success.
+    """Optionally activate rows only when their source has a positive reward.
 
-    In a mixed minibatch, aggregate reward can hide an entirely zero-reward
-    source. Its critic targets remain useful calibration data, but its actor
-    advantages are pure baseline error and push away arbitrary sampled text.
-    This is deliberately not per-prompt reward-variance filtering: failed
-    prompt groups inside a source with successes retain dense critic-GAE
-    credit. The pairwise formulation avoids a device-to-host sync for source
-    counts.
+    Disabled is the default: all rows retain their critic-GAE actor signal,
+    regardless of source reward. The opt-in legacy gate protects against
+    baseline error from an entirely zero-reward source, but can silently skew
+    a mixed-source objective toward whichever sources already succeed. It is
+    deliberately not a paper-prescribed VAPO/DAPO component.
+
+    When enabled, this remains source-level rather than per-prompt filtering:
+    failed prompt groups inside a source with any success retain dense
+    critic-GAE credit. The pairwise formulation avoids a device-to-host sync
+    for source counts.
     """
-    if source_ids is None:
+    if not enabled or source_ids is None:
         return torch.ones_like(reward_scalar, dtype=torch.bool)
     if source_ids.shape != reward_scalar.shape:
         raise ValueError("source ids and scalar rewards must have identical shape")
@@ -1921,6 +1927,7 @@ def update_minibatch(
     delightful_policy_gradient: bool = False,
     target_policy_optimization: bool = False,
     tpo_eta: float = 2.0,
+    source_success_actor_gate: bool = False,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -2011,7 +2018,9 @@ def update_minibatch(
     advantages = advantages.detach()
     value_targets = value_targets.detach()
     actor_signal_rows = source_actor_signal_mask(
-        batch.source_id, batch.reward_scalar
+        batch.source_id,
+        batch.reward_scalar,
+        enabled=source_success_actor_gate,
     )
     if not value_only:
         advantages = advantages * actor_signal_rows[:, None]
@@ -2495,6 +2504,7 @@ def measure_post_update_policy_drift(
     target_policy_optimization: bool = False,
     tpo_eta: float = 2.0,
     gae_lambda_alpha: float = 0.05,
+    source_success_actor_gate: bool = False,
 ) -> dict[str, float]:
     """Evaluate the just-updated policy on its behavior trajectories.
 
@@ -2565,7 +2575,9 @@ def measure_post_update_policy_drift(
                 length_adaptive_lambda(action_counts, gae_lambda_alpha),
             )
             actor_signal_rows = source_actor_signal_mask(
-                batch.source_id, batch.reward_scalar
+                batch.source_id,
+                batch.reward_scalar,
+                enabled=source_success_actor_gate,
             )
             actor_active_mask = (
                 batch.action_mask * actor_signal_rows[:, None]
@@ -2690,7 +2702,10 @@ def save_checkpoint(
         "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
         "source_signal_mask_schema": (
             SOURCE_SIGNAL_MASK_SCHEMA
-            if getattr(args, "rl_mixture_manifest", None)
+            if (
+                getattr(args, "rl_mixture_manifest", None)
+                and getattr(args, "source_success_actor_gate", False)
+            )
             else None
         ),
         "python_reward_schema": (
@@ -3555,7 +3570,9 @@ def main() -> None:
                 "current objective."
             )
         expected_source_mask_schema = (
-            SOURCE_SIGNAL_MASK_SCHEMA if args.rl_mixture_manifest else None
+            SOURCE_SIGNAL_MASK_SCHEMA
+            if args.rl_mixture_manifest and args.source_success_actor_gate
+            else None
         )
         if (
             payload.get("source_signal_mask_schema")
@@ -4255,7 +4272,12 @@ def main() -> None:
                     args.delightful_policy_gradient,
                     args.target_policy_optimization,
                 ),
-                "source_signal_mask_schema": SOURCE_SIGNAL_MASK_SCHEMA,
+                "source_signal_mask_schema": (
+                    SOURCE_SIGNAL_MASK_SCHEMA
+                    if args.rl_mixture_manifest
+                    and args.source_success_actor_gate
+                    else None
+                ),
                 "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
                 "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
@@ -5649,6 +5671,9 @@ def main() -> None:
                             args.target_policy_optimization
                         ),
                         tpo_eta=args.tpo_eta,
+                        source_success_actor_gate=(
+                            args.source_success_actor_gate
+                        ),
                     )
                 # The first minibatch runs against refresh-computed behavior
                 # statistics with the actor untouched. Later disjoint minibatches
@@ -5836,6 +5861,9 @@ def main() -> None:
                             ),
                             tpo_eta=args.tpo_eta,
                             gae_lambda_alpha=args.gae_lambda_alpha,
+                            source_success_actor_gate=(
+                                args.source_success_actor_gate
+                            ),
                         )
                     if not all(
                         math.isfinite(value) for value in post_update_drift.values()

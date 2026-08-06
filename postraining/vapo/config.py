@@ -126,6 +126,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "rollout policy, with no PG auxiliary",
     )
     parser.add_argument(
+        "--source-success-actor-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="zero every actor advantage from a mixture source unless that "
+        "source has at least one positive-reward trajectory in the optimizer "
+        "minibatch; disabled by default because this custom mask can turn a "
+        "nominally broad mixture into training on only its easiest sources",
+    )
+    parser.add_argument(
         "--tpo-eta",
         type=float,
         default=2.0,

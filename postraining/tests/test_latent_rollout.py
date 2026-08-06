@@ -465,6 +465,31 @@ def test_delightful_update_bypasses_behavior_ratios_and_reports_gate_metrics():
     assert metrics["delightful_surprisal_mean"] > 0.0
 
 
+def test_delightful_default_retains_actor_signal_for_zero_reward_source():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    batch.source_id = torch.zeros(4, dtype=torch.long)
+    assign_terminal_rewards(batch, torch.zeros(4))
+    refresh_old_statistics(wrapper, critic, batch)
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        actor_step=False,
+        critic_step=False,
+        delightful_policy_gradient=True,
+    )
+    assert metrics["actor_active_trajectory_fraction"] == 1.0
+    assert (
+        metrics["delightful_positive_count"]
+        + metrics["delightful_negative_count"]
+        == metrics["action_count"]
+    )
+    assert metrics["renderer_grad_norm"] > 0.0
+
+
 def test_target_policy_loss_uses_raw_detached_gae_odds_targets():
     old_probability = torch.tensor(
         [[0.8, 0.3, 0.1], [0.6, 0.4, 0.2]],
@@ -681,11 +706,35 @@ def test_tpo_zero_reward_source_freezes_stale_actor_target():
         actor_step=False,
         critic_step=False,
         target_policy_optimization=True,
+        source_success_actor_gate=True,
     )
     assert metrics["actor_active_trajectory_fraction"] == 0.0
     assert metrics["tpo_active_count"] == 0.0
     assert metrics["tpo_target_move_abs_mean"] == 0.0
     assert metrics["renderer_grad_norm"] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_tpo_default_retains_actor_targets_for_zero_reward_source():
+    wrapper = _wrapper()
+    critic = _critic()
+    batch = _rollout(wrapper, batch=4, prompt=5, new_tokens=3)
+    batch.source_id = torch.zeros(4, dtype=torch.long)
+    assign_terminal_rewards(batch, torch.zeros(4))
+    refresh_old_statistics(
+        wrapper, critic, batch, target_policy_optimization=True
+    )
+    metrics = update_minibatch(
+        wrapper,
+        critic,
+        batch,
+        _optimizers(wrapper, critic),
+        actor_step=False,
+        critic_step=False,
+        target_policy_optimization=True,
+    )
+    assert metrics["actor_active_trajectory_fraction"] == 1.0
+    assert metrics["tpo_active_count"] == metrics["action_count"]
+    assert metrics["tpo_target_move_abs_mean"] > 0.0
 
 
 def test_update_minibatch_trains_the_full_policy_model():
@@ -1246,6 +1295,19 @@ def test_current_defaults_have_explicit_control_opt_outs():
     assert not control.think_tokens
     assert not control.answer_fence
     assert control.rl_mixture_manifest == ""
+    assert not control.source_success_actor_gate
+
+
+def test_source_success_actor_gate_is_explicitly_opt_in():
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--checkpoint", "c", "--output", "o",
+            "--source-success-actor-gate",
+        ]
+    )
+    validate_args(parser, args)
+    assert args.source_success_actor_gate
 
 
 def test_tpo_cli_replaces_dg_and_preserves_the_production_topology():
