@@ -496,6 +496,7 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
         data_manifest=str(manifest),
         reference_column="solution",
         authorization=None,
+        allow_failed_authorization=False,
     )
     validated = validate_data_manifest(
         args, {"sft": {"traces_sha256": "sft-hash"}}
@@ -525,6 +526,32 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
     authorized = validate_authorization(args, {}, validated)
     assert authorized is not None
     assert authorized["sha256"] == sha256(authorization)
+    assert authorized["decision"] == "pass"
+    assert not authorized["failed_authorization_override"]
+
+    authorization.write_text(
+        json.dumps(
+            {
+                "schema": OPSD_AUTHORIZATION_SCHEMA,
+                "decision": "fail",
+                "gate_decisions": {"generation": "fail", "logit": "fail"},
+                "checkpoint_sha256": sha256(checkpoint),
+                "data_manifest_sha256": sha256(manifest),
+                "gate_sha256": sha256(gate),
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="decision is not pass"):
+        validate_authorization(args, {}, validated)
+    args.allow_failed_authorization = True
+    overridden = validate_authorization(args, {}, validated)
+    assert overridden is not None
+    assert overridden["decision"] == "fail"
+    assert overridden["failed_authorization_override"]
+    assert overridden["gate_decisions"] == {
+        "generation": "fail",
+        "logit": "fail",
+    }
 
     train.write_bytes(b"changed")
     with pytest.raises(ValueError, match="train bytes"):

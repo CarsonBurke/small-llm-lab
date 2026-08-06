@@ -52,6 +52,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "solution and permuted-solution training arms."
         ),
     )
+    parser.add_argument(
+        "--allow-failed-authorization",
+        action="store_true",
+        help=(
+            "Explicitly run an experimental final-answer arm even when its "
+            "bound authorization artifact records decision=fail. The failed "
+            "artifact remains required and is preserved in run provenance."
+        ),
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--effective-batch-size", type=int, default=32)

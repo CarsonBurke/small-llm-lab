@@ -48,6 +48,7 @@ _RESUME_EXACT_FIELDS = (
     "reference_column",
     "data_manifest",
     "authorization",
+    "allow_failed_authorization",
     "effective_batch_size",
     "rollout_batch_size",
     "max_completion_length",
@@ -123,6 +124,10 @@ def validate_authorization(
 ) -> dict[str, object] | None:
     controlled_columns = {"solution", "permuted_solution"}
     if args.authorization is None:
+        if getattr(args, "allow_failed_authorization", False):
+            raise ValueError(
+                "--allow-failed-authorization requires --authorization"
+            )
         if args.reference_column in controlled_columns:
             raise ValueError(
                 "--authorization is required for explicit final-answer OPSD arms"
@@ -134,8 +139,18 @@ def validate_authorization(
     authorization = json.loads(path.read_text())
     if authorization.get("schema") != OPSD_AUTHORIZATION_SCHEMA:
         raise ValueError("OPSD authorization has an incompatible schema")
-    if authorization.get("decision") != "pass":
-        raise ValueError("OPSD authorization decision is not pass")
+    decision = authorization.get("decision")
+    if decision not in {"pass", "fail"}:
+        raise ValueError("OPSD authorization has an invalid decision")
+    override_applied = decision == "fail"
+    if override_applied and not getattr(
+        args, "allow_failed_authorization", False
+    ):
+        raise ValueError(
+            "OPSD authorization decision is not pass; an explicitly requested "
+            "experimental run must preserve the failed artifact and pass "
+            "--allow-failed-authorization"
+        )
     if authorization.get("checkpoint_sha256") != file_sha256(args.checkpoint):
         raise ValueError("OPSD authorization used different checkpoint bytes")
     if authorization.get("data_manifest_sha256") != data_manifest["sha256"]:
@@ -146,6 +161,9 @@ def validate_authorization(
         "path": str(path),
         "sha256": file_sha256(path),
         "schema": authorization["schema"],
+        "decision": decision,
+        "gate_decisions": authorization.get("gate_decisions"),
+        "failed_authorization_override": override_applied,
         "checkpoint_sha256": authorization["checkpoint_sha256"],
         "data_manifest_sha256": authorization["data_manifest_sha256"],
         "gate_sha256": authorization["gate_sha256"],
