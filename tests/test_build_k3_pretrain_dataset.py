@@ -18,6 +18,7 @@ from scripts.build_k3_pretrain_dataset import (
     split_token_document,
     stable_digest,
 )
+from scripts.build_math_mix_dataset import GPT2BatchEncoder
 
 
 def read_payload(path: Path) -> np.ndarray:
@@ -36,6 +37,19 @@ class _TargetEncoder:
     def encode(self, texts: list[str], out_type=int) -> list[list[int]]:
         assert out_type is int
         return [[100 + ord(character) - 96 for character in text] for text in texts]
+
+
+def test_utf8_bytes_is_a_first_class_corpus_encoding() -> None:
+    encoder, provenance = builder.load_corpus_tokenizer(
+        "utf8_bytes", GPT2BatchEncoder()
+    )
+
+    assert encoder.encode(["A🙂"], out_type=int) == [list("A🙂".encode("utf-8"))]
+    assert encoder.decode([list("A🙂".encode("utf-8"))]) == ["A🙂"]
+    assert provenance["kind"] == "utf8_bytes"
+    assert provenance["vocab_size"] == 261
+    assert provenance["eot_id"] == 256
+    assert len(provenance["spec_sha256"]) == 64
 
 
 def test_custom_tokenizer_reencodes_challenge_validation(tmp_path: Path) -> None:
@@ -58,13 +72,13 @@ def test_custom_tokenizer_reencodes_challenge_validation(tmp_path: Path) -> None
 
     assert [path.name for path in outputs] == ["fineweb_val_000000.bin"]
     np.testing.assert_array_equal(
-        read_payload(outputs[0]), np.asarray([7, 101, 102, 7, 103, 104])
+        read_payload(outputs[0]), np.asarray([7, 101, 102, 7, 103, 104, 7])
     )
     assert metadata == {
         "reencoded": True,
         "documents": 2,
         "source_tokens": 6,
-        "tokens": 6,
+        "tokens": 7,
     }
 
 
@@ -219,6 +233,37 @@ def test_token_split_preserves_content_and_inserts_boundaries() -> None:
         [chunks[0], *(chunk[1:] for chunk in chunks[1:])]
     )
     np.testing.assert_array_equal(reconstructed, tokens)
+
+
+@pytest.mark.parametrize(
+    "character,prefix",
+    [
+        (character, 4 - consumed)
+        for character in ("¢", "ह", "🙂")
+        for consumed in range(1, len(character.encode("utf-8")))
+    ],
+)
+def test_byte_token_split_never_bisects_utf8(
+    character: str, prefix: int
+) -> None:
+    text = "a" * prefix + character + "z" * 12
+    tokens = np.asarray([256, *text.encode("utf-8")], dtype=np.int32)
+
+    chunks = list(
+        split_token_document(
+            tokens,
+            max_document_tokens=5,
+            eot_id=256,
+            utf8_bytes=True,
+        )
+    )
+
+    for chunk in chunks:
+        chunk[1:].astype(np.uint8).tobytes().decode("utf-8", errors="strict")
+    reconstructed = b"".join(
+        chunk[1:].astype(np.uint8).tobytes() for chunk in chunks
+    )
+    assert reconstructed == text.encode("utf-8")
 
 
 def test_paragraph_chunks_preserve_content_and_limit() -> None:
@@ -400,6 +445,41 @@ def test_a_stage_boundary_does_not_destroy_the_partial_document() -> None:
         np.concatenate([tokens for _, _, tokens in seen]), np.arange(20)
     )
     assert [name for name, _, _ in seen] == ["bulk", "anneal", "anneal"]
+
+
+def test_byte_stage_seam_reprefixes_tail_and_transfers_utf8_shortfall() -> None:
+    boundary = 256
+    document = np.asarray(
+        [boundary, *"a🙂b".encode("utf-8")], dtype=np.int32
+    )
+    stats = Counter()
+    seen = list(
+        builder.staged_interleave(
+            {
+                "a": iter((document,)),
+                "b": iter((np.asarray([boundary, *b"12345"]),)),
+            },
+            [("bulk", {"a": 4, "b": 4}), ("anneal", {"a": 6, "b": 0})],
+            boundary_id=boundary,
+            utf8_bytes=True,
+            split_stats=stats,
+        )
+    )
+
+    assert [(stage, source, tokens.size) for stage, source, tokens in seen] == [
+        ("bulk", "a", 2),
+        ("bulk", "b", 6),
+        ("anneal", "a", 6),
+    ]
+    assert seen[0][2].tolist() == [boundary, ord("a")]
+    assert seen[2][2].tolist() == [boundary, *"🙂b".encode("utf-8")]
+    assert stats == Counter(
+        {
+            "utf8_boundary_underfill": 2,
+            "utf8_budget_transfers": 1,
+            "reprefixed_tails": 1,
+        }
+    )
 
 
 def test_source_stream_draws_the_pushed_back_tail_before_anything_new() -> None:

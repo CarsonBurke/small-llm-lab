@@ -37,6 +37,27 @@ def test_token_cache_rejects_truncated_payload(tmp_path):
         list(checkpointed.token_cache_documents(path))
 
 
+@pytest.mark.parametrize("text", ["é", "€", "🙂"])
+@pytest.mark.parametrize("interior", [1, 2, 3])
+def test_complete_document_cache_never_splits_utf8(
+    text, interior, tmp_path
+):
+    encoded = text.encode("utf-8")
+    if interior >= len(encoded):
+        pytest.skip("offset is not interior to this UTF-8 code point")
+    document = np.asarray([256, *encoded, ord("x")], dtype=np.int32)
+    target = 1 + interior
+    path = tmp_path / "tokens.bin"
+    with checkpointed.TokenCacheWriter(path) as writer:
+        checkpointed.cache_complete_documents(writer, iter((document,)), target)
+        assert writer.tokens == len(document)
+        assert 0 <= writer.tokens - target < len(document)
+
+    restored = list(checkpointed.token_cache_documents(path))
+    assert len(restored) == 1
+    bytes(int(value) for value in restored[0][1:]).decode("utf-8", errors="strict")
+
+
 def test_dedup_journal_restores_exact_and_formatting_sets(tmp_path):
     path = tmp_path / "dedup.bin"
     web = base.RawDocument(
@@ -122,7 +143,7 @@ def test_raw_source_iterator_uses_the_target_tokenizer_boundary(
 
 def test_completed_checkpoint_validation_detects_changed_budget(tmp_path):
     source = {"name": "example", "kind": "parquet_text"}
-    signature = {"cache_format_version": 1}
+    signature = {"cache_format_version": 2, "max_document_tokens": 8192}
     fingerprints = [{"path": "part.parquet", "size_bytes": 1, "sha256": "x"}]
     tokens = np.asarray([base.GPT2_EOT_ID, 1, 2], dtype=np.int32)
     with checkpointed.TokenCacheWriter(tmp_path / "tokens.bin") as writer:
@@ -150,6 +171,7 @@ def test_completed_checkpoint_validation_detects_changed_budget(tmp_path):
         "source_spec_sha256": checkpointed.canonical_sha256(source),
         "budget": 3,
         "tokens": 3,
+        "overshoot_tokens": 0,
         "domains": ["web"],
         "signature": signature,
         "input_fingerprints": fingerprints,
@@ -168,7 +190,7 @@ def test_completed_checkpoint_validation_detects_changed_budget(tmp_path):
 
 def test_completed_checkpoint_detects_artifact_corruption(tmp_path):
     source = {"name": "example", "kind": "parquet_text"}
-    signature = {"cache_format_version": 1}
+    signature = {"cache_format_version": 2, "max_document_tokens": 8192}
     fingerprints = []
     with checkpointed.TokenCacheWriter(tmp_path / "tokens.bin") as writer:
         writer.append(np.asarray([1, 2], dtype=np.int32))
@@ -187,6 +209,7 @@ def test_completed_checkpoint_detects_artifact_corruption(tmp_path):
         "source_spec_sha256": checkpointed.canonical_sha256(source),
         "budget": 2,
         "tokens": 2,
+        "overshoot_tokens": 0,
         "domains": ["web"],
         "signature": signature,
         "input_fingerprints": fingerprints,

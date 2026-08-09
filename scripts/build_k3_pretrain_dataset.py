@@ -527,6 +527,19 @@ def load_corpus_tokenizer(name: str, gpt2: GPT2BatchEncoder) -> tuple[object, di
     dtype here rather than at the first overflow, which would otherwise
     surface as silently wrapped ids.
     """
+    if name == "utf8_bytes":
+        from pretraining.byte_diffusion.tokenizer import UTF8ByteBatchEncoder
+
+        encoder = UTF8ByteBatchEncoder()
+        return encoder, {
+            "kind": "utf8_bytes",
+            "name": "utf8_bytes",
+            "vocab_size": encoder.vocab_size,
+            "eot_id": encoder.eot_id,
+            "directory": None,
+            "spec_sha256": encoder.manifest.sha256,
+            "ngrams_sha256": None,
+        }
     if name == "gpt2":
         return gpt2, {
             "kind": "gpt2",
@@ -544,7 +557,8 @@ def load_corpus_tokenizer(name: str, gpt2: GPT2BatchEncoder) -> tuple[object, di
     spec_path = directory / "tokenizer.json"
     if not spec_path.exists():
         raise FileNotFoundError(
-            f"--tokenizer {name!r} is neither 'gpt2' nor a directory holding "
+            f"--tokenizer {name!r} is neither 'gpt2', 'utf8_bytes', nor a "
+            "directory holding "
             "tokenizer.json; train one with tokenization/train.py"
         )
     encoder = BatchEncoder.from_directory(directory)
@@ -645,6 +659,7 @@ def encode_raw_documents(
     rejection_counts: Counter,
     max_document_tokens: int,
     eot_id: int = GPT2_EOT_ID,
+    utf8_bytes: bool = False,
 ) -> Iterator[np.ndarray]:
     pending: list[RawDocument] = []
 
@@ -677,7 +692,10 @@ def encode_raw_documents(
                 validation.add(document.domain, array)
             else:
                 yield from split_token_document(
-                    array, max_document_tokens, eot_id
+                    array,
+                    max_document_tokens,
+                    eot_id,
+                    utf8_bytes=utf8_bytes,
                 )
 
     for document in documents:
@@ -710,6 +728,7 @@ def filter_token_documents(
     max_document_tokens: int,
     target: object = None,
     eot_id: int = GPT2_EOT_ID,
+    utf8_bytes: bool = False,
 ) -> Iterator[np.ndarray]:
     """Filter pre-tokenized shards, re-encoding them if the vocabulary changed.
 
@@ -757,7 +776,10 @@ def filter_token_documents(
                 validation.add(source["domain"], tokens)
             else:
                 yield from split_token_document(
-                    tokens, max_document_tokens, eot_id
+                    tokens,
+                    max_document_tokens,
+                    eot_id,
+                    utf8_bytes=utf8_bytes,
                 )
 
     for document in documents:
@@ -773,6 +795,8 @@ def split_token_document(
     tokens: np.ndarray,
     max_document_tokens: int,
     eot_id: int = GPT2_EOT_ID,
+    *,
+    utf8_bytes: bool = False,
 ) -> Iterator[np.ndarray]:
     if tokens.size <= max_document_tokens:
         yield tokens
@@ -781,16 +805,30 @@ def split_token_document(
         raise ValueError(
             f"token document does not begin with end-of-text id {eot_id}"
         )
+    if utf8_bytes:
+        body = tokens[1:]
+        if body.size and (int(body.min()) < 0 or int(body.max()) > 255):
+            raise ValueError("utf8_bytes document contains a non-byte id")
+        body.astype(np.uint8, copy=False).tobytes().decode(
+            "utf-8", errors="strict"
+        )
     cursor = 1
     while cursor < tokens.size:
-        take = min(max_document_tokens - 1, tokens.size - cursor)
+        stop = min(cursor + max_document_tokens - 1, tokens.size)
+        if utf8_bytes and stop < tokens.size:
+            while stop > cursor and 0x80 <= int(tokens[stop]) <= 0xBF:
+                stop -= 1
+            if stop == cursor:
+                raise ValueError(
+                    "max_document_tokens cannot hold one complete UTF-8 code point"
+                )
         yield np.concatenate(
             (
                 np.asarray([eot_id], dtype=np.int32),
-                tokens[cursor : cursor + take],
+                tokens[cursor:stop],
             )
         )
-        cursor += take
+        cursor = stop
 
 
 def token_shard_documents(path: Path) -> Iterator[np.ndarray]:
@@ -923,6 +961,10 @@ def materialize_challenge_validation(
     documents = 0
     pending: list[np.ndarray] = []
     with StreamingTokenShardWriter(output) as writer:
+        # Store the converted stream with both its leading virtual-BOS marker
+        # and a terminal delimiter. Consumers that split on terminal EOT no
+        # longer have to guess whether the final carried span is complete.
+        writer.append(np.asarray([target_eot_id], dtype=np.int32))
 
         def flush(batch: list[np.ndarray]) -> None:
             nonlocal documents
@@ -931,7 +973,7 @@ def materialize_challenge_validation(
             )
             encoded = target_tokenizer.encode(texts, out_type=int)
             for ids in encoded:
-                writer.append(np.asarray([target_eot_id, *ids], dtype=np.int32))
+                writer.append(np.asarray([*ids, target_eot_id], dtype=np.int32))
             documents += len(batch)
 
         for document in _documents_from_shards(source_shards, GPT2_EOT_ID):
@@ -987,6 +1029,10 @@ def logical_interleave(
     sources: dict[str, Iterator[np.ndarray]],
     budgets: dict[str, int],
     on_exhausted: str = "error",
+    *,
+    boundary_id: int | None = None,
+    utf8_bytes: bool = False,
+    split_stats: Counter | None = None,
 ) -> Iterator[tuple[str, np.ndarray]]:
     """Interleave sources toward per-source budgets, balanced by fill ratio.
 
@@ -1061,18 +1107,81 @@ def logical_interleave(
             continue
         keep = min(document.size, budgets[name] - written[name])
         if keep < document.size:
-            # Keep the unused tail for whoever draws from this source next --
-            # the next stage, or nobody if this was the last one.
-            streams[name].pushback(document[keep:])
+            emitted = document[:keep]
+            tail_start = keep
+            if boundary_id is not None:
+                if int(document[0]) != boundary_id:
+                    raise ValueError(
+                        f"source document does not begin with boundary {boundary_id}"
+                    )
+                if utf8_bytes:
+                    while (
+                        tail_start > 1
+                        and tail_start < document.size
+                        and 0x80 <= int(document[tail_start]) <= 0xBF
+                    ):
+                        tail_start -= 1
+                    shortfall = keep - tail_start
+                    if tail_start == 1:
+                        # A boundary by itself would become an empty document
+                        # once the next source's boundary arrives. Transfer the
+                        # complete tiny remainder instead of manufacturing a
+                        # training row with no literal bytes.
+                        shortfall = keep
+                        emitted = document[:0]
+                    else:
+                        emitted = document[:tail_start]
+                    if shortfall:
+                        recipients = [
+                            other
+                            for other in streams
+                            if other != name
+                        ]
+                        if not recipients:
+                            raise RuntimeError(
+                                "UTF-8-safe exact budgeting needs another source "
+                                "to absorb a final 1--3 byte boundary shortfall"
+                            )
+                        recipient = max(
+                            recipients,
+                            key=lambda other: budgets[other] - written[other],
+                        )
+                        budgets[name] -= shortfall
+                        budgets[recipient] += shortfall
+                        if recipient not in active:
+                            active.append(recipient)
+                        keep -= shortfall
+                        if split_stats is not None:
+                            split_stats["utf8_boundary_underfill"] += shortfall
+                            split_stats["utf8_budget_transfers"] += 1
+                streams[name].pushback(
+                    document
+                    if tail_start == 1
+                    else np.concatenate(
+                        (
+                            np.asarray([boundary_id], dtype=document.dtype),
+                            document[tail_start:],
+                        )
+                    )
+                )
+                if split_stats is not None:
+                    split_stats["reprefixed_tails"] += 1
+            else:
+                streams[name].pushback(document[keep:])
+            document = emitted
         if keep:
             written[name] += keep
-            yield name, document[:keep]
+            yield name, document
 
 
 def staged_interleave(
     sources: dict[str, Iterator[np.ndarray]],
     stages: list[tuple[str, dict[str, int]]],
     on_exhausted: str = "error",
+    *,
+    boundary_id: int | None = None,
+    utf8_bytes: bool = False,
+    split_stats: Counter | None = None,
 ) -> Iterator[tuple[str, str, np.ndarray]]:
     """Run several weight profiles back to back over one set of sources.
 
@@ -1103,7 +1212,12 @@ def staged_interleave(
         }
         stage_budgets = {source: budgets[source] for source in active}
         for source, tokens in logical_interleave(
-            active, stage_budgets, on_exhausted
+            active,
+            stage_budgets,
+            on_exhausted,
+            boundary_id=boundary_id,
+            utf8_bytes=utf8_bytes,
+            split_stats=split_stats,
         ):
             yield name, source, tokens
 
@@ -1496,6 +1610,7 @@ def main() -> None:
                 args.max_document_tokens,
                 tokenizer,
                 tokenizer_provenance["eot_id"],
+                utf8_bytes=tokenizer_provenance["kind"] == "utf8_bytes",
             )
             continue
         if kind == "parquet_text":
@@ -1523,6 +1638,7 @@ def main() -> None:
             rejection_counts,
             args.max_document_tokens,
             tokenizer_provenance["eot_id"],
+            utf8_bytes=tokenizer_provenance["kind"] == "utf8_bytes",
         )
 
     stages = stage_budgets(
@@ -1540,14 +1656,23 @@ def main() -> None:
     )
     written = Counter()
     stage_written: dict[str, Counter] = {name: Counter() for name, _ in stages}
+    split_stats: Counter = Counter()
     for stage_name, source_name, tokens in staged_interleave(
-        source_iterators, stages, args.on_exhausted
+        source_iterators,
+        stages,
+        args.on_exhausted,
+        boundary_id=tokenizer_provenance["eot_id"],
+        utf8_bytes=tokenizer_provenance["kind"] == "utf8_bytes",
+        split_stats=split_stats,
     ):
         writer.append(tokens, source_name)
         written[source_name] += tokens.size
         stage_written[stage_name][source_name] += tokens.size
     writer.finish()
-    if args.on_exhausted == "error":
+    if (
+        args.on_exhausted == "error"
+        and tokenizer_provenance["kind"] != "utf8_bytes"
+    ):
         if dict(written) != budgets:
             raise AssertionError(
                 f"written source budgets {dict(written)} != {budgets}"
@@ -1667,6 +1792,14 @@ def main() -> None:
             for name, counts in sorted(metadata_counts.items())
         },
         "ordering": "deterministic least-completed source token budget",
+        "document_budget_splits": {
+            "tail_reprefixed_with_eot": True,
+            "utf8_cut_retreat_uses_budget_transfer": (
+                tokenizer_provenance["kind"] == "utf8_bytes"
+            ),
+            "synthetic_padding_atoms": 0,
+            **dict(split_stats),
+        },
     }
     (output_dir / "mix_manifest.json").write_text(json.dumps(result, indent=2) + "\n")
     output_dir.rename(final_output_dir)

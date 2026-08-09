@@ -3,7 +3,7 @@
 The original builder interleaves filtering, tokenization, and final shard
 assembly. That is economical for small corpora, but a late source-capacity
 failure forces the entire preprocessing pass to be repeated. This builder
-materializes one exact-budget token cache per source first. Each completed
+materializes one bounded-overshoot token cache per source first. Each completed
 source is an atomic checkpoint containing:
 
 * its tokenized training documents;
@@ -43,7 +43,7 @@ from postraining import decontaminate, problem_registry
 from scripts import build_k3_pretrain_dataset as base
 from scripts.build_math_mix_dataset import GPT2BatchEncoder, allocate_token_budgets
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 TOKEN_LENGTH = struct.Struct("<I")
 DEDUP_RECORD_BYTES = 32
 ZERO_DIGEST = b"\0" * 16
@@ -200,6 +200,24 @@ def token_cache_documents(path: Path) -> Iterator[np.ndarray]:
             yield np.frombuffer(payload, dtype="<u2").astype(np.int32)
 
 
+def cache_complete_documents(
+    writer: TokenCacheWriter,
+    documents: Iterator[np.ndarray],
+    target: int,
+) -> None:
+    """Cache whole records until ``target`` is covered without byte truncation."""
+
+    if target <= 0:
+        raise ValueError("source cache target must be positive")
+    for tokens in documents:
+        writer.append(tokens)
+        if writer.tokens >= target:
+            return
+    raise RuntimeError(
+        f"source exhausted at {writer.tokens:,} / {target:,} cached tokens"
+    )
+
+
 def save_validation(
     directory: Path,
     validation: base.ValidationCollector,
@@ -277,6 +295,7 @@ def source_iterator(
             max_document_tokens,
             tokenizer,
             eot_id,
+            utf8_bytes=bool(getattr(tokenizer, "is_utf8_bytes", False)),
         )
     if kind == "parquet_text":
         raw = base.parquet_documents(
@@ -303,6 +322,7 @@ def source_iterator(
         rejection_counts,
         max_document_tokens,
         eot_id,
+        utf8_bytes=bool(getattr(tokenizer, "is_utf8_bytes", False)),
     )
 
 
@@ -340,11 +360,10 @@ def checkpoint_signature(args: argparse.Namespace, registry: dict) -> dict:
 def tokenizer_signature(tokenizer, provenance: dict) -> dict:
     """What the resume check must see to know two runs share a vocabulary.
 
-    For GPT-2 that means the serialized backend and the library versions that
-    produced it; for a trained ToaST+TST tokenizer it is the spec hash, which
-    already covers the vocabulary, the numeric scheme, and the n-gram
-    reference. Either way a cache built under one vocabulary can never be
-    resumed under another, because every cached token id would change meaning.
+    For GPT-2 that means the serialized backend and library versions. The
+    byte-native encoding and trained ToaST+TST tokenizers already carry stable
+    manifest/spec hashes in provenance. In every case a cache built under one
+    vocabulary must not resume under another.
     """
     if provenance["kind"] != "gpt2":
         return dict(provenance)
@@ -431,11 +450,15 @@ def validate_completed_checkpoint(
             f"checkpoint {directory} is incompatible with this build: "
             f"{mismatches}"
         )
-    if metadata.get("tokens") != budget:
+    tokens = int(metadata.get("tokens", -1))
+    max_document_tokens = int(signature["max_document_tokens"])
+    if not budget <= tokens < budget + max_document_tokens:
         raise ValueError(
-            f"checkpoint {directory} has {metadata.get('tokens')} tokens, "
-            f"expected {budget}"
+            f"checkpoint {directory} has {tokens} tokens, expected at least "
+            f"{budget} with less than {max_document_tokens} bounded overshoot"
         )
+    if metadata.get("overshoot_tokens") != tokens - budget:
+        raise ValueError(f"checkpoint {directory} has invalid overshoot metadata")
     expected_artifacts = metadata.get("artifacts")
     if not isinstance(expected_artifacts, dict):
         raise ValueError(f"checkpoint {directory} has no artifact fingerprints")
@@ -612,17 +635,13 @@ def build_source_caches(
                 eot_id,
             )
             target = budgets[name]
-            for tokens in documents:
-                keep = min(tokens.size, target - writer.tokens)
-                if keep:
-                    writer.append(tokens[:keep])
-                if writer.tokens == target:
-                    break
-            else:
+            try:
+                cache_complete_documents(writer, documents, target)
+            except RuntimeError as error:
                 raise RuntimeError(
                     f"source {name!r} exhausted at {writer.tokens:,} / "
                     f"{target:,} tokens"
-                )
+                ) from error
             deduplicator.journal = None
             token_count = writer.tokens
             document_count = writer.documents
@@ -669,6 +688,7 @@ def build_source_caches(
             "source_spec_sha256": canonical_sha256(source),
             "budget": budgets[name],
             "tokens": token_count,
+            "overshoot_tokens": token_count - budgets[name],
             "documents": document_count,
             "domains": list(domain_names),
             "signature": signature,
@@ -702,7 +722,14 @@ def assemble_dataset(
     stages: list[tuple[str, dict[str, int]]],
     cache_root: Path,
     output_dir: Path,
-) -> tuple[base.LoaderAlignedShardWriter, Counter, dict[str, Counter]]:
+    boundary_id: int,
+    utf8_bytes: bool,
+) -> tuple[
+    base.LoaderAlignedShardWriter,
+    Counter,
+    dict[str, Counter],
+    Counter,
+]:
     # Only sources some stage draws from have a cache directory on disk; a
     # zero-weight source was skipped at cache time and has nothing to open.
     drawn = {name for _, stage in stages for name, count in stage.items() if count}
@@ -721,8 +748,14 @@ def assemble_dataset(
     )
     written = Counter()
     stage_written = {name: Counter() for name, _ in stages}
+    split_stats: Counter = Counter()
     for stage_name, source_name, tokens in base.staged_interleave(
-        source_iterators, stages, args.on_exhausted
+        source_iterators,
+        stages,
+        args.on_exhausted,
+        boundary_id=boundary_id,
+        utf8_bytes=utf8_bytes,
+        split_stats=split_stats,
     ):
         writer.append(tokens, source_name)
         written[source_name] += tokens.size
@@ -731,7 +764,7 @@ def assemble_dataset(
     expected = Counter()
     for _, stage in stages:
         expected.update({k: v for k, v in stage.items() if v})
-    if args.on_exhausted == "error":
+    if args.on_exhausted == "error" and not utf8_bytes:
         if dict(written) != dict(expected):
             raise AssertionError(
                 f"written source budgets {dict(written)} != {dict(expected)}"
@@ -741,7 +774,7 @@ def assemble_dataset(
             f"redistributed stream wrote {sum(written.values()):,} tokens "
             f"against a {sum(expected.values()):,} token budget"
         )
-    return writer, written, stage_written
+    return writer, written, stage_written, split_stats
 
 
 def main() -> None:
@@ -768,7 +801,7 @@ def main() -> None:
     parser.add_argument(
         "--tokenizer",
         default="gpt2",
-        help="'gpt2', or a directory holding a trained ToaST+TST tokenizer",
+        help="'gpt2', 'utf8_bytes', or a trained ToaST+TST directory",
     )
     parser.add_argument("--remote-root", default=str(base.DEFAULT_REMOTE_ROOT))
     parser.add_argument("--full-source-set", action="store_true")
@@ -997,12 +1030,14 @@ def main() -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
-    writer, written, stage_written = assemble_dataset(
+    writer, written, stage_written, split_stats = assemble_dataset(
         args=args,
         sources=sources,
         stages=stages,
         cache_root=cache_root,
         output_dir=output_dir,
+        boundary_id=tokenizer_provenance["eot_id"],
+        utf8_bytes=tokenizer_provenance["kind"] == "utf8_bytes",
     )
     validation_sizes = validation.write(output_dir)
     fineweb = next(source for source in sources if source["name"] == "fineweb")
@@ -1103,6 +1138,14 @@ def main() -> None:
             for name, counts in sorted(metadata_counts.items())
         },
         "ordering": "deterministic least-completed source token budget",
+        "document_budget_splits": {
+            "tail_reprefixed_with_eot": True,
+            "utf8_cut_retreat_uses_budget_transfer": (
+                tokenizer_provenance["kind"] == "utf8_bytes"
+            ),
+            "synthetic_padding_atoms": 0,
+            **dict(split_stats),
+        },
         "checkpointing": {
             "format_version": CACHE_FORMAT_VERSION,
             "cache_dir": cache_root.as_posix(),
