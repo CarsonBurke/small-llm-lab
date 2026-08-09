@@ -58,6 +58,102 @@ different attribution and redistribution terms; do not redistribute them
 without reviewing the source-level licenses and underlying-content rights
 recorded in the source manifest.
 
+## Byte-native diffusion corpus
+
+Byte diffusion uses the production byte encoding during corpus selection. It
+does not select documents under GPT-2 or ToaST token counts and decode them
+again. The current 2,000-update baseline includes MathGLM v6 at 6% and the
+audited arithmetic drills at 4%. It deliberately uses one shuffled mixture,
+not an unmeasured late-stage anneal:
+
+```bash
+mlq submit --name bd_mathglm_v6_bytes_2k_data --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  "$PWD/.venv/bin/python" scripts/build_k3_pretrain_dataset_checkpointed.py \
+    --weights pretraining/k3_weights_math30_mathglm.json \
+    --tokenizer utf8_bytes --full-source-set --training-steps 2000 \
+    --train-batch-tokens 2097152 \
+    --cache-dir data/datasets/bd_mathglm_v6_bytes_2k.cache \
+    --output data/datasets/bd_mathglm_v6_bytes_2k
+
+mlq submit --name bd_mathglm_v6_atomic_2k_data --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  "$PWD/.venv/bin/python" scripts/build_byte_diffusion_dataset.py \
+    --output data/byte_diffusion \
+    --train 'data/datasets/bd_mathglm_v6_bytes_2k/fineweb_train_*.bin' \
+    --validation 'data/datasets/bd_mathglm_v6_bytes_2k/fineweb_val_*.bin' \
+    --chunk-size 8192 --chunks-per-shard 256 \
+    --max-train-documents 512000 \
+    --require-one-train-chunk-per-document
+```
+
+Here “2k” means 2,000 byte-diffusion updates. The default global batch is 256
+document-aligned rows, so the atomic builder pins exactly 512,000 rows and the
+trainer visits every row exactly once. The source build's 4,194,304,001-position
+budget is a worst-case envelope: because each UTF-8-safe source document is at
+most 8,192 atoms, it guarantees enough complete documents even when every one
+fills a row. Short documents leave storage PAD, so the manifest records the
+actual literal-byte, special-atom, scored-target, and PAD exposure rather than
+claiming 4.194B clean bytes. The second command only adds patch-aligned storage
+metadata; it performs no tokenization or lossy text round trip. The exact-budget
+source stream may end inside its final document; that one recorded incomplete
+tail is excluded rather than converted into a synthetic EOT target.
+
+After the atomic build, copy `payload_sha256` from
+`data/byte_diffusion/manifest.json` into the checked launch contract:
+
+```bash
+mlq submit --name bd_canvas512_scratch_v1_2k --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  "$PWD/.venv/bin/python" scripts/ablation.py --steps 2000 \
+    --name bd_canvas512_scratch_v1_2k \
+    --script scripts/train_byte_diffusion.py \
+    --env BYTE_DIFFUSION_PRESET=canvas512_scratch_v1 \
+    --env BYTE_DIFFUSION_MICROBATCH=24 \
+    --env BYTE_DIFFUSION_MICROBATCH_TOKEN_BUDGET=208896 \
+    --env PYTORCH_ALLOC_CONF=expandable_segments:True \
+    --env BYTE_DIFFUSION_VALIDATION_CHUNKS=2048 \
+    --env BYTE_DIFFUSION_EXPECTED_DATA_SHA256=<payload_sha256> \
+    --env BYTE_DIFFUSION_DATA_PATH=data/byte_diffusion
+```
+
+The preset fails closed if the recipe, absorbing corruption, 512-byte canvas,
+single branch, equal-mean joint objective, global optimizer batch, optimizer,
+schedule, seed, model layout, or dataset hash drifts. A staged data curriculum
+must be introduced as its own ablation; shuffling a nominal final stage into
+the bulk is not an anneal.
+
+The periodic 2,048-row readout is emitted as `val_proxy_bpb`. It is an exact
+causal codelength on a deterministic subset and is appropriate for paired
+ablation curves, but it is not the full challenge score. After training,
+evaluate the complete source-bound FineWeb validation split:
+
+```bash
+mlq submit --name bd_canvas512_scratch_v1_full_eval --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  "$PWD/.venv/bin/python" scripts/eval_byte_diffusion.py \
+    --checkpoint ablation_results/bd_canvas512_scratch_v1_2k/checkpoint.pt \
+    --data-path data/byte_diffusion --full-validation
+```
+
+Only that command emits `val_challenge_bpb`. The separate
+`val_diffusion_loss` is mean denoising CE, not an ELBO, likelihood, or BPB.
+
+For a matched nanoGPT AR experiment, derive GPT-2 ids from those already
+selected complete documents:
+
+```bash
+mlq submit --name bd_mathglm_v6_gpt2_view --cwd "$PWD" \
+  --max-parallel-runs 1 -- \
+  "$PWD/.venv/bin/python" scripts/materialize_byte_corpus_gpt2_view.py \
+    --source data/datasets/bd_mathglm_v6_bytes_2k \
+    --output data/datasets/bd_mathglm_v6_same_docs_gpt2
+```
+
+That view can contain a different number of model positions—that is the real
+compression difference—but its manifest proves document selection did not
+change.
+
 The short reference runs use the sampled source set above. Full pretraining
 downloads the expanded revision-pinned source set and builds a one-pass
 10.49B-token stream. The checkpointed builder fails rather than cycling if any
