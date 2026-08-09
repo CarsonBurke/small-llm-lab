@@ -4457,3 +4457,808 @@ read-only post-update replay reports actual target-fit KL and probability
 residuals alongside achieved behavior KL. The actor objective schema is v6,
 preventing silent resume from candidate TPO or the infeasible density-ratio
 port.
+
+## 2026-08-06: Corpus v8 — decontamination registry, math to 30%, worked-step drills, ToaST+TST
+
+An audit of how much mathematics the pretraining corpus actually contains, and
+of what post-training was silently training on, produced four connected
+changes. None of them has been trained on yet; everything below is
+construction and measurement, not a result.
+
+### The problem registry (`postraining/problem_registry.py`)
+
+There was no global answer to "which split owns this problem". The corpus
+builders carried a `--heldout` list that named DAPO and AIME and not GSM8K,
+and for web sources the exclusion was structurally inert: `quality_keys` is
+the whole document chunk, so it fired only when an entire page equalled a bare
+problem statement. Measured consequence: 97.5% of `openmath_gsm8k`, 97.0% of
+`gsm8k_socratic`, 96.7% of `had653_gold` and 96.9% of the GSM8K RL pool were
+problems the base model had already pretrained on.
+
+`postraining/problem_sources.json` now declares 38 sources across
+`eval > rl > sft > pretrain`, and `scripts/build_problem_registry.py` resolves
+them to one assignment: **344,309 distinct problems** (eval 2,472, rl 204,430,
+sft 137,407). Identity is the same `pgolf-holdout` blake2b over the
+framing-stripped, NFKC-normalized, casefolded statement the builder already
+used, so registry keys and the retired held-out keys agree bit for bit.
+
+### The n-gram index (`postraining/decontaminate.py`)
+
+Exact key matching cannot see a problem quoted inside a larger page, so a
+13-word-gram index runs alongside it, the GPT-3/Llama convention. Words are
+alphanumeric runs after NFKC and casefold; hashes are a cached blake2b per
+word folded into a numpy polynomial rolling hash (0.64 ms per 3,000-word
+document, 28 MB/s), stored as a sorted `uint64` array searched with one
+vectorized `searchsorted`. **4,045,060 unique 13-grams** over the eval, RL and
+SFT splits.
+
+Three defects a red-team pass found and confirmed by execution, all now fixed:
+
+- The index was built from **raw prompts**, so the 31-word DAPO preamble
+  contributed 19 pure-boilerplate 13-grams. Every QA document the corpus
+  builder rendered with that same template was then refused as contaminated:
+  measured **20.2% of `deepmind_math` and 16.9% of `openmath_instruct`
+  rejected for reproducing an instruction wrapper**. `--min-ngram-hits` could
+  not separate them, since a real GSM8K test problem also contributes exactly
+  19 distinct n-grams. The index now applies `strip_framing`, the same
+  canonical view `problem_key` hashes, and `deepmind_math` fell to 5.18%.
+- `--index-splits` defaulted to `eval` alone, leaving **341,837 of 344,309
+  protected problems (99.3%) on exact matching only** — including the GSM8K
+  train pool the whole mechanism exists for. Five admitted documents were
+  verified to contain a GSM8K-train 13-gram. The default is now
+  `eval rl sft`, and `ProblemGuard.__init__` **fails closed** when the index
+  does not cover every non-empty protected split rather than silently
+  degrading.
+- `scripts/audit_problem_overlap.py` could not measure the builder: it read
+  only `document.text` and dropped `quality_keys`, reporting
+  `openmath_instruct exact 0.00%` where the builder rejected 16.8%, and it
+  skipped `token_shards` entirely so fineweb was never audited. It now runs
+  the builder's own `ProblemGuard` over whole `RawDocument`s and decodes the
+  fineweb shards.
+
+Windows one word dominates (over half the slots) are dropped from the index —
+`a_1 a_2 a_3 ...` reduces to "a 1 a 2 a 3 a 4 a 5 a 6 a" and would flag every
+LaTeX subscript run. 244,236 windows were dropped this way. The filter bounds
+the pathology rather than eliminating it; an alternating pattern still lands
+half its windows, because `index_words` discards the operators that would
+distinguish it.
+
+**Measured admission rates** on a 25 MB-per-source sample against the final
+index: `fineweb` 0.00%, `fineweb_edu_dedup` 0.06%, `github_code_clean` 0.22%,
+`sci_code` 0.40%, `open_web_math` 1.58%, `finemath_4plus` 2.45%,
+`deepmind_math` 5.18% n-gram, `openmath_instruct` 16.45% exact + 15.98%
+n-gram. The last two are genuine overlap with the RL and SFT pools, not false
+positives — OpenMathInstruct's GSM8K band is 97% GSM8K, and
+`deepmind_interpolate_rl_full` comes from the same generator as
+`deepmind_math`. The false-positive cost of the 100x wider index is therefore
+approximately zero on pure web text, which is what made widening it safe.
+
+### Worked-step drills and a held-out arithmetic probe
+
+The corpus shortfall is not word problems; it is text that carries out an
+arithmetic procedure step by step. `postraining/math_drills.py` generates
+deterministic drills across 15 families with declared digit curricula:
+column addition/subtraction with explicit carries and borrows, partial
+products, long division, decimals, fractions, percentages, rounding,
+comparison, and unit conversion. Two thirds are written in expanded form and
+one third least-significant-digit-first.
+
+A design flaw found by reading the generated output rather than the code: the
+`forward` order was originally produced by *reversing* the LSB-first step
+list, which printed carries before the lines that produce them — a non-causal
+trace, exactly the thing this corpus exists to avoid teaching. `forward` is
+now genuinely the expanded-form algorithm, and `FAMILY_ORDERS` declares which
+orders each family can causally support. 9,884 of 10,000 generated drills were
+re-solved independently with `Fraction` arithmetic: 0 wrong.
+
+`postraining/arithmetic_probe.py` draws a held-out panel from a reserved seed,
+excluding the training key set and the registry, and `assert_disjoint`
+re-derives the training keys rather than trusting a manifest. Below three
+digits a family's problem space is exhausted by any real training set — there
+are a hundred one-digit additions — so the probe measures the multi-digit
+regime and says so instead of reporting memorized items as held-out accuracy.
+Built: 2,000,000 drills (703.2 MB, 352 characters each) and a 1,920-item
+panel; the drill corpus audits at 0.00% exact and 0.00% n-gram against the
+registry.
+
+### Corpus v8 profiles
+
+`k3_weights_math30.json` takes math from 15% to 30%, paid out of web
+(50% to 42%), keeping `math_drills` at 6% and `deepmind_math` at 5% so
+templated synthetic text stays a minority of the math budget. DeepMind's 56
+`train-easy` modules are no longer round-robined: `module_weights` gives
+arithmetic 5-6x, place value and rounding 4x, measurement 3-4x.
+
+`--anneal-weights` draws the final `--anneal-fraction` of the budget under a
+second profile (`k3_weights_math30_anneal.json`, math 50%, no raw web). The
+stages **share their source iterators**, so the anneal continues each source
+rather than restarting it — otherwise the tail of a one-pass corpus would
+quietly become a second epoch of its heaviest sources. This is distinct from
+the existing `--cooldown-data`, which swaps in a whole second dataset.
+
+Embedding tying needed no work: `TIE_EMBEDDINGS` already defaults on, and
+51.5M of 64.0M parameters are embeddings.
+
+### ToaST + TST tokenizer
+
+`tokenization/` combines vocabulary-independent binary split trees (ToaST,
+arXiv 2605.22705v1) with triadic digit grouping and magnitude suffixes (TST,
+arXiv 2604.11582v3). The shipped 50,257 artifact
+(`data/tokenizers/toast_tst_n1_50k`) was trained on a 189.8 MB sample of the
+math-30 mixture and measured on a 4.0 MB held-out slice of it: GPT-2 3.4673
+bytes/token, ToaST+TST **3.7288 (7.54% better)**, zero round-trip failures,
+and an exactly integral LP (zero fractional variables, zero relative gap).
+The 4.0001-at-50,257 and 3.4131-at-16,384 figures quoted in earlier revisions
+of this entry came from a different 95.3 MB exploratory sample and a 16,384
+artifact that was never built; `tokenization/README.md` retired them and this
+entry now agrees.
+
+Two deliberate deviations: numbers stay lossless (variable-length boundary
+groups instead of zero padding, so `0.1`/`0.10`/`0.100` do not collide), and a
+numeric token's identity is `(digits, power)` so its value is exactly
+`int(digits) * 10**power`.
+
+**Compression is not capability.** A tokenizer that packs more bytes per token
+also gives the model fewer forward passes per byte. Nothing here should be
+adopted on the bytes-per-token table alone, which is what the four-arm
+ablation in `pretraining/README.md` is for: GPT-2/quality, GPT-2/math30,
+ToaST+TST-50k/math30, ToaST+TST-16k/math30. Bits-per-byte is
+tokenizer-independent, so all four stay comparable to every run already in
+`ablation_results/`.
+
+The tokenizer artifacts are not on disk; the user runs the training commands.
+
+### Corpus-v8 review round: what the red team changed
+
+Eight confirmed findings, all fixed and covered by tests. The three that
+would have silently corrupted a result:
+
+**The contamination index was built from raw prompts.** Nineteen 13-grams of
+DAPO instruction boilerplate ("Let's think step by step and output the final
+answer within \boxed{}") entered the protected set, so any document quoting
+the template was refused: 20.2% of `deepmind_math` and 16.9% of
+`openmath_instruct`. `ContaminationIndex.build` now strips framing first, and
+`deepmind_math` re-measures at 5.18%. A guard that rejects the right documents
+for the wrong reason looks identical to a correct one in aggregate; only
+reading the rejected documents showed it.
+
+**Bits per byte was computed from a GPT-2 byte table regardless of tokenizer.**
+The one metric the four-arm ablation is compared on would have been wrong for
+arms C and D — and wrong in the flattering direction, since a denser tokenizer
+would have had its bytes undercounted. `pretraining/byte_accounting.py` keeps
+the table for GPT-2 corpora and decodes runs for everything else; a TST token
+carries `(digits, power)` and renders to bytes that depend on its neighbours,
+so no per-token table can exist for it.
+
+**Vocabulary identity was compared on padded size.** GPT-2's 50,257 and a
+trained 50,257 both pad to 50,304, so the cooldown-vs-main guard compared
+equal for two tokenizers that agree on nothing. It now compares
+`(kind, vocab_size, eot_id, spec_sha256, ngrams_sha256)`. Relatedly,
+`SplitTreeNumericTokenizer.from_directory` did not verify `ngrams.bin`
+against the digest in `tokenizer.json` — and since split trees are rebuilt
+from those counts at encode time, `spec_sha256` alone never pinned the
+encoding.
+
+Also fixed: a stage-boundary truncation that destroyed the tail of the
+document it split (found before review, confirmed reproduced by the reviewer);
+zero-weight sources breaking budget allocation in three places in the
+checkpointed builder; a resume-divergent rejection counter living on the
+stateless guard; and `--index-splits` defaulting to `eval` alone, which left
+99.3% of protected problems on exact matching — now `eval rl sft`, with
+`ProblemGuard` refusing an index that does not cover the splits the registry
+actually populates.
+
+Two changes went beyond the findings. Packed QA documents are now
+decontaminated per item: a DeepMind document holds 8-24 independent pairs, so
+refusing the whole document for one held-out problem was discarding roughly
+fifteen clean pairs each time. And `sample_tokenizer_corpus.py` applies the
+guard, which it never did — a tokenizer fitted to the evaluation problems buys
+shorter encodings of exactly the text it is judged on.
+
+One bug the review request itself surfaced: `run_arithmetic_probe.py`
+defaulted to `--temperature 0.0` for greedy decoding, and `top_p_sample`
+implemented temperature by division -- `logits / 0.0` is +inf for every
+positive logit and NaN for a zero one, which `torch.multinomial` refuses. The
+probe would have crashed on its first step. `top_p_sample` now treats
+temperature 0 as greedy, expressed as a one-hot distribution rather than an
+argmax shortcut so the draw order stays one multinomial per step; a test
+asserts the generator ends in the same state as a sampled draw, because that
+order is part of the rollout execution schema every actor objective shares.
+
+Two more probe defects found while writing that fix. Scoring paired captured
+attempts with panel items positionally without checking `problem_index` --
+`evaluate_latent_math` does sort the capture back into dataset order, so the
+pairing was correct, but a permuted capture would have produced a per-family
+table that was a permutation of the truth, which no aggregate would reveal;
+the probe now asserts the alignment. And the headline accuracy credited a
+`parsed_answer` scraped from the tail of an unterminated generation. The
+headline score now requires `terminated` and `structural_format_ok`, with the
+lenient number reported beside it rather than dropped.
+
+One test was deleted rather than fixed: `test_the_trainer_refuses_an_unpadded_
+vocab_size` asserted two source substrings existed in the trainer file and
+would have passed if the guard body were `pass`. Its replacements in
+`tests/test_byte_accounting.py` call the real functions.
+
+Round three found no blocking defect and confirmed three things empirically
+that had been argued rather than measured. Cross-boundary n-grams: joining a
+document's segments does create windows spanning a boundary, and none of them
+matched — 0 of 205 refusals came from a synthetic boundary. Item-level
+decontamination over 4,000 DeepMind documents: 0.356% of items contaminated,
+5.13% of documents holding at least one, 3,424 clean siblings released (5.35%
+of the stream), no document losing every item. And the shipped index's split
+declaration verified externally at 2,229/2,229 sampled problems detected.
+
+The four nits are fixed. Probe transcripts are written before the scoring
+guards, so a guard failure keeps its own evidence. Item and document rejection
+counts now live in separate manifest maps (`item_rejection_counts` vs
+`rejection_counts`) — summing them would have overstated documents refused by
+~16x on the DeepMind key. The byte counter gained a test for decode runs
+flushed around multi-byte neighbours, since the specials-are-one-byte
+convention is only defensible if it is neutral across arms rather than
+inherited from GPT-2's table. And `build_problem_registry.py` now ends with a
+positive control that re-queries sampled protected problems against the
+finished index and fails the build if an indexable one is not detected — as a
+build-time gate rather than a load-time one, so the already-audited
+`data/problem_registry/v1` stays valid.
+
+Two operational items came out of that round and are recorded rather than
+fixed. Build **arm C first**: at a fixed token budget the ToaST-50k arm reads
+~13% more source text than the GPT-2 arms, so it is the arm most likely to
+exhaust a thin source, and `build_source_caches` fails closed rather than
+cycling. Discovering that after three other corpora exist is expensive.
+Second, **518,560 of 2,861,011 protected rows yield no indexable 13-gram** —
+255 of 300 sampled `deepmind_interpolate_rl_full` rows — and are therefore
+protected by exact key alone, which for web text catches only a page that is
+nothing but the problem. Those are short generated RL templates so verbatim
+web reproduction is unlikely, but this is the decontamination's real residual
+exposure. It is not what the index does wrong; it is what no n-gram index can
+do.
+
+Round four attacked the probe and the greedy branch itself and found one real
+hole in a fix from round three. Greedy decoding accepts logits that sampling
+refuses: `argmax` ranks NaN above every real logit and returns index 0 for a
+wholly `-inf` row, so the `torch.multinomial` error that this codebase relies
+on to notice a corrupted forward or an over-aggressive mask simply does not
+fire at temperature 0 — which is the arithmetic probe's default. The failure
+would have been a complete, correctly ordered, contract-passing per-family
+accuracy table computed from argmax-of-NaN, with nothing aggregate to reveal
+it. `top_p_sample` now requires at least one finite logit per row and no NaN or
+`+inf` before taking the greedy path, and validates `top_p` in [0, 1] at both
+temperatures, since a negative `top_p` masked every rank and arrived as the
+same opaque multinomial error.
+
+The first version of that guard tested only "at least one finite entry per
+row and no NaN", which a row holding one `+inf` beside 31 finite logits
+satisfies -- and argmax then returns the `+inf` position as a confident
+answer. A stable softmax subtracts the row max, so `exp(inf - inf)` is NaN
+and the sampled path refuses the same row: the parity claim was false for
+exactly that case. `-inf` stays legal, because it is the mask value and a row
+masked to one candidate is a request rather than a corruption. Parity now
+verified case by case: clean, all-`-inf` row, one-`-inf` row among clean ones,
+NaN, `+inf`, `-inf` alone, masked-to-one, finite-but-1e38, and `-inf` with
+`+inf` all agree between temperature 0 and temperature 1 on refuse-or-accept.
+
+The probe's latent-checkpoint refusal was reading the weakest of three
+available signals. It tested `args["reasoning_mode"]`, but
+`train_latent_vapo.py` reads its own mode with a `latent` default, so a
+payload can carry a trained combiner and record no mode at all. Worse, the
+guard was unreachable for its own target: a latent VAPO checkpoint has no
+top-level `sft` key, so the prompt-schema check rejected it first and named
+the wrong reason. It is now `carries_trained_combiner(payload)` — decided on
+`combiner.*` parameter keys, with top-level `reasoning_mode` as a second
+line — and it runs before the schema check. The schema rejection goes through
+`parser.error` rather than a bare traceback, like every other rejection there.
+
+Verified rather than changed, in the same round: the temperature-0 branch is
+bit-identical to `argmax` across 1,440 truncation/seed combinations including
+exact ties, and leaves the generator in the same state as a sampled draw in
+all four truncation branches. The zero-init `CombinedEmbedding` is an exact
+identity, not an approximate one, so the probe's arrangement is faithful
+independently of `pin_emit`.
+
+Round five found the positive control from round three to be wrong, and wrong
+in the way that matters: run against the shipped `data/problem_registry/v1`
+it raised `SystemExit` at 2,875/2,879. The four undetected rows were
+`Simplify (d*d*((d*(d*d**3)/d)/d*d)/d)/(d/d**6) assuming d is positive.` and
+its siblings — 18 words of which 12 are `d`. The control decided a row was
+indexable by word count, but `ContaminationIndex.build` indexes a row only if
+`informative_ngram_hashes(...).size > 0`, and `informative` rejects any window
+one token dominates. So the control counted a row the builder correctly
+declined to index and then blamed the index for not detecting it.
+
+The provenance had been right all along: `covered_rows + short_rows =
+protected_rows` exactly, so `short_rows` already meant "contributed no
+informative n-gram". The control inherited that field's *name* and re-derived
+a length test from it. `short_rows` is now documented as the narrower name it
+is — a `v2` registry should call it `uncoverable_rows` — with the instruction
+that anything deciding coverage must call the builder's predicate rather than
+infer one. The control does that now and passes on `v1` at 2,875/2,875
+(eval 602, rl 814, sft 1,459; 685 uncoverable).
+
+All three round-three control tests passed throughout, and that is the lesson
+worth keeping: they used diverse prose fixtures, and the only failing case is
+a row that is *long but repetitive*. A green suite said nothing about whether
+the next registry build would abort. Two regression tests now use the verbatim
+failing row, one asserting it is not blamed on the index and one asserting
+`control["indexable"] == index.covered_rows` and
+`control["uncoverable"] == index.short_rows`, which is the drift itself rather
+than a symptom of it.
+
+Also fixed in the same path: `registry.write` ran before the control, so a
+failed gate left `registry.parquet` in the output directory and the
+immutability guard at the top of `main` then refused the retry — a control
+failure would have burned a version number. Nothing is written now until the
+control passes. And the failure message no longer claims to prove the index's
+declared splits: one `splits` value feeds both the build and the check, so
+what it proves is that the indexing pipeline covered what it was handed.
+
+## Bolmo: source-aligned optimizer, and why its BPB was not a codelength (2026-08-08)
+
+Four things landed together: a Bolmo arm trained under the source model's own
+optimizer, an annealed source baseline, an exact accounting of the batch-size
+asymmetry, and — the one that governs how any of it may be read — the finding
+that Bolmo's reported `byte_bpb` is not a bits-per-byte a subword model can be
+compared against.
+
+### The source-aligned arm
+
+The epoch-matched Bolmo arm trailed its source model by 0.0805 BPB under the
+paper's AdamW recipe. That comparison was confounded: the paper's Stage-2 rates
+(2.6e-5 global, 5.2e-5 local) are Table-8 values for a 1B model on a much longer
+schedule, and at 50M parameters over 2,400 updates they simply starve it.
+`pretraining/source_muon.py` is a single-process port of the source trainer's
+`Muon`/`PerHeadMuon` — the quintic Newton-Schulz iteration, the
+`max(1, rows/cols) ** 0.5` rectangular scaling, Nesterov momentum and decoupled
+decay, unchanged — and `BOLMO_OPTIMIZER_RECIPE=source` runs Bolmo under it with
+the source's learning rates, cosine schedule, 1% warmup, momentum warmup and no
+gradient clipping. `SourceOptimizerRecipe` binds all of it, plus
+`SOURCE_MUON_ALGORITHM`, into the training contract.
+
+Endpoints on the same one epoch, same data, same 2,400 updates:
+
+| arm | stage 1 (800) | final (2,400) byte | final joint |
+|---|---|---|---|
+| paper AdamW | 1.6414 | 1.4816 | 1.6276 |
+| source Muon | 1.4778 | 1.2369 | 1.3629 |
+
+The recipe is worth more than anything else measured on this model. Note the
+stage-1 endpoint alone (1.4778, frozen trunk) already beats the paper arm's
+full 2,400-step result. Boundary accuracy improved 0.9793 to 0.9839, still under
+the 0.99 gate we have been overriding.
+
+This is *not* clean evidence that Muon is a better byteification optimizer. The
+paper arm's Stage-2 trunk LR is 2.6e-5 AdamW against 0.025 Muon here, so the
+paper arm's trunk is effectively frozen while the source arm's is genuinely
+being pretrained for another 419M tokens. Most of that 0.265 gap is probably
+"training the trunk beats not training it". Isolating the optimizer needs a
+paper-recipe arm at matched trunk-update magnitude.
+
+### The schedule was not matched, and the source baseline was mid-anneal
+
+The source run was `ITERATIONS=2000 STOP_AFTER_STEP=1000`: half of one cosine,
+killed at multiplier 0.5087, never annealed. Its val BPB was flat at 1.397-1.403
+from step 840 on — a plateau at half peak LR, not a converged number. Bolmo, by
+contrast, restarts its cosine at the stage boundary (`train_bolmo.py` rebuilds
+the optimizer with `planned_steps=planned_stage2` and
+`stage_step = global_step - planned_stage1`), so it gets two complete anneals to
+zero. That asymmetry runs entirely in Bolmo's favour.
+
+`k3_v8_armC_kda8_cosine_nextlat_nope_anneal1k` is the control: identical command
+with `--steps 1000` and no `STOP_AFTER_STEP`, so the cosine completes over the
+same 524,288,000 tokens. **1.4011 to 1.3777.** The anneal is worth 0.023 BPB,
+close to the 0.009 measured on the source arm's own stage-1 tail. Per domain:
+web 1.2236 to 1.2043, code 0.8494 to 0.8302, knowledge 1.0447 to 1.0307, math
+0.8232 to 0.8248 (math alone did not move).
+
+Every future Bolmo-versus-source comparison uses 1.3777, not 1.4011.
+
+### The batch asymmetry is exact, and it is not extra data
+
+Source `global_batch_tokens` is 524,288 (16 microbatch sequences x 16
+accumulations x 2048). Bolmo's examples are also 2048 source tokens, at 64 per
+step in stage 1 and 128 in stage 2 — a quarter and a half of the source batch.
+So `800*64 + 1600*128 = 256,000` examples = 524,288,000 source tokens, exactly
+the source's `1000 * 524,288`. The 2.4x update count is purely the batch ratio;
+there is no extra data. But it does mean the "source-aligned" arm is aligned on
+the LR *numbers* and not on LR-relative-to-batch, which is what actually
+transfers. `bolmo_srcopt_bs256_*` fixes that: 1,000 total updates, 333/667
+stage split, 256 examples in both stages, which consumes the same 256,000
+examples exactly and needs no dataset rebuild.
+
+### `byte_bpb` is not a codelength
+
+`NonCausalBoundaryPredictor.forward` computes `log_p[t]` from `hidden[t]` and
+`hidden[t+1]`. The local encoder is causal, so `boundaries[t]` is a function of
+byte `t+1`. `prepare_hidden` routes position `t` to patch
+`cumsum(boundaries)[t] - 1`, which consumes `boundaries[t]`. Position `t` scores
+byte `t+1`. So every byte's score is conditioned on a bit derived from that
+byte. The marginal does not normalize: substituting all 257 atomic values for
+the target and summing the assigned marginal gives 1.0218, and the boundary
+flips for 126 of 257 candidates. Frozen to a single causal routing tensor it is
+1.000000.
+
+This is inherited, not a porting bug. The paper is explicit — the predictor
+"has access to one byte of future context", and Section 3.1.1 accounts for it as
+"the single bit of information leaked by discrete boundary predictions", the
+argument being that end-to-end training of the same predictor would leak 16
+bits and collapse. `test_boundary_predictor_uses_next_byte_and_forces_bos` has
+asserted the lookahead all along; what was missing was the consequence for the
+metric.
+
+What is *not* inherited is comparing that number to a subword model's BPB. The
+paper's own prefill/decode split says which regime is which: the non-causal
+predictor tokenizes the prefill, and during decoding boundaries are emitted as
+the fused `<b>` symbol. `joint_bpb` is that decoding regime — the routing bit at
+`t` was transmitted at `t-1`, `x -> (x, b(x))` is injective, so it is a valid
+codelength, deliberately loose. `byte_bpb` is the prefill regime applied to
+every scored position, which is teacher forcing with lookahead.
+
+`validation_statistics(causal_routing=True)` is the new diagnostic. It keeps the
+predicted boundaries and the pooled patch contents exactly as they are — `pool`
+still receives the unshifted mask, and every patch end it selects is causal —
+and shifts only the *routing* mask right by one, so a position reads the most
+recent patch that closed strictly before it. Everything scoring byte `t+1` is
+then a function of bytes `0..t`, the predictor is a deterministic function of
+those bytes so a decoder can recompute it, and marginalizing the output bit is
+legitimate. It charges a train/eval mismatch on top of the leak — the model was
+trained with the non-causal routing — so it is an upper bound on what a
+causally-routed model would cost, and `noncausal_routing_credit_bpb` in
+`eval_bolmo_patching.py` reports the difference.
+
+Restated on the numbers that are codelengths, against the annealed source:
+
+| | byte (invalid) | joint (valid, loose) | source |
+|---|---|---|---|
+| paper AdamW | 1.4816 | 1.6276 | 1.3777 |
+| source Muon | 1.2369 | 1.3629 | 1.3777 |
+
+The source arm's margin over the source model collapses from 0.141 to 0.015,
+and the paper arm goes from 0.104 behind to 0.250 behind. Nothing here supports
+a byteification-beats-tokenization claim yet. (Both left-hand figures are
+against the annealed 1.3777, per the rule set above; an earlier revision of
+this paragraph quoted 0.164 and 0.08, which are against the superseded
+un-annealed 1.4011.)
+
+### The remaining confound, and the control the paper itself runs
+
+Bolmo's trunk was pretrained on these 524,288,000 tokens and Bolmo then trains
+on the same 524,288,000 tokens. The trunk sees the corpus twice; the source saw
+it once. Appendix A of the paper runs exactly the right control — Bolmo against
+the source model given continued training on the same data under the same
+settings — so `k3_v8_armC_kda8_cosine_nextlat_nope_contd2k` resumes the source
+run and completes steps 1001-2000 of its original cosine. That is the same
+second epoch, fully annealed, at token level. Until it lands the defensible
+claim is "the source trunk plus a second annealed epoch, in byte space", not
+anything about byteification.
+
+Also unresolved and pointing the same way: nextlat. The source's auxiliary was
+about 12% of its training objective (`nextlat_total` 0.3155 of `train_loss`
+2.7063) and does not transport — its KL term runs through the 50,304-way
+unembedding Bolmo deletes. The trunk Bolmo inherits was shaped by it and both
+source baselines had it active throughout.
+
+Audited and clean: the validation span is byte-identical across all three
+artifacts (9,081,780 scored bytes, recomputed independently from the byte
+dataset and from the token shard, and both Bolmo arms report the same step-0
+BPB of 8.13146); no train/val contamination, since the split is document-level
+by hash after dedup and the val shard is the held-out FineWeb shard; both Bolmo
+arms consumed identical data; `evaluate` sets `eval()`/`train()` correctly with
+no cached batches; and the source's nextlat/MTP auxiliaries are `self.training`
+gated, so its own BPB is pure CE. All of it is n=1 per arm with no seeds.
+
+Review of the diagnostic found the routing fix itself correct — flipping the
+final byte of a row moves the scored logits by 1.48 under the old rule and by
+exactly 0.0 under causal routing, verified through every path: the
+suffix-matched encoder inputs, the mLSTM recurrences, `pool`'s `argsort`
+left-packing (prefix-stable, so the first patches are bit-identical across
+masks agreeing only on a prefix), and the KDA trunk. `_fused_targets` keeping
+the *unshifted* boundaries is also right: the fused head's label is the true
+boundary bit of byte `t+1`, not the bit used for routing, and substituting the
+routing mask there would be the bug.
+
+Three defects were real and are fixed. The end-to-end test was vacuous: the
+predictor's identity-initialized projections leave an untrained tiny encoder's
+cosine saturated on one side of `log 0.5`, so its thresholded mask never moved
+for any byte or seed and the assertion passed with `causal_routing` doing
+nothing — for three of four seeds the mask was a single patch, where the two
+rules cannot differ even in principle. It now randomizes those projections to
+make the decision live, taps the real decoder rather than a fake one, and
+asserts both directions. Nothing had exercised `prepare_hidden` under the
+shifted mask, where `clamp(min=0)` became load-bearing — the unshifted mask's
+forced leading boundary never produced a negative index, so deleting the clamp
+would have broken only the causal path, on GPU, silently. And
+`causal_routing` combined with the oracle, uniform or fixed-stride patchings
+now raises: those masks are whole-row quantities, non-causal by many bytes
+rather than one, and shifting their routing would not make them codelengths.
+
+Left as-is, pre-existing and unchanged by this work:
+`_force_well_formed_boundaries` never marks a row's last valid byte a boundary
+because its lookahead score is `-100_000`, so the trailing partial patch is
+never pooled and tail positions read the last complete patch. The causal run
+inherits that.
+
+## Bolmo does not beat its source: the margin was update count, and the comparison was never capacity-matched (2026-08-08)
+
+The earlier reading — Bolmo's 1.3629 joint BPB against the source's annealed
+1.3777 — does not survive its controls. Three independent findings remove it,
+and two of them cannot be fixed by re-running anything.
+
+### The margin was optimizer steps
+
+All arms consume exactly 524,288,000 source tokens of the same corpus in the
+same order.
+
+| run | updates x global batch | valid codelength (joint bpb) | marginalized byte bpb |
+| --- | --- | --- | --- |
+| source, annealed, 1 epoch | 1000 x 524,288 tok | **1.3777** | - |
+| Bolmo `srcopt_bs256`, 1 epoch | 1000 x 524,288 tok | **1.3927** | 1.2640 |
+| Bolmo `srcopt_v2`, 1 epoch | 2400 x 131,072/262,144 tok | **1.3629** | 1.2369 |
+| Bolmo `epoch1` (paper AdamW), 1 epoch | 2400 x 131,072/262,144 tok | 1.6276 | 1.4816 |
+| source, 2 epochs | 2000 x 524,288 tok | **1.3304** | - |
+
+At the source's exact batch and step count, Bolmo's codelength **loses by
+0.0150**. At 2.4x the updates on identical data it wins by 0.0148. The win and
+the loss are the same size; the effect is update count, not byteification.
+`bs256` still carries the per-stage LR restart, which favours Bolmo, and loses
+anyway.
+
+The source is also nowhere near converged: a second epoch takes it to 1.3304,
+below every Bolmo arm. Job 1499 queues the remaining control — the source at one
+epoch and 2000 updates (half batch), via the new `GLOBAL_BATCH_TOKENS` override,
+which is the first time this trainer's global batch has been anything but a
+hardcoded `8 * 64 * 1024`.
+
+### The comparison was never capacity-matched
+
+Counted from the two checkpoints:
+
+| | source | Bolmo `srcopt_v2` |
+| --- | --- | --- |
+| total parameters | 64,048,446 | 50,433,886 |
+| vocabulary I/O | 51,511,296 (80.4%) | 26,157,568 (51.9%) |
+| **modelling (non-vocab)** | **12,537,150** | **24,276,318** |
+
+`embed.weight` and `proj.weight` are untied — separate tensors, not `allclose`,
+different data pointers — and this trainer has no tying support at all
+(`TIE_EMBEDDINGS` lives only in `train_gpt.py`). Bolmo's `global_blocks` is
+12,485,822 parameters, the source trunk byte for byte; on top of it Bolmo adds
+2,935,328 encoder and 8,855,168 decoder parameters and deletes a 25.8M-parameter
+output projection that does no modelling. **Bolmo is the source's entire trunk
+plus 94% more compute-bearing capacity**, at 21% fewer total parameters, and
+those new parameters run at byte resolution (~4.56 bytes/patch), so the FLOP
+increase is larger still and is unmeasured.
+
+The paper holds this fixed: Bolmo 1B is -0.7% total parameters against OLMo 2
+1B, Bolmo 7B +4.5%. Here it is -21.3% total and +94.4% modelling. At
+`model_dim=512` with a 50,304-way untied head the head is 2.07x the modelling
+stack; the paper notes the softmax only begins to dominate a 1B model somewhere
+between 200k and 400k vocabulary. We are outside their regime, and
+"byteification at matched capacity" is not what this measures.
+
+### The source pays an unmeasured segmentation tax
+
+A subword model's reported BPB charges `-log P(canonical tokenization | text)`,
+not `-log P(text)`. That inflation is never measured. Structural bound over the
+validation span: ~3.4 vocabulary tokens prefix the upcoming bytes at each token
+start (only 11.4% of starts unambiguous), giving a ceiling of 0.3862 bits/byte.
+The bound is loose — a trained model concentrates on the canonical segmentation
+— but the direction is fixed: the source's true codelength is *below* 1.3777, so
+correcting for it widens the source's win. Bolmo's analogous tax is measured and
+paid (`joint - byte` = 0.1287 on `bs256`). The same asymmetry exists in the
+paper's own comparisons, where Bolmo still trails; it flatters byte models
+generally and does not explain why ours had looked different.
+
+### `joint_bpb`, not `canonical_bpb`, is the comparand
+
+Traced through the code rather than inferred. `pool` selects the **last** byte of
+each patch, so `pooled[k]` depends only on bytes up to that patch's end;
+`prepare_hidden` routes position `t` to `cumsum(boundaries)[t] - 1 <= t`. Neither
+leaks content. Position `t`'s logits are scored against
+`(byte[t+1], boundary[t+1])`, so `boundary[t]` — the bit routing consumes at `t`
+— was charged at `t-1`. `joint_bpb` is therefore a genuinely causal codelength,
+which is exactly the paper's Boundary Symbol Fusion, and it is tight. Only
+`byte_bpb` is invalid: marginalizing the boundary means never paying for a bit
+routing still reads.
+
+`causal_routing_bpb` is 3.4159 (`srcopt_v2`) and 3.6611 (`epoch1`) — about 2.2
+bpb above the marginalized number on both arms. That is almost entirely
+train/eval mismatch, not the leak: forcing routing one patch stale changes what
+every position reads. It is a valid upper bound and a useless one. The earlier
+framing of it as the primary codelength was wrong, and the driver docstrings and
+`pretraining/README.md` are corrected accordingly.
+
+Oracle patching is *worse* than predicted under the valid metric (joint 1.4464
+vs 1.3629 on `srcopt_v2`), because the joint charges for whichever boundary
+sequence is transmitted and the model finds its own cheap. The oracle is not an
+achievable ceiling for a causal predictor.
+
+### Baseline handicaps found, and what was ruled out
+
+The baseline is untuned, not sabotaged. `NUM_LAYERS=8` and `MLP_HIDDEN=2070` are
+hardcoded literals in `run_k3_context_curriculum.py:365,369` inherited from the
+16MB/10-min FineWeb lineage; every LR, WD and momentum is a trainer default; no
+mlq job in this repo has ever used `--sweep`; arm C was chosen for build-ordering
+risk and arms A/B/D were never built. Its two distinguishing flags were never
+validated together — on the v7 factorial (byte-identical configs, same step-0
+val_bpb 3.5345) NoPE alone cost +0.0014, NextLat alone cost **+0.0225 and 2.2x
+wall clock**, and the stacked cell was killed at step 10 and never measured. The
+source stacks both. Different dataset, so the sign is not guaranteed to carry.
+
+The tokenizer's compression advantage inverts on the evaluation distribution.
+Measured on the identical 9,081,775-byte window: GPT-2 needs 2,053,772 tokens
+(4.4220 bytes/token), ToaST+TST 50k needs 2,097,152 (4.3305) — ToaST is **2.1%
+worse** at the same 50,257 vocabulary. The recorded +13% was measured on a
+domain-weighted k3 sample; the validation shard is raw FineWeb and ToaST's
+`numeric.group_size: 1` was tuned for a math-30% mixture. BPB is designed to be
+tokenizer-independent so the BPB impact is *not* established — but the source
+pays whatever misfit exists and the byte model is structurally immune, and the
+GPT-2 control (arm B) was never built.
+
+Ruled out, with citations: every other `train_steps` coupling (weight decay is
+constructor-only, momentum warmup is absolute-step, `seq_len` is read once and
+never reassigned, no batch ramp, no EMA, auxiliary weights are module constants,
+`MTP_NUM_HEADS=0`); `WARMDOWN_ITERS` is inert in this trainer; data ordering
+(both runs consumed identical tokens in identical order, and the corpus is
+exactly one 1000-step epoch); validation-loop defects (NextLat and MTP both gate
+on `self.training`, so `eval()` is pure CE; the domain path uses the identical
+formula); NoPE extrapolation (train and val both 2048, no ramp); dtype (KDA
+kernel flags identical across both trainers, corroborated by Bolmo's stage-1
+oracle 1.3799 reproducing the source's 1.3777); vocabulary under-utilization
+(1,654 of 50,304 ids unseen); validation-set OOD-ness (symmetric — Bolmo is
+scored on the identical shard). Adversarial tuning is ruled out chronologically:
+the source finished 2026-08-06 19:47, the first Bolmo run started 21:09, and both
+post-hoc reruns move the baseline *down*. One asymmetry runs the other way —
+Bolmo's trunk is initialized from the weaker 1.4011 weights while being compared
+against 1.3777.
+
+No second conditioning leak exists. Row geometry is bit-exact against the raw
+shard for all 1024 rows, the BPB denominator is byte-identical at 9,081,780 on
+both sides, and the whole-row and row-length channels are closed.
+
+### Defects fixed in this pass
+
+The uniform floor was count-matched to the **oracle** while being used to
+bracket the **predicted** arm, which spends about 5% fewer patches — so the
+floor was systematically finer than the arm it bounded. `uniform_patching` now
+names the arm whose count it matches (`"oracle"` or `"predicted"`), the driver
+reports both floors, and `learned_predictor_placement_gain_bpb` compares the
+predicted arm only against its own count. The floor was also documented as
+"content-blind"; it is not, since the per-row patch count is content-derived
+from either source. It is placement-blind, and both docstrings now say so. The
+recovery ratio remains a rough guide: its endpoints sit at two different patch
+counts and its three terms carry different amounts of non-causality.
+
+`eval_bolmo_patching.py` had weaker provenance gates than the trainer — no
+`validate_paper_data_manifest` and no check of the dataset hash against the
+checkpoint's `data_manifest_sha256`, so a mismatched pair produced numbers
+silently. Both are now enforced.
+
+### Remaining exposure
+
+Not closed: `fineweb_edu_dedup` is ~37% of training and is a filtered FineWeb
+subset, and the validation shard never passes the deduplicator. An empirical
+64-token n-gram scan found 18/124,997 collisions (1.4e-4), all web boilerplate.
+This would inflate Bolmo and the source equally so the head-to-head is safe, but
+the absolute BPB is not a clean held-out number. Separately, the canonical
+validation span is 100% web while training is 42/30/14/14 web/math/code/knowledge;
+the `domainval_*` shards exist and are unused.
+
+The Stage-1 go/no-go gate reads `canonical_val_rows`, which is model selection on
+the evaluation set. Exposure is one binary decision with no best-checkpoint
+selection, and the 0.99 gate was overridden on both arms, so it was not binding.
+It should still be re-specified against a held-out slice or retired.
+
+Boundary bits over the unscored context prefix are supplied free: 5,453 bits over
+the corpus, 0.0006 bpb. Negligible but real.
+
+### What survives
+
+Byteification transfers the trunk faithfully — Bolmo's stage-1 oracle BPB of
+1.3799 reproduces the source's 1.3777 — and reaches a comparable codelength while
+spending its parameters very differently. "Bolmo produces a shorter code for this
+text than its source" is false at matched updates. "Bolmo models this text better
+than its source" was never supportable at this scale, because the two models do
+not have comparable modelling capacity and the source's BPB is inflated by an
+unmeasured tax. This is consistent with the paper, which reports Bolmo
+*approaching* its source and attributes the residual gap to boundary-predictor
+error (S6.1).
+
+### Review addendum to the entry above (2026-08-08)
+
+An adversarial review of the fixes found nine further defects. All are corrected.
+
+In `_uniform_boundaries`, the claim that a count match leaves "only placement"
+as the variable is false: the floor always closes the last valid byte, and
+`_force_well_formed_boundaries` never does, so the floor tiles a row the
+predicted arm leaves with an unpooled tail patch. Under 0.1% of a row, but the
+count-match framing made it newly load-bearing, so the docstring now says
+placement *and* tail-closure convention. The precondition
+`remaining_patches >= 1` is also newly reachable: predicted counts bottom out
+at 1 for a checkpoint whose predictor never fires, which oracle counts cannot
+do, so the error now explains that. `uniform_patching not in (\n X\n)` was bare
+grouping that a trailing comma would silently turn into a one-tuple rejecting
+every valid value; rewritten. `eval_bolmo_patching.py` now asserts each floor's
+`bytes_per_patch` equals its arm's — the check that would have caught this bug
+in the first place — and records `data`, `data_manifest_sha256`, `scored_rows`
+and the token budget in the summary, since validating provenance without
+recording it leaves the artifact unattributable.
+
+The new test survived a mutation replacing `_force_well_formed_boundaries`
+with a bare threshold, because its fixture had no padding and already fired at
+position 0 — the two things that function exists for. It now also asserts on a
+padded row whose predictor is silent at position 0 and active inside the pad
+region, where the well-formed count is 3 and the raw count 4. That mutant now
+fails.
+
+`GLOBAL_BATCH_TOKENS` had three holes. Resume never checked it, although the
+trainer has always written `global_batch_tokens` into the checkpoint: since
+`SEQ_LEN` and `MBS` deliberately vary across a curriculum resume, the global
+batch is the load-bearing invariant, and resuming under a different one
+re-indexes the data stream at `start_step * batch_size` and rescales the
+schedule. Guarded. `run_k3_context_curriculum.py` copied the ambient
+environment and popped only `RESUME_CHECKPOINT`, so an exported override would
+have halved a campaign whose own `expected_batch_tokens = 524_288` assert
+still claimed it had not; it now pops `GLOBAL_BATCH_TOKENS` too. And `0` and
+negatives passed `batch_size % (world_size * mbs * seq_len) == 0`, which the
+lazy data generator would have turned into a bare `ZeroDivisionError` after
+model init, compile warmup and step-0 validation; rejected up front.
+
+`train_bolmo.py` still described the causal-routing pass as "the number to
+compare against a subword model's bits-per-byte", the framing this entry calls
+wrong, and `eval_bolmo_patching.py` still offered `causal_routing_bpb` as a
+co-equal comparand. Both now say `joint_bpb` is the tight comparand and causal
+routing is a loose bracket. `learned_predictor_recovery` is already 1.012 and
+1.005 on the two measured arms — above the 1.0 its comment called full recovery
+— because the oracle is not a ceiling here; the comment now says so.
+
+Documentation errors corrected: the paragraph restating margins "against the
+annealed source" quoted 0.164 and 0.08, which are against the superseded
+un-annealed 1.4011; they are 0.141 and 0.104. `pretraining/README.md` named
+`val/joint_bpb`, which is the 256-example proxy's joint, where it meant
+`val/canonical_joint_bpb`. The math-30 profile's web share drops from 50% to
+42%, not 60% — `k3_weights_quality.json` is `0.5`. The 4.0001-bytes-per-token
+and 13%-compression figures came from a superseded 95.3 MB exploratory sample;
+the shipped artifact measures 3.7288 against GPT-2's 3.4673, i.e. 7.54%, which
+`tokenization/README.md` had already retired and the other two documents had
+not. No 16,384 artifact exists, so arm D has no measured compression at all.
+`k3_weights_math30.json` repeats the 60% error in its `description`, but it is
+bound by `weight_profile_sha256` in every built dataset, so it is left alone
+and wrong rather than silently re-hashed.
+
+Not fixed, recorded instead: `pretraining/README.md` prescribes
+`--max-train-examples 240000` (`..._paper_v3`) while every checkpoint behind
+the tables above carries `..._byte2048_epoch1` at 256,000, and `ExampleStream`
+uses `take_exact` with `repeat=False`, so the documented command does not
+reproduce the reported runs. `data/problem_registry/v1/overlap.json` is absent,
+so the admission-rate table in this file rests on no artifact on disk.
+
+### The learning-rate reset was not the confound (2026-08-08)
+
+`bolmo_armC_srcopt_cont` repeats the matched-batch arm (256 examples both
+stages, 1000 updates, 524,288 tokens per update, one 524,288,000-token epoch)
+under a single continuous cosine across the stage boundary instead of a
+per-stage restart. Only `BOLMO_SOURCE_SCHEDULE_SCOPE` differs.
+
+| matched arm | canonical byte bpb | canonical joint bpb |
+| --- | --- | --- |
+| per-stage restart (`bs256`) | 1.2640 | **1.3927** |
+| continuous (`cont`) | 1.2672 | **1.3960** |
+| source, annealed | - | **1.3777** |
+
+The continuous schedule is *worse* by 0.0033. It led at every intermediate
+step — proxy joint delta -0.1242 at step 340, narrowing monotonically to
+-0.0047 at 860 — and gave the lead back over the final anneal, because the
+per-stage arm runs a complete cosine inside stage 2 while the continuous one
+is already in its tail. Stage-1 canonical was 1.5162 against 1.4913, as
+expected when stage 1 ends at a 0.76 multiplier rather than annealed.
+
+So the schedule question that motivated this arm is closed in the opposite
+direction from the concern: the restart was worth 0.003 bpb and favoured
+Bolmo's competitor arm, not Bolmo. Both matched arms lose to the source, by
+0.0150 and 0.0183. The `srcopt_v2` margin of 0.0148 was update count, not
+schedule.
+
+Everything else agrees across the two arms — boundary accuracy 0.9836 both,
+bytes per patch 4.5659 against 4.5675, causal 3.4618 against 3.4555 — which is
+the check that the schedule was the only variable.

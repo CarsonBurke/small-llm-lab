@@ -18,8 +18,9 @@ mandatory 2,000-step ablation rules do not govern post-training work.
 
 ## Current Model Lineage
 
-- Canonical post-training base:
-  `postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt`.
+- Next canonical post-training base (after its required SFT run):
+  `postraining/runs/sft6_bare_a1swap10k_e3/sft_final_model.pt`. Do not treat
+  this path as available until the immutable run directory exists.
 - It is a three-epoch SFT checkpoint trained on verified reasoning traces with
   registered `<think>`, `</think>`, `<answer>`, and `</answer>` tokens.
 - Its pretrained ancestor, architecture metadata, tokenizer contract, source
@@ -94,20 +95,20 @@ Primary implementation and paper:
 
 ## Canonical Episode Contract
 
-Answer-fenced math SFT, RL, and evaluation use exactly one prompt suffix:
+Answer-fenced math SFT, RL, and evaluation use only the problem as the user
+prompt:
 
 ```text
 {bare problem}
-
-Start your response with <think> and reason until </think>, then end it with only the final answer inside <answer></answer>.
 ```
 
 Canonicalization removes source wrappers and legacy `Answer:` instructions;
-it must never append a second reminder. Reward and evaluation parse the
-registered tokens structurally and grade only the final-answer span. Prompt
-schema identifiers are checkpoint and resume invariants. If wording or token
-semantics change, version the schema, rebuild the data, and retrain SFT rather
-than adapting old checkpoints silently.
+it appends no replacement instruction. The completion itself begins with the
+registered `<think>` token and ends with an `<answer>...</answer>` span. Reward
+and evaluation parse those registered tokens structurally and grade only the
+final-answer span. Prompt schema identifiers are checkpoint and resume
+invariants. If wording or token semantics change, version the schema, rebuild
+the data, and retrain SFT rather than adapting old checkpoints silently.
 
 The source of truth is `postraining/math_prompt.py`.
 
