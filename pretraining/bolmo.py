@@ -1111,6 +1111,7 @@ class BolmoModel(nn.Module):
         fixed_stride: int | None = None,
         uniform_patching: str | None = None,
         causal_routing: bool = False,
+        patch_budget: int | None = None,
     ) -> BolmoValidationStatistics:
         """Return additive paper-style byte and diagnostic joint statistics.
 
@@ -1201,13 +1202,29 @@ class BolmoModel(nn.Module):
             )
         # ``pool`` truncates silently past its patch budget, which would make a
         # denser patching look better than it is by dropping the row's tail.
-        if int(boundaries.sum(1).max()) > batch.source_ids.shape[1]:
+        #
+        # The default budget is the stored source width, which is exactly right
+        # on the canonical panel, where the predictor emits fewer patches than
+        # the tokenizer did. It is not a modelling limit: the trunk is NoPE and
+        # `pool` only needs a fixed-size packed tensor. On out-of-distribution
+        # panels the predictor over-segments and can exceed it, so evaluation
+        # may raise the budget rather than report a truncated row. Doing so
+        # lets the trunk see a slightly longer sequence than training did;
+        # record the value used, and never lower it below the stored width.
+        budget = batch.source_ids.shape[1] if patch_budget is None else patch_budget
+        if budget < batch.source_ids.shape[1]:
+            raise ValueError(
+                "patch budget is below the stored source width, which would "
+                f"truncate rows the training geometry admits: {budget} < "
+                f"{batch.source_ids.shape[1]}"
+            )
+        if int(boundaries.sum(1).max()) > budget:
             raise ValueError(
                 "patching exceeded the pooled patch budget: "
-                f"{int(boundaries.sum(1).max())} > {batch.source_ids.shape[1]}"
+                f"{int(boundaries.sum(1).max())} > {budget}"
             )
         pooled, _ = self.local_encoder.pool(
-            byte_hidden, boundaries, max_patches=batch.source_ids.shape[1]
+            byte_hidden, boundaries, max_patches=budget
         )
         # ``prepare_hidden`` routes position ``t`` to patch
         # ``cumsum(boundaries)[t] - 1``, which consumes ``boundaries[t]``.

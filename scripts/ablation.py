@@ -390,17 +390,35 @@ def run_config(
     output_text = "".join(output_lines)
 
     val_entries = [e for e in entries if e["type"] == "val"]
-    final_bpb = (
-        val_entries[-1].get("val_canonical_bpb", val_entries[-1]["val_bpb"])
-        if val_entries
-        else None
+    # A script that reports a codelength reports it under this key, and it is
+    # the headline. Bolmo's `val_canonical_bpb` marginalizes a boundary bit
+    # that its own routing consumed, so it is below any achievable codelength
+    # and must not be compared against a subword model's bits-per-byte;
+    # preferring it here is what put an unreachable number in every summary.
+    # Subword runs emit no codelength key and fall through unchanged.
+    final_entry = val_entries[-1] if val_entries else None
+    final_bpb = None
+    if final_entry is not None:
+        final_bpb = final_entry.get("val_canonical_codelength_bpb")
+        if final_bpb is None:
+            final_bpb = final_entry.get("val_challenge_bpb")
+        if final_bpb is None and "val_proxy_bpb" not in final_entry:
+            final_bpb = final_entry.get(
+                "val_canonical_bpb", final_entry["val_bpb"]
+            )
+    final_marginalized_bpb = (
+        val_entries[-1].get("val_canonical_bpb") if val_entries else None
     )
     final_loss = (
         val_entries[-1].get("val_canonical_loss", val_entries[-1]["val_loss"])
         if val_entries
         else None
     )
-    final_proxy_bpb = val_entries[-1]["val_bpb"] if val_entries else None
+    final_proxy_bpb = (
+        val_entries[-1].get("val_proxy_bpb", val_entries[-1]["val_bpb"])
+        if val_entries
+        else None
+    )
     final_proxy_loss = val_entries[-1]["val_loss"] if val_entries else None
     final_probe_bpb = val_entries[-1].get("probe_val_bpb") if val_entries else None
     final_probe_loss = val_entries[-1].get("probe_val_loss") if val_entries else None
@@ -416,6 +434,9 @@ def run_config(
         "warmdown_iters_env": warmdown_iters_env,
         "elapsed_seconds": elapsed,
         "final_val_bpb": final_bpb,
+        # Kept so the paper-comparable marginalized number stays recoverable
+        # without re-reading metrics.jsonl. None for runs that never emit it.
+        "final_val_marginalized_bpb": final_marginalized_bpb,
         "final_val_loss": final_loss,
         "final_proxy_val_bpb": final_proxy_bpb,
         "final_proxy_val_loss": final_proxy_loss,
@@ -430,7 +451,12 @@ def run_config(
         print(f"  ERROR (rc={proc.returncode})")
         print(output_text[-1000:])
     else:
-        print(f"  Final BPB: {final_bpb:.4f}" if final_bpb else "  No val results found")
+        if final_bpb is not None:
+            print(f"  Final BPB: {final_bpb:.4f}")
+        elif final_proxy_bpb is not None:
+            print(f"  Final proxy BPB: {final_proxy_bpb:.4f}")
+        else:
+            print("  No val results found")
         print(f"  Elapsed: {elapsed:.1f}s")
 
     # Save result JSON; metrics.jsonl is the canonical machine-readable record.

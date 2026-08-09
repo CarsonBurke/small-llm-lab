@@ -1065,6 +1065,7 @@ def evaluate(
     fixed_stride: int | None = None,
     uniform_patching: str | None = None,
     causal_routing: bool = False,
+    patch_budget: int | None = None,
 ) -> EvaluationMetrics:
     model.eval()
     totals: BolmoValidationStatistics | None = None
@@ -1080,6 +1081,7 @@ def evaluate(
                 fixed_stride=fixed_stride,
                 uniform_patching=uniform_patching,
                 causal_routing=causal_routing,
+                patch_budget=patch_budget,
             )
         if totals is None:
             totals = chunk
@@ -1763,6 +1765,13 @@ def main() -> None:
                 f"val_canonical_loss:{canonical_validation.byte_loss:.6f} "
                 f"val_canonical_bpb:{canonical_validation.byte_bpb:.6f} "
                 f"val_canonical_joint_bpb:{canonical_validation.joint_bpb:.6f} "
+                # The headline. Same value as the joint, under the name that
+                # says what it is: the tightest bits-per-byte this model can
+                # actually be decoded at, and the only one comparable against
+                # a subword model. `val_canonical_bpb` marginalizes a boundary
+                # bit the routing already consumed, so it is unreachable.
+                f"val_canonical_codelength_bpb:"
+                f"{canonical_validation.joint_bpb:.6f} "
                 f"val_canonical_boundary_accuracy:"
                 f"{canonical_validation.boundary_accuracy:.6f} "
                 f"val_canonical_boundary_precision:"

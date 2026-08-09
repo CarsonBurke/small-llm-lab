@@ -853,3 +853,50 @@ def test_uniform_patching_rejects_an_unnamed_patch_count_source() -> None:
             assert "names the arm" in str(error)
         else:
             raise AssertionError(f"uniform_patching={bad!r} was accepted")
+
+
+def test_patch_budget_defaults_to_the_stored_width_and_refuses_to_shrink() -> None:
+    # The budget is what stops `pool` from silently dropping a row's tail, so
+    # it must fail loud in both directions: below the stored source width it
+    # would truncate rows the training geometry admits, and above it the
+    # over-segmentation guard must still fire.
+    architecture = tiny_architecture()
+    length = 8
+    predicted = torch.tensor([[True] * length])
+    log_probs = torch.where(
+        predicted, torch.zeros(1, length), torch.full((1, length), -100_000.0)
+    )
+    batch = _routing_probe_batch(length)
+    stored_width = batch.source_ids.shape[1]
+
+    model = _routing_probe_model(architecture, log_probs)
+    model.validation_statistics(batch)  # default budget == stored width
+
+    try:
+        model.validation_statistics(batch, patch_budget=stored_width - 1)
+    except ValueError as error:
+        assert "below the stored source width" in str(error)
+    else:
+        raise AssertionError("a budget below the stored width was accepted")
+
+    # Raising it is allowed and must not disturb the default-path result.
+    raised = _routing_probe_model(architecture, log_probs)
+    generous = raised.validation_statistics(batch, patch_budget=stored_width * 2)
+    baseline = _routing_probe_model(architecture, log_probs).validation_statistics(
+        batch
+    )
+    torch.testing.assert_close(generous.byte_nll, baseline.byte_nll)
+
+
+def test_patch_budget_still_refuses_an_over_segmented_row() -> None:
+    architecture = tiny_architecture()
+    length = 8
+    log_probs = torch.zeros(1, length)  # every position a boundary
+    batch = _routing_probe_batch(length)
+    model = _routing_probe_model(architecture, log_probs)
+    try:
+        model.validation_statistics(batch, patch_budget=length - 1)
+    except ValueError as error:
+        assert "pooled patch budget" in str(error) or "below the stored" in str(error)
+    else:
+        raise AssertionError("an over-segmented row was pooled silently")
