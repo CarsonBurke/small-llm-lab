@@ -42,6 +42,7 @@ canonical, most significant digit first, whichever method produced it.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 from collections.abc import Iterator, Sequence
@@ -50,9 +51,90 @@ from fractions import Fraction
 
 from postraining.problem_registry import problem_key
 
-DRILL_SCHEMA = "worked_arithmetic_drills/v2"
+DRILL_SCHEMA = "worked_arithmetic_drills/v3"
 
 DIGIT_ORDERS = ("reversed", "forward")
+
+
+def phrase(pool: tuple[str, ...], *parts: object) -> str:
+    """Deterministic phrasing pick, keyed on the operands.
+
+    Each working method opened with one fixed sentence through v2, so a
+    quarter of a million drills began with the identical string and the
+    instruction became a constant the model could ignore rather than English
+    it had to read. Keying on the operands rather than the generator's `rng`
+    keeps a drill a pure function of its problem, which is what lets the
+    probe panel be carved out by problem key alone.
+    """
+    digest = hashlib.blake2b(
+        "\x00".join(str(part) for part in parts).encode(), digest_size=8
+    ).digest()
+    return pool[int.from_bytes(digest, "little") % len(pool)]
+
+
+COLUMN_ADDITION_LEADS = (
+    "Add column by column, starting at the ones place.",
+    "Work right to left, one column at a time, carrying where needed.",
+    "Line the numbers up and add each column from the ones place.",
+    "Start at the ones place and add column by column.",
+    "Add the columns in turn, beginning at the right and carrying over.",
+)
+
+EXPANDED_ADDITION_LEADS = (
+    "Split both numbers by place value and add the places.",
+    "Break each number into its place values, then add matching places.",
+    "Take the largest place first: add place value by place value.",
+    "Expand both numbers into place values and combine them.",
+    "Add by place value, starting from the biggest place.",
+)
+
+COLUMN_SUBTRACTION_LEADS = (
+    "Subtract column by column, starting at the ones place.",
+    "Work right to left, one column at a time, borrowing where needed.",
+    "Start at the ones place and subtract column by column.",
+    "Line the numbers up and subtract each column from the right.",
+    "Take the columns in turn from the ones place, borrowing when short.",
+)
+
+EXPANDED_SUBTRACTION_LEADS = (
+    "Split both numbers by place value and subtract place by place; a "
+    "place may come out negative.",
+    "Break both numbers into place values and subtract each place; some "
+    "places will go negative.",
+    "Subtract place value by place value from the largest place; a negative "
+    "place is fine.",
+    "Expand both numbers and subtract matching places, keeping negative "
+    "places as they are.",
+)
+
+COLUMN_MULTIPLICATION_LEADS = (
+    "Multiply {left} by each digit of {right} from the ones place, then add "
+    "the partial products.",
+    "Take each digit of {right} in turn, starting at the ones place, "
+    "multiply {left} by it, and add the results.",
+    "Long multiplication: {left} times each digit of {right}, right to left, "
+    "then sum the partial products.",
+    "Work through the digits of {right} from the ones place, multiplying "
+    "{left} by each and adding as you go.",
+)
+
+EXPANDED_MULTIPLICATION_LEADS = (
+    "Split both numbers by place value and multiply every pair of places.",
+    "Break both numbers into place values, then multiply each pair.",
+    "Expand both numbers and take the product of every pair of places.",
+    "Multiply place by place: each place of one number against each place of "
+    "the other.",
+)
+
+LONG_DIVISION_LEADS = (
+    "Divide {dividend} by {divisor}, one digit at a time.",
+    "Long division: bring down the digits of {dividend} one at a time and "
+    "divide by {divisor}.",
+    "Work through {dividend} digit by digit, dividing each step by "
+    "{divisor}.",
+    "Take {dividend} one digit at a time, dividing by {divisor} and carrying "
+    "the remainder.",
+)
 
 
 @dataclass(frozen=True)
@@ -177,7 +259,7 @@ def column_addition(left: int, right: int) -> list[str]:
     left_digits = list(reversed(digits_of(left)))
     right_digits = list(reversed(digits_of(right)))
     width = max(len(left_digits), len(right_digits))
-    lines = ["Add column by column, starting at the ones place."]
+    lines = [phrase(COLUMN_ADDITION_LEADS, left, right)]
     written: list[int] = []
     carry = 0
     for index in range(width):
@@ -209,7 +291,7 @@ def expanded_addition(left: int, right: int) -> list[str]:
     left_digits = digits_of(left)
     right_digits = digits_of(right)
     width = max(len(left_digits), len(right_digits))
-    lines = ["Split both numbers by place value and add the places."]
+    lines = [phrase(EXPANDED_ADDITION_LEADS, left, right)]
     parts: list[int] = []
     for index in range(width - 1, -1, -1):
         a = left_digits[len(left_digits) - 1 - index] if index < len(left_digits) else 0
@@ -234,7 +316,7 @@ def column_subtraction(left: int, right: int) -> list[str]:
     """Ones-place-first column subtraction with explicit borrows."""
     left_digits = list(reversed(digits_of(left)))
     right_digits = list(reversed(digits_of(right)))
-    lines = ["Subtract column by column, starting at the ones place."]
+    lines = [phrase(COLUMN_SUBTRACTION_LEADS, left, right)]
     written: list[int] = []
     borrow = 0
     for index in range(len(left_digits)):
@@ -271,10 +353,7 @@ def expanded_subtraction(left: int, right: int) -> list[str]:
     left_digits = digits_of(left)
     right_digits = digits_of(right)
     width = max(len(left_digits), len(right_digits))
-    lines = [
-        "Split both numbers by place value and subtract place by place; a "
-        "place may come out negative."
-    ]
+    lines = [phrase(EXPANDED_SUBTRACTION_LEADS, left, right)]
     parts: list[int] = []
     for index in range(width - 1, -1, -1):
         a = left_digits[len(left_digits) - 1 - index] if index < len(left_digits) else 0
@@ -296,30 +375,110 @@ def expanded_subtraction(left: int, right: int) -> list[str]:
     return lines
 
 
-def partial_products(left: int, right: int, digit_order: str) -> list[str]:
-    """Multiplication by one partial product per digit of ``right``.
+def column_multiplication(left: int, right: int) -> list[str]:
+    """Ones-place-first long multiplication with every column worked.
 
-    Partial products do not depend on each other, so either order reads
-    correctly; only the running total has to follow the order chosen.
+    Each partial product is decomposed digit by digit with its carries, and
+    the partial products are then combined by column addition, so no line
+    asks for a product wider than one digit by one digit. That is what makes
+    this family learnable the way `column_addition` is: the single-digit
+    times table appears inside every multi-digit drill, instead of only in
+    the hundred-problem one-digit corner the deduplicator can never repeat.
     """
-    indexed = list(enumerate(reversed(digits_of(right))))
-    if digit_order == "forward":
-        indexed = list(reversed(indexed))
     lines = [
-        f"Multiply {left} by each digit of {right}, then add the partial "
-        "products."
+        phrase(COLUMN_MULTIPLICATION_LEADS, left, right).format(
+            left=left, right=right
+        )
     ]
     parts: list[int] = []
-    for index, digit in indexed:
-        part = left * digit * 10**index
+    for index, digit in enumerate(reversed(digits_of(right))):
         shift = "" if index == 0 else f", shifted {plural(index, 'place')}"
-        lines.append(f"{left} x {digit} ({place_name(index)}){shift} = {part}")
+        lines.append(
+            f"Partial product for the {place_name(index)} digit {digit}{shift}:"
+        )
+        written: list[int] = []
+        carry = 0
+        for position, a in enumerate(reversed(digits_of(left))):
+            base = a * digit
+            total = base + carry
+            # 9 x 9 + 8 = 89 is the widest column, so the carry is always a
+            # single digit and every line stays a times-table fact.
+            expression = (
+                f"{a} x {digit} = {base} + {carry} carried = {total}"
+                if carry
+                else f"{a} x {digit} = {total}"
+            )
+            lines.append(
+                f"  {place_name(position)}: {expression}, write {total % 10}, "
+                f"carry {total // 10}"
+            )
+            written.append(total % 10)
+            carry = total // 10
+        if carry:
+            lines.append(
+                f"  {place_name(len(written))}: nothing left but the carry "
+                f"{carry}"
+            )
+            written.append(carry)
+        digit_text = " ".join(str(d) for d in written)
+        part = left * digit * 10**index
+        lines.append(
+            f"  Digits from the ones place: {digit_text} -> {left * digit}"
+            + (f", shifted {plural(index, 'place')} -> {part}" if index else "")
+        )
         parts.append(part)
+    running = parts[0]
+    for part in parts[1:]:
+        lines.append(f"Add the next partial product: {running} + {part}")
+        lines.extend(f"  {line}" for line in column_addition(running, part)[1:])
+        running += part
+    lines.append(f"Product: {running}")
+    return lines
+
+
+def expanded_multiplication(left: int, right: int) -> list[str]:
+    """Largest-place-first multiplication by expanded form.
+
+    Splitting *both* operands means every product line is a single-digit
+    times-table fact scaled by a power of ten, and no line depends on the
+    ones below it -- the multiplicative analogue of `expanded_addition`.
+    """
+    left_digits = digits_of(left)
+    right_digits = digits_of(right)
+    lines = [phrase(EXPANDED_MULTIPLICATION_LEADS, left, right)]
+    parts: list[int] = []
+    for left_offset, a in enumerate(left_digits):
+        left_index = len(left_digits) - 1 - left_offset
+        for right_offset, b in enumerate(right_digits):
+            right_index = len(right_digits) - 1 - right_offset
+            zeros = left_index + right_index
+            part = a * b * 10**zeros
+            # Without a scale the restatement would just repeat itself, so
+            # the ones-by-ones line stays the bare times-table fact.
+            lines.append(
+                f"{a * 10**left_index} x {b * 10**right_index} = "
+                f"{a} x {b} = {a * b}, then {plural(zeros, 'zero')} -> {part}"
+                if zeros
+                else f"{a} x {b} = {a * b}"
+            )
+            parts.append(part)
     running = parts[0]
     for part in parts[1:]:
         lines.append(f"{running} + {part} = {running + part}")
         running += part
     return lines
+
+
+def partial_products(left: int, right: int, digit_order: str) -> list[str]:
+    """Worked multiplication in the requested reading order.
+
+    Both orders are fully decomposed to single-digit products; they differ in
+    which end they start from, exactly as `column_addition` and
+    `expanded_addition` do for the additive families.
+    """
+    if digit_order == "reversed":
+        return column_multiplication(left, right)
+    return expanded_multiplication(left, right)
 
 
 def long_division(dividend: int, divisor: int, places: int) -> list[str]:
@@ -331,7 +490,11 @@ def long_division(dividend: int, divisor: int, places: int) -> list[str]:
     """
     if divisor <= 0:
         raise ValueError(f"divisor must be positive, got {divisor}")
-    lines = [f"Divide {dividend} by {divisor}, one digit at a time."]
+    lines = [
+        phrase(LONG_DIVISION_LEADS, dividend, divisor, places).format(
+            dividend=dividend, divisor=divisor
+        )
+    ]
     remainder = 0
     quotient: list[str] = []
     for digit in digits_of(dividend):
@@ -400,7 +563,12 @@ def sub_integer(rng: random.Random, digit_order: str, digits: int) -> Drill:
 
 def mul_integer(rng: random.Random, digit_order: str, digits: int) -> Drill:
     left = sample_integer(rng, digits)
-    right = sample_integer(rng, rng.randint(1, max(1, digits - 1)))
+    # The multiplier spans the full width, not `digits - 1`. Capping it
+    # strictly below the multiplicand meant no equal-width multiplication
+    # existed at all -- v2 held no 2x2, 3x3 or 4x4 -- and 4x4 is 66.9% of the
+    # MathGLM corpus, which states such products as a single mapping and
+    # leaves this family to supply the algorithm behind them.
+    right = sample_integer(rng, rng.randint(1, digits))
     return Drill(
         family="mul_integer",
         problem=f"What is {left} * {right}?",
@@ -903,7 +1071,7 @@ DEFAULT_CURRICULUM = (
     FamilySpec("add_integer", 12.0, 1, 6),
     FamilySpec("sub_integer", 12.0, 1, 6),
     FamilySpec("mul_integer", 12.0, 1, 4),
-    FamilySpec("div_integer", 12.0, 2, 5),
+    FamilySpec("div_integer", 12.0, 1, 5),
     FamilySpec("add_decimal", 7.0, 1, 4),
     FamilySpec("sub_decimal", 7.0, 1, 4),
     FamilySpec("mul_decimal", 6.0, 1, 3),

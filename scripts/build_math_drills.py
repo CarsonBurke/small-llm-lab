@@ -158,6 +158,12 @@ def main() -> int:
             "training_count": args.count,
             "min_digits": min(item.digits for item in panel),
             "disjoint_from_training": True,
+            # Disjointness is a claim about one drill corpus, so the panel
+            # names it. Without this a panel cut against an older stream still
+            # reads as held out, and the probe reports memorised items as
+            # generalisation.
+            "drill_schema": DRILL_SCHEMA,
+            "drills_sha256": drills_digest,
         },
     )
     probe_digest = hashlib.sha256(probe_path.read_bytes()).hexdigest()

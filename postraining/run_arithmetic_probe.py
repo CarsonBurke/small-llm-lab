@@ -98,8 +98,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--panel",
-        default="data/math_drills/v1/probe.jsonl",
-        help="held-out panel written by scripts/build_math_drills.py",
+        default="data/math_drills/v4/probe.jsonl",
+        help="held-out panel written by scripts/build_math_drills.py; it must "
+        "be the panel cut against the drill corpus the model trained on",
     )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--prompt-tokens", type=int, default=256)
@@ -131,6 +132,27 @@ def main() -> None:
         parser.error(
             f"{panel_path} does not record disjointness from the drill "
             "training stream; it is not a held-out panel"
+        )
+    # Disjointness holds against exactly one drill corpus. A panel that does
+    # not name which one cannot be checked, and a panel left pointing at an
+    # older corpus scores items the model was trained on -- 84 of the 1,920
+    # items in the v1 panel appear verbatim in the v3 training stream. Both
+    # cases fail here rather than quietly reporting inflated accuracy.
+    panel_drills = panel_provenance.get("drills_sha256")
+    if not panel_drills or not panel_provenance.get("drill_schema"):
+        parser.error(
+            f"{panel_path} does not name the drill corpus it was cut against; "
+            "rebuild it with scripts/build_math_drills.py"
+        )
+    manifest_path = panel_path.parent / "manifest.json"
+    if not manifest_path.is_file():
+        parser.error(f"no drill manifest beside the panel at {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("drills_sha256") != panel_drills:
+        parser.error(
+            f"{panel_path} was cut against drills {panel_drills[:12]} but "
+            f"{manifest_path} holds {str(manifest.get('drills_sha256'))[:12]}; "
+            "the panel and the corpus beside it are from different builds"
         )
 
     checkpoint_path = Path(args.checkpoint)

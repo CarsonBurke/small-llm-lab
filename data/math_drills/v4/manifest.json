@@ -1,0 +1,132 @@
+{
+  "drills_sha256": "e9c9c476e4cd68cfdba4127260ae740a9a899ca269d0097404fe16e0276f01f8",
+  "probe_items": 1920,
+  "probe_seed": 20260806,
+  "probe_sha256": "285cb1b542ef663f87f8847fcfbe52ff135a12444251cd39ce48f88a57851653",
+  "problem_registry": {
+    "directory": "/home/marvin/Documents/repositories/parameter-golf/data/problem_registry/v1",
+    "excluded_problem_keys": 344309,
+    "registry_sha256": "01cb4ce0296026934f0c28b958e2decabc0b867dc745f4444027cf7ea9abcbc7"
+  },
+  "requested_count": 2000000,
+  "schema": "worked_arithmetic_drills/v3",
+  "seed": 11,
+  "statistics": {
+    "characters": 1028740188,
+    "digit_orders": {
+      "forward": 1346633,
+      "reversed": 653367
+    },
+    "digits_by_family": {
+      "add_decimal": {
+        "1": 48964,
+        "2": 50986,
+        "3": 50832,
+        "4": 51103
+      },
+      "add_integer": {
+        "1": 97,
+        "2": 8788,
+        "3": 52958,
+        "4": 58124,
+        "5": 58096,
+        "6": 58270
+      },
+      "compare_decimal": {
+        "1": 28662,
+        "2": 29338,
+        "3": 29041,
+        "4": 29378
+      },
+      "div_decimal": {
+        "1": 39164,
+        "2": 52164,
+        "3": 57455
+      },
+      "div_integer": {
+        "1": 80,
+        "2": 720,
+        "3": 35317,
+        "4": 65449,
+        "5": 69848
+      },
+      "fraction_add": {
+        "1": 3296,
+        "2": 57014
+      },
+      "fraction_mul": {
+        "1": 3294,
+        "2": 43060
+      },
+      "mul_decimal": {
+        "1": 49011,
+        "2": 56860,
+        "3": 58122
+      },
+      "mul_integer": {
+        "1": 99,
+        "2": 8959,
+        "3": 61787,
+        "4": 85115
+      },
+      "percent_change": {
+        "1": 257,
+        "2": 2270,
+        "3": 16151,
+        "4": 26855
+      },
+      "percent_of": {
+        "1": 233,
+        "2": 2134,
+        "3": 17071,
+        "4": 32837
+      },
+      "round_decimal": {
+        "1": 19713,
+        "2": 26425,
+        "3": 28890,
+        "4": 29007
+      },
+      "sub_decimal": {
+        "1": 47530,
+        "2": 50499,
+        "3": 50633,
+        "4": 50713
+      },
+      "sub_integer": {
+        "1": 55,
+        "2": 4993,
+        "3": 53877,
+        "4": 57849,
+        "5": 57963,
+        "6": 58295
+      },
+      "unit_convert": {
+        "1": 723,
+        "2": 6571,
+        "3": 22525,
+        "4": 34480
+      }
+    },
+    "drills": 2000000,
+    "families": {
+      "add_decimal": 201885,
+      "add_integer": 236333,
+      "compare_decimal": 116419,
+      "div_decimal": 148783,
+      "div_integer": 171414,
+      "fraction_add": 60310,
+      "fraction_mul": 46354,
+      "mul_decimal": 163993,
+      "mul_integer": 155960,
+      "percent_change": 45533,
+      "percent_of": 52275,
+      "round_decimal": 104035,
+      "sub_decimal": 199375,
+      "sub_integer": 233032,
+      "unit_convert": 64299
+    },
+    "mean_document_characters": 514.370094,
+    "schema": "worked_arithmetic_drills/v3"
+  }
+}

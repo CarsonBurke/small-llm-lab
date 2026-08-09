@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import random
 import re
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +16,7 @@ from postraining.arithmetic_probe import (
     TRAINING_SEED,
     assert_disjoint,
     build_panel,
+    read_panel,
     canonical_answer,
     graded,
     read_panel,
@@ -24,16 +27,19 @@ from postraining.arithmetic_probe import (
 from postraining.math_drills import (
     BUILDERS,
     DEFAULT_CURRICULUM,
+    DRILL_SCHEMA,
     DIGIT_ORDERS,
     FAMILIES,
     FAMILY_ORDERS,
     FamilySpec,
     column_addition,
+    column_multiplication,
     column_subtraction,
     decimal_places,
     decimal_text,
     drill_statistics,
     expanded_addition,
+    expanded_multiplication,
     expanded_subtraction,
     generate,
     long_division,
@@ -118,8 +124,67 @@ def test_partial_products_end_on_the_product_in_both_orders():
 
 
 def test_partial_products_start_at_the_declared_end():
-    assert "(ones)" in partial_products(123, 456, "reversed")[1]
-    assert "(hundreds)" in partial_products(123, 456, "forward")[1]
+    assert "ones digit" in partial_products(123, 456, "reversed")[1]
+    # Expanded form leads with the largest pair of places.
+    assert partial_products(123, 456, "forward")[1].startswith("100 x 400")
+
+
+# Every multiplication line must be a fact the model can read off rather than
+# a product it has to already know. The v2 corpus rendered `2933 x 3 = 8799`
+# as a single line, which is a lookup, and the family scored 0% at every digit
+# count while column-decomposed addition scored 95.8%.
+COLUMN_PRODUCT = re.compile(r"^\s+[a-z0-9^ ]+: (\d+) x (\d+) = ")
+
+
+def test_column_multiplication_never_asks_for_a_wide_product():
+    for left, right in [(2933, 3), (47, 68), (5039, 4589), (7, 8), (1000, 9)]:
+        for line in column_multiplication(left, right):
+            found = COLUMN_PRODUCT.match(line)
+            if found:
+                a, b = (int(group) for group in found.groups())
+                assert a < 10 and b < 10, (line, left, right)
+
+
+def test_expanded_multiplication_reduces_every_place_pair_to_a_digit_fact():
+    for left, right in [(2933, 3), (47, 68), (5039, 4589)]:
+        for line in expanded_multiplication(left, right)[1:]:
+            if "->" in line or line.count(" x ") == 1 and "+" not in line:
+                digits = re.search(r"(?:^|= )(\d) x (\d) = (\d+)", line)
+                assert digits, line
+                a, b, product = (int(group) for group in digits.groups())
+                assert a * b == product, line
+
+
+def test_both_multiplication_orders_reconstruct_the_product():
+    generator = random.Random(11)
+    for _ in range(400):
+        left = generator.randint(0, 99999)
+        right = generator.randint(0, 9999)
+        for order in DIGIT_ORDERS:
+            lines = partial_products(left, right, order)
+            assert lines[-1].endswith(str(left * right)), (left, right, order)
+
+
+def test_multiplication_orders_are_actually_different():
+    """v2 shipped 125,883 rows whose two `digit_order` labels rendered the
+    same bytes, because a single-digit multiplier left one partial product
+    and nothing to reorder."""
+    for left, right in [(2933, 3), (47, 68), (9, 9)]:
+        assert partial_products(left, right, "reversed") != partial_products(
+            left, right, "forward"
+        )
+
+
+def test_mul_integer_reaches_multi_digit_multipliers():
+    """v2 capped the multiplier strictly below the multiplicand, so no
+    equal-width multiplication existed anywhere in the corpus."""
+    generator = random.Random(3)
+    widths = set()
+    for _ in range(400):
+        drill = BUILDERS["mul_integer"](generator, "reversed", 4)
+        left, right = re.search(r"What is (\d+) \* (\d+)\?", drill.problem).groups()
+        widths.add((len(left), len(right)))
+    assert (4, 4) in widths
 
 
 def test_long_division_quotient_digits_reconstruct_the_quotient():
@@ -467,3 +532,22 @@ def test_a_trained_combiner_is_detected_from_the_parameters():
     # A bare backbone checkpoint, which is what SFT writes.
     assert not carries_trained_combiner({"model": {"blocks.0.attn.qkv.weight": None}})
     assert not carries_trained_combiner({})
+
+
+DRILL_CORPUS = Path(__file__).resolve().parents[1] / "data" / "math_drills" / "v4"
+
+
+@pytest.mark.skipif(
+    not (DRILL_CORPUS / "probe.jsonl").exists(),
+    reason="drill corpus has not been built in this checkout",
+)
+def test_the_shipped_panel_names_the_corpus_it_was_cut_against():
+    # The probe defaulted to a v1 panel long after the drill stream had moved
+    # on, and 84 of its 1,920 items were in the training set by then. The
+    # panel recorded disjointness without saying from what, so nothing caught
+    # it. These two fields are what makes that failure loud.
+    _, provenance = read_panel(DRILL_CORPUS / "probe.jsonl")
+    manifest = json.loads((DRILL_CORPUS / "manifest.json").read_text())
+    assert provenance["disjoint_from_training"]
+    assert provenance["drill_schema"] == DRILL_SCHEMA
+    assert provenance["drills_sha256"] == manifest["drills_sha256"]
