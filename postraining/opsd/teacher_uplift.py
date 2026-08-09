@@ -25,11 +25,8 @@ from postraining.model_io import load_model
 from postraining.opsd.data import TEACHER_PROMPT_SCHEMA, build_teacher_prompt
 from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX_ANSWER
 from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
-from postraining.opsd.prepare_dapo import (
-    DAPO_OPSD_DATA_SCHEMA,
-    DAPO_OPSD_SPLIT_SCHEMA,
-    file_sha256,
-)
+from postraining.opsd.manifest import validate_final_answer_manifest
+from postraining.opsd.prepare_dapo import file_sha256
 
 
 TEACHER_UPLIFT_SCHEMA = "opsd_frozen_teacher_uplift/v3"
@@ -250,11 +247,11 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--gate-data",
-        default="postraining/data/opsd_dapo17k_contractlast_gate.parquet",
+        default="postraining/data/opsd_dapo17k_bare_gate.parquet",
     )
     parser.add_argument(
         "--data-manifest",
-        default="postraining/data/opsd_dapo17k_contractlast.manifest.json",
+        default="postraining/data/opsd_dapo17k_bare.manifest.json",
     )
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--samples", type=int, default=8)
@@ -286,10 +283,10 @@ def main() -> None:
     gate_path = Path(args.gate_data)
     manifest_path = Path(args.data_manifest)
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("schema") != DAPO_OPSD_DATA_SCHEMA:
-        parser.error("data manifest uses a different DAPO schema")
-    if manifest.get("split_schema") != DAPO_OPSD_SPLIT_SCHEMA:
-        parser.error("data manifest uses a different DAPO split schema")
+    try:
+        validate_final_answer_manifest(manifest)
+    except ValueError as error:
+        parser.error(str(error))
     if file_sha256(gate_path) != manifest.get("gate_sha256"):
         parser.error("gate parquet does not match its manifest hash")
     if args.rows != manifest.get("gate_rows"):
@@ -307,7 +304,7 @@ def main() -> None:
         sft, answer_fence=True, source="OPSD uplift checkpoint"
     )
     if sft.get("traces_sha256") != manifest.get("sft_corpus_sha256"):
-        parser.error("checkpoint SFT corpus does not match DAPO gate manifest")
+        parser.error("checkpoint SFT corpus does not match OPSD gate manifest")
     context_tokens = int(payload.get("train_seq_len", 1024))
     if args.max_completion_length >= context_tokens:
         parser.error("completion length must leave room for the prompt")
@@ -321,6 +318,9 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=True,
         answer_tokens=True,
+        tokenizer_provenance=payload["model_config"].get(
+            "tokenizer_provenance"
+        ),
     )
     device = torch.device("cuda")
     model = load_model(checkpoint_path, device, payload=payload)

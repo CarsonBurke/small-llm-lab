@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 DEFAULT_CHECKPOINT = (
-    "postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt"
+    "postraining/runs/sft6_bare_a1swap10k_e3/sft_final_model.pt"
 )
 
 
@@ -40,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--data-manifest",
         default=None,
         help=(
-            "Dataset-build manifest. Required for the explicit DAPO "
+            "Dataset-build manifest. Required for explicit final-answer "
             "solution and permuted-solution arms."
         ),
     )
@@ -48,8 +48,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--authorization",
         default=None,
         help=(
-            "Dual frozen-gate pass artifact. Required for explicit DAPO "
-            "solution and permuted-solution training arms."
+            "Dual frozen-gate pass artifact. Required for explicit "
+            "final-answer solution and permuted-solution training arms."
         ),
     )
     parser.add_argument(
@@ -93,6 +93,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--generation-log-samples", type=int, default=2)
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=0,
+        help=(
+            "Optionally evaluate the question-only policy on --eval-data at "
+            "step 0 and this cadence. Disabled by default because live "
+            "VAPO-style train accuracy grades existing rollouts without "
+            "additional generation."
+        ),
+    )
+    parser.add_argument(
+        "--eval-data",
+        default="postraining/data/deepmind-interpolate-easy.parquet",
+        help=(
+            "Verifier dataset excluded from SFT and OPSD training. The "
+            "default is the fixed DeepMind interpolate-easy panel."
+        ),
+    )
+    parser.add_argument("--eval-rows", type=int, default=144)
+    parser.add_argument("--eval-samples", type=int, default=8)
+    parser.add_argument("--eval-batch-trajectories", type=int, default=128)
+    parser.add_argument("--eval-temperature", type=float, default=1.1)
+    parser.add_argument("--eval-top-p", type=float, default=0.95)
+    parser.add_argument("--eval-top-k", type=int, default=20)
+    parser.add_argument("--eval-think-min-tokens", type=int, default=33)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--think-tokens",
@@ -129,6 +155,10 @@ def validate_args(args: argparse.Namespace) -> None:
         "max_prompt_length",
         "logit_chunk_tokens",
         "save_every",
+        "eval_rows",
+        "eval_samples",
+        "eval_batch_trajectories",
+        "eval_think_min_tokens",
     )
     for field in positive_ints:
         if getattr(args, field) < 1:
@@ -157,6 +187,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--weight-decay must be nonnegative")
     if args.generation_log_samples < 0:
         raise ValueError("--generation-log-samples must be nonnegative")
+    if args.eval_every < 0:
+        raise ValueError("--eval-every must be nonnegative")
+    if args.eval_temperature <= 0:
+        raise ValueError("--eval-temperature must be positive")
+    if not 0 < args.eval_top_p <= 1:
+        raise ValueError("--eval-top-p must be in (0, 1]")
+    if args.eval_top_k < 0:
+        raise ValueError("--eval-top-k must be nonnegative")
     if args.answer_fence and args.think_tokens is False:
         raise ValueError("--answer-fence requires --think-tokens")
 

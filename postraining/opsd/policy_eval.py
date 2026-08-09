@@ -32,11 +32,11 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--gate-data",
-        default="postraining/data/opsd_dapo17k_contractlast_gate.parquet",
+        default="postraining/data/opsd_dapo17k_bare_gate.parquet",
     )
     parser.add_argument(
         "--data-manifest",
-        default="postraining/data/opsd_dapo17k_contractlast.manifest.json",
+        default="postraining/data/opsd_dapo17k_bare.manifest.json",
     )
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--samples", type=int, default=8)
@@ -92,6 +92,9 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=True,
         answer_tokens=True,
+        tokenizer_provenance=payload["model_config"].get(
+            "tokenizer_provenance"
+        ),
     )
     device = torch.device("cuda")
     model = load_model(checkpoint_path, device, payload=payload)

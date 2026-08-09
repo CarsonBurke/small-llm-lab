@@ -6,12 +6,23 @@ import argparse
 import json
 from pathlib import Path
 
+from postraining.opsd.data import file_sha256
+from postraining.opsd.data import TEACHER_PROMPT_SCHEMA
+from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
 from postraining.opsd.teacher_logit_gate import TEACHER_LOGIT_GATE_SCHEMA
 from postraining.opsd.teacher_uplift import TEACHER_UPLIFT_SCHEMA
 from postraining.opsd.teacher_uplift import atomic_json
 
 
-OPSD_AUTHORIZATION_SCHEMA = "opsd_dual_frozen_gate_authorization/v1"
+OPSD_AUTHORIZATION_SCHEMA = "opsd_dual_frozen_gate_authorization/v2"
+AUTHORIZATION_GATE_CONTRACT = {
+    "generation_schema": TEACHER_UPLIFT_SCHEMA,
+    "logit_schema": TEACHER_LOGIT_GATE_SCHEMA,
+    "logit_panel_role": "authorization",
+    "conditioning_method": "answer_only_frozen_self_rationalization_extension",
+    "teacher_prompt_schema": TEACHER_PROMPT_SCHEMA,
+    "opsd_prompt_schema": OPSD_PROMPT_SCHEMA,
+}
 
 
 def main() -> None:
@@ -23,8 +34,10 @@ def main() -> None:
     output = Path("postraining/runs") / args.name
     if output.exists():
         parser.error(f"refusing to overwrite authorization {output}")
-    generation = json.loads(Path(args.generation_gate).read_text())
-    logit = json.loads(Path(args.logit_gate).read_text())
+    generation_path = Path(args.generation_gate)
+    logit_path = Path(args.logit_gate)
+    generation = json.loads(generation_path.read_text())
+    logit = json.loads(logit_path.read_text())
     if generation.get("schema") != TEACHER_UPLIFT_SCHEMA:
         parser.error("generation gate has an incompatible schema")
     if logit.get("schema") != TEACHER_LOGIT_GATE_SCHEMA:
@@ -43,6 +56,12 @@ def main() -> None:
         "data_manifest_sha256"
     ):
         parser.error("frozen gates used different data manifests")
+    if generation.get("opsd_prompt_schema") != logit.get("opsd_prompt_schema"):
+        parser.error("frozen gates used different OPSD prompt schemas")
+    if generation.get("teacher_prompt_schema") != TEACHER_PROMPT_SCHEMA:
+        parser.error("generation gate used a different teacher prompt schema")
+    if generation.get("opsd_prompt_schema") != OPSD_PROMPT_SCHEMA:
+        parser.error("frozen gates used a different OPSD prompt schema")
     decisions = {
         "generation": generation["decision"],
         "logit": logit["decision"],
@@ -55,9 +74,16 @@ def main() -> None:
         "checkpoint_sha256": generation["checkpoint_sha256"],
         "gate_sha256": generation["gate_sha256"],
         "data_manifest_sha256": generation["data_manifest_sha256"],
-        "inputs": {
-            "generation_gate": args.generation_gate,
-            "logit_gate": args.logit_gate,
+        "gate_contract": dict(AUTHORIZATION_GATE_CONTRACT),
+        "input_artifacts": {
+            "generation_gate": {
+                "path": str(generation_path),
+                "sha256": file_sha256(generation_path),
+            },
+            "logit_gate": {
+                "path": str(logit_path),
+                "sha256": file_sha256(logit_path),
+            },
         },
     }
     output.mkdir(parents=True)

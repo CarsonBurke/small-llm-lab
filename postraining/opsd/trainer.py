@@ -10,22 +10,42 @@ from collections import Counter
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
-from postraining.core import load_posttraining_tokenizer
+from postraining.core import (
+    answer_style,
+    deterministic_math_subset,
+    load_posttraining_tokenizer,
+    load_unique_math_rows,
+    structural_format_ok,
+)
+from postraining.latent_eval import evaluate_latent_math, verify_terminated_answer
 from postraining.latent_rollout import emitted_token_rows, rollout_continuations
 from postraining.latent_thought import LatentThoughtModel
 from postraining.model_io import load_model
-from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
+from postraining.math_prompt import (
+    ANSWER_FENCE_PROMPT_SCHEMA,
+    canonicalize_answer_fence_rows,
+)
 from postraining.opsd.config import resolved_distillation_temperature
-from postraining.opsd.authorize import OPSD_AUTHORIZATION_SCHEMA
+from postraining.opsd.authorize import (
+    AUTHORIZATION_GATE_CONTRACT,
+    OPSD_AUTHORIZATION_SCHEMA,
+)
 from postraining.opsd.data import (
+    OPSDExample,
     ShuffledExampleSampler,
+    SourceQuotaSampler,
     TEACHER_PROMPT_SCHEMA,
     file_sha256,
     load_examples,
     resolve_reference_column,
     tokenize_example,
+)
+from postraining.opsd.manifest import (
+    source_quotas,
+    validate_final_answer_manifest,
 )
 from postraining.opsd.loss import backward_opsd_example
 from postraining.opsd.schemas import (
@@ -68,14 +88,21 @@ _RESUME_EXACT_FIELDS = (
     "answer_fence",
 )
 
-_DAPO_MANIFEST_SCHEMA = "dapo_opsd_final_answer_privilege/v2"
-_DAPO_SPLIT_SCHEMA = (
-    "sha256_clean_gate_then_split_local_token_length_answer_derangement/v3"
+_RESUME_EVAL_FIELDS = (
+    "eval_data",
+    "eval_rows",
+    "eval_samples",
+    "eval_batch_trajectories",
+    "eval_temperature",
+    "eval_top_p",
+    "eval_top_k",
+    "eval_think_min_tokens",
 )
 
+OPSD_REWARD_MIN_THINK_TOKENS = 33
 
 def validate_data_manifest(args, payload: dict) -> dict[str, object] | None:
-    """Bind explicit DAPO arms to one immutable, decontaminated data build."""
+    """Bind final-answer arms to one immutable, decontaminated data build."""
     controlled_columns = {"solution", "permuted_solution"}
     if args.data_manifest is None:
         if args.reference_column in controlled_columns:
@@ -85,16 +112,7 @@ def validate_data_manifest(args, payload: dict) -> dict[str, object] | None:
         return None
     manifest_path = Path(args.data_manifest)
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("schema") != _DAPO_MANIFEST_SCHEMA:
-        raise ValueError("OPSD data manifest has an incompatible schema")
-    if manifest.get("split_schema") != _DAPO_SPLIT_SCHEMA:
-        raise ValueError(
-            "OPSD data manifest lacks the split-local permutation contract"
-        )
-    if manifest.get("teacher_prompt_schema") != TEACHER_PROMPT_SCHEMA:
-        raise ValueError("OPSD data manifest has a different teacher prompt")
-    if manifest.get("opsd_prompt_schema") != OPSD_PROMPT_SCHEMA:
-        raise ValueError("OPSD data manifest has a different OPSD prompt schema")
+    validate_final_answer_manifest(manifest)
     dataset_sha256 = file_sha256(args.dataset)
     if dataset_sha256 != manifest.get("train_sha256"):
         raise ValueError("OPSD dataset does not match manifest train bytes")
@@ -115,7 +133,11 @@ def validate_data_manifest(args, payload: dict) -> dict[str, object] | None:
         "split_schema": manifest["split_schema"],
         "train_sha256": manifest["train_sha256"],
         "gate_sha256": manifest["gate_sha256"],
+        "gate": str(gate_path),
+        "gate_rows": int(manifest["gate_rows"]),
         "sft_corpus_sha256": manifest["sft_corpus_sha256"],
+        "source_quotas": source_quotas(manifest),
+        "groups_per_cycle": manifest.get("groups_per_cycle"),
     }
 
 
@@ -157,6 +179,21 @@ def validate_authorization(
         raise ValueError("OPSD authorization used a different data manifest")
     if authorization.get("gate_sha256") != data_manifest["gate_sha256"]:
         raise ValueError("OPSD authorization used different held-out gate bytes")
+    gate_contract = authorization.get("gate_contract")
+    if gate_contract != AUTHORIZATION_GATE_CONTRACT:
+        raise ValueError("OPSD authorization has a different frozen-gate contract")
+    input_artifacts = authorization.get("input_artifacts")
+    if not isinstance(input_artifacts, dict) or set(input_artifacts) != {
+        "generation_gate",
+        "logit_gate",
+    }:
+        raise ValueError("OPSD authorization lacks frozen-gate provenance")
+    for artifact in input_artifacts.values():
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
+            raise ValueError("OPSD authorization has malformed gate provenance")
+        digest = artifact.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("OPSD authorization has malformed gate digest")
     return {
         "path": str(path),
         "sha256": file_sha256(path),
@@ -167,6 +204,8 @@ def validate_authorization(
         "checkpoint_sha256": authorization["checkpoint_sha256"],
         "data_manifest_sha256": authorization["data_manifest_sha256"],
         "gate_sha256": authorization["gate_sha256"],
+        "gate_contract": gate_contract,
+        "input_artifacts": input_artifacts,
     }
 
 
@@ -238,6 +277,11 @@ def validate_source_contract(args, payload: dict) -> dict[str, object]:
         raise ValueError(
             f"--top-k {args.top_k} exceeds checkpoint vocabulary {vocab_size}"
         )
+    if args.eval_top_k > vocab_size:
+        raise ValueError(
+            f"--eval-top-k {args.eval_top_k} exceeds checkpoint vocabulary "
+            f"{vocab_size}"
+        )
     context_tokens = int(payload.get("train_seq_len", 1024))
     if args.max_prompt_length + args.max_completion_length > context_tokens:
         raise ValueError(
@@ -249,14 +293,48 @@ def validate_source_contract(args, payload: dict) -> dict[str, object]:
         FreshHyperparameters.tokenizer_path,
         think_tokens=args.think_tokens,
         answer_tokens=args.answer_fence,
+        tokenizer_provenance=model_config.get("tokenizer_provenance"),
     )
     data_manifest = validate_data_manifest(args, payload)
     authorization = validate_authorization(args, payload, data_manifest)
+    eval_contract = None
+    if args.eval_every > 0:
+        eval_rows = load_unique_math_rows(args.eval_data)
+        styles = {answer_style(row) for row in eval_rows}
+        if styles != {"exact"}:
+            raise ValueError(
+                "--eval-data must contain only strict exact-answer rows; "
+                f"resolved styles were {sorted(styles)}"
+            )
+        if args.eval_rows > len(eval_rows):
+            raise ValueError(
+                f"--eval-rows {args.eval_rows} exceeds evaluation set size "
+                f"{len(eval_rows)}"
+            )
+        eval_contract = {
+            "path": args.eval_data,
+            "sha256": file_sha256(args.eval_data),
+            "rows": len(eval_rows),
+        }
     examples = load_examples(
         args.dataset,
         answer_fence=args.answer_fence,
         reference_column=args.reference_column,
     )
+    quotas = data_manifest.get("source_quotas") if data_manifest else None
+    if quotas:
+        observed_sources = Counter(example.source for example in examples)
+        if set(observed_sources) != set(quotas):
+            raise ValueError(
+                "OPSD mixture dataset sources do not match manifest quotas: "
+                f"{sorted(observed_sources)} != {sorted(quotas)}"
+            )
+        cycle = sum(quotas.values())
+        if args.effective_batch_size % cycle:
+            raise ValueError(
+                "OPSD mixture effective batch size must be a multiple of its "
+                f"{cycle}-trajectory source cycle"
+            )
     first_valid = None
     valid_examples = 0
     rejection_counts: Counter[str] = Counter()
@@ -277,6 +355,11 @@ def validate_source_contract(args, payload: dict) -> dict[str, object]:
         rejection_counts[reason] += 1
     if first_valid is None:
         raise ValueError("no dataset row fits the configured context budgets")
+    if quotas and rejection_counts:
+        raise ValueError(
+            "prepared OPSD mixture contains runtime-invalid rows, which would "
+            f"change its exact source quotas: {dict(rejection_counts)}"
+        )
     return {
         "architecture": architecture,
         "context_tokens": context_tokens,
@@ -296,7 +379,11 @@ def validate_source_contract(args, payload: dict) -> dict[str, object]:
         ),
         "dataset": args.dataset,
         "data_manifest": data_manifest,
+        "source_rows": dict(
+            sorted(Counter(example.source for example in examples).items())
+        ),
         "authorization": authorization,
+        "evaluation": eval_contract,
     }
 
 
@@ -323,6 +410,151 @@ def _atomic_json(payload: dict, path: Path) -> None:
 def _append_jsonl(path: Path, payload: dict) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def opsd_tensorboard_metrics(entry: dict[str, object]) -> dict[str, float]:
+    """Stable live dashboard tags for one canonical OPSD train record."""
+    fields = {
+        "loss/clipped_objective": "train_loss",
+        "loss/raw_forward_kl": "forward_kl",
+        "loss/clipped_entry_fraction": "clipped_entry_fraction",
+        "loss/clipped_token_fraction": "clipped_token_fraction",
+        "loss/max_pointwise_contribution": "max_pointwise_contribution",
+        "optimization/preclip_gradient_norm": "gradient_norm",
+        "rollout/mean_response_tokens": "response_tokens_mean",
+        "rollout/termination_fraction": "terminated_fraction",
+        "rollout/empty_response_fraction": "empty_response_fraction",
+        "throughput/response_tokens_per_second": "response_tokens_per_second",
+        "throughput/step_seconds": "step_time_seconds",
+        "system/gpu_memory_allocated_gib": "gpu_memory_allocated_gib",
+        "system/gpu_memory_reserved_gib": "gpu_memory_reserved_gib",
+        "system/gpu_peak_memory_allocated_gib": (
+            "gpu_peak_memory_allocated_gib"
+        ),
+        "system/gpu_peak_memory_reserved_gib": "gpu_peak_memory_reserved_gib",
+        "data/rejected_examples": "rejected_examples",
+        "data/sampler_cursor": "sampler_cursor",
+        "reward/exact_accuracy": "exact_accuracy",
+        "reward/raw_exact_accuracy": "raw_exact_accuracy",
+        "reward/contract_accuracy": "contract_accuracy",
+        "reward/structural_format_fraction": "structural_format_fraction",
+        "reward/graded_trajectories": "graded_trajectories",
+        "perf/reward_scoring_seconds": "reward_scoring_seconds",
+    }
+    return {
+        tag: float(entry[field])
+        for tag, field in fields.items()
+        if field in entry
+    }
+
+
+def grade_on_policy_response(
+    emitted: list[int],
+    example: OPSDExample,
+    tokenizer,
+    *,
+    stop_ids: tuple[int, ...],
+    think_fence_ids: tuple[int, int] | None,
+    answer_fence_ids: tuple[int, int] | None,
+    min_think_tokens: int,
+) -> dict[str, int] | None:
+    """Grade an existing OPSD rollout without changing the OPSD objective."""
+    if example.ground_truth is None or example.grading_style is None:
+        return None
+    exact, _ = verify_terminated_answer(
+        emitted,
+        example.ground_truth,
+        tokenizer,
+        stop_ids,
+        example.grading_style,
+        answer_fence_ids=answer_fence_ids,
+    )
+    stop_set = set(stop_ids)
+    stop_cut = next(
+        (index for index, token in enumerate(emitted) if token in stop_set),
+        None,
+    )
+    if think_fence_ids is not None and answer_fence_ids is not None:
+        structurally_valid = bool(
+            stop_cut is not None
+            and structural_format_ok(
+                emitted[: stop_cut + 1],
+                think_fence_ids,
+                answer_fence_ids,
+                min_think_tokens,
+            )
+        )
+    else:
+        structurally_valid = stop_cut is not None
+    return {
+        "raw_exact": int(exact),
+        "exact": int(exact and structurally_valid),
+        "structurally_valid": int(structurally_valid),
+    }
+
+
+def opsd_stop_ids(tokenizer) -> tuple[int, ...]:
+    """Use one terminal-token contract for rollout, grading, and trimming."""
+    return tuple(
+        dict.fromkeys((int(tokenizer.eos_id()), int(tokenizer.bos_id())))
+    )
+
+
+def opsd_eval_tensorboard_metrics(entry: dict[str, object]) -> dict[str, float]:
+    """Quality indicators from one held-out question-only policy evaluation."""
+    fields = {
+        "eval/accuracy": "accuracy",
+        "eval/contract_accuracy": "contract_accuracy",
+        "eval/descriptive_accuracy_delta_from_step0": "accuracy_delta_from_step0",
+        "eval/descriptive_contract_accuracy_delta_from_step0": (
+            "contract_accuracy_delta_from_step0"
+        ),
+        "eval/paired_delta_bootstrap_low": "paired_delta_bootstrap_low",
+        "eval/paired_delta_bootstrap_high": "paired_delta_bootstrap_high",
+        "eval/structural_format_fraction": "structural_format_fraction",
+        "eval/termination_fraction": "ended_fraction",
+        "eval/prompt_any_correct_fraction": "prompt_any_correct_fraction",
+        "eval/prompt_zero_correct_fraction": "prompt_zero_correct_fraction",
+        "eval/within_group_reward_std": "within_group_reward_std",
+        "eval/mean_emitted_tokens": "emitted_tokens_mean",
+        "perf/eval_seconds": "eval_seconds",
+    }
+    return {
+        tag: float(entry[field])
+        for tag, field in fields.items()
+        if field in entry
+    }
+
+
+def paired_prompt_accuracy_delta(
+    current: list[int],
+    baseline: list[int],
+    *,
+    samples: int,
+    seed: int,
+    resamples: int = 5000,
+) -> dict[str, float]:
+    """Prompt-paired descriptive delta with a deterministic bootstrap band."""
+    if len(current) != len(baseline) or not current:
+        raise ValueError("paired accuracy counts must be nonempty and aligned")
+    if samples < 1 or resamples < 1:
+        raise ValueError("samples and resamples must be positive")
+    deltas = (
+        torch.tensor(current, dtype=torch.float64)
+        - torch.tensor(baseline, dtype=torch.float64)
+    ) / samples
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randint(
+        len(deltas),
+        (resamples, len(deltas)),
+        generator=generator,
+    )
+    bootstrap = deltas[indices].mean(dim=1)
+    return {
+        "paired_delta_mean": float(deltas.mean()),
+        "paired_delta_bootstrap_low": float(torch.quantile(bootstrap, 0.025)),
+        "paired_delta_bootstrap_high": float(torch.quantile(bootstrap, 0.975)),
+    }
 
 
 def _purge_jsonl_after(path: Path, step: int) -> int:
@@ -364,6 +596,7 @@ def _export_payload(
     dataset_sha256: str,
     data_manifest_sha256: str | None = None,
     authorization_sha256: str | None = None,
+    eval_data_sha256: str | None = None,
 ) -> dict:
     is_permuted_control = getattr(args, "reference_column", None) == (
         "permuted_solution"
@@ -404,6 +637,8 @@ def _export_payload(
         "data_manifest_sha256": data_manifest_sha256,
         "authorization": getattr(args, "authorization", None),
         "authorization_sha256": authorization_sha256,
+        "eval_data": getattr(args, "eval_data", None),
+        "eval_data_sha256": eval_data_sha256,
         "args": vars(args),
         "parent_opsd": source_payload.get("opsd"),
     }
@@ -453,6 +688,9 @@ class OPSDTrainer:
         self.authorization_sha256 = (
             file_sha256(args.authorization) if args.authorization else None
         )
+        self.eval_data_sha256 = (
+            file_sha256(args.eval_data) if args.eval_every > 0 else None
+        )
         self.context_tokens = int(source_payload.get("train_seq_len", 1024))
 
         self.tokenizer = load_posttraining_tokenizer(
@@ -460,13 +698,40 @@ class OPSDTrainer:
             FreshHyperparameters.tokenizer_path,
             think_tokens=args.think_tokens,
             answer_tokens=args.answer_fence,
+            tokenizer_provenance=source_payload["model_config"].get(
+                "tokenizer_provenance"
+            ),
         )
         self.examples = load_examples(
             args.dataset,
             answer_fence=args.answer_fence,
             reference_column=args.reference_column,
         )
-        self.sampler = ShuffledExampleSampler(self.examples, args.seed)
+        self.eval_rows: list[dict] = []
+        if args.eval_every > 0:
+            eval_rows = load_unique_math_rows(args.eval_data)
+            styles = {answer_style(row) for row in eval_rows}
+            if styles != {"exact"}:
+                raise ValueError(
+                    "--eval-data must contain only strict exact-answer rows; "
+                    f"resolved styles were {sorted(styles)}"
+                )
+            if args.answer_fence:
+                eval_rows = canonicalize_answer_fence_rows(eval_rows)
+            self.eval_rows = deterministic_math_subset(
+                eval_rows, args.eval_rows
+            )
+        quotas = (
+            data_manifest_contract.get("source_quotas")
+            if data_manifest_contract
+            else None
+        )
+        if quotas:
+            self.sampler = SourceQuotaSampler(
+                self.examples, quotas, args.seed
+            )
+        else:
+            self.sampler = ShuffledExampleSampler(self.examples, args.seed)
         self._tokenized_cache = {}
         self.rejection_counts: Counter[str] = Counter()
 
@@ -518,6 +783,112 @@ class OPSDTrainer:
         else:
             self.metrics_path.write_text("")
             self.generations_path.write_text("")
+        self.eval_baseline_accuracy: float | None = None
+        self.eval_baseline_contract_accuracy: float | None = None
+        self.eval_baseline_prompt_counts: list[int] | None = None
+        if args.resume and self.metrics_path.exists():
+            for line in self.metrics_path.read_text().splitlines():
+                record = json.loads(line)
+                if record.get("type") == "eval" and record.get("step") == 0:
+                    self.eval_baseline_accuracy = float(record["accuracy"])
+                    self.eval_baseline_contract_accuracy = float(
+                        record["contract_accuracy"]
+                    )
+                    self.eval_baseline_prompt_counts = [
+                        int(value) for value in record["prompt_correct_counts"]
+                    ]
+                    break
+        self.tensorboard = SummaryWriter(
+            self.output / "tensorboard",
+            purge_step=self.step + 1 if args.resume else None,
+        )
+
+    def _evaluate_policy(self, step: int) -> dict[str, object]:
+        """Evaluate question-only accuracy on a fixed, SFT-decontaminated gate."""
+        if not self.eval_rows:
+            raise RuntimeError("OPSD policy evaluation has no held-out rows")
+        # Training has already consumed this step's gradients. Releasing them
+        # keeps policy evaluation independent of full-vocabulary backward
+        # memory while preserving optimizer moments and parameters.
+        self.optimizer.zero_grad(set_to_none=True)
+        self.rollout_policy.eval()
+        started = time.perf_counter()
+        metrics = evaluate_latent_math(
+            self.rollout_policy,
+            self.tokenizer,
+            self.eval_rows,
+            self.args.eval_samples,
+            self.args.max_completion_length,
+            self.args.max_completion_length,
+            self.args.eval_samples,
+            self.args.seed,
+            self.device,
+            self.args.max_prompt_length,
+            batch_trajectories=self.args.eval_batch_trajectories,
+            # Keep evaluation execution independent from the compiled
+            # training decoder so fallback cannot alter resume behavior.
+            compiled_step_core=None,
+            temperature=self.args.eval_temperature,
+            top_p=self.args.eval_top_p,
+            top_k=self.args.eval_top_k or None,
+            pin_emit=True,
+            think_fence_ids=(
+                (self.tokenizer.think_open_id, self.tokenizer.think_close_id)
+                if self.args.think_tokens
+                else None
+            ),
+            answer_fence_ids=(
+                (self.tokenizer.answer_open_id, self.tokenizer.answer_close_id)
+                if self.args.answer_fence
+                else None
+            ),
+            min_think_tokens=self.args.eval_think_min_tokens,
+        )
+        torch.cuda.synchronize(self.device)
+        accuracy = float(metrics["accuracy"])
+        contract_accuracy = float(metrics["contract_accuracy"])
+        if step == 0:
+            self.eval_baseline_accuracy = accuracy
+            self.eval_baseline_contract_accuracy = contract_accuracy
+            self.eval_baseline_prompt_counts = [
+                int(value) for value in metrics["prompt_correct_counts"]
+            ]
+        if (
+            self.eval_baseline_accuracy is None
+            or self.eval_baseline_contract_accuracy is None
+            or self.eval_baseline_prompt_counts is None
+        ):
+            raise RuntimeError("OPSD evaluation is missing its step-0 baseline")
+        paired = paired_prompt_accuracy_delta(
+            [int(value) for value in metrics["prompt_correct_counts"]],
+            self.eval_baseline_prompt_counts,
+            samples=self.args.eval_samples,
+            seed=self.args.seed + step,
+        )
+        entry: dict[str, object] = {
+            "type": "eval",
+            "step": step,
+            "eval_seconds": time.perf_counter() - started,
+            "accuracy_delta_from_step0": (
+                accuracy - self.eval_baseline_accuracy
+            ),
+            "contract_accuracy_delta_from_step0": (
+                contract_accuracy - self.eval_baseline_contract_accuracy
+            ),
+            **paired,
+            **metrics,
+        }
+        _append_jsonl(self.metrics_path, entry)
+        for tag, value in opsd_eval_tensorboard_metrics(entry).items():
+            self.tensorboard.add_scalar(tag, value, step)
+        self.tensorboard.flush()
+        print(
+            f"step {step}: heldout accuracy {accuracy:.4f}, "
+            f"contract {contract_accuracy:.4f}, "
+            f"delta {entry['accuracy_delta_from_step0']:+.4f}",
+            flush=True,
+        )
+        return entry
 
     def _restore(self, path: Path) -> None:
         payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -527,6 +898,8 @@ class OPSDTrainer:
             raise ValueError("resume checkpoint has a different objective")
         if payload.get("prompt_schema") != OPSD_PROMPT_SCHEMA:
             raise ValueError("resume checkpoint has a different prompt schema")
+        if payload.get("data_order_schema") != OPSD_DATA_ORDER_SCHEMA:
+            raise ValueError("resume checkpoint has a different data order")
         if (
             self.args.answer_fence
             and payload.get("answer_fence_prompt_schema")
@@ -542,6 +915,20 @@ class OPSDTrainer:
                     f"resume requires the saved --{field.replace('_', '-')}: "
                     f"{saved_args.get(field)!r} != {getattr(self.args, field)!r}"
                 )
+        if self.args.eval_every > 0:
+            if int(saved_args.get("eval_every", 0)) <= 0:
+                raise ValueError(
+                    "cannot enable inline evaluation on resume without a "
+                    "saved step-0 baseline; run it as a separate evaluation"
+                )
+            for field in _RESUME_EVAL_FIELDS:
+                if saved_args.get(field) != getattr(self.args, field):
+                    raise ValueError(
+                        "resumed inline evaluation requires the saved "
+                        f"--{field.replace('_', '-')}: "
+                        f"{saved_args.get(field)!r} != "
+                        f"{getattr(self.args, field)!r}"
+                    )
         if payload["source_checkpoint_sha256"] != self.source_sha256:
             raise ValueError("source checkpoint bytes changed since the run began")
         if payload["dataset_sha256"] != self.dataset_sha256:
@@ -550,6 +937,19 @@ class OPSDTrainer:
             raise ValueError("OPSD data manifest changed since the run began")
         if payload.get("authorization_sha256") != self.authorization_sha256:
             raise ValueError("OPSD authorization changed since the run began")
+        # Evaluation is observability-only and saves/restores RNG state. It
+        # may be disabled or reconfigured on an exact optimization resume;
+        # when enabled against the same path, its bound bytes must still be
+        # unchanged.
+        if (
+            self.args.eval_every > 0
+            and saved_args.get("eval_data") == self.args.eval_data
+            and payload.get("eval_data_sha256") not in {
+                None,
+                self.eval_data_sha256,
+            }
+        ):
+            raise ValueError("OPSD evaluation data changed since the run began")
         self.student.load_state_dict(payload["model"], strict=True)
         self.teacher.load_state_dict(payload["teacher_model"], strict=True)
         self.optimizer.load_state_dict(payload["optimizer"])
@@ -557,6 +957,18 @@ class OPSDTrainer:
         if self.args.steps < self.step:
             raise ValueError("--steps cannot precede the resume step")
         self.sampler.cursor = int(payload["sampler_cursor"])
+        if isinstance(self.sampler, SourceQuotaSampler):
+            if self.sampler.cursor != self.step * self.args.effective_batch_size:
+                raise ValueError(
+                    "mixture sampler cursor does not equal step times effective "
+                    "batch size"
+                )
+            if payload.get("sampler_source_quotas") != self.sampler.quotas:
+                raise ValueError("resume checkpoint has different source quotas")
+            if payload.get(
+                "sampler_source_consumed"
+            ) != self.sampler.consumed_counts():
+                raise ValueError("resume checkpoint source cursors are inconsistent")
         self.rejection_counts = Counter(payload.get("rejection_counts", {}))
         self.rollout_generator.set_state(payload["rollout_rng_state"])
         torch.set_rng_state(payload["torch_rng_state"])
@@ -597,6 +1009,19 @@ class OPSDTrainer:
                 f"accepted {len(selected)}/{count}, rejections "
                 f"{dict(self.rejection_counts)}"
             )
+        if isinstance(self.sampler, SourceQuotaSampler):
+            factor = count // len(self.sampler.schedule)
+            expected = {
+                source: quota * factor
+                for source, quota in self.sampler.quotas.items()
+            }
+            observed = Counter(
+                example.example.source for example in selected
+            )
+            if observed != Counter(expected):
+                raise RuntimeError(
+                    f"OPSD source quota drift: {dict(observed)} != {expected}"
+                )
         return selected
 
     def _rollout(self, examples):
@@ -607,6 +1032,7 @@ class OPSDTrainer:
         )
         width = int(prompt_lengths.max())
         eos = int(self.tokenizer.eos_id())
+        stop_ids = opsd_stop_ids(self.tokenizer)
         prompts = torch.full(
             (len(examples), width), eos, dtype=torch.long, device=self.device
         )
@@ -633,7 +1059,7 @@ class OPSDTrainer:
                     self.args.temperature,
                     self.args.top_p,
                     generator=self.rollout_generator,
-                    stop_ids=eos,
+                    stop_ids=stop_ids,
                     prompt_lengths=prompt_lengths,
                     tensor_positions=self.rollout_step_core is not None,
                     replay_storage=False,
@@ -656,6 +1082,7 @@ class OPSDTrainer:
             dataset_sha256=self.dataset_sha256,
             data_manifest_sha256=self.data_manifest_sha256,
             authorization_sha256=self.authorization_sha256,
+            eval_data_sha256=self.eval_data_sha256,
         )
         resume_payload = {
             "schema": OPSD_CHECKPOINT_SCHEMA,
@@ -673,6 +1100,16 @@ class OPSDTrainer:
             "optimizer": self.optimizer.state_dict(),
             "step": self.step,
             "sampler_cursor": self.sampler.cursor,
+            "sampler_source_quotas": (
+                self.sampler.quotas
+                if isinstance(self.sampler, SourceQuotaSampler)
+                else None
+            ),
+            "sampler_source_consumed": (
+                self.sampler.consumed_counts()
+                if isinstance(self.sampler, SourceQuotaSampler)
+                else None
+            ),
             "rejection_counts": dict(self.rejection_counts),
             "rollout_rng_state": self.rollout_generator.get_state(),
             "torch_rng_state": torch.get_rng_state(),
@@ -681,6 +1118,7 @@ class OPSDTrainer:
             "dataset_sha256": self.dataset_sha256,
             "data_manifest_sha256": self.data_manifest_sha256,
             "authorization_sha256": self.authorization_sha256,
+            "eval_data_sha256": self.eval_data_sha256,
             "args": vars(self.args),
         }
         checkpoint_dir = self.output / "checkpoints"
@@ -698,21 +1136,52 @@ class OPSDTrainer:
             _atomic_torch_save(export, self.output / "opsd_final_model.pt")
 
     def train(self) -> None:
+        if self.args.eval_every > 0 and not self.args.resume and self.step == 0:
+            self._evaluate_policy(0)
         started = time.perf_counter()
-        eos = int(self.tokenizer.eos_id())
+        stop_ids = opsd_stop_ids(self.tokenizer)
+        think_fence_ids = (
+            (self.tokenizer.think_open_id, self.tokenizer.think_close_id)
+            if self.args.think_tokens
+            else None
+        )
+        answer_fence_ids = (
+            (self.tokenizer.answer_open_id, self.tokenizer.answer_close_id)
+            if self.args.answer_fence
+            else None
+        )
         while self.step < self.args.steps:
+            step_started = time.perf_counter()
+            torch.cuda.reset_peak_memory_stats(self.device)
             examples = self._next_tokenized(self.args.effective_batch_size)
             self.optimizer.zero_grad(set_to_none=True)
             per_example_metrics = []
             generated_for_log = []
             empty_responses = 0
+            reward_rows: list[dict[str, int | str]] = []
+            reward_scoring_seconds = 0.0
             for start in range(
                 0, len(examples), self.args.rollout_batch_size
             ):
                 chunk = examples[start:start + self.args.rollout_batch_size]
                 responses = self._rollout(chunk)
                 for example, response in zip(chunk, responses, strict=True):
-                    terminated = bool(response and response[-1] == eos)
+                    emitted_response = response
+                    reward_started = time.perf_counter()
+                    reward = grade_on_policy_response(
+                        emitted_response,
+                        example.example,
+                        self.tokenizer,
+                        stop_ids=stop_ids,
+                        think_fence_ids=think_fence_ids,
+                        answer_fence_ids=answer_fence_ids,
+                        min_think_tokens=OPSD_REWARD_MIN_THINK_TOKENS,
+                    )
+                    reward_scoring_seconds += time.perf_counter() - reward_started
+                    if reward is not None:
+                        reward["source"] = example.example.source
+                        reward_rows.append(reward)
+                    terminated = bool(response and response[-1] in stop_ids)
                     # Generation stop markers are not completion content in
                     # the paper code (EOS doubles as its padding token), so
                     # the distillation trajectory excludes the terminal EOT.
@@ -795,6 +1264,13 @@ class OPSDTrainer:
                     self.args.effective_batch_size
                 )
 
+            # Make timing and peak-memory telemetry cover the complete CUDA
+            # update rather than only host-side dispatch.
+            torch.cuda.synchronize(self.device)
+            step_seconds = time.perf_counter() - step_started
+            response_tokens_total = sum(
+                int(row["response_tokens"]) for row in per_example_metrics
+            )
             entry = {
                 "type": "train",
                 "step": self.step,
@@ -811,6 +1287,10 @@ class OPSDTrainer:
                     ).max()
                 ),
                 "response_tokens_mean": mean("response_tokens"),
+                "response_tokens_total": response_tokens_total,
+                "response_tokens_per_second": (
+                    response_tokens_total / step_seconds
+                ),
                 "terminated_fraction": mean("terminated"),
                 "empty_response_fraction": (
                     empty_responses / self.args.effective_batch_size
@@ -818,9 +1298,99 @@ class OPSDTrainer:
                 "gradient_norm": float(grad_norm),
                 "sampler_cursor": self.sampler.cursor,
                 "rejected_examples": sum(self.rejection_counts.values()),
+                "source_trajectories": dict(
+                    sorted(
+                        Counter(
+                            example.example.source for example in examples
+                        ).items()
+                    )
+                ),
+                "step_time_seconds": step_seconds,
                 "train_time_ms": (time.perf_counter() - started) * 1000,
+                "gpu_memory_allocated_gib": (
+                    torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+                ),
+                "gpu_memory_reserved_gib": (
+                    torch.cuda.memory_reserved(self.device) / (1024 ** 3)
+                ),
+                "gpu_peak_memory_allocated_gib": (
+                    torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+                ),
+                "gpu_peak_memory_reserved_gib": (
+                    torch.cuda.max_memory_reserved(self.device) / (1024 ** 3)
+                ),
             }
+            if reward_rows:
+                graded = len(reward_rows)
+                exact_accuracy = sum(
+                    row["exact"] for row in reward_rows
+                ) / graded
+                entry.update(
+                    {
+                        # Match VAPO's reward/exact_accuracy: correctness only
+                        # earns exact reward when the response also satisfies
+                        # the trained structural contract.
+                        "exact_accuracy": exact_accuracy,
+                        "contract_accuracy": exact_accuracy,
+                        "raw_exact_accuracy": sum(
+                            row["raw_exact"] for row in reward_rows
+                        ) / graded,
+                        "structural_format_fraction": sum(
+                            row["structurally_valid"] for row in reward_rows
+                        ) / graded,
+                        "graded_trajectories": graded,
+                        "reward_scoring_seconds": reward_scoring_seconds,
+                    }
+                )
+                source_reward_metrics = {}
+                for source in sorted(
+                    {str(row["source"]) for row in reward_rows}
+                ):
+                    source_rows = [
+                        row
+                        for row in reward_rows
+                        if row["source"] == source
+                    ]
+                    source_graded = len(source_rows)
+                    source_reward_metrics[source] = {
+                        "graded_trajectories": source_graded,
+                        "exact_accuracy": sum(
+                            int(row["exact"]) for row in source_rows
+                        )
+                        / source_graded,
+                        "raw_exact_accuracy": sum(
+                            int(row["raw_exact"]) for row in source_rows
+                        )
+                        / source_graded,
+                        "structural_format_fraction": sum(
+                            int(row["structurally_valid"])
+                            for row in source_rows
+                        )
+                        / source_graded,
+                    }
+                entry["source_reward_metrics"] = source_reward_metrics
             _append_jsonl(self.metrics_path, entry)
+            for tag, value in opsd_tensorboard_metrics(entry).items():
+                self.tensorboard.add_scalar(tag, value, self.step)
+            for source, count in entry["source_trajectories"].items():
+                self.tensorboard.add_scalar(
+                    f"data/source_fraction/{source}",
+                    count / self.args.effective_batch_size,
+                    self.step,
+                )
+            for source, metrics in entry.get(
+                "source_reward_metrics", {}
+            ).items():
+                for metric, value in metrics.items():
+                    self.tensorboard.add_scalar(
+                        f"reward/source/{source}/{metric}", value, self.step
+                    )
+            self.tensorboard.add_scalar(
+                "config/rollout_batch_size",
+                self.args.rollout_batch_size,
+                self.step,
+            )
+            self.tensorboard.flush()
             for generation in generated_for_log:
                 _append_jsonl(
                     self.generations_path,
@@ -833,6 +1403,11 @@ class OPSDTrainer:
                 f"grad {entry['gradient_norm']:.4f}",
                 flush=True,
             )
+            if (
+                self.args.eval_every > 0
+                and self.step % self.args.eval_every == 0
+            ):
+                self._evaluate_policy(self.step)
             if (
                 self.step % self.args.save_every == 0
                 and self.step < self.args.steps
@@ -861,10 +1436,15 @@ class OPSDTrainer:
             "data_manifest_sha256": self.data_manifest_sha256,
             "authorization": self.args.authorization,
             "authorization_sha256": self.authorization_sha256,
+            "eval_data": self.args.eval_data if self.args.eval_every > 0 else None,
+            "eval_data_sha256": self.eval_data_sha256,
             "rejections": dict(self.rejection_counts),
             "args": vars(self.args),
         }
         _atomic_json(result, self.output / "result.json")
+
+    def close(self) -> None:
+        self.tensorboard.close()
 
 
 def write_manifest(output: Path, args, contract: dict[str, object]) -> None:

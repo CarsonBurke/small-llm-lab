@@ -18,12 +18,12 @@ GPU workload -- submit through mlq:
         .venv/bin/python -m postraining.train_opsd \
         --name opsd_v1 \
         --checkpoint \
-          postraining/runs/sft_v4_answer_canonical_hfonly_e3/sft_final_model.pt \
-        --dataset postraining/data/opsd_dapo17k_contractlast_train.parquet \
+          postraining/runs/sft6_bare_a1swap10k_e3/sft_final_model.pt \
+        --dataset postraining/data/opsd_dapo17k_bare_train.parquet \
         --reference-column solution \
-        --data-manifest postraining/data/opsd_dapo17k_contractlast.manifest.json \
+        --data-manifest postraining/data/opsd_dapo17k_bare.manifest.json \
         --authorization \
-          postraining/runs/opsd_dapo_contractlast_512_authorization_v3/results.json
+          postraining/runs/opsd_dapo_bare_256_authorization_v1/results.json
 
 Static compatibility validation is CPU-only and may run directly:
 
@@ -75,7 +75,10 @@ def main() -> None:
     write_manifest(output, args, contract)
     trainer = OPSDTrainer(args, source_payload)
     del source_payload
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        trainer.close()
 
 
 if __name__ == "__main__":

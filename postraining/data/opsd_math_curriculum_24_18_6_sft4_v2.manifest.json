@@ -1,0 +1,112 @@
+{
+  "answer_fence_prompt_schema": "bare_problem_single_think_answer_contract/v1",
+  "args": {
+    "context_tokens": 8192,
+    "dapo_source": "postraining/data/dapo-math-17k.parquet",
+    "deepmind_source": "postraining/data/deepmind-interpolate-rl-full.parquet",
+    "gate_rows": 192,
+    "gsm8k_source": "postraining/data/gsm8k_rl_prompts.parquet",
+    "max_completion_length": 1024,
+    "max_prompt_length": 1024,
+    "output_prefix": "postraining/data/opsd_math_curriculum_24_18_6_sft4_v2",
+    "seed": 42,
+    "sft_corpus": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet"
+  },
+  "eligible_rows": 204237,
+  "gate": "postraining/data/opsd_math_curriculum_24_18_6_sft4_v2_gate.parquet",
+  "gate_ids_sha256": "b4c856a53b1faa55ca37116d78d02c96e4ff4c8bb298ec58c049498962a9494c",
+  "gate_rows": 192,
+  "gate_sha256": "e414d91439b0920f0f3330da1a8da33f4e309f872cfcab491b75e8b733963eaf",
+  "gate_source_rows": {
+    "dapo_math_17k": 24,
+    "deepmind_math": 96,
+    "gsm8k": 72
+  },
+  "groups_per_cycle": 48,
+  "opsd_prompt_schema": "privilege_then_shared_terminal_response_contract/v2",
+  "rejections": {
+    "dapo_math_17k/gate_8gram_sft_overlap": 2474,
+    "dapo_math_17k/gate_exact_sft_overlap": 1,
+    "dapo_math_17k/normalized_problem_conflict": 24,
+    "dapo_math_17k/student_prompt_overflow": 10,
+    "deepmind_math/gate_8gram_sft_overlap": 41,
+    "deepmind_math/normalized_problem_conflict": 0,
+    "gate_answer_position_bucket_excluded": 855,
+    "gsm8k/gate_8gram_sft_overlap": 10,
+    "gsm8k/gate_exact_sft_overlap": 7123,
+    "gsm8k/normalized_problem_conflict": 0,
+    "train_answer_position_bucket_excluded": 0
+  },
+  "schema": "opsd_answer_only_math_mixture/v1",
+  "sft_corpus": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+  "sft_corpus_sha256": "ac398fc38e4db4d5d53cd03594850b96d3be79425fc80f963f326e23f99e8007",
+  "source_hashes": {
+    "dapo_math_17k": "534375d6bb8630d22ab46a56e11f2ffec1d288d8f7d04099bc82d68948705941",
+    "deepmind_math": "90d222e0d395b7fe7d7413ffae2736647d4ab81142b04796eaa150ff64a78513",
+    "gsm8k": "64a5e2cbc65ca9096a042a775db5aff5defd434d1f918c0ee70f9abe93ef4a25"
+  },
+  "source_physical_rows": {
+    "dapo_math_17k": 1791700,
+    "deepmind_math": 179856,
+    "gsm8k": 7217
+  },
+  "source_quotas": {
+    "dapo_math_17k": 6,
+    "deepmind_math": 24,
+    "gsm8k": 18
+  },
+  "source_unique_rows": {
+    "dapo_math_17k": 17917,
+    "deepmind_math": 179856,
+    "gsm8k": 7217
+  },
+  "sources": {
+    "dapo_math_17k": {
+      "canonical_rows": 17174,
+      "clean_gate_candidates": 14689,
+      "eligible_rows": 17164,
+      "normalized_problem_conflicts": 24,
+      "normalized_problem_duplicates": 719,
+      "path": "postraining/data/dapo-math-17k.parquet",
+      "physical_rows": 1791700,
+      "reward_style": "rule-lighteval/MATH_v2",
+      "sha256": "534375d6bb8630d22ab46a56e11f2ffec1d288d8f7d04099bc82d68948705941",
+      "unique_rows": 17917
+    },
+    "deepmind_math": {
+      "canonical_rows": 179856,
+      "clean_gate_candidates": 179815,
+      "eligible_rows": 179856,
+      "normalized_problem_conflicts": 0,
+      "normalized_problem_duplicates": 0,
+      "path": "postraining/data/deepmind-interpolate-rl-full.parquet",
+      "physical_rows": 179856,
+      "reward_style": "rule",
+      "sha256": "90d222e0d395b7fe7d7413ffae2736647d4ab81142b04796eaa150ff64a78513",
+      "unique_rows": 179856
+    },
+    "gsm8k": {
+      "canonical_rows": 7217,
+      "clean_gate_candidates": 84,
+      "eligible_rows": 7217,
+      "normalized_problem_conflicts": 0,
+      "normalized_problem_duplicates": 0,
+      "path": "postraining/data/gsm8k_rl_prompts.parquet",
+      "physical_rows": 7217,
+      "reward_style": "rule-lighteval/MATH_v2",
+      "sha256": "64a5e2cbc65ca9096a042a775db5aff5defd434d1f918c0ee70f9abe93ef4a25",
+      "unique_rows": 7217
+    }
+  },
+  "split_schema": "source_stratified_clean_gate_split_local_position_derangement/v1",
+  "teacher_prompt_schema": "privilege_then_shared_terminal_response_contract/v2",
+  "train": "postraining/data/opsd_math_curriculum_24_18_6_sft4_v2_train.parquet",
+  "train_ids_sha256": "9eab410bc487fbc131039022a50d1db7404aff690c199c2bae00159f92cf4688",
+  "train_rows": 204045,
+  "train_sha256": "295eb9c88ac8f9319996e739402ee61d2d144012048035a7bd713e090d8d4ec4",
+  "train_source_rows": {
+    "dapo_math_17k": 17140,
+    "deepmind_math": 179760,
+    "gsm8k": 7145
+  }
+}

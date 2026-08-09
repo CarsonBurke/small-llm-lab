@@ -34,9 +34,9 @@ DAPO_OPSD_SPLIT_SCHEMA = (
 )
 DEFAULT_SOURCE = Path("postraining/data/dapo-math-17k.parquet")
 DEFAULT_SFT = Path(
-    "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet"
+    "postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet"
 )
-DEFAULT_OUTPUT_PREFIX = Path("postraining/data/opsd_dapo17k_contractlast")
+DEFAULT_OUTPUT_PREFIX = Path("postraining/data/opsd_dapo17k_bare")
 
 
 def file_sha256(path: Path) -> str:

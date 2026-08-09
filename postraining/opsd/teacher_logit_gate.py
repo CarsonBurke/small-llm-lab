@@ -24,11 +24,8 @@ from postraining.math_prompt import (
 )
 from postraining.model_io import load_model
 from postraining.opsd.data import TEACHER_PROMPT_SCHEMA, build_teacher_prompt
-from postraining.opsd.prepare_dapo import (
-    DAPO_OPSD_DATA_SCHEMA,
-    DAPO_OPSD_SPLIT_SCHEMA,
-    file_sha256,
-)
+from postraining.opsd.manifest import validate_final_answer_manifest
+from postraining.opsd.prepare_dapo import file_sha256
 from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
 from postraining.opsd.teacher_uplift import (
     TEACHER_UPLIFT_SCHEMA,
@@ -626,10 +623,10 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint)
     if file_sha256(gate_path) != manifest.get("gate_sha256"):
         parser.error("gate bytes do not match manifest")
-    if manifest.get("schema") != DAPO_OPSD_DATA_SCHEMA:
-        parser.error("manifest uses a different DAPO schema")
-    if manifest.get("split_schema") != DAPO_OPSD_SPLIT_SCHEMA:
-        parser.error("manifest uses a different DAPO split schema")
+    try:
+        validate_final_answer_manifest(manifest)
+    except ValueError as error:
+        parser.error(str(error))
     if manifest.get("teacher_prompt_schema") != TEACHER_PROMPT_SCHEMA:
         parser.error("manifest uses a different teacher prompt schema")
     if manifest.get("opsd_prompt_schema") != OPSD_PROMPT_SCHEMA:
@@ -699,6 +696,9 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=True,
         answer_tokens=True,
+        tokenizer_provenance=payload["model_config"].get(
+            "tokenizer_provenance"
+        ),
     )
     context_tokens = int(payload.get("train_seq_len", 1024))
     tokenizer_path = Path(FreshHyperparameters.tokenizer_path)

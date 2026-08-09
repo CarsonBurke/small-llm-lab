@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 from argparse import Namespace
+from collections import Counter
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,6 +21,7 @@ from postraining.opsd.config import build_arg_parser, validate_args
 from postraining.opsd.compare_policy import classify
 from postraining.opsd.data import (
     ShuffledExampleSampler,
+    SourceQuotaSampler,
     build_teacher_prompt,
     load_examples,
     resolve_reference_column,
@@ -42,7 +44,12 @@ from postraining.opsd.trainer import (
     OPSDTrainer,
     _export_payload,
     _purge_jsonl_after,
+    grade_on_policy_response,
     infer_source_contract,
+    opsd_tensorboard_metrics,
+    opsd_eval_tensorboard_metrics,
+    opsd_stop_ids,
+    paired_prompt_accuracy_delta,
     validate_authorization,
     validate_data_manifest,
 )
@@ -256,16 +263,16 @@ def test_teacher_prompt_places_reference_before_independent_solve():
     assert teacher.startswith("Problem?")
     assert teacher.index("proof") < teacher.index("Do not copy")
     assert teacher.index("Do not copy") < teacher.index("Begin the new solution")
-    assert teacher.endswith(INSTRUCTION_SUFFIX_ANSWER)
-    assert teacher.count(INSTRUCTION_SUFFIX_ANSWER) == 1
-    assert prompt == "Problem?" + INSTRUCTION_SUFFIX_ANSWER
+    assert teacher.endswith("Begin the new solution now:")
+    assert INSTRUCTION_SUFFIX_ANSWER == ""
+    assert prompt == "Problem?"
+
+    from postraining.math_prompt import LEGACY_ANSWER_FENCE_SUFFIX
 
     with pytest.raises(ValueError, match="bare problem"):
-        build_teacher_prompt(prompt, "reference")
-    with pytest.raises(ValueError, match="bare problem"):
-        build_teacher_prompt(prompt + "\n", "reference")
-    with pytest.raises(ValueError, match="bare problem"):
-        build_teacher_prompt("Problem?" + INSTRUCTION_SUFFIX, "reference")
+        build_teacher_prompt(
+            "Problem?" + LEGACY_ANSWER_FENCE_SUFFIX, "reference"
+        )
 
     plain = build_teacher_prompt(
         "Problem?", "reference", instruction_suffix=INSTRUCTION_SUFFIX
@@ -309,6 +316,8 @@ def test_verified_trace_loading_and_context_rejection(tmp_path):
     pq.write_table(pa.Table.from_pylist(rows), path)
     [example] = load_examples(path, answer_fence=True)
     assert example.problem == problem
+    assert example.ground_truth is None
+    assert example.grading_style is None
     tokenized, reason = tokenize_example(
         example,
         _Tokenizer(),
@@ -336,6 +345,34 @@ def test_reference_data_without_verification_fails_closed(tmp_path):
         load_examples(path, answer_fence=False)
 
 
+def test_verified_trace_loading_rejects_legacy_prompt_inside_completion(
+    tmp_path,
+):
+    from postraining.math_prompt import LEGACY_ANSWER_FENCE_SUFFIX
+
+    problem = "What is 1+2?"
+    path = tmp_path / "legacy-traces.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "source": "legacy",
+                    "problem": problem,
+                    "document": (
+                        problem
+                        + LEGACY_ANSWER_FENCE_SUFFIX
+                        + "<think>1+2=3</think><answer>3</answer>"
+                    ),
+                    "verified": True,
+                }
+            ]
+        ),
+        path,
+    )
+    with pytest.raises(ValueError, match="completion boundary"):
+        load_examples(path, answer_fence=True)
+
+
 def test_explicit_reference_column_selects_true_or_permuted_answer(tmp_path):
     path = tmp_path / "dapo.parquet"
     pq.write_table(
@@ -346,6 +383,8 @@ def test_explicit_reference_column_selects_true_or_permuted_answer(tmp_path):
                     "solution": "3",
                     "permuted_solution": "8",
                     "reference_kind": "final_answer",
+                    "ground_truth": "3",
+                    "reward_style": "rule-lighteval/MATH_v2",
                     "verified": True,
                 }
             ]
@@ -361,6 +400,8 @@ def test_explicit_reference_column_selects_true_or_permuted_answer(tmp_path):
     assert correct.reference_solution == "3"
     assert control.reference_solution == "8"
     assert correct.reference_kind == control.reference_kind == "final_answer"
+    assert correct.ground_truth == control.ground_truth == "3"
+    assert correct.grading_style == control.grading_style == "minerva"
 
 
 def test_auto_reference_resolves_to_controlled_solution_arm(tmp_path):
@@ -479,14 +520,15 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
                     "answer_derangement/v3"
                 ),
                 "teacher_prompt_schema": (
-                    "privilege_then_shared_terminal_response_contract/v2"
+                    "privilege_then_bare_problem_token_completion/v3"
                 ),
                 "opsd_prompt_schema": (
-                    "privilege_then_shared_terminal_response_contract/v2"
+                    "privilege_then_bare_problem_token_completion/v3"
                 ),
                 "train_sha256": sha256(train),
                 "gate": str(gate),
                 "gate_sha256": sha256(gate),
+                "gate_rows": 1,
                 "sft_corpus_sha256": "sft-hash",
             }
         )
@@ -508,7 +550,15 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"checkpoint")
     authorization = tmp_path / "authorization.json"
-    from postraining.opsd.authorize import OPSD_AUTHORIZATION_SCHEMA
+    from postraining.opsd.authorize import (
+        AUTHORIZATION_GATE_CONTRACT,
+        OPSD_AUTHORIZATION_SCHEMA,
+    )
+
+    gate_provenance = {
+        "generation_gate": {"path": "generation.json", "sha256": "a" * 64},
+        "logit_gate": {"path": "logit.json", "sha256": "b" * 64},
+    }
 
     authorization.write_text(
         json.dumps(
@@ -518,6 +568,8 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
                 "checkpoint_sha256": sha256(checkpoint),
                 "data_manifest_sha256": sha256(manifest),
                 "gate_sha256": sha256(gate),
+                "gate_contract": AUTHORIZATION_GATE_CONTRACT,
+                "input_artifacts": gate_provenance,
             }
         )
     )
@@ -538,6 +590,8 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
                 "checkpoint_sha256": sha256(checkpoint),
                 "data_manifest_sha256": sha256(manifest),
                 "gate_sha256": sha256(gate),
+                "gate_contract": AUTHORIZATION_GATE_CONTRACT,
+                "input_artifacts": gate_provenance,
             }
         )
     )
@@ -733,12 +787,148 @@ def test_resume_cleanup_discards_only_a_torn_final_jsonl_record(tmp_path):
         _purge_jsonl_after(path, 1)
 
 
+def test_opsd_tensorboard_metrics_expose_raw_kl_clipping_and_throughput():
+    dashboard = opsd_tensorboard_metrics(
+        {
+            "train_loss": -0.01,
+            "forward_kl": 0.12,
+            "clipped_token_fraction": 0.75,
+            "gradient_norm": 0.4,
+            "response_tokens_per_second": 1000.0,
+            "step_time_seconds": 12.0,
+            "gpu_memory_allocated_gib": 7.5,
+            "gpu_peak_memory_allocated_gib": 15.25,
+            "exact_accuracy": 0.125,
+            "raw_exact_accuracy": 0.25,
+            "structural_format_fraction": 0.75,
+            "reward_scoring_seconds": 0.01,
+        }
+    )
+    assert dashboard["loss/clipped_objective"] == -0.01
+    assert dashboard["loss/raw_forward_kl"] == 0.12
+    assert dashboard["loss/clipped_token_fraction"] == 0.75
+    assert dashboard["optimization/preclip_gradient_norm"] == 0.4
+    assert dashboard["throughput/response_tokens_per_second"] == 1000.0
+    assert dashboard["system/gpu_memory_allocated_gib"] == 7.5
+    assert dashboard["system/gpu_peak_memory_allocated_gib"] == 15.25
+    assert dashboard["reward/exact_accuracy"] == 0.125
+    assert dashboard["reward/raw_exact_accuracy"] == 0.25
+    assert dashboard["reward/structural_format_fraction"] == 0.75
+    assert dashboard["perf/reward_scoring_seconds"] == 0.01
+
+
+def test_on_policy_reward_matches_vapo_exact_contract():
+    class RewardTokenizer:
+        def decode(self, token_ids):
+            return "".join("3" if token == 20 else "x" for token in token_ids)
+
+    example = Namespace(ground_truth="3", grading_style="minerva")
+    think = (10, 11)
+    answer = (12, 13)
+    valid = [10, *range(30, 63), 11, 12, 20, 13, 7]
+    valid_reward = grade_on_policy_response(
+        valid,
+        example,
+        RewardTokenizer(),
+        stop_ids=(7,),
+        think_fence_ids=think,
+        answer_fence_ids=answer,
+        min_think_tokens=33,
+    )
+    assert valid_reward == {
+        "raw_exact": 1,
+        "exact": 1,
+        "structurally_valid": 1,
+    }
+
+    invalid_structure = [12, 20, 13, 7]
+    invalid_reward = grade_on_policy_response(
+        invalid_structure,
+        example,
+        RewardTokenizer(),
+        stop_ids=(7,),
+        think_fence_ids=think,
+        answer_fence_ids=answer,
+        min_think_tokens=33,
+    )
+    assert invalid_reward == {
+        "raw_exact": 1,
+        "exact": 0,
+        "structurally_valid": 0,
+    }
+
+
+def test_opsd_stop_ids_deduplicate_aliases_and_preserve_distinct_terminals():
+    aliased = Namespace(eos_id=lambda: 7, bos_id=lambda: 7)
+    distinct = Namespace(eos_id=lambda: 7, bos_id=lambda: 8)
+    assert opsd_stop_ids(aliased) == (7,)
+    assert opsd_stop_ids(distinct) == (7, 8)
+
+
+def test_opsd_eval_tensorboard_metrics_expose_quality_and_step0_delta():
+    dashboard = opsd_eval_tensorboard_metrics(
+        {
+            "accuracy": 0.25,
+            "contract_accuracy": 0.20,
+            "accuracy_delta_from_step0": 0.03,
+            "contract_accuracy_delta_from_step0": 0.02,
+            "paired_delta_bootstrap_low": 0.01,
+            "paired_delta_bootstrap_high": 0.05,
+            "structural_format_fraction": 0.9,
+            "ended_fraction": 0.95,
+            "prompt_any_correct_fraction": 0.5,
+            "prompt_zero_correct_fraction": 0.5,
+            "within_group_reward_std": 0.1,
+            "emitted_tokens_mean": 300,
+            "eval_seconds": 12,
+        }
+    )
+    assert dashboard["eval/accuracy"] == 0.25
+    assert dashboard["eval/contract_accuracy"] == 0.20
+    assert dashboard["eval/descriptive_accuracy_delta_from_step0"] == 0.03
+    assert dashboard["eval/paired_delta_bootstrap_low"] == 0.01
+    assert dashboard["eval/termination_fraction"] == 0.95
+    assert dashboard["perf/eval_seconds"] == 12
+
+
+def test_paired_prompt_accuracy_delta_is_aligned_and_deterministic():
+    first = paired_prompt_accuracy_delta(
+        [2, 0, 4, 1], [1, 0, 2, 1], samples=4, seed=9
+    )
+    second = paired_prompt_accuracy_delta(
+        [2, 0, 4, 1], [1, 0, 2, 1], samples=4, seed=9
+    )
+    assert first == second
+    assert first["paired_delta_mean"] == pytest.approx(3 / 16)
+    assert first["paired_delta_bootstrap_low"] <= first["paired_delta_mean"]
+    assert first["paired_delta_bootstrap_high"] >= first["paired_delta_mean"]
+
+
 def test_sampler_cursor_exactly_resumes_seeded_shuffle():
     examples = [Namespace(problem=str(index)) for index in range(8)]
     first = ShuffledExampleSampler(examples, seed=19)
     prefix = [first.next().problem for _ in range(11)]
     resumed = ShuffledExampleSampler(examples, seed=19, cursor=6)
     assert [resumed.next().problem for _ in range(5)] == prefix[6:]
+
+
+def test_source_quota_sampler_is_exact_shuffled_and_cursor_resumable():
+    examples = [
+        Namespace(problem=f"{source}-{index}", source=source)
+        for source, count in (("deepmind_math", 7), ("gsm8k", 5), ("dapo_math_17k", 3))
+        for index in range(count)
+    ]
+    quotas = {"deepmind_math": 24, "gsm8k": 18, "dapo_math_17k": 6}
+    sampler = SourceQuotaSampler(examples, quotas, seed=19)
+    first = [sampler.next() for _ in range(96)]
+    assert Counter(example.source for example in first[:48]) == quotas
+    assert Counter(example.source for example in first[48:]) == quotas
+    assert sampler.source_counts(48, 48) == quotas
+
+    resumed = SourceQuotaSampler(examples, quotas, seed=19, cursor=37)
+    assert [resumed.next().problem for _ in range(35)] == [
+        example.problem for example in first[37:72]
+    ]
 
 
 def test_top_k_sampling_never_leaves_candidate_set():
@@ -815,7 +1005,7 @@ def test_export_round_trips_through_project_model_loader(tmp_path):
         dataset_sha256="b",
     )
     assert payload["opsd"]["schema"] == OPSD_EXPORT_SCHEMA
-    assert payload["opsd"]["prompt_schema"].endswith("/v2")
+    assert payload["opsd"]["prompt_schema"].endswith("/v3")
     assert payload["sft"] == {"schema": "unit"}
     path = tmp_path / "opsd.pt"
     torch.save(payload, path)

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from postraining.core import encode_prompt
+from postraining.core import THINK_OPEN, answer_style, encode_prompt
 from postraining.math_prompt import strip_math_prompt_framing
 from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
 from postraining.prepare_sft_traces import (
@@ -36,6 +37,8 @@ class OPSDExample:
     reference_solution: str
     reference_kind: str
     source: str
+    ground_truth: str | None
+    grading_style: str | None
 
 
 @dataclass(frozen=True)
@@ -55,15 +58,17 @@ def build_teacher_prompt(
     reference_kind: str = "solution",
     instruction_suffix: str = INSTRUCTION_SUFFIX_ANSWER,
 ) -> str:
-    """Put privilege first and preserve the exact student response contract."""
-    if not problem or not instruction_suffix:
-        raise ValueError("teacher prompt requires a problem and response contract")
+    """Put privilege first; completion token structure carries the contract."""
+    if not problem:
+        raise ValueError("teacher prompt requires a problem")
     try:
         bare_problem, removed = strip_math_prompt_framing(problem)
     except ValueError as error:
         raise ValueError("teacher prompt requires a bare problem") from error
     if removed or bare_problem != problem.strip():
-        raise ValueError("teacher prompt requires a bare problem, not a student prompt")
+        raise ValueError(
+            "teacher prompt requires a bare problem, not a student prompt"
+        )
     if reference_kind == "solution":
         privilege = (
             "Here is a verified reference solution to the problem:\n"
@@ -119,13 +124,26 @@ def load_examples(
         problem = str(row["problem"])
         if not problem.strip():
             continue
+        bare_problem, removed = strip_math_prompt_framing(problem)
+        if removed or bare_problem != problem.strip():
+            raise ValueError(
+                f"{path} contains a non-bare problem column under the "
+                "current OPSD prompt schema"
+            )
+        problem = bare_problem
         student_prompt = problem + suffix
         if reference_column == "document":
             if row.get(reference_column) is None:
                 continue
             document = str(row[reference_column])
-            if not document.startswith(student_prompt):
-                continue
+            expected_start = student_prompt + (
+                THINK_OPEN if answer_fence else ""
+            )
+            if not document.startswith(expected_start):
+                raise ValueError(
+                    f"{path} contains a document incompatible with the "
+                    "current bare-prompt completion boundary"
+                )
             reference = document[len(student_prompt):].strip()
             reference_kind = "solution"
         else:
@@ -137,6 +155,18 @@ def load_examples(
             continue
         if not reference:
             continue
+        ground_truth = row.get("ground_truth")
+        if ground_truth is not None:
+            ground_truth = str(ground_truth).strip() or None
+        grading_style = None
+        if ground_truth is not None:
+            reward_style = row.get("reward_style")
+            if reward_style is None:
+                reward_style = (row.get("reward_model") or {}).get("style")
+            if reward_style is not None:
+                grading_style = answer_style(
+                    {"reward_model": {"style": reward_style}}
+                )
         examples.append(
             OPSDExample(
                 problem=problem,
@@ -145,6 +175,8 @@ def load_examples(
                 reference_solution=reference,
                 reference_kind=reference_kind,
                 source=str(row.get("source", "unknown")),
+                ground_truth=ground_truth,
+                grading_style=grading_style,
             )
         )
     if not examples:
@@ -224,6 +256,123 @@ class ShuffledExampleSampler:
         example = self.examples[self._order(epoch)[offset]]
         self.cursor += 1
         return example
+
+
+def _balanced_source_schedule(quotas: dict[str, int]) -> tuple[str, ...]:
+    """Spread exact source quotas deterministically across one cycle."""
+    if not quotas or any(
+        not isinstance(name, str) or not name or quota < 1
+        for name, quota in quotas.items()
+    ):
+        raise ValueError("source quotas must be positive and nonempty")
+    remaining = dict(quotas)
+    used: Counter[str] = Counter()
+    total = sum(quotas.values())
+    schedule = []
+    for position in range(total):
+        candidates = [name for name, count in remaining.items() if count]
+        source = max(
+            candidates,
+            key=lambda name: (
+                (position + 1) * quotas[name] / total - used[name],
+                name,
+            ),
+        )
+        schedule.append(source)
+        remaining[source] -= 1
+        used[source] += 1
+    if Counter(schedule) != Counter(quotas):
+        raise AssertionError("balanced source schedule changed quotas")
+    return tuple(schedule)
+
+
+class SourceQuotaSampler:
+    """Exact, shuffled, source-weighted sampling with cursor-only resume.
+
+    The global cursor selects a source from a fixed balanced cycle. Each
+    source owns an independently shuffled without-replacement stream, so a
+    small source may begin a new source-local epoch without perturbing any
+    other source. Reconstructing from the global cursor is exact.
+    """
+
+    def __init__(
+        self,
+        examples: list[OPSDExample],
+        quotas: dict[str, int],
+        seed: int,
+        cursor: int = 0,
+    ):
+        if cursor < 0:
+            raise ValueError("sampler cursor must be nonnegative")
+        self.schedule = _balanced_source_schedule(quotas)
+        grouped: dict[str, list[OPSDExample]] = {
+            source: [] for source in quotas
+        }
+        for example in examples:
+            if example.source not in grouped:
+                raise ValueError(
+                    f"example source {example.source!r} lacks a source quota"
+                )
+            grouped[example.source].append(example)
+        empty = [source for source, rows in grouped.items() if not rows]
+        if empty:
+            raise ValueError(f"source quotas reference empty sources {empty}")
+        self.examples_by_source = grouped
+        self.quotas = dict(quotas)
+        self.seed = seed
+        self.cursor = cursor
+        self._orders: dict[tuple[str, int], list[int]] = {}
+
+    def _consumed_before(self, source: str, position: int) -> int:
+        cycles, remainder = divmod(position, len(self.schedule))
+        return (
+            cycles * self.quotas[source]
+            + self.schedule[:remainder].count(source)
+        )
+
+    def _order(self, source: str, epoch: int) -> list[int]:
+        key = (source, epoch)
+        if key not in self._orders:
+            rows = self.examples_by_source[source]
+            order = list(range(len(rows)))
+            source_seed = int.from_bytes(
+                hashlib.sha256(source.encode()).digest()[:8], "big"
+            )
+            random.Random(
+                self.seed * 1_000_003 + source_seed + epoch
+            ).shuffle(order)
+            self._orders[key] = order
+        return self._orders[key]
+
+    def next(self) -> OPSDExample:
+        source = self.schedule[self.cursor % len(self.schedule)]
+        local = self._consumed_before(source, self.cursor)
+        rows = self.examples_by_source[source]
+        epoch, offset = divmod(local, len(rows))
+        example = rows[self._order(source, epoch)[offset]]
+        self.cursor += 1
+        return example
+
+    def source_counts(self, start: int, count: int) -> dict[str, int]:
+        if start < 0 or count < 0:
+            raise ValueError("source-count range must be nonnegative")
+        return dict(
+            Counter(
+                self.schedule[position % len(self.schedule)]
+                for position in range(start, start + count)
+            )
+        )
+
+    def consumed_counts(self, position: int | None = None) -> dict[str, int]:
+        """Redundant audit state derived from the global cursor."""
+        if position is None:
+            position = self.cursor
+        if position < 0:
+            raise ValueError("sampler position must be nonnegative")
+        return {
+            source: self._consumed_before(source, position)
+            for source in sorted(self.quotas)
+        }
 
 
 def file_sha256(path: str | Path) -> str:
