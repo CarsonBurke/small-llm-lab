@@ -633,11 +633,35 @@ class KDAGPT(nn.Module):
         self.norm1 = RMSNorm(model_dim)
         self.norm2 = RMSNorm(model_dim)
 
+    def hidden_states(self, inputs: Tensor) -> Tensor:
+        return self.norm2(self.blocks(self.norm1(self.embed(inputs))))
+
+    def project_logits(self, hidden: Tensor) -> Tensor:
+        logits = self.proj(hidden).float()
+        return 15 * logits * (logits.square() + 15**2).rsqrt()
+
+    def logits(self, inputs: Tensor, positions: Tensor | None = None) -> Tensor:
+        """Softcapped next-token logits, at selected positions when given.
+
+        Greedy decoding reads one position per row while the trunk must still
+        see the whole prefix. The vocabulary projection is twice the trunk's
+        parameter count, so gathering before projecting keeps it off every
+        position the decoder is not about to sample from.
+        """
+
+        hidden = self.hidden_states(inputs)
+        if positions is not None:
+            if positions.shape != inputs.shape[:1]:
+                raise ValueError("positions must hold one index per row")
+            hidden = torch.gather(
+                hidden,
+                1,
+                positions[:, None, None].expand(-1, 1, hidden.shape[-1]),
+            )
+        return self.project_logits(hidden)
+
     def forward(self, inputs: Tensor, targets: Tensor):
-        x = self.norm1(self.embed(inputs))
-        x = self.blocks(x)
-        logits = self.proj(self.norm2(x)).float()
-        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        logits = self.project_logits(self.hidden_states(inputs))
         return F.cross_entropy(
             logits.view(targets.numel(), -1), targets.view(-1), reduction="sum"
         )

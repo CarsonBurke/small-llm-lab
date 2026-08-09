@@ -1408,8 +1408,14 @@ print0(
     f"microbatch_sequences={mbs}, "
     f"local_microbatches_per_step={local_microbatches_per_step}"
 )
+# Overridable so the main panel can be pointed at a split other than the
+# held-out one -- in particular at training shards, to measure fit on data the
+# model actually consumed. Anything but the default is NOT held-out; the run
+# name and NOTES must say so, because nothing downstream distinguishes them.
+val_glob = os.environ.get("VAL_GLOB", "fineweb_val_*.bin")
 val_inputs, val_targets = next(distributed_data_generator(
-    f"{data_path}/fineweb_val_*.bin", val_tokens, seq_len=seq_len))
+    f"{data_path}/{val_glob}", val_tokens, seq_len=seq_len))
+print0(f"validation panel: {data_path}/{val_glob}")
 
 # Bits-per-byte byte accounting, taken from the corpus rather than assumed.
 # The GPT-2 byte-length LUT is exact only because every GPT-2 BPE token maps
@@ -2123,6 +2129,69 @@ for trial in range(num_trials):
         print0(
             f"resumed model, optimizers, and RNG from {resume_checkpoint} "
             f"at completed step {start_step}",
+            console=True,
+        )
+
+    # Score a finished run's weights on a panel without training. Distinct from
+    # RESUME_CHECKPOINT, which needs optimizer states this trainer only writes
+    # to `*_resume.pt`; final model exports carry weights alone. The loop
+    # validates before it checks `step == stop_after_step`, so starting at the
+    # stop step runs exactly one validation and applies no update.
+    eval_checkpoint = os.environ.get("EVAL_CHECKPOINT", "")
+    if eval_checkpoint:
+        if resume_checkpoint:
+            raise ValueError(
+                "EVAL_CHECKPOINT and RESUME_CHECKPOINT both set; an evaluation "
+                "run must not also continue training"
+            )
+        eval_payload = torch.load(
+            eval_checkpoint, map_location="cpu", weights_only=False
+        )
+        # The export strips `mtp_heads.` and `nextlat_dynamics.` from "model"
+        # and carries the nextlat dynamics out-of-band, so `strict=True` on the
+        # base state would reject every finished run. Be strict about what
+        # decodes instead: nothing unexpected, nothing missing outside those
+        # two training-only prefixes, and the auxiliary restored explicitly.
+        missing, unexpected = model.load_state_dict(
+            eval_payload["model"], strict=False
+        )
+        if unexpected:
+            raise ValueError(
+                f"{eval_checkpoint} carries state this model has no home for, "
+                f"so the architectures disagree: {sorted(unexpected)}"
+            )
+        stray = [
+            name
+            for name in missing
+            if not name.startswith(("mtp_heads.", "nextlat_dynamics."))
+        ]
+        if stray:
+            raise ValueError(
+                f"{eval_checkpoint} is missing weights the scored forward pass "
+                f"uses: {sorted(stray)}"
+            )
+        nextlat_state = eval_payload.get("nextlat_dynamics")
+        if (model.nextlat_dynamics is None) != (nextlat_state is None):
+            raise ValueError(
+                "NEXTLAT disagrees with the checkpoint: it "
+                f"{'has' if nextlat_state is not None else 'has no'} nextlat "
+                f"dynamics, this model "
+                f"{'has' if model.nextlat_dynamics is not None else 'has none'}"
+            )
+        if nextlat_state is not None:
+            model.nextlat_dynamics.load_state_dict(nextlat_state, strict=True)
+        if len(model.mtp_heads) and any(
+            name.startswith("mtp_heads.") for name in missing
+        ):
+            raise ValueError(
+                f"{eval_checkpoint} does not export MTP heads, so this model's "
+                "would stay randomly initialized; score with MTP_NUM_HEADS=0"
+            )
+        start_step = stop_after_step
+        print0(
+            f"evaluation-only: loaded {eval_checkpoint} "
+            f"(completed_steps={eval_payload.get('completed_steps')}), "
+            f"scoring one panel at step {stop_after_step} without training",
             console=True,
         )
 
