@@ -430,13 +430,94 @@ class GPT2BPETokenizer:
         return self._tokenizer.convert_ids_to_tokens(int(token_id))
 
 
+class ToastTSTPosttrainingTokenizer:
+    """Post-training adapter for a checkpoint-bound ToaST+TST vocabulary."""
+
+    def __init__(
+        self,
+        provenance: dict,
+        think_tokens: bool = False,
+        answer_tokens: bool = False,
+    ) -> None:
+        from pretraining.byte_accounting import load_bound_tokenizer
+
+        if answer_tokens and not think_tokens:
+            raise ValueError("answer_tokens requires think_tokens")
+        self._tokenizer = load_bound_tokenizer(provenance)
+        specials = tuple(self._tokenizer.spec.specials)
+        self._special_ids = frozenset(range(len(specials)))
+
+        def special_id(piece: str) -> int:
+            try:
+                return specials.index(piece)
+            except ValueError as error:
+                raise ValueError(
+                    f"checkpoint tokenizer does not reserve {piece!r}"
+                ) from error
+
+        self._eot_id = special_id("<|endoftext|>")
+        self.think_open_id = special_id(THINK_OPEN) if think_tokens else None
+        self.think_close_id = special_id(THINK_CLOSE) if think_tokens else None
+        self.answer_open_id = special_id(ANSWER_OPEN) if answer_tokens else None
+        self.answer_close_id = special_id(ANSWER_CLOSE) if answer_tokens else None
+
+    def encode(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text)
+
+    def decode(self, ids) -> str:
+        # Match GPT2BPETokenizer(skip_special_tokens=True): structural fences
+        # and document separators guide generation but are not response text.
+        # TST's numeric decoding is context-dependent, so a skipped special is
+        # also a hard run boundary: filtering all specials first could merge a
+        # number before </think> with one after <answer> and change its value.
+        pieces: list[str] = []
+        run: list[int] = []
+        for value in ids:
+            token = int(value)
+            if token in self._special_ids:
+                if run:
+                    pieces.append(self._tokenizer.decode(run))
+                    run = []
+            else:
+                run.append(token)
+        if run:
+            pieces.append(self._tokenizer.decode(run))
+        return "".join(pieces)
+
+    def eos_id(self) -> int:
+        return self._eot_id
+
+    def bos_id(self) -> int:
+        return self._eot_id
+
+    def id_to_piece(self, token_id: int) -> str:
+        token_id = int(token_id)
+        if token_id in self._special_ids:
+            return self._tokenizer.spec.specials[token_id]
+        return self._tokenizer.decode([token_id])
+
+
 def load_posttraining_tokenizer(
     architecture: str,
     sp_model_path: str,
     think_tokens: bool = False,
     answer_tokens: bool = False,
+    tokenizer_provenance: dict | None = None,
 ):
     """The tokenizer family the checkpoint's pretraining data was built with."""
+    tokenizer_kind = (
+        tokenizer_provenance.get("kind")
+        if tokenizer_provenance is not None
+        else None
+    )
+    if tokenizer_kind == "toast_tst":
+        return ToastTSTPosttrainingTokenizer(
+            tokenizer_provenance,
+            think_tokens=think_tokens,
+            answer_tokens=answer_tokens,
+        )
+    if tokenizer_kind not in {None, "gpt2"}:
+        raise ValueError(f"unsupported checkpoint tokenizer kind {tokenizer_kind!r}")
     if "gpt2vocab" in architecture:
         return GPT2BPETokenizer(
             think_tokens=think_tokens, answer_tokens=answer_tokens
@@ -1005,8 +1086,56 @@ def top_p_sample(
             f"cannot draw {num_samples} unique samples from "
             f"support of size {candidate_support}"
         )
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be nonnegative, got {temperature}")
+    if not 0.0 <= top_p <= 1.0:
+        # Out of range, or NaN, which fails both comparisons. A negative top_p
+        # masks every rank and surfaces as the same opaque multinomial error a
+        # corrupted forward gives, so it is worth separating here.
+        raise ValueError(f"top_p must lie in [0, 1], got {top_p}")
     logits = logits.float()
-    if temperature != 1.0:
+    if temperature == 0.0:
+        # Greedy decoding, by the usual convention. Dividing by zero would
+        # give +inf for every positive logit and NaN for a zero one, and
+        # multinomial refuses that outright -- so a caller asking for the
+        # argmax path has to be answered here rather than arithmetically.
+        #
+        # Expressed as a one-hot distribution rather than an argmax shortcut
+        # so the draw order stays one multinomial per step: that order is part
+        # of the rollout's execution schema, and a caller that skipped a draw
+        # would desynchronize a shared generator from a sampled rollout's.
+        if num_samples > 1:
+            raise ValueError(
+                "temperature 0 is greedy decoding and has a single outcome; "
+                f"cannot draw {num_samples} distinct samples"
+            )
+        # multinomial refusing a NaN, +inf, or wholly masked row is this
+        # codebase's de-facto detector for a corrupted forward pass or an
+        # over-aggressive mask, and argmax has no such reflex: it ranks NaN
+        # above every real logit, picks a lone +inf outright, and returns
+        # index 0 for an all -inf row. Greedy decoding would otherwise turn a
+        # broken forward into a complete, plausible-looking set of predictions
+        # that every downstream contract accepts.
+        #
+        # +inf is refused for parity rather than because argmax is ambiguous
+        # about it: a stable softmax subtracts the row max, so `exp(inf - inf)`
+        # is NaN and the sampled path raises on the same logits. -inf stays
+        # legal -- it is the mask value, and a row masked down to one candidate
+        # is a request, not a corruption.
+        if (
+            logits.isnan().any()
+            or logits.eq(torch.inf).any()
+            or not logits.isfinite().any(dim=-1).all()
+        ):
+            raise ValueError(
+                "temperature-0 decoding needs at least one finite logit per "
+                "row and no NaN or +inf; argmax would silently rank those "
+                "above every real logit where sampling refuses them"
+            )
+        logits = torch.full_like(logits, -torch.inf).scatter(
+            -1, logits.argmax(dim=-1, keepdim=True), 0.0
+        )
+    elif temperature != 1.0:
         # Dividing by exactly 1.0 is the identity in IEEE arithmetic, so the
         # skip is bit-exact -- but the kernel is not free: it reads and writes
         # a (rows, 50304) fp32 tensor at every rollout step of the training

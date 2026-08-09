@@ -25,6 +25,7 @@ from postraining.core import (
     nearby_numeric_reward,
     normalize_final_answer,
     parse_numeric_answer,
+    top_p_sample,
     validate_posttraining_context_budget,
     verify_answer,
 )
@@ -419,3 +420,106 @@ def test_behavior_kl_is_stable_and_nonnegative_near_zero_drift():
         rtol=0.15,
         atol=1e-16,
     )
+
+
+def test_temperature_zero_decodes_greedily_under_every_truncation():
+    """Greedy decoding is a supported request, not a division by zero.
+
+    `logits / 0.0` gives +inf for every positive logit and NaN for a zero
+    one, and `torch.multinomial` refuses that outright -- so an evaluation
+    that asks for the argmax path (arithmetic has one right answer, and
+    sampling would measure the decoder) would crash rather than run.
+    """
+    logits = torch.tensor([[1.0, 3.0, 0.0, -2.0], [5.0, -1.0, 4.9, 0.0]])
+    for top_p in (1.0, 0.7):
+        for top_k in (None, 2):
+            generator = torch.Generator().manual_seed(7)
+            sampled = top_p_sample(
+                logits, 0.0, top_p, generator=generator, top_k=top_k
+            )
+            assert sampled.tolist() == [1, 0]
+
+
+def test_temperature_zero_is_deterministic_across_generator_states():
+    logits = torch.tensor([[0.10, 0.11, 0.09]])
+    outcomes = {
+        int(top_p_sample(logits, 0.0, 1.0, generator=torch.Generator().manual_seed(seed)))
+        for seed in range(50)
+    }
+    assert outcomes == {1}
+
+
+def test_temperature_zero_refuses_contradictory_requests():
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+    with pytest.raises(ValueError, match="single outcome"):
+        top_p_sample(logits, 0.0, 1.0, num_samples=2)
+    with pytest.raises(ValueError, match="nonnegative"):
+        top_p_sample(logits, -0.5, 1.0)
+
+
+def test_temperature_zero_refuses_the_logits_sampling_would_refuse():
+    """Greedy decoding must not be the quiet path for a broken forward pass.
+
+    `torch.multinomial` raising on a NaN or wholly masked row is what this
+    codebase actually relies on to notice a corrupted forward or an
+    over-aggressive mask. `argmax` has no such reflex: it ranks NaN above
+    every real logit, and returns index 0 when every logit is -inf. Since the
+    arithmetic probe decodes greedily by default, that difference is the
+    difference between a crash and a complete, plausible-looking accuracy
+    table built from argmax-of-NaN, which no aggregate would reveal.
+    """
+    for broken in (
+        torch.tensor([[1.0, float("nan"), 3.0]]),
+        torch.tensor([[-torch.inf, -torch.inf, -torch.inf]]),
+        torch.tensor([[1.0, 2.0, 3.0], [-torch.inf, -torch.inf, -torch.inf]]),
+        # A lone +inf beside finite logits: the row has finite entries and no
+        # NaN, so a bare "at least one finite entry" test would pass it, and
+        # argmax would return the +inf position as a confident answer. A
+        # stable softmax subtracts the row max, so `exp(inf - inf)` is NaN and
+        # the sampled path refuses the same row.
+        torch.tensor([[1.0, torch.inf, 3.0]]),
+    ):
+        with pytest.raises(ValueError, match="finite logit"):
+            top_p_sample(broken, 0.0, 1.0)
+        with pytest.raises(RuntimeError):
+            top_p_sample(broken, 1.0, 1.0)
+    # A row that is merely masked down to one candidate is not broken, and
+    # -inf on its own is the mask value rather than a corruption.
+    masked = torch.tensor([[-torch.inf, 2.0, -torch.inf]])
+    assert top_p_sample(masked, 0.0, 1.0).tolist() == [1]
+    assert top_p_sample(torch.tensor([[1.0, -torch.inf, 3.0]]), 0.0, 1.0).tolist() == [2]
+    # Finite but enormous is legal at both temperatures, so the check must not
+    # be a magnitude test.
+    assert top_p_sample(torch.tensor([[1.0, 1e38, 3.0]]), 0.0, 1.0).tolist() == [1]
+
+
+def test_top_p_outside_the_unit_interval_is_refused_by_name():
+    """A negative top_p masks every rank and reaches multinomial as noise.
+
+    It surfaces as the same opaque `probability tensor contains ...` error a
+    corrupted forward gives, at both temperatures, so the two failures are
+    indistinguishable from the traceback alone.
+    """
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+    for top_p in (-0.1, 1.5, float("nan")):
+        for temperature in (0.0, 1.0):
+            with pytest.raises(ValueError, match=r"top_p must lie in \[0, 1\]"):
+                top_p_sample(logits, temperature, top_p)
+    # The closed endpoints are legal: top_p=0 keeps the single best token.
+    assert top_p_sample(logits, 1.0, 0.0).tolist() == [2]
+    assert top_p_sample(logits, 1.0, 1.0).shape == (1,)
+
+
+def test_temperature_zero_still_consumes_one_generator_draw():
+    """The draw order is part of the rollout execution schema.
+
+    Every actor objective consumes one token draw per step; a greedy path
+    that skipped the draw would leave a shared generator at a different
+    state than a sampled rollout of the same length.
+    """
+    logits = torch.tensor([[1.0, 3.0, 0.0, -2.0]])
+    greedy = torch.Generator().manual_seed(3)
+    top_p_sample(logits, 0.0, 1.0, generator=greedy)
+    sampled = torch.Generator().manual_seed(3)
+    top_p_sample(logits, 1.0, 1.0, generator=sampled)
+    assert greedy.get_state().equal(sampled.get_state())

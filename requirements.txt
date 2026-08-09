@@ -11,6 +11,7 @@ setuptools
 typing-extensions==4.15.0
 datasets
 fla-core==0.5.2
+xlstm==2.0.5
 tiktoken
 sentencepiece
 scipy
