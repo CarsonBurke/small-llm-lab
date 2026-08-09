@@ -1,0 +1,244 @@
+{
+  "schema": "math_problem_sources/v1",
+  "description": "Every file in this repository that supplies math or code problem statements, and the split each one owns. Priority is eval > rl > sft > pretrain, so a problem claimed by a higher-priority split is refused by every lower-priority builder. Pretraining declares no sources of its own: it is the residual and receives whatever no evaluation or post-training set has claimed. Historical and superseded artifacts stay listed -- a retired SFT pool still contaminated the checkpoints trained on it, and a problem the base model has already memorized is no less contaminated for the pool having been replaced.",
+  "sources": [
+    {
+      "name": "aime_2024",
+      "path": "postraining/data/aime-2024.parquet",
+      "split": "eval",
+      "columns": ["prompt"],
+      "note": "held-out competition benchmark"
+    },
+    {
+      "name": "aime_2026",
+      "path": "postraining/data/aime-2026.parquet",
+      "split": "eval",
+      "columns": ["prompt"],
+      "note": "held-out competition benchmark; union of the I and II sittings"
+    },
+    {
+      "name": "aime_2026_i",
+      "path": "postraining/data/aime-2026-i.parquet",
+      "split": "eval",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "aime_2026_ii",
+      "path": "postraining/data/aime-2026-ii.parquet",
+      "split": "eval",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "gsm8k_test",
+      "path": "postraining/data/relaxed_bar/gsm8k_test_questions.parquet",
+      "split": "eval",
+      "columns": ["question"],
+      "note": "the GSM8K test split; the headline word-problem benchmark"
+    },
+    {
+      "name": "deepmind_interpolate_easy_panel",
+      "path": "postraining/data/deepmind-interpolate-easy.parquet",
+      "split": "eval",
+      "columns": ["prompt"],
+      "note": "frozen gate panel"
+    },
+    {
+      "name": "opsd_math_curriculum_sft4_v2_gate",
+      "path": "postraining/data/opsd_math_curriculum_24_18_6_sft4_v2_gate.parquet",
+      "split": "eval",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_math_curriculum_sft6_bare_gate",
+      "path": "postraining/data/opsd_math_curriculum_24_18_6_sft6_bare_gate.parquet",
+      "split": "eval",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_dapo17k_gate",
+      "path": "postraining/data/opsd_dapo17k_gate.parquet",
+      "split": "eval",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_dapo17k_bare_gate",
+      "path": "postraining/data/opsd_dapo17k_bare_gate.parquet",
+      "split": "eval",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_dapo17k_contractlast_gate",
+      "path": "postraining/data/opsd_dapo17k_contractlast_gate.parquet",
+      "split": "eval",
+      "columns": ["problem"]
+    },
+
+    {
+      "name": "dapo_math_17k",
+      "path": "postraining/data/dapo-math-17k.parquet",
+      "split": "rl",
+      "columns": ["prompt"],
+      "note": "primary VAPO math pool; rows repeat, keys do not"
+    },
+    {
+      "name": "gsm8k_rl_prompts",
+      "path": "postraining/data/gsm8k_rl_prompts.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "deepmind_interpolate_rl_full",
+      "path": "postraining/data/deepmind-interpolate-rl-full.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "deepmind_interpolate_rl",
+      "path": "postraining/data/deepmind-interpolate-rl.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "vapo_broad_v1_mbpp_train",
+      "path": "postraining/data/vapo_broad_v1_mbpp_train.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "vapo_broad_v2_mbpp_train",
+      "path": "postraining/data/vapo_broad_v2_mbpp_train.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "vapo_broad_v3_mbpp_train",
+      "path": "postraining/data/vapo_broad_v3_mbpp_train.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "vapo_broad_v4_mbpp_train",
+      "path": "postraining/data/vapo_broad_v4_mbpp_train.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "vapo_broad_v5_mbpp_train",
+      "path": "postraining/data/vapo_broad_v5_mbpp_train.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "vapo_broad_v6_bare_mbpp_train",
+      "path": "postraining/data/vapo_broad_v6_bare_mbpp_train.parquet",
+      "split": "rl",
+      "columns": ["prompt"]
+    },
+
+    {
+      "name": "sft_traces_v1",
+      "path": "postraining/data/sft_traces_v1.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "sft_traces_v2_think",
+      "path": "postraining/data/sft_traces_v2_think.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "sft_traces_v3_answer",
+      "path": "postraining/data/sft_traces_v3_answer.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "sft_traces_v4_answer_canonical_hfonly",
+      "path": "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+      "split": "sft",
+      "columns": ["problem"],
+      "note": "the corpus behind the canonical post-training base checkpoint"
+    },
+    {
+      "name": "sft_traces_v5_answer_canonical_a1swap10k",
+      "path": "postraining/data/sft_traces_v5_answer_canonical_a1swap10k.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "sft_traces_v6_answer_bare_a1swap10k",
+      "path": "postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_math_curriculum_sft4_v2_train",
+      "path": "postraining/data/opsd_math_curriculum_24_18_6_sft4_v2_train.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_math_curriculum_sft6_bare_train",
+      "path": "postraining/data/opsd_math_curriculum_24_18_6_sft6_bare_train.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_dapo17k_train",
+      "path": "postraining/data/opsd_dapo17k_train.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_dapo17k_bare_train",
+      "path": "postraining/data/opsd_dapo17k_bare_train.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "opsd_dapo17k_contractlast_train",
+      "path": "postraining/data/opsd_dapo17k_contractlast_train.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "relaxed_bar_gsm8k_main_train",
+      "path": "postraining/data/relaxed_bar/gsm8k_main_train.parquet",
+      "split": "sft",
+      "columns": ["question"],
+      "note": "GSM8K train split; the pool the 2026-08-06 audit found 97% pretrained"
+    },
+    {
+      "name": "relaxed_bar_gsm8k_socratic_train",
+      "path": "postraining/data/relaxed_bar/gsm8k_socratic_train.parquet",
+      "split": "sft",
+      "columns": ["question"],
+      "note": "same problems as gsm8k_main_train under Socratic rationales"
+    },
+    {
+      "name": "relaxed_bar_had653_gsm8k_openmath",
+      "path": "postraining/data/relaxed_bar/had653_gsm8k_openmath.parquet",
+      "split": "sft",
+      "columns": ["question"]
+    },
+    {
+      "name": "relaxed_bar_openmathinstruct2_gsm8k_band",
+      "path": "postraining/data/relaxed_bar/openmathinstruct2_gsm8k_band.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    },
+    {
+      "name": "relaxed_bar_a1_math_deepmind",
+      "path": "postraining/data/relaxed_bar/a1_math_deepmind.parquet",
+      "split": "sft",
+      "columns": ["question"]
+    },
+    {
+      "name": "relaxed_bar_sxiong_synthetic_math",
+      "path": "postraining/data/relaxed_bar/sxiong_synthetic_math.parquet",
+      "split": "sft",
+      "columns": ["problem"]
+    }
+  ]
+}

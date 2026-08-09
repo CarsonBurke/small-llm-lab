@@ -1,0 +1,16 @@
+{
+  "covered_rows": 2342451,
+  "low_diversity_ngrams": 244236,
+  "max_repeated_word_fraction": 0.5,
+  "ngram_size": 13,
+  "ngrams_sha256": "2e8abd66fe0e449842f6f3b03fde58949fab4b2b1cdb1d88fa55baa272a9ebe5",
+  "protected_rows": 2861011,
+  "schema": "math_contamination_index/v1",
+  "short_rows": 518560,
+  "splits": [
+    "eval",
+    "rl",
+    "sft"
+  ],
+  "unique_ngrams": 4045060
+}

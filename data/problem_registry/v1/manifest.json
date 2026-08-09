@@ -1,0 +1,381 @@
+{
+  "conflicts": {
+    "dapo_math_17k": 781,
+    "deepmind_interpolate_rl": 11,
+    "deepmind_interpolate_rl_full": 96,
+    "gsm8k_rl_prompts": 73,
+    "opsd_dapo17k_bare_train": 16936,
+    "opsd_dapo17k_contractlast_train": 16709,
+    "opsd_dapo17k_train": 16937,
+    "opsd_math_curriculum_sft4_v2_train": 204044,
+    "opsd_math_curriculum_sft6_bare_train": 204045,
+    "relaxed_bar_gsm8k_main_train": 7217,
+    "relaxed_bar_gsm8k_socratic_train": 7217,
+    "relaxed_bar_had653_gsm8k_openmath": 6759,
+    "relaxed_bar_openmathinstruct2_gsm8k_band": 7171,
+    "relaxed_bar_sxiong_synthetic_math": 4,
+    "sft_traces_v1": 7081,
+    "sft_traces_v2_think": 7081,
+    "sft_traces_v3_answer": 7124,
+    "sft_traces_v4_answer_canonical_hfonly": 7124,
+    "sft_traces_v5_answer_canonical_a1swap10k": 7123,
+    "sft_traces_v6_answer_bare_a1swap10k": 7123
+  },
+  "registry_sha256": "01cb4ce0296026934f0c28b958e2decabc0b867dc745f4444027cf7ea9abcbc7",
+  "schema": "math_problem_registry/v1",
+  "sources": {
+    "aime_2024": {
+      "claimed": 30,
+      "distinct_problems": 30,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/aime-2024.parquet",
+      "rows": 960,
+      "sha256": "12154e38a716d12db5731f9a022ae69a610c4f7d0e0dcc04e902887a686877e7",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "aime_2026": {
+      "claimed": 30,
+      "distinct_problems": 30,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/aime-2026.parquet",
+      "rows": 30,
+      "sha256": "db9db6759acff350c96ed3fd838e9b7285326a28862add29962395626fed1c8a",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "aime_2026_i": {
+      "claimed": 0,
+      "distinct_problems": 15,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/aime-2026-i.parquet",
+      "rows": 15,
+      "sha256": "e459bb718925b5baf9c936670e8eeb022b477dcad6f6cece71168fabb4393bda",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "aime_2026_ii": {
+      "claimed": 0,
+      "distinct_problems": 15,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/aime-2026-ii.parquet",
+      "rows": 15,
+      "sha256": "8276d5939374efc5ceee23a310b8186a61fd7e5ec8c7f7616bb97033b214ea70",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "dapo_math_17k": {
+      "claimed": 16404,
+      "distinct_problems": 17185,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/dapo-math-17k.parquet",
+      "rows": 1791700,
+      "sha256": "534375d6bb8630d22ab46a56e11f2ffec1d288d8f7d04099bc82d68948705941",
+      "split": "rl",
+      "yielded_to_higher_priority": 781
+    },
+    "deepmind_interpolate_easy_panel": {
+      "claimed": 144,
+      "distinct_problems": 144,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/deepmind-interpolate-easy.parquet",
+      "rows": 144,
+      "sha256": "b77b0fad8d57bcd4b31aa8e189bcec92ef72370282a242dc18c655cde37ba9f6",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "deepmind_interpolate_rl": {
+      "claimed": 0,
+      "distinct_problems": 18000,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/deepmind-interpolate-rl.parquet",
+      "rows": 18000,
+      "sha256": "075a6de26b849932251f4d0cf3563339b6cca42994cd843b39fcc57897d4156f",
+      "split": "rl",
+      "yielded_to_higher_priority": 11
+    },
+    "deepmind_interpolate_rl_full": {
+      "claimed": 179760,
+      "distinct_problems": 179856,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/deepmind-interpolate-rl-full.parquet",
+      "rows": 179856,
+      "sha256": "90d222e0d395b7fe7d7413ffae2736647d4ab81142b04796eaa150ff64a78513",
+      "split": "rl",
+      "yielded_to_higher_priority": 96
+    },
+    "gsm8k_rl_prompts": {
+      "claimed": 7144,
+      "distinct_problems": 7217,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/gsm8k_rl_prompts.parquet",
+      "rows": 7217,
+      "sha256": "64a5e2cbc65ca9096a042a775db5aff5defd434d1f918c0ee70f9abe93ef4a25",
+      "split": "rl",
+      "yielded_to_higher_priority": 73
+    },
+    "gsm8k_test": {
+      "claimed": 1319,
+      "distinct_problems": 1319,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/gsm8k_test_questions.parquet",
+      "rows": 1319,
+      "sha256": "13da55c6b95b4e977e36d723476c97b95b5229fa077143f121a2772738f5154a",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "opsd_dapo17k_bare_gate": {
+      "claimed": 251,
+      "distinct_problems": 256,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_dapo17k_bare_gate.parquet",
+      "rows": 256,
+      "sha256": "ac45eeabf3e531b264fe3724c3340ec2d0d5761b90624336b6e4a00fba024d91",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "opsd_dapo17k_bare_train": {
+      "claimed": 0,
+      "distinct_problems": 16936,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_dapo17k_bare_train.parquet",
+      "rows": 17646,
+      "sha256": "fcc34abbfe828c5fc7bda00baae5c0819492824f898c0dd18f23b55e3b432b13",
+      "split": "sft",
+      "yielded_to_higher_priority": 16936
+    },
+    "opsd_dapo17k_contractlast_gate": {
+      "claimed": 250,
+      "distinct_problems": 512,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_dapo17k_contractlast_gate.parquet",
+      "rows": 512,
+      "sha256": "05eeb460f823d3fba355807b57d265c9e31ae3d0e41a86ac59da644945105642",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "opsd_dapo17k_contractlast_train": {
+      "claimed": 0,
+      "distinct_problems": 16709,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_dapo17k_contractlast_train.parquet",
+      "rows": 17389,
+      "sha256": "ece2cca61b803180b7436c6017bffb46fea0212e3f7a010ecb562367b1be45c5",
+      "split": "sft",
+      "yielded_to_higher_priority": 16709
+    },
+    "opsd_dapo17k_gate": {
+      "claimed": 255,
+      "distinct_problems": 256,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_dapo17k_gate.parquet",
+      "rows": 256,
+      "sha256": "6f646a172e5f7e7af71ad953decfe7fc4d8ec6ba9e765706a0c6f87b51b1bbcf",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "opsd_dapo17k_train": {
+      "claimed": 0,
+      "distinct_problems": 16937,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_dapo17k_train.parquet",
+      "rows": 17651,
+      "sha256": "278c49b9f236cc3dae812ebaec6e67254ec6bf9eda7a5ce444e697557282876a",
+      "split": "sft",
+      "yielded_to_higher_priority": 16937
+    },
+    "opsd_math_curriculum_sft4_v2_gate": {
+      "claimed": 192,
+      "distinct_problems": 192,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_math_curriculum_24_18_6_sft4_v2_gate.parquet",
+      "rows": 192,
+      "sha256": "e414d91439b0920f0f3330da1a8da33f4e309f872cfcab491b75e8b733963eaf",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "opsd_math_curriculum_sft4_v2_train": {
+      "claimed": 0,
+      "distinct_problems": 204044,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_math_curriculum_24_18_6_sft4_v2_train.parquet",
+      "rows": 204045,
+      "sha256": "295eb9c88ac8f9319996e739402ee61d2d144012048035a7bd713e090d8d4ec4",
+      "split": "sft",
+      "yielded_to_higher_priority": 204044
+    },
+    "opsd_math_curriculum_sft6_bare_gate": {
+      "claimed": 1,
+      "distinct_problems": 192,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_math_curriculum_24_18_6_sft6_bare_gate.parquet",
+      "rows": 192,
+      "sha256": "ec1c32e7e07e69abe65ad2c147212f5fde176bec4c4830605083d6afbe0eb24a",
+      "split": "eval",
+      "yielded_to_higher_priority": 0
+    },
+    "opsd_math_curriculum_sft6_bare_train": {
+      "claimed": 0,
+      "distinct_problems": 204045,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/opsd_math_curriculum_24_18_6_sft6_bare_train.parquet",
+      "rows": 204046,
+      "sha256": "d318c5b98395b1e55ca230e993e9fa1224bd7e35a6f17c9e25e2fdb83259d64e",
+      "split": "sft",
+      "yielded_to_higher_priority": 204045
+    },
+    "relaxed_bar_a1_math_deepmind": {
+      "claimed": 31597,
+      "distinct_problems": 31597,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/a1_math_deepmind.parquet",
+      "rows": 31600,
+      "sha256": "4109a20efc985cd119284936cde1fdbec844ca36561112da6b962d055eacedaf",
+      "split": "sft",
+      "yielded_to_higher_priority": 0
+    },
+    "relaxed_bar_gsm8k_main_train": {
+      "claimed": 0,
+      "distinct_problems": 7473,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/gsm8k_main_train.parquet",
+      "rows": 7473,
+      "sha256": "b06b6cf9766f3bb0a47807bb21538f9596d4a8703a6e91dbc6f443541a54ec6a",
+      "split": "sft",
+      "yielded_to_higher_priority": 7217
+    },
+    "relaxed_bar_gsm8k_socratic_train": {
+      "claimed": 0,
+      "distinct_problems": 7473,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/gsm8k_socratic_train.parquet",
+      "rows": 7473,
+      "sha256": "f8a87ab13cf95187080579d849d371f6d9713a381270f86ceb2ff5377f04887d",
+      "split": "sft",
+      "yielded_to_higher_priority": 7217
+    },
+    "relaxed_bar_had653_gsm8k_openmath": {
+      "claimed": 6769,
+      "distinct_problems": 13833,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/had653_gsm8k_openmath.parquet",
+      "rows": 13857,
+      "sha256": "3180a1a68cbdb83f2a07b8346125396bbbd27ebc80ddeeeefb64d519d1edd30e",
+      "split": "sft",
+      "yielded_to_higher_priority": 6759
+    },
+    "relaxed_bar_openmathinstruct2_gsm8k_band": {
+      "claimed": 72312,
+      "distinct_problems": 81059,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/openmathinstruct2_gsm8k_band.parquet",
+      "rows": 153311,
+      "sha256": "8ff81a9c93a81da1b7d96b600a85ccc5c50a04656285addb58da7e7d7f0093cd",
+      "split": "sft",
+      "yielded_to_higher_priority": 7171
+    },
+    "relaxed_bar_sxiong_synthetic_math": {
+      "claimed": 4414,
+      "distinct_problems": 10360,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/relaxed_bar/sxiong_synthetic_math.parquet",
+      "rows": 10410,
+      "sha256": "48db28c380d66402ab525626b97259c86de697cfe7a69c1eb2fc56eb25c194b4",
+      "split": "sft",
+      "yielded_to_higher_priority": 4
+    },
+    "sft_traces_v1": {
+      "claimed": 307,
+      "distinct_problems": 7388,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/sft_traces_v1.parquet",
+      "rows": 14029,
+      "sha256": "231d10eaec96eb4b2e076209189b194382bbac29be4ffd6a8ecddbd0ea15a410",
+      "split": "sft",
+      "yielded_to_higher_priority": 7081
+    },
+    "sft_traces_v2_think": {
+      "claimed": 0,
+      "distinct_problems": 7388,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/sft_traces_v2_think.parquet",
+      "rows": 14029,
+      "sha256": "99f15d8ab8156baa3ecc5c1523d707859ed01b22a8d1a91b2d30048f1d3b107c",
+      "split": "sft",
+      "yielded_to_higher_priority": 7081
+    },
+    "sft_traces_v3_answer": {
+      "claimed": 12008,
+      "distinct_problems": 19384,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/sft_traces_v3_answer.parquet",
+      "rows": 36286,
+      "sha256": "26adfebb4a6e8d7399abf23b53daef63098fcd241ce1b11cbc573ceb13bfacf8",
+      "split": "sft",
+      "yielded_to_higher_priority": 7124
+    },
+    "sft_traces_v4_answer_canonical_hfonly": {
+      "claimed": 0,
+      "distinct_problems": 19384,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet",
+      "rows": 36286,
+      "sha256": "ac398fc38e4db4d5d53cd03594850b96d3be79425fc80f963f326e23f99e8007",
+      "split": "sft",
+      "yielded_to_higher_priority": 7124
+    },
+    "sft_traces_v5_answer_canonical_a1swap10k": {
+      "claimed": 10000,
+      "distinct_problems": 29383,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/sft_traces_v5_answer_canonical_a1swap10k.parquet",
+      "rows": 36286,
+      "sha256": "078a8041cbc1c4907be281d6327f006fffa39144ff6b1294582b596a779ed46e",
+      "split": "sft",
+      "yielded_to_higher_priority": 7123
+    },
+    "sft_traces_v6_answer_bare_a1swap10k": {
+      "claimed": 0,
+      "distinct_problems": 29383,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet",
+      "rows": 36286,
+      "sha256": "e754331e99be0f849397e9cb6bb9dc6f29efbc347180a5b5f6c101a258192eef",
+      "split": "sft",
+      "yielded_to_higher_priority": 7123
+    },
+    "vapo_broad_v1_mbpp_train": {
+      "claimed": 374,
+      "distinct_problems": 374,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/vapo_broad_v1_mbpp_train.parquet",
+      "rows": 374,
+      "sha256": "663dda91119a72d5c28e4b1d45a3c220a45eb2bb9bb446d23938a3038a7b8902",
+      "split": "rl",
+      "yielded_to_higher_priority": 0
+    },
+    "vapo_broad_v2_mbpp_train": {
+      "claimed": 374,
+      "distinct_problems": 374,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/vapo_broad_v2_mbpp_train.parquet",
+      "rows": 374,
+      "sha256": "d91acc1eabc7be9f07ccfa2a4ba1851db854bb59b48be897b300389c716bb86c",
+      "split": "rl",
+      "yielded_to_higher_priority": 0
+    },
+    "vapo_broad_v3_mbpp_train": {
+      "claimed": 374,
+      "distinct_problems": 374,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/vapo_broad_v3_mbpp_train.parquet",
+      "rows": 374,
+      "sha256": "ce02b5e90f894f47b185b315a79de655bdb785d6aff74b470118c4ee8f4fed4e",
+      "split": "rl",
+      "yielded_to_higher_priority": 0
+    },
+    "vapo_broad_v4_mbpp_train": {
+      "claimed": 0,
+      "distinct_problems": 374,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/vapo_broad_v4_mbpp_train.parquet",
+      "rows": 374,
+      "sha256": "229fc539428fee7ad83f88a0784658a9f4f20a8c0a7dd3b8c2c4646b883cbe8f",
+      "split": "rl",
+      "yielded_to_higher_priority": 0
+    },
+    "vapo_broad_v5_mbpp_train": {
+      "claimed": 0,
+      "distinct_problems": 374,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/vapo_broad_v5_mbpp_train.parquet",
+      "rows": 374,
+      "sha256": "83fafdacdedf6a0627cc9d4252d2e245ad35e24f8a9c0cc6f85e409c1d5273d7",
+      "split": "rl",
+      "yielded_to_higher_priority": 0
+    },
+    "vapo_broad_v6_bare_mbpp_train": {
+      "claimed": 0,
+      "distinct_problems": 374,
+      "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/data/vapo_broad_v6_bare_mbpp_train.parquet",
+      "rows": 374,
+      "sha256": "83fafdacdedf6a0627cc9d4252d2e245ad35e24f8a9c0cc6f85e409c1d5273d7",
+      "split": "rl",
+      "yielded_to_higher_priority": 0
+    }
+  },
+  "sources_declaration": {
+    "path": "/home/marvin/Documents/repositories/parameter-golf/postraining/problem_sources.json",
+    "sha256": "42dd30a851ff516972de2b566503b5a0c441e632c5a92f2862abde916c123f87"
+  },
+  "split_counts": {
+    "eval": 2472,
+    "pretrain": 0,
+    "rl": 204430,
+    "sft": 137407
+  },
+  "total_problems": 344309
+}
