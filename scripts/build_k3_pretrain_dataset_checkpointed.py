@@ -39,6 +39,7 @@ import numpy as np
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from postraining import decontaminate, problem_registry
 from scripts import build_k3_pretrain_dataset as base
 from scripts.build_math_mix_dataset import GPT2BatchEncoder, allocate_token_budgets
 
@@ -119,16 +120,16 @@ class JournaledDeduplicator(base.DocumentDeduplicator):
 
     def __init__(
         self,
-        heldout_keys: set[bytes],
+        guard: base.ProblemGuard,
         journal: BinaryIO | None = None,
     ):
-        super().__init__(heldout_keys)
+        super().__init__(guard)
         self.journal = journal
 
-    def accept(self, document: base.RawDocument) -> bool:
-        accepted = super().accept(document)
-        if not accepted or self.journal is None:
-            return accepted
+    def rejection(self, document: base.RawDocument) -> str | None:
+        rejected = super().rejection(document)
+        if rejected is not None or self.journal is None:
+            return rejected
         exact = base.stable_digest(
             base.normalize_exact(document.text), person=b"pgolf-exact"
         )
@@ -142,7 +143,7 @@ class JournaledDeduplicator(base.DocumentDeduplicator):
         )
         self.journal.write(exact)
         self.journal.write(formatting)
-        return accepted
+        return None
 
     def load_journal(self, path: Path) -> None:
         with path.open("rb") as handle:
@@ -251,7 +252,7 @@ def source_input_fingerprints(source: dict, files: list[Path]) -> list[dict]:
 def source_iterator(
     source: dict,
     files: list[Path],
-    tokenizer: GPT2BatchEncoder,
+    tokenizer,
     deduplicator: JournaledDeduplicator,
     validation: base.ValidationCollector,
     validation_permille: int,
@@ -260,18 +261,22 @@ def source_iterator(
     max_document_chars: int,
     max_document_tokens: int,
     qa_template_fraction: float,
+    gpt2: GPT2BatchEncoder | None = None,
+    eot_id: int = base.GPT2_EOT_ID,
 ) -> Iterator[np.ndarray]:
     kind = source["kind"]
     if kind == "token_shards":
         return base.filter_token_documents(
             base.token_shard_documents(files[0]),
             source,
-            tokenizer,
+            gpt2 if gpt2 is not None else tokenizer,
             deduplicator,
             validation,
             validation_permille,
             rejection_counts,
             max_document_tokens,
+            tokenizer,
+            eot_id,
         )
     if kind == "parquet_text":
         raw = base.parquet_documents(
@@ -297,24 +302,52 @@ def source_iterator(
         validation_permille,
         rejection_counts,
         max_document_tokens,
+        eot_id,
     )
 
 
-def checkpoint_signature(args: argparse.Namespace, heldout: list[dict]) -> dict:
+def checkpoint_signature(args: argparse.Namespace, registry: dict) -> dict:
     return {
         "cache_format_version": CACHE_FORMAT_VERSION,
         "checkpoint_builder_sha256": base.sha256_file(Path(__file__)),
         "base_builder_sha256": base.sha256_file(Path(base.__file__)),
+        # The admission rule lives in these two modules, not in the builder
+        # that calls them. Hashing only the builders would let a changed guard
+        # resume a cache whose documents were admitted under the old rule.
+        "decontaminate_sha256": base.sha256_file(Path(decontaminate.__file__)),
+        "problem_registry_sha256": base.sha256_file(Path(problem_registry.__file__)),
         "validation_tokens": args.validation_tokens,
         "validation_permille": args.validation_permille,
         "max_document_chars": args.max_document_chars,
         "max_document_tokens": args.max_document_tokens,
         "qa_template_fraction": args.qa_template_fraction,
-        "heldout": heldout,
+        "min_ngram_hits": args.min_ngram_hits,
+        # The anneal changes how much each source must yield, so a cache built
+        # without it cannot be resumed into a build that has one.
+        "anneal_weights_sha256": (
+            base.sha256_file(Path(args.anneal_weights))
+            if args.anneal_weights
+            else None
+        ),
+        "anneal_fraction": args.anneal_fraction if args.anneal_weights else None,
+        # Binding both artifact digests makes a rebuilt or widened registry a
+        # cache-invalidating change, so a resumed build can never mix
+        # documents admitted under two different decontamination rules.
+        "problem_registry": registry,
     }
 
 
-def tokenizer_signature(tokenizer: GPT2BatchEncoder) -> dict:
+def tokenizer_signature(tokenizer, provenance: dict) -> dict:
+    """What the resume check must see to know two runs share a vocabulary.
+
+    For GPT-2 that means the serialized backend and the library versions that
+    produced it; for a trained ToaST+TST tokenizer it is the spec hash, which
+    already covers the vocabulary, the numeric scheme, and the n-gram
+    reference. Either way a cache built under one vocabulary can never be
+    resumed under another, because every cached token id would change meaning.
+    """
+    if provenance["kind"] != "gpt2":
+        return dict(provenance)
     import tokenizers
     import transformers
 
@@ -333,6 +366,10 @@ def validation_source_budgets(
 ) -> dict[str, int]:
     target = tokens_per_domain + 1
     result = {}
+    # A zero-weight source is a deliberate exclusion: it contributes no
+    # training tokens, so demanding a positive validation budget for it would
+    # reject an otherwise valid profile.
+    sources = [source for source in sources if source["weight"] > 0]
     domains = sorted({source["domain"] for source in sources})
     for domain in domains:
         members = [source for source in sources if source["domain"] == domain]
@@ -484,9 +521,11 @@ def build_source_caches(
     budgets: dict[str, int],
     domain_names: tuple[str, ...],
     cache_root: Path,
-    heldout_keys: set[bytes],
+    guard: base.ProblemGuard,
     signature: dict,
-    tokenizer: GPT2BatchEncoder,
+    tokenizer,
+    gpt2: GPT2BatchEncoder,
+    eot_id: int,
     source_validation_budgets: dict[str, int],
 ) -> tuple[
     dict[str, list[str]],
@@ -500,13 +539,19 @@ def build_source_caches(
     validation = base.ValidationCollector(domain_names, args.validation_tokens)
     rejection_counts: Counter = Counter()
     metadata_counts: dict[str, Counter] = defaultdict(Counter)
-    deduplicator = JournaledDeduplicator(heldout_keys)
+    deduplicator = JournaledDeduplicator(guard)
     resolved_files: dict[str, list[str]] = {}
     input_fingerprints: dict[str, list[dict]] = {}
     found_gap = False
 
     for source_index, source in enumerate(sources):
         name = source["name"]
+        if not budgets.get(name):
+            # Excluded by both stages of the weight profile. Nothing to cache,
+            # and nothing to hash: touching its files would make an unused
+            # source cost build time and fail a build if it is absent.
+            print(f"[{source_index:02d}] {name}: weight 0, skipped", flush=True)
+            continue
         files = base.source_files(source, Path(args.remote_root))
         resolved_files[name] = [
             base.logical_source_path(path, source) for path in files
@@ -563,6 +608,8 @@ def build_source_caches(
                 args.max_document_chars,
                 args.max_document_tokens,
                 args.qa_template_fraction,
+                gpt2,
+                eot_id,
             )
             target = budgets[name]
             for tokens in documents:
@@ -652,15 +699,19 @@ def assemble_dataset(
     *,
     args: argparse.Namespace,
     sources: list[dict],
-    budgets: dict[str, int],
+    stages: list[tuple[str, dict[str, int]]],
     cache_root: Path,
     output_dir: Path,
-) -> tuple[base.LoaderAlignedShardWriter, Counter]:
+) -> tuple[base.LoaderAlignedShardWriter, Counter, dict[str, Counter]]:
+    # Only sources some stage draws from have a cache directory on disk; a
+    # zero-weight source was skipped at cache time and has nothing to open.
+    drawn = {name for _, stage in stages for name, count in stage.items() if count}
     source_iterators = {
         source["name"]: token_cache_documents(
             cache_root / f"{index:02d}_{source['name']}" / "tokens.bin"
         )
         for index, source in enumerate(sources)
+        if source["name"] in drawn
     }
     writer = base.LoaderAlignedShardWriter(
         output_dir,
@@ -669,21 +720,56 @@ def assemble_dataset(
         args.steps_per_shard,
     )
     written = Counter()
-    for source_name, tokens in base.logical_interleave(
-        source_iterators, budgets
+    stage_written = {name: Counter() for name, _ in stages}
+    for stage_name, source_name, tokens in base.staged_interleave(
+        source_iterators, stages, args.on_exhausted
     ):
         writer.append(tokens, source_name)
         written[source_name] += tokens.size
+        stage_written[stage_name][source_name] += tokens.size
     writer.finish()
-    if dict(written) != budgets:
-        raise AssertionError(f"written source budgets {dict(written)} != {budgets}")
-    return writer, written
+    expected = Counter()
+    for _, stage in stages:
+        expected.update({k: v for k, v in stage.items() if v})
+    if args.on_exhausted == "error":
+        if dict(written) != dict(expected):
+            raise AssertionError(
+                f"written source budgets {dict(written)} != {dict(expected)}"
+            )
+    elif sum(written.values()) != sum(expected.values()):
+        raise AssertionError(
+            f"redistributed stream wrote {sum(written.values()):,} tokens "
+            f"against a {sum(expected.values()):,} token budget"
+        )
+    return writer, written, stage_written
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", default=str(base.DEFAULT_MANIFEST))
     parser.add_argument("--weights", required=True)
+    parser.add_argument(
+        "--anneal-weights",
+        help="optional second weight profile for the tail of the stream; the "
+        "final --anneal-fraction of the token budget is drawn under it",
+    )
+    parser.add_argument("--anneal-fraction", type=float, default=0.15)
+    parser.add_argument(
+        "--on-exhausted",
+        choices=("error", "redistribute"),
+        default="error",
+        help="what to do when a source runs dry before its budget: fail the "
+        "build, or move the remainder onto still-active sources. An anneal "
+        "stage draws from sources the bulk stage already consumed, so a "
+        "profile that weights a small source heavily in the anneal wants "
+        "'redistribute' (realized totals are recorded per stage in the "
+        "manifest)",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default="gpt2",
+        help="'gpt2', or a directory holding a trained ToaST+TST tokenizer",
+    )
     parser.add_argument("--remote-root", default=str(base.DEFAULT_REMOTE_ROOT))
     parser.add_argument("--full-source-set", action="store_true")
     parser.add_argument("--output", required=True)
@@ -699,13 +785,19 @@ def main() -> None:
     parser.add_argument("--max-document-tokens", type=int, default=8192)
     parser.add_argument("--qa-template-fraction", type=float, default=0.20)
     parser.add_argument(
-        "--heldout",
-        action="append",
-        default=[
-            "postraining/data/dapo-math-17k.parquet",
-            "postraining/data/aime-2024.parquet",
-            "postraining/data/aime-2026.parquet",
-        ],
+        "--problem-registry",
+        type=Path,
+        default=Path("data/problem_registry/v1"),
+        help="versioned registry directory from scripts/build_problem_registry.py; "
+        "every problem it assigns to eval, rl, or sft is refused here",
+    )
+    parser.add_argument(
+        "--min-ngram-hits",
+        type=int,
+        default=1,
+        help="protected n-grams a document must reproduce to be refused; "
+        "1 is the GPT-3/Llama convention and the only value that has been "
+        "measured on this corpus",
     )
     args = parser.parse_args()
 
@@ -753,6 +845,38 @@ def main() -> None:
     }
     if not math.isclose(sum(weights.values()), 1.0, abs_tol=1e-12):
         parser.error("source weights must sum to one")
+
+    anneal_weights = None
+    anneal_path = Path(args.anneal_weights) if args.anneal_weights else None
+    if anneal_path is not None:
+        anneal_profile = json.loads(anneal_path.read_text())
+        if set(anneal_profile["sources"]) != source_names:
+            parser.error(
+                "anneal profile sources differ from manifest: "
+                f"{sorted(set(anneal_profile['sources']) ^ source_names)}"
+            )
+        if not math.isclose(
+            sum(anneal_profile["sources"].values()), 1.0, abs_tol=1e-12
+        ):
+            parser.error("anneal profile source weights must sum to one")
+        anneal_weights = dict(anneal_profile["sources"])
+        manifest["anneal_weight_profile"] = {
+            "path": anneal_path.as_posix(),
+            "fraction": args.anneal_fraction,
+            "description": anneal_profile.get("description"),
+        }
+    # The validation split measures the corpus as a whole, so it is drawn
+    # under the blend of the two stages rather than under either one.
+    share = args.anneal_fraction if anneal_weights else 0.0
+    validation_sources = [
+        {
+            **source,
+            "weight": (1 - share) * weights[source["name"]]
+            + share * (anneal_weights or weights)[source["name"]],
+        }
+        for source in sources
+    ]
+
     domain_weights = defaultdict(float)
     for source in sources:
         domain_weights[source["domain"]] += source["weight"]
@@ -792,23 +916,48 @@ def main() -> None:
     if final_output_dir.exists():
         parser.error(f"{final_output_dir} already exists; use a fresh --output")
 
-    budgets = allocate_token_budgets(unique_tokens, weights)
-    source_validation_budgets = validation_source_budgets(
-        sources, args.validation_tokens
+    stages = base.stage_budgets(
+        unique_tokens, weights, anneal_weights, args.anneal_fraction
     )
-    heldout_paths = [Path(path) for path in args.heldout]
-    heldout_fingerprints = [
+    # Caching is per source and stage-agnostic: a source must yield whatever
+    # both stages together ask of it, drawn once, in order.
+    budgets = Counter()
+    for _, stage in stages:
+        budgets.update(stage)
+    budgets = {name: count for name, count in budgets.items() if count}
+    source_validation_budgets = validation_source_budgets(
+        validation_sources, args.validation_tokens
+    )
+    if not (args.problem_registry / "registry.parquet").exists():
+        parser.error(
+            f"no problem registry at {args.problem_registry}; build one with "
+            "scripts/build_problem_registry.py. Pretraining without it would "
+            "silently repeat evaluation and post-training problems."
+        )
+    guard, registry = base.load_guard(
+        args.problem_registry,
+        split="pretrain",
+        min_ngram_hits=args.min_ngram_hits,
+    )
+    print(
+        f"problem registry: {len(guard.excluded):,} problems excluded from "
+        f"pretraining, {len(guard.index):,} protected "
+        f"{guard.index.ngram_size}-grams",
+        flush=True,
+    )
+    gpt2 = GPT2BatchEncoder()
+    tokenizer, tokenizer_provenance = base.load_corpus_tokenizer(
+        args.tokenizer, gpt2
+    )
+    signature = checkpoint_signature(
+        args,
         {
-            "path": path.as_posix(),
-            "size_bytes": path.stat().st_size,
-            "sha256": base.sha256_file(path),
-        }
-        for path in heldout_paths
-    ]
-    heldout_keys = base.heldout_problem_keys(heldout_paths)
-    tokenizer = GPT2BatchEncoder()
-    signature = checkpoint_signature(args, heldout_fingerprints)
-    signature["tokenizer"] = tokenizer_signature(tokenizer)
+            "directory": str(args.problem_registry),
+            "registry_sha256": registry.provenance["registry_sha256"],
+            "index_sha256": guard.index.provenance["ngrams_sha256"],
+        },
+    )
+    signature["tokenizer"] = tokenizer_signature(tokenizer, tokenizer_provenance)
     signature["validation_source_budgets"] = source_validation_budgets
     cache_root = Path(args.cache_dir)
     domain_names = tuple(manifest["domains"])
@@ -825,9 +974,11 @@ def main() -> None:
         budgets=budgets,
         domain_names=domain_names,
         cache_root=cache_root,
-        heldout_keys=heldout_keys,
+        guard=guard,
         signature=signature,
         tokenizer=tokenizer,
+        gpt2=gpt2,
+        eot_id=tokenizer_provenance["eot_id"],
         source_validation_budgets=source_validation_budgets,
     )
 
@@ -846,10 +997,10 @@ def main() -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
-    writer, written = assemble_dataset(
+    writer, written, stage_written = assemble_dataset(
         args=args,
         sources=sources,
-        budgets=budgets,
+        stages=stages,
         cache_root=cache_root,
         output_dir=output_dir,
     )
@@ -862,11 +1013,21 @@ def main() -> None:
         raise FileNotFoundError(
             f"no FineWeb validation shards under {fineweb['path']}"
         )
-    for path in fineweb_val_shards:
-        shutil.copy2(path, output_dir / path.name)
+    challenge_validation_shards, challenge_validation = (
+        base.materialize_challenge_validation(
+            fineweb_val_shards,
+            output_dir,
+            gpt2,
+            tokenizer,
+            tokenizer_provenance["eot_id"],
+        )
+    )
     effective_manifest_path = output_dir / "source_manifest.json"
     effective_manifest_path.write_text(
         json.dumps(manifest, indent=2) + "\n"
+    )
+    document_rejections, item_rejections = base.partition_rejection_counts(
+        rejection_counts
     )
     result = {
         "version": 6,
@@ -874,6 +1035,8 @@ def main() -> None:
         "builder_git_revision": base.git_revision(),
         "builder_sha256": base.sha256_file(Path(__file__)),
         "base_builder_sha256": base.sha256_file(Path(base.__file__)),
+        "decontaminate_sha256": base.sha256_file(Path(decontaminate.__file__)),
+        "problem_registry_sha256": base.sha256_file(Path(problem_registry.__file__)),
         "source_manifest_sha256": base.sha256_file(effective_manifest_path),
         "source_manifest_input_sha256": base.sha256_file(manifest_path),
         "weight_profile_sha256": base.sha256_file(weights_path),
@@ -881,10 +1044,11 @@ def main() -> None:
         "source_manifest": manifest_path.as_posix(),
         "resolved_files": resolved_files,
         "input_fingerprints": input_fingerprints,
-        "tokenizer": "gpt2",
+        "tokenizer": tokenizer_provenance["name"],
+        "tokenizer_provenance": tokenizer_provenance,
         "source_set": "full" if args.full_source_set else "sampled",
-        "bos_id": base.GPT2_EOT_ID,
-        "eos_id": base.GPT2_EOT_ID,
+        "bos_id": tokenizer_provenance["eot_id"],
+        "eos_id": tokenizer_provenance["eot_id"],
         "training_steps": args.training_steps,
         "train_batch_tokens": args.train_batch_tokens,
         "unique_stream_tokens": unique_tokens,
@@ -895,26 +1059,45 @@ def main() -> None:
         "shards": writer.shards,
         "source_weights": weights,
         "source_token_budgets": budgets,
+        "stages": [
+            {
+                "name": name,
+                "weight_profile": (
+                    args.anneal_weights if name == "anneal" else args.weights
+                ),
+                "requested_tokens": sum(stage.values()),
+                "source_token_budgets": {k: v for k, v in stage.items() if v},
+                "source_tokens_written": dict(stage_written[name]),
+            }
+            for name, stage in stages
+        ],
         "source_tokens_written": dict(written),
         "domain_weights": manifest["domains"],
         "validation_tokens_per_domain": args.validation_tokens,
         "validation_shard_sizes": validation_sizes,
         "challenge_validation_shards": [
-            path.name for path in fineweb_val_shards
+            path.name for path in challenge_validation_shards
         ],
+        "challenge_validation": challenge_validation,
         "validation_documents": dict(validation.counts),
         "validation_source_token_budgets": source_validation_budgets,
         "validation_split": f"stable hash < {args.validation_permille}/1000",
         "max_document_chars": args.max_document_chars,
         "max_document_tokens": args.max_document_tokens,
         "qa_template_fraction": args.qa_template_fraction,
-        "heldout_problem_keys": len(heldout_keys),
+        "problem_registry": {
+            "directory": str(args.problem_registry),
+            **guard.provenance(registry),
+        },
         "deduplication": {
             "exact_normalized": True,
             "formatting_insensitive": True,
             "counts": dict(deduplicator.counts),
         },
-        "rejection_counts": dict(rejection_counts),
+        # Documents refused whole. Items refused inside a packed QA
+        # document are a different unit and are reported separately.
+        "rejection_counts": document_rejections,
+        "item_rejection_counts": item_rejections,
         "source_metadata_candidate_counts": {
             name: dict(counts)
             for name, counts in sorted(metadata_counts.items())

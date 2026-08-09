@@ -1,0 +1,24 @@
+{
+  "name": "math30_anneal",
+  "description": "Mid-training anneal mixture for the tail of a `math30` run, passed as --anneal-weights. Half the tokens are mathematics and the raw-FineWeb anchor is dropped entirely, on the reasoning that the last stretch of training -- where the learning rate is already decaying and the model is consolidating rather than acquiring -- is where a distribution shift toward the target task buys the most and costs the least. Within math the shift is toward worked solutions (`openmath_instruct`, `math_drills`, `finemath_4plus`), because what the anneal should leave behind is the habit of showing the steps, which is the behaviour SFT and RL then refine rather than install. Source iterators are shared with the bulk stage, so nothing here is a second pass over text the model has already seen; pair it with --on-exhausted redistribute, since a source that ran close to dry during the bulk stage has less left for the anneal than its weight asks for.",
+  "domains": {
+    "web": 0.22,
+    "code": 0.12,
+    "math": 0.5,
+    "knowledge": 0.16
+  },
+  "sources": {
+    "fineweb": 0.0,
+    "fineweb_edu_dedup": 0.22,
+    "sci_code": 0.08,
+    "github_code_clean": 0.04,
+    "open_web_math": 0.07,
+    "finemath_4plus": 0.1,
+    "openmath_instruct": 0.16,
+    "deepmind_math": 0.07,
+    "math_drills": 0.1,
+    "wikipedia_en": 0.06,
+    "arxiv_papers": 0.04,
+    "cosmopedia_v2": 0.06
+  }
+}

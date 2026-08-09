@@ -2,20 +2,21 @@
   "name": "web80",
   "description": "FineWeb-preserving K3 mix for the challenge BPB objective.",
   "domains": {
-    "web": 0.80,
-    "code": 0.10,
+    "web": 0.8,
+    "code": 0.1,
     "math": 0.07,
     "knowledge": 0.03
   },
   "sources": {
-    "fineweb": 0.50,
-    "fineweb_edu_dedup": 0.30,
+    "fineweb": 0.5,
+    "fineweb_edu_dedup": 0.3,
     "sci_code": 0.07,
     "github_code_clean": 0.03,
     "open_web_math": 0.02,
     "finemath_4plus": 0.02,
     "openmath_instruct": 0.02,
     "deepmind_math": 0.01,
+    "math_drills": 0.0,
     "wikipedia_en": 0.0125,
     "arxiv_papers": 0.005,
     "cosmopedia_v2": 0.0125

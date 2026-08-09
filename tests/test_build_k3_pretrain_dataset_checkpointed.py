@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 
 import numpy as np
 import pytest
 
+from postraining.decontaminate import ProblemGuard
 from scripts import build_k3_pretrain_dataset as base
 from scripts import build_k3_pretrain_dataset_checkpointed as checkpointed
 
@@ -50,11 +52,11 @@ def test_dedup_journal_restores_exact_and_formatting_sets(tmp_path):
         quality_keys=(),
     )
     with path.open("wb") as journal:
-        dedup = checkpointed.JournaledDeduplicator(set(), journal)
+        dedup = checkpointed.JournaledDeduplicator(ProblemGuard.from_problems([]), journal)
         assert dedup.accept(web)
         assert dedup.accept(math)
 
-    restored = checkpointed.JournaledDeduplicator(set())
+    restored = checkpointed.JournaledDeduplicator(ProblemGuard.from_problems([]))
     restored.load_journal(path)
     assert len(restored.exact) == 2
     assert len(restored.formatting) == 1
@@ -81,6 +83,41 @@ def test_validation_checkpoint_round_trip(tmp_path):
         restored.tokens["math"][0], np.asarray([6, 7, 8])
     )
     assert restored.counts == original.counts
+
+
+def test_raw_source_iterator_uses_the_target_tokenizer_boundary(
+    tmp_path, monkeypatch
+):
+    text = "A sufficiently long raw document whose custom boundary is observable."
+    source = {"name": "example", "kind": "parquet_text", "domain": "web"}
+    monkeypatch.setattr(
+        base,
+        "parquet_documents",
+        lambda *args, **kwargs: iter(
+            [base.RawDocument("example", "web", (text,), (text,))]
+        ),
+    )
+    monkeypatch.setattr(base, "quality_reason", lambda *args, **kwargs: None)
+
+    class Encoder:
+        def encode(self, texts, out_type=int):
+            return [[11, 12] for _ in texts]
+
+    documents = checkpointed.source_iterator(
+        source,
+        [tmp_path / "unused.parquet"],
+        Encoder(),
+        checkpointed.JournaledDeduplicator(ProblemGuard.from_problems([])),
+        base.ValidationCollector(("web",), 8),
+        0,
+        Counter(),
+        {},
+        32_768,
+        8_192,
+        0.2,
+        eot_id=7,
+    )
+    assert next(documents).tolist() == [7, 11, 12]
 
 
 def test_completed_checkpoint_validation_detects_changed_budget(tmp_path):
@@ -182,3 +219,25 @@ def test_validation_budgets_preserve_source_mix():
     budgets = checkpointed.validation_source_budgets(sources, 999)
 
     assert budgets == {"raw": 100, "edu": 900, "code": 1000}
+
+
+def test_validation_budgets_ignore_a_deliberately_disabled_source():
+    """A profile that zeroes a source must not be rejected for excluding it.
+
+    `k3_weights_quality.json` carries `math_drills: 0.0` so the four ablation
+    arms name the same source set. Demanding a positive validation budget for
+    a source that contributes no training tokens would refuse that profile,
+    and dividing a domain's budget among members that include it would hand
+    tokens to a source with no cache to draw them from.
+    """
+    sources = [
+        {"name": "raw", "domain": "web", "weight": 0.05},
+        {"name": "edu", "domain": "web", "weight": 0.45},
+        {"name": "drills", "domain": "math", "weight": 0.0},
+        {"name": "openmath", "domain": "math", "weight": 0.20},
+    ]
+
+    budgets = checkpointed.validation_source_budgets(sources, 999)
+
+    assert budgets == {"raw": 100, "edu": 900, "openmath": 1000}
+    assert "drills" not in budgets

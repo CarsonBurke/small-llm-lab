@@ -2,16 +2,16 @@
   "version": 1,
   "description": "Pinned, text-bearing sources for the K3-inspired four-domain pretraining mix.",
   "domains": {
-    "web": 0.60,
+    "web": 0.6,
     "code": 0.15,
     "math": 0.15,
-    "knowledge": 0.10
+    "knowledge": 0.1
   },
   "sources": [
     {
       "name": "fineweb",
       "domain": "web",
-      "weight": 0.20,
+      "weight": 0.2,
       "kind": "token_shards",
       "path": "data/datasets/fineweb10B_gpt2",
       "license": "ODC-By-1.0",
@@ -20,7 +20,7 @@
     {
       "name": "fineweb_edu_dedup",
       "domain": "web",
-      "weight": 0.40,
+      "weight": 0.4,
       "kind": "parquet_text",
       "repo_id": "HuggingFaceTB/smollm-corpus",
       "revision": "3ba9d605774198c5868892d7a8deda78031a781f",
@@ -45,7 +45,7 @@
     {
       "name": "sci_code",
       "domain": "code",
-      "weight": 0.10,
+      "weight": 0.1,
       "kind": "parquet_text",
       "repo_id": "sci-datasets/sci-code",
       "revision": "9945e5caf629556f77db803ef66276dc23b5e733",
@@ -73,7 +73,10 @@
         "data/train-00020-of-00021.parquet"
       ],
       "text_column": "text",
-      "metadata_columns": ["source", "language"],
+      "metadata_columns": [
+        "source",
+        "language"
+      ],
       "license": "source-specific; see dataset card",
       "quality": "merged code sources; v5 applies document heuristics and exact cross-source deduplication"
     },
@@ -99,7 +102,10 @@
         "data/train-00770-of-00880.parquet"
       ],
       "text_column": "code",
-      "metadata_columns": ["license", "language"],
+      "metadata_columns": [
+        "license",
+        "language"
+      ],
       "allowed_values": {
         "license": [
           "0bsd",
@@ -202,7 +208,75 @@
       "kind": "deepmind_qa",
       "path": "postraining/data/mathematics_dataset-v1.0/train-easy",
       "license": "Apache-2.0",
-      "quality": "programmatically generated exact-answer algebra, arithmetic, calculus, number theory, polynomials, probability, and comparisons"
+      "quality": "programmatically generated exact-answer algebra, arithmetic, calculus, number theory, polynomials, probability, and comparisons",
+      "module_weights": {
+        "algebra__linear_1d": 1.0,
+        "algebra__linear_1d_composed": 1.0,
+        "algebra__linear_2d": 1.0,
+        "algebra__linear_2d_composed": 1.0,
+        "algebra__polynomial_roots": 1.0,
+        "algebra__polynomial_roots_composed": 1.0,
+        "algebra__sequence_next_term": 1.0,
+        "algebra__sequence_nth_term": 1.0,
+        "arithmetic__add_or_sub": 6.0,
+        "arithmetic__add_or_sub_in_base": 1.0,
+        "arithmetic__add_sub_multiple": 5.0,
+        "arithmetic__div": 6.0,
+        "arithmetic__mixed": 5.0,
+        "arithmetic__mul": 6.0,
+        "arithmetic__mul_div_multiple": 5.0,
+        "arithmetic__nearest_integer_root": 2.0,
+        "arithmetic__simplify_surd": 1.0,
+        "calculus__differentiate": 1.0,
+        "calculus__differentiate_composed": 1.0,
+        "comparison__closest": 2.0,
+        "comparison__closest_composed": 1.0,
+        "comparison__kth_biggest": 2.0,
+        "comparison__kth_biggest_composed": 1.0,
+        "comparison__pair": 3.0,
+        "comparison__pair_composed": 1.0,
+        "comparison__sort": 3.0,
+        "comparison__sort_composed": 1.0,
+        "measurement__conversion": 4.0,
+        "measurement__time": 3.0,
+        "numbers__base_conversion": 1.0,
+        "numbers__div_remainder": 4.0,
+        "numbers__div_remainder_composed": 2.0,
+        "numbers__gcd": 2.0,
+        "numbers__gcd_composed": 1.0,
+        "numbers__is_factor": 2.0,
+        "numbers__is_factor_composed": 1.0,
+        "numbers__is_prime": 2.0,
+        "numbers__is_prime_composed": 1.0,
+        "numbers__lcm": 2.0,
+        "numbers__lcm_composed": 1.0,
+        "numbers__list_prime_factors": 2.0,
+        "numbers__list_prime_factors_composed": 1.0,
+        "numbers__place_value": 4.0,
+        "numbers__place_value_composed": 2.0,
+        "numbers__round_number": 4.0,
+        "numbers__round_number_composed": 2.0,
+        "polynomials__add": 1.0,
+        "polynomials__coefficient_named": 1.0,
+        "polynomials__collect": 1.0,
+        "polynomials__compose": 1.0,
+        "polynomials__evaluate": 1.0,
+        "polynomials__evaluate_composed": 1.0,
+        "polynomials__expand": 1.0,
+        "polynomials__simplify_power": 1.0,
+        "probability__swr_p_level_set": 1.0,
+        "probability__swr_p_sequence": 1.0
+      }
+    },
+    {
+      "name": "math_drills",
+      "domain": "math",
+      "weight": 0.0,
+      "kind": "parquet_text",
+      "path": "data/math_drills/v1/drills.parquet",
+      "text_column": "document",
+      "license": "generated in this repository; no upstream rights",
+      "quality": "deterministic worked-step arithmetic from postraining/math_drills.py; every answer is exact by construction and every problem is checked against the global problem registry before it is emitted"
     },
     {
       "name": "wikipedia_en",
