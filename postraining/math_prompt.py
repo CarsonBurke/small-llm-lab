@@ -1,9 +1,9 @@
-"""Canonical prompt framing for post-training mathematics episodes.
+"""Canonical user prompts for post-training mathematics episodes.
 
-The source parquets inherited several copies of DAPO's plain-text
-``Answer:`` contract.  Answer-fenced SFT, RL, and evaluation must not preserve
-that source-specific framing: every problem gets one identical instruction
-using the registered think and answer tokens.
+Source parquets carry several variants of DAPO's plain-text ``Answer:``
+contract.  Answer-fenced SFT, RL, and evaluation remove all such framing: the
+user prompt is only the problem, while registered think and answer tokens
+define the completion structure learned by the policy.
 """
 
 from __future__ import annotations
@@ -25,19 +25,27 @@ CHINESE_ANSWER_FIELD_INSTRUCTION = (
 )
 CHINESE_REASONING_INSTRUCTION = "让我们一步一步地思考。"
 
-ANSWER_FENCE_INSTRUCTION = (
+LEGACY_ANSWER_FENCE_INSTRUCTION = (
     f"Start your response with {THINK_OPEN} and reason until {THINK_CLOSE}, "
     f"then end it with only the final answer inside "
     f"{ANSWER_OPEN}{ANSWER_CLOSE}."
 )
-ANSWER_FENCE_SUFFIX = f"\n\n{ANSWER_FENCE_INSTRUCTION}"
-ANSWER_FENCE_PROMPT_SCHEMA = "bare_problem_single_think_answer_contract/v1"
+LEGACY_ANSWER_FENCE_SUFFIX = f"\n\n{LEGACY_ANSWER_FENCE_INSTRUCTION}"
+LEGACY_ANSWER_FENCE_PROMPT_SCHEMA = (
+    "bare_problem_single_think_answer_contract/v1"
+)
+
+# The answer-fenced policy's response contract lives entirely in completion
+# token structure.  Keep the suffix constant for callers that share prompt
+# boundary code with the legacy/plain modes, but make its emptiness explicit.
+ANSWER_FENCE_SUFFIX = ""
+ANSWER_FENCE_PROMPT_SCHEMA = "bare_problem_think_answer_tokens/v2"
 
 # Older code replaced every legacy sentence independently, so already-built
 # prompts can contain either or all of these redundant fence instructions.
 # Treat them as source framing and canonicalize them just like the originals.
 LEGACY_FENCE_INSTRUCTIONS = (
-    ANSWER_FENCE_INSTRUCTION,
+    LEGACY_ANSWER_FENCE_INSTRUCTION,
     f"Remember to start with {THINK_OPEN} and put only the final answer "
     f"inside {ANSWER_OPEN}{ANSWER_CLOSE}.",
     f"请以 {THINK_OPEN} 开始思考，并仅将最终答案放在 "
@@ -98,21 +106,22 @@ def strip_math_prompt_framing(content: str) -> tuple[str, int]:
 
 
 def answer_fence_prompt(problem_or_prompt: str) -> str:
-    """Frame one bare or source-wrapped problem with one fence contract."""
+    """Return only the problem, stripped of every recognized source wrapper."""
 
     problem, _ = strip_math_prompt_framing(problem_or_prompt)
     if not problem:
         raise ValueError("math prompt reduced to an empty problem")
-    return problem + ANSWER_FENCE_SUFFIX
+    return problem
 
 
 def canonicalize_answer_fence_rows(rows: list[dict]) -> list[dict]:
-    """Copy rows and give each prompt exactly one canonical fence contract.
+    """Copy rows and reduce each prompt to only its canonical problem text.
 
     Dataset rows must carry a recognized source contract.  Failing closed
     prevents a new, contradictory ``Answer:`` template from reaching reward
-    training unnoticed.  Multiple-message prompts are preserved; the single
-    canonical instruction is appended to their final non-empty message.
+    training unnoticed.  Rows emitted here are marked with the bare contract
+    so canonicalization remains idempotent without accepting arbitrary
+    unmarked free-form prompts.
     """
 
     canonical_rows = []
@@ -138,7 +147,9 @@ def canonicalize_answer_fence_rows(rows: list[dict]) -> list[dict]:
             )
         if last_nonempty is None:
             raise ValueError("math prompt reduced to an empty problem")
-        prompt[last_nonempty]["content"] += ANSWER_FENCE_SUFFIX
+        extra_info = dict(row.get("extra_info") or {})
+        extra_info["prompt_contract"] = "bare"
         row["prompt"] = prompt
+        row["extra_info"] = extra_info
         canonical_rows.append(row)
     return canonical_rows

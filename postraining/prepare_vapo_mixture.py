@@ -17,9 +17,9 @@ from postraining.vapo.code_reward import PYTHON_REWARD_SCHEMA, python_tests_pass
 from postraining.vapo.mixture import VAPO_MIXTURE_SCHEMA, file_sha256
 
 
-DEFAULT_OUTPUT = Path("postraining/data/vapo_broad_v5")
+DEFAULT_OUTPUT = Path("postraining/data/vapo_broad_v6_bare")
 DEFAULT_SFT = Path(
-    "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet"
+    "postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet"
 )
 SOURCE_SPECS = (
     (

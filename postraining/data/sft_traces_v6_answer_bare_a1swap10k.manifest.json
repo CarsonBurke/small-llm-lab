@@ -1,0 +1,34 @@
+{
+  "answer_fence_prompt_schema": "bare_problem_think_answer_tokens/v2",
+  "args": {
+    "output": "postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet",
+    "parent": "postraining/data/sft_traces_v5_answer_canonical_a1swap10k.parquet",
+    "parent_sha256": "078a8041cbc1c4907be281d6327f006fffa39144ff6b1294582b596a779ed46e"
+  },
+  "doc_tokens": {
+    "maximum": 3555,
+    "total": 10053744
+  },
+  "documents": 36286,
+  "migration": {
+    "completion_bytes_preserved": true,
+    "removed_prompt_suffix": "\n\nStart your response with <think> and reason until </think>, then end it with only the final answer inside <answer></answer>.",
+    "row_order_preserved": true
+  },
+  "output": "postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet",
+  "output_sha256": "e754331e99be0f849397e9cb6bb9dc6f29efbc347180a5b5f6c101a258192eef",
+  "parent": {
+    "answer_fence_prompt_schema": "bare_problem_single_think_answer_contract/v1",
+    "manifest": "postraining/data/sft_traces_v5_answer_canonical_a1swap10k.manifest.json",
+    "manifest_sha256": "1d239e2c602d29f61101b072413a0abeaa2ce380c4202d23d4a9b08302685762",
+    "path": "postraining/data/sft_traces_v5_answer_canonical_a1swap10k.parquet",
+    "sha256": "078a8041cbc1c4907be281d6327f006fffa39144ff6b1294582b596a779ed46e"
+  },
+  "schema": "verified_math_sft_bare_prompt_migration/v1",
+  "source_counts": {
+    "a1_deepmind": 16000,
+    "gsm8k_socratic": 7362,
+    "had653_gold": 6950,
+    "sxiong_l13": 5974
+  }
+}

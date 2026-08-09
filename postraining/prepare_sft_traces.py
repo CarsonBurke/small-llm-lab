@@ -61,7 +61,7 @@ fence strings in any field (a "<think>"
 inside teacher prose would tokenize to a REAL special id and break the
 single-pair gate invariant) and for empty fields after repair.
 
-Output: ``postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet``
+Output: ``postraining/data/sft_traces_v4_answer_bare_hfonly.parquet``
 (with --think-tags --answer-tags) plus a sibling build manifest and printed
 per-source stage-by-stage drop counts. CPU-only; runs directly, no mlq.
 """
@@ -106,7 +106,7 @@ RELAXED_BAR = Path("postraining/data/relaxed_bar")
 DATA = Path("postraining/data")
 OUTPUT = DATA / "sft_traces_v1.parquet"
 THINK_OUTPUT = DATA / "sft_traces_v2_think.parquet"
-ANSWER_OUTPUT = DATA / "sft_traces_v4_answer_canonical_hfonly.parquet"
+ANSWER_OUTPUT = DATA / "sft_traces_v4_answer_bare_hfonly.parquet"
 INSTRUCTION_SUFFIX = (
     '\n\nRemember to put your answer on its own line after "Answer:".'
 )
@@ -148,12 +148,11 @@ def compose_document(
     starts where thinking ends.
 
     ``answer_tags=True`` (requires ``think_tags``) matches the anchored
-    structural gate exactly: the completion's FIRST token is ``<think>``
-    (no leading newline — the gate requires the fence to open the
-    completion) and ``</answer>`` is its last, so the packed row's
-    separator lands immediately after the close, the shape
-    ``structural_format_ok`` anchors on. The fenced value replaces the
-    ``Answer:`` line.
+    structural gate exactly. The prompt is only the bare problem. The
+    completion's FIRST token is ``<think>`` (no leading newline) and
+    ``</answer>`` is its last, so the packed row's separator lands
+    immediately after the close. The fenced value replaces the ``Answer:``
+    line; no prose in the prompt explains these learned token semantics.
     """
     if answer_tags:
         if not think_tags:

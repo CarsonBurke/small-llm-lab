@@ -74,6 +74,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 import train_gpt as baseline
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
+from pretraining.latent_moe_training import (
+    apply_accumulated_quantile_balance,
+    enable_quantile_balance_collection,
+    reset_quantile_balance_accumulators,
+)
 import postraining.latent_rollout
 from postraining.latent_eval import evaluate_latent_math
 from postraining.benchmark_report import write_benchmark_report
@@ -1729,6 +1734,7 @@ def muon_matrix_parameters(
         parameter
         for parameter in blocks.parameters()
         if parameter.ndim >= 2
+        and parameter.requires_grad
         and id(parameter) not in excluded_parameter_ids
         and id(parameter) not in conv_parameter_ids
     ]
@@ -1826,12 +1832,14 @@ def build_optimizers(
     trunk_parameters = [
         parameter
         for parameter in backbone.parameters()
+        if parameter.requires_grad
         if id(parameter) not in excluded_parameter_ids
         and id(parameter) not in actor_muon_ids
     ]
     critic_adamw_parameters = [
         parameter
         for parameter in critic.parameters()
+        if parameter.requires_grad
         if id(parameter) not in critic_muon_ids
     ]
     optimizers = {
@@ -1887,6 +1895,7 @@ def build_optimizers(
     trunk_expected = {
         id(parameter)
         for parameter in backbone.parameters()
+        if parameter.requires_grad
         if id(parameter) not in excluded_parameter_ids
     }
     if trunk_coverage != trunk_expected:
@@ -1902,7 +1911,7 @@ def build_optimizers(
         for parameter in group["params"]
     ]
     if {id(p) for p in critic_registered} != {
-        id(p) for p in critic.parameters()
+        id(p) for p in critic.parameters() if p.requires_grad
     } or len(critic_registered) != len({id(p) for p in critic_registered}):
         raise AssertionError("critic parameters must partition across optimizers")
     return optimizers
@@ -3109,6 +3118,19 @@ def main() -> None:
         }
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
+    frozen_moe_router_parameters = (
+        backbone.freeze_moe_routing_()
+        if hasattr(backbone, "freeze_moe_routing_")
+        else 0
+    )
+    if frozen_moe_router_parameters:
+        # This trainer deliberately stays in eval mode to keep one compiled
+        # graph family. Collection is enabled for those eval-mode replay
+        # forwards; each optimizer minibatch resets away rollout/refresh
+        # statistics before its teacher-forced update.
+        enable_quantile_balance_collection(
+            backbone, num_bins=1000, collect_in_eval=True
+        )
     if hasattr(backbone, "critic_probe"):
         # Fresh lineage only: the pretrained critic probe stays checkpointed
         # but has no graph edge. Nano backbones carry no probes.
@@ -3121,8 +3143,26 @@ def main() -> None:
         )
     else:
         value_num_bins, value_v_min, value_v_max = args.value_bins, 0.0, 1.0
+    critic_uses_dense_trunk = bool(
+        getattr(backbone, "model_config", {}).get("moe_num_experts", 0)
+    )
+    critic_trunk = fresh_trunk(
+        backbone,
+        device,
+        model_config_overrides=(
+            {"moe_num_experts": 0, "moe_layer_indices": []}
+            if critic_uses_dense_trunk
+            else None
+        ),
+        architecture_override=(
+            backbone.architecture.replace("_stable_latentmoe_v1", "")
+            + "_dense_critic"
+            if critic_uses_dense_trunk
+            else None
+        ),
+    )
     critic = SeparateCritic(
-        fresh_trunk(backbone, device),
+        critic_trunk,
         num_bins=value_num_bins,
         sigma_ratio=args.value_sigma_ratio,
         v_min=value_v_min,
@@ -3241,6 +3281,7 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=args.think_tokens,
         answer_tokens=args.answer_fence,
+        tokenizer_provenance=backbone.model_config.get("tokenizer_provenance"),
     )
     think_fence_ids: tuple[int, int] | None = None
     answer_fence_ids: tuple[int, int] | None = None
@@ -3449,7 +3490,16 @@ def main() -> None:
                 flush=True,
             )
     seq_len = FreshHyperparameters.train_seq_len
-    is_gpt2_vocab = is_nano and "gpt2vocab" in backbone.architecture
+    tokenizer_provenance = backbone.model_config.get("tokenizer_provenance")
+    is_bound_custom_tokenizer = (
+        tokenizer_provenance is not None
+        and tokenizer_provenance.get("kind") == "toast_tst"
+    )
+    is_gpt2_vocab = (
+        is_nano
+        and "gpt2vocab" in backbone.architecture
+        and not is_bound_custom_tokenizer
+    )
     if is_gpt2_vocab:
         # GPT-2 tokens map to fixed byte strings, so the guard reduces to a
         # direct LUT sum: zero leading-space/boundary tables make eval_val's
@@ -3461,19 +3511,31 @@ def main() -> None:
             gpt2_bytes.size(0), dtype=torch.bool, device=device
         )
         luts = (gpt2_bytes, no_correction, no_correction)
-    else:
+    elif not is_bound_custom_tokenizer:
         luts = baseline.build_sentencepiece_luts(
             tokenizer, FreshHyperparameters.vocab_size, device
         )
+    else:
+        # TST token byte lengths depend on adjacent magnitude tokens, so no
+        # per-token byte LUT exists. eval_val still supplies the token CE; an
+        # all-one LUT makes its temporary BPB equal bits/token, which is
+        # replaced below by the exact decode-based byte denominator.
+        vocab_size = int(backbone.model_config["vocab_size"])
+        one_byte = torch.ones(vocab_size, dtype=torch.int16, device=device)
+        no_correction = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        luts = (one_byte, no_correction, no_correction)
     # The BPB guard shares the checkpoint's own tokenizer family, and nano
     # pretrains against its own shard family; keep the guard on the same
     # validation bytes as nano's own pretraining val_bpb (DATA_PATH overrides).
     bpb_val_files = FreshHyperparameters.val_files
     if is_nano:
-        default_val_dataset = (
-            "data/datasets/fineweb10B_gpt2"
-            if is_gpt2_vocab
-            else "data/datasets/fineweb_onepass_sp1024"
+        default_val_dataset = backbone.model_config.get(
+            "pretraining_data_path",
+            (
+                "data/datasets/fineweb10B_gpt2"
+                if is_gpt2_vocab
+                else "data/datasets/fineweb_onepass_sp1024"
+            ),
         )
         bpb_val_files = os.path.join(
             os.environ.get("DATA_PATH", default_val_dataset),
@@ -3490,6 +3552,15 @@ def main() -> None:
         print(
             f"BPB guard subsampled to {usable} validation tokens", flush=True
         )
+    exact_val_byte_count = None
+    if is_bound_custom_tokenizer:
+        from pretraining.byte_accounting import ByteCounter
+
+        exact_val_byte_count = ByteCounter(
+            {"tokenizer_provenance": tokenizer_provenance}
+        ).count(val_tokens[1:])
+        if exact_val_byte_count <= 0:
+            raise ValueError("custom-tokenizer validation has no bytes")
 
     start_step = 0
     warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
@@ -4334,7 +4405,12 @@ def main() -> None:
                         if args.actor_critic_init
                         else None
                     ),
-                    "architecture": backbone.architecture,
+                    "architecture": critic.trunk.architecture,
+                    "model_config": critic.trunk.model_config,
+                    "dense_for_latent_moe": critic_uses_dense_trunk,
+                    "frozen_actor_moe_router_parameters": (
+                        frozen_moe_router_parameters
+                    ),
                     "value_bins": args.value_bins,
                     "value_anchored_support": args.value_anchored_support,
                     "value_margin_bins": args.value_margin_bins,
@@ -4810,9 +4886,15 @@ def main() -> None:
     def teacher_forced_bpb() -> float:
         """Teacher-forced BPB through the deployed belief renderer."""
         wrapper.eval()
-        _, bpb = baseline.eval_val(
+        val_loss, bpb = baseline.eval_val(
             FreshHyperparameters, wrapper, 0, 1, device, 8, val_tokens, *luts
         )
+        if exact_val_byte_count is not None:
+            bpb = (
+                val_loss
+                / math.log(2.0)
+                * ((val_tokens.numel() - 1) / exact_val_byte_count)
+            )
         wrapper.eval()
         return bpb
 
@@ -5651,6 +5733,8 @@ def main() -> None:
                 policy_action_denominator = actor_minibatch_action_denominator(
                     [device_minibatch], [0]
                 )
+                if frozen_moe_router_parameters:
+                    reset_quantile_balance_accumulators(backbone)
                 with profiler.phase("forward_backward"):
                     metrics = training_update(
                         wrapper, critic, device_minibatch, optimizers,
@@ -5744,6 +5828,16 @@ def main() -> None:
                     )
                 with profiler.phase("optimizer_step"):
                     if not minibatch_actor_frozen:
+                        if frozen_moe_router_parameters:
+                            moe_load_cv, moe_max_load = (
+                                apply_accumulated_quantile_balance(backbone)
+                            )
+                            actor_dashboard.update(
+                                {
+                                    "moe/load_cv2": float(moe_load_cv),
+                                    "moe/max_load": float(moe_max_load),
+                                }
+                            )
                         step_optimizers(optimizers, "actor")
                     step_optimizers(optimizers, "critic")
                     # Gradient buffers have already been reduced to scalar

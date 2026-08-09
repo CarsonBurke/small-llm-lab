@@ -72,7 +72,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument(
         "--rl-mixture-manifest",
-        default="postraining/data/vapo_broad_v5.manifest.json",
+        default="postraining/data/vapo_broad_v6_bare.manifest.json",
         help="immutable multi-source verifier manifest whose exact source "
         "quotas replace --math-data (pass an empty string for a single "
         "--math-data source)",

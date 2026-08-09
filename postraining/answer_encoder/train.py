@@ -52,7 +52,7 @@ from postraining.answer_encoder.probes import run_behavioral_probes
 DEFAULT_TRAIN_GLOB = "data/datasets/k3mix_v7_quality_gpt2_20k/fineweb_train_*.bin"
 DEFAULT_VAL_GLOB = "data/datasets/k3mix_v7_quality_gpt2_20k/fineweb_val_*.bin"
 DEFAULT_ANSWER_SOURCES = (
-    "postraining/data/opsd_dapo17k_contractlast_train.parquet:solution",
+    "postraining/data/opsd_dapo17k_bare_train.parquet:solution",
     "data/pretraining_sources/github_code_clean/data/train-00000-of-00880.parquet:code",
 )
 

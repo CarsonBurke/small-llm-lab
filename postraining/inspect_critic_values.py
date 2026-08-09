@@ -196,6 +196,7 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=run_thinks,
         answer_tokens=run_answer_fence,
+        tokenizer_provenance=backbone.model_config.get("tokenizer_provenance"),
     )
     think_fence_ids = (
         (tokenizer.think_open_id, tokenizer.think_close_id)

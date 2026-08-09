@@ -67,8 +67,12 @@ import torch.nn.functional as F
 
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
+from pretraining.latent_moe_training import (
+    apply_accumulated_quantile_balance,
+    enable_quantile_balance_collection,
+    reset_quantile_balance_accumulators,
+)
 from postraining.core import (
-    GPT2BPETokenizer,
     encode_prompt,
     load_posttraining_tokenizer,
     structural_format_ok,
@@ -82,7 +86,10 @@ from postraining.prepare_sft_traces import (
     INSTRUCTION_SUFFIX_ANSWER,
     normalize_problem,
 )
-from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
+from postraining.math_prompt import (
+    ANSWER_FENCE_PROMPT_SCHEMA,
+    require_answer_fence_prompt_schema,
+)
 
 SFT_CHECKPOINT_SCHEMA = "sft_trace_train/v1"
 
@@ -112,7 +119,7 @@ MUON_MOMENTUM_WARMUP_STEPS = 500
 IGNORE_INDEX = -100
 
 
-def register_special_tokens(backbone, tokenizer: GPT2BPETokenizer) -> None:
+def register_special_tokens(backbone, tokenizer) -> None:
     """Prepare the padded-vocab slack rows for the registered special tokens.
 
     The rows already exist (pretraining pads 50257 -> 50304), but their
@@ -427,7 +434,9 @@ def build_optimizers(backbone, lr_scale: float) -> list[torch.optim.Optimizer]:
     if len(owned) != len({id(parameter) for parameter in owned}):
         raise AssertionError("a parameter is owned by two optimizer groups")
     if {id(parameter) for parameter in owned} != {
-        id(parameter) for parameter in backbone.parameters()
+        id(parameter)
+        for parameter in backbone.parameters()
+        if parameter.requires_grad
     }:
         raise AssertionError(
             "optimizer groups must exactly partition the backbone parameters"
@@ -638,6 +647,37 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_trace_manifest(
+    traces: str | Path, *, answer_fence: bool
+) -> Path | None:
+    """Bind answer-fenced SFT to current-schema immutable corpus bytes."""
+    if not answer_fence:
+        return None
+    traces = Path(traces)
+    manifest_path = traces.with_suffix(".manifest.json")
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"answer-fenced SFT requires corpus manifest {manifest_path}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"invalid trace manifest {manifest_path}: {error}"
+        ) from error
+    require_answer_fence_prompt_schema(
+        manifest, answer_fence=True, source=str(manifest_path)
+    )
+    expected_hash = manifest.get("output_sha256")
+    actual_hash = file_sha256(traces)
+    if expected_hash != actual_hash:
+        raise ValueError(
+            f"trace manifest hash mismatch for {traces}: "
+            f"{expected_hash!r} != {actual_hash!r}"
+        )
+    return manifest_path
+
+
 def create_fresh_run_dir(path: Path) -> None:
     """Create one immutable run root; this trainer has no resume semantics."""
     try:
@@ -702,6 +742,13 @@ def main() -> None:
     if args.min_completion_tokens < 0:
         parser.error("--min-completion-tokens must be nonnegative")
 
+    try:
+        traces_manifest = validate_trace_manifest(
+            args.traces, answer_fence=args.answer_fence
+        )
+    except ValueError as error:
+        parser.error(str(error))
+
     run_dir = Path("postraining/runs") / args.name
     try:
         create_fresh_run_dir(run_dir)
@@ -720,19 +767,26 @@ def main() -> None:
         )
     for parameter in backbone.parameters():
         parameter.requires_grad_(True)
+    frozen_moe_router_parameters = (
+        backbone.freeze_moe_routing_()
+        if hasattr(backbone, "freeze_moe_routing_")
+        else 0
+    )
+    if frozen_moe_router_parameters:
+        enable_quantile_balance_collection(backbone, num_bins=1000)
     if args.answer_fence and not args.think_tokens:
         parser.error("--answer-fence requires --think-tokens")
+    tokenizer = load_posttraining_tokenizer(
+        backbone.architecture,
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=args.think_tokens,
+        answer_tokens=args.answer_fence,
+        tokenizer_provenance=backbone.model_config.get(
+            "tokenizer_provenance"
+        ),
+    )
     if args.think_tokens:
-        if "gpt2vocab" not in backbone.architecture:
-            parser.error("--think-tokens requires a gpt2vocab checkpoint")
-        tokenizer = GPT2BPETokenizer(
-            think_tokens=True, answer_tokens=args.answer_fence
-        )
         register_special_tokens(backbone, tokenizer)
-    else:
-        tokenizer = load_posttraining_tokenizer(
-            backbone.architecture, FreshHyperparameters.tokenizer_path
-        )
 
     instruction_suffix = (
         INSTRUCTION_SUFFIX_ANSWER if args.answer_fence else INSTRUCTION_SUFFIX
@@ -760,11 +814,12 @@ def main() -> None:
         # lacks the anchored fence shape would still stamp
         # answer_fence=True into provenance, and the RL guard would then
         # admit a checkpoint that earns all-zero structural reward.
-        if fence_fraction < 0.99:
+        if fence_fraction != 1.0:
             parser.error(
                 f"--answer-fence: only {fence_fraction:.1%} of documents "
                 "carry the anchored <think>...</think><answer>...</answer> "
-                "completion shape; this corpus cannot teach the "
+                "completion shape; every row must match the exact prompt "
+                "boundary and this corpus cannot safely teach the "
                 "structural gate (want an --answer-tags parquet from "
                 "prepare_sft_traces)"
             )
@@ -857,6 +912,8 @@ def main() -> None:
                     if isinstance(optimizer, Muon):
                         group["mu"] = momentum
             step_loss = 0.0
+            if frozen_moe_router_parameters:
+                reset_quantile_balance_accumulators(backbone)
             for micro_start in range(
                 0, len(step_rows), args.rows_per_micro_batch
             ):
@@ -874,6 +931,10 @@ def main() -> None:
                 loss, _ = masked_ce_sum(backbone, inputs, targets)
                 (loss / supervised_total).backward()
                 step_loss += float(loss) / supervised_total
+            if frozen_moe_router_parameters:
+                moe_load_cv, moe_max_load = apply_accumulated_quantile_balance(
+                    backbone
+                )
             for optimizer in optimizers:
                 optimizer.step()
             for optimizer in optimizers:
@@ -885,6 +946,14 @@ def main() -> None:
                     "step": step,
                     "train_loss": step_loss,
                     "lr_scale": scale,
+                    **(
+                        {
+                            "moe_load_cv2": float(moe_load_cv),
+                            "moe_max_load": float(moe_max_load),
+                        }
+                        if frozen_moe_router_parameters
+                        else {}
+                    ),
                     "train_time_ms": (time.perf_counter() - started) * 1000,
                 }
             )
@@ -904,12 +973,14 @@ def main() -> None:
             "traces": args.traces,
             "traces_sha256": file_sha256(Path(args.traces)),
             "traces_manifest": (
-                str(Path(args.traces).with_suffix(".manifest.json"))
-                if Path(args.traces).with_suffix(".manifest.json").is_file()
-                else None
+                str(traces_manifest) if traces_manifest is not None else None
             ),
             "args": vars(args),
             "steps": step,
+            "moe_router_frozen_parameters": frozen_moe_router_parameters,
+            "moe_quantile_balance_bins": (
+                1000 if frozen_moe_router_parameters else None
+            ),
             # Measured on token ids, not asserted by flag; the RL
             # trainer's --answer-fence guard keys off this value.
             "answer_fence_document_fraction": fence_fraction,

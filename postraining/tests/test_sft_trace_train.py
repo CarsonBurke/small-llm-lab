@@ -394,6 +394,52 @@ def test_instruction_suffix_byte_parity_with_rl_rewrite():
     assert INSTRUCTION_SUFFIX == "\n\n" + ANSWER_FIELD_INSTRUCTIONS[1]
 
 
+def test_answer_fenced_sft_manifest_binds_current_schema_and_bytes(
+    tmp_path,
+) -> None:
+    import hashlib
+    import json
+
+    from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
+    from postraining.sft_trace_train import validate_trace_manifest
+
+    traces = tmp_path / "traces.parquet"
+    traces.write_bytes(b"immutable corpus")
+    manifest = traces.with_suffix(".manifest.json")
+    manifest.write_text(
+        json.dumps(
+            {
+                "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
+                "output_sha256": hashlib.sha256(traces.read_bytes()).hexdigest(),
+            }
+        )
+    )
+    assert validate_trace_manifest(traces, answer_fence=True) == manifest
+    assert validate_trace_manifest(traces, answer_fence=False) is None
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "answer_fence_prompt_schema": "legacy/v1",
+                "output_sha256": hashlib.sha256(traces.read_bytes()).hexdigest(),
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="silently change"):
+        validate_trace_manifest(traces, answer_fence=True)
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
+                "output_sha256": "0" * 64,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="hash mismatch"):
+        validate_trace_manifest(traces, answer_fence=True)
+
+
 def test_think_span_percentiles_expose_floor_reachability():
     """A shape-perfect but terse corpus must be visible to the RL floor.
 

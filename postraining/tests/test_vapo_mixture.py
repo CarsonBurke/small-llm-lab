@@ -28,7 +28,6 @@ from postraining.vapo.mixture import (
     rollout_window_source_quotas,
 )
 from postraining.math_prompt import (
-    ANSWER_FENCE_INSTRUCTION,
     canonicalize_answer_fence_rows,
 )
 
@@ -155,12 +154,12 @@ def test_rollout_windows_preserve_exact_source_composition() -> None:
         shifted_sampler.validate_next_source_quotas(shifted_quotas)
 
 
-def test_explicit_bare_prompt_gets_one_canonical_contract() -> None:
+def test_explicit_bare_prompt_stays_bare() -> None:
     row = _row("7")
     canonical = canonicalize_answer_fence_rows([row])[0]
     content = canonical["prompt"][0]["content"]
-    assert content == f"Compute 7.\n\n{ANSWER_FENCE_INSTRUCTION}"
-    assert content.count(ANSWER_FENCE_INSTRUCTION) == 1
+    assert content == "Compute 7."
+    assert canonical["extra_info"]["prompt_contract"] == "bare"
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap is unavailable")

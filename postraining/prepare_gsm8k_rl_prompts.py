@@ -31,7 +31,7 @@ from postraining.sft_trace_train import load_documents, split_holdout
 
 OUTPUT = Path("postraining/data/gsm8k_rl_prompts.parquet")
 SFT_TRACES = Path(
-    "postraining/data/sft_traces_v4_answer_canonical_hfonly.parquet"
+    "postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet"
 )
 SFT_HOLDOUT_PROBLEMS = 256  # must match the SFT run's --holdout-problems
 

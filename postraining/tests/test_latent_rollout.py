@@ -1224,7 +1224,10 @@ def test_default_cli_selects_current_delightful_broad_regime():
     validate_args(parser, cli)
 
     assert cli.steps == 40_000
-    assert cli.rl_mixture_manifest == "postraining/data/vapo_broad_v5.manifest.json"
+    assert (
+        cli.rl_mixture_manifest
+        == "postraining/data/vapo_broad_v6_bare.manifest.json"
+    )
     assert cli.reasoning_mode == "latent"
     assert cli.delightful_policy_gradient
     assert not cli.allow_dg_topology_migration
@@ -1488,17 +1491,18 @@ def test_answer_fence_prompt_rewrite():
     ]
     rewritten = rewrite_prompts_for_answer_fence(rows)
     content = rewritten[0]["prompt"][0]["content"]
-    # Every source-specific copy is removed and exactly one shared contract
-    # is appended after the bare problem.
-    assert content.endswith(ANSWER_FENCE_SUFFIX)
+    # Every source-specific copy is removed; the user prompt is only the
+    # problem. Registered completion tokens carry the response contract.
+    assert content == "Solve it.\n\nWhat is 1+1?"
+    assert ANSWER_FENCE_SUFFIX == ""
     for fence in (THINK_OPEN, THINK_CLOSE, ANSWER_OPEN, ANSWER_CLOSE):
-        assert content.count(fence) == 1
+        assert content.count(fence) == 0
     assert ANSWER_FIELD_INSTRUCTIONS[0] not in content
     assert ANSWER_FIELD_INSTRUCTIONS[1] not in content
     chinese_content = rewritten[1]["prompt"][0]["content"]
     assert chinese_field not in chinese_content
     assert "Answer:" not in chinese_content
-    assert chinese_content.endswith(ANSWER_FENCE_SUFFIX)
+    assert chinese_content == "Solve it.\n\n某数学问题。"
     assert "让我们一步一步地思考。" not in chinese_content
     # Canonicalization is idempotent, including already-fenced rows.
     assert rewrite_prompts_for_answer_fence(rewritten) == rewritten
@@ -1577,9 +1581,9 @@ def test_answer_fence_prompt_rewrite_covers_real_datasets():
         ), f"surviving Answer: demand in {path}"
         for row in rewritten:
             content = "".join(message["content"] for message in row["prompt"])
-            assert content.endswith(ANSWER_FENCE_SUFFIX), path
+            assert content.strip() == content, path
             for fence in (THINK_OPEN, THINK_CLOSE, ANSWER_OPEN, ANSWER_CLOSE):
-                assert content.count(fence) == 1, (path, fence)
+                assert content.count(fence) == 0, (path, fence)
 
 
 def test_answer_fence_prompt_schema_rejects_legacy_offline_evaluation():

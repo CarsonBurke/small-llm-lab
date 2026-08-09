@@ -79,6 +79,9 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=True,
         answer_tokens=True,
+        tokenizer_provenance=payload["model_config"].get(
+            "tokenizer_provenance"
+        ),
     )
     gate_args = Namespace(
         gate_prompts=args.gate_prompts,

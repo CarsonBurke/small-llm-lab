@@ -516,6 +516,7 @@ def main() -> None:
         FreshHyperparameters.tokenizer_path,
         think_tokens=bool(saved_args.get("think_tokens")),
         answer_tokens=bool(saved_args.get("answer_fence")),
+        tokenizer_provenance=backbone.model_config.get("tokenizer_provenance"),
     )
     stop_ids = tuple(
         dict.fromkeys(
