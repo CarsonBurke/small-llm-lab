@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from pretraining.byte_accounting import padded_vocab_size, tokenizer_identity
 from scripts.ablation import MetricsWriter, parse_log_line
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +106,41 @@ def validate_training_manifest(
         )
 
 
+# `padded_vocab_size` comes from the same module the trainer uses to size its
+# embedding table and to count bytes, so the launcher cannot drift from it.
+# Token ids only mean something under the vocabulary that produced them, and a
+# shard stream carries no record of its own, so the size comes from the dataset
+# manifest rather than from a default. Padding to a multiple of 128 keeps the
+# logit matmul on tensor cores; the pad rows are unreachable ids, the same
+# arrangement GPT-2's 50,257-into-50,304 padding already relies on.
+
+
+def latent_moe_environment(
+    *,
+    enabled: bool,
+    num_experts: int,
+    top_k: int,
+    latent_dim: int,
+    expert_hidden: int,
+    shared_hidden: int,
+    num_shared_experts: int,
+    layer_indices: str,
+    quantile_balance_interval: int,
+) -> dict[str, str]:
+    """Canonical compute-matched K3 LatentMoE environment for every stage."""
+
+    return {
+        "MOE_NUM_EXPERTS": str(num_experts if enabled else 0),
+        "MOE_TOP_K": str(top_k),
+        "MOE_LATENT_DIM": str(latent_dim),
+        "MOE_EXPERT_HIDDEN": str(expert_hidden),
+        "MOE_SHARED_HIDDEN": str(shared_hidden),
+        "MOE_NUM_SHARED_EXPERTS": str(num_shared_experts),
+        "MOE_LAYER_INDICES": layer_indices if enabled else "",
+        "MOE_QB_INTERVAL": str(quantile_balance_interval if enabled else 0),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data/datasets/k3mix_v5_gpt2_8k")
@@ -119,9 +156,33 @@ def main() -> None:
     )
     parser.add_argument("--kda-heads", type=int, default=3)
     parser.add_argument("--full-rank-gate", action="store_true")
-    parser.add_argument("--per-head-muon", action="store_true")
+    parser.add_argument(
+        "--per-head-muon",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="orthogonalize KDA/MHA Q/K/V independently per head (default: on)",
+    )
     parser.add_argument("--mtp-heads", type=int, default=0)
     parser.add_argument("--mtp-loss-weight", type=float, default=0.1)
+    parser.add_argument("--nextlat", action="store_true")
+    parser.add_argument("--nope", action="store_true")
+    parser.add_argument("--nextlat-proj-factor", type=float, default=1.6)
+    parser.add_argument("--nextlat-hidden-weight", type=float, default=1.0)
+    parser.add_argument("--nextlat-kl-weight", type=float, default=1.0)
+    parser.add_argument("--nextlat-token-chunk-size", type=int, default=4096)
+    parser.add_argument(
+        "--latent-moe",
+        action="store_true",
+        help="replace the legacy dense MLPs with compute-matched K3 Stable LatentMoE",
+    )
+    parser.add_argument("--moe-num-experts", type=int, default=32)
+    parser.add_argument("--moe-top-k", type=int, default=2)
+    parser.add_argument("--moe-latent-dim", type=int, default=128)
+    parser.add_argument("--moe-expert-hidden", type=int, default=256)
+    parser.add_argument("--moe-shared-hidden", type=int, default=64)
+    parser.add_argument("--moe-num-shared-experts", type=int, default=2)
+    parser.add_argument("--moe-layer-indices", default="0,1,2,3,4,5,6,7")
+    parser.add_argument("--moe-qb-interval", type=int, default=1)
     parser.add_argument(
         "--dense-attention",
         choices=("mha", "gated_nope_mla"),
@@ -156,6 +217,45 @@ def main() -> None:
         parser.error("--mtp-heads must be nonnegative")
     if args.mtp_loss_weight < 0:
         parser.error("--mtp-loss-weight must be nonnegative")
+    if args.nextlat and args.mtp_heads:
+        parser.error("--nextlat and --mtp-heads are separate auxiliary objectives")
+    if (
+        not math.isfinite(args.nextlat_proj_factor)
+        or args.nextlat_proj_factor <= 0
+    ):
+        parser.error("--nextlat-proj-factor must be positive")
+    if not all(
+        math.isfinite(weight)
+        for weight in (args.nextlat_hidden_weight, args.nextlat_kl_weight)
+    ) or min(args.nextlat_hidden_weight, args.nextlat_kl_weight) < 0:
+        parser.error("NextLat loss weights must be nonnegative")
+    if args.nextlat and args.nextlat_hidden_weight == args.nextlat_kl_weight == 0:
+        parser.error("--nextlat requires at least one nonzero loss weight")
+    if args.nextlat_token_chunk_size <= 0:
+        parser.error("--nextlat-token-chunk-size must be positive")
+    if min(
+        args.moe_num_experts,
+        args.moe_top_k,
+        args.moe_latent_dim,
+        args.moe_expert_hidden,
+        args.moe_shared_hidden,
+        args.moe_num_shared_experts,
+    ) <= 0:
+        parser.error("all LatentMoE dimensions/counts must be positive")
+    if args.moe_top_k > args.moe_num_experts:
+        parser.error("--moe-top-k cannot exceed --moe-num-experts")
+    try:
+        moe_layers = [
+            int(index) for index in args.moe_layer_indices.split(",") if index
+        ]
+    except ValueError:
+        parser.error("--moe-layer-indices must be comma-separated integers")
+    if len(moe_layers) != len(set(moe_layers)) or not set(moe_layers) <= set(range(8)):
+        parser.error("--moe-layer-indices must be unique indices in [0, 8)")
+    if args.latent_moe and not moe_layers:
+        parser.error("--latent-moe requires at least one MoE layer")
+    if args.moe_qb_interval < 0:
+        parser.error("--moe-qb-interval must be nonnegative (zero disables it)")
     if min(
         args.embed_lr,
         args.proj_lr,
@@ -195,6 +295,7 @@ def main() -> None:
     manifest_path = Path(args.data) / "mix_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     validate_training_manifest(manifest, args.steps)
+    vocab_size = padded_vocab_size(manifest)
     cooldown_data = Path(args.cooldown_data) if args.cooldown_data else None
     if cooldown_data is not None:
         cooldown_manifest_path = cooldown_data / "mix_manifest.json"
@@ -206,6 +307,22 @@ def main() -> None:
                 f"{cooldown_manifest_path} contains {cooldown_steps} steps, "
                 f"but the final stage requires {final_stage_steps}"
             )
+        # Two datasets, one embedding table: if they were tokenized
+        # differently, the final stage would feed the model ids that mean
+        # something else, and the run would look like a catastrophic
+        # distribution shift rather than a configuration error. Comparing
+        # padded sizes would not catch that -- every vocabulary in the same
+        # 128-wide bucket compares equal -- so this compares content identity.
+        if tokenizer_identity(cooldown_manifest) != tokenizer_identity(manifest):
+            raise ValueError(
+                f"{cooldown_manifest_path} was built under tokenizer "
+                f"{cooldown_manifest.get('tokenizer')!r} "
+                f"{tokenizer_identity(cooldown_manifest)} and "
+                f"{manifest_path} under {manifest.get('tokenizer')!r} "
+                f"{tokenizer_identity(manifest)}; a cooldown dataset must "
+                "share the main dataset's exact vocabulary"
+            )
+        assert padded_vocab_size(cooldown_manifest) == vocab_size
 
     metrics_dir = Path("ablation_results") / args.run_id
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -235,8 +352,14 @@ def main() -> None:
             # Stage 1 must always start from scratch. Do not let an unrelated
             # shell-level resume setting silently change the campaign.
             env.pop("RESUME_CHECKPOINT", None)
+            # Same reasoning: this campaign's step budget and its
+            # `expected_batch_tokens` check are both written against the
+            # trainer's default global batch, so an exported override would
+            # halve the campaign while the assert still claimed it had not.
+            env.pop("GLOBAL_BATCH_TOKENS", None)
             env.update(
                 {
+                    "VOCAB_SIZE": str(vocab_size),
                     "RUN_ID": stage_run_id,
                     "DATA_PATH": str(stage_data),
                     "ITERATIONS": str(args.steps),
@@ -254,6 +377,14 @@ def main() -> None:
                     "PER_HEAD_MUON": "1" if args.per_head_muon else "0",
                     "MTP_NUM_HEADS": str(args.mtp_heads),
                     "MTP_LOSS_WEIGHT": str(args.mtp_loss_weight),
+                    "NEXTLAT": "1" if args.nextlat else "0",
+                    "NOPE": "1" if args.nope else "0",
+                    "NEXTLAT_PROJ_FACTOR": str(args.nextlat_proj_factor),
+                    "NEXTLAT_HIDDEN_WEIGHT": str(args.nextlat_hidden_weight),
+                    "NEXTLAT_KL_WEIGHT": str(args.nextlat_kl_weight),
+                    "NEXTLAT_TOKEN_CHUNK_SIZE": str(
+                        args.nextlat_token_chunk_size
+                    ),
                     "DENSE_ATTENTION_TYPE": args.dense_attention,
                     "LR_SCHEDULE": args.lr_schedule,
                     "WARMUP_FRACTION": str(args.warmup_fraction),
@@ -280,6 +411,19 @@ def main() -> None:
                     "DOMAIN_VAL_EVERY": str(args.domain_val_every),
                     "VAL_TOKENS": str(args.val_tokens),
                 }
+            )
+            env.update(
+                latent_moe_environment(
+                    enabled=args.latent_moe,
+                    num_experts=args.moe_num_experts,
+                    top_k=args.moe_top_k,
+                    latent_dim=args.moe_latent_dim,
+                    expert_hidden=args.moe_expert_hidden,
+                    shared_hidden=args.moe_shared_hidden,
+                    num_shared_experts=args.moe_num_shared_experts,
+                    layer_indices=",".join(map(str, moe_layers)),
+                    quantile_balance_interval=args.moe_qb_interval,
+                )
             )
             if resume_checkpoint is not None:
                 env["RESUME_CHECKPOINT"] = str(resume_checkpoint)

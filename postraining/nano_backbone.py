@@ -180,9 +180,12 @@ class _NanoPostrainingMixin:
         k = attention.k(x).view(batch, 1, num_heads, head_dim)
         v = attention.v(x).view(batch, 1, num_heads, head_dim)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
-        angular_freq = attention.rotary.angular_freq
-        q = self._rotate_step(q, position, angular_freq).transpose(1, 2)
-        k = self._rotate_step(k, position, angular_freq).transpose(1, 2)
+        if getattr(attention, "use_rope", True):
+            angular_freq = attention.rotary.angular_freq
+            q = self._rotate_step(q, position, angular_freq)
+            k = self._rotate_step(k, position, angular_freq)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         # Autocast puts rms_norm on the fp32 list and linear on the bf16 one,
         # so k arrives fp32 and v bf16 while the cache holds one dtype: eager
@@ -297,19 +300,22 @@ class _NanoPostrainingMixin:
         value = attention.v(x).view(batch, 1, num_heads, head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        angular_freq = attention.rotary.angular_freq
-        theta = positions[:, None].to(angular_freq.dtype) * angular_freq[None]
-        cos, sin = theta.cos()[:, None, None], theta.sin()[:, None, None]
+        if getattr(attention, "use_rope", True):
+            angular_freq = attention.rotary.angular_freq
+            theta = positions[:, None].to(angular_freq.dtype) * angular_freq[None]
+            cos, sin = theta.cos()[:, None, None], theta.sin()[:, None, None]
 
-        def rotate(tensor: Tensor) -> Tensor:
-            first, second = tensor.float().chunk(2, dim=-1)
-            return torch.cat(
-                (first * cos + second * sin, first * (-sin) + second * cos),
-                dim=-1,
-            ).type_as(tensor)
+            def rotate(tensor: Tensor) -> Tensor:
+                first, second = tensor.float().chunk(2, dim=-1)
+                return torch.cat(
+                    (first * cos + second * sin, first * (-sin) + second * cos),
+                    dim=-1,
+                ).type_as(tensor)
 
-        q = rotate(q).transpose(1, 2).to(cache[0].dtype)
-        k = rotate(k).transpose(1, 2).to(cache[0].dtype)
+            q = rotate(q)
+            k = rotate(k)
+        q = q.transpose(1, 2).to(cache[0].dtype)
+        k = k.transpose(1, 2).to(cache[0].dtype)
         value = value.transpose(1, 2).to(cache[1].dtype)
         self._write_paged_cache(cache[0], k, cache_addresses)
         self._write_paged_cache(cache[1], value, cache_addresses)
@@ -379,7 +385,8 @@ class _NanoPostrainingMixin:
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         # The dense Rotary derives positions 0..length-1 from x.size(1) —
         # exactly the absolute cache slots the prefix occupies.
-        q, k = attention.rotary(q), attention.rotary(k)
+        if getattr(attention, "use_rope", True):
+            q, k = attention.rotary(q), attention.rotary(k)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         cache[0][:, :, :length].copy_(k.to(cache[0].dtype))
         cache[1][:, :, :length].copy_(v.to(cache[1].dtype))

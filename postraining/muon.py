@@ -71,12 +71,23 @@ def _polar_express(
     g = grad.lerp_(momentum_buffer, momentum)
 
     X = g.bfloat16()
+    original_shape = X.shape
     is_tall = g.size(-2) > g.size(-1)
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
     X = X.contiguous()
+
+    # A native matrix parameter may itself carry a leading expert axis.  The
+    # optimizer then stacks same-shaped parameters by layer, producing e.g.
+    # [layers, experts, rows, cols].  bmm only accepts three dimensions, while
+    # every leading entry is still an independent matrix for Muon's purposes.
+    # Flatten all batch axes for the batched kernels and restore them before
+    # returning the update.  This also keeps the single-parameter fallback
+    # valid: [1, experts, rows, cols] follows the same path.
+    if X.ndim > 3:
+        X = X.reshape(-1, X.size(-2), X.size(-1))
 
     # Multiply on whichever side keeps the Gram matrix at (min-dim, min-dim).
     gram = X.size(-1) if is_tall else X.size(-2)
@@ -110,7 +121,7 @@ def _polar_express(
 
         X, C = C, X  # Swap references to avoid unnecessary copies
 
-    return X
+    return X.reshape(original_shape)
 
 
 # Pretraining compiles the update; CPU (tests) stays eager — the math is

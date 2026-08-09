@@ -209,6 +209,8 @@ def test_graph_stats_parse_and_route_to_graph_namespace() -> None:
     }
     assert MetricsWriter._extra_scalar_tag("graph_rewire_l0") == "graph/rewire_l0"
     assert MetricsWriter._extra_scalar_tag("graph_support_l0") == "graph/support_l0"
+    assert MetricsWriter._extra_scalar_tag("nextlat_kl") == "nextlat/kl"
+    assert MetricsWriter._extra_scalar_tag("train_ce") == "train/ce"
 
 
 def test_muon_wrapper_updates_graph_once_per_optimizer_call(monkeypatch: pytest.MonkeyPatch) -> None:

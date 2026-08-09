@@ -66,6 +66,20 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from pretraining.byte_accounting import (
+    ByteCounter,
+    read_dataset_manifest,
+    require_matching_vocab_size,
+    tokenizer_identity,
+)
+from pretraining.nextlat import NextLatDynamicsModel, nextlat_terminal_loss
+from pretraining.latent_moe import LatentMoEConfig, StableLatentMoE
+from pretraining.latent_moe_training import (
+    apply_accumulated_quantile_balance,
+    enable_quantile_balance_collection,
+    reset_quantile_balance_accumulators,
+)
+
 try:
     import fla
     from fla.modules import FusedRMSNormGated, FusedRMSNormSwishGate, ShortConvolution
@@ -77,7 +91,24 @@ except ImportError as exc:
         "Install it in an isolated environment before launching."
     ) from exc
 
-VOCAB_SIZE = 50304  # GPT-2 BPE (50,257 real tokens, padded for GPU efficiency)
+# GPT-2 BPE (50,257 real tokens) padded to a multiple of 128 for GPU
+# efficiency. VOCAB_SIZE is overridable because the corpus builder can now emit
+# a stream under a trained ToaST+TST tokenizer, whose vocabulary is a different
+# size; the dataset manifest records `tokenizer_provenance.vocab_size`, and the
+# curriculum runner passes it through. A mismatch is not a degradation but a
+# corrupt run -- ids above the embedding table index out of range, and ids
+# below it silently make the tail of the vocabulary unreachable. It is
+# therefore asserted against the corpus manifest below, next to the data path,
+# so a trainer launched outside the curriculum runner (scripts/ablation.py
+# among others, which only forwards --env overrides) cannot fall back to the
+# GPT-2 default against a corpus that is not GPT-2.
+VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", "50304"))
+if VOCAB_SIZE % 128:
+    raise ValueError(
+        f"VOCAB_SIZE={VOCAB_SIZE} must be a multiple of 128; pad the "
+        "tokenizer's real vocabulary size up"
+    )
+GPT2_EOT_ID = 50256
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "24"))
 if NUM_LAYERS <= 0:
     raise ValueError(f"NUM_LAYERS must be positive, got {NUM_LAYERS}")
@@ -106,12 +137,33 @@ KDA_FULL_RANK_GATE = os.environ.get("KDA_FULL_RANK_GATE", "0") == "1"
 PER_HEAD_MUON = os.environ.get("PER_HEAD_MUON", "0") == "1"
 MTP_NUM_HEADS = int(os.environ.get("MTP_NUM_HEADS", "0"))
 MTP_LOSS_WEIGHT = float(os.environ.get("MTP_LOSS_WEIGHT", "0.1"))
+NEXTLAT = os.environ.get("NEXTLAT", "0") == "1"
+NOPE = os.environ.get("NOPE", "0") == "1"
+NEXTLAT_PROJ_FACTOR = float(os.environ.get("NEXTLAT_PROJ_FACTOR", "1.6"))
+NEXTLAT_HIDDEN_WEIGHT = float(os.environ.get("NEXTLAT_HIDDEN_WEIGHT", "1.0"))
+NEXTLAT_KL_WEIGHT = float(os.environ.get("NEXTLAT_KL_WEIGHT", "1.0"))
+NEXTLAT_TOKEN_CHUNK_SIZE = int(
+    os.environ.get("NEXTLAT_TOKEN_CHUNK_SIZE", "4096")
+)
 if MTP_NUM_HEADS < 0:
     raise ValueError(f"MTP_NUM_HEADS must be nonnegative, got {MTP_NUM_HEADS}")
 if MTP_LOSS_WEIGHT < 0:
     raise ValueError(
         f"MTP_LOSS_WEIGHT must be nonnegative, got {MTP_LOSS_WEIGHT}"
     )
+if NEXTLAT and MTP_NUM_HEADS:
+    raise ValueError("NEXTLAT and MTP_NUM_HEADS are separate auxiliary objectives")
+if not math.isfinite(NEXTLAT_PROJ_FACTOR) or NEXTLAT_PROJ_FACTOR <= 0:
+    raise ValueError("NEXTLAT_PROJ_FACTOR must be positive")
+if not all(
+    math.isfinite(weight)
+    for weight in (NEXTLAT_HIDDEN_WEIGHT, NEXTLAT_KL_WEIGHT)
+) or min(NEXTLAT_HIDDEN_WEIGHT, NEXTLAT_KL_WEIGHT) < 0:
+    raise ValueError("NextLat loss weights must be nonnegative")
+if NEXTLAT and NEXTLAT_HIDDEN_WEIGHT == NEXTLAT_KL_WEIGHT == 0:
+    raise ValueError("NEXTLAT requires at least one nonzero auxiliary loss weight")
+if NEXTLAT_TOKEN_CHUNK_SIZE <= 0:
+    raise ValueError("NEXTLAT_TOKEN_CHUNK_SIZE must be positive")
 DENSE_ATTENTION_TYPE = os.environ.get("DENSE_ATTENTION_TYPE", "mha")
 if DENSE_ATTENTION_TYPE not in {"mha", "gated_nope_mla"}:
     raise ValueError(
@@ -170,9 +222,51 @@ DELTA_USE_CUDAGRAPHS = DELTA_COMPILE_MODE in {
 }
 DELTA_MLP_ON_DELTA = os.environ.get("DELTA_MLP_ON_DELTA", "0") == "1"
 MLP_HIDDEN = int(os.environ.get("MLP_HIDDEN", "2048"))
+MOE_NUM_EXPERTS = int(os.environ.get("MOE_NUM_EXPERTS", "0"))
+MOE_TOP_K = int(os.environ.get("MOE_TOP_K", "2"))
+MOE_LATENT_DIM = int(os.environ.get("MOE_LATENT_DIM", "128"))
+MOE_EXPERT_HIDDEN = int(os.environ.get("MOE_EXPERT_HIDDEN", "256"))
+MOE_SHARED_HIDDEN = int(os.environ.get("MOE_SHARED_HIDDEN", "64"))
+MOE_NUM_SHARED_EXPERTS = int(os.environ.get("MOE_NUM_SHARED_EXPERTS", "2"))
+MOE_QB_INTERVAL = int(os.environ.get("MOE_QB_INTERVAL", "1" if MOE_NUM_EXPERTS else "0"))
+MOE_QB_BINS = int(os.environ.get("MOE_QB_BINS", "1000"))
+_default_moe_layers = ",".join(map(str, range(NUM_LAYERS))) if MOE_NUM_EXPERTS else ""
+MOE_LAYER_INDICES = frozenset(
+    int(index)
+    for index in os.environ.get("MOE_LAYER_INDICES", _default_moe_layers).split(",")
+    if index
+)
 GDN2_RESIDUAL_RANK = int(os.environ.get("GDN2_RESIDUAL_RANK", "32"))
 if MLP_HIDDEN <= 0:
     raise ValueError(f"MLP_HIDDEN must be positive, got {MLP_HIDDEN}")
+if MOE_NUM_EXPERTS < 0:
+    raise ValueError("MOE_NUM_EXPERTS must be nonnegative")
+if not MOE_LAYER_INDICES.issubset(range(NUM_LAYERS)):
+    raise ValueError(
+        f"MOE_LAYER_INDICES must be within [0, {NUM_LAYERS}), "
+        f"got {sorted(MOE_LAYER_INDICES)}"
+    )
+if not MOE_NUM_EXPERTS and MOE_LAYER_INDICES:
+    raise ValueError("MOE_LAYER_INDICES requires MOE_NUM_EXPERTS > 0")
+if MOE_NUM_EXPERTS and not MOE_LAYER_INDICES:
+    raise ValueError("MOE_NUM_EXPERTS > 0 requires at least one MOE layer")
+if MOE_QB_INTERVAL < 0:
+    raise ValueError("MOE_QB_INTERVAL must be nonnegative")
+if MOE_NUM_EXPERTS and MOE_QB_INTERVAL and MOE_QB_BINS <= 0:
+    raise ValueError("MOE_QB_BINS must be positive when Quantile Balancing is enabled")
+MOE_CONFIG = (
+    LatentMoEConfig(
+        model_dim=512,
+        latent_dim=MOE_LATENT_DIM,
+        routed_hidden_dim=MOE_EXPERT_HIDDEN,
+        num_routed_experts=MOE_NUM_EXPERTS,
+        experts_per_token=MOE_TOP_K,
+        shared_hidden_dim=MOE_SHARED_HIDDEN,
+        num_shared_experts=MOE_NUM_SHARED_EXPERTS,
+    )
+    if MOE_NUM_EXPERTS
+    else None
+)
 if GDN2_RESIDUAL_RANK <= 0:
     raise ValueError(
         f"GDN2_RESIDUAL_RANK must be positive, got {GDN2_RESIDUAL_RANK}"
@@ -305,7 +399,8 @@ class CausalSelfAttention(nn.Module):
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k)
-        q, k = self.rotary(q), self.rotary(k)
+        if not NOPE:
+            q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                            v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
@@ -663,7 +758,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, use_kda: bool):
+    def __init__(self, dim: int, use_kda: bool, use_moe: bool):
         super().__init__()
         self.use_kda = use_kda
         if use_kda:
@@ -680,9 +775,10 @@ class Block(nn.Module):
             }
             self.attn = dense_attention_types[DENSE_ATTENTION_TYPE](dim)
         self.norm1 = RMSNorm(dim)
-        self.use_mlp = not use_kda or DELTA_MLP_ON_DELTA
+        self.use_moe = use_moe
+        self.use_mlp = use_moe or not use_kda or DELTA_MLP_ON_DELTA
         if self.use_mlp:
-            self.mlp = MLP(dim)
+            self.mlp = StableLatentMoE(MOE_CONFIG) if use_moe else MLP(dim)
             self.norm2 = RMSNorm(dim)
 
     def forward(self, x: Tensor):
@@ -692,14 +788,29 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        eot_id: int = GPT2_EOT_ID,
+    ):
         super().__init__()
+        if not 0 <= eot_id < vocab_size:
+            raise ValueError(
+                f"end-of-text id {eot_id} is outside vocabulary size {vocab_size}"
+            )
+        self.eot_id = eot_id
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         # Sequential lets Dynamo statically inline the fixed-depth stack.
         # A Python loop containing an eager FLA region makes Dynamo abandon
         # the whole GPT frame, leaving every surrounding MLP and norm eager.
         self.blocks = nn.Sequential(*[
-            Block(model_dim, use_kda=layer_idx in DELTA_LAYER_INDICES)
+            Block(
+                model_dim,
+                use_kda=layer_idx in DELTA_LAYER_INDICES,
+                use_moe=layer_idx in MOE_LAYER_INDICES,
+            )
             for layer_idx in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)
@@ -709,13 +820,55 @@ class GPT(nn.Module):
             BiasFreeLinear(model_dim, vocab_size)
             for _ in range(MTP_NUM_HEADS)
         )
+        self.nextlat_dynamics = (
+            NextLatDynamicsModel(model_dim, proj_factor=NEXTLAT_PROJ_FACTOR)
+            if NEXTLAT
+            else None
+        )
         self.norm1 = RMSNorm(model_dim)
         self.norm2 = RMSNorm(model_dim)
+        self.last_nextlat_metrics: Tensor | None = None
 
     def forward(self, inputs: Tensor, targets: Tensor):
-        x = self.norm1(self.embed(inputs))
-        x = self.blocks(x)
-        return self.compute_loss(x, targets)
+        raw_token_latent = self.embed(inputs)
+        token_latent = self.norm1(raw_token_latent)
+        x = self.blocks(token_latent)
+        if self.training and self.nextlat_dynamics is not None:
+            hidden = self.norm2(x)
+            if hidden.size(1) < 2:
+                raise ValueError("NextLat requires sequences of at least two tokens")
+            predicted = self.nextlat_dynamics(
+                hidden[:, :-1],
+                raw_token_latent[:, 1:],
+            )
+            transition_mask = inputs[:, 1:] != self.eot_id
+            # The compiled terminal computes main CE and both NextLat terms
+            # together. Main logits are reused as the detached KL teacher;
+            # no eager vocabulary loop or redundant teacher projection is
+            # left on the hot path.
+            losses = nextlat_terminal_loss(
+                hidden,
+                predicted,
+                targets,
+                self.proj,
+                transition_mask=transition_mask,
+                hidden_weight=NEXTLAT_HIDDEN_WEIGHT,
+                kl_weight=NEXTLAT_KL_WEIGHT,
+                softcap=15.0,
+                token_chunk_size=NEXTLAT_TOKEN_CHUNK_SIZE,
+            )
+            # The trainer's primary CE is a token sum. Scale the paper's
+            # independently averaged auxiliary terms to preserve their unit
+            # weights under that convention.
+            loss = losses.ce_sum + targets.numel() * losses.total
+            self.last_nextlat_metrics = torch.stack(
+                (losses.hidden_loss, losses.kl_loss, losses.total)
+            ).detach()
+        else:
+            loss, _ = self.compute_loss(x, targets)
+            if self.nextlat_dynamics is not None:
+                self.last_nextlat_metrics = None
+        return loss
 
     def compute_loss(self, x: Tensor, targets: Tensor):
         hidden = self.norm2(x)
@@ -753,7 +906,7 @@ class GPT(nn.Module):
                     * auxiliary
                     / auxiliary_tokens
                 )
-        return loss
+        return loss, hidden
 
 @torch.no_grad()
 def initialize_model(model: GPT, seed: int):
@@ -932,24 +1085,45 @@ def initialize_model(model: GPT, seed: int):
         else:
             block.norm1.gains.normal_(mean=1, std=0)
         if block.use_mlp:
-            baseline_mlp_shape = (
-                4 * block.mlp.fc.in_features,
-                block.mlp.fc.in_features,
-            )
-            mlp_extra_generator = torch.Generator(
-                device=block.mlp.fc.weight.device
-            )
-            mlp_extra_generator.manual_seed(seed + 30_000 + layer_idx)
-            paired_prefix_weight(
-                block.mlp.fc.weight,
-                baseline_mlp_shape,
-                reference_generator=(
-                    mlp_extra_generator if block.use_kda else None
-                ),
-                extra_generator=mlp_extra_generator,
-            )
-            block.mlp.fc.bias.zero_()
-            zero_linear(block.mlp.proj)
+            if block.use_moe:
+                moe = block.mlp
+                moe_generator = torch.Generator(device=moe.router_weight.device)
+                moe_generator.manual_seed(seed + 30_000 + layer_idx)
+                for weight in (
+                    moe.router_weight,
+                    moe.latent_down_proj.weight,
+                    moe.expert_gate_up_weight,
+                    moe.expert_down_weight,
+                    moe.shared_expert.gate_up_proj.weight,
+                ):
+                    normal_weight(weight, generator=moe_generator)
+                # Match the existing residual-MLP initialization: both dense
+                # and routed output branches start at zero, while their inner
+                # features are already non-degenerate and wake as soon as the
+                # output projections receive their first update.
+                zero_linear(moe.shared_expert.down_proj)
+                zero_linear(moe.latent_up_proj)
+                moe.routed_norm.weight.fill_(1)
+                moe.correction_bias.zero_()
+            else:
+                baseline_mlp_shape = (
+                    4 * block.mlp.fc.in_features,
+                    block.mlp.fc.in_features,
+                )
+                mlp_extra_generator = torch.Generator(
+                    device=block.mlp.fc.weight.device
+                )
+                mlp_extra_generator.manual_seed(seed + 30_000 + layer_idx)
+                paired_prefix_weight(
+                    block.mlp.fc.weight,
+                    baseline_mlp_shape,
+                    reference_generator=(
+                        mlp_extra_generator if block.use_kda else None
+                    ),
+                    extra_generator=mlp_extra_generator,
+                )
+                block.mlp.fc.bias.zero_()
+                zero_linear(block.mlp.proj)
             if block.use_kda:
                 block.norm2.gains.fill_(1)
             else:
@@ -958,6 +1132,14 @@ def initialize_model(model: GPT, seed: int):
     zero_linear(model.proj)
     for head in model.mtp_heads:
         zero_linear(head)
+    if model.nextlat_dynamics is not None:
+        dynamics_generator = torch.Generator(device=model.embed.weight.device)
+        dynamics_generator.manual_seed(seed + 50_000)
+        for module in model.nextlat_dynamics.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.normal_(std=0.02, generator=dynamics_generator)
+            elif isinstance(module, nn.RMSNorm):
+                module.weight.fill_(1)
     model.norm1.gains.normal_(mean=1, std=0)
     model.norm2.gains.normal_(mean=1, std=0)
 
@@ -1175,6 +1357,22 @@ print0(f"compile mode: {DELTA_COMPILE_MODE}")
 print0(f"CUDA graphs with persistent grad buffers: {DELTA_USE_CUDAGRAPHS}")
 print0(f"{delta_label} blocks include MLPs: {DELTA_MLP_ON_DELTA}")
 print0(f"MLP hidden width: {MLP_HIDDEN}")
+if MOE_NUM_EXPERTS:
+    print0(
+        "K3 Stable LatentMoE: "
+        f"layers={sorted(MOE_LAYER_INDICES)}, experts={MOE_NUM_EXPERTS}, "
+        f"top-k={MOE_TOP_K}, latent={MOE_LATENT_DIM}, "
+        f"routed-hidden={MOE_EXPERT_HIDDEN}, "
+        f"shared={MOE_NUM_SHARED_EXPERTS}x{MOE_SHARED_HIDDEN}"
+    )
+    print0(
+        (
+            f"K3 Quantile Balancing: every {MOE_QB_INTERVAL} step(s), "
+            f"{MOE_QB_BINS} bins"
+            if MOE_QB_INTERVAL
+            else "K3 Quantile Balancing: disabled"
+        )
+    )
 if DELTA_ATTENTION_TYPE == "gdn2_kda_erase":
     print0(f"GDN2 erase residual rank: {GDN2_RESIDUAL_RANK}")
 print0("="*100)
@@ -1182,12 +1380,24 @@ print0("="*100)
 data_path = os.environ.get("DATA_PATH", "data/datasets/fineweb10B_gpt2")
 
 val_tokens = int(os.environ.get("VAL_TOKENS", 64 * 524288))
-batch_size = 8 * 64 * 1024
+# Default global batch, in tokens. Overridable so a run can trade batch size
+# against optimizer steps at a fixed token budget: comparing this trainer
+# against a model trained at a different batch on the same corpus otherwise
+# confounds byteification (or any other change) with update count. Must stay a
+# multiple of world_size * mbs * seq_len, which the assert below enforces.
+batch_size = int(os.environ.get("GLOBAL_BATCH_TOKENS", 8 * 64 * 1024))
 # SEQ_LEN reshapes the same token budget into longer rows (RoPE positions seen
 # in pretraining bound the usable RL context). Halve MBS when doubling SEQ_LEN
 # to keep microbatch tokens (and the 50304-wide logit buffer) constant.
 seq_len = int(os.environ.get("SEQ_LEN", 1024))
 mbs = int(os.environ.get("MBS", 8))
+if batch_size <= 0:
+    # `0 % anything == 0` and Python's modulo makes negatives pass too, and the
+    # data generator is lazy, so a bad value would survive model init, compile
+    # warmup and step-0 validation before dying on a bare ZeroDivisionError.
+    raise ValueError(
+        f"GLOBAL_BATCH_TOKENS must be positive, got {batch_size}"
+    )
 assert batch_size % (world_size * mbs * seq_len) == 0
 assert val_tokens % (world_size * mbs * seq_len) == 0
 local_microbatches_per_step = batch_size // (
@@ -1201,15 +1411,20 @@ print0(
 val_inputs, val_targets = next(distributed_data_generator(
     f"{data_path}/fineweb_val_*.bin", val_tokens, seq_len=seq_len))
 
-# Challenge BPB metric with GPT-2 byte accounting: each GPT-2 BPE token maps
-# to a fixed byte string, so a per-token byte-length LUT is exact.
-gpt2_byte_lut = torch.load("data/tokenizers/gpt2_byte_lut.pt", weights_only=True).to(device)
-assert gpt2_byte_lut.numel() == VOCAB_SIZE
+# Bits-per-byte byte accounting, taken from the corpus rather than assumed.
+# The GPT-2 byte-length LUT is exact only because every GPT-2 BPE token maps
+# to a fixed byte string; a corpus built under the ToaST+TST tokenizer breaks
+# that assumption, and looking its ids up in the GPT-2 table would silently
+# produce a plausible, meaningless BPB -- for the vocabulary-matched arm the
+# size assert would even pass. `ByteCounter` decodes instead in that case.
+dataset_manifest = read_dataset_manifest(data_path)
+require_matching_vocab_size(dataset_manifest, VOCAB_SIZE)
+byte_counter = ByteCounter(dataset_manifest, device=device)
+if byte_counter.expected_lut_size() is not None:
+    assert byte_counter.expected_lut_size() == VOCAB_SIZE
 with torch.no_grad():
-    val_byte_count_tensor = (
-        gpt2_byte_lut[val_targets.reshape(-1)]
-        .to(torch.int64)
-        .sum()
+    val_byte_count_tensor = torch.tensor(
+        byte_counter.count(val_targets), dtype=torch.int64, device=device
     )
     dist.all_reduce(val_byte_count_tensor, op=dist.ReduceOp.SUM)
     val_byte_count = float(val_byte_count_tensor)
@@ -1229,10 +1444,10 @@ for domain in ("web", "code", "math", "knowledge"):
             )
         )
         with torch.no_grad():
-            domain_bytes_tensor = (
-                gpt2_byte_lut[domain_targets.reshape(-1)]
-                .to(torch.int64)
-                .sum()
+            domain_bytes_tensor = torch.tensor(
+                byte_counter.count(domain_targets),
+                dtype=torch.int64,
+                device=device,
             )
             dist.all_reduce(domain_bytes_tensor, op=dist.ReduceOp.SUM)
             domain_bytes = float(domain_bytes_tensor)
@@ -1242,8 +1457,15 @@ for domain in ("web", "code", "math", "knowledge"):
             domain_bytes,
         )
 
-model = GPT(vocab_size=VOCAB_SIZE, num_layers=NUM_LAYERS, model_dim=512).cuda()
-if DELTA_BLOCKWISE_COMPILE:
+model = GPT(
+    vocab_size=VOCAB_SIZE,
+    num_layers=NUM_LAYERS,
+    model_dim=512,
+    eot_id=tokenizer_identity(dataset_manifest)[2],
+).cuda()
+if MOE_QB_INTERVAL:
+    enable_quantile_balance_collection(model, num_bins=MOE_QB_BINS)
+if DELTA_BLOCKWISE_COMPILE or NEXTLAT:
     # Compile every residual block independently so an opaque FLA recurrence
     # cannot make Dynamo abandon the entire fixed-depth model. Compile the
     # vocabulary projection and cross-entropy separately; they dominate the
@@ -1255,11 +1477,21 @@ if DELTA_BLOCKWISE_COMPILE:
         dynamic=False,
         mode=DELTA_COMPILE_MODE,
     )
+    if model.nextlat_dynamics is not None:
+        # The terminal orchestration deliberately stays outside Dynamo
+        # because it computes and stores compact first-order gradients in
+        # its forward.
+        # Dynamics remains a conventional, fully compiled module.
+        model.nextlat_dynamics.compile(
+            dynamic=False,
+            mode=DELTA_COMPILE_MODE,
+        )
 else:
     model.compile(dynamic=False, mode=DELTA_COMPILE_MODE)
 print0(f"parameters: {sum(p.numel() for p in model.parameters()):,}", console=True)
 print0(f"val window: {val_tokens:,} tokens = {val_byte_count:,.0f} bytes "
        f"({val_byte_count/val_tokens:.3f} bytes/token)", console=True)
+
 
 @torch.no_grad()
 def reset_model_grads(model: nn.Module) -> None:
@@ -1684,6 +1916,12 @@ for trial in range(num_trials):
         and id(p) not in per_head_param_ids
     ]
     matrix_params.extend(model.mtp_heads.parameters())
+    if model.nextlat_dynamics is not None:
+        matrix_params.extend(
+            parameter
+            for parameter in model.nextlat_dynamics.parameters()
+            if parameter.ndim >= 2
+        )
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_momentum_warmup_start = float(
         os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
@@ -1790,6 +2028,77 @@ for trial in range(num_trials):
             raise ValueError(
                 f"{resume_checkpoint} does not contain optimizer_states"
             )
+        # SEQ_LEN and MBS are deliberately allowed to vary across a resume, for
+        # the context curriculum, which makes the global batch the load-bearing
+        # invariant: the data stream restarts at `start_step * batch_size`, so
+        # resuming under a different one silently re-consumes or skips tokens
+        # and rescales the whole LR schedule.
+        saved_batch_tokens = resume_payload.get("training_config", {}).get(
+            "global_batch_tokens"
+        )
+        if saved_batch_tokens is not None and saved_batch_tokens != batch_size:
+            raise ValueError(
+                "resume global batch differs from the current run: "
+                f"saved={saved_batch_tokens}, current={batch_size}. The data "
+                "stream is indexed by step * global_batch_tokens, so this "
+                "would not continue the same training run."
+            )
+        expected_moe_config = {
+            "moe_num_experts": MOE_NUM_EXPERTS,
+            "moe_top_k": MOE_TOP_K,
+            "moe_latent_dim": MOE_LATENT_DIM,
+            "moe_expert_hidden": MOE_EXPERT_HIDDEN,
+            "moe_shared_hidden": MOE_SHARED_HIDDEN,
+            "moe_num_shared_experts": MOE_NUM_SHARED_EXPERTS,
+            "moe_layer_indices": sorted(MOE_LAYER_INDICES),
+        }
+        saved_model_config = resume_payload.get("model_config", {})
+        saved_moe_config = {
+            key: saved_model_config.get(key, 0 if key == "moe_num_experts" else value)
+            for key, value in expected_moe_config.items()
+        }
+        if saved_moe_config != expected_moe_config:
+            raise ValueError(
+                "resume LatentMoE config differs from the current recipe: "
+                f"saved={saved_moe_config}, current={expected_moe_config}"
+            )
+        expected_qb_config = {
+            "moe_qb_interval": MOE_QB_INTERVAL,
+            "moe_qb_bins": MOE_QB_BINS,
+        }
+        saved_training_config = resume_payload.get("training_config", {})
+        saved_qb_config = {
+            key: saved_training_config.get(key, value)
+            for key, value in expected_qb_config.items()
+        }
+        if MOE_NUM_EXPERTS and saved_qb_config != expected_qb_config:
+            raise ValueError(
+                "resume Quantile Balancing config differs from the current recipe: "
+                f"saved={saved_qb_config}, current={expected_qb_config}"
+            )
+        saved_nextlat_enabled = bool(saved_training_config.get("nextlat", False))
+        if saved_nextlat_enabled != NEXTLAT:
+            raise ValueError(
+                "resume NextLat enabled state differs from the current recipe: "
+                f"saved={saved_nextlat_enabled}, current={NEXTLAT}"
+            )
+        if NEXTLAT:
+            expected_nextlat_config = {
+                "nextlat_proj_factor": NEXTLAT_PROJ_FACTOR,
+                "nextlat_hidden_weight": NEXTLAT_HIDDEN_WEIGHT,
+                "nextlat_kl_weight": NEXTLAT_KL_WEIGHT,
+                "nextlat_token_chunk_size": NEXTLAT_TOKEN_CHUNK_SIZE,
+            }
+            saved_nextlat_config = {
+                key: saved_training_config.get(key)
+                for key in expected_nextlat_config
+            }
+            if saved_nextlat_config != expected_nextlat_config:
+                raise ValueError(
+                    "resume NextLat config differs from the current recipe: "
+                    f"saved={saved_nextlat_config}, "
+                    f"current={expected_nextlat_config}"
+                )
         model.load_state_dict(resume_payload["model"], strict=True)
         optimizer_states = resume_payload["optimizer_states"]
         if len(optimizer_states) != len(optimizers):
@@ -1925,14 +2234,29 @@ for trial in range(num_trials):
 
         # --------------- TRAINING SECTION -----------------
         inputs, targets = next(train_loader)
+        if MOE_QB_INTERVAL:
+            reset_quantile_balance_accumulators(model)
         # accumulate across microbatches in case we are running with fewer than 8 gpus
         assert len(inputs) % mbs == 0
         train_loss_sum = torch.zeros((), device=device)
+        nextlat_metric_sums = torch.zeros(3, device=device)
+        moe_qb_load_cv = torch.full((), float("nan"), device=device)
+        moe_qb_max_load = torch.full((), float("nan"), device=device)
         for i in range(len(inputs) // mbs):
             mark_model_step_begin()
-            loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+            microbatch_inputs = inputs[i*mbs:(i+1)*mbs]
+            microbatch_targets = targets[i*mbs:(i+1)*mbs]
+            loss = model(microbatch_inputs, microbatch_targets)
             train_loss_sum += loss.detach()
+            if model.last_nextlat_metrics is not None:
+                nextlat_metric_sums += (
+                    model.last_nextlat_metrics * microbatch_targets.numel()
+                )
             loss.backward()
+        if MOE_QB_INTERVAL and (step + 1) % MOE_QB_INTERVAL == 0:
+            moe_qb_load_cv, moe_qb_max_load = apply_accumulated_quantile_balance(
+                model
+            )
         for name, p in model.named_parameters():
             assert p.grad is not None, name
             if world_size > 1:
@@ -1945,7 +2269,26 @@ for trial in range(num_trials):
         approx_training_time = training_time + (time.perf_counter() - t0)
         if (step + 1) % train_log_every == 0:
             train_loss = float(train_loss_sum) / targets.numel()
+            nextlat_log = ""
+            if NEXTLAT:
+                nextlat_hidden, nextlat_kl, nextlat_total = (
+                    nextlat_metric_sums / targets.numel()
+                ).tolist()
+                train_ce = train_loss - nextlat_total
+                nextlat_log = (
+                    f" train_ce:{train_ce:.4f}"
+                    f" nextlat_hidden:{nextlat_hidden:.4f}"
+                    f" nextlat_kl:{nextlat_kl:.4f}"
+                    f" nextlat_total:{nextlat_total:.4f}"
+                )
             print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f}"
+                   + nextlat_log
+                   + (
+                       f" moe_load_cv2:{float(moe_qb_load_cv):.4f}"
+                       f" moe_max_load:{float(moe_qb_max_load):.4f}"
+                       if MOE_NUM_EXPERTS
+                       else ""
+                   )
                    + f" train_time:{1000*approx_training_time:.0f}ms"
                    + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
 
@@ -1958,10 +2301,18 @@ for trial in range(num_trials):
         export_model_state = {
             name: tensor
             for name, tensor in full_model_state.items()
-            if not name.startswith("mtp_heads.")
+            if not name.startswith(("mtp_heads.", "nextlat_dynamics."))
         }
         model_payload = {
             "model": export_model_state,
+            # Training-only for ordinary decoding, but retained out-of-band
+            # so a winning model can use its learned dynamics for self-
+            # speculative decoding without inflating the loadable base state.
+            "nextlat_dynamics": (
+                model.nextlat_dynamics.state_dict()
+                if model.nextlat_dynamics is not None
+                else None
+            ),
             "model_config": dict(
                 vocab_size=VOCAB_SIZE,
                 num_layers=NUM_LAYERS,
@@ -1973,6 +2324,7 @@ for trial in range(num_trials):
                 delta_layer_indices=sorted(DELTA_LAYER_INDICES),
                 delta_mlp_on_delta=DELTA_MLP_ON_DELTA,
                 dense_attention_type=DENSE_ATTENTION_TYPE,
+                dense_position_encoding="none" if NOPE else "rope",
                 mla_q_rank=MLA_Q_RANK,
                 mla_kv_rank=MLA_KV_RANK,
                 mla_qk_nope_dim=MLA_QK_NOPE_DIM,
@@ -1983,6 +2335,17 @@ for trial in range(num_trials):
                     if DELTA_ATTENTION_TYPE == "gdn2_kda_erase"
                     else None
                 ),
+                moe_num_experts=MOE_NUM_EXPERTS,
+                moe_top_k=MOE_TOP_K,
+                moe_latent_dim=MOE_LATENT_DIM,
+                moe_expert_hidden=MOE_EXPERT_HIDDEN,
+                moe_shared_hidden=MOE_SHARED_HIDDEN,
+                moe_num_shared_experts=MOE_NUM_SHARED_EXPERTS,
+                moe_layer_indices=sorted(MOE_LAYER_INDICES),
+                tokenizer_provenance=dataset_manifest.get(
+                    "tokenizer_provenance"
+                ),
+                pretraining_data_path=data_path,
             ),
             "architecture": (
                 f"nanogpt_mini_gpt2vocab_{DELTA_ATTENTION_TYPE}_"
@@ -1990,11 +2353,13 @@ for trial in range(num_trials):
                     "k" if layer_idx in DELTA_LAYER_INDICES else "d"
                     for layer_idx in range(NUM_LAYERS)
                 )
+                + ("_nope" if NOPE else "")
                 + (
                     "_fullblocks_v3"
                     if DELTA_MLP_ON_DELTA
                     else "_mixers_v3"
                 )
+                + ("_stable_latentmoe_v1" if MOE_NUM_EXPERTS else "")
             ),
             "training_config": {
                 "delta_disable_recompute": DELTA_DISABLE_RECOMPUTE,
@@ -2004,9 +2369,19 @@ for trial in range(num_trials):
                 "delta_compile_mode": DELTA_COMPILE_MODE,
                 "delta_use_cudagraphs": DELTA_USE_CUDAGRAPHS,
                 "delta_mlp_on_delta": DELTA_MLP_ON_DELTA,
+                "moe_num_experts": MOE_NUM_EXPERTS,
+                "moe_top_k": MOE_TOP_K,
+                "moe_latent_dim": MOE_LATENT_DIM,
+                "moe_expert_hidden": MOE_EXPERT_HIDDEN,
+                "moe_shared_hidden": MOE_SHARED_HIDDEN,
+                "moe_num_shared_experts": MOE_NUM_SHARED_EXPERTS,
+                "moe_layer_indices": sorted(MOE_LAYER_INDICES),
+                "moe_qb_interval": MOE_QB_INTERVAL,
+                "moe_qb_bins": MOE_QB_BINS,
                 "kda_num_heads": KDA_NUM_HEADS,
                 "kda_full_rank_gate": KDA_FULL_RANK_GATE,
                 "dense_attention_type": DENSE_ATTENTION_TYPE,
+                "dense_position_encoding": "none" if NOPE else "rope",
                 "mla_q_rank": MLA_Q_RANK,
                 "mla_kv_rank": MLA_KV_RANK,
                 "mla_qk_nope_dim": MLA_QK_NOPE_DIM,
@@ -2015,6 +2390,11 @@ for trial in range(num_trials):
                 "per_head_muon": PER_HEAD_MUON,
                 "mtp_num_heads": MTP_NUM_HEADS,
                 "mtp_loss_weight": MTP_LOSS_WEIGHT,
+                "nextlat": NEXTLAT,
+                "nextlat_proj_factor": NEXTLAT_PROJ_FACTOR,
+                "nextlat_hidden_weight": NEXTLAT_HIDDEN_WEIGHT,
+                "nextlat_kl_weight": NEXTLAT_KL_WEIGHT,
+                "nextlat_token_chunk_size": NEXTLAT_TOKEN_CHUNK_SIZE,
                 "lr_schedule": lr_schedule,
                 "warmup_fraction": warmup_fraction,
                 "embed_lr": embed_lr,
@@ -2031,8 +2411,9 @@ for trial in range(num_trials):
                 "microbatch_sequences": mbs,
                 "local_microbatches_per_step": local_microbatches_per_step,
             },
-            # RoPE positions seen in pretraining bound the usable RL context
-            # (half-truncate rotary has no extrapolation).
+            # This remains the measured training context. For RoPE models it
+            # also bounds safe positional extrapolation; NoPE removes that
+            # particular limit but not the need to validate longer contexts.
             "train_seq_len": seq_len,
             "completed_steps": stop_after_step,
             "planned_train_steps": train_steps,

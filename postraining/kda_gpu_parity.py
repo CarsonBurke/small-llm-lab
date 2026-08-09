@@ -15,6 +15,8 @@ Asserts, on CUDA, the agreements the CPU suite cannot check:
    the inductor-compiled ``paged_step_core`` == its eager self — the gate
    ``--rollout-scheduler continuous_refill`` and ``--rollout-graph-decode``
    stand on for KDA trunks.
+5. The same BF16 teacher/decode and compiled paged-decode gates with the
+   production 32-expert Stable LatentMoE active in every layer.
 
 Writes ``postraining/runs/kda_gpu_parity/result.json`` and exits nonzero on
 any failed bound, so an mlq failure IS a parity failure.
@@ -301,6 +303,103 @@ def main() -> None:
         for compiled_step, eager_step in zip(compiled_paged, eager_paged)
     )
     check("fp32_compiled_paged_vs_eager", compiled_err, 2e-3)
+
+    # ---- 5. Stable LatentMoE in production BF16/fullgraph decode ----------
+    moe_kwargs = {
+        **MODEL_KWARGS,
+        "moe_num_experts": 32,
+        "moe_top_k": 2,
+        "moe_latent_dim": 128,
+        "moe_expert_hidden": 256,
+        "moe_shared_hidden": 64,
+        "moe_num_shared_experts": 2,
+        "moe_layer_indices": list(range(8)),
+    }
+    torch.manual_seed(3)
+    moe_backbone = NanoKDABackbone(**moe_kwargs).to(device).eval()
+    with torch.no_grad():
+        for block in moe_backbone.blocks:
+            if block.use_kda:
+                block.attn.o_proj.weight.normal_(std=0.02)
+            else:
+                block.attn.proj.weight.normal_(std=0.02)
+            block.mlp.shared_expert.down_proj.weight.normal_(std=0.02)
+            block.mlp.latent_up_proj.weight.normal_(std=0.02)
+        moe_backbone.proj.weight.normal_(std=0.02)
+    moe_wrapper = LatentThoughtModel(moe_backbone)
+    moe_ids = ids[:8, :96]
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        moe_reference = moe_wrapper.policy_logits(moe_ids).float()
+        moe_caches = moe_wrapper.make_generation_cache(
+            8, 96, device, dtype=torch.bfloat16
+        )
+        moe_output = moe_wrapper.prefill(moe_ids[:, :64], moe_caches)
+        moe_decode_err = max_err(moe_output.logits, moe_reference[:, 63])
+        for position in range(64, 96):
+            moe_output = moe_wrapper.token_step(
+                moe_ids[:, position], moe_caches, position
+            )
+            moe_decode_err = max(
+                moe_decode_err,
+                max_err(moe_output.logits, moe_reference[:, position]),
+            )
+    check("moe_bf16_decode_vs_dense", moe_decode_err, 5e-1)
+
+    def run_moe_paged() -> list[torch.Tensor]:
+        paged = moe_wrapper.make_paged_generation_cache(
+            8, prompt_width + steps, device, dtype=torch.bfloat16
+        )
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            bank = moe_wrapper.build_prompt_prefix_bank(pad_prompts, lengths)
+            moe_wrapper.admit_prompt_prefixes(
+                bank, selected_groups, slots, paged
+            )
+            live = torch.tensor([True] * 4 + [False] * 4, device=device)
+            slot_ids = torch.cat(
+                (
+                    slots.flatten(),
+                    torch.zeros(4, dtype=torch.long, device=device),
+                )
+            )
+            logits = []
+            for offset in range(steps):
+                positions = torch.where(
+                    live,
+                    torch.tensor(prompt_width + offset, device=device),
+                    torch.tensor(0, device=device),
+                )
+                tokens = torch.cat(
+                    (
+                        step_tokens[offset],
+                        torch.zeros(4, dtype=torch.long, device=device),
+                    )
+                )
+                stepped = moe_wrapper.token_paged_step(
+                    tokens,
+                    paged,
+                    slot_ids=slot_ids,
+                    positions=positions,
+                    live=live,
+                )
+                logits.append(stepped.logits[:4].clone())
+        return logits
+
+    eager_moe_paged = run_moe_paged()
+    original_moe_paged_core = moe_wrapper.paged_step_core
+    moe_wrapper.paged_step_core = torch.compile(
+        original_moe_paged_core, fullgraph=True, dynamic=False
+    )
+    try:
+        compiled_moe_paged = run_moe_paged()
+    finally:
+        moe_wrapper.paged_step_core = original_moe_paged_core
+    moe_compiled_err = max(
+        max_err(compiled_step, eager_step)
+        for compiled_step, eager_step in zip(
+            compiled_moe_paged, eager_moe_paged
+        )
+    )
+    check("moe_bf16_compiled_paged_vs_eager", moe_compiled_err, 2e-2)
 
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULT_PATH.write_text(

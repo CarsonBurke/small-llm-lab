@@ -56,6 +56,22 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
             model_config["num_layers"], model_config["model_dim"]
         )
 
+    def freeze_moe_routing_(self) -> int:
+        """Freeze pretrained route selection while fine-tuning expert values.
+
+        Updating both the router matrix and its changing hidden inputs would
+        make post-training route drift needlessly abrupt. SFT/RL therefore
+        keep the projection fixed while causal Quantile Balancing continues
+        to track input-distribution drift as the experts and trunk adapt.
+        """
+
+        frozen = 0
+        for block in self.blocks:
+            if getattr(block, "use_moe", False):
+                block.mlp.router_weight.requires_grad_(False)
+                frozen += block.mlp.router_weight.numel()
+        return frozen
+
     # ------------------------------------------------------------------ init
     def _apply_pretraining_init(self) -> None:
         """The training script's init recipe for fresh (critic) trunks.
@@ -113,9 +129,24 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
                     zero_linear(attn.proj)
                 block.norm1.gains.fill_(1)
                 if block.use_mlp:
-                    normal_weight(block.mlp.fc.weight)
-                    block.mlp.fc.bias.zero_()
-                    zero_linear(block.mlp.proj)
+                    if block.use_moe:
+                        moe = block.mlp
+                        for weight in (
+                            moe.router_weight,
+                            moe.latent_down_proj.weight,
+                            moe.expert_gate_up_weight,
+                            moe.expert_down_weight,
+                            moe.shared_expert.gate_up_proj.weight,
+                        ):
+                            normal_weight(weight)
+                        zero_linear(moe.shared_expert.down_proj)
+                        zero_linear(moe.latent_up_proj)
+                        moe.routed_norm.weight.fill_(1)
+                        moe.correction_bias.zero_()
+                    else:
+                        normal_weight(block.mlp.fc.weight)
+                        block.mlp.fc.bias.zero_()
+                        zero_linear(block.mlp.proj)
                     block.norm2.gains.fill_(1)
             zero_linear(self.proj)
             self.norm1.gains.fill_(1)

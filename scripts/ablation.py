@@ -164,10 +164,30 @@ class MetricsWriter:
         }
         if key == "stage_id":
             return "stage/id"
+        if key.startswith("val_"):
+            return f"val/{key.removeprefix('val_')}"
         if key == "step_avg_ms":
             return "perf/step_avg_ms"
+        if key in {
+            "train_wall_time_ms",
+            "train_device_time_ms",
+            "eval_seconds",
+            "peak_vram_allocated_mib",
+            "peak_vram_reserved_mib",
+        }:
+            return f"perf/{key}"
+        if key.startswith("stage_") and key.endswith("_per_second"):
+            return f"perf/{key}"
+        if key == "train_ce":
+            return "train/ce"
         if key.startswith("lejepa_"):
             return f"lejepa/{key.removeprefix('lejepa_')}"
+        if key.startswith("nextlat_"):
+            return f"nextlat/{key.removeprefix('nextlat_')}"
+        if key.startswith("bolmo_"):
+            return f"bolmo/{key.removeprefix('bolmo_')}"
+        if key == "predicted_bytes_per_patch":
+            return "bolmo/predicted_bytes_per_patch"
         if key in lejepa_keys:
             return f"lejepa/{key}"
         if key.startswith("probe_"):
@@ -344,11 +364,14 @@ def run_config(
             bufsize=1,
         )
         assert proc.stdout is not None
-        for line in proc.stdout:
-            output_lines.append(line)
-            entry = parse_log_line(line)
-            if entry:
-                metrics_writer.write_entry(entry)
+        with log_file.open("w") as raw_log:
+            for line in proc.stdout:
+                output_lines.append(line)
+                raw_log.write(line)
+                raw_log.flush()
+                entry = parse_log_line(line)
+                if entry:
+                    metrics_writer.write_entry(entry)
         proc.wait()
     except BaseException:
         if proc is not None and proc.poll() is None:
@@ -367,8 +390,18 @@ def run_config(
     output_text = "".join(output_lines)
 
     val_entries = [e for e in entries if e["type"] == "val"]
-    final_bpb = val_entries[-1]["val_bpb"] if val_entries else None
-    final_loss = val_entries[-1]["val_loss"] if val_entries else None
+    final_bpb = (
+        val_entries[-1].get("val_canonical_bpb", val_entries[-1]["val_bpb"])
+        if val_entries
+        else None
+    )
+    final_loss = (
+        val_entries[-1].get("val_canonical_loss", val_entries[-1]["val_loss"])
+        if val_entries
+        else None
+    )
+    final_proxy_bpb = val_entries[-1]["val_bpb"] if val_entries else None
+    final_proxy_loss = val_entries[-1]["val_loss"] if val_entries else None
     final_probe_bpb = val_entries[-1].get("probe_val_bpb") if val_entries else None
     final_probe_loss = val_entries[-1].get("probe_val_loss") if val_entries else None
 
@@ -384,6 +417,8 @@ def run_config(
         "elapsed_seconds": elapsed,
         "final_val_bpb": final_bpb,
         "final_val_loss": final_loss,
+        "final_proxy_val_bpb": final_proxy_bpb,
+        "final_proxy_val_loss": final_proxy_loss,
         "final_probe_val_bpb": final_probe_bpb,
         "final_probe_val_loss": final_probe_loss,
         "val_entries": val_entries,
@@ -426,6 +461,8 @@ def compare_results(results_dir: Path) -> None:
     seen = set()
     unique = []
     for r in results:
+        if not isinstance(r, dict) or "name" not in r:
+            continue
         if r["name"] not in seen:
             seen.add(r["name"])
             unique.append(r)
@@ -469,7 +506,7 @@ def build_sweep(sweep_type: str, steps: int, val_every: int) -> list[tuple[str, 
         raise ValueError(f"Unknown sweep type: {sweep_type}. Use: lr, dim, layers")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Parameter Golf ablation runner")
     parser.add_argument("--steps", type=int, default=2000, help="Training steps (default: 2000)")
     parser.add_argument("--val-every", type=int, default=None, help="Validate every N steps (default: 20)")
@@ -487,7 +524,7 @@ def main():
 
     if args.compare:
         compare_results(RESULTS_DIR)
-        return
+        return 0
 
     val_every = args.val_every or 20
     extra_env = {}
@@ -497,15 +534,19 @@ def main():
 
     if args.sweep:
         runs = build_sweep(args.sweep, args.steps, val_every)
+        returncode = 0
         for name, overrides in runs:
             merged = {**extra_env, **overrides}
-            run_config(name, merged, args.steps, val_every, args.script)
+            result = run_config(name, merged, args.steps, val_every, args.script)
+            returncode = returncode or int(result["returncode"])
         print("\n\nSWEEP SUMMARY:")
         compare_results(RESULTS_DIR)
+        return returncode
     else:
         name = args.name or f"baseline_s{args.steps}"
-        run_config(name, extra_env, args.steps, val_every, args.script)
+        result = run_config(name, extra_env, args.steps, val_every, args.script)
+        return int(result["returncode"])
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

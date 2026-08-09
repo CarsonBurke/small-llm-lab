@@ -405,6 +405,74 @@ def test_load_posttraining_tokenizer_selects_gpt2_for_gpt2vocab_archs():
     assert tokenizer.decode(ids + [50256]) == text
 
 
+def test_explicit_gpt2_provenance_keeps_gpt2_dispatch():
+    pytest.importorskip("transformers")
+    tokenizer = load_posttraining_tokenizer(
+        "nanogpt_mini_gpt2vocab_v1",
+        FreshHyperparameters.tokenizer_path,
+        tokenizer_provenance={
+            "kind": "gpt2",
+            "name": "gpt2",
+            "vocab_size": 50_257,
+            "eot_id": 50_256,
+            "directory": None,
+            "spec_sha256": None,
+            "ngrams_sha256": None,
+        },
+    )
+    assert isinstance(tokenizer, GPT2BPETokenizer)
+
+
+def test_checkpoint_provenance_overrides_misleading_gpt2_architecture(
+    monkeypatch,
+):
+    decoded_runs = []
+
+    class Spec:
+        specials = (
+            "<|endoftext|>",
+            "<think>",
+            "</think>",
+            "<answer>",
+            "</answer>",
+        )
+
+    class Tokenizer:
+        spec = Spec()
+        eot_id = 0
+
+        def encode(self, text):
+            assert text == "<think>x</think>"
+            return [1, 5, 2]
+
+        def decode(self, ids):
+            ids = [int(token) for token in ids]
+            decoded_runs.append(ids)
+            return "".join({5: "x", 6: "y"}.get(token, "") for token in ids)
+
+    monkeypatch.setattr(
+        "pretraining.byte_accounting.load_bound_tokenizer",
+        lambda provenance: Tokenizer(),
+    )
+    tokenizer = load_posttraining_tokenizer(
+        "nanogpt_mini_gpt2vocab_kda_kdkd_mixers_v3",
+        FreshHyperparameters.tokenizer_path,
+        think_tokens=True,
+        answer_tokens=True,
+        tokenizer_provenance={"kind": "toast_tst"},
+    )
+    assert tokenizer.encode("<think>x</think>") == [1, 5, 2]
+    assert tokenizer.decode([0, 1, 5, 2, 3, 6, 4]) == "xy"
+    assert decoded_runs == [[5], [6]]
+    assert (tokenizer.bos_id(), tokenizer.eos_id()) == (0, 0)
+    assert (
+        tokenizer.think_open_id,
+        tokenizer.think_close_id,
+        tokenizer.answer_open_id,
+        tokenizer.answer_close_id,
+    ) == (1, 2, 3, 4)
+
+
 def test_answer_prefix_derivation_is_boundary_stable_under_gpt2():
     pytest.importorskip("transformers")
     tokenizer = GPT2BPETokenizer()

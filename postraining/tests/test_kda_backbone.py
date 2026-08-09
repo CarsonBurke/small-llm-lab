@@ -24,7 +24,7 @@ from postraining.latent_rollout import (
     rollout_continuations,
     trim_stream,
 )
-from postraining.model_io import load_model
+from postraining.model_io import fresh_trunk, load_model
 
 MODEL_KWARGS = dict(
     vocab_size=32,
@@ -40,6 +40,18 @@ MODEL_KWARGS = dict(
 )
 
 ARCHITECTURE = "nanogpt_mini_gpt2vocab_kda_kdkd_mixers_v3"
+
+MOE_MODEL_KWARGS = {
+    **MODEL_KWARGS,
+    "moe_num_experts": 4,
+    "moe_top_k": 2,
+    "moe_latent_dim": 32,
+    "moe_expert_hidden": 64,
+    "moe_shared_hidden": 16,
+    "moe_num_shared_experts": 2,
+    "moe_layer_indices": [0, 1, 2, 3],
+}
+MOE_ARCHITECTURE = ARCHITECTURE + "_stable_latentmoe_v1"
 
 
 def _seeded_backbone(seed: int = 3) -> NanoKDABackbone:
@@ -67,6 +79,23 @@ def _wrapper(seed: int = 3) -> LatentThoughtModel:
     return LatentThoughtModel(_seeded_backbone(seed))
 
 
+def _seeded_moe_backbone(seed: int = 7) -> NanoKDABackbone:
+    torch.manual_seed(seed)
+    backbone = NanoKDABackbone(**MOE_MODEL_KWARGS).float().eval()
+    with torch.no_grad():
+        for block in backbone.blocks:
+            if block.use_kda:
+                block.attn.o_proj.weight.normal_(std=0.02)
+            else:
+                block.attn.proj.weight.normal_(std=0.02)
+                block.attn.proj.bias.zero_()
+            block.mlp.shared_expert.down_proj.weight.normal_(std=0.02)
+            block.mlp.latent_up_proj.weight.normal_(std=0.02)
+        backbone.proj.weight.normal_(std=0.05)
+        backbone.proj.bias.normal_(std=0.05)
+    return backbone
+
+
 def test_kda_checkpoint_payload_strict_loads_through_model_io(tmp_path):
     torch.manual_seed(11)
     reference = _seeded_backbone(11)
@@ -92,6 +121,95 @@ def test_kda_checkpoint_payload_strict_loads_through_model_io(tmp_path):
             loaded.float().policy_logits(input_ids),
             reference.policy_logits(input_ids),
         )
+
+
+def test_latent_moe_checkpoint_strict_loads_and_decodes_identically(tmp_path):
+    reference = _seeded_moe_backbone()
+    payload = {
+        "model": {key: value.clone() for key, value in reference.state_dict().items()},
+        "model_config": dict(MOE_MODEL_KWARGS),
+        "architecture": MOE_ARCHITECTURE,
+        "train_seq_len": 96,
+    }
+    path = tmp_path / "kda_latent_moe.pt"
+    torch.save(payload, path)
+    loaded = load_model(path, torch.device("cpu")).float()
+
+    assert all(block.use_moe for block in loaded.blocks)
+    assert all(block.use_mlp for block in loaded.blocks)
+    for block in loaded.blocks:
+        assert block.mlp.router_weight.dtype == torch.float32
+        assert block.mlp.correction_bias.shape == (4,)
+
+    wrapper = LatentThoughtModel(loaded)
+    input_ids = torch.randint(0, 32, (2, 11))
+    with torch.no_grad():
+        expected = reference.policy_logits(input_ids)
+        torch.testing.assert_close(loaded.policy_logits(input_ids), expected)
+        caches = wrapper.make_generation_cache(2, 11, torch.device("cpu"))
+        output = wrapper.prefill(input_ids[:, :6], caches)
+        torch.testing.assert_close(output.logits.float(), expected[:, 5].float())
+        for position in range(6, 11):
+            output = wrapper.token_step(input_ids[:, position], caches, position)
+            torch.testing.assert_close(
+                output.logits.float(),
+                expected[:, position].float(),
+                rtol=2e-4,
+                atol=2e-5,
+            )
+
+
+def test_posttraining_freezes_moe_router_and_uses_dense_fresh_critic() -> None:
+    from postraining.train_latent_vapo import build_optimizers
+    from postraining.value_model import SeparateCritic
+
+    actor = _seeded_moe_backbone()
+    actor.model_config = dict(MOE_MODEL_KWARGS)
+    actor.architecture = MOE_ARCHITECTURE
+    for parameter in actor.parameters():
+        parameter.requires_grad_(True)
+    frozen = actor.freeze_moe_routing_()
+    router_parameters = [
+        block.mlp.router_weight for block in actor.blocks if block.use_moe
+    ]
+    assert frozen == sum(parameter.numel() for parameter in router_parameters)
+    assert all(not parameter.requires_grad for parameter in router_parameters)
+    assert all(
+        block.mlp.expert_gate_up_weight.requires_grad
+        for block in actor.blocks
+        if block.use_moe
+    )
+
+    critic = fresh_trunk(
+        actor,
+        torch.device("cpu"),
+        model_config_overrides={"moe_num_experts": 0, "moe_layer_indices": []},
+        architecture_override=ARCHITECTURE + "_dense_critic",
+    )
+    assert critic.model_config["moe_num_experts"] == 0
+    assert critic.architecture.endswith("_dense_critic")
+    assert not any(block.use_moe for block in critic.blocks)
+    assert [block.use_mlp for block in critic.blocks] == [False, True, False, True]
+
+    wrapper = LatentThoughtModel(actor)
+    value_model = SeparateCritic(critic, num_bins=8)
+    optimizers = build_optimizers(
+        wrapper,
+        value_model,
+        learning_rate=2e-5,
+        critic_learning_rate=2e-5,
+        trunk_optimizer="muon",
+        muon_learning_rate=5e-6,
+        critic_muon_learning_rate=5e-6,
+        fused=False,
+    )
+    owned_ids = {
+        id(parameter)
+        for optimizer in optimizers.values()
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert owned_ids.isdisjoint(map(id, router_parameters))
 
 
 def test_model_io_refuses_gdn2_and_configless_kda(tmp_path):
@@ -159,6 +277,41 @@ def test_stepwise_decode_matches_teacher_forced_logits():
             output = wrapper.token_step(
                 input_ids[:, position], caches, position
             )
+            torch.testing.assert_close(
+                output.logits.float(),
+                reference[:, position],
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+
+def test_nope_stepwise_decode_matches_teacher_forced_logits():
+    """NoPE checkpoints preserve dense/stepwise parity without rotating Q/K."""
+    torch.manual_seed(5)
+    backbone = NanoKDABackbone(
+        **MODEL_KWARGS,
+        dense_position_encoding="none",
+    ).float().eval()
+    with torch.no_grad():
+        for block in backbone.blocks:
+            if block.use_kda:
+                block.attn.o_proj.weight.normal_(std=0.02)
+            else:
+                block.attn.proj.weight.normal_(std=0.02)
+                block.attn.proj.bias.zero_()
+            if block.use_mlp:
+                block.mlp.proj.weight.normal_(std=0.02)
+        backbone.proj.weight.normal_(std=0.05)
+        backbone.proj.bias.normal_(std=0.05)
+
+        wrapper = LatentThoughtModel(backbone)
+        input_ids = torch.randint(0, 32, (2, 11))
+        reference = wrapper.policy_logits(input_ids).float()
+        caches = wrapper.make_generation_cache(2, 11, torch.device("cpu"))
+        output = wrapper.prefill(input_ids[:, :6], caches)
+        torch.testing.assert_close(output.logits.float(), reference[:, 5])
+        for position in range(6, 11):
+            output = wrapper.token_step(input_ids[:, position], caches, position)
             torch.testing.assert_close(
                 output.logits.float(),
                 reference[:, position],

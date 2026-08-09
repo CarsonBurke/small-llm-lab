@@ -110,6 +110,38 @@ def test_polar_express_covers_both_orientations():
     assert singular_values.min() > 0.8
 
 
+def test_polar_express_treats_every_leading_axis_as_a_matrix_batch():
+    """Stacked MoE expert weights add an axis beyond Muon's layer batch."""
+    generator = torch.Generator().manual_seed(41)
+    gradients = torch.randn(3, 4, 16, 8, generator=generator)
+    momenta = torch.randn(3, 4, 16, 8, generator=generator)
+    momentum = torch.tensor(0.37)
+
+    actual_momenta = momenta.clone()
+    actual = _polar_express(gradients.clone(), actual_momenta, momentum)
+    flat_momenta = momenta.flatten(0, 1)
+    expected = _polar_express(
+        gradients.flatten(0, 1).clone(), flat_momenta, momentum
+    ).reshape_as(gradients)
+
+    assert actual.shape == gradients.shape
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_momenta, flat_momenta.reshape_as(momenta))
+
+
+def test_muon_steps_stacked_expert_parameters():
+    torch.manual_seed(43)
+    experts = torch.nn.Parameter(torch.randn(4, 16, 8))
+    experts.grad = torch.randn_like(experts)
+    before = experts.detach().clone()
+
+    optimizer = Muon([experts], lr=1e-2)
+    optimizer.step()
+
+    assert not torch.equal(experts.detach(), before)
+    assert optimizer.state[experts]["momentum"].shape == experts.shape
+
+
 def test_batched_matmuls_are_the_only_bit_exact_entry_point():
     """``mm`` and ``bmm`` disagree, so ``step`` never mixes them.
 

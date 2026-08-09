@@ -331,14 +331,35 @@ def load_model(
     return model
 
 
-def fresh_trunk(reference, device: torch.device):
+def fresh_trunk(
+    reference,
+    device: torch.device,
+    *,
+    model_config_overrides: dict | None = None,
+    architecture_suffix: str = "",
+    architecture_override: str | None = None,
+):
     """A fresh, randomly initialized, fully trainable instance of a loaded
-    model's architecture — same class and config, none of its weights."""
+    model's architecture — same class and config, none of its weights.
+
+    ``model_config_overrides`` supports deliberately simpler auxiliary trunks
+    such as a dense critic behind a LatentMoE policy.  The effective config is
+    retained on the object so manifests and checkpoints describe the critic
+    that was actually constructed. ``architecture_override`` supplies the
+    corresponding self-description when a suffix alone would be misleading.
+    """
     construction = (
         _pope_construction() if "_pope_" in reference.architecture else nullcontext()
     )
+    model_config = dict(reference.model_config)
+    if model_config_overrides:
+        model_config.update(model_config_overrides)
     with construction:
-        model = type(reference)(**reference.model_config).to(device)
-    model.model_config = reference.model_config
-    model.architecture = reference.architecture
+        model = type(reference)(**model_config).to(device)
+    model.model_config = model_config
+    model.architecture = (
+        architecture_override
+        if architecture_override is not None
+        else reference.architecture + architecture_suffix
+    )
     return model

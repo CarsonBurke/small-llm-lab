@@ -46,6 +46,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from pretraining.latent_moe import LatentMoEConfig, StableLatentMoE
+
 KDA_SAFE_GATE_LOWER_BOUND = -5.0
 
 
@@ -96,8 +98,9 @@ class Rotary(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim=128):
+    def __init__(self, dim: int, head_dim=128, use_rope: bool = True):
         super().__init__()
+        self.use_rope = use_rope
         self.num_heads = dim // head_dim
         self.head_dim = head_dim
         hdim = self.num_heads * self.head_dim
@@ -113,7 +116,8 @@ class CausalSelfAttention(nn.Module):
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k)
-        q, k = self.rotary(q), self.rotary(k)
+        if self.use_rope:
+            q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                            v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
@@ -473,6 +477,8 @@ class Block(nn.Module):
         delta_num_heads: int,
         delta_full_rank_gate: bool,
         delta_mlp_on_delta: bool,
+        dense_position_encoding: str,
+        moe_config: LatentMoEConfig | None = None,
     ):
         super().__init__()
         self.use_kda = use_kda
@@ -483,11 +489,19 @@ class Block(nn.Module):
                 full_rank_gate=delta_full_rank_gate,
             )
         else:
-            self.attn = CausalSelfAttention(dim)
+            self.attn = CausalSelfAttention(
+                dim,
+                use_rope=dense_position_encoding == "rope",
+            )
         self.norm1 = RMSNorm(dim)
-        self.use_mlp = not use_kda or delta_mlp_on_delta
+        self.use_moe = moe_config is not None
+        self.use_mlp = self.use_moe or not use_kda or delta_mlp_on_delta
         if self.use_mlp:
-            self.mlp = MLP(dim, mlp_hidden)
+            self.mlp = (
+                StableLatentMoE(moe_config)
+                if moe_config is not None
+                else MLP(dim, mlp_hidden)
+            )
             self.norm2 = RMSNorm(dim)
 
     def forward(self, x: Tensor):
@@ -523,14 +537,28 @@ class KDAGPT(nn.Module):
         delta_full_rank_gate: bool = False,
         delta_mlp_on_delta: bool = False,
         dense_attention_type: str = "mha",
+        dense_position_encoding: str = "rope",
         mla_q_rank: int | None = None,
         mla_kv_rank: int | None = None,
         mla_qk_nope_dim: int | None = None,
         mla_shared_qk_dim: int | None = None,
         mla_v_head_dim: int | None = None,
         delta_residual_rank: int | None = None,
+        moe_num_experts: int = 0,
+        moe_top_k: int = 2,
+        moe_latent_dim: int = 128,
+        moe_expert_hidden: int = 256,
+        moe_shared_hidden: int = 64,
+        moe_num_shared_experts: int = 2,
+        moe_layer_indices: list[int] | None = None,
+        tokenizer_provenance: dict | None = None,
+        pretraining_data_path: str | None = None,
     ):
         super().__init__()
+        # Tokenizer identity is checkpoint metadata rather than an architectural
+        # hyperparameter. Accept it so the self-describing model_config can be
+        # passed through every post-training constructor unchanged.
+        del tokenizer_provenance, pretraining_data_path
         if delta_attention_type != "kda":
             raise NotImplementedError(
                 f"delta_attention_type={delta_attention_type!r}: only 'kda' "
@@ -540,6 +568,11 @@ class KDAGPT(nn.Module):
             raise NotImplementedError(
                 f"dense_attention_type={dense_attention_type!r}: only 'mha' "
                 "has a decode-capable implementation"
+            )
+        if dense_position_encoding not in {"rope", "none"}:
+            raise ValueError(
+                "dense_position_encoding must be 'rope' or 'none', got "
+                f"{dense_position_encoding!r}"
             )
         if delta_residual_rank is not None:
             raise NotImplementedError(
@@ -552,7 +585,36 @@ class KDAGPT(nn.Module):
                 f"delta_layer_indices {sorted(delta_layers)} outside "
                 f"0..{num_layers - 1}"
             )
+        if moe_num_experts < 0:
+            raise ValueError("moe_num_experts must be nonnegative")
+        moe_layers = (
+            set(range(num_layers))
+            if moe_num_experts and moe_layer_indices is None
+            else set(moe_layer_indices or ())
+        )
+        if not moe_layers <= set(range(num_layers)):
+            raise ValueError(
+                f"moe_layer_indices {sorted(moe_layers)} outside "
+                f"0..{num_layers - 1}"
+            )
+        if not moe_num_experts and moe_layers:
+            raise ValueError(
+                "moe_layer_indices requires moe_num_experts to be positive"
+            )
+        moe_config = None
+        if moe_num_experts:
+            moe_config = LatentMoEConfig(
+                model_dim=model_dim,
+                latent_dim=moe_latent_dim,
+                routed_hidden_dim=moe_expert_hidden,
+                num_routed_experts=moe_num_experts,
+                experts_per_token=moe_top_k,
+                shared_hidden_dim=moe_shared_hidden,
+                num_shared_experts=moe_num_shared_experts,
+            )
         self.delta_layer_indices = sorted(delta_layers)
+        self.moe_layer_indices = sorted(moe_layers)
+        self.dense_position_encoding = dense_position_encoding
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.Sequential(*[
             Block(
@@ -562,6 +624,8 @@ class KDAGPT(nn.Module):
                 delta_num_heads=delta_num_heads,
                 delta_full_rank_gate=delta_full_rank_gate,
                 delta_mlp_on_delta=delta_mlp_on_delta,
+                dense_position_encoding=dense_position_encoding,
+                moe_config=moe_config if layer_idx in moe_layers else None,
             )
             for layer_idx in range(num_layers)
         ])
