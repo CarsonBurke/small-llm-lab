@@ -1,0 +1,25 @@
+{
+  "name": "math30_mathglm",
+  "description": "The `math30` profile with the arithmetic budget split between two corpora that teach different things. `mathglm` (6%) supplies compositional depth: 1 to 12 chained operations under operator precedence, and multiplication that is 66.9% four-digit by four-digit. `math_drills` (4%) supplies the algorithm underneath it -- MathGLM resolves each atomic operation in a single jump, so nothing in it shows how a product is formed, while the v3 drills decompose every multiplication into single-digit column facts with carries. The audited v2 corpus had the opposite gap: every drill was one operation, the multiplier was always strictly narrower than the multiplicand so no equal-width product existed anywhere, and multiplication scored 0% at every digit width against 95.8% for column-decomposed four-digit addition. The extra 4% is paid out of `deepmind_math`, which drops from 5% to 2% because generated arithmetic is precisely the role `mathglm` now fills at greater scale and depth, and out of `open_web_math` by one point. `openmath_instruct` is held at 8%: it is the only source carrying word problems with worked solutions, which is the capability the arithmetic corpora feed rather than replace.",
+  "domains": {
+    "web": 0.42,
+    "code": 0.14,
+    "math": 0.3,
+    "knowledge": 0.14
+  },
+  "sources": {
+    "fineweb": 0.05,
+    "fineweb_edu_dedup": 0.37,
+    "sci_code": 0.09,
+    "github_code_clean": 0.05,
+    "open_web_math": 0.04,
+    "finemath_4plus": 0.06,
+    "openmath_instruct": 0.08,
+    "deepmind_math": 0.02,
+    "math_drills": 0.04,
+    "mathglm": 0.06,
+    "wikipedia_en": 0.05,
+    "arxiv_papers": 0.03,
+    "cosmopedia_v2": 0.06
+  }
+}

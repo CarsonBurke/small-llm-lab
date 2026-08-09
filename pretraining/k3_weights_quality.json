@@ -17,6 +17,7 @@
     "openmath_instruct": 0.027,
     "deepmind_math": 0.02,
     "math_drills": 0.0,
+    "mathglm": 0.0,
     "wikipedia_en": 0.05,
     "arxiv_papers": 0.04,
     "cosmopedia_v2": 0.06

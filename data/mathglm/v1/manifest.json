@@ -1,0 +1,29 @@
+{
+  "characters": 1597187547,
+  "corpus_sha256": "fd328cf045bce41237d912565e67f333b529c7566818d8c7201ed1e870af7211",
+  "counts": {
+    "document_rejected:low_alpha_fraction": 23199,
+    "documents": 2837132,
+    "rows_read": 5000000,
+    "rows_unparsed": 2,
+    "rows_used": 4999998
+  },
+  "documents": 2837132,
+  "header": "Evaluate each expression one operation at a time, following operator precedence.",
+  "mean_document_characters": 562.9584901231243,
+  "min_document_characters": 300,
+  "problem_registry": {
+    "directory": "/home/marvin/Documents/repositories/parameter-golf/data/problem_registry/v1",
+    "excluded_problem_keys": 344309,
+    "registry_sha256": "01cb4ce0296026934f0c28b958e2decabc0b867dc745f4444027cf7ea9abcbc7"
+  },
+  "schema": "mathglm_expression_chains/v1",
+  "upstream": {
+    "dataset": "jonathanasdf/MathGLM-dataset-5M",
+    "derivation": "every 10th row of the THUDM/MathGLM 50M arithmetic pre-training set",
+    "license": "AFL-3.0",
+    "paper": "arXiv:2309.03241",
+    "source_file": "dataset5m.txt",
+    "source_sha256": "19f41203c471f89b2126afe184083db89f27734749bef6613344d5719b5faa7b"
+  }
+}

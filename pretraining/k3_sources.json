@@ -273,10 +273,20 @@
       "domain": "math",
       "weight": 0.0,
       "kind": "parquet_text",
-      "path": "data/math_drills/v1/drills.parquet",
+      "path": "data/math_drills/v4/drills.parquet",
       "text_column": "document",
       "license": "generated in this repository; no upstream rights",
-      "quality": "deterministic worked-step arithmetic from postraining/math_drills.py; every answer is exact by construction and every problem is checked against the global problem registry before it is emitted"
+      "quality": "deterministic worked-step arithmetic from postraining/math_drills.py (schema v3); every answer is exact by construction and every problem is checked against the global problem registry before it is emitted. v3 decomposes multiplication into single-digit column facts with explicit carries -- v2 stated each product in one jump and scored 0% at every digit width -- and lets the multiplier reach the width of the multiplicand, which v2 never did. Each working method draws its instruction line from a phrasing pool keyed on the operands, so the corpus no longer opens a quarter of a million drills with one identical sentence. The v4 directory holds byte-identical drills to v3; it exists because its held-out probe panel now names the corpus it was cut against, so a stale panel fails rather than scoring trained items as generalisation."
+    },
+    {
+      "name": "mathglm",
+      "domain": "math",
+      "weight": 0.0,
+      "kind": "parquet_text",
+      "path": "data/mathglm/v6/mathglm.parquet",
+      "text_column": "document",
+      "license": "AFL-3.0 (THUDM/MathGLM, arXiv:2309.03241); rendered into documents by scripts/build_mathglm_corpus.py",
+      "quality": "chained arithmetic with operator precedence, 1 to 26 operations per expression (95.8% carry 1 to 9; 1.0% run past 12) and multiplication that is 66.9% four-digit by four-digit; supplies the compositional depth the single-operation math_drills corpus has none of. The operator set reaches past the four basics: [] group like parentheses, ^ raises to a power (exponents reach four digits and go negative), and a postfix % means hundredths, so 4.0/1% is 400. Every upstream row is refused by the corpus quality gate on its own (61% too_short, 39% low_alpha_fraction, zero alphabetic characters anywhere in the file), so the builder packs them under one of ten natural-language headers, with eight rotating question forms and an optional step-count note chosen by content hash, and re-checks each document against that same gate before writing. The upstream arithmetic is not trusted either: MathGLM mangles scientific-notation steps and its fraction chains step aside into scratch work, and 7,571 of its wide products are wrong past the sixteenth digit, so 1.622% of rows state a false equality. v6 evaluates every chain and admits only those whose segments all share one value, comparing whole integers exactly rather than through floats."
     },
     {
       "name": "wikipedia_en",

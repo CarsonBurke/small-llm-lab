@@ -1,0 +1,25 @@
+{
+  "name": "math30_mathglm_anneal",
+  "description": "Mid-training anneal mixture for the tail of a `math30_mathglm` run, passed as --anneal-weights. It keeps the `math30_anneal` shape -- half the tokens mathematics, the raw-FineWeb anchor dropped, the shift toward showing the steps -- and splits the arithmetic budget the same way the bulk profile does: `mathglm` at 10% for chained multi-operation evaluation, `math_drills` at 7% for the column-level algorithm MathGLM never spells out. `openmath_instruct` is held at 16%, unchanged from `math30_anneal`, because the habit the anneal should leave behind is reading a word problem and working it, not arithmetic in isolation; the extra weight comes out of `finemath_4plus`, `open_web_math` and `deepmind_math`. Source iterators are shared with the bulk stage, so nothing here is a second pass over text the model has already seen; pair it with --on-exhausted redistribute.",
+  "domains": {
+    "web": 0.22,
+    "code": 0.12,
+    "math": 0.5,
+    "knowledge": 0.16
+  },
+  "sources": {
+    "fineweb": 0.0,
+    "fineweb_edu_dedup": 0.22,
+    "sci_code": 0.08,
+    "github_code_clean": 0.04,
+    "open_web_math": 0.05,
+    "finemath_4plus": 0.09,
+    "openmath_instruct": 0.16,
+    "deepmind_math": 0.03,
+    "math_drills": 0.07,
+    "mathglm": 0.1,
+    "wikipedia_en": 0.06,
+    "arxiv_papers": 0.04,
+    "cosmopedia_v2": 0.06
+  }
+}

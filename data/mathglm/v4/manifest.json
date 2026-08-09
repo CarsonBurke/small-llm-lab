@@ -1,0 +1,75 @@
+{
+  "characters": 1658189275,
+  "corpus_sha256": "0c4f89073948e0410eb7cf595d78dac2c4c1c88f8fbdfd98b47e4b09258386e1",
+  "counts": {
+    "document_rejected:low_alpha_fraction": 4912,
+    "document_rejected:repeated_lines": 29,
+    "documents": 2879274,
+    "rows_dropped_with_document": 5984,
+    "rows_read": 5000000,
+    "rows_rejected:not_a_chain": 2,
+    "rows_rejected:power_out_of_range": 64275,
+    "rows_rejected:segments_disagree": 46229,
+    "rows_rejected:uncomputable_segment": 226,
+    "rows_rejected:unparsed_segment": 23064,
+    "rows_used": 4860220
+  },
+  "documents": 2879274,
+  "framing": {
+    "answer_prefix": "Answer: ",
+    "headers": [
+      "Evaluate each expression one operation at a time, following operator precedence.",
+      "Work through each calculation step by step, taking multiplication and division before addition and subtraction.",
+      "Each expression below is reduced one operation at a time until a single number is left.",
+      "Simplify each of these expressions, taking the operations in precedence order.",
+      "A short set of arithmetic exercises, each worked one operation at a time.",
+      "Resolve the operations in each expression in the order the precedence rules require.",
+      "Practice: reduce every expression below to a single value, showing each step.",
+      "The following expressions are evaluated step by step, innermost precedence first.",
+      "Careful arithmetic: each line below removes exactly one operation from the expression.",
+      "Worked arithmetic. Multiplication and division bind more tightly than addition and subtraction."
+    ],
+    "prompts": [
+      "What is {expression}?",
+      "Evaluate {expression}.",
+      "Compute {expression}.",
+      "Work out {expression}.",
+      "Simplify {expression}.",
+      "Find the value of {expression}.",
+      "What does {expression} come to?",
+      "Reduce {expression} to a single number."
+    ],
+    "selection": "blake2b content hash; reproducible across rebuilds",
+    "step_notes": [
+      "",
+      "",
+      "",
+      "This takes {steps} steps.",
+      "There are {steps} operations to remove.",
+      "{steps} steps, one operation each."
+    ]
+  },
+  "mean_document_characters": 575.9053410686166,
+  "min_document_characters": 300,
+  "problem_registry": {
+    "directory": "/home/marvin/Documents/repositories/parameter-golf/data/problem_registry/v1",
+    "excluded_problem_keys": 344309,
+    "registry_sha256": "01cb4ce0296026934f0c28b958e2decabc0b867dc745f4444027cf7ea9abcbc7"
+  },
+  "schema": "mathglm_expression_chains/v4",
+  "upstream": {
+    "dataset": "jonathanasdf/MathGLM-dataset-5M",
+    "derivation": "every 10th row of the THUDM/MathGLM 50M arithmetic pre-training set",
+    "license": "AFL-3.0",
+    "paper": "arXiv:2309.03241",
+    "source_file": "dataset5m.txt",
+    "source_sha256": "19f41203c471f89b2126afe184083db89f27734749bef6613344d5719b5faa7b"
+  },
+  "validation": {
+    "absolute_tolerance": 1e-12,
+    "max_result_digits": 100,
+    "percent_is_hundredths": true,
+    "relative_tolerance": 1e-09,
+    "rule": "every '='-separated segment must evaluate to the same value; MathGLM ships mangled scientific-notation steps and fraction chains that step aside into scratch work"
+  }
+}
