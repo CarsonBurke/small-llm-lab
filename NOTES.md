@@ -5262,3 +5262,106 @@ schedule.
 Everything else agrees across the two arms — boundary accuracy 0.9836 both,
 bytes per patch 4.5659 against 4.5675, causal 3.4618 against 3.4555 — which is
 the check that the schedule was the only variable.
+
+## 2026-08-08: MathGLM added, drills rewritten, and a validator that did not validate
+
+Multiplication scored 0% at every digit width in the arithmetic probe. That was
+a data defect, not a capacity limit. The generated drill corpus under schema v2
+stated every product as a single jump -- `2933 x 3 (ones) = 8799`, one line, no
+algorithm -- and `mul_integer` capped the multiplier strictly below the
+multiplicand, so no equal-width product (2x2, 3x3, 4x4) existed anywhere in two
+million drills. `digit_order` was inert for multiplication: 62,988 `forward`
+and 62,895 `reversed` rows rendered identical bytes. Measured over 20,000
+multiplication drills:
+
+| drill schema | times-table facts | distinct digit pairs |
+| --- | --- | --- |
+| v2 | 0 | 0/100 |
+| v3 | 72,926 | 100/100 |
+
+Schema v3 decomposes each partial product into single-digit column facts with
+carries and combines the partials through `column_addition`, keeps a genuinely
+different expanded/distributive form for `forward`, lets the multiplier reach
+the multiplicand's width, and drops `div_integer` to one digit. Each working
+method draws its lead sentence from a phrasing pool keyed on the operands, so
+the corpus no longer opens a quarter of a million drills with one identical
+line (`mul_integer` 1 -> 1,477 distinct leads, `div_integer` 1 -> 2,958).
+
+### The probe panel was scoring trained items
+
+`run_arithmetic_probe.py` defaulted to `data/math_drills/v1/probe.jsonl` long
+after the generator had changed. 84 of its 1,920 items (4.4%) appear verbatim
+in the current training stream. The panel recorded `disjoint_from_training:
+true` without saying *from what*, so the existing check passed. Panels now
+carry `drill_schema` and `drills_sha256`; the probe refuses a panel that does
+not name its corpus, or whose digest disagrees with the manifest beside it.
+`data/math_drills/v4` exists only for that: its `drills.parquet` is byte-
+identical to v3 (`e9c9c476e4cd68cf`), which also confirms the generator is
+reproducible.
+
+### MathGLM as a pretraining corpus
+
+`jonathanasdf/MathGLM-dataset-5M` supplies what the drills lack: 1 to 26
+chained operations under precedence (95.8% at 1-9), multiplication that is
+66.9% four-digit by four-digit, and operators past the four basics (`[]`
+grouping, `^` powers, postfix `%` as hundredths, so `4.0/1%` is 400). Every
+upstream row fails the corpus quality gate on its own -- 61% `too_short`, 39%
+`low_alpha_fraction`, and *not one alphabetic character in the entire file* --
+so `scripts/build_mathglm_corpus.py` packs chains under rotating natural
+language framing (10 headers, 8 question forms, an optional step-count note)
+and re-checks each document against that same gate.
+
+### Negative result: four validators in a row that did not validate
+
+The upstream arithmetic is not trustworthy, and neither were my first four
+attempts to check it. Each defect was found by measuring the *output* of the
+previous build, never by reading the code:
+
+1. `MAX_EXPONENT = 64` rejected `1^2864=1` -- 37,204 valid rows discarded. The
+   premise came from a regex that matched only a bare literal after `^`, which
+   covered 39k of 162,403 occurrences; real exponents reach four digits and go
+   negative.
+2. Bounding result magnitude symmetrically rejected `46^-94` -- 64,275 rows,
+   and it hid which of them were genuinely wrong. Only a large *positive*
+   exponent can materialise an unbounded integer.
+3. `abs_tol=1e-12` made every value below that floor compare equal to every
+   other, so `46^-94 = 1/<121-digit denominator>` -- two numbers 36 orders of
+   magnitude apart -- passed as a true statement.
+4. Comparing through floats admitted 7,571 wide products wrong past the
+   sixteenth significant digit, e.g. `385924542305736*3405=1314073066551031040`
+   whose true value ends `031080`. That is precisely the multi-digit
+   multiplication family the corpus was added to teach.
+
+The rule that survives: every `=`-separated segment must evaluate to the same
+value, whole integers compared exactly and everything else on relative
+tolerance with no absolute floor. Over 5,000,000 rows it admits 4,918,912
+(98.378%) and rejects 1.622% -- 57,796 self-contradicting chains, 23,290
+unevaluable, 2 unparsed. Two upstream defect families account for the
+disagreements: MathGLM's step generator mangles scientific notation, reducing
+`0.018706333107955823-1.923635517236736e-06` to `0.018706333107955823-06` and
+landing on `-5.98` where the truth is `0.0187`; and its fraction chains step
+aside into scratch work, so `=` does not always join equal values.
+
+Verified independently against the built corpus with exact integer arithmetic
+sharing no code with the builder: 136,264 integer chains, 3,995 of them
+carrying a value past 2^53, **zero** false equalities.
+
+### Shipped
+
+`data/mathglm/v6` -- 2,922,446 documents, 1,686,167,867 characters, 577 chars
+each, `e74d7993cd1ae184`. `data/math_drills/v4` -- 2,000,000 drills, 1028.7 MB,
+514 chars each, 1,920-item bound panel. Both registered in `k3_sources.json`.
+`k3_weights_math30_mathglm.json` splits the arithmetic budget mathglm 6% /
+drills 4%, paid out of `deepmind_math` (5% -> 2%) and `open_web_math`, holding
+`openmath_instruct` at 8% as the only source carrying worked word problems.
+
+At 1.375 chars/token mathglm is a 1,226M-token corpus and 6% of a 524M-token
+run is 31.5M tokens, i.e. 2.6% coverage; drills at 2.092 chars/token are 492M
+tokens and 4% is 21.0M, i.e. 4.3%. Arithmetic therefore takes 10% of the run
+while both corpora stay largely unread -- the binding constraint is the run's
+token budget, not the weights.
+
+Superseded and not to be used: `data/mathglm/v1` and `v2` contain the false
+arithmetic outright; `v3` and `v4` are lossy from defects 1 and 2; `v5` admits
+the wide-product errors of defect 4. `data/math_drills/v1` through `v3` predate
+the panel binding.
