@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -34,40 +35,84 @@ TB_DIR = REPO_ROOT / "tb_logs"
 SANITIZED_ENV_PREFIXES = ("PURE_LEJEPA_", "LEJEPA_")
 REFERENCE_ABLATION_STEPS = 2000
 REFERENCE_WARMDOWN_ITERS = 1200
+DECIMAL_PATTERN = r"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+SCALAR_PATTERN = rf"(?:{DECIMAL_PATTERN}|[+-]?(?:nan|inf(?:inity)?))"
+METRIC_INTEGRITY_RETURN_CODE = 65
 
 
-def parse_extra_metrics(extras: str) -> dict[str, float]:
-    metrics = {}
-    for key, value in re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*):([+-]?(?:\d+\.?\d*|\.\d+))", extras):
+def _parse_extra_metrics(extras: str) -> tuple[dict[str, float], list[str]]:
+    metrics: dict[str, float] = {}
+    errors: list[str] = []
+    for match in re.finditer(r"(?:^|\s)([a-zA-Z_][a-zA-Z0-9_]*):([^\s]+)", extras):
+        key, token = match.groups()
         if key == "train_time" or key.startswith("native_"):
+            continue
+        if key == "step_avg" and token.endswith("ms"):
+            token = token[:-2]
+        if re.fullmatch(SCALAR_PATTERN, token, flags=re.IGNORECASE) is None:
+            errors.append(f"malformed metric {key}:{match.group(2)}")
+            continue
+        value = float(token)
+        if not math.isfinite(value):
+            errors.append(f"non-finite metric {key}:{match.group(2)}")
             continue
         if key == "step_avg":
             key = "step_avg_ms"
-        metrics[key] = float(value)
+        metrics[key] = value
+    return metrics, errors
+
+
+def parse_extra_metrics(extras: str) -> dict[str, float]:
+    metrics, errors = _parse_extra_metrics(extras)
+    if errors:
+        raise ValueError("; ".join(errors))
     return metrics
 
 
 def parse_time_ms(text: str) -> float | None:
-    match = re.search(r"train_time:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*(ms|m)?", text)
+    match = re.search(
+        rf"(?:^|\s)train_time:\s*({SCALAR_PATTERN})(ms|s|m)(?=\s|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
     if not match:
         return None
     value = float(match.group(1))
-    unit = match.group(2) or "ms"
+    if not math.isfinite(value):
+        return None
+    unit = match.group(2).lower()
     if unit == "m":
         return value * 60_000
+    if unit == "s":
+        return value * 1_000
     return value
+
+
+def _metric_error(line: str, message: str, *, step: int | None = None) -> dict:
+    result: dict[str, object] = {
+        "type": "metric_error",
+        "metric_integrity_error": message,
+        "raw_metric_line": line.rstrip("\r\n"),
+    }
+    if step is not None:
+        result["step"] = step
+    return result
 
 
 def parse_log_line(line: str) -> dict | None:
     """Parse a single log line into a metric dict."""
     graph_match = re.match(r"graph_stats\s+(.*)", line)
     if graph_match:
-        metrics = parse_extra_metrics(graph_match.group(1))
+        metrics, errors = _parse_extra_metrics(graph_match.group(1))
+        if errors:
+            return _metric_error(line, "; ".join(errors))
         return {"type": "graph_stats", **metrics} if metrics else None
 
     churn_match = re.match(r"churn_stats\s+(.*)", line)
     if churn_match:
-        metrics = parse_extra_metrics(churn_match.group(1))
+        metrics, errors = _parse_extra_metrics(churn_match.group(1))
+        if errors:
+            return _metric_error(line, "; ".join(errors))
         # stepless by design: emitted just before the val line it belongs to,
         # MetricsWriter folds it into that val entry
         return {"type": "churn_stats", **metrics} if metrics else None
@@ -80,43 +125,81 @@ def parse_log_line(line: str) -> dict | None:
         }
         extras = diag_match.group(2).strip()
         if extras:
-            entry.update(parse_extra_metrics(extras))
+            metrics, errors = _parse_extra_metrics(extras)
+            if errors:
+                return _metric_error(
+                    line, "; ".join(errors), step=int(diag_match.group(1))
+                )
+            entry.update(metrics)
         return entry
 
     val_match = re.match(
-        r"(?:step:)?(\d+)/\d+\s+val_loss:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s+val_bpb:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*(.*)",
+        rf"(?:step:)?(\d+)/\d+\s+val_loss:\s*({SCALAR_PATTERN})(?=\s|$)\s+val_bpb:\s*({SCALAR_PATTERN})(?=\s|$)\s*(.*)",
         line,
+        flags=re.IGNORECASE,
     )
     if val_match:
+        step = int(val_match.group(1))
+        val_loss = float(val_match.group(2))
+        val_bpb = float(val_match.group(3))
+        if not math.isfinite(val_loss) or not math.isfinite(val_bpb):
+            return _metric_error(
+                line,
+                "non-finite validation loss or BPB",
+                step=step,
+            )
         extras = val_match.group(4).strip()
+        train_time_ms = parse_time_ms(extras)
+        if train_time_ms is None:
+            if re.search(r"(?:^|\s)train_time:", extras):
+                return _metric_error(line, "malformed train_time", step=step)
+            train_time_ms = 0.0
         entry = {
-            "step": int(val_match.group(1)),
-            "val_loss": float(val_match.group(2)),
-            "val_bpb": float(val_match.group(3)),
-            "train_time_ms": parse_time_ms(extras) or 0.0,
+            "step": step,
+            "val_loss": val_loss,
+            "val_bpb": val_bpb,
+            "train_time_ms": train_time_ms,
             "type": "val",
         }
         if extras:
-            entry.update(parse_extra_metrics(extras))
+            metrics, errors = _parse_extra_metrics(extras)
+            if errors:
+                return _metric_error(line, "; ".join(errors), step=step)
+            entry.update(metrics)
         return entry
     train_match = re.match(
-        r"(?:step:)?(\d+)/\d+\s+train_loss:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*(.*)",
+        rf"(?:step:)?(\d+)/\d+\s+train_loss:\s*({SCALAR_PATTERN})(?=\s|$)\s*(.*)",
         line,
+        flags=re.IGNORECASE,
     )
     if train_match:
+        step = int(train_match.group(1))
+        train_loss = float(train_match.group(2))
+        if not math.isfinite(train_loss):
+            return _metric_error(line, "non-finite training loss", step=step)
         extras = train_match.group(3).strip()
         train_time_ms = parse_time_ms(extras)
         if train_time_ms is None:
-            return None
+            return _metric_error(line, "missing or malformed train_time", step=step)
         entry = {
-            "step": int(train_match.group(1)),
-            "train_loss": float(train_match.group(2)),
+            "step": step,
+            "train_loss": train_loss,
             "train_time_ms": train_time_ms,
             "type": "train",
         }
         if extras:
-            entry.update(parse_extra_metrics(extras))
+            metrics, errors = _parse_extra_metrics(extras)
+            if errors:
+                return _metric_error(line, "; ".join(errors), step=step)
+            entry.update(metrics)
         return entry
+    malformed_metric = re.match(r"(?:step:)?(\d+)/\d+\s+(?:train_loss|val_loss):", line)
+    if malformed_metric:
+        return _metric_error(
+            line,
+            "malformed training or validation metric line",
+            step=int(malformed_metric.group(1)),
+        )
     return None
 
 
@@ -218,7 +301,9 @@ class MetricsWriter:
             if self._pending_graph:
                 entry = {**entry, **self._pending_graph}
                 self._pending_graph = None
-        self.metrics_file.write(json.dumps(entry, sort_keys=True) + "\n")
+        self.metrics_file.write(
+            json.dumps(entry, sort_keys=True, allow_nan=False) + "\n"
+        )
         self.metrics_file.flush()
         if entry["type"] == "val":
             time_s = int(entry["train_time_ms"] / 1000)
@@ -255,20 +340,78 @@ class MetricsWriter:
         self.writer.close()
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _validate_finite_json(value: object, path: str = "$") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number at {path}")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_finite_json(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_finite_json(item, f"{path}[{index}]")
+
+
 def read_metrics_jsonl(metrics_path: Path) -> list[dict]:
     entries = []
     if not metrics_path.exists():
         return entries
     with metrics_path.open(encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+                entry = json.loads(
+                    line,
+                    parse_constant=_reject_json_constant,
+                )
+                if not isinstance(entry, dict) or not isinstance(
+                    entry.get("type"), str
+                ):
+                    raise ValueError("metric record must be an object with a type")
+                _validate_finite_json(entry)
+                entries.append(entry)
+            except (json.JSONDecodeError, ValueError) as error:
+                raise ValueError(
+                    f"malformed metrics JSON at {metrics_path}:{line_number}"
+                ) from error
     return entries
+
+
+def metric_integrity_errors(entries: list[dict], effective_steps: int) -> list[str]:
+    errors = [
+        str(entry["metric_integrity_error"])
+        for entry in entries
+        if entry.get("type") == "metric_error"
+    ]
+    final_validations = [
+        entry
+        for entry in entries
+        if entry.get("type") == "val" and entry.get("step") == effective_steps
+    ]
+    for entry in final_validations:
+        for key in ("val_loss", "val_bpb", "train_time_ms"):
+            value = entry.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                errors.append(
+                    f"final validation has non-finite or missing {key}"
+                )
+    if not final_validations:
+        errors.append(f"missing finite validation at requested step {effective_steps}")
+    elif len(final_validations) != 1:
+        errors.append(
+            f"expected one validation at step {effective_steps}, "
+            f"observed {len(final_validations)}"
+        )
+    return errors
 
 
 def build_run_env(
@@ -390,13 +533,23 @@ def run_config(
     output_text = "".join(output_lines)
 
     val_entries = [e for e in entries if e["type"] == "val"]
+    integrity_errors = metric_integrity_errors(entries, effective_steps)
     # A script that reports a codelength reports it under this key, and it is
     # the headline. Bolmo's `val_canonical_bpb` marginalizes a boundary bit
     # that its own routing consumed, so it is below any achievable codelength
     # and must not be compared against a subword model's bits-per-byte;
     # preferring it here is what put an unreachable number in every summary.
     # Subword runs emit no codelength key and fall through unchanged.
-    final_entry = val_entries[-1] if val_entries else None
+    final_entry = next(
+        (
+            entry
+            for entry in reversed(val_entries)
+            if entry["step"] == effective_steps
+        ),
+        None,
+    )
+    if integrity_errors:
+        final_entry = None
     final_bpb = None
     if final_entry is not None:
         final_bpb = final_entry.get("val_canonical_codelength_bpb")
@@ -407,21 +560,25 @@ def run_config(
                 "val_canonical_bpb", final_entry["val_bpb"]
             )
     final_marginalized_bpb = (
-        val_entries[-1].get("val_canonical_bpb") if val_entries else None
+        final_entry.get("val_canonical_bpb") if final_entry else None
     )
     final_loss = (
-        val_entries[-1].get("val_canonical_loss", val_entries[-1]["val_loss"])
-        if val_entries
+        final_entry.get("val_canonical_loss", final_entry["val_loss"])
+        if final_entry
         else None
     )
     final_proxy_bpb = (
-        val_entries[-1].get("val_proxy_bpb", val_entries[-1]["val_bpb"])
-        if val_entries
+        final_entry.get("val_proxy_bpb", final_entry["val_bpb"])
+        if final_entry
         else None
     )
-    final_proxy_loss = val_entries[-1]["val_loss"] if val_entries else None
-    final_probe_bpb = val_entries[-1].get("probe_val_bpb") if val_entries else None
-    final_probe_loss = val_entries[-1].get("probe_val_loss") if val_entries else None
+    final_proxy_loss = final_entry["val_loss"] if final_entry else None
+    final_probe_bpb = final_entry.get("probe_val_bpb") if final_entry else None
+    final_probe_loss = final_entry.get("probe_val_loss") if final_entry else None
+    training_returncode = int(proc.returncode)
+    effective_returncode = training_returncode
+    if effective_returncode == 0 and integrity_errors:
+        effective_returncode = METRIC_INTEGRITY_RETURN_CODE
 
     result = {
         "name": name,
@@ -443,13 +600,20 @@ def run_config(
         "final_probe_val_bpb": final_probe_bpb,
         "final_probe_val_loss": final_probe_loss,
         "val_entries": val_entries,
-        "returncode": proc.returncode,
+        "returncode": effective_returncode,
+        "training_returncode": training_returncode,
+        "metric_integrity_errors": integrity_errors,
     }
 
-    if proc.returncode != 0:
+    if training_returncode != 0:
         result["error"] = output_text[-2000:] if output_text else "unknown error"
-        print(f"  ERROR (rc={proc.returncode})")
+        print(f"  ERROR (rc={training_returncode})")
         print(output_text[-1000:])
+    elif integrity_errors:
+        result["error"] = "; ".join(integrity_errors)
+        print(f"  METRIC INTEGRITY ERROR (rc={effective_returncode})")
+        for error in integrity_errors:
+            print(f"    - {error}")
     else:
         if final_bpb is not None:
             print(f"  Final BPB: {final_bpb:.4f}")
@@ -462,7 +626,7 @@ def run_config(
     # Save result JSON; metrics.jsonl is the canonical machine-readable record.
     result_path = run_dir / "result.json"
     with open(result_path, "w") as f:
-        json.dump(result, f, indent=2)
+        json.dump(result, f, indent=2, allow_nan=False)
     print(f"  Saved: {run_dir}/")
 
     return result
@@ -474,10 +638,14 @@ def compare_results(results_dir: Path) -> None:
     # Support both old flat .json and new subfolder/result.json
     for f in sorted(results_dir.glob("*/result.json")):
         with open(f) as fh:
-            results.append(json.load(fh))
+            result = json.load(fh, parse_constant=_reject_json_constant)
+            _validate_finite_json(result)
+            results.append(result)
     for f in sorted(results_dir.glob("*.json")):
         with open(f) as fh:
-            results.append(json.load(fh))
+            result = json.load(fh, parse_constant=_reject_json_constant)
+            _validate_finite_json(result)
+            results.append(result)
 
     if not results:
         print("No results found.")
@@ -495,19 +663,29 @@ def compare_results(results_dir: Path) -> None:
 
     print(
         f"\n{'Name':<40} {'Steps':>6} {'WD env':>7} "
-        f"{'BPB':>8} {'Probe':>8} {'Loss':>8} {'Time':>8}"
+        f"{'Scope':>9} {'BPB':>8} {'Probe':>8} {'Loss':>8} {'Time':>8}"
     )
-    print("-" * 91)
-    for r in sorted(unique, key=lambda x: x.get("final_val_bpb") or 99):
+    print("-" * 101)
+
+    def comparison_bpb(result: dict) -> float | None:
+        if result.get("returncode", 0) != 0:
+            return None
+        return result.get("final_val_bpb") or result.get("final_proxy_val_bpb")
+
+    for r in sorted(unique, key=lambda x: comparison_bpb(x) or 99):
         warmdown = r.get("warmdown_iters_env", r.get("warmdown_iters"))
         warmdown_text = str(warmdown) if warmdown is not None else "?"
-        bpb = f"{r['final_val_bpb']:.4f}" if r.get("final_val_bpb") else "FAIL"
+        value = comparison_bpb(r)
+        bpb = f"{value:.4f}" if value is not None else "FAIL"
+        scope = "challenge" if r.get("final_val_bpb") is not None else "proxy"
+        if value is None:
+            scope = "-"
         probe = f"{r['final_probe_val_bpb']:.4f}" if r.get("final_probe_val_bpb") else "-"
         loss = f"{r['final_val_loss']:.4f}" if r.get("final_val_loss") else "-"
         time_s = f"{r['elapsed_seconds']:.0f}s" if r.get("elapsed_seconds") else "-"
         print(
             f"{r['name']:<40} {r['steps']:>6} {warmdown_text:>7} "
-            f"{bpb:>8} {probe:>8} {loss:>8} {time_s:>8}"
+            f"{scope:>9} {bpb:>8} {probe:>8} {loss:>8} {time_s:>8}"
         )
 
 
