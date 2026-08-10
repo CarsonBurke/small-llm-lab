@@ -116,6 +116,39 @@ def absorbing_rb(
     return result
 
 
+def blt_exact_k(
+    clean_ids: Tensor,
+    eligible: Tensor,
+    vocab: AtomicVocabulary,
+    *,
+    generator: torch.Generator | None = None,
+    k: Tensor | None = None,
+) -> CorruptedBatch:
+    """Lower-variance unbiased estimator of Fast-BLT's masked sum.
+
+    A row samples K uniformly from 1..S and a uniform K-subset of its S
+    eligible positions.  Dividing the selected CE sum by K/S recovers the
+    complete-position sum in expectation without Bernoulli ``1/t``'s
+    unbounded small-t variance or empty-mask rows.
+    """
+
+    sampled = absorbing_rb(
+        clean_ids,
+        eligible,
+        vocab,
+        generator=generator,
+        k=k,
+    )
+    return CorruptedBatch(
+        ids=sampled.ids,
+        targets=sampled.targets,
+        active=sampled.active,
+        noise_fraction=sampled.noise_fraction,
+        kind="blt_exact_k",
+        t=sampled.noise_fraction.clamp_min(torch.finfo(torch.float32).tiny),
+    )
+
+
 def allmask_50(
     clean_ids: Tensor,
     eligible: Tensor,
@@ -153,24 +186,25 @@ def blt_bernoulli(
     generator: torch.Generator | None = None,
     t: Tensor | None = None,
 ) -> CorruptedBatch:
-    """Fast-BLT corruption: one shared t and independent byte masks."""
+    """Fast-BLT corruption: one t per example and independent byte masks."""
 
     _require_inputs(clean_ids, eligible, vocab)
+    batch = clean_ids.shape[0]
     if t is None:
-        t = torch.rand((), device=clean_ids.device, generator=generator).clamp_min(
-            torch.finfo(torch.float32).tiny
-        )
-    if t.numel() != 1 or (
-        not t.is_cuda and not 0.0 < float(t) <= 1.0
+        t = torch.rand(
+            (batch,), device=clean_ids.device, generator=generator
+        ).clamp_min(torch.finfo(torch.float32).tiny)
+    if t.shape not in {(), (batch,)} or (
+        not t.is_cuda and bool(((t <= 0) | (t > 1)).any())
     ):
-        raise ValueError("t must be one scalar in (0, 1]")
+        raise ValueError("t must be scalar or one value per example in (0, 1]")
     active = eligible & (
         torch.rand(
             clean_ids.shape,
             device=clean_ids.device,
             generator=generator,
             dtype=torch.float32,
-        ) < t
+        ) < t.reshape(-1, 1)
     )
     counts = eligible.sum(1)
     result = CorruptedBatch(

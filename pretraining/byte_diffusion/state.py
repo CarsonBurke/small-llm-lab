@@ -24,6 +24,8 @@ class CacheSnapshot:
     ids: Tensor
     tensors: dict[str, Tensor]
     generator_state: Tensor
+    patch_phase: int
+    terminal_eot: bool
 
 
 @dataclass
@@ -43,6 +45,11 @@ class TransactionalDecodeState:
     counters: WorkCounters = field(default_factory=WorkCounters)
     _generator: torch.Generator = field(init=False, repr=False)
     _scratch: CacheSnapshot | None = field(default=None, init=False, repr=False)
+    _patch_phase: int = field(default=0, init=False, repr=False)
+    _terminal_eot: bool = field(default=False, init=False, repr=False)
+    _phase_storage: tuple[int, int, int] = field(
+        default=(0, 0, -1), init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.device = torch.device(self.device)
@@ -51,11 +58,25 @@ class TransactionalDecodeState:
 
     @property
     def patch_phase(self) -> int:
-        if self.ids.numel() and int(self.ids[-1]) == self.eot_id:
-            return 0
-        tail = self.ids.tolist()
-        last_eot = len(tail) - 1 - tail[::-1].index(self.eot_id) if self.eot_id in tail else -1
-        return (len(tail) - last_eot - 1) % self.patch_stride
+        # Normal decode commits maintain this scalar incrementally. Refreshing
+        # is needed only for direct external tensor replacement (including old
+        # checkpoints/tests), never by rescanning the prefix on every action.
+        # Tensor identity and length do not change under an in-place edit.
+        # Include PyTorch's mutation counter so direct callers cannot leave a
+        # stale EOT/patch phase behind after editing the exposed prefix tensor.
+        storage = (self.ids.data_ptr(), self.ids.numel(), self.ids._version)
+        if storage != self._phase_storage:
+            eot = self.ids.eq(self.eot_id).nonzero().flatten()
+            terminal = bool(eot.numel() and int(eot[-1]) == self.ids.numel() - 1)
+            last_eot = int(eot[-1]) if eot.numel() else -1
+            self._terminal_eot = terminal
+            self._patch_phase = (
+                0
+                if terminal
+                else (self.ids.numel() - last_eot - 1) % self.patch_stride
+            )
+            self._phase_storage = storage
+        return self._patch_phase
 
     @property
     def incomplete_patch_buffer(self) -> Tensor:
@@ -77,6 +98,8 @@ class TransactionalDecodeState:
         if ids.ndim != 1 or ids.dtype != torch.long or ids.numel() == 0:
             raise ValueError("decode prefix must be nonempty rank-1 int64")
         self.ids = ids.clone().to(self.device)
+        self._phase_storage = (0, 0, -1)
+        _ = self.patch_phase
         self.caches.clear()
 
     @property
@@ -86,10 +109,17 @@ class TransactionalDecodeState:
         return self._generator
 
     def snapshot(self) -> CacheSnapshot:
+        _ = self.patch_phase
         return CacheSnapshot(
+            # A public transaction must also isolate in-place edits made by a
+            # caller. The production generator keeps its large LayerKV stores
+            # outside this legacy tensor dictionary, so preserving the actual
+            # rollback contract here is cheap in the optimized decode path.
             ids=self.ids.clone(),
             tensors={name: value.clone() for name, value in self.caches.items()},
             generator_state=self._generator.get_state().clone(),
+            patch_phase=self._patch_phase,
+            terminal_eot=self._terminal_eot,
         )
 
     def begin(self) -> CacheSnapshot:
@@ -122,6 +152,13 @@ class TransactionalDecodeState:
         self.ids = snapshot.ids
         self.caches = snapshot.tensors
         self._generator.set_state(snapshot.generator_state)
+        self._patch_phase = snapshot.patch_phase
+        self._terminal_eot = snapshot.terminal_eot
+        self._phase_storage = (
+            self.ids.data_ptr(),
+            self.ids.numel(),
+            self.ids._version,
+        )
         self._scratch = None
 
     def commit_ids(self, proposed: Tensor) -> Tensor:
@@ -136,6 +173,17 @@ class TransactionalDecodeState:
         if eot.numel():
             accepted = proposed[: int(eot[0]) + 1]
         self.ids = torch.cat((self.ids, accepted))
+        self._terminal_eot = bool(eot.numel())
+        self._patch_phase = (
+            0
+            if self._terminal_eot
+            else (self._scratch.patch_phase + accepted.numel()) % self.patch_stride
+        )
+        self._phase_storage = (
+            self.ids.data_ptr(),
+            self.ids.numel(),
+            self.ids._version,
+        )
         self.counters.committed_bytes += accepted.numel()
         # Scratch tensors are never promoted; causal replay populates cache.
         # The RNG is deliberately *not* restored on commit: accepted sampling
@@ -166,6 +214,8 @@ class TransactionalDecodeState:
         if int(state["eot_id"]) != self.eot_id or int(state["patch_stride"]) != self.patch_stride:
             raise ValueError("decode-state schema mismatch")
         self.ids = state["ids"].to(self.device)  # type: ignore[union-attr]
+        self._phase_storage = (0, 0, -1)
+        _ = self.patch_phase
         self.caches = {
             name: value.to(self.device)
             for name, value in state["caches"].items()  # type: ignore[union-attr]

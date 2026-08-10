@@ -162,11 +162,10 @@ class CanvasBranchLayout:
             ):
                 raise ValueError("branch_segment_ids must be int64 [batch, branches]")
             tensors += (self.clean_segment_ids, self.branch_segment_ids)
-        if self.prefix_window is not None:
-            if self.prefix_window <= 0:
-                raise ValueError("prefix_window must be positive")
-            if self.clean_positions is None or self.branch_positions is None:
-                raise ValueError("windowed branches require clean and branch positions")
+        if (self.clean_positions is None) != (self.branch_positions is None):
+            raise ValueError("clean and branch positions must be provided together")
+        if self.clean_positions is not None:
+            assert self.branch_positions is not None
             if (
                 self.clean_positions.shape != self.clean_valid.shape
                 or self.clean_positions.dtype != torch.int64
@@ -180,6 +179,11 @@ class CanvasBranchLayout:
                     "branch_positions must be int64 [batch, branches, canvas_length]"
                 )
             tensors += (self.clean_positions, self.branch_positions)
+        if self.prefix_window is not None:
+            if self.prefix_window <= 0:
+                raise ValueError("prefix_window must be positive")
+            if self.clean_positions is None:
+                raise ValueError("windowed branches require clean and branch positions")
         _require_same_device("canvas layout", tensors)
         if canvas <= 0 or branches <= 0:
             raise ValueError("canvas branches and length must be positive")
@@ -275,6 +279,219 @@ class IntrospectionBranchLayout:
 BranchLayout = CanvasBranchLayout | IntrospectionBranchLayout
 
 
+@dataclass(frozen=True)
+class CanvasBlockMaskMetadata:
+    """Conservative sparse block topology independent of attention values.
+
+    The metadata contains only candidate K/V blocks.  The exact token rule is
+    still supplied by :func:`_canvas_mask_mod`, so document, PAD, prefix-window,
+    and branch isolation remain exact even when a block straddles a boundary.
+    Keeping this topology as O(query_blocks * prefix_blocks) integer metadata
+    avoids materializing a token mask and lets CPU collation prepare it before
+    the fullgraph CUDA forward.
+    """
+
+    kv_num_blocks: Tensor
+    kv_indices: Tensor
+    q_num_blocks: Tensor
+    q_indices: Tensor
+    block_size: tuple[int, int]
+    query_length: int
+    kv_length: int
+
+    def __post_init__(self) -> None:
+        if self.kv_num_blocks.dtype != torch.int32 or self.q_num_blocks.dtype != torch.int32:
+            raise ValueError("canvas block counts must be int32")
+        if self.kv_indices.dtype != torch.int32 or self.q_indices.dtype != torch.int32:
+            raise ValueError("canvas block indices must be int32")
+        if self.kv_num_blocks.ndim != 3 or self.kv_indices.ndim != 4:
+            raise ValueError("canvas block metadata must have [B,H,Q(,K)] shape")
+        if self.kv_num_blocks.shape != self.kv_indices.shape[:-1]:
+            raise ValueError("canvas block counts and indices do not align")
+        if self.q_num_blocks.shape != self.q_indices.shape[:-1]:
+            raise ValueError("transposed canvas block counts and indices do not align")
+        if self.kv_num_blocks.shape[1] != 1:
+            raise ValueError("canvas block metadata must be shared across heads")
+        if any(size <= 0 for size in self.block_size):
+            raise ValueError("canvas block sizes must be positive")
+        if self.query_length <= 0 or self.kv_length <= 0:
+            raise ValueError("canvas sequence lengths must be positive")
+        expected_query_blocks = math.ceil(self.query_length / self.block_size[0])
+        expected_kv_blocks = math.ceil(self.kv_length / self.block_size[1])
+        if self.kv_indices.shape[-2:] != (
+            expected_query_blocks,
+            expected_kv_blocks,
+        ):
+            raise ValueError(
+                "canvas block metadata capacity must cover every physical "
+                "query and K/V block"
+            )
+        if self.q_indices.shape[-2:] != (
+            expected_kv_blocks,
+            expected_query_blocks,
+        ):
+            raise ValueError("transposed canvas block capacity is incomplete")
+        if self.kv_num_blocks.device.type == "cpu":
+            if bool(
+                ((self.kv_num_blocks < 0) | (self.kv_num_blocks > expected_kv_blocks)).any()
+            ):
+                raise ValueError("canvas block counts exceed K/V block capacity")
+            slots = torch.arange(expected_kv_blocks)[None, None, None, :]
+            populated = slots < self.kv_num_blocks[..., None]
+            populated_indices = self.kv_indices[populated]
+            if bool(
+                (
+                    (populated_indices < 0)
+                    | (populated_indices >= expected_kv_blocks)
+                ).any()
+            ):
+                raise ValueError("canvas block index lies outside K/V capacity")
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> "CanvasBlockMaskMetadata":
+        return CanvasBlockMaskMetadata(
+            self.kv_num_blocks.to(device, non_blocking=non_blocking),
+            self.kv_indices.to(device, non_blocking=non_blocking),
+            self.q_num_blocks.to(device, non_blocking=non_blocking),
+            self.q_indices.to(device, non_blocking=non_blocking),
+            self.block_size,
+            self.query_length,
+            self.kv_length,
+        )
+
+    def pin_memory(self) -> "CanvasBlockMaskMetadata":
+        return CanvasBlockMaskMetadata(
+            self.kv_num_blocks.pin_memory(),
+            self.kv_indices.pin_memory(),
+            self.q_num_blocks.pin_memory(),
+            self.q_indices.pin_memory(),
+            self.block_size,
+            self.query_length,
+            self.kv_length,
+        )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        self.kv_num_blocks.record_stream(stream)
+        self.kv_indices.record_stream(stream)
+        self.q_num_blocks.record_stream(stream)
+        self.q_indices.record_stream(stream)
+
+
+def canvas_block_mask_metadata(
+    layout: CanvasBranchLayout,
+    *,
+    block_size: int | tuple[int, int] = 128,
+) -> CanvasBlockMaskMetadata:
+    """Build scalable conservative K/V-block lists for canvas Flex attention.
+
+    This setup routine intentionally runs on CPU.  It inspects one scalar per
+    branch origin, never a ``query_length * kv_length`` token grid.  A query
+    tile receives the union of the clean-prefix blocks and own-branch blocks
+    needed by the branches it overlaps; the attached token mask removes false
+    positives within those blocks.
+    """
+
+    if layout.clean_valid.device.type != "cpu":
+        raise ValueError("canvas block metadata must be constructed from CPU layout")
+    q_block, kv_block = (
+        (block_size, block_size) if isinstance(block_size, int) else block_size
+    )
+    if q_block <= 0 or kv_block <= 0:
+        raise ValueError("canvas block sizes must be positive")
+    query_blocks = math.ceil(layout.query_length / q_block)
+    # ``BlockMask.from_kv_blocks`` uses the final ``kv_indices`` dimension as
+    # the number of physical K/V block columns when it transposes the sparse
+    # topology for backward.  It is therefore a dense *capacity* dimension,
+    # not merely the maximum number of populated entries in one query row.
+    # Allocating only ``max(kv_num_blocks)`` makes otherwise-valid high block
+    # indices out of bounds on real 8K rows (the small oracle layouts did not
+    # expose this).
+    kv_blocks = math.ceil(layout.kv_length / kv_block)
+    # Construct one conservative candidate bitset per branch entirely with
+    # broadcast tensor arithmetic.  The previous nested Python/set loop made
+    # ~64K set updates per optimizer update at B4/128 and scaled especially
+    # poorly toward exhaustive origins.
+    block_starts = torch.arange(kv_blocks, dtype=torch.long) * kv_block
+    block_stops = block_starts + kv_block
+    prefix_stop = layout.prefix_lengths
+    prefix_start = (
+        torch.zeros_like(prefix_stop)
+        if layout.prefix_window is None
+        else (prefix_stop - layout.prefix_window).clamp_min(0)
+    )
+    if layout.branch_positions is not None:
+        # Document offsets reset at every packed-document boundary. Convert
+        # each origin's document-relative position back to its physical start
+        # and exclude all earlier documents before creating candidate tiles.
+        document_start = prefix_stop - layout.branch_positions[..., 0]
+        prefix_start = torch.maximum(prefix_start, document_start)
+    prefix_candidates = (
+        (block_stops[None, None, :] > prefix_start[..., None])
+        & (block_starts[None, None, :] < prefix_stop[..., None])
+    )
+    branch_numbers = torch.arange(layout.branches, dtype=torch.long)
+    own_start = layout.clean_length + branch_numbers * layout.branch_length
+    own_stop = own_start + layout.branch_length
+    own_candidates = (
+        (block_stops[None, :] > own_start[:, None])
+        & (block_starts[None, :] < own_stop[:, None])
+    )
+    per_branch = prefix_candidates | own_candidates[None]
+    per_branch &= layout.branch_valid.any(-1)[..., None]
+
+    if q_block >= layout.branch_length and q_block % layout.branch_length == 0:
+        branches_per_query_block = q_block // layout.branch_length
+        padded_branches = query_blocks * branches_per_query_block
+        if padded_branches != layout.branches:
+            per_branch = torch.nn.functional.pad(
+                per_branch,
+                (0, 0, 0, padded_branches - layout.branches),
+            )
+        active = per_branch.view(
+            layout.batch_size,
+            query_blocks,
+            branches_per_query_block,
+            kv_blocks,
+        ).any(2)
+    else:
+        # Generic non-aligned oracle/configuration path.  Boolean semiring
+        # matmul expresses the same query-block/branch overlap union without a
+        # Python loop; production B4/B8/B16 uses the cheaper grouped path.
+        query_starts = torch.arange(query_blocks, dtype=torch.long) * q_block
+        query_stops = query_starts + q_block
+        branch_starts = branch_numbers * layout.branch_length
+        branch_stops = branch_starts + layout.branch_length
+        membership = (
+            (query_stops[:, None] > branch_starts[None])
+            & (query_starts[:, None] < branch_stops[None])
+        )
+        active = torch.matmul(
+            membership.to(torch.float32), per_branch.to(torch.float32)
+        ).gt(0)
+    counts = active.sum(-1, dtype=torch.int32)[:, None]
+    indices = torch.argsort(
+        active.to(torch.int8), dim=-1, descending=True, stable=True
+    ).to(torch.int32)[:, None]
+    transposed = active.transpose(-2, -1)
+    q_counts = transposed.sum(-1, dtype=torch.int32)[:, None]
+    q_indices = torch.argsort(
+        transposed.to(torch.int8), dim=-1, descending=True, stable=True
+    ).to(torch.int32)[:, None]
+    return CanvasBlockMaskMetadata(
+        counts,
+        indices,
+        q_counts,
+        q_indices,
+        (q_block, kv_block),
+        layout.query_length,
+        layout.kv_length,
+    )
+
+
 def canvas_branch_allowed(layout: CanvasBranchLayout) -> Tensor:
     """Dense ``[batch, branch_query, clean_plus_branch_key]`` canvas oracle."""
 
@@ -300,11 +517,11 @@ def canvas_branch_allowed(layout: CanvasBranchLayout) -> Tensor:
     if layout.prefix_window is not None:
         assert layout.clean_positions is not None
         assert layout.branch_positions is not None
-        query_absolute = layout.branch_positions[:, branch_index, branch_offset]
+        prefix_absolute = layout.branch_positions[:, branch_index, 0]
         key_absolute = layout.clean_positions[:, None, :]
         clean_allowed &= (
-            (key_absolute <= query_absolute[:, :, None])
-            & (key_absolute > query_absolute[:, :, None] - layout.prefix_window)
+            (key_absolute < prefix_absolute[:, :, None])
+            & (key_absolute >= prefix_absolute[:, :, None] - layout.prefix_window)
         )
 
     branch_key_index = torch.arange(layout.query_length, device=layout.clean_valid.device)
@@ -379,11 +596,11 @@ def _canvas_mask_mod(layout: CanvasBranchLayout):
         if layout.prefix_window is not None:
             assert layout.clean_positions is not None
             assert layout.branch_positions is not None
-            query_absolute = layout.branch_positions[batch, branch, query_offset]
+            prefix_absolute = layout.branch_positions[batch, branch, 0]
             key_absolute = layout.clean_positions[batch, clean_offset]
             prefix = prefix & (
-                (key_absolute <= query_absolute)
-                & (key_absolute > query_absolute - layout.prefix_window)
+                (key_absolute < prefix_absolute)
+                & (key_absolute >= prefix_absolute - layout.prefix_window)
             )
         own_branch = (
             ~clean_key
@@ -438,13 +655,32 @@ def build_canvas_block_mask(
     *,
     block_size: int | tuple[int, int] = 128,
     compile_mask: bool | None = None,
+    metadata: CanvasBlockMaskMetadata | None = None,
 ):
     """Build the exact sparse Flex ``BlockMask`` for canvas branch queries."""
 
     try:
-        from torch.nn.attention.flex_attention import create_block_mask
+        from torch.nn.attention.flex_attention import BlockMask, create_block_mask
     except Exception as error:
         raise RuntimeError("FlexAttention BlockMask construction is unavailable") from error
+    if metadata is not None:
+        if metadata.query_length != layout.query_length or metadata.kv_length != layout.kv_length:
+            raise ValueError("canvas block metadata does not match layout geometry")
+        if metadata.kv_num_blocks.device != layout.clean_valid.device:
+            raise ValueError("canvas block metadata and layout must share a device")
+        return BlockMask(
+            seq_lengths=(layout.query_length, layout.kv_length),
+            kv_num_blocks=metadata.kv_num_blocks,
+            kv_indices=metadata.kv_indices,
+            full_kv_num_blocks=None,
+            full_kv_indices=None,
+            q_num_blocks=metadata.q_num_blocks,
+            q_indices=metadata.q_indices,
+            full_q_num_blocks=None,
+            full_q_indices=None,
+            BLOCK_SIZE=metadata.block_size,
+            mask_mod=_canvas_mask_mod(layout),
+        )
     if compile_mask is None:
         # PyTorch 2.13 Inductor can fail symbolic indexing for tensor-backed
         # layouts on sm120. Mask construction is once per geometry; compile the
@@ -755,11 +991,13 @@ def branch_attention(
 
 __all__ = [
     "BranchLayout",
+    "CanvasBlockMaskMetadata",
     "CanvasBranchLayout",
     "IntrospectionBranchLayout",
     "PackedCleanQKV",
     "branch_attention",
     "build_canvas_block_mask",
+    "canvas_block_mask_metadata",
     "build_introspection_block_mask",
     "canvas_branch_allowed",
     "dense_packed_clean_attention",

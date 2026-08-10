@@ -12,6 +12,7 @@ from pretraining.byte_diffusion.objectives import (
     blt_masked_loss,
     canvas_cross_entropy,
     cross_entropy_per_row,
+    masked_cross_entropy_per_target,
     introspection_balanced_loss,
     joint_canvas_ar_loss,
     same_position_targets,
@@ -76,6 +77,17 @@ def test_bfloat16_cross_entropy_is_reduced_in_float32() -> None:
     rows = cross_entropy_per_row(logits, targets)
     assert rows.total.dtype == torch.float32
     assert float(rows.mean) == pytest.approx(math.log(261), rel=1e-6)
+
+
+def test_masked_per_target_cross_entropy_is_shape_stable_and_zero_safe() -> None:
+    logits = torch.zeros(2, 3, 5, dtype=torch.bfloat16)
+    targets = torch.tensor([[0, IGNORE_INDEX, 2], [IGNORE_INDEX, 3, 4]])
+    active = targets.ne(IGNORE_INDEX)
+    nll = masked_cross_entropy_per_target(logits, targets, active)
+    assert nll.shape == targets.shape
+    assert nll.dtype == torch.float32
+    torch.testing.assert_close(nll[active], torch.full((4,), math.log(5)))
+    torch.testing.assert_close(nll[~active], torch.zeros(2))
 
 
 def test_canvas_loss_weights_canvases_equally_instead_of_weighting_by_k() -> None:

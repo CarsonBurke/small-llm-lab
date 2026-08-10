@@ -10,6 +10,7 @@ from pretraining.byte_diffusion.attention import (
     PackedCleanQKV,
     branch_attention,
     build_canvas_block_mask,
+    canvas_block_mask_metadata,
     build_introspection_block_mask,
     canvas_branch_allowed,
     dense_packed_clean_attention,
@@ -17,6 +18,7 @@ from pretraining.byte_diffusion.attention import (
     packed_clean_attention,
 )
 from pretraining.byte_diffusion.kernels import AttentionBackend, AttentionBackendCapabilities
+from pretraining.byte_diffusion.layers import PackedSelfAttention
 from pretraining.byte_diffusion.masks import canvas_branch_mask, introspection_mask
 
 
@@ -217,11 +219,11 @@ def test_canvas_segment_ids_prevent_cross_document_prefix_attention() -> None:
 def test_windowed_canvas_prefix_uses_absolute_positions_but_own_branch_is_bidi() -> None:
     layout = _canvas_layout(windowed=True)
     allowed = canvas_branch_allowed(layout)
-    # First branch query is at absolute position 3: clean key 1 is excluded by
-    # the strict two-token window, clean key 2 and all own branch keys survive.
+    # The branch origin is absolute position 3: the same two-token decoder
+    # prefix (clean keys 1 and 2) is shared by every query in that branch.
     assert allowed[0, 0].tolist() == [
         False,
-        False,
+        True,
         True,
         False,
         False,
@@ -250,6 +252,75 @@ def test_canvas_block_mask_token_rule_matches_dense_oracle() -> None:
         device="cpu",
     )[:, 0]
     assert torch.equal(actual, canvas_branch_allowed(layout))
+
+
+def test_canvas_metadata_block_mask_matches_dense_oracle() -> None:
+    from torch.nn.attention.flex_attention import BlockMask
+
+    layout = _canvas_layout(windowed=True)
+    metadata = canvas_block_mask_metadata(layout, block_size=4)
+    block_mask = build_canvas_block_mask(layout, metadata=metadata)
+    batch = torch.arange(layout.batch_size)[:, None, None]
+    query = torch.arange(layout.query_length)[None, :, None]
+    key = torch.arange(layout.kv_length)[None, None, :]
+    actual = block_mask.mask_mod(batch, torch.zeros_like(batch), query, key)
+    assert torch.equal(actual, canvas_branch_allowed(layout))
+
+    # The direct constructor must carry the exact backward transpose PyTorch
+    # would derive from the K/V candidates, not merely an exact token mask.
+    reference = BlockMask.from_kv_blocks(
+        metadata.kv_num_blocks,
+        metadata.kv_indices,
+        BLOCK_SIZE=metadata.block_size,
+        mask_mod=block_mask.mask_mod,
+        seq_lengths=(metadata.query_length, metadata.kv_length),
+    )
+    assert torch.equal(metadata.q_num_blocks, reference.q_num_blocks)
+    assert torch.equal(metadata.q_indices, reference.q_indices)
+
+    q_block, kv_block = metadata.block_size
+    candidate_blocks = torch.zeros(
+        (
+            layout.batch_size,
+            metadata.kv_num_blocks.shape[-1],
+            metadata.kv_indices.shape[-1],
+        ),
+        dtype=torch.bool,
+    )
+    slots = torch.arange(metadata.kv_indices.shape[-1])[None, None, :]
+    active_slots = slots < metadata.kv_num_blocks[:, 0, :, None]
+    candidate_blocks.scatter_(
+        -1,
+        metadata.kv_indices[:, 0].to(torch.long),
+        active_slots,
+    )
+    q_blocks = torch.arange(layout.query_length) // q_block
+    kv_blocks = torch.arange(layout.kv_length) // kv_block
+    candidate_tokens = candidate_blocks[:, q_blocks[:, None], kv_blocks[None, :]]
+    assert bool((~canvas_branch_allowed(layout) | candidate_tokens).all())
+
+
+def test_canvas_metadata_scales_to_2048_branches_without_dense_mask() -> None:
+    clean_length, branches, branch_length = 16_384, 2_048, 16
+    layout = CanvasBranchLayout(
+        clean_valid=torch.ones(1, clean_length, dtype=torch.bool),
+        branch_valid=torch.ones(1, branches, branch_length, dtype=torch.bool),
+        prefix_lengths=(torch.arange(branches) * 4).clamp_max(clean_length)[None],
+        prefix_window=512,
+        clean_positions=torch.arange(clean_length)[None],
+        branch_positions=(
+            (torch.arange(branches) * 4)[:, None]
+            + torch.arange(branch_length)[None]
+        )[None],
+    )
+    metadata = canvas_block_mask_metadata(layout)
+    assert metadata.kv_num_blocks.shape == (1, 1, 256)
+    assert int(metadata.kv_num_blocks.max()) <= 6
+    # Flex uses the final dimension as the complete physical K/V-block
+    # capacity when deriving its transposed backward topology.  This remains
+    # tiny relative to a dense token mask (98K integers versus >1.6B bools).
+    assert metadata.kv_indices.shape == (1, 1, 256, 384)
+    assert metadata.kv_indices.numel() < 100_000
 
 
 def _introspection_layout() -> IntrospectionBranchLayout:
@@ -381,3 +452,137 @@ def test_branch_dispatch_fails_closed_without_flex() -> None:
             layout,
             capabilities=NO_ACCELERATOR,
         )
+
+
+def test_prepacked_document_branches_match_dynamic_reference_with_tail() -> None:
+    torch.manual_seed(29)
+    layer = PackedSelfAttention(dim=8, heads=2, rope_theta=10_000.0)
+    clean_length = 16
+    branch_length = 4
+    branches = 3
+    total_length = clean_length + branches * branch_length
+    states = torch.randn(1, total_length, 8)
+    clean_valid = torch.tensor(
+        [[True] * 8 + [True] * 6 + [False] * 2]
+    )
+    clean_documents = torch.tensor([[0] * 8 + [1] * 6 + [-1] * 2])
+    clean_positions = torch.tensor([[*range(8), *range(6), 0, 0]])
+    branch_valid = torch.tensor(
+        [[[True] * 4, [True, True, False, False], [False] * 4]]
+    )
+    branch_starts = torch.tensor([[4, 12, 0]])
+    branch_positions = torch.tensor(
+        [[[4, 5, 6, 7], [4, 5, 6, 7], [0, 1, 2, 3]]]
+    )
+    positions = torch.cat((clean_positions, branch_positions.flatten(1, 2)), dim=1)
+    clean_indices = torch.tensor([*range(14)])
+    clean_cu = torch.tensor([0, 8, 14], dtype=torch.int32)
+
+    dynamic = layer.forward_document_branches(
+        states,
+        clean_valid=clean_valid,
+        clean_indices=clean_indices,
+        clean_cu_seqlens=clean_cu,
+        clean_document_ids=clean_documents,
+        positions=positions,
+        branch_valid=branch_valid,
+        branch_starts=branch_starts,
+        clean_window=4,
+        allow_dense_reference=True,
+    )
+    prepacked = layer.forward_packed_document_branches(
+        states,
+        clean_length=clean_length,
+        clean_indices=clean_indices,
+        clean_cu_seqlens=clean_cu,
+        positions=positions,
+        branch_query_indices=torch.tensor([16, 17, 18, 19, 20, 21]),
+        branch_kv_indices=torch.tensor(
+            [0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 20, 21]
+        ),
+        branch_query_cu_seqlens=torch.tensor([0, 4, 6], dtype=torch.int32),
+        branch_kv_cu_seqlens=torch.tensor([0, 8, 14], dtype=torch.int32),
+        max_branch_query_length=4,
+        max_branch_kv_length=8,
+        clean_window=4,
+        allow_dense_reference=True,
+    )
+
+    torch.testing.assert_close(prepacked, dynamic, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("window", [4, None])
+def test_shared_document_branches_match_duplicated_oracle_and_do_not_leak(
+    window: int | None,
+) -> None:
+    torch.manual_seed(41)
+    layer = PackedSelfAttention(dim=8, heads=2, rope_theta=10_000.0)
+    clean_length, branches, branch_length = 16, 3, 4
+    states = torch.randn(1, clean_length + branches * branch_length, 8)
+    clean_valid = torch.tensor([[True] * 8 + [True] * 6 + [False] * 2])
+    documents = torch.tensor([[0] * 8 + [1] * 6 + [-1] * 2])
+    clean_positions = torch.tensor([[*range(8), *range(6), 0, 0]])
+    branch_valid = torch.tensor(
+        [[[True] * 4, [True, True, False, False], [False] * 4]]
+    )
+    starts = torch.tensor([[4, 12, 0]])
+    branch_positions = torch.tensor(
+        [[[4, 5, 6, 7], [4, 5, 6, 7], [0, 1, 2, 3]]]
+    )
+    positions = torch.cat((clean_positions, branch_positions.flatten(1, 2)), 1)
+    clean_indices = torch.arange(14)
+    clean_cu = torch.tensor([0, 8, 14], dtype=torch.int32)
+    layout = CanvasBranchLayout(
+        clean_valid,
+        branch_valid,
+        starts,
+        window,
+        None if window is None else clean_positions,
+        None if window is None else branch_positions,
+        documents,
+        torch.tensor([[0, 1, 0]]),
+    )
+    shared = layer.forward_shared_document_branches(
+        states,
+        clean_length=clean_length,
+        clean_indices=clean_indices,
+        clean_cu_seqlens=clean_cu,
+        positions=positions,
+        layout=layout,
+        clean_window=window,
+        allow_dense_reference=True,
+    )
+    oracle = layer.forward_document_branches(
+        states,
+        clean_valid=clean_valid,
+        clean_indices=clean_indices,
+        clean_cu_seqlens=clean_cu,
+        clean_document_ids=documents,
+        positions=positions,
+        branch_valid=branch_valid,
+        branch_starts=starts,
+        clean_window=window,
+        allow_dense_reference=True,
+    )
+    torch.testing.assert_close(shared, oracle, rtol=1e-5, atol=1e-6)
+
+    # Branch one belongs to document one. Document-zero clean bytes, PAD, and
+    # branch zero are sentinels that its output must never observe.
+    changed = states.clone()
+    changed[:, :8] += 1_000
+    changed[:, 14:16] -= 2_000
+    changed[:, clean_length : clean_length + branch_length] += 3_000
+    changed_output = layer.forward_shared_document_branches(
+        changed,
+        clean_length=clean_length,
+        clean_indices=clean_indices,
+        clean_cu_seqlens=clean_cu,
+        positions=positions,
+        layout=layout,
+        clean_window=window,
+        allow_dense_reference=True,
+    )
+    branch_one = slice(clean_length + branch_length, clean_length + 2 * branch_length)
+    torch.testing.assert_close(
+        changed_output[:, branch_one], shared[:, branch_one], rtol=0, atol=0
+    )

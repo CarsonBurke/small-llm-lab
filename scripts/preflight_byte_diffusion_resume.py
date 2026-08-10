@@ -46,6 +46,8 @@ def _run_config() -> TrainingRunConfig:
         val_loss_every=2,
         train_log_every=1,
         validation_chunks=16,
+        validation_microbatch_per_rank=16,
+        diffusion_validation_chunks=16,
         warmdown_iters=0,
         run_id="byte_diffusion_resume_preflight",
         recipe="canvas",
@@ -71,6 +73,7 @@ def _trainer(data_path: Path) -> ByteDiffusionTrainer:
         chunk_size=8_192,
         recipe=run.recipe,
         required_branch_bytes=run.corruption.corrupted_positions_per_row,
+        branch_span_length=run.corruption.canvas_length,
         validation_chunk_limit=run.validation_chunks,
         require_challenge_validation=False,
     )

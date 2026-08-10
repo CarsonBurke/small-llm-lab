@@ -2,11 +2,21 @@
 
 ## Status
 
-Implemented, correctness-gated family. No BPB or generation-quality result is
-claimed yet: the required 2,000-update ablations have not run. Engineering
-measurements below are queued RTX 5090 benchmarks, not paper results or quality
-evidence. The model is initialized from scratch and pretrained natively with
-diffusion masks; it is not a conversion of a BOLMo checkpoint. The completed
+Implemented family under causal-first re-ablation. The first canvas-512 run was
+stopped at update 160 (durable checkpoint 140) after validation showed the
+model was only marginally better than the validation byte unigram: 4.5634 BPB
+at step 140 versus 4.6637 empirical unigram bits/byte. That run is diagnostic
+evidence, not a baseline to resume: it exposed a degenerate base-257 n-gram
+hash and a decoder conditioner whose injected vector norm was about 35 times
+the byte-plus-mode input norm. The checkpoint schema now rejects those weights.
+Three 2,000-update causal controls are complete. The split-cross-attention
+control regressed and is rejected; the next controlled cells use the winning
+gated conditioner, document-isolated packed pages, and then Fast-BLT B=4.
+
+Engineering measurements below are queued RTX 5090 benchmarks, not paper
+results or quality evidence. The model is initialized from scratch and
+pretrained natively with diffusion masks; it is not a conversion of a BOLMo
+checkpoint. The completed
 `bolmo_srcopt_cont_stage2` run is retained only as a byte-accounting, quality,
 and hardware calibration reference:
 
@@ -29,30 +39,86 @@ procedure are absent from the new model.
 The current implementation closes the architecture, data, training, inference,
 and export loop:
 
-- exact default size: 23,011,584 parameters;
-- complete signed-int4 artifact: 12,590,075 bytes including 348,797 counted
-  code bytes, leaving 3,409,925 bytes below the 16,000,000-byte cap;
-- canonical v3 builder/loader artifacts are SHA-verified, lazily shard-cached,
-  isolate one document segment per physical row, and retain short documents
-  and final tails for AR/BPB while diffusion uses PAD-excluded short blocks;
+- gated-conditioner default size: 23,011,074 parameters; the rejected exact
+  split-cross-attention arm has 23,798,528 and the legacy normalized-
+  conditioner control has 23,011,584;
+- the last complete signed-int4 audit belonged to the obsolete normalized-
+  conditioner topology; schema-2 artifact size is re-audited before training;
+- immutable v3 one-document rows remain the C0--C2 controls. Production v5
+  pages pack many document segments into 8,192 physical positions, add only
+  zero-to-three unscored PAD slots at boundaries, precompute byte/patch Flash
+  offsets and a byte-to-condition-patch map, and retain final short Fast-BLT
+  origins with only their out-of-document suffix padded;
 - the virtual leading EOT/BOS predicts every document's first byte without
   shifting its fixed four-byte patch phase;
 - validation reports normalized total codelength per scorer-accounted byte
   (including each registered special/EOT atom as one byte), reduces CE in FP32,
   separately reports atomic CE, includes partial batches, shards across DDP
   ranks with rank-invariant corruption, and uses BF16 model execution;
-- clean/global/decoder K/V caches are typed and reused across canvas NFE, while
-  mid-patch prompts take up to three AR atoms and commits discard scratch K/V
-  before PAD-masked causal replay of accepted ids;
+- the legacy canvas cache is a correctness control. The Fast-BLT serving path
+  still needs incremental clean-cache append before its speed is a publishable
+  comparison; full-prefix replay is not called a production speed result;
 - checkpoints and exported artifacts bind the exact byte/control manifest;
   final export requires a completed checkpoint, dataset provenance, and
   post-dequantization evaluation.
 
-The CPU gate currently passes 212 focused tests, plus a real two-rank
-Gloo update/validation/exact-resume test. Queued CUDA parity passes
-native varlen Flash forward/backward, Flex branch forward/backward, Triton
-categorical/reveal parity, and production branch backpropagation. Compiled
-steady-state measurements are recorded in the compute section.
+The focused pretraining and ablation-integrity CPU suites pass after each
+change; CUDA correctness and performance tests are queued separately. Exact
+test counts are recorded with the corresponding frozen experiment rather than
+kept as a stale family-wide constant. The resume and artifact gates are rerun
+whenever an experiment topology is frozen. Compiled steady-state measurements
+are recorded in the compute section.
+
+The completed C0 control is
+`ablation_results/bd_causal_c0_legacy_norm_2k_v4`:
+
+- 23,011,584 parameters, random initialization, 2,000 updates, 512,000 rows,
+  and 651,665,597 scored atomic targets from the MathGLM-v6 byte build;
+- 684.80 seconds measured training time and 992.45 seconds end-to-end including
+  cold compilation, periodic validation, checkpointing, and harness overhead;
+- 2.206009 BPB on the fixed 2,048-row proxy and 2.210925 BPB on all 158,308
+  challenge-validation rows / 444,874,807 targets;
+- the 0.004916-BPB proxy/full difference shows close agreement for C0; rank
+  preservation still requires multiple completed ablation cells, and C0 is
+  1.0375 BPB worse than the retained
+  `nanogpt_mini_gpt2vocab_2k` 1.1734-BPB control;
+- training source SHA-256
+  `1f451133565d7f03f9693093280bd6fb68c3b0a7dda072fd552b662d1fa85068`
+  and dataset payload SHA-256
+  `2f3a75473e678cbaf2a1d25cad8a6e0a50c94b66582d2927d4184a9b3d5c1c52`.
+
+This fails the quality gate decisively. It is the causal byte-family baseline,
+not an architecture to promote unchanged into diffusion pretraining.
+
+The completed combined repair control C1 is
+`ablation_results/bd_causal_c1_refcfg_2k_v1`:
+
+- 23,011,074 parameters, 2,000 updates, the identical v3 dataset, row order,
+  global batch, AdamW optimizer, and schedule as C0;
+- 1.888405 BPB on the fixed 2,048-row proxy, 639.80 seconds measured training
+  time, and 984.33 seconds end to end;
+- checkpoint SHA-256
+  `b18a9e31928bed0bde40f8c24b29a7422123dd336befcd8cc6a9e0fd91d5fbcb`;
+- training source SHA-256
+  `386c52afa3a7f8d800f2c4f94075f3466bf10676a2047d9cfa99123b37b80039`.
+
+C1 simultaneously replaces the degenerate base-257 n-gram hash with the prime
+hash and replaces unit-RMS conditioning with a scale-matched gated projection.
+Its 0.317604 proxy-BPB gain therefore validates the combined repair but cannot
+be attributed to either mechanism separately. The earlier C1/H1 naming matrix
+was not the experiment actually run and is corrected below.
+
+The completed split-conditioner control C2 is
+`ablation_results/bd_causal_c2_splitxattn_2k_v1`:
+
+- 23,798,528 parameters and the same data/order/optimizer/schedule as C1;
+- 1.956511 proxy BPB, 759.98 seconds measured training, and 1,166.19 seconds
+  end to end;
+- a 0.068106 BPB regression versus C1, so split cross-attention is retained as
+  a paper-fidelity arm but is not the family default;
+- hot periodic validation is 1.33--1.35 seconds after packed logits, length
+  ordering, and shard-resident batching; the 53.998-second step-zero value
+  includes cold compilation.
 
 ## References
 
@@ -86,19 +152,21 @@ sharing one checkpoint:
 1. **AR anchor:** exact next-byte generation and BPB evaluation.
 2. **Introspective stride:** lossless or near-lossless self-speculative byte
    generation for high-concurrency rollouts.
-3. **Canvas diffusion:** iterative generation of a fixed 512-byte canvas for
-   low-concurrency latency and long parallel proposals.
+3. **Fast-BLT blocks:** iterative generation of B=4 first, then B=8/16 only
+   when their measured quality/speed frontier justifies the larger horizon.
+   A 512-byte latent canvas remains a separate research arm.
 
-The intended final system routes between the modes. Canvas diffusion is the
-primary pretraining objective. The causal prefix loss is an auxiliary applied
-inside the same mixed-mask forward, not a separate AR pretraining stage.
+The intended final system routes between the modes. Fast-BLT B=4 is the first
+primary diffusion objective because it is the strongest quality point in the
+reference. The causal prefix loss is trained in the same optimizer update, not
+as an earlier pretraining stage. Canvas-512 must beat B=4 before promotion.
 
-Production batching is document-count exact. Each optimizer update consumes
-256 rows. On the 32GiB RTX 5090, cropped clean-plus-canvas banks use ten
-24-row microbatches plus one 16-row tail at worst, with a 208,896-position
-cap. The trainer normalizes AR targets and diffusion canvases over the whole
-update, so the tail changes neither sample exposure nor objective weighting.
-On 8xH100 the same global batch may use one 32-row microbatch per rank.
+Production batching is supervision-budget exact, not row-count exact. The
+first aligned-page control targets about 1.31M clean atoms/update (160 full
+8,192-position pages), matching the latest AR comparator within 3%. On the
+32GiB RTX 5090 the initial physical bucket is four pages/microstep; on 8xH100
+that becomes five local microsteps. Diffusion origins are budgeted separately
+so changing B or document density cannot silently change objective exposure.
 
 ### Evaluation contract
 
@@ -365,6 +433,10 @@ I-DLM's accepted-prefix-only commit provide the inference-side precedent.
 - Align artificial training chunks to patch boundaries and carry one extra
   target-byte halo for shifted AR labels. If no halo exists at a true stream
   end, exclude only that undefined final label.
+- Retain every Fast-BLT origin after a document's first patch, including the
+  final short origin. Gather real atoms only through that document's EOT and
+  fill the rest of the B-wide branch with attention-excluded, unscored PAD;
+  never gather through the alignment gap into the next document.
 - Incremental AR/ISD state carries zero to three committed bytes in an
   `incomplete_patch_buffer`. They decode from the previous complete global
   latent. On byte four or EOT, pool the patch and append its global state.
@@ -448,7 +520,12 @@ A compact causal n-gram feature arm is implemented behind a switch: one shared
 small `16 -> 256` projections. Hashes are computed from the actual visible or
 `[MASK]` ids, never from hidden clean targets. This is only a parameter-
 constrained analogue of BLT's much larger tables and requires a 2,000-step
-on/off ablation.
+on/off ablation. The experiment contract separates four details that were
+previously confounded: the legacy base-257 hash versus the Appendix-C-oriented
+10-digit-prime hash, weak versus scale-matched low-rank factors, official-code-
+style summation versus the paper's divide-by-seven aggregation, and normalized
+versus gated decoder conditioning. The default does not divide weak low-rank
+features by seven.
 
 For a noisy latent canvas, the same encoder weights use a different verified
 mask: noisy bytes read the committed clean prefix and all bytes in their own
@@ -471,10 +548,11 @@ papers when doing so would create 16- or 32-wide heads at this scale.
 The two denoising paths are named so results cannot be accidentally conflated:
 
 - **BLT-D reference:** the encoder and global trunk process only the clean
-  row. Isolated 16-byte, then 32-byte, corrupted blocks are handled by the
+  row. Isolated 4-byte, then 8- and 16-byte, corrupted blocks are handled by the
   decoder and every block reads the clean global latent immediately before its
-  start. Training samples enough nonoverlapping blocks to total 512 corrupted
-  decoder positions per clean row: 32 blocks at length 16 or 16 at length 32.
+  start. The first compute-bounded cell samples 128 unique origins per page,
+  totaling at most 512 corrupted decoder positions, with Horvitz--Thompson
+  inclusion weighting against the full eligible-origin population.
   This preserves Fast BLT's decoder mechanics, masks, positions, alignment,
   and loss while scaling its decoder to two layers, lowering one-key cross-
   attention to a projection, fixing routing, and replacing its block-at-every-
@@ -496,12 +574,17 @@ a 512-byte sliding window, SwiGLU width 512, and aligned global conditioning
 before the Transformer block. This moves the parameter ratio toward BLT and
 reduces the repeated per-byte work that dominates both training and sampling.
 
-With exactly one permitted global latent per byte, BLT cross-attention's
-softmax is over one key and therefore reduces algebraically to a learned
-projection of that latent plus a residual. The optimized baseline uses a
-`512 -> 256` projected addition at every decoder layer. A literal cross-
-attention module remains a parity/quality ablation; if a byte is ever allowed
-to read multiple latents, real cross-attention becomes mandatory.
+BLT does not expose one softmax key per aligned latent. Its `D_C` transform
+maps each 512-wide global latent to 512 values and splits it into `k = 2`
+256-wide representations. Every decoder byte therefore performs genuine,
+query-dependent four-head cross-attention over two keys, with Q/K/V/output
+projections and no cross-attention positional encoding. C2 implemented that
+topology and regressed BPB by 0.068106. The default is therefore the measured
+23,011,074-parameter gated `512 -> 256` projection; the split implementation
+remains available as the explicit paper-fidelity arm. At initialization
+the split path's condition residual is about 3.6 times the RMS of a 0.02-scale
+decoder input; residual scaling or zero initialization is a named stabilization
+ablation because the papers do not close that initialization detail.
 
 Decoder states start from `E_in[input_id]`, not bidirectional encoder hidden
 states. Clean decoder attention is causal. Corrupted BLT-D or canvas positions
@@ -530,18 +613,21 @@ before any GPU workload.
 | local encoder Transformer | 1 block, width 256, SwiGLU 512 | 655,872 |
 | patch pooling | max-pool projection plus local-to-global cross-attention | 918,272 |
 | global latent backbone | 9 blocks, width 512, SwiGLU 704 | 19,178,496 |
-| local decoder | 2 blocks, width 256, SwiGLU 512, per-layer `512 x 256` conditioning | 1,574,400 |
+| local decoder | 2 blocks, width 256, SwiGLU 512, per-layer gated `512 x 256` conditioning | 1,573,890 |
 | untied output head | bias-free `256 x 261` | 66,816 |
 | final norms and three local-width mode embeddings | no gates/timestep/self-conditioning | 1,536 |
-| provisional base total | factorized n-grams on | 23,011,584 |
-| hard parameter cap | | 24.8M |
+| provisional base total | factorized n-grams on | 23,011,074 |
+| measured default | 9 global blocks | 23,011,074 |
+| size-utilization arm | 12 global blocks | 29,403,906 |
+| hard parameter cap | int4 group-64 artifact | 29.41M |
 
-About 83% of the provisional parameters are in the global trunk, versus roughly
+About 83% of the default parameters are in the global trunk, versus roughly
 54% in the previous draft; the four-layer local decoder is removed. A raw
-4-bit payload for 23,011,584 values is about 11.51MB. This does not prove artifact
+4-bit payload for 23,011,074 values is about 11.51MB. This does not prove artifact
 eligibility: quantization scales, exceptions, metadata, and executable code
-must all fit in 16,000,000 decimal bytes. The remaining parameter headroom is
-not pre-spent on LoRA, timestep projections, or self-conditioning.
+must all fit in 16,000,000 decimal bytes. The 12-global-layer arm produces a
+15,639,227-byte schema-2 artifact before submission code, leaving 360,773
+bytes. It is an ablation, not yet a promoted default.
 
 Proposal-only adapters are a later I-DLM ablation and must compete against
 putting the same serialized bytes into the base model. Local-decoder-only LoRA
@@ -553,7 +639,7 @@ called lossless merely because its gates are zero on anchor positions.
 The implementation begins with two named configurations rather than pretending
 that the 512-byte extrapolation is already established:
 
-| Field | `bd_blt16_ref` | `bd_canvas512` target |
+| Field | `bd_blt4_ref` | `bd_canvas512` target |
 |---|---:|---:|
 | local/global widths | 256 / 512 | 256 / 512 |
 | encoder / global / decoder blocks | 1 / 9 / 2 | 1 / 9 / 2 |
@@ -561,7 +647,7 @@ that the 512-byte extrapolation is already established:
 | fixed patch stride | 4 | 4 |
 | factorized n-grams | on; ablate off | on; inherit winning reference arm |
 | corrupted global latents | none | 128 |
-| corrupted length | 32 x 16-byte blocks, then 16 x 32 | 512; benchmark 128/256 first |
+| corrupted length | 128 x 4-byte blocks; then B=8/16 | 512; benchmark 128/256 first |
 | corrupted positions per clean row | 512 | 512 at `M=1`; ablate `M=2,4` |
 | corruption | independent-byte absorbing `[MASK]` | `absorbing_rb`; then `allmask_50`, then whole-patch if needed |
 | corrupted target alignment | same position | same position |
@@ -610,6 +696,88 @@ breaks or recompiles. Batch 32 reaches 1.097s/update but repeatedly leaves less 
 therefore gives up only 1.3% wall throughput while recovering about 5.7GiB of
 allocated headroom, and is the single-5090 production choice. At 1.111s/update,
 2,000 training updates are about 37.0 minutes before periodic validation.
+
+The causal C0 control now has its own upstream-AR-referenced performance audit.
+The comparison uses the same RTX 5090 and samples only steady training, but the
+units are kept explicit: the upstream model consumes SP1024 tokens while C0
+consumes atomic byte/control targets. The upstream validation corpus averages
+2.43593 source bytes per SP1024 token, so its 790,853 tokens/s corresponds to
+about 1.926M source bytes/s. C0 directly reports scored atomic targets/s.
+
+| steady training path | ms/update | useful throughput | avg util / power | peak allocated | result |
+|---|---:|---:|---:|---:|---|
+| upstream `train_gpt.py` AR | 662.94 | 790,853 SP tokens/s; about 1.926M source bytes/s | 99.27% / 505W | 12.87GiB | hardware reference |
+| original causal C0, B24 | 338.57 | 957,194 byte targets/s | 88.45% / 348W | 15.04GiB | superseded |
+| reusable row indices + packed logits/CE, 12-update sample | 284.80 | 1,131,255 byte targets/s | 76.11% / 357W | 13.93GiB | accepted |
+| frozen accepted source, first 20-update sample | 291.18 | 1,132,790 byte targets/s | 84.56% / 349W | 13.93GiB | retained sample |
+| SHA-audited accepted source, independent 20-update sample | 310.41 wall; 296.57 device | 1,062,604 wall; 1,112,201 device byte targets/s | 85.78% / 359W | 13.93GiB | production C0 reference |
+
+The accepted path computes the 261-way projection only for valid packed
+decoder states, keeps logits packed through FP32 summed CE, and reuses one flat
+row-index vector for every byte-width gather/scatter plus one at patch
+resolution. The 338.57 and 284.80ms aggregates cover different 8- and
+12-update windows, so their raw 15.9% delta is directional rather than an
+exact paired claim. The first longer sample is 14.0% lower in raw update time
+and 18.3% higher in target-normalized throughput than the original sample. An
+independent audited sample is slower at 310.41ms wall / 296.57ms device, so the
+accepted result is reported as replicate variance instead of selecting only
+the faster run. The audited artifact binds dataset SHA-256
+`2f3a75473e678cbaf2a1d25cad8a6e0a50c94b66582d2927d4184a9b3d5c1c52`
+and training-source SHA-256
+`1f451133565d7f03f9693093280bd6fb68c3b0a7dda072fd552b662d1fa85068`.
+The path preserves the global active-target mean, stored label halos,
+synthetic BOS targets, and the per-row clean sums still required by mixed
+Fast-BLT `paper_sum`. Across the two longer samples, C0 is about 1.70--1.81x
+behind upstream AR in source-byte-normalized throughput, despite being faster
+per optimizer update; raw update time and raw token/s are therefore not used as
+cross-tokenizer speed claims.
+
+The completed checkpoint's audited hot full-challenge validation pass takes
+161.08 seconds for
+444,874,807 targets (about 2.76M targets/s), averages 72.53% utilization and
+373.76W, peaks at 95% and 431.54W, and uses 3.50/7.86GiB allocated/reserved.
+There are zero hot graph breaks or recompiles. This is no longer the old
+intermittent roughly 110W validation path, although its irregular packed kernels
+still leave a material utilization gap versus the 99.27% / 505W AR reference.
+The separate cold materialization/compile pass takes 201.88 seconds, for
+362.96 seconds across the two evidence passes. Its v2 artifact binds checkpoint
+SHA-256 `10ba05b1fafafb1ebd1ddb825eecdb3c25f8de8769259edf9e573f73990cb9dd`,
+dataset payload SHA-256
+`2f3a75473e678cbaf2a1d25cad8a6e0a50c94b66582d2927d4184a9b3d5c1c52`,
+and evaluation-source SHA-256
+`41983e16675df0d288e06e251856a7fa16ebd5463e13e2f4d1c5440a3dc48821`.
+
+The dominant remaining step-level sample-efficiency defect is now quantified:
+one isolated document per 8,192-position physical row fills only 15.54% of the
+training storage. C0 therefore receives 325,833 scored byte/control targets per
+update, while the AR reference's 524,288 SP1024 targets correspond to about
+1,277,129 source bytes per update at the measured 2.43593 bytes/token. Equal
+optimizer steps give AR about 3.92x more source-byte supervision. Packed varlen
+attention avoids paying the full trunk cost for every PAD position, but it does
+not create missing learning signal. The next isolated data-layout ablation is
+document-local multi-segment packing with explicit segment offsets/resets; it
+must preserve BOS/EOT, halos, fixed patch phase, and causal isolation while
+raising active targets/update. Inflating the existing microbatch is not a
+substitute.
+
+The following follow-ups were isolated on the identical C0/data order and
+rejected rather than accumulated:
+
+| rejected path | ms/update | delta versus 284.80ms | reason |
+|---|---:|---:|---|
+| shared RoPE tensors | 294.03 | +3.2% | materialization/traffic exceeded saved trig kernels |
+| patch-rate conditioner projection | 315.42 | +10.8% | repeated alignment/gathers fragmented otherwise efficient GEMMs |
+| pack embeddings/ngrams before the trunk | 292.10 | +2.6% | smaller irregular kernels lost more than PAD work saved |
+| one fused n-gram recurrence/projection | 304.30 | +6.8% | original per-order compiler fusion was faster |
+| B32 / eight microsteps | 307.13 | +7.8% | higher 82.45% utilization but lower useful throughput |
+| dynamic CUDA graphs | 489.02 | +71.7% | ragged capture was slower despite no graph churn |
+
+`max-autotune-no-cudagraphs` was cancelled as broken after spending nearly the
+entire challenge wall-clock budget compiling before its first measured update.
+Ordinary dynamic compile and B24 are fail-closed defaults. These measurements
+also demonstrate why board utilization and watts are telemetry rather than
+promotion objectives: B32 reports higher utilization while training 7.8%
+slower.
 
 A fresh-process CUDA resume preflight restores the cursor and every Python,
 Torch, CUDA, and corruption RNG state exactly, reproduces the next update's
@@ -712,7 +880,18 @@ evidence of a specific BPB improvement.
 Larger `M`, sampler replay, distillation, and RL all count against wall time;
 they are not free sample-efficiency gains.
 
-Parameter storage is not the VRAM bottleneck. The provisional 23,011,584-parameter model
+Periodic validation originally took about 72.7 seconds because each field
+access repeatedly decompressed NPZ shards and every row also ran the expensive
+joint canvas path. After loading each referenced shard once per batch, caching
+the fixed proxy, evaluating all 2,048 rows through causal BPB, and restricting
+the all-mask diagnostic to an evenly covered 256-row subset, queued job 1637
+measured 2.8215 seconds per cached validation: 92.8% average GPU utilization,
+389W average power, 11.66GiB peak allocation, and zero post-warmup recompiles.
+The first validation still took 109.9 seconds including shard materialization
+and compilation. Both cold and hot latency are now explicit readiness gates;
+global length sorting was rejected because it broke compressed-shard locality.
+
+Parameter storage is not the VRAM bottleneck. The provisional 23,011,074-parameter model
 uses under 0.7GiB for BF16/FP32 weights, gradients, and optimizer state in the
 expected setup. Activations, attention workspaces, and compiler pools dominate.
 Bucket lengths and tune `B_row` per bucket rather than padding everything to
@@ -762,17 +941,15 @@ justified because compiled batch sweeps plateau in useful positions/s rather
 than exposing a measured launch-gap breakdown; this is a specific remaining
 profile, not a policy to wait on obvious fusion.
 
-The production profile does expose one remaining material packing cost:
-expanded-mask `masked_select`/`masked_scatter` around each clean Q/K/V varlen
-bank. This was acted on, not deferred. Exact CPU-built ragged indices, fused
-QKV gather, opaque custom gather/scatter autograd, and fixed-capacity
-dummy-suffix variants were each implemented and CUDA-tested. On the installed
-PyTorch 2.13 compiler all four fail production dynamic backward lowering with
-an Inductor `CantSplit` error when packed-clean and branch gradients meet.
-Those rejected paths are not retained. The warning-free 1.111s/update path is
-the launch baseline; revisiting vector-granularity packing requires either an
-upstream scheduler fix or a fully opaque fused attention/backward extension,
-and must beat that measured baseline before promotion.
+The production profile exposed expanded-mask `masked_select`/`masked_scatter`
+around each clean varlen bank. The causal-only path now replaces repeated
+scalar-expanded selection with reusable vector row indices and keeps logits
+packed through CE; this is the accepted 15.9% result above. Mixed canvas/BLT
+paths retain their per-row/scatter representation because branch backward and
+`paper_sum` require additional segment structure. Fully opaque branch-aware
+packing still requires either an upstream scheduler fix or a fused
+attention/backward extension, and must beat the measured mixed baseline before
+promotion.
 
 The compiled joint path at `B=1,L=8192,C=512` measures 18.82 ms versus
 273.26 ms eager, a 14.5x systems speedup and a reduction from 1.82GiB to
@@ -1012,22 +1189,25 @@ estimate of the complete fixed-patch masked sum and adds the exact clean sum
 before the batch mean. It is not an exact enumeration of all blocks and is not
 assumed optimal at length 512.
 
-The latent-canvas baseline, named `absorbing_rb`, uses a lower-variance
-equivalent sampling view. Let `U` be the number of eligible positions. If one
-unobserved `t` governs all `U` identical Bernoulli masks, the marginal count is
-`K ~ Uniform{0, ..., U}`; conditional on nonzero `K`, the subset is uniform and
-`E[1/t | K] = (U + 1) / K`. Therefore sample
-`K ~ Uniform{1, ..., U}`, choose exactly `K` eligible positions without
-replacement, and take a mean over masked positions within each canvas before
-averaging canvases. Apart from the zero-contribution `K=0` event and a constant
-scale, this Rao--Blackwellizes the Fast BLT estimator.
+The latent-canvas baseline, named `absorbing_rb`, uses the lower-variance noise
+sampling part of a Rao--Blackwell construction, but its current equal-mean loss
+is deliberately not the Fast-BLT estimator. Let `U` be the number of eligible
+positions. If one unobserved `t` governs all `U` identical Bernoulli masks, the
+marginal count is `K ~ Uniform{0, ..., U}`; conditional on nonzero `K`, the
+subset is uniform and `E[1/t | K] = (U + 1) / K`. An exact conditional
+Rao--Blackwell loss is therefore proportional to `(U + 1) * masked_mean` (or
+`U * masked_mean` when sampling `K` uniformly from `1..U` and retaining the
+zero-event probability). The implemented `equal_mean` arm omits this length
+factor and averages canvases equally. That avoids high-noise canvases
+dominating by label count, but it underweights long canvases relative to the
+paper estimator whenever `U` varies. It must not be described as an ELBO or
+paper-equivalent objective.
 
-That equivalence requires all of the stated conditions: a single shared `t`,
-no model input for `t`, identical masking eligibility, per-canvas reduction,
-and no selective treatment of specials. If an objective excludes any clean
-special from corruption, use its actual eligible count `U`; a global masked-
-token mean across the batch would reweight examples by `K` and is not the same
-objective.
+The exact relation also requires a single shared `t`, no model input for `t`,
+identical masking eligibility, and no selective treatment of specials. If an
+objective excludes any clean special from corruption, use its actual eligible
+count `U`; a global masked-token mean across the batch instead reweights
+examples by `K` and is a third objective.
 
 For `whole_patch`, apply the same derivation to 128 patch groups: sample
 `J ~ Uniform{1, ..., valid_patches}`, choose exactly `J` groups, mask every
@@ -1383,12 +1563,22 @@ approximately four-second 5090-equivalent step needed for the challenge cap.
 
 ### 4. Scratch-pretraining ablations
 
-- Train a causal-only control with the identical architecture and device-time
-  budget; it is an experimental control, not a warm-start checkpoint.
-- Train `bd_blt16_ref` from random initialization, then ablate block 32. These
+- C0 and C1 are completed combined diagnostic controls, not a valid one-factor
+  sequence: C0 is `legacy257 + weak/sum + RMS-normalized projection`; C1 is
+  `prime hash + weak/sum + gated projection`. If attribution remains useful,
+  complete the missing two-by-two cells `legacy+gated` and `prime+normalized`
+  on identical v3 rows. Do not attribute C1's gain retrospectively.
+- Run the paper-topology cell `X1 = C1 + split k=2 cross-attention`, followed by
+  a residual-scale stabilization arm only if X1's initialization or learning
+  curve is worse. Separately ablate scale-matched n-gram factors, divide-by-seven
+  aggregation, and the repository's nanoGPT Adam+Muon recipe. Every contrast
+  keeps data, clean atoms, stochastic seed, and schedule fixed.
+- Train `bd_blt4_ref` from random initialization, then ablate blocks 8 and 16.
+  Fast BLT's reported quality degrades monotonically as block size grows, so
+  32 and 512 are not justified starting points. These
   retain Fast BLT's decoder masks and same-position target while deliberately
-  using fixed routing and sampled nonoverlapping blocks totaling 512 corrupted
-  positions rather than entropy patching and every eligible patch start.
+  using fixed routing and unique sampled blocks with an inclusion-weighted
+  estimator rather than entropy patching and full origin enumeration.
 - Only after that reference works, enable noisy encoder/global latents at
   `C = 128`; compare `absorbing_rb` with `allmask_50`, then whole-patch and
   contiguous-patch-span corruption only if local reconstruction remains a
@@ -1508,12 +1698,26 @@ teams after the first full pass. The review found and this revision fixes:
   the shared-bank reference on CPU and measure 12.45x faster on the 5090;
 - hot-path GPU scalar extraction for full-row checks and per-row branch-start
   sampling; full-row metadata stays on CPU and starts are sampled vectorially.
+- repeated NPZ decompression and full joint-path evaluation in periodic
+  validation; the fixed proxy is cached, causal BPB remains complete, and the
+  all-mask diagnostic uses a declared deterministic subset;
+- an ablation parser that truncated scientific notation (`9.775e-05` became
+  `9.775`), silently discarded non-finite metrics, and could report an old
+  finite validation as a successful endpoint; numeric tokens are now parsed
+  completely, time units are explicit, JSON is finite-only, malformed records
+  fail closed, and a successful run requires one finite validation at its
+  requested final step;
+- a base-257 polynomial hash that collapses into structured low-bit moments
+  modulo the power-of-two table, plus a decoder conditioner whose unconditional
+  RMS normalization overwhelmed byte identity; both are isolated as explicit
+  causal-first controls rather than silently folded into a new canvas run.
 
 The earlier specification audit also fixed:
 
 - the high-variance sampled `1/t` estimator at large canvas length by defining
-  both an inclusion-weighted Fast-BLT control and a Rao--Blackwellized
-  `absorbing_rb` baseline;
+  an inclusion-weighted Fast-BLT control and a lower-variance exact-`K`
+  optimization arm; the latter is now explicitly documented as unequal to the
+  paper estimator because it omits the variable `U` length factor;
 - a parameter budget inferred by subtraction rather than counted from the new
   architecture;
 - an intra-patch-only local encoder that did not implement BLT's causal byte

@@ -27,6 +27,8 @@ from torch import Tensor
 ATOMIC_OUTPUT_SIZE = 261
 _TRITON_BLOCK_SIZE = 512
 _TRITON_CATEGORICAL_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+# Largest standard canvas. The reveal implementation is also shape-specialized
+# for Fast-BLT B4/B8/B16 inference.
 CANVAS_REVEAL_SIZE = 512
 DEFAULT_DENSE_REFERENCE_LIMIT = 256
 
@@ -500,12 +502,12 @@ def _validate_reveal_inputs(
     quota: int | Tensor,
     eot_id: int,
 ) -> None:
-    expected = (canvas.shape[0], CANVAS_REVEAL_SIZE) if canvas.ndim == 2 else None
-    if expected is None or canvas.shape != expected:
+    if canvas.ndim != 2 or not 0 < canvas.shape[1] <= CANVAS_REVEAL_SIZE:
         raise ValueError(
-            f"canvas must have shape [batch, {CANVAS_REVEAL_SIZE}], "
-            f"got {tuple(canvas.shape)}"
+            f"canvas must have shape [batch, width] with 1 <= width <= "
+            f"{CANVAS_REVEAL_SIZE}, got {tuple(canvas.shape)}"
         )
+    expected = canvas.shape
     for name, tensor in {
         "samples": samples,
         "entropy": entropy,
@@ -542,10 +544,11 @@ def _validate_reveal_inputs(
 
 
 def _quota_per_row(canvas: Tensor, quota: int | Tensor) -> Tensor:
+    width = canvas.shape[1]
     if isinstance(quota, int):
         return torch.full(
             (canvas.shape[0],),
-            max(0, min(quota, CANVAS_REVEAL_SIZE)),
+            max(0, min(quota, width)),
             dtype=torch.int64,
             device=canvas.device,
         )
@@ -646,12 +649,23 @@ def _reveal_low_entropy_triton(
             quota,
             eot_id=eot_id,
         )
-    quota_rows = (
-        _quota_per_row(canvas, quota)
-        .clamp(0, CANVAS_REVEAL_SIZE)
-        .to(torch.int32)
-        .contiguous()
-    )
+    width = canvas.shape[1]
+    # tl.sort requires a power-of-two compile-time width. Canonical BLT block
+    # sizes and the 512-byte canvas satisfy this; unusual widths use the
+    # vectorized Torch reference without returning to scalar Python.
+    if width & (width - 1):
+        return reveal_low_entropy_reference(
+            canvas,
+            samples,
+            entropy,
+            unresolved,
+            active,
+            quota,
+            eot_id=eot_id,
+        )
+    quota_rows = _quota_per_row(canvas, quota).clamp(0, width).to(
+        torch.int32
+    ).contiguous()
     contiguous_canvas = canvas.contiguous()
     contiguous_samples = samples.contiguous()
     contiguous_entropy = entropy.contiguous()
@@ -677,8 +691,8 @@ def _reveal_low_entropy_triton(
         active_out,
         revealed_out,
         eot_id,
-        WIDTH=CANVAS_REVEAL_SIZE,
-        num_warps=8,
+        WIDTH=width,
+        num_warps=8 if width >= 256 else 4,
     )
     return canvas_out, unresolved_out, active_out, revealed_out
 

@@ -16,7 +16,12 @@ from .layers import (
     RMSNorm,
     TransformerBlock,
     pack_valid,
+    pack_rows,
+    packed_sequence_offsets,
+    prefix_row_indices,
+    valid_row_indices,
     unpack_valid,
+    unpack_rows,
 )
 
 
@@ -25,6 +30,7 @@ class ModelOutput:
     logits: Tensor
     byte_states: Tensor
     patch_states: Tensor
+    bos_patch_states: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,7 @@ class BltBranchOutput:
     clean_logits: Tensor
     branch_logits: Tensor
     clean_patch_states: Tensor
+    bos_patch_states: Tensor | None = None
 
 
 class CausalNgramEmbedding(nn.Module):
@@ -49,35 +56,124 @@ class CausalNgramEmbedding(nn.Module):
         super().__init__()
         self.orders = config.ngram_orders
         self.table_size = config.ngram_table_size
+        self.table_mask = (
+            config.ngram_table_size - 1
+            if config.ngram_table_size & (config.ngram_table_size - 1) == 0
+            else None
+        )
         self.eot_id = config.vocab.eot_id
         self.pad_id = config.vocab.pad_id
-        self.table = nn.Embedding(config.ngram_table_size, config.ngram_rank)
-        self.projections = nn.ModuleList(
-            nn.Linear(config.ngram_rank, config.local_dim, bias=False)
-            for _ in self.orders
+        self.hash_kind = config.ngram_hash
+        self.table = (
+            nn.Embedding(config.ngram_table_size, config.ngram_rank)
+            if config.ngram_table_sharing == "shared"
+            else None
+        )
+        self.tables = (
+            None
+            if config.ngram_table_sharing == "shared"
+            else nn.ModuleList(
+                nn.Embedding(config.ngram_table_size, config.ngram_rank)
+                for _ in self.orders
+            )
+        )
+        self.projection_weight = nn.Parameter(
+            torch.empty(
+                len(self.orders) * config.local_dim,
+                config.ngram_rank,
+            )
         )
 
+    @property
+    def projection_weights(self) -> Tensor:
+        return self.projection_weight.view(
+            len(self.orders), -1, self.projection_weight.shape[-1]
+        )
+
+    def _hash_ids(self, ids: Tensor, order: int) -> tuple[Tensor, Tensor]:
+        """Return configured polynomial hashes and their causal validity mask."""
+
+        rolling = torch.zeros_like(ids)
+        context_ok = torch.ones_like(ids, dtype=torch.bool)
+        if self.hash_kind == "blt_prime":
+            # Appendix C puts the current byte at exponent zero, so consume
+            # oldest-to-current in the Horner recurrence. The 10-digit prime
+            # avoids the legacy base-257 collapse modulo a power-of-two table.
+            base = 1_000_000_007
+            offsets = reversed(range(order))
+            addend = 0
+        else:
+            base = 257
+            offsets = range(order)
+            addend = 1
+        for offset in offsets:
+            shifted = torch.zeros_like(ids)
+            if offset == 0:
+                shifted = ids
+            elif offset < ids.shape[1]:
+                shifted[:, offset:] = ids[:, :-offset]
+            rolling = rolling * base + shifted + addend
+            rolling = (
+                rolling & self.table_mask
+                if self.table_mask is not None
+                else rolling % self.table_size
+            )
+            if offset:
+                context_ok &= (shifted != self.eot_id) & (shifted != self.pad_id)
+        enough_context = torch.arange(ids.shape[1], device=ids.device) >= order - 1
+        return rolling, context_ok & enough_context[None, :]
+
     def forward(self, ids: Tensor) -> Tensor:
-        batch, length = ids.shape
-        result = self.table.weight.new_zeros((batch, length, self.projections[0].out_features))
-        modulus = self.table_size
-        for order, projection in zip(self.orders, self.projections, strict=True):
-            rolling = torch.zeros_like(ids)
-            context_ok = torch.ones_like(ids, dtype=torch.bool)
-            for offset in range(order):
+        """Embed all configured orders with one shared rolling recurrence."""
+
+        features: list[Tensor] = []
+        maximum_order = max(self.orders)
+        base = 1_000_000_007 if self.hash_kind == "blt_prime" else 257
+        addend = 0 if self.hash_kind == "blt_prime" else 1
+        rolling = ids + addend
+        rolling = (
+            rolling & self.table_mask
+            if self.table_mask is not None
+            else rolling % self.table_size
+        )
+        context_ok = torch.ones_like(ids, dtype=torch.bool)
+        position_indices = torch.arange(ids.shape[1], device=ids.device)
+        power = 1
+        feature_index = 0
+        for order in range(1, maximum_order + 1):
+            if order > 1:
+                offset = order - 1
                 shifted = torch.zeros_like(ids)
-                if offset == 0:
-                    shifted = ids
-                elif offset < length:
-                    shifted[:, offset:] = ids[:, :-offset]
-                rolling = (rolling * 257 + shifted + 1) % modulus
-                if offset:
-                    context_ok &= (shifted != self.eot_id) & (shifted != self.pad_id)
-            enough_context = torch.arange(length, device=ids.device) >= order - 1
-            features = projection(self.table(rolling))
-            active = context_ok & enough_context[None, :]
-            result = result + features * active[:, :, None]
-        return result
+                shifted[:, offset:] = ids[:, :-offset]
+                if self.hash_kind == "blt_prime":
+                    power = (power * base) % self.table_size
+                    rolling = rolling + shifted * power
+                else:
+                    # legacy257 consumes current-to-oldest in its Horner
+                    # recurrence; extending the order therefore appends the
+                    # newly exposed older byte at exponent zero.
+                    rolling = rolling * base + shifted + addend
+                rolling = (
+                    rolling & self.table_mask
+                    if self.table_mask is not None
+                    else rolling % self.table_size
+                )
+                context_ok &= (shifted != self.eot_id) & (
+                    shifted != self.pad_id
+                )
+            if order not in self.orders:
+                continue
+            enough_context = position_indices >= order - 1
+            active = context_ok & enough_context[None]
+            table = (
+                self.table
+                if self.table is not None
+                else self.tables[feature_index]
+            )
+            features.append(table(rolling) * active[:, :, None])
+            feature_index += 1
+        stacked = torch.stack(features, dim=2)
+        return torch.einsum("blor,odr->bld", stacked, self.projection_weights)
 
 
 def _causal_window_mask(length: int, window: int, device: torch.device) -> Tensor:
@@ -118,6 +214,7 @@ class ByteDiffusionModel(nn.Module):
                 config.global_heads,
                 config.global_ffn_dim,
                 config.rope_theta,
+                config.global_ffn_kind,
             )
             for _ in range(config.global_layers)
         )
@@ -129,6 +226,7 @@ class ByteDiffusionModel(nn.Module):
                 config.local_heads,
                 config.decoder_ffn_dim,
                 config.rope_theta,
+                config.decoder_conditioning,
             )
             for _ in range(config.decoder_layers)
         )
@@ -160,9 +258,100 @@ class ByteDiffusionModel(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
         with torch.no_grad():
+            if self.ngrams is not None:
+                nn.init.normal_(
+                    self.ngrams.projection_weight,
+                    mean=0.0,
+                    std=0.02,
+                )
             self.embedding.weight[self.config.vocab.pad_id].zero_()
+            if (
+                self.ngrams is not None
+                and self.config.ngram_factor_init == "scale_matched"
+            ):
+                self.ngrams.projection_weight.mul_(
+                    self.config.ngram_rank**-0.5 / 0.02
+                )
             if self.timestep_vector is not None:
                 nn.init.normal_(self.timestep_vector, mean=0.0, std=0.02)
+
+    def combine_ngram_features(self, base: Tensor, features: Tensor) -> Tensor:
+        combined = base + features
+        if self.config.ngram_aggregation == "mean":
+            if self.ngrams is None:
+                raise AssertionError("ngram mean requested without ngrams")
+            combined = combined / (len(self.ngrams.orders) + 1)
+        return combined
+
+    def encoder_embeddings(self, ids: Tensor) -> Tensor:
+        states = self.embedding(ids)
+        if self.ngrams is not None:
+            states = self.combine_ngram_features(states, self.ngrams(ids))
+        return states
+
+    def virtual_bos_patch_input(
+        self,
+        device: torch.device,
+        *,
+        allow_dense_reference: bool,
+    ) -> Tensor:
+        """Encode Fast BLT's one-byte BOS patch through the shared local path."""
+
+        stride = self.config.patch_stride
+        ids = torch.full(
+            (1, stride),
+            self.config.vocab.pad_id,
+            dtype=torch.long,
+            device=device,
+        )
+        ids[:, 0] = self.config.vocab.eot_id
+        valid = torch.zeros((1, stride), dtype=torch.bool, device=device)
+        valid[:, 0] = True
+        padded = self.encoder_embeddings(ids)
+        local = padded[:, :1].reshape(1, self.config.local_dim)
+        cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        positions = torch.zeros(1, dtype=torch.long, device=device)
+        for block in self.encoder:
+            local = block.forward_packed(
+                local,
+                cu_seqlens=cu,
+                positions=positions,
+                max_seqlen=1,
+                window=1,
+                allow_dense_reference=allow_dense_reference,
+            )
+        local_padded = padded.clone()
+        local_padded[:, 0] = local
+        return self.pool(local_padded, valid)[0, 0]
+
+    def virtual_bos_global_states(
+        self,
+        count: int,
+        *,
+        device: torch.device,
+        allow_dense_reference: bool,
+    ) -> Tensor:
+        """Return document-isolated normalized outputs of the virtual BOS patch."""
+
+        if count < 0:
+            raise ValueError("virtual BOS count cannot be negative")
+        if count == 0:
+            return self.embedding.weight.new_empty((0, self.config.global_dim))
+        states = self.virtual_bos_patch_input(
+            device, allow_dense_reference=allow_dense_reference
+        )[None]
+        cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        positions = torch.zeros(1, dtype=torch.long, device=device)
+        for block in self.global_blocks:
+            states = block.forward_packed(
+                states,
+                cu_seqlens=cu,
+                positions=positions,
+                max_seqlen=1,
+                window=None,
+                allow_dense_reference=allow_dense_reference,
+            )
+        return self.global_norm(states).expand(count, -1)
 
     def enforce_padding_invariant(self) -> None:
         """Restore the fixed PAD row after optimizers that apply decoupled decay."""
@@ -200,9 +389,37 @@ class ByteDiffusionModel(nn.Module):
 
     @staticmethod
     def _cu_seqlens(lengths: Tensor) -> Tensor:
-        return torch.cat(
-            (torch.zeros(1, dtype=torch.int32, device=lengths.device), lengths.cumsum(0).to(torch.int32))
+        return packed_sequence_offsets(lengths)
+
+    @staticmethod
+    def _fixed_cu_seqlens(
+        batch_size: int, sequence_length: int, device: torch.device
+    ) -> Tensor:
+        """Offsets for fixed-width rows without compiling a constant cumsum."""
+
+        return torch.arange(
+            batch_size + 1, dtype=torch.int32, device=device
+        ) * sequence_length
+
+    @staticmethod
+    def _segment_lengths(
+        valid: Tensor, document_ids: Tensor, indices: Tensor
+    ) -> Tensor:
+        """Lengths of row- and document-isolated sequences in packed order."""
+
+        if document_ids.shape != valid.shape or document_ids.dtype != torch.long:
+            raise ValueError("document ids must be aligned int64 values")
+        flat_documents = document_ids.reshape(-1).index_select(0, indices)
+        flat_rows = torch.div(indices, valid.shape[1], rounding_mode="floor")
+        if not torch.compiler.is_compiling() and bool((flat_documents < 0).any()):
+            raise ValueError("valid atoms need nonnegative document ids")
+        boundary = torch.ones_like(flat_documents, dtype=torch.bool)
+        boundary[1:] = (flat_rows[1:] != flat_rows[:-1]) | (
+            flat_documents[1:] != flat_documents[:-1]
         )
+        starts = torch.nonzero(boundary, as_tuple=False).flatten()
+        stops = torch.cat((starts[1:], starts.new_tensor([indices.numel()])))
+        return stops - starts
 
     def encode(
         self,
@@ -214,9 +431,7 @@ class ByteDiffusionModel(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         self._validate(ids, valid)
         length = ids.shape[1]
-        local = self.embedding(ids)
-        if self.ngrams is not None:
-            local = local + self.ngrams(ids)
+        local = self.encoder_embeddings(ids)
         if bidirectional:
             local_allowed = _bidirectional_valid_mask(valid)
         else:
@@ -255,6 +470,43 @@ class ByteDiffusionModel(nn.Module):
             repeated = patches.repeat_interleave(self.config.patch_stride, dim=1)
             return torch.cat((initial, repeated), dim=1)[:, :length]
         return patches.repeat_interleave(self.config.patch_stride, dim=1)[:, :length]
+
+    def _document_aligned_condition(
+        self,
+        patches: Tensor,
+        valid: Tensor,
+        document_ids: Tensor,
+        positions: Tensor,
+        mode: ModelMode,
+    ) -> Tensor:
+        """Align patch states without leaking across packed documents."""
+
+        batch, length = valid.shape
+        stride = self.config.patch_stride
+        patch_documents = document_ids.view(batch, -1, stride).amax(-1)
+        physical_patch = torch.arange(length, device=valid.device) // stride
+        if mode is ModelMode.AR:
+            chosen_patch = physical_patch[None].expand(batch, -1) - 1
+            chosen_patch = torch.where(
+                positions.remainder(stride).eq(stride - 1),
+                physical_patch[None],
+                chosen_patch,
+            )
+        else:
+            chosen_patch = physical_patch[None].expand(batch, -1)
+        gather_patch = chosen_patch.clamp_min(0)
+        gathered_states = torch.gather(
+            patches,
+            1,
+            gather_patch[..., None].expand(-1, -1, patches.shape[-1]),
+        )
+        gathered_documents = torch.gather(patch_documents, 1, gather_patch)
+        active = (
+            valid
+            & chosen_patch.ge(0)
+            & gathered_documents.eq(document_ids)
+        )
+        return torch.where(active[..., None], gathered_states, 0)
 
     def decode(
         self,
@@ -359,7 +611,16 @@ class ByteDiffusionModel(nn.Module):
         positions: Tensor | None = None,
         allow_dense_reference: bool = False,
         assume_full_clean: bool = False,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        document_ids: Tensor | None = None,
+        byte_indices: Tensor | None = None,
+        byte_cu_seqlens: Tensor | None = None,
+        patch_indices_override: Tensor | None = None,
+        patch_cu_seqlens: Tensor | None = None,
+        global_patch_sources: Tensor | None = None,
+        global_patch_positions: Tensor | None = None,
+        physical_to_global_patch_indices: Tensor | None = None,
+        materialize_padded_patches: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         self._validate(ids, valid)
         if (
             assume_full_clean
@@ -367,26 +628,67 @@ class ByteDiffusionModel(nn.Module):
             and not bool(valid.all())
         ):
             raise ValueError("assume_full_clean requires every clean slot to be valid")
-        lengths = self._prefix_lengths(valid)
+        prepacked = byte_indices is not None
+        if prepacked != (byte_cu_seqlens is not None):
+            raise ValueError("byte packed indices and offsets must be supplied together")
+        virtual_bos_values = (
+            global_patch_sources,
+            global_patch_positions,
+            physical_to_global_patch_indices,
+        )
+        has_virtual_bos = global_patch_sources is not None
+        if sum(value is not None for value in virtual_bos_values) not in {0, 3}:
+            raise ValueError("virtual BOS patch metadata must be supplied together")
+        if (patch_indices_override is None) != (patch_cu_seqlens is None):
+            raise ValueError("patch packed indices and offsets must be supplied together")
+        if has_virtual_bos and patch_indices_override is None:
+            raise ValueError("virtual BOS patches require packed physical patch indices")
+        document_packed = document_ids is not None or prepacked
+        lengths = (
+            valid.sum(1)
+            if document_packed
+            else self._prefix_lengths(valid)
+        )
         if not torch.compiler.is_compiling() and bool((lengths == 0).any()):
             raise ValueError("varlen rows must be nonempty")
         if positions is None:
             positions = torch.arange(ids.shape[1], device=ids.device)[None].expand_as(ids)
         if positions.shape != ids.shape:
             raise ValueError("absolute positions must align with ids")
-        cu = self._cu_seqlens(lengths)
         max_length = ids.shape[1]
-        padded_local = self.embedding(ids)
-        if self.ngrams is not None:
-            padded_local = padded_local + self.ngrams(ids)
+        padded_local = self.encoder_embeddings(ids)
+        if assume_full_clean and document_packed:
+            raise ValueError("document-packed pages cannot assume one full sequence per row")
         if assume_full_clean:
             lengths = torch.full_like(lengths, ids.shape[1])
-            cu = self._cu_seqlens(lengths)
+            cu = self._fixed_cu_seqlens(
+                ids.shape[0], ids.shape[1], ids.device
+            )
             local = padded_local.reshape(-1, self.config.local_dim)
             packed_positions = positions.reshape(-1)
+            clean_indices = torch.arange(
+                ids.numel(), dtype=torch.long, device=ids.device
+            )
         else:
-            local = pack_valid(padded_local, valid)
-            packed_positions = pack_valid(positions, valid)
+            clean_indices = (
+                byte_indices
+                if byte_indices is not None
+                else (
+                    valid_row_indices(valid)
+                    if document_packed
+                    else prefix_row_indices(valid)
+                )
+            )
+            if byte_cu_seqlens is not None:
+                cu = byte_cu_seqlens
+                lengths = cu[1:] - cu[:-1]
+            elif document_ids is not None:
+                lengths = self._segment_lengths(valid, document_ids, clean_indices)
+                cu = self._cu_seqlens(lengths)
+            else:
+                cu = self._cu_seqlens(lengths)
+            local = pack_rows(padded_local, clean_indices)
+            packed_positions = pack_rows(positions, clean_indices)
         for block in self.encoder:
             local = block.forward_packed(
                 local,
@@ -399,16 +701,10 @@ class ByteDiffusionModel(nn.Module):
         if assume_full_clean:
             local_padded = local.view_as(padded_local)
         else:
-            local_padded = unpack_valid(local, valid, padded_local)
+            local_padded = unpack_rows(local, clean_indices, padded_local)
         patches = self.pool(local_padded, valid)
         patch_valid = valid.view(valid.shape[0], -1, self.config.patch_stride).any(-1)
         patch_lengths = patch_valid.sum(1)
-        patch_cu = self._cu_seqlens(patch_lengths)
-        packed_patches = (
-            patches.reshape(-1, self.config.global_dim)
-            if assume_full_clean
-            else pack_valid(patches, patch_valid)
-        )
         # Global RoPE is expressed in patch units everywhere.  Using raw byte
         # offsets here would make the clean bank rotate four times faster than
         # canvas/BLT branches despite representing the same physical patches.
@@ -416,30 +712,100 @@ class ByteDiffusionModel(nn.Module):
             positions[:, :: self.config.patch_stride]
             // self.config.patch_stride
         )
-        packed_patch_positions = (
-            patch_positions_padded.reshape(-1)
-            if assume_full_clean
-            else pack_valid(patch_positions_padded, patch_valid)
-        )
+        if assume_full_clean:
+            patch_indices = torch.arange(
+                patch_valid.numel(), dtype=torch.long, device=ids.device
+            )
+            packed_patches = patches.reshape(-1, self.config.global_dim)
+            packed_patch_positions = patch_positions_padded.reshape(-1)
+        else:
+            patch_indices = (
+                patch_indices_override
+                if patch_indices_override is not None
+                else (
+                    valid_row_indices(patch_valid)
+                    if document_packed
+                    else prefix_row_indices(patch_valid)
+                )
+            )
+            physical_packed_patches = pack_rows(patches, patch_indices)
+            physical_packed_positions = pack_rows(
+                patch_positions_padded, patch_indices
+            )
+            if has_virtual_bos:
+                if global_patch_sources is None or global_patch_positions is None:
+                    raise AssertionError("virtual BOS metadata disappeared")
+                safe_sources = global_patch_sources.clamp_min(0)
+                packed_patches = physical_packed_patches.index_select(
+                    0, safe_sources
+                )
+                bos_patch = self.virtual_bos_patch_input(
+                    ids.device, allow_dense_reference=allow_dense_reference
+                )
+                packed_patches = torch.where(
+                    global_patch_sources[:, None].ge(0),
+                    packed_patches,
+                    bos_patch[None],
+                )
+                packed_patch_positions = global_patch_positions
+            else:
+                packed_patches = physical_packed_patches
+                packed_patch_positions = physical_packed_positions
         if assume_full_clean:
             patch_lengths = torch.full_like(patch_lengths, patches.shape[1])
-            patch_cu = self._cu_seqlens(patch_lengths)
+            patch_cu = self._fixed_cu_seqlens(
+                patches.shape[0], patches.shape[1], patches.device
+            )
+        else:
+            if patch_cu_seqlens is not None:
+                patch_cu = patch_cu_seqlens
+                patch_lengths = patch_cu[1:] - patch_cu[:-1]
+            elif document_ids is not None:
+                patch_documents = document_ids.view(
+                    document_ids.shape[0], -1, self.config.patch_stride
+                ).amax(-1)
+                patch_lengths = self._segment_lengths(
+                    patch_valid, patch_documents, patch_indices
+                )
+                patch_cu = self._cu_seqlens(patch_lengths)
+            else:
+                patch_cu = self._cu_seqlens(patch_lengths)
         for block in self.global_blocks:
             packed_patches = block.forward_packed(
                 packed_patches,
                 cu_seqlens=patch_cu,
                 positions=packed_patch_positions,
-                max_seqlen=patches.shape[1],
+                max_seqlen=patches.shape[1] + (1 if has_virtual_bos else 0),
                 window=None,
                 allow_dense_reference=allow_dense_reference,
             )
-        if assume_full_clean:
-            normalized_patches = self.global_norm(packed_patches).view_as(patches)
-        else:
-            normalized_patches = unpack_valid(
-                self.global_norm(packed_patches), patch_valid, patches
+        normalized_packed_patches = self.global_norm(packed_patches)
+        if not materialize_padded_patches:
+            normalized_patches = normalized_packed_patches.new_empty(
+                (ids.shape[0], 0, self.config.global_dim)
             )
-        return local_padded, normalized_patches, cu, lengths, packed_positions
+        elif assume_full_clean:
+            normalized_patches = normalized_packed_patches.view_as(patches)
+        else:
+            physical_normalized = normalized_packed_patches
+            if has_virtual_bos:
+                if physical_to_global_patch_indices is None:
+                    raise AssertionError("physical/global patch map disappeared")
+                physical_normalized = normalized_packed_patches.index_select(
+                    0, physical_to_global_patch_indices
+                )
+            normalized_patches = unpack_rows(
+                physical_normalized, patch_indices, patches
+            )
+        return (
+            local_padded,
+            normalized_patches,
+            cu,
+            lengths,
+            packed_positions,
+            clean_indices,
+            normalized_packed_patches,
+        )
 
     def forward_ar_varlen(
         self,
@@ -449,33 +815,94 @@ class ByteDiffusionModel(nn.Module):
         positions: Tensor | None = None,
         allow_dense_reference: bool = False,
         assume_full_clean: bool = False,
+        return_padded_logits: bool = True,
+        document_ids: Tensor | None = None,
+        byte_indices: Tensor | None = None,
+        byte_cu_seqlens: Tensor | None = None,
+        patch_indices: Tensor | None = None,
+        patch_cu_seqlens: Tensor | None = None,
+        condition_patch_indices: Tensor | None = None,
+        global_patch_sources: Tensor | None = None,
+        global_patch_positions: Tensor | None = None,
+        physical_to_global_patch_indices: Tensor | None = None,
+        bos_condition_indices: Tensor | None = None,
     ) -> ModelOutput:
         """Production PAD-free native-varlen Flash path for clean AR rows."""
 
         if positions is None:
             positions = torch.arange(ids.shape[1], device=ids.device)[None].expand_as(ids)
-        local_padded, normalized_patches, cu, lengths, packed_positions = (
+        (
+            local_padded,
+            normalized_patches,
+            cu,
+            lengths,
+            packed_positions,
+            clean_indices,
+            normalized_packed_patches,
+        ) = (
             self._encode_clean_varlen(
                 ids,
                 valid,
                 positions=positions,
                 allow_dense_reference=allow_dense_reference,
                 assume_full_clean=assume_full_clean,
+                document_ids=document_ids,
+                byte_indices=byte_indices,
+                byte_cu_seqlens=byte_cu_seqlens,
+                patch_indices_override=patch_indices,
+                patch_cu_seqlens=patch_cu_seqlens,
+                global_patch_sources=global_patch_sources,
+                global_patch_positions=global_patch_positions,
+                physical_to_global_patch_indices=physical_to_global_patch_indices,
             )
         )
 
-        condition = self._aligned_condition(normalized_patches, ids.shape[1], ModelMode.AR)
+        bos_patch_states = (
+            None
+            if bos_condition_indices is None
+            else normalized_packed_patches.index_select(0, bos_condition_indices)
+        )
+
+        if condition_patch_indices is not None:
+            safe_condition = condition_patch_indices.clamp_min(0)
+            packed_condition = normalized_packed_patches.index_select(
+                0, safe_condition
+            )
+            packed_condition = torch.where(
+                condition_patch_indices[:, None].ge(0),
+                packed_condition,
+                0,
+            )
+            condition = None
+        else:
+            packed_condition = None
+            condition = (
+            self._document_aligned_condition(
+                normalized_patches,
+                valid,
+                document_ids,
+                positions,
+                ModelMode.AR,
+            )
+            if document_ids is not None
+            else self._aligned_condition(
+                normalized_patches, ids.shape[1], ModelMode.AR
+            )
+            )
         padded_states = self.embedding(ids) + self.mode_embedding.weight[int(ModelMode.AR)]
         states = (
             padded_states.reshape(-1, self.config.local_dim)
             if assume_full_clean
-            else pack_valid(padded_states, valid)
+            else pack_rows(padded_states, clean_indices)
         )
-        packed_condition = (
-            condition.reshape(-1, self.config.global_dim)
-            if assume_full_clean
-            else pack_valid(condition, valid)
-        )
+        if packed_condition is None:
+            if condition is None:
+                raise AssertionError("AR condition was not constructed")
+            packed_condition = (
+                condition.reshape(-1, self.config.global_dim)
+                if assume_full_clean
+                else pack_rows(condition, clean_indices)
+            )
         for block in self.decoder:
             states = block.forward_packed(
                 states,
@@ -483,12 +910,9 @@ class ByteDiffusionModel(nn.Module):
                 cu_seqlens=cu,
                 positions=packed_positions,
                 max_seqlen=ids.shape[1],
-                window=self.config.local_window,
+                window=self.config.decoder_prefix_window,
                 allow_dense_reference=allow_dense_reference,
             )
-        logits = local_padded.new_zeros(
-            (*ids.shape, self.config.vocab.output_size)
-        )
         normalized_states = self.decoder_norm(states)
         if self.output is None:
             packed_logits = F.linear(
@@ -496,39 +920,45 @@ class ByteDiffusionModel(nn.Module):
             )
         else:
             packed_logits = self.output(normalized_states)
-        if assume_full_clean:
+        if not return_padded_logits:
+            logits = packed_logits
+        elif assume_full_clean:
             logits = packed_logits.view(*ids.shape, self.config.vocab.output_size)
         else:
-            logits = unpack_valid(packed_logits, valid, logits)
+            logits = unpack_rows(
+                packed_logits,
+                clean_indices,
+                local_padded.new_empty(
+                    (*ids.shape, self.config.vocab.output_size)
+                ),
+            )
         return ModelOutput(
             logits=logits,
             byte_states=local_padded,
             patch_states=normalized_patches,
+            bos_patch_states=bos_patch_states,
         )
 
     def forward_bos_logits(
         self,
-        batch_size: int,
+        condition: Tensor,
         *,
-        device: torch.device,
         allow_dense_reference: bool = False,
     ) -> Tensor:
-        """Predict each document's first atom from a synthetic EOT/BOS.
+        """Predict document-first atoms from their own virtual BOS latents."""
 
-        The virtual BOS is deliberately outside the fixed four-byte patch
-        stream, so real byte zero remains at patch offset zero.  At this first
-        AR position global conditioning is exactly zero; consequently only the
-        shared decoder needs to run.  Packing the ``batch_size`` one-token
-        sequences keeps CUDA on the native varlen Flash path.
-        """
-
-        if batch_size <= 0:
-            raise ValueError("BOS batch size must be positive")
+        if condition.ndim != 2 or condition.shape[1] != self.config.global_dim:
+            raise ValueError("BOS condition must be [documents, global_dim]")
+        batch_size = condition.shape[0]
+        device = condition.device
+        if batch_size == 0:
+            return self.embedding.weight.new_empty(
+                (0, self.config.vocab.output_size), device=device
+            )
         ids = torch.full(
             (batch_size,), self.config.vocab.eot_id, dtype=torch.long, device=device
         )
         states = self.embedding(ids) + self.mode_embedding.weight[int(ModelMode.AR)]
-        condition = states.new_zeros((batch_size, self.config.global_dim))
         cu = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
         positions = torch.zeros(batch_size, dtype=torch.long, device=device)
         for block in self.decoder:
@@ -628,7 +1058,10 @@ class ByteDiffusionModel(nn.Module):
             branch_features = self.ngrams(visible)[:, -canvas_length:].reshape(
                 batch, branches * canvas_length, self.config.local_dim
             )
-            local = local + torch.cat((self.ngrams(clean_ids), branch_features), dim=1)
+            local = self.combine_ngram_features(
+                local,
+                torch.cat((self.ngrams(clean_ids), branch_features), dim=1),
+            )
         offsets = torch.arange(canvas_length, device=clean_ids.device)
         branch_indices = branch_starts[:, :, None] + offsets[None, None, :]
         branch_positions = torch.gather(
@@ -649,6 +1082,25 @@ class ByteDiffusionModel(nn.Module):
             None
             if allow_dense_reference
             else build_canvas_block_mask(local_layout)
+        )
+        decoder_layout = CanvasBranchLayout(
+            clean_valid=clean_valid,
+            branch_valid=branch_valid,
+            prefix_lengths=branch_starts,
+            prefix_window=self.config.decoder_prefix_window,
+            clean_positions=(
+                None if self.config.decoder_prefix_window is None else positions
+            ),
+            branch_positions=(
+                None
+                if self.config.decoder_prefix_window is None
+                else branch_positions
+            ),
+        )
+        decoder_block_mask = (
+            None
+            if allow_dense_reference
+            else build_canvas_block_mask(decoder_layout)
         )
         for block in self.encoder:
             local = block.forward_clean_and_branches(
@@ -738,11 +1190,11 @@ class ByteDiffusionModel(nn.Module):
                 condition,
                 clean_valid=clean_valid,
                 positions=physical_positions,
-                layout=local_layout,
-                clean_window=self.config.local_window,
+                layout=decoder_layout,
+                clean_window=self.config.decoder_prefix_window,
                 allow_dense_reference=allow_dense_reference,
                 assume_full_clean=assume_full_clean,
-                block_mask=local_block_mask,
+                block_mask=decoder_block_mask,
             )
         states = self.decoder_norm(states)
         logits = (
@@ -769,6 +1221,7 @@ class ByteDiffusionModel(nn.Module):
         noisy_ids: Tensor,
         valid: Tensor,
         *,
+        block_conditions: Tensor,
         block_starts: Tensor | None = None,
         block_length: int | None = None,
         positions: Tensor | None = None,
@@ -789,6 +1242,14 @@ class ByteDiffusionModel(nn.Module):
             raise ValueError("block_starts must be [batch, blocks] int64")
         if block_starts.shape[0] != clean_ids.shape[0]:
             raise ValueError("block starts and clean rows must align")
+        if block_conditions.shape != (
+            clean_ids.shape[0],
+            block_starts.shape[1],
+            self.config.global_dim,
+        ):
+            raise ValueError(
+                "BLT-D requires one resolved global condition per block"
+            )
         if bool((block_starts % self.config.patch_stride).any()):
             raise ValueError("BLT-D blocks must start on patch boundaries")
         batch, length = clean_ids.shape
@@ -799,7 +1260,7 @@ class ByteDiffusionModel(nn.Module):
         condition = patch_states.new_zeros((batch, length, self.config.global_dim))
         query_claimed = torch.zeros((batch, length), dtype=torch.bool, device=clean_ids.device)
         for row in range(batch):
-            for start_tensor in block_starts[row]:
+            for branch, start_tensor in enumerate(block_starts[row]):
                 start = int(start_tensor)
                 stop = start + block_length
                 if bool(query_claimed[row, start:stop].any()):
@@ -807,14 +1268,16 @@ class ByteDiffusionModel(nn.Module):
                 query_claimed[row, start:stop] = True
                 query_positions = byte_positions[start:stop, None]
                 prefix_keys = (byte_positions[None, :] < start) & (
-                    query_positions - byte_positions[None, :] < self.config.local_window
+                    (
+                        self.config.decoder_prefix_window is None
+                        or query_positions - byte_positions[None, :]
+                        < self.config.decoder_prefix_window
+                    )
                 )
                 own_block = (byte_positions[None, :] >= start) & (byte_positions[None, :] < stop)
                 keys = (prefix_keys | own_block) & valid[row, None, :]
                 allowed[row, start:stop] = keys & valid[row, start:stop, None]
-                prior_patch = start // self.config.patch_stride - 1
-                if prior_patch >= 0:
-                    condition[row, start:stop] = patch_states[row, prior_patch]
+                condition[row, start:stop] = block_conditions[row, branch]
         logits = self.decode(
             noisy_ids,
             valid,
@@ -836,6 +1299,23 @@ class ByteDiffusionModel(nn.Module):
         *,
         positions: Tensor | None = None,
         assume_full_clean: bool = False,
+        document_ids: Tensor | None = None,
+        byte_indices: Tensor | None = None,
+        byte_cu_seqlens: Tensor | None = None,
+        patch_indices: Tensor | None = None,
+        patch_cu_seqlens: Tensor | None = None,
+        condition_patch_indices: Tensor | None = None,
+        global_patch_sources: Tensor | None = None,
+        global_patch_positions: Tensor | None = None,
+        physical_to_global_patch_indices: Tensor | None = None,
+        bos_condition_indices: Tensor | None = None,
+        branch_condition_indices: Tensor | None = None,
+        branch_query_indices: Tensor | None = None,
+        branch_kv_indices: Tensor | None = None,
+        branch_query_cu_seqlens: Tensor | None = None,
+        branch_kv_cu_seqlens: Tensor | None = None,
+        branch_block_mask=None,
+        return_clean_patch_states: bool = True,
     ) -> BltBranchOutput:
         """Fast-BLT sampled blocks with one shared clean encoder/decoder bank."""
 
@@ -855,6 +1335,12 @@ class ByteDiffusionModel(nn.Module):
             raise ValueError("BLT block length must be patch aligned")
         if block_starts.shape != (batch, branches) or block_starts.dtype != torch.long:
             raise ValueError("one int64 block start is required per sampled block")
+        if (
+            branch_condition_indices is None
+            or branch_condition_indices.shape != block_starts.shape
+            or branch_condition_indices.dtype != torch.long
+        ):
+            raise ValueError("BLT blocks require explicit int64 prior conditions")
         if not torch.compiler.is_compiling():
             if bool((block_starts % self.config.patch_stride).any()):
                 raise ValueError("BLT blocks must start on patch boundaries")
@@ -863,69 +1349,319 @@ class ByteDiffusionModel(nn.Module):
         if positions is None:
             positions = torch.arange(clean_ids.shape[1], device=clean_ids.device)[None].expand_as(clean_ids)
         allow_dense_reference = clean_ids.device.type != "cuda"
-        _, patch_states, _, _, _ = self._encode_clean_varlen(
+        (
+            _,
+            patch_states,
+            _,
+            _,
+            _,
+            clean_indices,
+            packed_patch_states,
+        ) = self._encode_clean_varlen(
             clean_ids,
             clean_valid,
             positions=positions,
             allow_dense_reference=allow_dense_reference,
             assume_full_clean=assume_full_clean,
+            document_ids=document_ids,
+            byte_indices=byte_indices,
+            byte_cu_seqlens=byte_cu_seqlens,
+            patch_indices_override=patch_indices,
+            patch_cu_seqlens=patch_cu_seqlens,
+            global_patch_sources=global_patch_sources,
+            global_patch_positions=global_patch_positions,
+            physical_to_global_patch_indices=physical_to_global_patch_indices,
+            materialize_padded_patches=return_clean_patch_states,
         )
         clean_length = clean_ids.shape[1]
-        physical_ids = torch.cat((clean_ids, noisy_blocks.flatten(1, 2)), dim=1)
+        branch_ids = noisy_blocks.flatten(1, 2)
         offsets = torch.arange(block_length, device=clean_ids.device)
-        branch_positions = block_starts[:, :, None] + offsets[None, None, :]
+        start_positions = torch.gather(positions, 1, block_starts)
+        branch_positions = start_positions[:, :, None] + offsets[None, None, :]
         physical_positions = torch.cat((positions, branch_positions.flatten(1, 2)), dim=1)
-        layout = CanvasBranchLayout(
-            clean_valid=clean_valid,
-            branch_valid=branch_valid,
-            prefix_lengths=block_starts,
-            prefix_window=self.config.local_window,
-            clean_positions=positions,
-            branch_positions=branch_positions,
+        document_packed = document_ids is not None
+        shared_document_attention = (
+            document_packed
+            and self.config.decoder_branch_attention == "shared_flex"
         )
-        if not torch.compiler.is_compiling():
-            layout.validate_prefix_lengths()
-        block_mask = (
-            None if allow_dense_reference else build_canvas_block_mask(layout)
+        projected_shared_conditioning = (
+            shared_document_attention
+            and self.config.decoder_conditioning != "split_cross_attention"
         )
-        clean_condition = self._aligned_condition(patch_states, clean_length, ModelMode.AR)
-        prior_patch = block_starts // self.config.patch_stride - 1
-        gather_index = prior_patch.clamp_min(0)[..., None].expand(
-            -1, -1, self.config.global_dim
-        )
-        prior_states = torch.gather(patch_states, 1, gather_index)
-        prior_states = torch.where(
-            (prior_patch >= 0)[..., None], prior_states, torch.zeros_like(prior_states)
-        )
-        branch_condition = prior_states[:, :, None, :].expand(
-            -1, -1, block_length, -1
-        )
-        condition = torch.cat((clean_condition, branch_condition.flatten(1, 2)), dim=1)
-        mode_ids = torch.full_like(physical_ids, int(ModelMode.BLT_D))
-        mode_ids[:, :clean_length] = int(ModelMode.AR)
-        states = self.embedding(physical_ids) + self.mode_embedding(mode_ids)
-        for block in self.decoder:
-            states = block.forward_clean_and_branches(
-                states,
-                condition,
-                clean_valid=clean_valid,
-                positions=physical_positions,
-                layout=layout,
-                clean_window=self.config.local_window,
-                allow_dense_reference=allow_dense_reference,
-                assume_full_clean=assume_full_clean,
-                block_mask=block_mask,
+        if document_packed:
+            if (
+                byte_indices is None
+                or byte_cu_seqlens is None
+                or condition_patch_indices is None
+            ):
+                raise ValueError("document-packed BLT-D requires packed clean metadata")
+            if not projected_shared_conditioning:
+                selected_condition = packed_patch_states.index_select(
+                    0, condition_patch_indices.clamp_min(0)
+                )
+                selected_condition = torch.where(
+                    condition_patch_indices[:, None].ge(0), selected_condition, 0
+                )
+                clean_condition = patch_states.new_zeros(
+                    (batch, clean_length, self.config.global_dim)
+                )
+                clean_condition.reshape(-1, self.config.global_dim).index_copy_(
+                    0, byte_indices, selected_condition
+                )
+            else:
+                clean_condition = None
+        else:
+            clean_condition = self._aligned_condition(
+                patch_states, clean_length, ModelMode.AR
             )
-        states = self.decoder_norm(states)
-        logits = (
-            F.linear(states, self.embedding.weight[: self.config.vocab.output_size])
-            if self.output is None
-            else self.output(states)
+        prior_states = None
+        if document_packed and not projected_shared_conditioning:
+            prior_states = packed_patch_states.index_select(
+                0, branch_condition_indices.clamp_min(0).reshape(-1)
+            ).view(batch, branches, self.config.global_dim)
+        elif not document_packed:
+            gather_index = branch_condition_indices.clamp_min(0)[..., None].expand(
+                -1, -1, self.config.global_dim
+            )
+            prior_states = torch.gather(patch_states, 1, gather_index)
+        if prior_states is not None:
+            prior_states = torch.where(
+                branch_condition_indices[..., None].ge(0),
+                prior_states,
+                torch.zeros_like(prior_states),
+            )
+        condition = None
+        if not projected_shared_conditioning:
+            if clean_condition is None or prior_states is None:
+                raise AssertionError("decoder clean condition disappeared")
+            branch_condition = prior_states[:, :, None, :].expand(
+                -1, -1, block_length, -1
+            )
+            condition = torch.cat(
+                (clean_condition, branch_condition.flatten(1, 2)), dim=1
         )
+        if shared_document_attention:
+            clean_states = self.embedding(clean_ids) + self.mode_embedding.weight[
+                int(ModelMode.AR)
+            ]
+            branch_states = self.embedding(branch_ids) + self.mode_embedding.weight[
+                int(ModelMode.BLT_D)
+            ]
+            states = torch.cat((clean_states, branch_states), dim=1)
+        else:
+            physical_ids = torch.cat((clean_ids, branch_ids), dim=1)
+            mode_ids = torch.full_like(physical_ids, int(ModelMode.BLT_D))
+            mode_ids[:, :clean_length] = int(ModelMode.AR)
+            states = self.embedding(physical_ids) + self.mode_embedding(mode_ids)
+        if document_packed:
+            if document_ids is None or byte_cu_seqlens is None:
+                raise AssertionError("document-packed BLT-D metadata disappeared")
+            branch_documents = torch.gather(document_ids, 1, block_starts)
+            layout = CanvasBranchLayout(
+                clean_valid=clean_valid,
+                branch_valid=branch_valid,
+                prefix_lengths=block_starts,
+                prefix_window=self.config.decoder_prefix_window,
+                clean_positions=positions,
+                branch_positions=branch_positions,
+                clean_segment_ids=document_ids,
+                branch_segment_ids=branch_documents,
+            )
+            if not torch.compiler.is_compiling():
+                layout.validate_prefix_lengths()
+            if (
+                self.config.decoder_branch_attention == "shared_flex"
+                and not allow_dense_reference
+                and branch_block_mask is None
+            ):
+                raise ValueError(
+                    "shared document branch attention requires a prebuilt BlockMask"
+                )
+            packed_branch_metadata = (
+                branch_query_indices,
+                branch_kv_indices,
+                branch_query_cu_seqlens,
+                branch_kv_cu_seqlens,
+            )
+            prepacked_branches = not any(
+                value is None for value in packed_branch_metadata
+            )
+            if (
+                self.config.decoder_branch_attention == "duplicated_varlen"
+                and not prepacked_branches
+                and clean_ids.is_cuda
+            ):
+                raise ValueError(
+                    "document-packed BLT-D requires precomputed branch attention metadata"
+                )
+            for block in self.decoder:
+                if self.config.decoder_branch_attention == "shared_flex":
+                    if not projected_shared_conditioning:
+                        if condition is None:
+                            raise AssertionError(
+                                "shared decoder condition disappeared"
+                            )
+                        states = block.forward_shared_document_branches(
+                            states,
+                            condition,
+                            clean_length=clean_length,
+                            clean_indices=clean_indices,
+                            clean_cu_seqlens=byte_cu_seqlens,
+                            positions=physical_positions,
+                            layout=layout,
+                            clean_window=self.config.decoder_prefix_window,
+                            allow_dense_reference=allow_dense_reference,
+                            block_mask=branch_block_mask,
+                        )
+                        continue
+                    # One global patch state conditions four neighboring
+                    # bytes. Project each unique 512D patch/origin state once
+                    # per decoder layer, then gather/repeat the 256D result.
+                    # This removes the dominant redundant conditioning GEMM.
+                    projected_patches = block.condition(packed_patch_states)
+                    selected_projected = projected_patches.index_select(
+                        0, condition_patch_indices.clamp_min(0)
+                    )
+                    selected_projected = torch.where(
+                        condition_patch_indices[:, None].ge(0),
+                        selected_projected,
+                        0,
+                    )
+                    clean_projected = states.new_zeros(
+                        (batch, clean_length, self.config.local_dim)
+                    )
+                    clean_projected.reshape(
+                        -1, self.config.local_dim
+                    ).index_copy_(0, byte_indices, selected_projected)
+                    branch_projected = projected_patches.index_select(
+                        0, branch_condition_indices.clamp_min(0).reshape(-1)
+                    ).view(batch, branches, self.config.local_dim)
+                    branch_projected = torch.where(
+                        branch_condition_indices[..., None].ge(0),
+                        branch_projected,
+                        0,
+                    )[:, :, None, :].expand(-1, -1, block_length, -1)
+                    projected_condition = torch.cat(
+                        (
+                            clean_projected,
+                            branch_projected.flatten(1, 2),
+                        ),
+                        dim=1,
+                    )
+                    states = block.forward_shared_document_branches_projected(
+                        states,
+                        projected_condition,
+                        clean_length=clean_length,
+                        clean_indices=clean_indices,
+                        clean_cu_seqlens=byte_cu_seqlens,
+                        positions=physical_positions,
+                        layout=layout,
+                        clean_window=self.config.decoder_prefix_window,
+                        allow_dense_reference=allow_dense_reference,
+                        block_mask=branch_block_mask,
+                    )
+                elif prepacked_branches:
+                    if condition is None:
+                        raise AssertionError("packed decoder condition disappeared")
+                    states = block.forward_packed_document_branches(
+                        states,
+                        condition,
+                        clean_length=clean_length,
+                        clean_indices=clean_indices,
+                        clean_cu_seqlens=byte_cu_seqlens,
+                        positions=physical_positions,
+                        branch_query_indices=branch_query_indices,
+                        branch_kv_indices=branch_kv_indices,
+                        branch_query_cu_seqlens=branch_query_cu_seqlens,
+                        branch_kv_cu_seqlens=branch_kv_cu_seqlens,
+                        max_branch_query_length=block_length,
+                        max_branch_kv_length=(
+                            clean_length
+                            if self.config.decoder_prefix_window is None
+                            else self.config.decoder_prefix_window
+                        )
+                        + block_length,
+                        clean_window=self.config.decoder_prefix_window,
+                        allow_dense_reference=allow_dense_reference,
+                    )
+                else:
+                    if condition is None:
+                        raise AssertionError("decoder condition disappeared")
+                    states = block.forward_document_branches(
+                        states,
+                        condition,
+                        clean_valid=clean_valid,
+                        clean_indices=clean_indices,
+                        clean_cu_seqlens=byte_cu_seqlens,
+                        clean_document_ids=document_ids,
+                        positions=physical_positions,
+                        branch_valid=branch_valid,
+                        branch_starts=block_starts,
+                        clean_window=self.config.decoder_prefix_window,
+                        allow_dense_reference=True,
+                    )
+        else:
+            layout = CanvasBranchLayout(
+                clean_valid=clean_valid,
+                branch_valid=branch_valid,
+                prefix_lengths=block_starts,
+                prefix_window=self.config.decoder_prefix_window,
+                clean_positions=(
+                    None
+                    if self.config.decoder_prefix_window is None
+                    else positions
+                ),
+                branch_positions=(
+                    None
+                    if self.config.decoder_prefix_window is None
+                    else branch_positions
+                ),
+            )
+            if not torch.compiler.is_compiling():
+                layout.validate_prefix_lengths()
+            block_mask = (
+                None if allow_dense_reference else build_canvas_block_mask(layout)
+            )
+            for block in self.decoder:
+                states = block.forward_clean_and_branches(
+                    states,
+                    condition,
+                    clean_valid=clean_valid,
+                    positions=physical_positions,
+                    layout=layout,
+                    clean_window=self.config.decoder_prefix_window,
+                    allow_dense_reference=allow_dense_reference,
+                    assume_full_clean=assume_full_clean,
+                    block_mask=block_mask,
+                )
+        if shared_document_attention:
+            clean_states = self.decoder_norm(states[:, :clean_length])
+            branch_states = self.decoder_norm(states[:, clean_length:])
+            if self.output is None:
+                output_weight = self.embedding.weight[: self.config.vocab.output_size]
+                clean_logits = F.linear(clean_states, output_weight)
+                branch_logits = F.linear(branch_states, output_weight)
+            else:
+                clean_logits = self.output(clean_states)
+                branch_logits = self.output(branch_states)
+        else:
+            states = self.decoder_norm(states)
+            logits = (
+                F.linear(states, self.embedding.weight[: self.config.vocab.output_size])
+                if self.output is None
+                else self.output(states)
+            )
+            clean_logits = logits[:, :clean_length]
+            branch_logits = logits[:, clean_length:]
         return BltBranchOutput(
-            clean_logits=logits[:, :clean_length].clone(),
-            branch_logits=logits[:, clean_length:].reshape(
+            clean_logits=clean_logits,
+            branch_logits=branch_logits.reshape(
                 batch, branches, block_length, self.config.vocab.output_size
-            ).clone(),
+            ),
             clean_patch_states=patch_states,
+            bos_patch_states=(
+                None
+                if bos_condition_indices is None
+                else packed_patch_states.index_select(0, bos_condition_indices)
+            ),
         )

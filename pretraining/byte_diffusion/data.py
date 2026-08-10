@@ -12,12 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import random
 from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
 
 
 ATOMIC_MANIFEST_SCHEMA = "byte_diffusion_atomic_ids/v2"
-CURSOR_SCHEMA = "byte_diffusion_cursor/v1"
+CURSOR_SCHEMA = "byte_diffusion_cursor/v2"
 BYTE_COUNT = 256
 CLEAN_SPECIAL_COUNT = 5
 MASK_ID = 261
@@ -544,8 +545,8 @@ class DeterministicChunkCursor:
         self.position = 0
         self._order = self._order_for_epoch(self.epoch)
 
-    def _order_for_epoch(self, epoch: int) -> tuple[int, ...]:
-        order = list(range(len(self._chunks)))
+    def _order_for_epoch(self, epoch: int) -> np.ndarray:
+        order = np.arange(len(self._chunks), dtype=np.int64)
         if self.shuffle:
             seed_material = f"{self.seed}:{epoch}".encode("ascii")
             epoch_seed = int.from_bytes(
@@ -553,19 +554,41 @@ class DeterministicChunkCursor:
             )
             custom_order = getattr(self._chunks, "shuffled_indices", None)
             if custom_order is None:
-                random.Random(epoch_seed).shuffle(order)
+                np.random.default_rng(epoch_seed).shuffle(order)
             else:
-                order = list(custom_order(epoch_seed))
-        return tuple(order)
+                order = np.asarray(custom_order(epoch_seed), dtype=np.int64)
+        if order.shape != (len(self._chunks),):
+            raise ValueError("custom epoch order has the wrong shape")
+        return order
 
     def next_index(self) -> int:
         if self.position == len(self._order):
             self.epoch += 1
             self.position = 0
             self._order = self._order_for_epoch(self.epoch)
-        index = self._order[self.position]
+        index = int(self._order[self.position])
         self.position += 1
         return index
+
+    def next_indices(self, count: int) -> np.ndarray:
+        """Advance through ``count`` rows without boxing every index."""
+
+        if count <= 0:
+            raise ValueError("cursor batch size must be positive")
+        result = np.empty(count, dtype=np.int64)
+        filled = 0
+        while filled < count:
+            if self.position == len(self._order):
+                self.epoch += 1
+                self.position = 0
+                self._order = self._order_for_epoch(self.epoch)
+            take = min(count - filled, len(self._order) - self.position)
+            result[filled : filled + take] = self._order[
+                self.position : self.position + take
+            ]
+            self.position += take
+            filled += take
+        return result
 
     def next_chunk(self) -> PackedChunk:
         return self._chunks[self.next_index()]

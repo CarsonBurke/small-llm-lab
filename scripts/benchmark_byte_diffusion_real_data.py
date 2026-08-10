@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pretraining.byte_diffusion.config import ByteDiffusionConfig
+from pretraining.byte_diffusion.config import model_config_from_env
 from pretraining.byte_diffusion.data import DeterministicChunkCursor
 from pretraining.byte_diffusion.model import ByteDiffusionModel
 from pretraining.byte_diffusion.training import (
@@ -35,6 +35,7 @@ from pretraining.byte_diffusion.training import (
     TrainingRunConfig,
     load_data_directory,
 )
+from scripts.train_byte_diffusion import training_source_provenance
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,8 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-path", type=Path, default=Path("data/byte_diffusion"))
     parser.add_argument("--warmup-updates", type=int, default=2)
     parser.add_argument("--measured-updates", type=int, default=4)
-    parser.add_argument("--microbatch", type=int, default=16)
+    parser.add_argument("--microbatch", type=int, default=32)
     parser.add_argument("--global-batch", type=int, default=256)
+    parser.add_argument(
+        "--expected-recipe",
+        choices=("canvas", "blt_d", "causal_only"),
+        required=True,
+        help="Fail closed unless the environment resolves to this recipe.",
+    )
     parser.add_argument("--static-shapes", action="store_true")
     parser.add_argument(
         "--microbatch-token-budget",
@@ -59,8 +66,8 @@ def parse_args() -> argparse.Namespace:
         help="Enable the experimental global-stack activation checkpointing path.",
     )
     parser.add_argument("--max-update-ms", type=float, default=2_000.0)
-    parser.add_argument("--min-average-power-w", type=float, default=350.0)
-    parser.add_argument("--min-average-gpu-utilization", type=float, default=70.0)
+    parser.add_argument("--min-average-power-w", type=float, default=500.0)
+    parser.add_argument("--min-average-gpu-utilization", type=float, default=90.0)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument(
         "--profile-table",
@@ -98,6 +105,35 @@ def counter_total(name: str) -> int:
     return int(sum(dynamo_counters[name].values()))
 
 
+def build_benchmark_run_config(
+    args: argparse.Namespace, *, total_updates: int
+) -> TrainingRunConfig:
+    """Resolve the benchmark through the production environment contract."""
+
+    run = TrainingRunConfig.from_env(
+        iterations=total_updates,
+        val_loss_every=total_updates,
+        train_log_every=total_updates,
+        validation_chunks=16,
+        validation_microbatch_per_rank=16,
+        diffusion_validation_chunks=16,
+        warmdown_iters=0,
+        run_id="byte_diffusion_real_data_readiness",
+        microbatch_per_rank=args.microbatch,
+        microbatch_token_budget=args.microbatch_token_budget,
+        gradient_accumulation=math.ceil(args.global_batch / args.microbatch),
+        global_batch_size=args.global_batch,
+        compile_model=True,
+        compile_dynamic_shapes=not args.static_shapes,
+        activation_checkpointing=args.activation_checkpointing,
+    )
+    if run.recipe != args.expected_recipe:
+        raise ValueError(
+            f"expected recipe {args.expected_recipe!r}, observed {run.recipe!r}"
+        )
+    return run
+
+
 def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
@@ -112,36 +148,51 @@ def main() -> None:
 
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     torch.set_float32_matmul_precision("high")
+    source_provenance = training_source_provenance()
+    expected_source_sha256 = os.environ.get(
+        "BYTE_DIFFUSION_EXPECTED_SOURCE_SHA256"
+    )
+    if expected_source_sha256 is None:
+        raise ValueError(
+            "BYTE_DIFFUSION_EXPECTED_SOURCE_SHA256 is required for a readiness run"
+        )
+    if source_provenance["sha256"] != expected_source_sha256:
+        raise ValueError(
+            "training source differs from the pinned readiness contract: "
+            f"expected {expected_source_sha256}, "
+            f"observed {source_provenance['sha256']}"
+        )
     total_updates = (
         args.warmup_updates
         + args.measured_updates
         + int(args.profile_table is not None)
     )
-    run = TrainingRunConfig(
-        iterations=total_updates,
-        val_loss_every=total_updates,
-        train_log_every=total_updates,
-        validation_chunks=16,
-        warmdown_iters=0,
-        run_id="byte_diffusion_real_data_readiness",
-        microbatch_per_rank=args.microbatch,
-        microbatch_token_budget=token_budget,
-        gradient_accumulation=math.ceil(args.global_batch / args.microbatch),
-        global_batch_size=args.global_batch,
-        compile_model=True,
-        compile_dynamic_shapes=not args.static_shapes,
-        activation_checkpointing=args.activation_checkpointing,
-    )
+    args.microbatch_token_budget = token_budget
+    run = build_benchmark_run_config(args, total_updates=total_updates)
+    expected_data_sha256 = os.environ.get("BYTE_DIFFUSION_EXPECTED_DATA_SHA256")
+    if expected_data_sha256 is None:
+        raise ValueError(
+            "BYTE_DIFFUSION_EXPECTED_DATA_SHA256 is required for a readiness run"
+        )
     manifest, train_chunks, validation_chunks = load_data_directory(
         args.data_path,
         chunk_size=8192,
         recipe=run.recipe,
         required_branch_bytes=run.corruption.corrupted_positions_per_row,
+        branch_span_length=run.corruption.canvas_length,
         validation_chunk_limit=run.validation_chunks,
         require_challenge_validation=True,
+        expected_payload_sha256=expected_data_sha256,
     )
+    dataset_manifest = json.loads((args.data_path / "manifest.json").read_text())
+    dataset_payload_sha256 = dataset_manifest.get("payload_sha256")
+    if dataset_payload_sha256 != expected_data_sha256:
+        raise ValueError(
+            "dataset manifest hash differs from the pinned readiness contract: "
+            f"expected {expected_data_sha256}, observed {dataset_payload_sha256}"
+        )
     trainer = ByteDiffusionTrainer(
-        ByteDiffusionModel(ByteDiffusionConfig()),
+        ByteDiffusionModel(model_config_from_env()),
         DeterministicChunkCursor(train_chunks, seed=run.seed, shuffle=True),
         validation_chunks,
         run,
@@ -150,8 +201,10 @@ def main() -> None:
         atomic_manifest=manifest,
     )
 
-    for _ in range(args.warmup_updates):
-        trainer.run_update()
+    for update in range(args.warmup_updates):
+        trainer.run_update(
+            materialize_metrics=update + 1 == args.warmup_updates
+        )
     torch.cuda.synchronize()
     if args.profile_table is not None:
         with torch.profiler.profile(
@@ -161,7 +214,7 @@ def main() -> None:
             ),
             profile_memory=True,
         ) as profile:
-            trainer.run_update()
+            trainer.run_update(materialize_metrics=True)
         torch.cuda.synchronize()
         args.profile_table.parent.mkdir(parents=True, exist_ok=True)
         args.profile_table.write_text(
@@ -186,7 +239,13 @@ def main() -> None:
     )
     sampler.start()
     started = time.perf_counter()
-    update_metrics = [trainer.run_update() for _ in range(args.measured_updates)]
+    update_metrics = None
+    for update in range(args.measured_updates):
+        update_metrics = trainer.run_update(
+            materialize_metrics=update + 1 == args.measured_updates
+        )
+    if update_metrics is None:
+        raise AssertionError("final measured update omitted metrics")
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
     stop.set()
@@ -226,7 +285,8 @@ def main() -> None:
         )
 
     result = {
-        "schema": "byte_diffusion_real_data_readiness/v1",
+        "schema": "byte_diffusion_real_data_readiness/v2",
+        "training_source_sha256": source_provenance["sha256"],
         "warmup_updates": args.warmup_updates,
         "measured_updates": args.measured_updates,
         "microbatch": args.microbatch,
@@ -234,22 +294,19 @@ def main() -> None:
         "global_batch": args.global_batch,
         "dynamic_shapes": run.compile_dynamic_shapes,
         "activation_checkpointing": run.activation_checkpointing,
+        "recipe": run.recipe,
+        "model_config": trainer.model_config.to_dict(),
+        "dataset_payload_sha256": dataset_payload_sha256,
         "update_ms": update_ms,
         "trainer_device_ms_per_update": (
-            update_metrics[-1].elapsed_ms - training_time_before_measurement
+            update_metrics.elapsed_ms - training_time_before_measurement
         )
         / args.measured_updates,
-        "ar_targets_per_update": [item.ar_targets for item in update_metrics],
-        "diffusion_targets_per_update": [
-            item.diffusion_targets for item in update_metrics
-        ],
-        "microsteps_per_update": [item.microsteps for item in update_metrics],
-        "max_microbatch_per_update": [
-            item.max_microbatch for item in update_metrics
-        ],
-        "max_physical_positions_per_update": [
-            item.max_physical_positions for item in update_metrics
-        ],
+        "ar_targets_per_update": update_metrics.ar_targets,
+        "diffusion_targets_per_update": update_metrics.diffusion_targets,
+        "microsteps_per_update": update_metrics.microsteps,
+        "max_microbatch_per_update": update_metrics.max_microbatch,
+        "max_physical_positions_per_update": update_metrics.max_physical_positions,
         "compile_unique_graphs_after_warmup": unique_graphs,
         "compile_recompiles_after_warmup": recompiles,
         "compile_graph_breaks_after_warmup": graph_breaks,

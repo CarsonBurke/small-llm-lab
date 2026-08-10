@@ -36,8 +36,11 @@ def test_atomic_vocabulary_rejects_ambiguous_layouts(overrides, message) -> None
 
 def test_default_and_tiny_configs_preserve_fixed_stride_contract() -> None:
     production = ByteDiffusionConfig()
+    assert production.schema_version == 4
+    assert production.decoder_prefix_window == 512
+    assert production.decoder_branch_attention == "shared_flex"
     assert production.patch_stride == 4
-    assert production.production_parameter_target == 23_011_584
+    assert production.production_parameter_target == 23_011_074
     assert production.to_dict()["vocab"]["pad_id"] == 262
 
     tiny = ByteDiffusionConfig.tiny()
@@ -57,4 +60,11 @@ def test_configs_fail_closed_on_invalid_geometry() -> None:
         CorruptionConfig(canvas_length=130)
     with pytest.raises(ValueError, match="branches_per_row"):
         CorruptionConfig(branches_per_row=0)
-
+    with pytest.raises(ValueError, match="ngram_hash"):
+        ByteDiffusionConfig.tiny(ngram_hash="bad")
+    with pytest.raises(ValueError, match="ngram_table_sharing"):
+        ByteDiffusionConfig.tiny(ngram_table_sharing="bad")
+    with pytest.raises(ValueError, match="decoder_conditioning"):
+        ByteDiffusionConfig.tiny(decoder_conditioning="bad")
+    with pytest.raises(ValueError, match="global_ffn_kind"):
+        ByteDiffusionConfig.tiny(global_ffn_kind="bad")

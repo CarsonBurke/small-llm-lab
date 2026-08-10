@@ -13,12 +13,32 @@ def test_abort_restores_semantic_cache_and_rng_but_keeps_work() -> None:
     state.begin()
     state.note_work(4)
     state.ids = torch.tensor([1, 2])
-    state.caches["k"].zero_()
+    state.caches["k"] = torch.zeros_like(state.caches["k"])
     state.abort()
     torch.testing.assert_close(state.ids, before.ids, rtol=0, atol=0)
     torch.testing.assert_close(state.caches["k"], before.tensors["k"], rtol=0, atol=0)
     torch.testing.assert_close(state._generator.get_state(), before.generator_state, rtol=0, atol=0)
     assert state.counters.forwards == 1
+
+
+def test_abort_restores_in_place_tensor_edits() -> None:
+    state = TransactionalDecodeState(eot_id=256)
+    state.replace_prefix(torch.tensor([97, 98, 99]))
+    state.install_replayed_cache("k", torch.arange(3))
+    state.begin()
+    state.ids[0] = 7
+    state.caches["k"][0] = 8
+    state.abort()
+    torch.testing.assert_close(state.ids, torch.tensor([97, 98, 99]))
+    torch.testing.assert_close(state.caches["k"], torch.arange(3))
+
+
+def test_patch_phase_refreshes_after_in_place_prefix_edit() -> None:
+    state = TransactionalDecodeState(eot_id=256)
+    state.replace_prefix(torch.tensor([97, 98, 99]))
+    assert state.patch_phase == 3
+    state.ids[-1] = state.eot_id
+    assert state.patch_phase == 0
 
 
 def test_commit_truncates_at_eot_and_never_promotes_scratch_cache() -> None:

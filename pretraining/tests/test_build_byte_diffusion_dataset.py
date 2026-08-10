@@ -19,13 +19,19 @@ from scripts.build_bolmo_dataset import (
 )
 from scripts.build_byte_diffusion_dataset import (
     ARTIFACT_SCHEMA,
+    ARTIFACT_ALIGNMENT,
     DATASET_SCHEMA,
     ChallengeDocumentReader,
     StreamingDocumentPacker,
+    VectorizedDocumentPagePacker,
+    _chunk_arrays,
     build_dataset,
+    build_split,
     parse_args,
     validate_atomic_utf8,
+    validate_atomic_utf8_batch,
     write_deterministic_npz,
+    write_deterministic_mapped_artifact,
 )
 from tokenization import ngram_store
 from tokenization.spec import (
@@ -146,9 +152,16 @@ def fixture_source(tmp_path: Path):
 def _load_split_arrays(output: Path, split: dict) -> dict[str, np.ndarray]:
     rows: dict[str, list[np.ndarray]] = {}
     for artifact in split["artifacts"]:
-        with np.load(output / artifact["path"], allow_pickle=False) as payload:
-            for name in payload.files:
-                rows.setdefault(name, []).append(payload[name].copy())
+        path = output / artifact["path"]
+        for name, descriptor in artifact["arrays"].items():
+            array = np.memmap(
+                path,
+                mode="r",
+                dtype=np.dtype(descriptor["dtype"]),
+                offset=int(descriptor["byte_offset"]),
+                shape=tuple(descriptor["shape"]),
+            )
+            rows.setdefault(name, []).append(np.asarray(array).copy())
     return {name: np.concatenate(values, axis=0) for name, values in rows.items()}
 
 
@@ -178,25 +191,161 @@ def test_streaming_packer_exactly_matches_reference_contract(fixture_source) -> 
             AtomicDocument(str(index), byteifier.byteify(source_ids).atomic_ids)
         )
 
-    expected = tuple(
-        chunk
-        for document in documents
-        for chunk in pack_documents((document,), manifest, chunk_size=8)
-    )
     streaming = StreamingDocumentPacker(manifest, chunk_size=8)
     actual = []
     for index, document in enumerate(documents):
         actual.extend(streaming.add_document(index, document))
     actual.extend(streaming.finish())
 
-    assert len(actual) == len(expected)
-    for observed, reference in zip(actual, expected, strict=True):
-        assert observed.input_ids == reference.input_ids
-        assert observed.target_ids == reference.target_ids
-        assert observed.valid_mask == reference.valid_mask
-        assert observed.score_mask == reference.score_mask
-        assert observed.document_offsets == reference.document_offsets
-        assert len({value for value in observed.document_indices if value >= 0}) == 1
+    expected_ids = tuple(
+        atomic_id for document in documents for atomic_id in document.atomic_ids
+    )
+    observed_ids = tuple(
+        atomic_id
+        for chunk in actual
+        for atomic_id, valid in zip(chunk.input_ids, chunk.valid_mask, strict=True)
+        if valid
+    )
+    observed_targets = tuple(
+        target
+        for chunk in actual
+        for target, score in zip(chunk.target_ids, chunk.score_mask, strict=True)
+        if score
+    )
+    assert observed_ids == expected_ids
+    assert observed_targets == expected_ids[1:]
+    assert len(actual) == -(-len(expected_ids) // 8)
+    assert any(
+        len({value for value in chunk.document_indices if value >= 0}) > 1
+        for chunk in actual
+    )
+
+
+def test_vectorized_document_packer_exactly_matches_streaming_reference() -> None:
+    manifest = AtomicIdManifest.reference()
+    documents = (
+        AtomicDocument("empty", (manifest.eot_id,)),
+        AtomicDocument("short", (65, 66, manifest.eot_id)),
+        AtomicDocument("aligned", tuple(range(70, 77)) + (manifest.eot_id,)),
+        AtomicDocument(
+            "cross-page",
+            tuple((index % 95) + 32 for index in range(9_000))
+            + (manifest.eot_id,),
+        ),
+        AtomicDocument(
+            "utf8", tuple("hé🙂".encode("utf-8")) + (manifest.eot_id,)
+        ),
+    )
+    reference_packer = StreamingDocumentPacker(
+        manifest, chunk_size=128, document_aligned_pages=True
+    )
+    reference_chunks = []
+    for index, document in enumerate(documents):
+        reference_chunks.extend(reference_packer.add_document(index, document))
+    reference_chunks.extend(reference_packer.finish())
+    reference = _chunk_arrays(reference_chunks)
+
+    source = np.asarray(
+        [value for document in documents for value in document.atomic_ids],
+        dtype="<u2",
+    )
+    lengths = np.asarray([len(document.atomic_ids) for document in documents])
+    vectorized = VectorizedDocumentPagePacker(manifest, chunk_size=128)
+    first_tokens = int(lengths[:2].sum())
+    blocks = [
+        vectorized.add_batch(
+            source[:first_tokens], lengths[:2], first_document_index=0
+        ),
+        vectorized.add_batch(
+            source[first_tokens:], lengths[2:], first_document_index=2
+        ),
+        vectorized.finish(),
+    ]
+    blocks = [block for block in blocks if block is not None]
+    observed = {
+        name: np.concatenate([block[name] for block in blocks])
+        for name in reference
+    }
+
+    assert vectorized.alignment_padding == reference_packer.alignment_padding
+    for name, expected in reference.items():
+        np.testing.assert_array_equal(observed[name], expected, err_msg=name)
+
+
+def test_vectorized_document_reader_exactly_matches_scalar_reader(
+    fixture_source,
+) -> None:
+    scalar = ChallengeDocumentReader(
+        fixture_source["train_paths"], eot_id=0, overlap_tokens=1
+    )
+    expected = list(scalar.iter_documents())
+    expected_stats = scalar.stats
+    vectorized = ChallengeDocumentReader(
+        fixture_source["train_paths"], eot_id=0, overlap_tokens=1
+    )
+    observed = []
+    for source, lengths in vectorized.iter_document_batches(target_tokens=5):
+        cursor = 0
+        for length in lengths:
+            stop = cursor + int(length)
+            observed.append(tuple(int(value) for value in source[cursor:stop]))
+            cursor = stop
+
+    assert observed == expected
+    assert vectorized.stats == expected_stats
+
+
+def test_vectorized_byte_native_split_is_byte_identical_to_reference(
+    tmp_path: Path,
+) -> None:
+    manifest = AtomicIdManifest.reference()
+    tokens = np.asarray(
+        [
+            manifest.eot_id,
+            *b"a",
+            manifest.eot_id,
+            *b"bcdef",
+            manifest.eot_id,
+            *(b"x" * 37),
+            manifest.eot_id,
+            *"hé🙂".encode("utf-8"),
+            manifest.eot_id,
+        ],
+        dtype="<u2",
+    )
+    source = tmp_path / "source.bin"
+    _write_challenge_shard(source, tokens)
+    fast_dir = tmp_path / "fast"
+    reference_dir = tmp_path / "reference"
+    fast_dir.mkdir()
+    reference_dir.mkdir()
+    common = {
+        "name": "train",
+        "paths": (source,),
+        "tokenizer": None,
+        "atomic_manifest": manifest,
+        "overlap_tokens": 0,
+        "chunk_size": 16,
+        "chunks_per_shard": 2,
+        "max_documents": None,
+        "require_one_chunk_per_document": False,
+        "require_terminal_eot": True,
+        "close_rows_at_document": False,
+        "document_aligned_pages": True,
+    }
+
+    fast = build_split(output_dir=fast_dir, **common)
+    reference = build_split(
+        output_dir=reference_dir,
+        vectorized_byte_native=False,
+        **common,
+    )
+
+    assert fast == reference
+    for artifact in fast["artifacts"]:
+        assert (fast_dir / artifact["path"]).read_bytes() == (
+            reference_dir / artifact["path"]
+        ).read_bytes()
 
 
 def test_one_pass_builder_rejects_documents_that_expand_to_multiple_rows(
@@ -212,6 +361,72 @@ def test_one_pass_builder_rejects_documents_that_expand_to_multiple_rows(
             chunks_per_shard=2,
             require_one_train_chunk_per_document=True,
         )
+
+
+def test_document_aligned_pages_pack_multiple_isolated_documents() -> None:
+    manifest = AtomicIdManifest.reference()
+    documents = (
+        AtomicDocument("a", (65, 66, manifest.eot_id)),
+        AtomicDocument("b", (70, 71, 72, 73, manifest.eot_id)),
+        AtomicDocument(
+            "c", (80, 81, 82, 83, 84, 85, 86, 87, manifest.eot_id)
+        ),
+    )
+    packer = StreamingDocumentPacker(
+        manifest,
+        chunk_size=16,
+        document_aligned_pages=True,
+    )
+    chunks = []
+    for index, document in enumerate(documents):
+        chunks.extend(packer.add_document(index, document))
+    chunks.extend(packer.finish())
+
+    assert len(chunks) == 2
+    first = chunks[0]
+    assert first.valid_mask == (
+        True,
+        True,
+        True,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+    )
+    assert first.document_offsets == (
+        0,
+        1,
+        2,
+        -1,
+        0,
+        1,
+        2,
+        3,
+        4,
+        -1,
+        -1,
+        -1,
+        0,
+        1,
+        2,
+        3,
+    )
+    assert first.label_halo_valid
+    assert first.label_halo_id == 84
+    batch = chunks_to_batch(chunks)
+    assert batch.bos_targets.tolist() == [65, 70, 80]
+    assert batch.bos_row_indices is not None
+    assert batch.bos_row_indices.tolist() == [0, 0, 0]
+    assert int(batch.ar_targets.ne(-100).sum() + batch.bos_targets.numel()) == 17
 
 
 def test_builder_writes_versioned_reproducible_document_aligned_artifacts(
@@ -250,10 +465,14 @@ def test_builder_writes_versioned_reproducible_document_aligned_artifacts(
     assert np.all(train_arrays["target_ids"][~train_arrays["score_mask"]] == 262)
     assert np.all(train_arrays["document_indices"][~train_arrays["valid_mask"]] == -1)
     assert np.all(train_arrays["patch_offsets"][~train_arrays["valid_mask"]] == -1)
-    # Every new document resets its patch offset in its independent row.
+    # Patch phase follows the dense physical stream rather than restarting and
+    # wasting the tail of every short document.
     for document_index in range(3):
         positions = train_arrays["document_indices"] == document_index
-        assert train_arrays["patch_offsets"][positions][0] == 0
+        physical = np.flatnonzero(positions.reshape(-1))
+        assert train_arrays["patch_offsets"][positions].tolist() == [
+            int(index % 4) for index in physical
+        ]
         assert train_arrays["document_offsets"][positions].tolist() == list(
             range(int(positions.sum()))
         )
@@ -281,13 +500,24 @@ def test_builder_writes_versioned_reproducible_document_aligned_artifacts(
         == train_chunks.exposure_summary["valid_atomic_tokens"]
     )
     assert validation_chunks
-    assert all(
-        len({value for value in chunk.document_indices if value >= 0}) == 1
-        for chunk in (*train_chunks, *validation_chunks)
+    _, pinned_train_chunks, _ = load_data_directory(
+        first_output,
+        chunk_size=8,
+        recipe="causal_only",
+        expected_payload_sha256=claimed_hash,
+    )
+    assert pinned_train_chunks.trust_pinned_row_index
+    pinned_train_chunks.training_batch([0])
+    assert not pinned_train_chunks._semantically_validated_artifacts
+    assert manifest["packing"]["layout"] == "dense_eot_delimited_stream"
+    assert any(
+        len({value for value in chunk.document_indices if value >= 0}) > 1
+        for chunk in train_chunks
     )
     native_batch = train_chunks.training_batch([0, min(1, len(train_chunks) - 1)])
     reference_batch = chunks_to_batch(
-        [train_chunks[0], train_chunks[min(1, len(train_chunks) - 1)]]
+        [train_chunks[0], train_chunks[min(1, len(train_chunks) - 1)]],
+        dense_stream=True,
     )
     width = native_batch.ids.shape[1]
     reference_batch = type(reference_batch)(
@@ -299,36 +529,25 @@ def test_builder_writes_versioned_reproducible_document_aligned_artifacts(
         full_valid=bool(reference_batch.valid[:, :width].all()),
     )
     assert native_batch.full_valid == reference_batch.full_valid
-    for field in ("ids", "valid", "ar_targets", "bos_targets", "positions"):
+    for field in ("ids", "valid", "ar_targets", "bos_targets"):
         torch.testing.assert_close(
             getattr(native_batch, field), getattr(reference_batch, field)
         )
+    torch.testing.assert_close(
+        native_batch.positions,
+        torch.arange(width)[None].expand(native_batch.ids.shape[0], -1),
+    )
     validation_batch, identities = validation_chunks.validation_batch([0])
     assert validation_batch.ids.shape[0] == 1
     assert identities[0].chunk_index == validation_chunks[0].chunk_index
     assert identities[0].stream_start == validation_chunks[0].stream_start
-    _, diffusion_train, diffusion_validation = load_data_directory(
-        first_output,
-        chunk_size=8,
-        recipe="canvas",
-        required_branch_bytes=8,
-    )
-    # Diffusion eligibility must never filter AR/BPB rows. The two-atom "A"
-    # document and short validation documents remain present and use padded
-    # short canvases at objective construction time.
-    assert len(diffusion_train) == len(train_chunks)
-    assert len(diffusion_validation) == len(validation_chunks)
-    assert min(sum(chunk.valid_mask) for chunk in diffusion_train) < 8
-    adaptive = diffusion_train.training_batches(
-        list(range(len(diffusion_train))),
-        max_batch_size=2,
-        physical_token_budget=16,
-    )
-    assert sum(batch.ids.shape[0] for batch in adaptive) == len(diffusion_train)
-    assert all(
-        batch.ids.shape[0] * (batch.ids.shape[1] + 8) <= 16
-        for batch in adaptive
-    )
+    with pytest.raises(ValueError, match="document-local patch-aligned"):
+        load_data_directory(
+            first_output,
+            chunk_size=8,
+            recipe="canvas",
+            required_branch_bytes=8,
+        )
     for fingerprint in manifest["input_fingerprints"]:
         path = Path(fingerprint["path"])
         assert hashlib.sha256(path.read_bytes()).hexdigest() == fingerprint["sha256"]
@@ -513,6 +732,42 @@ def test_deterministic_npz_is_byte_identical(tmp_path: Path) -> None:
     with np.load(first, allow_pickle=False) as restored:
         assert restored.files == ["a", "z"]
         assert np.array_equal(restored["z"], arrays["z"])
+
+
+def test_mapped_artifact_is_deterministic_aligned_and_row_addressable(
+    tmp_path: Path,
+) -> None:
+    arrays = {
+        "z": np.arange(64 * 8, dtype="<u2").reshape(64, 8),
+        "a": np.arange(64, dtype="<i8"),
+    }
+    first = tmp_path / "first.bdm"
+    second = tmp_path / "second.bdm"
+    first_index = write_deterministic_mapped_artifact(first, arrays)
+    second_index = write_deterministic_mapped_artifact(
+        second, dict(reversed(tuple(arrays.items())))
+    )
+
+    assert first.read_bytes() == second.read_bytes()
+    assert first_index == second_index
+    assert list(first_index) == ["a", "z"]
+    assert all(
+        descriptor["byte_offset"] % ARTIFACT_ALIGNMENT == 0
+        for descriptor in first_index.values()
+    )
+    z = first_index["z"]
+    mapped = np.memmap(
+        first,
+        mode="r",
+        dtype=np.dtype(z["dtype"]),
+        offset=z["byte_offset"],
+        shape=tuple(z["shape"]),
+    )
+    selected = mapped[np.arange(32)]
+    assert isinstance(mapped, np.memmap)
+    assert selected.shape == (32, 8)
+    assert selected.nbytes == arrays["z"][:32].nbytes
+    np.testing.assert_array_equal(selected, arrays["z"][:32])
 
 
 def test_cli_contract_parses_required_inputs() -> None:

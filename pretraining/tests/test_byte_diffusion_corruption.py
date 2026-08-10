@@ -11,6 +11,7 @@ from pretraining.byte_diffusion.corruption import (
     absorbing_rb,
     allmask_50,
     blt_bernoulli,
+    blt_exact_k,
     exact_k_mask,
     uniform_replacement,
     whole_patch,
@@ -53,7 +54,7 @@ def test_absorbing_rb_masks_exact_k_and_never_touches_padding() -> None:
     torch.testing.assert_close(result.noise_fraction, torch.tensor([0.5]))
 
 
-def test_blt_uses_one_shared_t_and_allows_a_zero_mask_row() -> None:
+def test_blt_uses_one_t_per_example_and_allows_a_zero_mask_row() -> None:
     clean = torch.tensor([[1, 2, 3], [4, 5, VOCAB.pad_id]])
     eligible = torch.tensor([[True, True, True], [True, True, False]])
     fully_masked = blt_bernoulli(
@@ -66,7 +67,17 @@ def test_blt_uses_one_shared_t_and_allows_a_zero_mask_row() -> None:
     torch.testing.assert_close(fully_masked.active, eligible)
     assert fully_masked.t is not None and fully_masked.t.ndim == 0
 
-    # A very small shared t may select no bytes.  The corruption object itself
+    per_example = blt_bernoulli(
+        clean,
+        eligible,
+        VOCAB,
+        t=torch.tensor([1.0, 1e-6]),
+        generator=torch.Generator().manual_seed(14),
+    )
+    torch.testing.assert_close(per_example.active[0], eligible[0])
+    assert not bool(per_example.active[1].any())
+
+    # A very small t may select no bytes.  The corruption object itself
     # remains valid; the objective owns the zero-safe reduction.
     zero_found = False
     for seed in range(64):
@@ -81,6 +92,32 @@ def test_blt_uses_one_shared_t_and_allows_a_zero_mask_row() -> None:
             zero_found = True
             break
     assert zero_found
+
+
+def test_blt_exact_k_has_nonempty_masks_and_inverse_fraction_sum_weight() -> None:
+    clean = torch.arange(12, dtype=torch.long).view(2, 6)
+    eligible = torch.tensor(
+        [[True, True, True, True, False, False], [True] * 6]
+    )
+    result = blt_exact_k(
+        clean,
+        eligible,
+        VOCAB,
+        k=torch.tensor([2, 3]),
+        generator=torch.Generator().manual_seed(15),
+    )
+    torch.testing.assert_close(result.active.sum(1), torch.tensor([2, 3]))
+    assert result.t is not None
+    torch.testing.assert_close(result.t, torch.tensor([0.5, 0.5]))
+    # For constant per-position loss c, sum(masked loss)/(K/S) is exactly S*c.
+    constant_nll = torch.full_like(clean, 1.25, dtype=torch.float32)
+    estimated_full_sum = (
+        (constant_nll * result.active).sum(1) / result.t
+    )
+    torch.testing.assert_close(
+        estimated_full_sum,
+        eligible.sum(1).to(torch.float32) * 1.25,
+    )
 
 
 def test_allmask_50_keeps_exact_nonzero_counts_and_valid_targets() -> None:

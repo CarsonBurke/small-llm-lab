@@ -1,7 +1,9 @@
-"""Reference target construction and losses for byte diffusion.
+"""Target construction and fused CUDA loss reductions for byte diffusion.
 
-These routines favor explicit reductions over fused-kernel convenience.  They
-are the CPU correctness oracle for later optimized loss gathers.
+CPU execution remains the explicit correctness oracle. CUDA routes the large
+vocabulary reductions through compiled full-graph kernels so converting BF16
+logits to FP32 is fused into log-softmax instead of materializing a second
+``[..., vocabulary]`` tensor at every objective boundary.
 """
 
 from __future__ import annotations
@@ -52,6 +54,116 @@ class BltMaskedObjective:
     per_row: Tensor
     masked_total: Tensor
     masked_count: Tensor
+    group_total: Tensor
+
+
+def _cross_entropy_rows_impl(
+    logits: Tensor,
+    safe_targets: Tensor,
+    active: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Kernel body shared by the eager oracle and compiled CUDA reduction."""
+
+    ce_logits = (
+        logits.float()
+        if logits.dtype in {torch.float16, torch.bfloat16}
+        else logits
+    )
+    nll = F.cross_entropy(
+        ce_logits.reshape(-1, logits.shape[-1]),
+        safe_targets.reshape(-1),
+        reduction="none",
+    ).reshape_as(safe_targets)
+    masked_nll = torch.where(active, nll, 0.0)
+    total = masked_nll.sum(dim=-1)
+    count = active.sum(dim=-1)
+    mean = total / count.clamp_min(1).to(total.dtype)
+    return mean, total, count
+
+
+def _cross_entropy_per_target_impl(logits: Tensor, targets: Tensor) -> Tensor:
+    ce_logits = (
+        logits.float()
+        if logits.dtype in {torch.float16, torch.bfloat16}
+        else logits
+    )
+    return F.cross_entropy(ce_logits, targets, reduction="none")
+
+
+def _masked_cross_entropy_per_target_impl(
+    logits: Tensor, safe_targets: Tensor, active: Tensor
+) -> Tensor:
+    flattened = _cross_entropy_per_target_impl(
+        logits.reshape(-1, logits.shape[-1]), safe_targets.reshape(-1)
+    ).reshape_as(safe_targets)
+    return torch.where(
+        active,
+        flattened,
+        0.0,
+    )
+
+
+# These wrappers are lazy: construction is cheap and CUDA code generation
+# happens only on first use. Dynamic shapes let training tails and validation
+# batches share the same reduction implementation.
+_compiled_cross_entropy_rows = torch.compile(
+    _cross_entropy_rows_impl,
+    fullgraph=True,
+    dynamic=True,
+)
+_compiled_cross_entropy_per_target = torch.compile(
+    _cross_entropy_per_target_impl,
+    fullgraph=True,
+    dynamic=True,
+)
+_compiled_masked_cross_entropy_per_target = torch.compile(
+    _masked_cross_entropy_per_target_impl,
+    fullgraph=True,
+    dynamic=True,
+)
+
+
+def cross_entropy_per_target(logits: Tensor, targets: Tensor) -> Tensor:
+    """Return FP32 NLL values without a standalone FP32 logits allocation."""
+
+    if logits.ndim != 2 or targets.shape != logits.shape[:1]:
+        raise ValueError("per-target logits and targets do not align")
+    if targets.dtype != torch.long:
+        raise ValueError("targets must be int64")
+    if not logits.is_cuda and bool(
+        ((targets < 0) | (targets >= logits.shape[-1])).any()
+    ):
+        raise ValueError("a target is outside the logit vocabulary")
+    implementation = (
+        _compiled_cross_entropy_per_target
+        if logits.is_cuda
+        else _cross_entropy_per_target_impl
+    )
+    return implementation(logits, targets)
+
+
+def masked_cross_entropy_per_target(
+    logits: Tensor, targets: Tensor, active: Tensor
+) -> Tensor:
+    """Return shape-stable FP32 NLL values, with inactive entries exactly zero."""
+
+    if logits.ndim < 2 or logits.shape[:-1] != targets.shape:
+        raise ValueError("masked per-target logits and targets do not align")
+    if targets.dtype != torch.long:
+        raise ValueError("targets must be int64")
+    if active.dtype != torch.bool or active.shape != targets.shape:
+        raise ValueError("active must be boolean and aligned with targets")
+    safe_targets = torch.where(active, targets, 0)
+    if not logits.is_cuda and bool(
+        ((safe_targets < 0) | (safe_targets >= logits.shape[-1])).any()
+    ):
+        raise ValueError("a target is outside the logit vocabulary")
+    implementation = (
+        _compiled_masked_cross_entropy_per_target
+        if logits.is_cuda
+        else _masked_cross_entropy_per_target_impl
+    )
+    return implementation(logits, safe_targets, active)
 
 
 def _require_aligned_ids_mask(ids: Tensor, mask: Tensor) -> None:
@@ -147,20 +259,12 @@ def cross_entropy_per_row(
         raise ValueError("an active target is outside the logit vocabulary")
 
     safe_targets = torch.where(active, targets, 0)
-    ce_logits = (
-        logits.float()
-        if logits.dtype in {torch.float16, torch.bfloat16}
-        else logits
+    implementation = (
+        _compiled_cross_entropy_rows
+        if logits.is_cuda
+        else _cross_entropy_rows_impl
     )
-    nll = F.cross_entropy(
-        ce_logits.reshape(-1, logits.shape[-1]),
-        safe_targets.reshape(-1),
-        reduction="none",
-    ).reshape_as(targets)
-    masked_nll = torch.where(active, nll, 0.0)
-    total = masked_nll.sum(dim=-1)
-    count = active.sum(dim=-1)
-    mean = total / count.clamp_min(1).to(total.dtype)
+    mean, total, count = implementation(logits, safe_targets, active)
     return RowCrossEntropy(mean=mean, total=total, count=count)
 
 
@@ -238,20 +342,30 @@ def blt_masked_loss(
     the caller may add the clean per-row summed CE before the batch mean.
     """
 
-    rows = cross_entropy_per_row(logits, targets, active=active)
-    noise = torch.as_tensor(t, dtype=rows.total.dtype, device=rows.total.device)
+    groups = cross_entropy_per_row(logits, targets, active=active)
+    if groups.total.ndim == 1:
+        masked_total = groups.total
+        masked_count = groups.count
+    else:
+        reduce_dims = tuple(range(1, groups.total.ndim))
+        masked_total = groups.total.sum(dim=reduce_dims)
+        masked_count = groups.count.sum(dim=reduce_dims)
+    noise = torch.as_tensor(
+        t, dtype=masked_total.dtype, device=masked_total.device
+    )
     if noise.ndim == 0:
         pass
-    elif noise.shape != rows.total.shape:
+    elif noise.shape != masked_total.shape:
         raise ValueError("non-scalar t must match the loss row shape")
     if not logits.is_cuda and bool(((noise <= 0) | (noise > 1)).any()):
         raise ValueError("t must lie in (0, 1]")
-    per_row = rows.total / noise
+    per_row = masked_total / noise
     return BltMaskedObjective(
         loss=per_row.mean(),
         per_row=per_row,
-        masked_total=rows.total,
-        masked_count=rows.count,
+        masked_total=masked_total,
+        masked_count=masked_count,
+        group_total=groups.total,
     )
 
 

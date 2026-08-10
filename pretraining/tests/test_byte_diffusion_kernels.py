@@ -355,20 +355,20 @@ def test_reveal_accepts_noncontiguous_inputs_with_contiguous_outputs() -> None:
     assert revealed.sum(dim=-1).tolist() == [2, 3]
 
 
-def test_reveal_requires_exact_canvas_width_and_strict_triton_fails_on_cpu(
+def test_reveal_supports_blt_widths_and_strict_triton_fails_on_cpu(
     monkeypatch,
 ) -> None:
     canvas, samples, entropy, unresolved, active = _reveal_inputs()
-    with pytest.raises(ValueError, match="canvas must have shape"):
-        reveal_low_entropy(
-            canvas[:, :-1],
-            samples[:, :-1],
-            entropy[:, :-1],
-            unresolved[:, :-1],
-            active[:, :-1],
-            quota=1,
-            eot_id=256,
-        )
+    narrowed = reveal_low_entropy(
+        canvas[:, :4],
+        samples[:, :4],
+        entropy[:, :4],
+        unresolved[:, :4],
+        active[:, :4],
+        quota=1,
+        eot_id=256,
+    )
+    assert all(tensor.shape == (canvas.shape[0], 4) for tensor in narrowed)
     monkeypatch.setattr(kernels, "triton_is_importable", lambda: True)
     monkeypatch.setattr(
         kernels,

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace as dataclass_replace
 from enum import IntEnum
+import os
 from typing import Any, Literal
 
 
@@ -53,6 +54,7 @@ class AtomicVocabulary:
 class CorruptionConfig:
     kind: Literal[
         "blt_bernoulli",
+        "blt_exact_k",
         "absorbing_rb",
         "allmask_50",
         "whole_patch",
@@ -96,7 +98,7 @@ class CorruptionConfig:
 
 @dataclass(frozen=True)
 class ByteDiffusionConfig:
-    schema_version: int = 1
+    schema_version: int = 4
     vocab: AtomicVocabulary = AtomicVocabulary()
     local_dim: int = 256
     global_dim: int = 512
@@ -108,13 +110,25 @@ class ByteDiffusionConfig:
     encoder_ffn_dim: int = 512
     global_ffn_dim: int = 704
     decoder_ffn_dim: int = 512
+    global_ffn_kind: Literal["swiglu", "relu_squared"] = "swiglu"
     patch_stride: int = 4
     local_window: int = 512
+    decoder_prefix_window: int | None = 512
+    decoder_branch_attention: Literal[
+        "shared_flex", "duplicated_varlen"
+    ] = "shared_flex"
     rope_theta: float = 500_000.0
     ngram_enabled: bool = True
     ngram_table_size: int = 32_768
     ngram_rank: int = 16
     ngram_orders: tuple[int, ...] = (3, 4, 5, 6, 7, 8)
+    ngram_hash: Literal["blt_prime", "legacy257"] = "blt_prime"
+    ngram_factor_init: Literal["weak", "scale_matched"] = "weak"
+    ngram_aggregation: Literal["sum", "mean"] = "sum"
+    ngram_table_sharing: Literal["shared", "per_order"] = "shared"
+    decoder_conditioning: Literal[
+        "split_cross_attention", "gated_projection", "rmsnorm_projection"
+    ] = "gated_projection"
     output_tied: bool = False
     explicit_timestep: bool = False
     self_conditioning: bool = False
@@ -147,6 +161,39 @@ class ByteDiffusionConfig:
             raise ValueError("version 1 implements fixed stride four")
         if tuple(sorted(set(self.ngram_orders))) != self.ngram_orders:
             raise ValueError("ngram_orders must be sorted and unique")
+        if self.ngram_hash not in {"blt_prime", "legacy257"}:
+            raise ValueError(f"unsupported ngram_hash {self.ngram_hash!r}")
+        if self.ngram_factor_init not in {"weak", "scale_matched"}:
+            raise ValueError(
+                f"unsupported ngram_factor_init {self.ngram_factor_init!r}"
+            )
+        if self.ngram_aggregation not in {"sum", "mean"}:
+            raise ValueError(
+                f"unsupported ngram_aggregation {self.ngram_aggregation!r}"
+            )
+        if self.ngram_table_sharing not in {"shared", "per_order"}:
+            raise ValueError(
+                f"unsupported ngram_table_sharing {self.ngram_table_sharing!r}"
+            )
+        if self.decoder_conditioning not in {
+            "split_cross_attention",
+            "gated_projection",
+            "rmsnorm_projection",
+        }:
+            raise ValueError(
+                f"unsupported decoder_conditioning {self.decoder_conditioning!r}"
+            )
+        if self.global_ffn_kind not in {"swiglu", "relu_squared"}:
+            raise ValueError(f"unsupported global_ffn_kind {self.global_ffn_kind!r}")
+        if self.decoder_prefix_window is not None and self.decoder_prefix_window <= 0:
+            raise ValueError("decoder_prefix_window must be positive or None")
+        if self.decoder_branch_attention not in {
+            "shared_flex",
+            "duplicated_varlen",
+        }:
+            raise ValueError(
+                "decoder_branch_attention must be shared_flex or duplicated_varlen"
+            )
         if self.output_tied and self.local_dim <= 0:
             raise ValueError("invalid tied output width")
 
@@ -162,6 +209,7 @@ class ByteDiffusionConfig:
             "global_ffn_dim": 96,
             "decoder_ffn_dim": 64,
             "local_window": 16,
+            "decoder_prefix_window": 16,
             "ngram_enabled": False,
             "validate_production_layout": False,
             **overrides,
@@ -175,4 +223,59 @@ class ByteDiffusionConfig:
     def production_parameter_target(self) -> int:
         if self != ByteDiffusionConfig():
             raise ValueError("the closed parameter target applies only to the default config")
-        return 23_011_584
+        return 23_011_074
+
+
+def model_config_from_env(*, tiny: bool = False) -> ByteDiffusionConfig:
+    """Build one explicit architecture cell from the ablation environment."""
+
+    base = ByteDiffusionConfig.tiny() if tiny else ByteDiffusionConfig()
+    overrides: dict[str, object] = {}
+    string_fields = {
+        "BYTE_DIFFUSION_NGRAM_HASH": "ngram_hash",
+        "BYTE_DIFFUSION_NGRAM_FACTOR_INIT": "ngram_factor_init",
+        "BYTE_DIFFUSION_NGRAM_AGGREGATION": "ngram_aggregation",
+        "BYTE_DIFFUSION_NGRAM_TABLE_SHARING": "ngram_table_sharing",
+        "BYTE_DIFFUSION_DECODER_CONDITIONING": "decoder_conditioning",
+        "BYTE_DIFFUSION_GLOBAL_FFN_KIND": "global_ffn_kind",
+        "BYTE_DIFFUSION_DECODER_BRANCH_ATTENTION": "decoder_branch_attention",
+    }
+    for environment, field in string_fields.items():
+        if environment in os.environ:
+            overrides[field] = os.environ[environment]
+    if "BYTE_DIFFUSION_NGRAM_ENABLED" in os.environ:
+        value = os.environ["BYTE_DIFFUSION_NGRAM_ENABLED"]
+        if value not in {"0", "1"}:
+            raise ValueError("BYTE_DIFFUSION_NGRAM_ENABLED must be 0 or 1")
+        overrides["ngram_enabled"] = value == "1"
+    if "BYTE_DIFFUSION_GLOBAL_LAYERS" in os.environ:
+        layers = int(os.environ["BYTE_DIFFUSION_GLOBAL_LAYERS"])
+        if layers <= 0:
+            raise ValueError("BYTE_DIFFUSION_GLOBAL_LAYERS must be positive")
+        overrides["global_layers"] = layers
+    if "BYTE_DIFFUSION_DECODER_PREFIX_WINDOW" in os.environ:
+        raw_window = os.environ["BYTE_DIFFUSION_DECODER_PREFIX_WINDOW"].strip().lower()
+        if raw_window in {"none", "unbounded", "exact"}:
+            overrides["decoder_prefix_window"] = None
+        else:
+            window = int(raw_window)
+            if window <= 0:
+                raise ValueError(
+                    "BYTE_DIFFUSION_DECODER_PREFIX_WINDOW must be positive or unbounded"
+                )
+            overrides["decoder_prefix_window"] = window
+    if "BYTE_DIFFUSION_NGRAM_ORDERS" in os.environ:
+        try:
+            orders = tuple(
+                int(value.strip())
+                for value in os.environ["BYTE_DIFFUSION_NGRAM_ORDERS"].split(",")
+                if value.strip()
+            )
+        except ValueError as error:
+            raise ValueError(
+                "BYTE_DIFFUSION_NGRAM_ORDERS must be comma-separated integers"
+            ) from error
+        if not orders:
+            raise ValueError("BYTE_DIFFUSION_NGRAM_ORDERS cannot be empty")
+        overrides["ngram_orders"] = orders
+    return dataclass_replace(base, **overrides)

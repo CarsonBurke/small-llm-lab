@@ -109,6 +109,7 @@ def main() -> None:
             chunk_size=chunk_size,
             recipe=run.recipe,
             required_branch_bytes=run.corruption.corrupted_positions_per_row,
+            branch_span_length=run.corruption.canvas_length,
             validation_chunk_limit=(None if args.full_validation else run.validation_chunks),
             require_challenge_validation=args.full_validation,
         )

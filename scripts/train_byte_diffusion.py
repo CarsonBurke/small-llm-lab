@@ -3,8 +3,8 @@
 
 GPU usage must be queued, for example:
 
-    mlq submit --name bd_canvas128_2k --cwd "$PWD" --max-parallel-runs 1 -- \
-      python3 scripts/ablation.py --steps 2000 --name bd_canvas128_2k \
+    mlq submit --name bd_fast_blt_b4_2k --cwd "$PWD" --max-parallel-runs 1 -- \
+      python3 scripts/ablation.py --steps 2000 --name bd_fast_blt_b4_2k \
       --script scripts/train_byte_diffusion.py
 
 For multi-GPU final validation, submit ``torchrun`` itself through ``mlq``.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pretraining.byte_diffusion.config import ByteDiffusionConfig
+from pretraining.byte_diffusion.config import ByteDiffusionConfig, model_config_from_env
 from pretraining.byte_diffusion.data import DeterministicChunkCursor
 from pretraining.byte_diffusion.model import ByteDiffusionModel
 from pretraining.byte_diffusion.training import (
@@ -40,6 +41,33 @@ from pretraining.byte_diffusion.training import (
     format_validation_metric,
     load_data_directory,
 )
+
+
+def training_source_provenance() -> dict[str, object]:
+    """Fingerprint every runtime source file that defines a training cell."""
+
+    paths = sorted(
+        [
+            *(REPO_ROOT / "pretraining" / "byte_diffusion").glob("*.py"),
+            REPO_ROOT / "scripts" / "ablation.py",
+            REPO_ROOT / "scripts" / "train_byte_diffusion.py",
+        ],
+        key=lambda path: path.relative_to(REPO_ROOT).as_posix(),
+    )
+    digest = hashlib.sha256()
+    files: dict[str, str] = {}
+    for path in paths:
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        files[relative] = file_sha256
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(file_sha256))
+    return {
+        "schema": "byte_diffusion_source_provenance/v1",
+        "sha256": digest.hexdigest(),
+        "files": files,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +113,24 @@ def main() -> None:
     distributed = DistributedContext.from_environment(device.type)
     try:
         run = TrainingRunConfig.from_env()
+        source_provenance = training_source_provenance()
+        expected_source_sha256 = os.environ.get(
+            "BYTE_DIFFUSION_EXPECTED_SOURCE_SHA256"
+        )
+        if run.iterations >= 2_000 and expected_source_sha256 is None:
+            raise ValueError(
+                "2k and longer runs require "
+                "BYTE_DIFFUSION_EXPECTED_SOURCE_SHA256"
+            )
+        if (
+            expected_source_sha256 is not None
+            and source_provenance["sha256"] != expected_source_sha256
+        ):
+            raise ValueError(
+                "training source differs from the pinned run contract: "
+                f"expected {expected_source_sha256}, "
+                f"observed {source_provenance['sha256']}"
+            )
         if device.type == "cpu":
             run = replace(
                 run,
@@ -97,10 +143,11 @@ def main() -> None:
             torch.cuda.manual_seed_all(run.seed)
             torch.set_float32_matmul_precision("high")
 
-        model_config = (
-            ByteDiffusionConfig.tiny()
-            if args.tiny or os.environ.get("BYTE_DIFFUSION_TINY", "0") == "1"
-            else ByteDiffusionConfig()
+        model_config = model_config_from_env(
+            tiny=(
+                args.tiny
+                or os.environ.get("BYTE_DIFFUSION_TINY", "0") == "1"
+            )
         )
         if run.preset == CANONICAL_PRESET and model_config != ByteDiffusionConfig():
             raise ValueError(
@@ -111,13 +158,22 @@ def main() -> None:
                 "BYTE_DIFFUSION_CHUNK_SIZE", "8192"
             )
         )
+        expected_data_sha256 = os.environ.get(
+            "BYTE_DIFFUSION_EXPECTED_DATA_SHA256"
+        )
+        if run.iterations >= 2_000 and not expected_data_sha256:
+            raise ValueError(
+                "2k and longer runs require BYTE_DIFFUSION_EXPECTED_DATA_SHA256"
+            )
         manifest, train_chunks, validation_chunks = load_data_directory(
             args.data_path,
             chunk_size=chunk_size,
             recipe=run.recipe,
             required_branch_bytes=run.corruption.corrupted_positions_per_row,
+            branch_span_length=run.corruption.canvas_length,
             validation_chunk_limit=run.validation_chunks,
             require_challenge_validation=run.preset == CANONICAL_PRESET,
+            expected_payload_sha256=expected_data_sha256,
         )
         dataset_manifest = json.loads(
             (args.data_path / "manifest.json").read_text()
@@ -127,9 +183,6 @@ def main() -> None:
             "payload_sha256": dataset_payload_sha256,
             "source_manifests": dataset_manifest.get("source_manifests", []),
         }
-        expected_data_sha256 = os.environ.get(
-            "BYTE_DIFFUSION_EXPECTED_DATA_SHA256"
-        )
         if run.preset == CANONICAL_PRESET and not expected_data_sha256:
             raise ValueError(
                 f"preset {CANONICAL_PRESET!r} requires "
@@ -157,10 +210,10 @@ def main() -> None:
             * distributed.world_size
         )
         planned_rows = run.iterations * effective_global_batch
-        if run.preset == CANONICAL_PRESET and len(train_chunks) != planned_rows:
+        if run.preset == CANONICAL_PRESET and len(train_chunks) < planned_rows:
             raise ValueError(
-                f"preset {CANONICAL_PRESET!r} requires exactly one shuffled "
-                f"pass over {planned_rows:,} rows; dataset has {len(train_chunks):,}"
+                f"preset {CANONICAL_PRESET!r} needs at least {planned_rows:,} "
+                f"unique rows before wraparound; dataset has {len(train_chunks):,}"
             )
         trainer = ByteDiffusionTrainer(
             ByteDiffusionModel(model_config),
@@ -204,6 +257,21 @@ def main() -> None:
                 )
 
         if distributed.is_primary:
+            source_record = (
+                REPO_ROOT
+                / "ablation_results"
+                / run.run_id
+                / "source_provenance.json"
+            )
+            source_record.parent.mkdir(parents=True, exist_ok=True)
+            source_record.write_text(
+                json.dumps(source_provenance, indent=2, sort_keys=True) + "\n"
+            )
+            print(
+                "byte_diffusion_source_provenance "
+                + json.dumps(source_provenance, sort_keys=True),
+                flush=True,
+            )
             print(
                 "byte_diffusion_contract "
                 + json.dumps(
@@ -245,21 +313,29 @@ def main() -> None:
                     flush=True,
                 )
         while trainer.completed_steps < run.iterations:
-            metrics = trainer.run_update()
+            next_step = trainer.completed_steps + 1
+            log_update = (
+                next_step % run.train_log_every == 0
+                or next_step % run.val_loss_every == 0
+                or next_step == run.iterations
+            )
+            metrics = trainer.run_update(materialize_metrics=log_update)
+            step = trainer.completed_steps
             if distributed.is_primary and (
-                metrics.step % run.train_log_every == 0
-                or metrics.step == run.iterations
+                step % run.train_log_every == 0 or step == run.iterations
             ):
+                if metrics is None:
+                    raise AssertionError("logging update omitted its metrics")
                 print(format_train_metric(metrics, run.iterations), flush=True)
             if (
-                metrics.step % run.val_loss_every == 0
-                or metrics.step == run.iterations
+                step % run.val_loss_every == 0
+                or step == run.iterations
             ):
                 validation = trainer.validate()
                 if distributed.is_primary:
                     print(
                         format_validation_metric(
-                            metrics.step,
+                            step,
                             run.iterations,
                             validation,
                             trainer.training_time_ms,

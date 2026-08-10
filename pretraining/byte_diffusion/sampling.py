@@ -108,55 +108,29 @@ def reveal_low_entropy(
         raise ValueError("unresolved positions must store MASK")
     if quota == 0:
         return ids.clone(), unresolved.clone()
-    probabilities = logits.float().softmax(-1)
     if uniforms is None:
-        proposed = probabilities.argmax(-1)
+        proposed = logits.argmax(-1)
+        entropy = entropy_from_logits(logits)
     else:
         if uniforms.shape != ids.shape:
             raise ValueError("one supplied uniform is required per position")
-        cdf = probabilities.cumsum(-1)
-        proposed = torch.searchsorted(cdf, uniforms[:, None], right=False).squeeze(-1)
-    entropy = entropy_from_logits(logits)
-    # Stable positional tie-break: argsort(stable=True) preserves byte order.
-    order = entropy.masked_fill(~unresolved, torch.inf).argsort(stable=True)
-    selected: list[int] = []
-    for index in order.tolist():
-        if len(selected) == quota:
-            break
-        if not bool(unresolved[index]):
-            continue
-        if int(proposed[index]) == eot_id and bool(unresolved[:index].any()):
-            continue
-        selected.append(index)
-        # A revealed terminal atom ends the active sequence.  Filling the old
-        # quota from its suffix would do useless work and made the reference
-        # path disagree with the fused 512-position kernel.
-        if int(proposed[index]) == eot_id:
-            break
-    # If EOT gating removed candidates, fill deterministically with eligible
-    # non-EOT proposals. The final step may force argmax alternatives upstream.
-    if len(selected) < quota and not any(
-        int(proposed[index]) == eot_id for index in selected
-    ):
-        for index in order.tolist():
-            if len(selected) == quota:
-                break
-            if index not in selected and bool(unresolved[index]) and int(proposed[index]) != eot_id:
-                selected.append(index)
-    if len(selected) != quota and not any(
-        int(proposed[index]) == eot_id for index in selected
-    ):
-        raise RuntimeError("EOT gating left no legal reveal set")
-    output, next_unresolved = ids.clone(), unresolved.clone()
-    index_tensor = torch.tensor(selected, device=ids.device)
-    output[index_tensor] = proposed[index_tensor]
-    next_unresolved[index_tensor] = False
-    revealed_eot = ((output == eot_id) & ~next_unresolved).nonzero()
-    if revealed_eot.numel():
-        first_eot = int(revealed_eot[0])
-        output[first_eot + 1 :] = mask_id
-        next_unresolved[first_eot + 1 :] = False
-    return output, next_unresolved
+        from .kernels import categorical_sample_entropy_argmax_confidence
+
+        proposed, entropy, _, _ = categorical_sample_entropy_argmax_confidence(
+            logits, uniforms
+        )
+    from .kernels import reveal_low_entropy as fused_reveal
+
+    output, next_unresolved, _, _ = fused_reveal(
+        ids[None],
+        proposed[None],
+        entropy[None],
+        unresolved[None],
+        torch.ones_like(unresolved)[None],
+        quota,
+        eot_id=eot_id,
+    )
+    return output[0], next_unresolved[0]
 
 
 @dataclass(frozen=True)
@@ -212,36 +186,28 @@ def sample_absorbing_canvas(
                 generator=generator,
                 dtype=torch.float32,
             )
-            if ids.numel() == 512:
-                from .kernels import (
-                    categorical_sample_entropy_argmax_confidence,
-                    reveal_low_entropy as fused_reveal,
-                )
+            from .kernels import (
+                categorical_sample_entropy_argmax_confidence,
+                reveal_low_entropy as fused_reveal,
+            )
 
-                samples, entropy, _, _ = categorical_sample_entropy_argmax_confidence(
-                    logits, uniforms
-                )
-                canvas, next_unresolved, next_active, _ = fused_reveal(
-                    ids[None],
-                    samples[None],
-                    entropy[None],
-                    unresolved[None],
-                    active[None],
-                    quota,
-                    eot_id=eot_id,
-                )
-                ids, unresolved, active = canvas[0], next_unresolved[0], next_active[0]
-            else:
-                ids, unresolved = reveal_low_entropy(
-                    ids,
-                    unresolved,
-                    logits,
-                    quota,
-                    mask_id=mask_id,
-                    eot_id=eot_id,
-                    uniforms=uniforms,
-                )
-                active &= unresolved | ids.ne(mask_id)
+            samples, entropy, _, _ = categorical_sample_entropy_argmax_confidence(
+                logits, uniforms
+            )
+            canvas, next_unresolved, next_active, _ = fused_reveal(
+                ids[None],
+                samples[None],
+                entropy[None],
+                unresolved[None],
+                active[None],
+                quota,
+                eot_id=eot_id,
+            )
+            ids, unresolved, active = (
+                canvas[0],
+                next_unresolved[0],
+                next_active[0],
+            )
             if bool((live_before & ~unresolved).any()):
                 useful += 1
     if bool(unresolved.any()):
