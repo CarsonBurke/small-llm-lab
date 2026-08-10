@@ -7,6 +7,10 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+import torch
+from types import SimpleNamespace
+
+from pretraining.eval_byte_diffusion_gsm8k import greedy_generate_bytes
 
 from pretraining.eval_fewshot_gsm8k import (
     DAPO_PREAMBLE,
@@ -14,6 +18,7 @@ from pretraining.eval_fewshot_gsm8k import (
     build_prompt,
     extract_gold,
     extract_prediction,
+    greedy_generate,
     normalize_number,
     select_exemplars,
     truncate_at_stop,
@@ -155,3 +160,119 @@ def test_prediction_delimiter_follows_the_format():
 def test_gold_extraction_is_format_independent():
     # Gold always comes from GSM8K's own `#### N`, whatever the prompt format.
     assert extract_gold("reasoning\n#### 72") == "72"
+
+
+class _FakeCachedNano:
+    def __init__(self, continuations):
+        self.continuations = continuations
+        self.step_index = 0
+        self.prefill_ids = None
+        self.prefill_valid = None
+
+    def make_generation_cache(self, batch, width, device, dtype=None):
+        del device, dtype
+        return [(batch, width)]
+
+    def _logits(self):
+        logits = torch.zeros((len(self.continuations), 8))
+        for row, continuation in enumerate(self.continuations):
+            logits[row, continuation[self.step_index]] = 10
+            logits[row, 7] = 20
+        return logits
+
+    def prefill(self, ids, caches, key_valid):
+        del caches
+        self.prefill_ids = ids.clone()
+        self.prefill_valid = key_valid.clone()
+        return SimpleNamespace(logits=self._logits())
+
+    def token_step(self, chosen, caches, position):
+        del chosen, caches, position
+        self.step_index += 1
+        return SimpleNamespace(logits=self._logits())
+
+
+def test_nanogpt_greedy_uses_one_prefill_then_cached_steps():
+    model = _FakeCachedNano([[2, 0], [3, 4]])
+    outputs, work = greedy_generate(
+        model,
+        [[5], [5, 6]],
+        max_new_tokens=2,
+        eot_id=0,
+        blocked_ids=torch.tensor([7]),
+        device=torch.device("cpu"),
+        stop_check_every=2,
+        stops=("never",),
+        decode=lambda ids: "".join(map(str, ids)),
+    )
+
+    assert outputs == [[2], [3, 4]]
+    assert model.prefill_ids.tolist() == [[0, 5], [5, 6]]
+    assert model.prefill_valid.tolist() == [[False, True], [True, True]]
+    assert work == {
+        "prefill_forwards": 1,
+        "decode_forwards": 1,
+        "model_forwards": 2,
+    }
+
+
+class _FakeByteModel:
+    def __init__(self, prompt_lengths, continuations):
+        self.config = SimpleNamespace(
+            vocab=SimpleNamespace(pad_id=262, eot_id=256, output_size=261)
+        )
+        self.prompt_lengths = prompt_lengths
+        self.continuations = continuations
+        self.first_ids = None
+
+    def forward_ar_varlen(self, ids, valid, **kwargs):
+        del kwargs
+        if self.first_ids is None:
+            self.first_ids = ids.clone()
+        lengths = valid.sum(1)
+        logits = torch.zeros((int(lengths.sum()), 261))
+        offsets = torch.cat((torch.zeros(1, dtype=torch.long), lengths.cumsum(0)))
+        for row, length in enumerate(lengths.tolist()):
+            generated = length - self.prompt_lengths[row]
+            token = self.continuations[row][generated]
+            logits[offsets[row + 1] - 1, token] = 10
+            # An untrained control id must never win even with a larger logit.
+            logits[offsets[row + 1] - 1, 257] = 20
+        return SimpleNamespace(logits=logits)
+
+
+def test_byte_greedy_uses_virtual_bos_blocks_controls_and_stops_on_eot():
+    prompts = [b"A", b"BC"]
+    model = _FakeByteModel([1, 2], [[ord("2"), 256], [256]])
+    results = greedy_generate_bytes(
+        model,
+        prompts,
+        max_new_bytes=4,
+        max_native_actions=4,
+        context_bytes=16,
+        stops=("\n\n",),
+        device=torch.device("cpu"),
+    )
+
+    assert model.first_ids[0, 0].item() == ord("A")
+    assert model.first_ids[1, :2].tolist() == [ord("B"), ord("C")]
+    assert [result.raw for result in results] == [b"2", b""]
+    assert [result.termination for result in results] == ["eot", "eot"]
+    assert [result.native_actions for result in results] == [2, 1]
+
+
+def test_byte_greedy_marks_invalid_utf8_wrong_instead_of_replacement_decoding():
+    model = _FakeByteModel([1], [[0xFF, 256]])
+    result = greedy_generate_bytes(
+        model,
+        [b"A"],
+        max_new_bytes=4,
+        max_native_actions=4,
+        context_bytes=16,
+        stops=("\n\n",),
+        device=torch.device("cpu"),
+    )[0]
+
+    assert result.raw == b"\xff"
+    assert result.text is None
+    assert result.invalid_utf8

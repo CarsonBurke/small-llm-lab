@@ -2,8 +2,9 @@
 
 Base-model GSM8K is a standard k-shot generative benchmark: prompt with k
 worked exemplars, greedily continue the test question, and exact-match the
-number after ``####``. Nothing in this repository could run it -- the
-pretraining trainer has no decode path at all -- so this driver supplies one.
+number after ``####``. Generation uses the same heterogeneous dense-KV/KDA
+state caches as post-training rollouts: one batched prefill and one cached
+model forward per generated token.
 
 The GSM8K *test* split is genuinely held out of pretraining: `data/problem_registry/v1`
 reserves it under the ``eval`` split, which outranks ``pretrain``, behind a
@@ -13,10 +14,9 @@ GSM8K-train -- and the exemplars here are drawn from that train split, so the
 few-shot demonstrations may be familiar to the model. That biases scores up,
 not down.
 
-Scope: source-tokenizer checkpoints only. Bolmo needs a byte-level decoder with
-strictly-prior boundary routing, which is a separate and much larger piece of
-work; its ``causal_bpb`` sits 2.1-2.7 bpb above its teacher-forced codelength,
-so its generative numbers would measure that gap rather than byteification.
+Scope: source-tokenizer nanoGPT checkpoints. The byte-diffusion family has a
+separate evaluator because its generation units, UTF-8 validity checks, and
+native-action accounting differ.
 
 Read-only with respect to data and checkpoints, and refuses to overwrite its
 own output. Run through mlq: it executes a model on the GPU.
@@ -34,13 +34,15 @@ import hashlib
 import json
 import random
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 from pretraining.byte_accounting import load_bound_tokenizer
-from pretraining.nanogpt_mini.nanogpt_mini_kda_model import KDAGPT
+from postraining.latent_thought import LatentThoughtModel
+from postraining.model_io import load_model
 
 # The canonical OpenAI release, as cached by `datasets`. The repository's own
 # `gsm8k_test_questions.parquet` carries questions without gold answers, so it
@@ -216,7 +218,7 @@ def select_exemplars(train, shots: int, max_shots: int, seed: int) -> list[int]:
 
 @torch.no_grad()
 def greedy_generate(
-    model: KDAGPT,
+    model: LatentThoughtModel,
     prompts: list[list[int]],
     *,
     max_new_tokens: int,
@@ -226,47 +228,53 @@ def greedy_generate(
     stop_check_every: int,
     stops: tuple[str, ...],
     decode,
-) -> list[list[int]]:
-    """Greedy continuation, one row per prompt, left-aligned per row.
+) -> tuple[list[list[int]], dict[str, int]]:
+    """Greedy continuation through one cached prefill and token steps.
 
-    Rows have different prompt lengths, so each keeps its own cursor and writes
-    at its own position. Attention is causal, the depthwise conv only reads
-    leftward, the KDA recurrence runs left to right, and the trunk carries no
-    position encoding, so every position a row attends to is that row's own
-    real token and the unwritten tail beyond its cursor is never read.
+    Prompts are left padded for one batched prefill. The key-valid mask keeps
+    padded atoms out of dense attention and KDA state. Every later action is a
+    one-token cached step; the full prefix is never replayed.
     """
 
     if stop_check_every < 1:
         raise ValueError("stop_check_every must be at least 1")
+    if not prompts or any(not prompt for prompt in prompts):
+        raise ValueError("generation prompts must be nonempty")
     batch = len(prompts)
-    lengths = torch.tensor([len(ids) for ids in prompts], device=device)
-    width = int(lengths.max()) + max_new_tokens
-    # Filler is never attended: it sits strictly after each row's cursor.
-    buffer = torch.full((batch, width), eot_id, dtype=torch.int32, device=device)
+    prompt_width = max(map(len, prompts))
+    width = prompt_width + max_new_tokens
+    buffer = torch.full(
+        (batch, prompt_width), eot_id, dtype=torch.long, device=device
+    )
+    key_valid = torch.zeros(
+        (batch, prompt_width), dtype=torch.bool, device=device
+    )
     for row, ids in enumerate(prompts):
-        buffer[row, : len(ids)] = torch.tensor(ids, dtype=torch.int32, device=device)
+        start = prompt_width - len(ids)
+        buffer[row, start:] = torch.tensor(ids, dtype=torch.long, device=device)
+        key_valid[row, start:] = True
 
-    cursor = lengths.clone()
     finished = torch.zeros(batch, dtype=torch.bool, device=device)
     generated: list[list[int]] = [[] for _ in range(batch)]
-    rows = torch.arange(batch, device=device)
+    caches = model.make_generation_cache(
+        batch, width, device, dtype=torch.bfloat16 if device.type == "cuda" else None
+    )
+    output = model.prefill(buffer, caches, key_valid)
+    logits = output.logits
+    decode_steps = 0
     for step in range(max_new_tokens):
-        span = int(cursor.max())
-        logits = model.logits(buffer[:, :span], cursor - 1)[:, 0]
         # Ids the corpus never made a target carry unconstrained logits, and
         # argmax breaks ties toward the low id. That covers the padding above
         # the tokenizer's vocabulary and the registered post-training specials,
         # whose projection rows are bit-identical to the padding.
         logits[:, blocked_ids] = float("-inf")
-        chosen = logits.argmax(-1).to(torch.int32)
-        buffer[rows, cursor] = chosen
+        chosen = logits.argmax(-1).to(torch.long)
         # End-of-text terminates the row and is not part of its answer.
         stopping = chosen == eot_id
         for row, token in enumerate(chosen.tolist()):
             if not finished[row] and not stopping[row]:
                 generated[row].append(token)
         finished |= stopping
-        cursor += 1
         if bool(finished.all()):
             break
         if step % stop_check_every == stop_check_every - 1:
@@ -277,7 +285,18 @@ def greedy_generate(
                         finished[row] = True
             if bool(finished.all()):
                 break
-    return generated
+        if step + 1 < max_new_tokens:
+            # Finished lanes feed EOT into their private caches. Those caches
+            # are never read again; live lanes remain exactly independent.
+            chosen = torch.where(finished, eot_id, chosen)
+            output = model.token_step(chosen, caches, prompt_width + step)
+            logits = output.logits
+            decode_steps += 1
+    return generated, {
+        "prefill_forwards": 1,
+        "decode_forwards": decode_steps,
+        "model_forwards": 1 + decode_steps,
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -340,20 +359,8 @@ def main() -> None:
             "cannot be tied to a vocabulary"
         )
     tokenizer = load_bound_tokenizer(provenance)
-    model = KDAGPT(**config)
-    missing, unexpected = model.load_state_dict(payload["model"], strict=False)
-    if missing:
-        raise ValueError(f"checkpoint is missing decoding weights: {sorted(missing)}")
-    # KDAGPT is the decoding trunk alone. A resume payload also carries the
-    # training-only auxiliaries, which have no home here and are inert anyway.
-    stray = [
-        name
-        for name in unexpected
-        if not name.startswith(("mtp_heads.", "nextlat_dynamics."))
-    ]
-    if stray:
-        raise ValueError(f"checkpoint carries unknown state: {sorted(stray)}")
-    model.to(device).eval()
+    backbone = load_model(args.checkpoint, device, payload=payload).eval()
+    model = LatentThoughtModel(backbone).to(device).eval()
 
     specials = list(range(len(tokenizer.spec.specials)))
     blocked = sorted(
@@ -406,19 +413,34 @@ def main() -> None:
             answered: list[bool] = []
             transcripts: list[str] = []
             raw_transcripts: list[str] = []
+            native_work = {
+                "prefill_forwards": 0,
+                "decode_forwards": 0,
+                "model_forwards": 0,
+            }
+            generated_token_count = 0
+            generation_started = time.perf_counter()
             for start in range(0, len(prompts), args.batch_size):
                 chunk = prompts[start : start + args.batch_size]
-                outputs = greedy_generate(
-                    model,
-                    chunk,
-                    max_new_tokens=args.max_new_tokens,
-                    eot_id=tokenizer.eot_id,
-                    blocked_ids=blocked_ids,
-                    device=device,
-                    stop_check_every=args.stop_check_every,
-                    stops=fmt.stops,
-                    decode=decode,
-                )
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=device.type == "cuda",
+                ):
+                    outputs, chunk_work = greedy_generate(
+                        model,
+                        chunk,
+                        max_new_tokens=args.max_new_tokens,
+                        eot_id=tokenizer.eot_id,
+                        blocked_ids=blocked_ids,
+                        device=device,
+                        stop_check_every=args.stop_check_every,
+                        stops=fmt.stops,
+                        decode=decode,
+                    )
+                for name, value in chunk_work.items():
+                    native_work[name] += value
+                generated_token_count += sum(map(len, outputs))
                 for ids in outputs:
                     raw = decode(ids)
                     text = truncate_at_stop(raw, fmt.stops)
@@ -431,6 +453,8 @@ def main() -> None:
                     f"scored {len(predictions)}/{len(prompts)}",
                     flush=True,
                 )
+
+            generation_seconds = time.perf_counter() - generation_started
 
             correct = sum(
                 1
@@ -453,6 +477,9 @@ def main() -> None:
                 / len(prompts),
                 "mean_prompt_tokens": sum(prompt_lengths) / len(prompt_lengths),
                 "max_prompt_tokens": max(prompt_lengths),
+                "generation_seconds": generation_seconds,
+                "generated_tokens": generated_token_count,
+                **native_work,
                 "samples": [
                     {
                         "question": q,
@@ -492,6 +519,7 @@ def main() -> None:
         "seeds": seeds,
         "max_new_tokens": args.max_new_tokens,
         "strip_calculator_annotations": strip_calculator,
+        "implementation_maturity": "incremental_kv_kda_cache",
         "mean_exact_match_by_shots": {
             str(shots): sum(values) / len(values) for shots, values in by_shots.items()
         },
