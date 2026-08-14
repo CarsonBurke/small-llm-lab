@@ -39,9 +39,13 @@ slice-copy; 0-dim tensor position ``index_copy_`` + narrow; 1-D full-cache
 key mask; 2-D per-row left-pad key mask), with the nano deltas: separate
 q/k/v Linears, unweighted ``F.rms_norm`` on q/k, half-truncate RoPE applied
 at the absolute cache position, SDPA scale 0.12, no GQA, no q_gain.
+Padded CUDA prefill replaces the quadratic left-pad mask with native bf16/fp16
+varlen Flash; CPU retains the exact dense-mask oracle.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -56,6 +60,27 @@ NANO_DEFAULT_MODEL_CONFIG = {
     "model_dim": 512,
     "mlp_hidden": 2048,
 }
+
+
+@dataclass(frozen=True)
+class _PrefillAttentionLayout:
+    """One batch-wide attention layout, shared by every dense layer.
+
+    CPU keeps the exact dense oracle mask.  CUDA stores only the O(B)
+    cumulative-sequence metadata consumed by native varlen Flash;
+    in particular, it never materializes the old O(BL²) boolean mask.
+    ``max_seqlen`` is the padded width, a static upper bound accepted by the
+    Flash kernel, so deriving the layout does not synchronize for a CUDA
+    ``lengths.max().item()``.
+    """
+
+    attention_mask: Tensor | None = None
+    cu_seqlens: Tensor | None = None
+    max_seqlen: int | None = None
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.cu_seqlens is not None
 
 
 class _NanoPostrainingMixin:
@@ -369,14 +394,67 @@ class _NanoPostrainingMixin:
             key_valid[:, None, :, None], mask, causal[None, None]
         )
 
+    @classmethod
+    def _prefill_attention_layout(
+        cls,
+        token_latent: Tensor,
+        key_valid: Tensor | None,
+    ) -> _PrefillAttentionLayout:
+        """Build dense-CPU or packed-CUDA metadata once for the whole trunk."""
+
+        if key_valid is None:
+            return _PrefillAttentionLayout()
+        if (
+            key_valid.dtype != torch.bool
+            or key_valid.ndim != 2
+            or key_valid.shape != token_latent.shape[:2]
+        ):
+            raise ValueError("key_valid must be boolean [batch, length]")
+        if key_valid.device != token_latent.device:
+            raise ValueError("key_valid and token_latent must share a device")
+        if token_latent.device.type != "cuda":
+            return _PrefillAttentionLayout(
+                attention_mask=cls._prefill_attention_mask(key_valid)
+            )
+
+        # Preserve the original contiguous [B, L] token storage and describe
+        # each row as exactly two causal sequences: its invalid left prefix
+        # and its valid suffix.  The former reproduces the dense oracle's
+        # finite padded-query states; the latter cannot see padded keys.  This
+        # fixed 2B-sequence representation is fully packed (cu[-1] == B*L),
+        # handles the longest row through a zero-length pad sequence, and
+        # avoids both dynamic-shape ``nonzero`` synchronization and gather /
+        # scatter kernels.  Callers promise left padding; CPU remains the
+        # general arbitrary-mask oracle.
+        valid_lengths = key_valid.sum(dim=1, dtype=torch.int32)
+        pad_lengths = token_latent.shape[1] - valid_lengths
+        segment_lengths = torch.stack(
+            (pad_lengths, valid_lengths), dim=1
+        ).flatten()
+        cu_seqlens = F.pad(
+            segment_lengths.cumsum(dim=0, dtype=torch.int32), (1, 0)
+        )
+        return _PrefillAttentionLayout(
+            cu_seqlens=cu_seqlens,
+            max_seqlen=token_latent.shape[1],
+        )
+
     def _attention_prefill(
         self,
         attention: nanogpt_mini_model.CausalSelfAttention,
         x: Tensor,
         cache: tuple[Tensor, Tensor],
-        attention_mask: Tensor | None,
+        layout: _PrefillAttentionLayout,
     ) -> Tensor:
-        """Evaluate a prefix densely and populate its generation cache."""
+        """Evaluate a prefix and populate its generation cache.
+
+        A padded CUDA batch is true packed causal attention: every physical
+        row contributes separate pad-prefix and valid-suffix sequences to
+        native varlen Flash.  The split reproduces even the dense oracle's
+        padded-query outputs while making it structurally impossible for a
+        valid query to see a padded key.  Q/K/V storage and physical cache
+        addresses remain unchanged.
+        """
         batch, length, dim = x.shape
         num_heads, head_dim = attention.num_heads, attention.head_dim
         q = attention.q(x).view(batch, length, num_heads, head_dim)
@@ -390,11 +468,53 @@ class _NanoPostrainingMixin:
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         cache[0][:, :, :length].copy_(k.to(cache[0].dtype))
         cache[1][:, :, :length].copy_(v.to(cache[1].dtype))
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask,
-            is_causal=attention_mask is None, scale=0.12,
-        )
-        y = y.transpose(1, 2).contiguous().view(batch, length, dim)
+        if layout.is_varlen:
+            if q.device.type != "cuda":
+                raise RuntimeError("packed prefill requires CUDA")
+            if v.dtype not in (torch.float16, torch.bfloat16):
+                raise RuntimeError(
+                    "packed CUDA prefill requires fp16 or bf16 Q/K/V; run "
+                    "generation under CUDA autocast"
+                )
+            try:
+                from torch.nn.attention.varlen import varlen_attn
+            except Exception as error:
+                raise RuntimeError(
+                    "native varlen Flash attention is required for padded "
+                    "CUDA prefill"
+                ) from error
+            assert layout.cu_seqlens is not None
+            assert layout.max_seqlen is not None
+            # Autocast keeps linear V in bf16/fp16 but rms_norm Q/K in fp32.
+            # SDPA would autocast all three internally; native varlen requires
+            # an explicit common dtype before dispatch.
+            q_tokens = q.transpose(1, 2).reshape(-1, num_heads, head_dim)
+            k_tokens = k.transpose(1, 2).reshape(-1, num_heads, head_dim)
+            v_tokens = v.transpose(1, 2).reshape(-1, num_heads, head_dim)
+            packed_y = varlen_attn(
+                q_tokens.to(v.dtype),
+                k_tokens.to(v.dtype),
+                v_tokens,
+                layout.cu_seqlens,
+                layout.cu_seqlens,
+                layout.max_seqlen,
+                layout.max_seqlen,
+                scale=0.12,
+                window_size=(-1, 0),
+            )
+            y = packed_y.view(batch, length, num_heads, head_dim).reshape(
+                batch, length, dim
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=layout.attention_mask,
+                is_causal=layout.attention_mask is None,
+                scale=0.12,
+            )
+            y = y.transpose(1, 2).contiguous().view(batch, length, dim)
         return attention.proj(y)
 
     def _block_prefill(
@@ -402,10 +522,10 @@ class _NanoPostrainingMixin:
         block: nanogpt_mini_model.Block,
         x: Tensor,
         cache: tuple[Tensor, Tensor],
-        attention_mask: Tensor | None,
+        layout: _PrefillAttentionLayout,
     ) -> Tensor:
         x = x + self._attention_prefill(
-            block.attn, block.norm1(x), cache, attention_mask
+            block.attn, block.norm1(x), cache, layout
         )
         return x + block.mlp(block.norm2(x))
 
@@ -416,14 +536,10 @@ class _NanoPostrainingMixin:
         key_valid: Tensor | None = None,
     ) -> Tensor:
         """Compute a whole deterministic prefix and fill every layer cache."""
-        attention_mask = (
-            self._prefill_attention_mask(key_valid)
-            if key_valid is not None
-            else None
-        )
+        layout = self._prefill_attention_layout(token_latent, key_valid)
         x = token_latent
         for i, block in enumerate(self.blocks):
-            x = self._block_prefill(block, x, caches[i], attention_mask)
+            x = self._block_prefill(block, x, caches[i], layout)
         return self.norm2(x)
 
     def make_generation_cache(

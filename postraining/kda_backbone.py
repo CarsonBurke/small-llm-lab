@@ -288,11 +288,7 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
         key_valid: Tensor | None = None,
     ) -> Tensor:
         """Compute a whole deterministic prefix and fill every layer cache."""
-        attention_mask = (
-            self._prefill_attention_mask(key_valid)
-            if key_valid is not None
-            else None
-        )
+        layout = self._prefill_attention_layout(token_latent, key_valid)
         x = token_latent
         for i, block in enumerate(self.blocks):
             if block.use_kda:
@@ -313,5 +309,5 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
                 if block.use_mlp:
                     x = x + block.mlp(block.norm2(x))
             else:
-                x = self._block_prefill(block, x, caches[i], attention_mask)
+                x = self._block_prefill(block, x, caches[i], layout)
         return self.norm2(x)

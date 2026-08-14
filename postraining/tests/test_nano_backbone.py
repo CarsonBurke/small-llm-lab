@@ -387,6 +387,140 @@ def test_eager_step_under_cuda_bf16_autocast():
             assert torch.isfinite(out.logits).all()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or os.environ.get("RUN_CUDA_TESTS") != "1",
+    reason="set RUN_CUDA_TESTS=1 on CUDA host",
+)
+@torch.no_grad()
+def test_cuda_ragged_prefill_uses_varlen_and_matches_independent_rows(
+    monkeypatch,
+):
+    """CUDA padding is packed once and never becomes a dense B×L×L mask.
+
+    Comparing the next cached step as well as the prefill result catches both
+    valid-token attention errors and a subtle cache-position error: the
+    packed valid suffix is an isolated sequence, but K/V must still land in
+    the original physical left-padded slots for generation.
+    """
+
+    from torch.nn.attention import varlen as varlen_module
+
+    device = torch.device("cuda")
+    wrapper = LatentThoughtModel(_backbone()).to(device).eval()
+    lengths = torch.tensor([3, 6], device=device)
+    width = 6
+    ids = torch.randint(
+        1,
+        KWARGS["vocab_size"],
+        (2, width),
+        generator=torch.Generator(device=device).manual_seed(53),
+        device=device,
+    )
+    key_valid = torch.arange(width, device=device)[None] >= (
+        width - lengths[:, None]
+    )
+    ids = torch.where(key_valid, ids, torch.zeros_like(ids))
+
+    calls: list[tuple[int, list[int]]] = []
+    native_varlen = varlen_module.varlen_attn
+
+    def counted_varlen(query, key, value, cu_seq_q, cu_seq_k, *args, **kwargs):
+        calls.append((query.shape[0], cu_seq_q.detach().cpu().tolist()))
+        return native_varlen(
+            query, key, value, cu_seq_q, cu_seq_k, *args, **kwargs
+        )
+
+    def dense_mask_forbidden(_key_valid):
+        raise AssertionError("CUDA prefill constructed the dense padding mask")
+
+    monkeypatch.setattr(varlen_module, "varlen_attn", counted_varlen)
+    monkeypatch.setattr(
+        NanoGPTBackbone,
+        "_prefill_attention_mask",
+        staticmethod(dense_mask_forbidden),
+    )
+
+    batched_caches = wrapper.make_generation_cache(
+        2, width + 2, device, dtype=torch.bfloat16
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        batched = wrapper.prefill(ids, batched_caches, key_valid)
+    assert len(calls) == KWARGS["num_layers"]
+    assert calls == [(12, [0, 3, 6, 6, 12])] * KWARGS["num_layers"]
+
+    reference_outputs = []
+    reference_caches = []
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        for row, length in enumerate((3, 6)):
+            row_cache = wrapper.make_generation_cache(
+                1, length + 2, device, dtype=torch.bfloat16
+            )
+            reference_outputs.append(
+                wrapper.prefill(ids[row : row + 1, -length:], row_cache)
+            )
+            reference_caches.append(row_cache)
+    torch.testing.assert_close(
+        batched.belief,
+        torch.cat([output.belief for output in reference_outputs]),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    torch.testing.assert_close(
+        batched.logits,
+        torch.cat([output.logits for output in reference_outputs]),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    next_ids = torch.tensor([7, 11], device=device)
+    next_valid = torch.cat(
+        (key_valid, torch.ones(2, 1, dtype=torch.bool, device=device)), dim=1
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        batched_step = wrapper.token_step(
+            next_ids, batched_caches, torch.tensor(width, device=device), next_valid
+        )
+        reference_steps = [
+            wrapper.token_step(
+                next_ids[row : row + 1], reference_caches[row], length
+            )
+            for row, length in enumerate((3, 6))
+        ]
+    torch.testing.assert_close(
+        batched_step.belief,
+        torch.cat([output.belief for output in reference_steps]),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    torch.testing.assert_close(
+        batched_step.logits,
+        torch.cat([output.logits for output in reference_steps]),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    # Production compiles this tensor-only surface with dynamic batch/length
+    # shapes.  Full-graph capture here prevents metadata construction or the
+    # native varlen call from silently falling back to Python between layers.
+    monkeypatch.undo()
+    compiled_prefill = torch.compile(
+        wrapper.prefill_core, fullgraph=True, dynamic=True
+    )
+    compiled_caches = wrapper.make_generation_cache(
+        2, width + 2, device, dtype=torch.bfloat16
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        compiled_belief, compiled_logits = compiled_prefill(
+            wrapper.embed_tokens(ids), compiled_caches, key_valid
+        )
+    torch.testing.assert_close(
+        compiled_belief, batched.belief, rtol=3e-2, atol=3e-2
+    )
+    torch.testing.assert_close(
+        compiled_logits, batched.logits, rtol=3e-2, atol=3e-2
+    )
+
+
 @torch.no_grad()
 def test_renderer_matches_pretraining_forward():
     """Adapter-assembled sum-CE equals the pretraining class's forward."""
