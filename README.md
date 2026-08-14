@@ -33,6 +33,7 @@ Happy training!
 - `ablations/` contains experimental baseline forks and reference implementations.
 - `pretraining/` contains versioned model lineages and corpus configuration.
 - `postraining/`, `energy_readout/`, and `xlayer/` keep domain-specific code together.
+- [`docs/`](docs/) contains dated technology assessments and their revisit criteria.
 - `tests/` and `postraining/tests/` contain the unit test suites; `records/` is immutable submission history.
 
 ## Leaderboard
