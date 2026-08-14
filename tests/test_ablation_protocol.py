@@ -26,6 +26,7 @@ def test_ablation_uses_reference_warmdown_instead_of_ambient_value(monkeypatch) 
     assert env["WARMDOWN_ITERS"] == str(REFERENCE_WARMDOWN_ITERS)
     assert env["ITERATIONS"] == "2000"
     assert env["VAL_LOSS_EVERY"] == "20"
+    assert env["ABLATION_RUNNER_OWNS_METRICS"] == "1"
 
 
 def test_ablation_allows_explicit_warmdown_override() -> None:
@@ -37,6 +38,16 @@ def test_ablation_allows_explicit_warmdown_override() -> None:
     )
 
     assert env["WARMDOWN_ITERS"] == "0"
+
+
+def test_ablation_metrics_ownership_cannot_be_overridden() -> None:
+    with pytest.raises(ValueError, match="reserved by the runner"):
+        build_run_env(
+            {"ABLATION_RUNNER_OWNS_METRICS": "0"},
+            steps=20,
+            val_every=20,
+            name="invalid_metrics_owner",
+        )
 
 
 def test_short_checkpoint_run_keeps_flat_learning_rate() -> None:
@@ -88,6 +99,19 @@ def test_numeric_helpers_do_not_truncate_exponents() -> None:
     assert parse_time_ms("train_time:1e3ms") == pytest.approx(1_000.0)
     assert parse_time_ms("train_time:3msjunk") is None
     assert parse_time_ms("train_time:1e") is None
+
+
+def test_unavailable_compiler_step_average_is_not_a_metric_error() -> None:
+    entry = parse_log_line(
+        "step:20/20 train_loss:1.0 train_time:100ms step_avg:nanms lr:1e-3"
+    )
+
+    assert entry is not None
+    assert entry["type"] == "train"
+    assert entry["train_loss"] == pytest.approx(1.0)
+    assert entry["train_time_ms"] == pytest.approx(100.0)
+    assert entry["lr"] == pytest.approx(1e-3)
+    assert "step_avg_ms" not in entry
 
 
 @pytest.mark.parametrize(
@@ -169,6 +193,21 @@ def test_validation_without_time_uses_metrics_writer_fallback() -> None:
     }
 
 
+def test_diffusion_validation_does_not_masquerade_as_bpb() -> None:
+    entry = parse_log_line(
+        "step:20/20 val_loss:1.25 "
+        "val_diffusion_nelbo_bits_per_atom:1.75 train_time:3ms"
+    )
+    assert entry == {
+        "step": 20,
+        "val_loss": 1.25,
+        "val_diffusion_nelbo_bits_per_atom": 1.75,
+        "train_time_ms": 3.0,
+        "type": "val",
+    }
+    assert "val_bpb" not in entry
+
+
 def test_metrics_reader_rejects_malformed_middle_record(tmp_path) -> None:
     path = tmp_path / "metrics.jsonl"
     path.write_text(
@@ -245,6 +284,189 @@ def test_run_config_fails_closed_on_nonfinite_final_metric(
     )
     assert persisted["returncode"] == ablation.METRIC_INTEGRITY_RETURN_CODE
     assert persisted["final_val_bpb"] is None
+
+
+def test_run_config_forwards_explicit_training_script_arguments(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "emit_args.py"
+    child.write_text(
+        "import sys\n"
+        "assert sys.argv[1:] == ['--canvas-length', '256', '--branches', '15']\n"
+        "print('step:0/20 val_loss:2.0 val_bpb:3.0')\n"
+        "print('step:20/20 val_loss:1.0 val_bpb:2.0')\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+
+    script_args = ["--canvas-length", "256", "--branches", "15"]
+    result = run_config("script_args", {}, 20, 20, child.name, script_args)
+
+    assert result["returncode"] == 0
+    assert result["script_args"] == script_args
+
+
+def test_run_config_records_predeclared_futility_stop(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "emit_futile.py"
+    child.write_text(
+        "import time\n"
+        "print('step:0/2000 val_loss:3.0 "
+        "val_diffusion_nelbo_bits_per_atom:4.0', flush=True)\n"
+        "print('step:800/2000 val_loss:2.0 "
+        "val_diffusion_nelbo_bits_per_atom:3.1', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+
+    gate = (800, "val_diffusion_nelbo_bits_per_atom", 3.05)
+    result = run_config(
+        "futile", {}, 2_000, 20, child.name, futility_gates=(gate,)
+    )
+
+    assert result["returncode"] == 0
+    assert result["training_returncode"] != 0
+    assert result["completed_steps"] == 800
+    assert result["final_diffusion_nelbo_bits_per_atom"] == 3.1
+    assert result["metric_integrity_errors"] == []
+    assert result["early_stop"] == {
+        "step": 800,
+        "metric": "val_diffusion_nelbo_bits_per_atom",
+        "observed": 3.1,
+        "reject_at_or_above": 3.05,
+        "decision": "rejected_for_futility",
+        "termination": {
+            "signal": 15,
+            "forced": False,
+            "returncode": -15,
+        },
+    }
+
+
+def test_futility_stop_kills_sigterm_resistant_process_group(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "ignore_term.py"
+    child.write_text(
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('step:20/2000 val_loss:2.0 val_bpb:3.1', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+    monkeypatch.setattr(ablation, "TERMINATE_GRACE_SECONDS", 0.1)
+
+    result = run_config(
+        "force_kill", {}, 2_000, 20, child.name,
+        futility_gates=((20, "val_bpb", 3.0),),
+    )
+
+    assert result["returncode"] == 0
+    assert result["training_returncode"] == -9
+    assert result["early_stop"]["termination"] == {
+        "signal": 9,
+        "forced": True,
+        "returncode": -9,
+    }
+
+
+def test_futility_stop_kills_resistant_descendant_after_leader_exits(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "resistant_descendant.py"
+    child.write_text(
+        "import subprocess, sys, time\n"
+        "descendant = subprocess.Popen([sys.executable, '-c', "
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print(\"ready\", flush=True); time.sleep(60)'], "
+        "stdout=subprocess.PIPE, text=True)\n"
+        "assert descendant.stdout.readline().strip() == 'ready'\n"
+        "print('step:20/2000 val_loss:2.0 val_bpb:3.1', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+    monkeypatch.setattr(ablation, "TERMINATE_GRACE_SECONDS", 0.1)
+
+    result = run_config(
+        "kill_descendant", {}, 2_000, 20, child.name,
+        futility_gates=((20, "val_bpb", 3.0),),
+    )
+
+    assert result["returncode"] == 0
+    assert result["training_returncode"] == -15
+    assert result["early_stop"]["termination"] == {
+        "signal": 9,
+        "forced": True,
+        "returncode": -15,
+    }
+
+
+def test_generation_primary_recipe_never_ranks_its_ar_anchor(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "emit_idlm_anchor.py"
+    child.write_text(
+        "print('step:0/20 val_loss:2.0 val_bpb:3.0 "
+        "val_ar_anchor_bpb:3.0 val_diffusion_nelbo_bits_per_atom:3.0 "
+        "generation_primary:1')\n"
+        "print('step:20/20 val_loss:1.0 val_bpb:2.0 "
+        "val_ar_anchor_bpb:2.0 val_diffusion_nelbo_bits_per_atom:2.0 "
+        "generation_primary:1')\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+
+    result = run_config("idlm", {}, 20, 20, child.name)
+
+    assert result["returncode"] == 0
+    assert result["final_val_bpb"] is None
+    assert result["final_proxy_val_bpb"] is None
+    assert result["final_ar_anchor_bpb"] == 2.0
+    assert result["final_diffusion_nelbo_bits_per_atom"] == 2.0
+    assert (
+        result["promotion_metric"]
+        == "gsm8k_exact_match_generation_accuracy"
+    )
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ("train_byte_idlm.py", "train_byte_diffusion_gemma.py", "train_byte_duo.py"),
+)
+def test_known_generation_recipe_fails_closed_even_if_flag_is_missing(
+    tmp_path, monkeypatch, script_name: str
+) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / script_name
+    child.write_text(
+        "print('step:20/20 val_loss:1.0 val_bpb:2.0 "
+        "val_ar_anchor_bpb:2.0')\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+
+    result = run_config("idlm_missing_flag", {}, 20, 20, child.name)
+
+    assert result["returncode"] == 0
+    assert result["final_val_bpb"] is None
+    assert result["final_proxy_val_bpb"] is None
+    assert result["final_ar_anchor_bpb"] == 2.0
+    assert result["promotion_metric"] == "gsm8k_exact_match_generation_accuracy"
 
 
 def test_compare_results_rejects_nonfinite_legacy_json(tmp_path) -> None:

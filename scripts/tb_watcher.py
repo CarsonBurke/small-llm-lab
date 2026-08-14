@@ -30,15 +30,30 @@ def parse_line(line):
 def write_entry(writer: SummaryWriter, entry: dict, prev_train_loss: float | None) -> float | None:
     if entry["type"] == "val":
         time_s = int(entry["train_time_ms"] / 1000)
-        writer.add_scalar("val/bpb", entry["val_bpb"], entry["step"])
+        primary = entry.get("val_bpb", entry.get("val_diffusion_nelbo_bits_per_atom"))
+        if primary is None:
+            return prev_train_loss
+        primary_tag = "val/bpb" if "val_bpb" in entry else "val/diffusion_nelbo_bits_per_atom"
+        time_tag = "time/val_bpb" if "val_bpb" in entry else "time/val_diffusion_nelbo_bits_per_atom"
+        writer.add_scalar(primary_tag, primary, entry["step"])
         writer.add_scalar("val/loss", entry["val_loss"], entry["step"])
-        writer.add_scalar("time/val_bpb", entry["val_bpb"], time_s)
+        writer.add_scalar(time_tag, primary, time_s)
         writer.add_scalar("time/val_loss", entry["val_loss"], time_s)
         for key, value in entry.items():
             if key in {"step", "type", "val_loss", "val_bpb", "train_time_ms"}:
                 continue
             writer.add_scalar(MetricsWriter._extra_scalar_tag(key), value, entry["step"])
-        print(f"  val step={entry['step']} bpb={entry['val_bpb']:.4f} t={time_s}s")
+        metric = (
+            "diffusion-NELBO-bits/atom"
+            if "val_diffusion_nelbo_bits_per_atom" in entry
+            else "diffusion-elbo-proxy-bpb"
+            if entry.get("val_diffusion_primary") == 1
+            else "bpb"
+        )
+        print(
+            f"  val step={entry['step']} {metric}={primary:.4f} "
+            f"t={time_s}s"
+        )
     elif entry["type"] == "train":
         time_s = int(entry["train_time_ms"] / 1000)
         writer.add_scalar("train/loss", entry["train_loss"], entry["step"])
