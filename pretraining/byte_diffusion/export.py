@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import struct
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
@@ -15,6 +15,7 @@ from torch import Tensor, nn
 
 from .config import ByteDiffusionConfig
 from .data import AtomicIdManifest
+from .patching import CausalEntropyPatcher
 
 
 MAGIC = b"BDI4\x03\x00\x00\x00"
@@ -271,6 +272,7 @@ def _metadata_for_plan(
     atomic_manifest: AtomicIdManifest | None,
     post_quantization_metrics: Mapping[str, object] | None,
     provenance: Mapping[str, object] | None,
+    entropy_patcher_metadata: Mapping[str, object] | None,
 ) -> dict[str, object]:
     encoding_counts, encoding_parameter_counts = _encoding_summaries(
         parameters, encodings
@@ -318,6 +320,11 @@ def _metadata_for_plan(
         }
         payload_offset += packed_bytes + scale_bytes
     metadata["tensors"] = tensor_metadata
+    if entropy_patcher_metadata is not None:
+        metadata["entropy_patcher"] = {
+            **entropy_patcher_metadata,
+            "payload_offset": payload_offset,
+        }
     return metadata
 
 
@@ -333,7 +340,33 @@ def _planned_artifact_bytes(metadata: Mapping[str, object]) -> int:
         int(info["packed_bytes"]) + int(info["scale_bytes"])
         for info in tensors.values()
     )
+    patcher = metadata.get("entropy_patcher")
+    if patcher is not None:
+        if not isinstance(patcher, Mapping):
+            raise TypeError("artifact entropy patcher metadata must be an object")
+        payload_bytes += int(patcher["payload_bytes"])
     return len(MAGIC) + 8 + len(_metadata_bytes(metadata)) + payload_bytes
+
+
+def _validated_patcher_metadata(
+    artifact: bytes | None,
+) -> dict[str, object] | None:
+    if artifact is None:
+        return None
+    if not artifact:
+        raise ValueError("embedded entropy patcher artifact cannot be empty")
+    try:
+        patcher = CausalEntropyPatcher.from_bytes(artifact)
+    except (TypeError, ValueError) as error:
+        raise ValueError("embedded entropy patcher artifact is invalid") from error
+    return {
+        "schema": "causal_entropy_patcher/v1",
+        "payload_bytes": len(artifact),
+        "sha256": hashlib.sha256(artifact).hexdigest(),
+        "boundary_config": asdict(patcher.config),
+        "entropy_model_config": asdict(patcher.model.config),
+        "max_patch_size": patcher.config.max_patch_size,
+    }
 
 
 def _make_plan(
@@ -346,6 +379,7 @@ def _make_plan(
     atomic_manifest: AtomicIdManifest | None,
     post_quantization_metrics: Mapping[str, object] | None,
     provenance: Mapping[str, object] | None,
+    entropy_patcher: bytes | None,
 ) -> _ArtifactPlan:
     if group_size <= 0:
         raise ValueError("group_size must be positive")
@@ -360,6 +394,7 @@ def _make_plan(
         for name, parameter in parameters.items()
     }
     fallbacks: dict[str, str] = {}
+    entropy_patcher_metadata = _validated_patcher_metadata(entropy_patcher)
 
     def materialize_metadata() -> dict[str, object]:
         return _metadata_for_plan(
@@ -374,6 +409,7 @@ def _make_plan(
             atomic_manifest=atomic_manifest,
             post_quantization_metrics=post_quantization_metrics,
             provenance=provenance,
+            entropy_patcher_metadata=entropy_patcher_metadata,
         )
 
     metadata = materialize_metadata()
@@ -419,6 +455,7 @@ def artifact_size_report(
     atomic_manifest: AtomicIdManifest | None = None,
     post_quantization_metrics: Mapping[str, object] | None = None,
     provenance: Mapping[str, object] | None = None,
+    entropy_patcher: bytes | None = None,
 ) -> ArtifactSizeReport:
     """Return exact serialized size without reading or quantizing tensor values."""
 
@@ -431,6 +468,7 @@ def artifact_size_report(
         atomic_manifest=atomic_manifest,
         post_quantization_metrics=post_quantization_metrics,
         provenance=provenance,
+        entropy_patcher=entropy_patcher,
     )
     complete_bytes = plan.artifact_bytes + code_bytes
     return ArtifactSizeReport(
@@ -454,22 +492,86 @@ def _validate_final_evaluation(
     encoding_policy: ArtifactEncodingPolicy,
     group_size: int,
     encoding_fallbacks: Mapping[str, str],
+    entropy_patcher_metadata: Mapping[str, object] | None,
 ) -> None:
     if post_quantization_metrics is None:
         raise ValueError("final artifacts require post-quantization evaluation")
     if provenance is None:
         raise ValueError("final artifacts require checkpoint/data provenance")
-    bpb = post_quantization_metrics.get("bpb")
-    literal_bytes = post_quantization_metrics.get("literal_bytes")
-    if (
-        not isinstance(bpb, (float, int))
-        or not math.isfinite(float(bpb))
-        or not isinstance(literal_bytes, int)
-        or literal_bytes <= 0
+    patching_policy = provenance.get("patching_policy")
+    if patching_policy == "causal_entropy_v1":
+        if entropy_patcher_metadata is None:
+            raise ValueError(
+                "final entropy artifacts require an embedded authenticated patcher"
+            )
+        if provenance.get("entropy_patcher_sha256") != (
+            entropy_patcher_metadata.get("sha256")
+        ):
+            raise ValueError(
+                "final entropy artifact provenance disagrees with its patcher"
+            )
+    elif patching_policy == "fixed_stride_v1" and (
+        entropy_patcher_metadata is not None
     ):
-        raise ValueError(
-            "final evaluation needs finite BPB and a positive literal-byte count"
+        raise ValueError("fixed-stride artifacts cannot embed an entropy patcher")
+    if provenance.get("architecture") == "byte_duo_uniform_state_diffusion":
+        proxy = post_quantization_metrics.get(
+            "conditional_canvas_nelbo_nats_per_atom"
         )
+        targets = post_quantization_metrics.get("targets")
+        if (
+            not isinstance(proxy, (float, int))
+            or not math.isfinite(float(proxy))
+            or not isinstance(targets, int)
+            or targets <= 0
+        ):
+            raise ValueError(
+                "final Byte-Duo evaluation needs a finite conditional-canvas "
+                "NELBO proxy and positive target count"
+            )
+        delta = post_quantization_metrics.get("quantization_delta_bits_per_atom")
+        delta_limit = post_quantization_metrics.get(
+            "max_quantization_delta_bits_per_atom"
+        )
+        cached_smoke = post_quantization_metrics.get("cached_inference_smoke")
+        if (
+            not isinstance(delta, (float, int))
+            or not math.isfinite(float(delta))
+            or not isinstance(delta_limit, (float, int))
+            or not math.isfinite(float(delta_limit))
+            or float(delta_limit) < 0
+            or float(delta) > float(delta_limit)
+        ):
+            raise ValueError(
+                "final Byte-Duo evaluation must pass its finite quantization-"
+                "degradation threshold"
+            )
+        if (
+            not isinstance(cached_smoke, Mapping)
+            or cached_smoke.get("finite") is not True
+            or not isinstance(
+                cached_smoke.get("full_vs_cached_max_abs_error"), (float, int)
+            )
+            or not math.isfinite(
+                float(cached_smoke["full_vs_cached_max_abs_error"])
+            )
+            or float(cached_smoke["full_vs_cached_max_abs_error"]) > 1e-5
+        ):
+            raise ValueError(
+                "final Byte-Duo evaluation must pass cached inference parity"
+            )
+    else:
+        bpb = post_quantization_metrics.get("bpb")
+        literal_bytes = post_quantization_metrics.get("literal_bytes")
+        if (
+            not isinstance(bpb, (float, int))
+            or not math.isfinite(float(bpb))
+            or not isinstance(literal_bytes, int)
+            or literal_bytes <= 0
+        ):
+            raise ValueError(
+                "final evaluation needs finite BPB and a positive literal-byte count"
+            )
     expected_plan = {
         "policy": encoding_policy,
         "group_size": group_size,
@@ -503,6 +605,7 @@ def build_artifact(
     atomic_manifest: AtomicIdManifest | None = None,
     post_quantization_metrics: Mapping[str, object] | None = None,
     provenance: Mapping[str, object] | None = None,
+    entropy_patcher: bytes | None = None,
     require_evaluation: bool = False,
 ) -> bytes:
     """Build a deterministic, metadata-inclusive weight artifact.
@@ -520,6 +623,7 @@ def build_artifact(
         atomic_manifest=atomic_manifest,
         post_quantization_metrics=post_quantization_metrics,
         provenance=provenance,
+        entropy_patcher=entropy_patcher,
     )
     if require_evaluation:
         _validate_final_evaluation(
@@ -528,6 +632,9 @@ def build_artifact(
             encoding_policy=encoding_policy,
             group_size=group_size,
             encoding_fallbacks=plan.fallbacks,
+            entropy_patcher_metadata=(
+                plan.metadata.get("entropy_patcher")  # type: ignore[arg-type]
+            ),
         )
     complete_size = plan.artifact_bytes + code_bytes
     if complete_size > ARTIFACT_CAP_BYTES:
@@ -552,6 +659,15 @@ def build_artifact(
             raise AssertionError("encoded scale length drifted from its size plan")
         payload.extend(tensor.packed)
         payload.extend(tensor.scales)
+    if entropy_patcher is not None:
+        patcher_info = plan.metadata.get("entropy_patcher")
+        if not isinstance(patcher_info, Mapping):
+            raise AssertionError("entropy patcher disappeared from the size plan")
+        if len(payload) != int(patcher_info["payload_offset"]):
+            raise AssertionError("entropy patcher offset drifted from its size plan")
+        if len(entropy_patcher) != int(patcher_info["payload_bytes"]):
+            raise AssertionError("entropy patcher length drifted from its size plan")
+        payload.extend(entropy_patcher)
     metadata_bytes = _metadata_bytes(plan.metadata)
     artifact = MAGIC + struct.pack("<Q", len(metadata_bytes)) + metadata_bytes + bytes(payload)
     if len(artifact) != plan.artifact_bytes:
@@ -609,9 +725,9 @@ def _parse_tensor(
     )
 
 
-def parse_artifact(
+def _artifact_metadata_and_payload(
     artifact: bytes,
-) -> tuple[dict[str, object], dict[str, QuantizedTensor]]:
+) -> tuple[dict[str, object], bytes]:
     if artifact[: len(MAGIC)] != MAGIC:
         raise ValueError("invalid byte-diffusion artifact magic")
     header_start = len(MAGIC)
@@ -630,10 +746,55 @@ def parse_artifact(
         raise ValueError("artifact metadata must be a JSON object")
     if metadata.get("schema") != 3:
         raise ValueError("unsupported byte-diffusion artifact schema")
+    return metadata, artifact[metadata_end:]
+
+
+def _validate_embedded_entropy_patcher(
+    metadata: Mapping[str, object], payload: bytes, cursor: int
+) -> int:
+    info = metadata.get("entropy_patcher")
+    if info is None:
+        return cursor
+    if not isinstance(info, Mapping):
+        raise ValueError("artifact entropy patcher metadata must be an object")
+    try:
+        schema = str(info["schema"])
+        offset = int(info["payload_offset"])
+        payload_bytes = int(info["payload_bytes"])
+        expected_sha256 = str(info["sha256"])
+        max_patch_size = int(info["max_patch_size"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid embedded entropy patcher metadata") from error
+    if schema != "causal_entropy_patcher/v1":
+        raise ValueError("unsupported embedded entropy patcher schema")
+    if offset != cursor or payload_bytes <= 0:
+        raise ValueError("embedded entropy patcher leaves a gap or overlap")
+    stop = offset + payload_bytes
+    if stop > len(payload):
+        raise ValueError("embedded entropy patcher lies outside the artifact")
+    artifact = payload[offset:stop]
+    if hashlib.sha256(artifact).hexdigest() != expected_sha256:
+        raise ValueError("embedded entropy patcher sha256 mismatch")
+    try:
+        patcher = CausalEntropyPatcher.from_bytes(artifact)
+    except (TypeError, ValueError) as error:
+        raise ValueError("embedded entropy patcher artifact is invalid") from error
+    if max_patch_size != patcher.config.max_patch_size:
+        raise ValueError("embedded entropy patcher maximum size metadata mismatch")
+    if info.get("boundary_config") != asdict(patcher.config):
+        raise ValueError("embedded entropy patcher boundary metadata mismatch")
+    if info.get("entropy_model_config") != asdict(patcher.model.config):
+        raise ValueError("embedded entropy model metadata mismatch")
+    return stop
+
+
+def parse_artifact(
+    artifact: bytes,
+) -> tuple[dict[str, object], dict[str, QuantizedTensor]]:
+    metadata, payload = _artifact_metadata_and_payload(artifact)
     tensor_metadata = metadata.get("tensors")
     if not isinstance(tensor_metadata, dict):
         raise ValueError("artifact omitted tensor metadata")
-    payload = artifact[metadata_end:]
     tensors = {
         name: _parse_tensor(name, info, payload)
         for name, info in tensor_metadata.items()
@@ -651,9 +812,27 @@ def parse_artifact(
         if start != cursor:
             raise ValueError(f"tensor {name!r} leaves a gap or overlap in the payload")
         cursor = stop
+    cursor = _validate_embedded_entropy_patcher(metadata, payload, cursor)
     if cursor != len(payload):
-        raise ValueError("artifact contains unclaimed tensor payload bytes")
+        raise ValueError("artifact contains unclaimed payload bytes")
     return metadata, tensors
+
+
+def load_embedded_entropy_patcher(
+    artifact: bytes,
+) -> CausalEntropyPatcher | None:
+    """Return the hash-validated self-contained patcher, when present."""
+
+    metadata, _ = parse_artifact(artifact)
+    info = metadata.get("entropy_patcher")
+    if info is None:
+        return None
+    if not isinstance(info, Mapping):
+        raise AssertionError("validated entropy patcher metadata disappeared")
+    _, payload = _artifact_metadata_and_payload(artifact)
+    offset = int(info["payload_offset"])
+    stop = offset + int(info["payload_bytes"])
+    return CausalEntropyPatcher.from_bytes(payload[offset:stop])
 
 
 def load_artifact(

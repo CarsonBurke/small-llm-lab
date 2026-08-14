@@ -14,6 +14,7 @@ class WorkCounters:
     denoise_forwards: int = 0
     prefix_prefills: int = 0
     causal_replays: int = 0
+    cache_appends: int = 0
     proposed_bytes: int = 0
     committed_bytes: int = 0
     rejected_bytes: int = 0
@@ -144,6 +145,12 @@ class TransactionalDecodeState:
             self.counters.causal_replays += 1
         else:
             self.counters.prefix_prefills += 1
+
+    def note_cache_append(self) -> None:
+        """Count one incremental clean encoder/global/decoder replay."""
+
+        self.counters.forwards += 1
+        self.counters.cache_appends += 1
 
     def abort(self) -> None:
         if self._scratch is None:

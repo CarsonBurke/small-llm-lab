@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -118,6 +120,28 @@ def test_blt_exact_k_has_nonempty_masks_and_inverse_fraction_sum_weight() -> Non
         estimated_full_sum,
         eligible.sum(1).to(torch.float32) * 1.25,
     )
+
+
+@pytest.mark.parametrize("eligible_count", range(1, 8))
+def test_exact_k_coefficients_equal_integrated_bernoulli_objective(
+    eligible_count: int,
+) -> None:
+    """Prove equality for every subset size in a finite eligible canvas."""
+
+    for selected_count in range(1, eligible_count + 1):
+        bernoulli_coefficient = (
+            math.factorial(selected_count - 1)
+            * math.factorial(eligible_count - selected_count)
+            / math.factorial(eligible_count)
+        )
+        exact_k_coefficient = (
+            (1 / eligible_count)
+            * (1 / math.comb(eligible_count, selected_count))
+            * (eligible_count / selected_count)
+        )
+        assert exact_k_coefficient == pytest.approx(
+            bernoulli_coefficient, rel=1e-15, abs=1e-15
+        )
 
 
 def test_allmask_50_keeps_exact_nonzero_counts_and_valid_targets() -> None:

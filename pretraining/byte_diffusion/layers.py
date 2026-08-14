@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+
+@dataclass(frozen=True)
+class CleanAttentionBank:
+    """Rotated clean K/V tensors reused by branch-only inference passes."""
+
+    key: Tensor
+    value: Tensor
+
+    def __post_init__(self) -> None:
+        if self.key.ndim != 4 or self.value.shape != self.key.shape:
+            raise ValueError("cached clean attention K/V must be aligned [B,H,L,D]")
+        if self.key.device != self.value.device or self.key.dtype != self.value.dtype:
+            raise ValueError("cached clean attention K/V must share dtype and device")
 
 
 def packed_sequence_offsets(lengths: Tensor) -> Tensor:
@@ -564,6 +579,7 @@ class PackedSelfAttention(nn.Module):
         layout,
         clean_window: int | None,
         allow_dense_reference: bool,
+        assume_physical_clean: bool = False,
         block_mask=None,
     ) -> Tensor:
         """Document-packed clean Flash plus shared-prefix branch Flex attention.
@@ -589,15 +605,14 @@ class PackedSelfAttention(nn.Module):
         if clean_cu_seqlens.ndim != 1 or clean_cu_seqlens.dtype != torch.int32:
             raise ValueError("clean offsets must be rank-1 int32")
 
-        clean_states = x[:, :clean_length]
-        branch_states = x[:, clean_length:]
-        clean_qkv = self.qkv(clean_states).view(
-            batch, clean_length, 3, self.heads, self.head_dim
+        # QKV is also a shared positionwise projection. One static combined
+        # GEMM is materially more efficient than separate clean/branch calls.
+        qkv = self.qkv(x).view(
+            batch, total_length, 3, self.heads, self.head_dim
         )
+        clean_qkv = qkv[:, :clean_length]
         branch_length = total_length - clean_length
-        branch_qkv = self.qkv(branch_states).view(
-            batch, branch_length, 3, self.heads, self.head_dim
-        )
+        branch_qkv = qkv[:, clean_length:]
         clean_q, clean_k, clean_v = (
             value.transpose(1, 2) for value in clean_qkv.unbind(2)
         )
@@ -611,16 +626,40 @@ class PackedSelfAttention(nn.Module):
             branch_q, branch_k, positions[:, clean_length:], self.rope_theta
         )
 
-        packed_clean_q = pack_rows(
-            clean_q.transpose(1, 2), clean_indices
+        # Production compile-stable metadata covers the complete physical
+        # clean bank in row-major order. In that case packing/unpacking is an
+        # identity, but generic index_select/index_copy left a material
+        # index_add backward hotspot. Compact metadata still takes the exact
+        # gather/scatter path used by CPU/reference tests.
+        full_physical_clean = assume_physical_clean
+        if full_physical_clean and clean_indices.numel() != batch * clean_length:
+            raise ValueError("physical clean metadata must cover the complete bank")
+        clean_q_rows = clean_q.transpose(1, 2).reshape(
+            batch * clean_length, self.heads, self.head_dim
         )
-        packed_clean_k = pack_rows(
-            clean_k.transpose(1, 2), clean_indices
+        clean_k_rows = clean_k.transpose(1, 2).reshape_as(clean_q_rows)
+        clean_v_rows = clean_v.transpose(1, 2).reshape_as(clean_q_rows)
+        packed_clean_q = (
+            clean_q_rows
+            if full_physical_clean
+            else clean_q_rows.index_select(0, clean_indices)
         )
-        packed_clean_v = pack_rows(
-            clean_v.transpose(1, 2), clean_indices
+        packed_clean_k = (
+            clean_k_rows
+            if full_physical_clean
+            else clean_k_rows.index_select(0, clean_indices)
         )
-        clean_positions = pack_rows(positions[:, :clean_length], clean_indices)
+        packed_clean_v = (
+            clean_v_rows
+            if full_physical_clean
+            else clean_v_rows.index_select(0, clean_indices)
+        )
+        clean_position_rows = positions[:, :clean_length].reshape(-1)
+        clean_positions = (
+            clean_position_rows
+            if full_physical_clean
+            else clean_position_rows.index_select(0, clean_indices)
+        )
         clean_packed = PackedCleanQKV(
             packed_clean_q,
             packed_clean_k,
@@ -635,12 +674,16 @@ class PackedSelfAttention(nn.Module):
             backend="dense_reference" if allow_dense_reference else "varlen_flash",
             allow_dense_reference=allow_dense_reference,
         )
-        clean_output = unpack_rows(
-            clean_attended,
-            clean_indices,
-            clean_attended.new_empty(
-                (batch, clean_length, self.heads, self.head_dim)
-            ),
+        clean_output = (
+            clean_attended.view(batch, clean_length, self.heads, self.head_dim)
+            if full_physical_clean
+            else unpack_rows(
+                clean_attended,
+                clean_indices,
+                clean_attended.new_empty(
+                    (batch, clean_length, self.heads, self.head_dim)
+                ),
+            )
         )
         branch_output = branch_attention(
             branch_q,
@@ -653,12 +696,128 @@ class PackedSelfAttention(nn.Module):
             block_mask=block_mask,
             allow_dense_reference=allow_dense_reference,
         ).transpose(1, 2)
-        # Keep the symbolic clean and branch extents separate through the
-        # head-flattening projection.  Inductor's dynamic backward scheduler
-        # cannot reliably split the otherwise concatenated sum on sm120.
-        clean_projected = self.output(clean_output.flatten(-2))
-        branch_projected = self.output(branch_output.flatten(-2))
-        return torch.cat((clean_projected, branch_projected), dim=1)
+        # Projection is positionwise and shared. Compile-stable production
+        # geometry makes the combined extent static, so one larger GEMM is
+        # exactly equivalent and avoids two launches per attention block.
+        attended = torch.cat((clean_output, branch_output), dim=1)
+        return self.output(attended.flatten(-2))
+
+    def prepare_clean_bank(
+        self,
+        clean_states: Tensor,
+        *,
+        clean_indices: Tensor,
+        clean_cu_seqlens: Tensor,
+        positions: Tensor,
+        clean_window: int | None,
+        allow_dense_reference: bool,
+        assume_physical_clean: bool = False,
+    ) -> tuple[Tensor, CleanAttentionBank]:
+        """Run the clean attention once and retain its rotated K/V bank."""
+
+        from .attention import PackedCleanQKV, packed_clean_attention
+
+        if clean_states.ndim != 3 or positions.shape != clean_states.shape[:2]:
+            raise ValueError("clean states and positions must align")
+        batch, clean_length, _ = clean_states.shape
+        qkv = self.qkv(clean_states).view(
+            batch, clean_length, 3, self.heads, self.head_dim
+        )
+        clean_q, clean_k, clean_v = (
+            value.transpose(1, 2) for value in qkv.unbind(2)
+        )
+        clean_q, clean_k = apply_rotary(
+            clean_q, clean_k, positions, self.rope_theta
+        )
+        full_physical_clean = assume_physical_clean
+        if full_physical_clean and clean_indices.numel() != batch * clean_length:
+            raise ValueError("physical clean metadata must cover the complete bank")
+        q_rows = clean_q.transpose(1, 2).reshape(
+            batch * clean_length, self.heads, self.head_dim
+        )
+        k_rows = clean_k.transpose(1, 2).reshape_as(q_rows)
+        v_rows = clean_v.transpose(1, 2).reshape_as(q_rows)
+        position_rows = positions.reshape(-1)
+        packed = PackedCleanQKV(
+            q_rows if full_physical_clean else q_rows.index_select(0, clean_indices),
+            k_rows if full_physical_clean else k_rows.index_select(0, clean_indices),
+            v_rows if full_physical_clean else v_rows.index_select(0, clean_indices),
+            clean_cu_seqlens,
+            (
+                position_rows
+                if full_physical_clean
+                else position_rows.index_select(0, clean_indices)
+            ),
+            clean_length,
+        )
+        attended = packed_clean_attention(
+            packed,
+            window=clean_window,
+            backend="dense_reference" if allow_dense_reference else "varlen_flash",
+            allow_dense_reference=allow_dense_reference,
+        )
+        clean_output = (
+            attended.view(batch, clean_length, self.heads, self.head_dim)
+            if full_physical_clean
+            else unpack_rows(
+                attended,
+                clean_indices,
+                attended.new_zeros(
+                    (batch, clean_length, self.heads, self.head_dim)
+                ),
+            )
+        )
+        return self.output(clean_output.flatten(-2)), CleanAttentionBank(
+            clean_k, clean_v
+        )
+
+    def forward_branch_from_clean_bank(
+        self,
+        branch_states: Tensor,
+        clean_bank: CleanAttentionBank,
+        *,
+        positions: Tensor,
+        layout,
+        allow_dense_reference: bool,
+        block_mask=None,
+    ) -> Tensor:
+        """Attend revisable branch queries to cached clean K/V and branch K/V."""
+
+        from .attention import branch_attention
+
+        if branch_states.ndim != 3 or positions.shape != branch_states.shape[:2]:
+            raise ValueError("branch states and positions must align")
+        batch, branch_length, _ = branch_states.shape
+        if clean_bank.key.shape[0] != batch:
+            raise ValueError("cached clean bank batch does not match branches")
+        if layout.clean_length != clean_bank.key.shape[2]:
+            raise ValueError("cached clean bank length does not match branch layout")
+        qkv = self.qkv(branch_states).view(
+            batch, branch_length, 3, self.heads, self.head_dim
+        )
+        branch_q, branch_k, branch_v = (
+            value.transpose(1, 2) for value in qkv.unbind(2)
+        )
+        if branch_k.dtype != clean_bank.key.dtype:
+            raise ValueError(
+                "branch projection dtype differs from the prepared clean bank; "
+                "prepare and consume the cache under the same autocast policy"
+            )
+        branch_q, branch_k = apply_rotary(
+            branch_q, branch_k, positions, self.rope_theta
+        )
+        attended = branch_attention(
+            branch_q,
+            clean_bank.key,
+            clean_bank.value,
+            branch_k,
+            branch_v,
+            layout,
+            backend="dense_reference" if allow_dense_reference else "flex",
+            block_mask=block_mask,
+            allow_dense_reference=allow_dense_reference,
+        ).transpose(1, 2)
+        return self.output(attended.flatten(-2))
 
     def forward_packed_document_branches(
         self,
@@ -943,6 +1102,111 @@ class TransformerBlock(nn.Module):
         branch = branch + self.ffn(self.ffn_norm(branch))
         return torch.cat((clean, branch), dim=1)
 
+    def forward_shared_document_branches_adaln(
+        self,
+        x: Tensor,
+        branch_modulation: Tensor,
+        **kwargs,
+    ) -> Tensor:
+        """Shared clean bank plus DiT-style AdaLN-Zero noisy branches.
+
+        The clean prefix is deliberately independent of diffusion time and
+        follows the ordinary transformer path. Only the revisable branch bank
+        receives the six per-block shift/scale/gate values used by Duo's DiT
+        reference implementation.
+        """
+
+        clean_length = kwargs["clean_length"]
+        clean = x[:, :clean_length]
+        branch = x[:, clean_length:]
+        if branch_modulation.ndim != 3 or branch.shape[1] % branch_modulation.shape[1]:
+            raise ValueError("branch AdaLN values must align with complete branches")
+        branch_count = branch_modulation.shape[1]
+        branch_width = branch.shape[1] // branch_count
+        branch = branch.view(branch.shape[0], branch_count, branch_width, branch.shape[-1])
+        parameters = tuple(
+            value[:, :, None, :] for value in branch_modulation.chunk(6, dim=-1)
+        )
+        (
+            attention_shift,
+            attention_scale,
+            attention_gate,
+            ffn_shift,
+            ffn_scale,
+            ffn_gate,
+        ) = parameters
+
+        clean_normalized = self.attention_norm(clean)
+        branch_normalized = self.attention_norm(branch)
+        branch_normalized = branch_normalized * (1 + attention_scale) + attention_shift
+        branch_normalized = branch_normalized.flatten(1, 2)
+        attended = self.attention.forward_shared_document_branches(
+            torch.cat((clean_normalized, branch_normalized), dim=1), **kwargs
+        )
+        clean_attended = attended[:, :clean_length]
+        branch_attended = attended[:, clean_length:]
+        clean = clean + clean_attended
+        branch = branch + attention_gate * branch_attended.view_as(branch)
+
+        clean_normalized = self.ffn_norm(clean)
+        branch_normalized = self.ffn_norm(branch)
+        branch_normalized = branch_normalized * (1 + ffn_scale) + ffn_shift
+        combined_ffn = self.ffn(
+            torch.cat((clean_normalized, branch_normalized.flatten(1, 2)), dim=1)
+        )
+        clean = clean + combined_ffn[:, :clean_length]
+        branch = branch + ffn_gate * combined_ffn[:, clean_length:].view_as(branch)
+        return torch.cat((clean, branch.flatten(1, 2)), dim=1)
+
+    def prepare_clean_bank(
+        self, clean: Tensor, **kwargs
+    ) -> tuple[Tensor, CleanAttentionBank]:
+        """Advance a time-independent clean stream and cache layer K/V."""
+
+        attended, bank = self.attention.prepare_clean_bank(
+            self.attention_norm(clean), **kwargs
+        )
+        clean = clean + attended
+        clean = clean + self.ffn(self.ffn_norm(clean))
+        return clean, bank
+
+    def forward_branch_from_clean_bank_adaln(
+        self,
+        branch: Tensor,
+        branch_modulation: Tensor,
+        clean_bank: CleanAttentionBank,
+        **kwargs,
+    ) -> Tensor:
+        """Run only the time-conditioned branch stream against cached K/V."""
+
+        if branch_modulation.ndim != 3 or branch.shape[1] % branch_modulation.shape[1]:
+            raise ValueError("branch AdaLN values must align with complete branches")
+        branch_count = branch_modulation.shape[1]
+        branch_width = branch.shape[1] // branch_count
+        shaped = branch.view(
+            branch.shape[0], branch_count, branch_width, branch.shape[-1]
+        )
+        (
+            attention_shift,
+            attention_scale,
+            attention_gate,
+            ffn_shift,
+            ffn_scale,
+            ffn_gate,
+        ) = tuple(
+            value[:, :, None, :] for value in branch_modulation.chunk(6, dim=-1)
+        )
+        normalized = self.attention_norm(shaped)
+        normalized = normalized * (1 + attention_scale) + attention_shift
+        attended = self.attention.forward_branch_from_clean_bank(
+            normalized.flatten(1, 2), clean_bank, **kwargs
+        ).view_as(shaped)
+        shaped = shaped + attention_gate * attended
+        normalized = self.ffn_norm(shaped)
+        normalized = normalized * (1 + ffn_scale) + ffn_shift
+        shaped = shaped + ffn_gate * self.ffn(normalized)
+        return shaped.flatten(1, 2)
+
     def forward_packed_document_branches(self, x: Tensor, **kwargs) -> Tensor:
         x = x + self.attention.forward_packed_document_branches(
             self.attention_norm(x), **kwargs
@@ -959,6 +1223,7 @@ class ConditionedTransformerBlock(nn.Module):
         ffn_dim: int,
         rope_theta: float,
         conditioning: str,
+        split_residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.conditioning = conditioning
@@ -966,6 +1231,7 @@ class ConditionedTransformerBlock(nn.Module):
         self.global_dim = global_dim
         self.heads = heads
         self.head_dim = local_dim // heads
+        self.split_residual_scale = float(split_residual_scale)
         if conditioning == "split_cross_attention":
             if global_dim % local_dim:
                 raise ValueError(
@@ -1028,7 +1294,7 @@ class ConditionedTransformerBlock(nn.Module):
             scores = (query * key).sum(-1) / math.sqrt(self.head_dim)
             weights = scores.softmax(-1)
             attended = (weights[..., None] * value).sum(-2).flatten(-2)
-            return x + self.cross_output(attended)
+            return x + self.split_residual_scale * self.cross_output(attended)
         projected = self.condition(condition)
         if self.condition_gate is not None:
             return x + self.condition_gate.to(x.dtype) * projected
@@ -1117,15 +1383,47 @@ class ConditionedTransformerBlock(nn.Module):
     def forward_shared_document_branches(
         self, x: Tensor, condition: Tensor, **kwargs
     ) -> Tensor:
-        clean_length = kwargs["clean_length"]
-        clean = self._add_condition(
-            x[:, :clean_length], condition[:, :clean_length]
-        )
-        branch = self._add_condition(
-            x[:, clean_length:], condition[:, clean_length:]
-        )
         return self.block.forward_shared_document_branches(
-            torch.cat((clean, branch), dim=1), **kwargs
+            self._add_condition(x, condition), **kwargs
+        )
+
+    def forward_shared_document_branches_adaln(
+        self,
+        x: Tensor,
+        condition: Tensor,
+        branch_modulation: Tensor,
+        **kwargs,
+    ) -> Tensor:
+        """Apply BLT patch conditioning, then branch-only AdaLN-Zero."""
+
+        return self.block.forward_shared_document_branches_adaln(
+            self._add_condition(x, condition),
+            branch_modulation,
+            **kwargs,
+        )
+
+    def prepare_clean_bank(
+        self, clean: Tensor, condition: Tensor, **kwargs
+    ) -> tuple[Tensor, CleanAttentionBank]:
+        """Cache a decoder clean stream after its BLT condition projection."""
+
+        return self.block.prepare_clean_bank(
+            self._add_condition(clean, condition), **kwargs
+        )
+
+    def forward_branch_from_clean_bank_adaln(
+        self,
+        branch: Tensor,
+        condition: Tensor,
+        branch_modulation: Tensor,
+        clean_bank: CleanAttentionBank,
+        **kwargs,
+    ) -> Tensor:
+        return self.block.forward_branch_from_clean_bank_adaln(
+            self._add_condition(branch, condition),
+            branch_modulation,
+            clean_bank,
+            **kwargs,
         )
 
     def forward_shared_document_branches_projected(
@@ -1162,6 +1460,37 @@ class PatchPool(nn.Module):
         self.key_value = nn.Linear(local_dim, 2 * global_dim, bias=False)
         self.output = nn.Linear(global_dim, global_dim, bias=False)
 
+    def _pool_padded(self, local: Tensor, patch_valid: Tensor) -> Tensor:
+        """Pool ``[..., patches, max_patch, dim]`` padded patch banks."""
+
+        if local.ndim < 3 or patch_valid.shape != local.shape[:-1]:
+            raise ValueError("padded patch states and validity must align")
+        if patch_valid.dtype != torch.bool:
+            raise TypeError("padded patch validity must be boolean")
+        has_valid = patch_valid.any(-1)
+        pooled = local.masked_fill(~patch_valid[..., None], -torch.inf).amax(-2)
+        pooled = torch.where(has_valid[..., None], pooled, torch.zeros_like(pooled))
+        pooled = self.max_projection(pooled)
+        query = self.query(self.global_norm(pooled)).view(
+            *pooled.shape[:-1], self.heads, self.head_dim
+        )
+        key, value = self.key_value(local).chunk(2, dim=-1)
+        key = key.view(*local.shape[:-1], self.heads, self.head_dim)
+        value = value.view(*local.shape[:-1], self.heads, self.head_dim)
+        scores = torch.einsum("...hd,...shd->...hs", query, key) / math.sqrt(
+            self.head_dim
+        )
+        scores = scores.masked_fill(~patch_valid[..., None, :], -torch.inf)
+        scores = torch.where(
+            has_valid[..., None, None], scores, torch.zeros_like(scores)
+        )
+        weights = scores.softmax(-1)
+        weights = torch.where(
+            has_valid[..., None, None], weights, torch.zeros_like(weights)
+        )
+        attended = torch.einsum("...hs,...shd->...hd", weights, value).flatten(-2)
+        return pooled + self.output(attended)
+
     def forward(self, local: Tensor, valid: Tensor) -> Tensor:
         if local.shape[:2] != valid.shape or valid.dtype != torch.bool:
             raise ValueError("local states and valid mask must align")
@@ -1169,22 +1498,53 @@ class PatchPool(nn.Module):
         if length % self.stride:
             raise ValueError("pooling length must be patch aligned")
         patches = length // self.stride
-        local = self.local_norm(local).view(batch, patches, self.stride, local_dim)
-        patch_valid = valid.view(batch, patches, self.stride)
-        has_valid = patch_valid.any(-1)
-        pooled = local.masked_fill(~patch_valid[..., None], -torch.inf).amax(2)
-        pooled = torch.where(has_valid[..., None], pooled, torch.zeros_like(pooled))
-        pooled = self.max_projection(pooled)
-        query = self.query(self.global_norm(pooled)).view(
-            batch, patches, self.heads, self.head_dim
+        normalized = self.local_norm(local).view(
+            batch, patches, self.stride, local_dim
         )
-        key, value = self.key_value(local).chunk(2, dim=-1)
-        key = key.view(batch, patches, self.stride, self.heads, self.head_dim)
-        value = value.view(batch, patches, self.stride, self.heads, self.head_dim)
-        scores = torch.einsum("bphd,bpshd->bphs", query, key) / math.sqrt(self.head_dim)
-        scores = scores.masked_fill(~patch_valid[:, :, None, :], -torch.inf)
-        scores = torch.where(has_valid[:, :, None, None], scores, torch.zeros_like(scores))
-        weights = scores.softmax(-1)
-        weights = torch.where(has_valid[:, :, None, None], weights, torch.zeros_like(weights))
-        attended = torch.einsum("bphs,bpshd->bphd", weights, value).flatten(-2)
-        return pooled + self.output(attended)
+        patch_valid = valid.view(batch, patches, self.stride)
+        return self._pool_padded(normalized, patch_valid)
+
+    def forward_packed(
+        self,
+        local: Tensor,
+        patch_byte_cu_seqlens: Tensor,
+        *,
+        max_patch_size: int,
+    ) -> Tensor:
+        """Pool a document-packed variable-length patch partition.
+
+        ``patch_byte_cu_seqlens`` addresses the packed local-state bank and
+        therefore carries no artificial row padding.  A bounded gather lowers
+        ragged patches to one static ``[patches, max_patch_size, dim]`` bank,
+        which keeps the Perceiver pooling math identical to fixed stride.
+        """
+
+        if local.ndim != 2:
+            raise ValueError("packed local states must be rank two")
+        if (
+            patch_byte_cu_seqlens.ndim != 1
+            or patch_byte_cu_seqlens.dtype != torch.int32
+            or patch_byte_cu_seqlens.numel() < 2
+        ):
+            raise ValueError("patch byte offsets must be nonempty rank-1 int32")
+        if max_patch_size <= 0:
+            raise ValueError("max_patch_size must be positive")
+        if not torch.compiler.is_compiling():
+            if int(patch_byte_cu_seqlens[0]) != 0 or int(
+                patch_byte_cu_seqlens[-1]
+            ) != local.shape[0]:
+                raise ValueError("patch byte offsets must partition local states")
+        starts = patch_byte_cu_seqlens[:-1].to(torch.long)
+        lengths = torch.diff(patch_byte_cu_seqlens).to(torch.long)
+        if not torch.compiler.is_compiling() and bool(
+            ((lengths <= 0) | (lengths > max_patch_size)).any()
+        ):
+            raise ValueError("packed patch length lies outside the configured bound")
+        offsets = torch.arange(max_patch_size, device=local.device)
+        valid = offsets[None] < lengths[:, None]
+        indices = starts[:, None] + offsets[None]
+        indices = indices.clamp_max(local.shape[0] - 1)
+        padded = self.local_norm(local).index_select(0, indices.reshape(-1)).view(
+            starts.numel(), max_patch_size, local.shape[-1]
+        )
+        return self._pool_padded(padded, valid)

@@ -10,6 +10,12 @@ import torch
 
 from pretraining.bolmo_data import SourceTokenByteifier
 from pretraining.byte_diffusion.data import AtomicDocument, AtomicIdManifest, pack_documents
+from pretraining.byte_diffusion.patching import (
+    CausalEntropyPatcher,
+    EntropyPatchConfig,
+    HashedNgramEntropyConfig,
+    HashedNgramEntropyModel,
+)
 from pretraining.byte_diffusion.training import chunks_to_batch, load_data_directory
 from scripts.build_bolmo_dataset import (
     CHALLENGE_HEADER_INTS,
@@ -21,13 +27,17 @@ from scripts.build_byte_diffusion_dataset import (
     ARTIFACT_SCHEMA,
     ARTIFACT_ALIGNMENT,
     DATASET_SCHEMA,
+    ENTROPY_DATASET_SCHEMA,
+    PATCHING_POLICY_SCHEMA,
     ChallengeDocumentReader,
+    DatasetPatchingPolicy,
     StreamingDocumentPacker,
     VectorizedDocumentPagePacker,
     _chunk_arrays,
     build_dataset,
     build_split,
     parse_args,
+    resolve_patching_policy,
     validate_atomic_utf8,
     validate_atomic_utf8_batch,
     write_deterministic_npz,
@@ -101,6 +111,27 @@ def _source_manifest(
         "physical_shard_tokens": physical_tokens,
         "unique_stream_tokens": unique_tokens,
     }
+
+
+def _write_entropy_patcher(path: Path, *, max_patch_size: int = 5) -> bytes:
+    patcher = CausalEntropyPatcher(
+        HashedNgramEntropyModel(
+            HashedNgramEntropyConfig(
+                vocab_size=261,
+                context_order=2,
+                table_size=16,
+                additive_smoothing=0.5,
+            )
+        ),
+        EntropyPatchConfig(
+            mode="threshold",
+            threshold=100.0,
+            max_patch_size=max_patch_size,
+        ),
+    )
+    artifact = patcher.to_bytes()
+    path.write_bytes(artifact)
+    return artifact
 
 
 @pytest.fixture
@@ -770,6 +801,141 @@ def test_mapped_artifact_is_deterministic_aligned_and_row_addressable(
     np.testing.assert_array_equal(selected, arrays["z"][:32])
 
 
+def test_entropy_patcher_binding_rejects_tampering_and_wrong_policy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "entropy.patcher"
+    artifact = _write_entropy_patcher(path)
+
+    policy = resolve_patching_policy(
+        "causal_entropy_v1", entropy_patcher_path=path
+    )
+
+    assert policy.name == "causal_entropy_v1"
+    assert policy.artifact_sha256 == hashlib.sha256(artifact).hexdigest()
+    assert policy.to_manifest()["patcher_artifact"]["parameter_bytes"] == 16 * 261 * 4
+    with pytest.raises(ValueError, match="requires --entropy-patcher"):
+        resolve_patching_policy("causal_entropy_v1")
+    with pytest.raises(ValueError, match="only valid"):
+        resolve_patching_policy("fixed_stride_v1", entropy_patcher_path=path)
+
+    corrupted = bytearray(artifact)
+    corrupted[-1] ^= 1
+    path.write_bytes(corrupted)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        DatasetPatchingPolicy.causal_entropy(path)
+
+
+def test_entropy_dataset_packs_whole_patches_and_binds_provenance(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    atomic = AtomicIdManifest.reference()
+    # The first EOT is the loader's stream BOS. The real document has forced
+    # max-five patches [5, 5, 2], including EOT in the final short tail.
+    tokens = [atomic.eot_id, *b"abcdefghijk", atomic.eot_id]
+    train = source / "train.bin"
+    validation = source / "validation.bin"
+    _write_challenge_shard(train, tokens)
+    _write_challenge_shard(validation, tokens)
+    source_manifest = {
+        "tokenizer_provenance": {
+            "kind": "utf8_bytes",
+            "name": "utf8_bytes",
+            "vocab_size": atomic.output_size,
+            "eot_id": atomic.eot_id,
+            "spec_sha256": atomic.sha256,
+            "ngrams_sha256": None,
+        },
+        "loader_aligned": True,
+        "physical_shard_tokens": len(tokens),
+        "unique_stream_tokens": len(tokens),
+    }
+    (source / "mix_manifest.json").write_text(json.dumps(source_manifest))
+    patcher_path = tmp_path / "entropy.patcher"
+    patcher_artifact = _write_entropy_patcher(patcher_path, max_patch_size=5)
+
+    built = build_dataset(
+        output_dir=output,
+        train_paths=(train,),
+        validation_paths=(validation,),
+        chunk_size=8,
+        chunks_per_shard=2,
+        document_aligned_pages=True,
+        patching_policy_name="causal_entropy_v1",
+        entropy_patcher_path=patcher_path,
+    )
+
+    assert built["schema"] == ENTROPY_DATASET_SCHEMA
+    patching = built["patching"]
+    assert patching["schema"] == PATCHING_POLICY_SCHEMA
+    assert patching["name"] == "causal_entropy_v1"
+    assert patching["patcher_artifact"] == {
+        "path": "entropy-patcher.bdpatch",
+        "input_path": str(patcher_path),
+        "sha256": hashlib.sha256(patcher_artifact).hexdigest(),
+        "bytes": len(patcher_artifact),
+        "parameter_bytes": 16 * 261 * 4,
+    }
+    assert (output / "entropy-patcher.bdpatch").read_bytes() == patcher_artifact
+    assert patching["boundary_config"]["max_patch_size"] == 5
+    assert built["packing"]["patch_stride"] is None
+    assert built["packing"]["chunk_alignment"].startswith("whole variable patches")
+    assert built["patching_input_fingerprints"][0]["sha256"] == patching[
+        "patcher_artifact"
+    ]["sha256"]
+
+    split = built["splits"]["train"]
+    assert split["patches"] == 3
+    assert split["mean_patch_size"] == pytest.approx(4.0)
+    assert split["maximum_observed_patch_size"] == 5
+    assert split["document_padding_tokens"] == 0
+    assert split["patch_boundary_padding_tokens"] == 3
+    arrays = _load_split_arrays(output, split)
+    np.testing.assert_array_equal(
+        arrays["valid_mask"][0],
+        np.asarray([True] * 5 + [False] * 3),
+    )
+    np.testing.assert_array_equal(
+        arrays["patch_offsets"],
+        np.asarray(
+            [
+                [0, 1, 2, 3, 4, -1, -1, -1],
+                [0, 1, 2, 3, 4, 0, 1, -1],
+            ],
+            dtype=np.int8,
+        ),
+    )
+    # No row can start with a continuation offset, which would prove an
+    # artificial chunk boundary had split a logical entropy patch.
+    for row_offsets, row_valid in zip(
+        arrays["patch_offsets"], arrays["valid_mask"], strict=True
+    ):
+        valid_offsets = row_offsets[row_valid]
+        assert valid_offsets[0] == 0
+    eot = arrays["input_ids"] == atomic.eot_id
+    assert arrays["patch_offsets"][eot].tolist() == [1]
+
+
+def test_entropy_policy_requires_document_aligned_byte_native_build(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "entropy.patcher"
+    _write_entropy_patcher(path)
+    with pytest.raises(ValueError, match="byte-native document_aligned_pages"):
+        build_dataset(
+            output_dir=tmp_path / "output",
+            train_paths=(tmp_path / "missing-train.bin",),
+            validation_paths=(tmp_path / "missing-val.bin",),
+            chunk_size=8,
+            chunks_per_shard=1,
+            patching_policy_name="causal_entropy_v1",
+            entropy_patcher_path=path,
+        )
+
+
 def test_cli_contract_parses_required_inputs() -> None:
     args = parse_args(
         [
@@ -793,3 +959,5 @@ def test_cli_contract_parses_required_inputs() -> None:
     assert args.chunk_size == 512
     assert args.chunks_per_shard == 4
     assert args.require_terminal_eot
+    assert args.patching_policy == "fixed_stride_v1"
+    assert args.entropy_patcher is None

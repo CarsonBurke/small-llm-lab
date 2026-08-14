@@ -14,6 +14,7 @@ This script never launches a child GPU workload.
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -32,7 +33,7 @@ from pretraining.byte_diffusion.config import ByteDiffusionConfig, model_config_
 from pretraining.byte_diffusion.data import DeterministicChunkCursor
 from pretraining.byte_diffusion.model import ByteDiffusionModel
 from pretraining.byte_diffusion.training import (
-    CANONICAL_PRESET,
+    PRODUCTION_PRESETS,
     ByteDiffusionTrainer,
     DeterministicSubsetChunkDataset,
     DistributedContext,
@@ -43,17 +44,69 @@ from pretraining.byte_diffusion.training import (
 )
 
 
-def training_source_provenance() -> dict[str, object]:
-    """Fingerprint every runtime source file that defines a training cell."""
+def _local_imports(path: Path) -> tuple[Path, ...]:
+    """Resolve repository-local imports without importing executable modules."""
 
-    paths = sorted(
-        [
-            *(REPO_ROOT / "pretraining" / "byte_diffusion").glob("*.py"),
-            REPO_ROOT / "scripts" / "ablation.py",
-            REPO_ROOT / "scripts" / "train_byte_diffusion.py",
-        ],
-        key=lambda path: path.relative_to(REPO_ROOT).as_posix(),
+    tree = ast.parse(path.read_text(), filename=str(path))
+    candidates: set[Path] = set()
+
+    def add_module(parts: list[str]) -> None:
+        if not parts:
+            return
+        module_path = REPO_ROOT.joinpath(*parts)
+        for candidate in (module_path.with_suffix(".py"), module_path / "__init__.py"):
+            if candidate.is_file():
+                candidates.add(candidate.resolve())
+
+    relative = path.relative_to(REPO_ROOT).with_suffix("")
+    package = list(relative.parts[:-1])
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                add_module(alias.name.split("."))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                keep = len(package) - (node.level - 1)
+                if keep < 0:
+                    raise ValueError(f"invalid relative import in {path}: {node.module}")
+                base = package[:keep]
+            else:
+                base = []
+            module = [] if node.module is None else node.module.split(".")
+            add_module(base + module)
+            for alias in node.names:
+                if alias.name != "*":
+                    add_module(base + module + alias.name.split("."))
+    return tuple(sorted(candidates))
+
+
+def _training_source_paths() -> tuple[Path, ...]:
+    """Return the deterministic transitive source closure of a training run."""
+
+    pending = [
+        (REPO_ROOT / "scripts" / "ablation.py").resolve(),
+        (REPO_ROOT / "scripts" / "train_byte_diffusion.py").resolve(),
+    ]
+    observed: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in observed:
+            continue
+        if not path.is_relative_to(REPO_ROOT):
+            raise ValueError(f"training source escaped the repository: {path}")
+        observed.add(path)
+        pending.extend(
+            imported for imported in _local_imports(path) if imported not in observed
+        )
+    return tuple(
+        sorted(observed, key=lambda item: item.relative_to(REPO_ROOT).as_posix())
     )
+
+
+def training_source_provenance() -> dict[str, object]:
+    """Fingerprint the transitive source closure that defines a training cell."""
+
+    paths = _training_source_paths()
     digest = hashlib.sha256()
     files: dict[str, str] = {}
     for path in paths:
@@ -64,7 +117,7 @@ def training_source_provenance() -> dict[str, object]:
         digest.update(b"\0")
         digest.update(bytes.fromhex(file_sha256))
     return {
-        "schema": "byte_diffusion_source_provenance/v1",
+        "schema": "byte_diffusion_source_provenance/v2",
         "sha256": digest.hexdigest(),
         "files": files,
     }
@@ -149,9 +202,9 @@ def main() -> None:
                 or os.environ.get("BYTE_DIFFUSION_TINY", "0") == "1"
             )
         )
-        if run.preset == CANONICAL_PRESET and model_config != ByteDiffusionConfig():
+        if run.preset in PRODUCTION_PRESETS and model_config != ByteDiffusionConfig():
             raise ValueError(
-                f"preset {CANONICAL_PRESET!r} requires the production model config"
+                f"preset {run.preset!r} requires the production model config"
             )
         chunk_size = int(
             os.environ.get(
@@ -172,8 +225,9 @@ def main() -> None:
             required_branch_bytes=run.corruption.corrupted_positions_per_row,
             branch_span_length=run.corruption.canvas_length,
             validation_chunk_limit=run.validation_chunks,
-            require_challenge_validation=run.preset == CANONICAL_PRESET,
+            require_challenge_validation=run.preset in PRODUCTION_PRESETS,
             expected_payload_sha256=expected_data_sha256,
+            expected_patching_policy=run.patching_policy,
         )
         dataset_manifest = json.loads(
             (args.data_path / "manifest.json").read_text()
@@ -183,9 +237,9 @@ def main() -> None:
             "payload_sha256": dataset_payload_sha256,
             "source_manifests": dataset_manifest.get("source_manifests", []),
         }
-        if run.preset == CANONICAL_PRESET and not expected_data_sha256:
+        if run.preset in PRODUCTION_PRESETS and not expected_data_sha256:
             raise ValueError(
-                f"preset {CANONICAL_PRESET!r} requires "
+                f"preset {run.preset!r} requires "
                 "BYTE_DIFFUSION_EXPECTED_DATA_SHA256"
             )
         if (
@@ -210,9 +264,9 @@ def main() -> None:
             * distributed.world_size
         )
         planned_rows = run.iterations * effective_global_batch
-        if run.preset == CANONICAL_PRESET and len(train_chunks) < planned_rows:
+        if run.preset in PRODUCTION_PRESETS and len(train_chunks) < planned_rows:
             raise ValueError(
-                f"preset {CANONICAL_PRESET!r} needs at least {planned_rows:,} "
+                f"preset {run.preset!r} needs at least {planned_rows:,} "
                 f"unique rows before wraparound; dataset has {len(train_chunks):,}"
             )
         trainer = ByteDiffusionTrainer(
@@ -224,6 +278,7 @@ def main() -> None:
             distributed=distributed,
             atomic_manifest=manifest,
             dataset_provenance=dataset_provenance,
+            source_provenance=source_provenance,
         )
         validation_scope = (
             "proxy"
@@ -233,6 +288,11 @@ def main() -> None:
         checkpoint = args.checkpoint or (
             REPO_ROOT / "ablation_results" / run.run_id / "checkpoint.pt"
         )
+        checkpoint_every = int(
+            os.environ.get("BYTE_DIFFUSION_CHECKPOINT_EVERY", "200")
+        )
+        if checkpoint_every <= 0:
+            raise ValueError("BYTE_DIFFUSION_CHECKPOINT_EVERY must be positive")
         if args.resume is not None:
             trainer.load_checkpoint(args.resume)
 
@@ -343,7 +403,14 @@ def main() -> None:
                         ),
                         flush=True,
                     )
-                trainer.save_checkpoint(checkpoint)
+                # Validation remains intentionally frequent for 2k ablation
+                # curves, but serializing the ~276 MB model+optimizer payload
+                # at every validation point creates a synchronous host/GPU
+                # bubble every 20 updates.  Recovery checkpoints have their
+                # own, much sparser cadence; the terminal update is always
+                # durable.
+                if step % checkpoint_every == 0 or step == run.iterations:
+                    trainer.save_checkpoint(checkpoint)
     finally:
         distributed.close()
 

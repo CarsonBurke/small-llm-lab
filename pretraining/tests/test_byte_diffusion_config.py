@@ -8,6 +8,7 @@ from pretraining.byte_diffusion.config import (
     AtomicVocabulary,
     ByteDiffusionConfig,
     CorruptionConfig,
+    model_config_from_env,
 )
 
 
@@ -36,11 +37,15 @@ def test_atomic_vocabulary_rejects_ambiguous_layouts(overrides, message) -> None
 
 def test_default_and_tiny_configs_preserve_fixed_stride_contract() -> None:
     production = ByteDiffusionConfig()
-    assert production.schema_version == 4
+    assert production.schema_version == 5
     assert production.decoder_prefix_window == 512
     assert production.decoder_branch_attention == "shared_flex"
     assert production.patch_stride == 4
-    assert production.production_parameter_target == 23_011_074
+    assert production.duo_time_features == 64
+    assert production.duo_time_condition_dim == 32
+    assert production.duo_diffusion_atoms == 257
+    assert production.duo_variable_length_probability == 0.01
+    assert production.production_parameter_target == 23_010_306
     assert production.to_dict()["vocab"]["pad_id"] == 262
 
     tiny = ByteDiffusionConfig.tiny()
@@ -68,3 +73,40 @@ def test_configs_fail_closed_on_invalid_geometry() -> None:
         ByteDiffusionConfig.tiny(decoder_conditioning="bad")
     with pytest.raises(ValueError, match="global_ffn_kind"):
         ByteDiffusionConfig.tiny(global_ffn_kind="bad")
+    with pytest.raises(ValueError, match="architecture values"):
+        ByteDiffusionConfig.tiny(ngram_table_size=0)
+    with pytest.raises(ValueError, match="decoder_split_residual_scale"):
+        ByteDiffusionConfig.tiny(decoder_split_residual_scale=0)
+    with pytest.raises(ValueError, match="duo_time_features"):
+        ByteDiffusionConfig.tiny(duo_time_features=63)
+    for unsupported_atoms in (256, 258, 259, 260, 262):
+        with pytest.raises(ValueError, match="duo_diffusion_atoms"):
+            ByteDiffusionConfig.tiny(duo_diffusion_atoms=unsupported_atoms)
+    assert (
+        ByteDiffusionConfig.tiny(duo_diffusion_atoms=257).duo_diffusion_atoms == 257
+    )
+    assert (
+        ByteDiffusionConfig.tiny(duo_diffusion_atoms=261).duo_diffusion_atoms == 261
+    )
+    with pytest.raises(ValueError, match="duo_variable_length_probability"):
+        ByteDiffusionConfig.tiny(duo_variable_length_probability=1.01)
+
+
+def test_duo_prior_support_and_variable_length_are_explicit_env_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BYTE_DUO_DIFFUSION_ATOMS", "261")
+    monkeypatch.setenv("BYTE_DUO_VARIABLE_LENGTH_PROBABILITY", "0")
+    config = model_config_from_env(tiny=True)
+    assert config.duo_diffusion_atoms == 261
+    assert config.duo_variable_length_probability == 0.0
+
+
+def test_duo_prior_support_does_not_expand_with_custom_vocabulary() -> None:
+    expanded = AtomicVocabulary(clean_specials=6, mask_id=262, pad_id=263)
+    with pytest.raises(ValueError, match="supported posterior size"):
+        ByteDiffusionConfig.tiny(vocab=expanded, duo_diffusion_atoms=262)
+
+    shifted_eot = AtomicVocabulary(eot_id=257)
+    with pytest.raises(ValueError, match="supported posterior size"):
+        ByteDiffusionConfig.tiny(vocab=shifted_eot, duo_diffusion_atoms=258)

@@ -213,22 +213,88 @@ def test_nanogpt_greedy_uses_one_prefill_then_cached_steps():
         "prefill_forwards": 1,
         "decode_forwards": 1,
         "model_forwards": 2,
+        "termination_reasons": ("eot", "token_safety_cap"),
+        "realized_bytes": (1, 2),
     }
+
+
+def test_nanogpt_greedy_pads_every_chunk_to_one_static_prompt_width():
+    model = _FakeCachedNano([[2]])
+    outputs, _ = greedy_generate(
+        model,
+        [[5, 6]],
+        max_new_tokens=1,
+        eot_id=0,
+        blocked_ids=torch.tensor([7]),
+        device=torch.device("cpu"),
+        stop_check_every=1,
+        stops=("never",),
+        decode=lambda ids: "".join(map(str, ids)),
+        padded_prompt_width=5,
+    )
+
+    assert outputs == [[2]]
+    assert model.prefill_ids.tolist() == [[0, 0, 0, 5, 6]]
+    assert model.prefill_valid.tolist() == [[False, False, False, True, True]]
+
+
+def test_nanogpt_greedy_rejects_short_static_prompt_width():
+    model = _FakeCachedNano([[2]])
+    with pytest.raises(ValueError, match="shorter"):
+        greedy_generate(
+            model,
+            [[5, 6]],
+            max_new_tokens=1,
+            eot_id=0,
+            blocked_ids=torch.tensor([7]),
+            device=torch.device("cpu"),
+            stop_check_every=1,
+            stops=("never",),
+            decode=lambda ids: "".join(map(str, ids)),
+            padded_prompt_width=1,
+        )
+
+
+def test_nanogpt_greedy_never_overshoots_semantic_byte_cap():
+    model = _FakeCachedNano([[1, 2]])
+    outputs, work = greedy_generate(
+        model,
+        [[5]],
+        max_new_tokens=2,
+        eot_id=0,
+        blocked_ids=torch.tensor([7]),
+        device=torch.device("cpu"),
+        stop_check_every=1,
+        stops=("never",),
+        decode=lambda ids: "".join({1: "abc", 2: "def"}[token] for token in ids),
+        max_new_bytes=4,
+    )
+
+    assert outputs == [[1]]
+    assert work["termination_reasons"] == ("byte_cap",)
+    assert work["realized_bytes"] == (3,)
 
 
 class _FakeByteModel:
     def __init__(self, prompt_lengths, continuations):
         self.config = SimpleNamespace(
-            vocab=SimpleNamespace(pad_id=262, eot_id=256, output_size=261)
+            vocab=SimpleNamespace(pad_id=262, eot_id=256, output_size=261),
+            patch_stride=4,
         )
         self.prompt_lengths = prompt_lengths
         self.continuations = continuations
         self.first_ids = None
+        self.first_valid = None
+        self.first_kwargs = None
 
     def forward_ar_varlen(self, ids, valid, **kwargs):
-        del kwargs
         if self.first_ids is None:
             self.first_ids = ids.clone()
+            self.first_valid = valid.clone()
+            self.first_kwargs = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in kwargs.items()
+            }
         lengths = valid.sum(1)
         logits = torch.zeros((int(lengths.sum()), 261))
         offsets = torch.cat((torch.zeros(1, dtype=torch.long), lengths.cumsum(0)))
@@ -256,6 +322,15 @@ def test_byte_greedy_uses_virtual_bos_blocks_controls_and_stops_on_eot():
 
     assert model.first_ids[0, 0].item() == ord("A")
     assert model.first_ids[1, :2].tolist() == [ord("B"), ord("C")]
+    assert model.first_ids.shape == (2, 4)
+    assert model.first_valid.tolist() == [
+        [True, False, False, False],
+        [True, True, False, False],
+    ]
+    assert model.first_kwargs["byte_cu_seqlens"].tolist() == [0, 1, 3]
+    assert model.first_kwargs["patch_cu_seqlens"].tolist() == [0, 2, 4]
+    assert model.first_kwargs["global_patch_sources"].tolist() == [-1, 0, -1, 1]
+    assert model.first_kwargs["condition_patch_indices"].tolist() == [0, 2, 2]
     assert [result.raw for result in results] == [b"2", b""]
     assert [result.termination for result in results] == ["eot", "eot"]
     assert [result.native_actions for result in results] == [2, 1]

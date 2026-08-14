@@ -4,14 +4,14 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Literal, Mapping, Sequence
 import zipfile
 
 import numpy as np
@@ -27,6 +27,7 @@ from pretraining.byte_diffusion.data import (
     ChunkDocumentSpan,
     PackedChunk,
 )
+from pretraining.byte_diffusion.patching import CausalEntropyPatcher
 from scripts.build_bolmo_dataset import (
     canonical_sha256,
     discover_source_manifest,
@@ -41,8 +42,112 @@ from tokenization.tokenizer import SplitTreeNumericTokenizer
 
 
 DATASET_SCHEMA = "byte_diffusion_dataset/v5"
+ENTROPY_DATASET_SCHEMA = "byte_diffusion_dataset/v6"
 ARTIFACT_SCHEMA = "byte_diffusion_mapped_chunks/v5"
 ARTIFACT_ALIGNMENT = 4_096
+PATCHING_POLICY_SCHEMA = "byte_diffusion_patching_policy/v1"
+
+PatchingPolicyName = Literal["fixed_stride_v1", "causal_entropy_v1"]
+
+
+@dataclass(frozen=True)
+class DatasetPatchingPolicy:
+    """Hash-bound byte-to-patch policy used before physical page packing."""
+
+    name: PatchingPolicyName
+    stride: int | None = None
+    patcher: CausalEntropyPatcher | None = None
+    artifact_path: Path | None = None
+    artifact_sha256: str | None = None
+    artifact_bytes: int | None = None
+
+    @classmethod
+    def fixed_stride(cls, stride: int = 4) -> "DatasetPatchingPolicy":
+        if stride <= 0 or stride > 128:
+            raise ValueError("fixed patch stride must be in [1, 128]")
+        return cls(name="fixed_stride_v1", stride=int(stride))
+
+    @classmethod
+    def causal_entropy(cls, path: Path) -> "DatasetPatchingPolicy":
+        artifact_path = Path(path)
+        artifact = artifact_path.read_bytes()
+        patcher = CausalEntropyPatcher.from_bytes(artifact)
+        if patcher.config.max_patch_size > 128:
+            raise ValueError(
+                "entropy max_patch_size exceeds the int8 patch-offset contract"
+            )
+        digest = hashlib.sha256(artifact).hexdigest()
+        if digest != patcher.sha256:
+            raise ValueError("entropy-patcher artifact digest is inconsistent")
+        return cls(
+            name="causal_entropy_v1",
+            patcher=patcher,
+            artifact_path=artifact_path,
+            artifact_sha256=digest,
+            artifact_bytes=len(artifact),
+        )
+
+    @property
+    def max_patch_size(self) -> int:
+        if self.name == "fixed_stride_v1":
+            if self.stride is None:
+                raise AssertionError("fixed-stride policy has no stride")
+            return self.stride
+        if self.patcher is None:
+            raise AssertionError("entropy policy has no patcher")
+        return self.patcher.config.max_patch_size
+
+    def to_manifest(self) -> dict[str, Any]:
+        if self.name == "fixed_stride_v1":
+            return {
+                "schema": PATCHING_POLICY_SCHEMA,
+                "name": self.name,
+                "stride": self.stride,
+                "max_patch_size": self.max_patch_size,
+                "boundary_source": "document-local fixed atomic-id offsets",
+            }
+        if (
+            self.patcher is None
+            or self.artifact_path is None
+            or self.artifact_sha256 is None
+            or self.artifact_bytes is None
+        ):
+            raise AssertionError("incomplete entropy-patcher binding")
+        return {
+            "schema": PATCHING_POLICY_SCHEMA,
+            "name": self.name,
+            "boundary_source": "causal entropy of each complete logical document",
+            "patcher_artifact": {
+                "path": str(self.artifact_path),
+                "sha256": self.artifact_sha256,
+                "bytes": self.artifact_bytes,
+                "parameter_bytes": self.patcher.model.parameter_bytes,
+            },
+            "entropy_model_config": asdict(self.patcher.model.config),
+            "boundary_config": asdict(self.patcher.config),
+            "max_patch_size": self.max_patch_size,
+        }
+
+
+def resolve_patching_policy(
+    name: PatchingPolicyName = "fixed_stride_v1",
+    *,
+    entropy_patcher_path: Path | None = None,
+    fixed_stride: int = 4,
+) -> DatasetPatchingPolicy:
+    """Resolve and authenticate the explicit preprocessing patch policy."""
+
+    if name == "fixed_stride_v1":
+        if entropy_patcher_path is not None:
+            raise ValueError(
+                "--entropy-patcher is only valid with causal_entropy_v1"
+            )
+        return DatasetPatchingPolicy.fixed_stride(fixed_stride)
+    if name == "causal_entropy_v1":
+        if entropy_patcher_path is None:
+            raise ValueError("causal_entropy_v1 requires --entropy-patcher")
+        return DatasetPatchingPolicy.causal_entropy(entropy_patcher_path)
+    raise ValueError(f"unsupported patching policy {name!r}")
 
 
 @dataclass
@@ -644,6 +749,7 @@ def _write_array_artifact(
         raise ValueError("artifact arrays must share one nonempty row axis")
     descriptors = write_deterministic_mapped_artifact(path, arrays)
     valid_ids = arrays["input_ids"][arrays["valid_mask"]]
+    valid_patch_offsets = arrays["patch_offsets"][arrays["valid_mask"]]
     literal_atomic_tokens = int((valid_ids < 256).sum())
     special_atomic_tokens = int((valid_ids >= 256).sum())
     physical_storage_positions = int(arrays["input_ids"].size)
@@ -673,6 +779,8 @@ def _write_array_artifact(
         "literal_atomic_tokens": literal_atomic_tokens,
         "special_atomic_tokens": special_atomic_tokens,
         "eot_atomic_tokens": int((valid_ids == 256).sum()),
+        "patches": int((valid_patch_offsets == 0).sum()),
+        "maximum_observed_patch_size": int(valid_patch_offsets.max()) + 1,
         "physical_storage_positions": physical_storage_positions,
         "storage_padding_tokens": physical_storage_positions - valid_atomic_tokens,
         "canvas512_eligible_positions": int(
@@ -704,14 +812,47 @@ class VectorizedDocumentPagePacker:
         "patch_offsets",
     )
 
-    def __init__(self, manifest: AtomicIdManifest, *, chunk_size: int) -> None:
+    def __init__(
+        self,
+        manifest: AtomicIdManifest,
+        *,
+        chunk_size: int,
+        patching_policy: DatasetPatchingPolicy | None = None,
+    ) -> None:
         if chunk_size <= 0 or chunk_size % 4:
             raise ValueError("chunk_size must be a positive multiple of four")
         self.manifest = manifest
         self.chunk_size = int(chunk_size)
+        self.patching_policy = (
+            DatasetPatchingPolicy.fixed_stride()
+            if patching_policy is None
+            else patching_policy
+        )
+        if self.patching_policy.max_patch_size > self.chunk_size:
+            raise ValueError("maximum patch size cannot exceed the physical chunk")
+        if (
+            self.patching_policy.name == "fixed_stride_v1"
+            and self.chunk_size % self.patching_policy.max_patch_size
+        ):
+            raise ValueError(
+                "physical chunk size must be divisible by the fixed patch stride"
+            )
+        if (
+            self.patching_policy.name == "causal_entropy_v1"
+            and self.patching_policy.patcher is not None
+            and self.patching_policy.patcher.model.config.vocab_size
+            != self.manifest.mask_id
+        ):
+            raise ValueError(
+                "entropy-patcher vocabulary must exactly cover all clean atomic ids"
+            )
         self.chunk_index = 0
         self.stream_start = 0
         self.alignment_padding = 0
+        self.document_padding = 0
+        self.patch_boundary_padding = 0
+        self.patch_count = 0
+        self.maximum_observed_patch_size = 0
         self._remainder = self._empty_positions(0)
 
     def _empty_positions(self, width: int) -> dict[str, np.ndarray]:
@@ -747,20 +888,28 @@ class VectorizedDocumentPagePacker:
             raise ValueError("document batch contains an unterminated document")
         if bool((source >= self.manifest.mask_id).any()):
             raise ValueError("document batch contains a non-clean atomic id")
-        leading_padding = -(
-            self.stream_start + self._remainder["input_ids"].size
-        ) % 4
-        padded_lengths = (lengths + 3) // 4 * 4
-        starts = np.empty(lengths.size, dtype=np.int64)
-        starts[0] = leading_padding
-        if lengths.size > 1:
-            starts[1:] = leading_padding + np.cumsum(padded_lengths[:-1])
-        physical_width = int(starts[-1] + lengths[-1])
-        positions = self._empty_positions(physical_width)
-        source_starts = document_stops - lengths
+        if self.patching_policy.name == "causal_entropy_v1":
+            positions = self._entropy_patched_positions(source, lengths)
+            starts = np.flatnonzero(positions["logical_patch_starts"])
+            patch_lengths = np.diff(np.r_[starts, source.size])
+            del positions["logical_patch_starts"]
+            inserted_padding = positions["input_ids"].size - source.size
+            self.patch_boundary_padding += inserted_padding
+        else:
+            positions, patch_lengths = self._fixed_stride_positions(source, lengths)
+            inserted_padding = positions["input_ids"].size - source.size
+            self.document_padding += inserted_padding
+        self.alignment_padding += inserted_padding
+        self.patch_count += patch_lengths.size
+        if patch_lengths.size:
+            self.maximum_observed_patch_size = max(
+                self.maximum_observed_patch_size, int(patch_lengths.max())
+            )
+
+        source_stops = np.cumsum(lengths)
+        source_starts = source_stops - lengths
         repeated_source_starts = np.repeat(source_starts, lengths)
         offsets = np.arange(source.size, dtype=np.int64) - repeated_source_starts
-        packed_positions = offsets + np.repeat(starts, lengths)
         document_ids = np.repeat(
             np.arange(
                 first_document_index,
@@ -769,14 +918,12 @@ class VectorizedDocumentPagePacker:
             ),
             lengths,
         )
-        positions["input_ids"][packed_positions] = source
-        positions["valid_mask"][packed_positions] = True
+        packed_positions = np.flatnonzero(positions["valid_mask"])
+        if packed_positions.size != source.size:
+            raise AssertionError("physical packing lost or duplicated atomic ids")
         positions["document_indices"][packed_positions] = document_ids
         positions["document_offsets"][packed_positions] = offsets.astype(
             np.int32, copy=False
-        )
-        positions["patch_offsets"][packed_positions] = (offsets % 4).astype(
-            np.int8, copy=False
         )
         targets = np.empty_like(source)
         targets[:-1] = source[1:]
@@ -785,8 +932,6 @@ class VectorizedDocumentPagePacker:
         targets[terminal] = self.manifest.pad_id
         positions["target_ids"][packed_positions] = targets
         positions["score_mask"][packed_positions] = ~terminal
-        inserted_padding = physical_width - source.size
-        self.alignment_padding += inserted_padding
 
         combined = {
             name: np.concatenate((self._remainder[name], positions[name]))
@@ -808,6 +953,117 @@ class VectorizedDocumentPagePacker:
             name: values[full_width:].copy() for name, values in combined.items()
         }
         return result
+
+    def _fixed_stride_positions(
+        self, source: np.ndarray, lengths: np.ndarray
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        """Preserve the byte-identical fixed-stride v5 control layout."""
+
+        stride = self.patching_policy.stride
+        if stride is None:
+            raise AssertionError("fixed-stride policy has no stride")
+        leading_padding = -(
+            self.stream_start + self._remainder["input_ids"].size
+        ) % stride
+        padded_lengths = (lengths + stride - 1) // stride * stride
+        starts = np.empty(lengths.size, dtype=np.int64)
+        starts[0] = leading_padding
+        if lengths.size > 1:
+            starts[1:] = leading_padding + np.cumsum(padded_lengths[:-1])
+        physical_width = int(starts[-1] + lengths[-1])
+        positions = self._empty_positions(physical_width)
+        document_stops = np.cumsum(lengths)
+        source_starts = document_stops - lengths
+        repeated_source_starts = np.repeat(source_starts, lengths)
+        offsets = np.arange(source.size, dtype=np.int64) - repeated_source_starts
+        packed_positions = offsets + np.repeat(starts, lengths)
+        positions["input_ids"][packed_positions] = source
+        positions["valid_mask"][packed_positions] = True
+        positions["patch_offsets"][packed_positions] = (offsets % stride).astype(
+            np.int8, copy=False
+        )
+        patch_counts = (lengths + stride - 1) // stride
+        patch_documents = np.repeat(np.arange(lengths.size), patch_counts)
+        patch_run_starts = np.repeat(
+            np.cumsum(patch_counts) - patch_counts, patch_counts
+        )
+        patch_ordinals = np.arange(int(patch_counts.sum())) - patch_run_starts
+        patch_lengths = np.minimum(
+            stride,
+            lengths[patch_documents] - patch_ordinals * stride,
+        )
+        return positions, patch_lengths
+
+    def _entropy_patched_positions(
+        self, source: np.ndarray, lengths: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """Route complete causal patches into pages without splitting one.
+
+        The only Python loop is over physical output rows. All byte routing and
+        all entropy/boundary work is NumPy-vectorized across a full document
+        batch; preprocessing never performs a Python operation per byte.
+        """
+
+        patcher = self.patching_policy.patcher
+        if patcher is None:
+            raise AssertionError("entropy policy has no loaded patcher")
+        local_documents = np.repeat(
+            np.arange(lengths.size, dtype=np.int64), lengths
+        )
+        plan = patcher.patch(source.astype(np.int64, copy=False), local_documents)
+        patch_starts = plan.layout.patch_starts
+        patch_lengths = plan.layout.patch_lengths
+        if not patch_starts.size or int(patch_lengths.max()) > self.chunk_size:
+            raise ValueError("entropy patch geometry is incompatible with chunks")
+
+        patch_ends = np.cumsum(patch_lengths, dtype=np.int64)
+        physical_patch_starts = np.empty(patch_starts.size, dtype=np.int64)
+        patch_cursor = 0
+        physical_cursor = 0
+        column = self._remainder["input_ids"].size
+        while patch_cursor < patch_starts.size:
+            logical_consumed = int(patch_ends[patch_cursor - 1]) if patch_cursor else 0
+            capacity = self.chunk_size - column
+            stop = int(
+                np.searchsorted(
+                    patch_ends,
+                    logical_consumed + capacity,
+                    side="right",
+                )
+            )
+            if stop == patch_cursor:
+                # The next complete patch does not fit in this row. Leave the
+                # artificial tail invalid and begin the patch at column zero.
+                physical_cursor += capacity
+                column = 0
+                continue
+            physical_patch_starts[patch_cursor:stop] = (
+                physical_cursor
+                + patch_starts[patch_cursor:stop]
+                - patch_starts[patch_cursor]
+            )
+            used = int(patch_ends[stop - 1]) - logical_consumed
+            physical_cursor += used
+            column += used
+            patch_cursor = stop
+            if patch_cursor < patch_starts.size:
+                physical_cursor += self.chunk_size - column
+                column = 0
+
+        byte_to_patch = plan.layout.byte_to_patch
+        patch_offsets = (
+            np.arange(source.size, dtype=np.int64)
+            - patch_starts[byte_to_patch]
+        )
+        packed_positions = physical_patch_starts[byte_to_patch] + patch_offsets
+        positions = self._empty_positions(physical_cursor)
+        positions["input_ids"][packed_positions] = source
+        positions["valid_mask"][packed_positions] = True
+        positions["patch_offsets"][packed_positions] = patch_offsets.astype(
+            np.int8, copy=False
+        )
+        positions["logical_patch_starts"] = plan.starts
+        return positions
 
     def finish(self) -> dict[str, np.ndarray] | None:
         real_width = self._remainder["input_ids"].size
@@ -836,10 +1092,17 @@ class VectorizedDocumentPagePacker:
             else real_widths.astype(np.int64, copy=False)
         )
         starts = self.stream_start + np.arange(rows, dtype=np.int64) * self.chunk_size
-        final_columns = widths - 1
         row_indices = np.arange(rows)
-        full = widths == self.chunk_size
-        halo_valid = full & arrays["score_mask"][row_indices, final_columns]
+        physical_columns = np.arange(self.chunk_size, dtype=np.int64)[None]
+        final_columns = np.where(
+            arrays["valid_mask"], physical_columns, -1
+        ).max(axis=1)
+        if bool((final_columns < 0).any()):
+            raise ValueError("cannot emit metadata for an empty packed row")
+        # A halo describes a logical row cut, not only a cut at the final
+        # physical storage column. Entropy patch packing can leave an invalid
+        # tail when the next whole patch does not fit.
+        halo_valid = arrays["score_mask"][row_indices, final_columns]
         halo_id = np.where(
             halo_valid,
             arrays["target_ids"][row_indices, final_columns],
@@ -928,8 +1191,13 @@ def _build_byte_native_document_aligned_split(
     chunks_per_shard: int,
     max_documents: int | None,
     overlap_tokens: int,
+    patching_policy: DatasetPatchingPolicy,
 ) -> dict[str, Any]:
-    packer = VectorizedDocumentPagePacker(atomic_manifest, chunk_size=chunk_size)
+    packer = VectorizedDocumentPagePacker(
+        atomic_manifest,
+        chunk_size=chunk_size,
+        patching_policy=patching_policy,
+    )
     accumulator = ArrayArtifactAccumulator(
         output_dir, name, rows_per_artifact=chunks_per_shard
     )
@@ -985,6 +1253,7 @@ def _build_byte_native_document_aligned_split(
     stats = reader.stats
     atomic_tokens = source_tokens_in_documents
     scored_targets = sum(int(item["scored_ar_targets"]) for item in artifacts)
+    patch_count = sum(int(item["patches"]) for item in artifacts)
     return {
         "input_shards": [str(path) for path in reader.paths],
         "overlap_tokens_per_transition": overlap_tokens,
@@ -1006,7 +1275,13 @@ def _build_byte_native_document_aligned_split(
         ),
         "eot_atomic_tokens": sum(int(item["eot_atomic_tokens"]) for item in artifacts),
         "bos_ar_targets": accepted_documents,
-        "document_padding_tokens": packer.alignment_padding,
+        "patches": patch_count,
+        "mean_patch_size": atomic_tokens / patch_count,
+        "maximum_observed_patch_size": max(
+            int(item["maximum_observed_patch_size"]) for item in artifacts
+        ),
+        "document_padding_tokens": packer.document_padding,
+        "patch_boundary_padding_tokens": packer.patch_boundary_padding,
         "packed_stream_tokens": atomic_tokens + packer.alignment_padding,
         "physical_storage_positions": sum(
             int(item["physical_storage_positions"]) for item in artifacts
@@ -1040,7 +1315,23 @@ def build_split(
     close_rows_at_document: bool,
     document_aligned_pages: bool,
     vectorized_byte_native: bool = True,
+    patching_policy: DatasetPatchingPolicy | None = None,
 ) -> dict[str, Any]:
+    policy = (
+        DatasetPatchingPolicy.fixed_stride()
+        if patching_policy is None
+        else patching_policy
+    )
+    if policy.name == "causal_entropy_v1" and (
+        tokenizer is not None
+        or not document_aligned_pages
+        or close_rows_at_document
+        or not vectorized_byte_native
+    ):
+        raise ValueError(
+            "causal_entropy_v1 requires vectorized byte-native "
+            "document_aligned_pages"
+        )
     reader = ChallengeDocumentReader(
         paths,
         eot_id=(
@@ -1067,6 +1358,11 @@ def build_split(
             chunks_per_shard=chunks_per_shard,
             max_documents=max_documents,
             overlap_tokens=overlap_tokens,
+            patching_policy=policy,
+        )
+    if policy.name != "fixed_stride_v1" or policy.stride != 4:
+        raise ValueError(
+            "non-default patch policies require the vectorized byte-native path"
         )
     byteifier = SourceTokenByteifier(tokenizer) if tokenizer is not None else None
     packer = StreamingDocumentPacker(
@@ -1137,6 +1433,7 @@ def build_split(
     if not artifacts:
         raise ValueError(f"split {name!r} produced no complete documents")
     stats = reader.stats
+    patch_count = sum(int(artifact["patches"]) for artifact in artifacts)
     return {
         "input_shards": [str(path) for path in paths],
         "overlap_tokens_per_transition": overlap_tokens,
@@ -1167,7 +1464,14 @@ def build_split(
             if close_rows_at_document or document_aligned_pages
             else 1
         ),
+        "patches": patch_count,
+        "mean_patch_size": atomic_tokens / patch_count,
+        "maximum_observed_patch_size": max(
+            int(artifact["maximum_observed_patch_size"])
+            for artifact in artifacts
+        ),
         "document_padding_tokens": packer.alignment_padding,
+        "patch_boundary_padding_tokens": 0,
         "packed_stream_tokens": atomic_tokens + packer.alignment_padding,
         "physical_storage_positions": sum(
             int(artifact["physical_storage_positions"])
@@ -1253,6 +1557,9 @@ def build_dataset(
     require_terminal_eot: bool = False,
     close_rows_at_document: bool = False,
     document_aligned_pages: bool = False,
+    patching_policy_name: PatchingPolicyName = "fixed_stride_v1",
+    entropy_patcher_path: Path | None = None,
+    fixed_patch_stride: int = 4,
     command: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build train/validation artifacts and atomically publish their manifest."""
@@ -1261,6 +1568,19 @@ def build_dataset(
         raise ValueError("chunks_per_shard must be positive")
     if close_rows_at_document and document_aligned_pages:
         raise ValueError("packing layouts are mutually exclusive")
+    patching_policy = resolve_patching_policy(
+        patching_policy_name,
+        entropy_patcher_path=entropy_patcher_path,
+        fixed_stride=fixed_patch_stride,
+    )
+    if patching_policy.name == "causal_entropy_v1" and (
+        tokenizer_dir is not None
+        or not document_aligned_pages
+        or close_rows_at_document
+    ):
+        raise ValueError(
+            "causal_entropy_v1 requires a byte-native document_aligned_pages build"
+        )
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"output directory is not empty: {output_dir}")
@@ -1294,6 +1614,7 @@ def build_dataset(
     base_implementation_paths = (
         Path(__file__).resolve(),
         repository / "pretraining" / "byte_diffusion" / "data.py",
+        repository / "pretraining" / "byte_diffusion" / "patching.py",
         repository / "pretraining" / "byte_diffusion" / "tokenizer.py",
         *(item[0] for item in source_discoveries),
     )
@@ -1340,10 +1661,35 @@ def build_dataset(
             "tst_group_size": tokenizer.scheme.group_size,
             "tst_compound": tokenizer.scheme.compound,
         }
-    consumed_paths = tuple(dict.fromkeys((*implementation_paths, *all_paths)))
+    policy_input_paths = (
+        ()
+        if patching_policy.artifact_path is None
+        else (patching_policy.artifact_path,)
+    )
+    consumed_paths = tuple(
+        dict.fromkeys((*implementation_paths, *all_paths, *policy_input_paths))
+    )
     consumed_before = {
         str(path): fingerprint_file(path) for path in consumed_paths
     }
+    published_patcher_path: Path | None = None
+    if patching_policy.artifact_path is not None:
+        source_fingerprint = consumed_before[str(patching_policy.artifact_path)]
+        if source_fingerprint["sha256"] != patching_policy.artifact_sha256:
+            raise RuntimeError(
+                "entropy-patcher input changed while its policy was being resolved"
+            )
+        if patching_policy.patcher is None:
+            raise AssertionError("entropy policy has no loaded patcher")
+        published_patcher_path = output_dir / "entropy-patcher.bdpatch"
+        temporary_patcher = published_patcher_path.with_suffix(
+            published_patcher_path.suffix + ".working"
+        )
+        with temporary_patcher.open("wb") as handle:
+            handle.write(patching_policy.patcher.to_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_patcher, published_patcher_path)
     splits = {
         "train": build_split(
             name="train",
@@ -1359,6 +1705,7 @@ def build_dataset(
             require_terminal_eot=require_terminal_eot,
             close_rows_at_document=close_rows_at_document,
             document_aligned_pages=document_aligned_pages,
+            patching_policy=patching_policy,
         ),
         "validation": build_split(
             name="validation",
@@ -1374,6 +1721,7 @@ def build_dataset(
             require_terminal_eot=require_terminal_eot,
             close_rows_at_document=close_rows_at_document,
             document_aligned_pages=document_aligned_pages,
+            patching_policy=patching_policy,
         ),
     }
     consumed_after = {
@@ -1389,8 +1737,23 @@ def build_dataset(
             "a consumed input changed during the dataset build: " + repr(changed)
         )
 
+    patching_manifest = patching_policy.to_manifest()
+    if published_patcher_path is not None:
+        patcher_record = patching_manifest["patcher_artifact"]
+        patcher_record["input_path"] = patcher_record["path"]
+        patcher_record["path"] = published_patcher_path.name
+        if (
+            published_patcher_path.stat().st_size != patcher_record["bytes"]
+            or sha256_file(published_patcher_path) != patcher_record["sha256"]
+        ):
+            raise RuntimeError("published entropy-patcher artifact is not exact")
+
     manifest: dict[str, Any] = {
-        "schema": DATASET_SCHEMA,
+        "schema": (
+            ENTROPY_DATASET_SCHEMA
+            if patching_policy.name == "causal_entropy_v1"
+            else DATASET_SCHEMA
+        ),
         "artifact_schema": ARTIFACT_SCHEMA,
         "artifact_format": {
             "kind": "aligned_raw_arrays/v1",
@@ -1405,9 +1768,10 @@ def build_dataset(
         "command": list(command) if command is not None else None,
         "atomic_vocabulary": atomic_manifest.to_dict(),
         "source_encoding": source_encoding,
+        "patching": patching_manifest,
         "packing": {
             "chunk_size": chunk_size,
-            "patch_stride": 4,
+            "patch_stride": patching_policy.stride,
             "layout": (
                 "one_document_per_row"
                 if close_rows_at_document
@@ -1418,16 +1782,29 @@ def build_dataset(
                 )
             ),
             "document_padding": (
-                "independent zero-to-three PAD positions after EOT"
-                if close_rows_at_document or document_aligned_pages
-                else "none"
+                "none between documents; only an incomplete row tail is padded"
+                if patching_policy.name == "causal_entropy_v1"
+                else (
+                    f"independent zero-to-{patching_policy.max_patch_size - 1} "
+                    "PAD positions after EOT"
+                    if close_rows_at_document or document_aligned_pages
+                    else "none"
+                )
             ),
             "patch_phase": (
-                "resets to zero after each terminal EOT"
-                if close_rows_at_document or document_aligned_pages
-                else "continuous across EOT-delimited documents"
+                "causal per-document entropy boundaries computed before packing"
+                if patching_policy.name == "causal_entropy_v1"
+                else (
+                    "resets to zero after each terminal EOT"
+                    if close_rows_at_document or document_aligned_pages
+                    else "continuous across EOT-delimited documents"
+                )
             ),
-            "chunk_alignment": "artificial starts are fixed-stride boundaries",
+            "chunk_alignment": (
+                "whole variable patches; PAD row tail before any crossing patch"
+                if patching_policy.name == "causal_entropy_v1"
+                else "artificial starts are fixed-stride boundaries"
+            ),
             "label_halo": "one clean next-atomic target when a chunk splits a document",
             "pad_is_valid": False,
             "pad_is_scored": False,
@@ -1445,7 +1822,10 @@ def build_dataset(
             "score_mask": "bool [N,chunk_size] aligned with input logits",
             "document_indices": "int64 [N,chunk_size], -1 on PAD",
             "document_offsets": "int32 [N,chunk_size], -1 on PAD",
-            "patch_offsets": "int8 [N,chunk_size], -1 on PAD",
+            "patch_offsets": (
+                "int8 [N,chunk_size], offset within the manifest-bound patch, "
+                "-1 on PAD"
+            ),
             "label_halo_id": "uint16 [N]",
             "label_halo_valid": "bool [N]",
             "chunk_index": "int64 [N]",
@@ -1463,6 +1843,9 @@ def build_dataset(
         "source_manifests": source_manifests,
         "input_fingerprints": [
             consumed_before[str(path)] for path in all_paths
+        ],
+        "patching_input_fingerprints": [
+            consumed_before[str(path)] for path in policy_input_paths
         ],
         "implementation_fingerprints": [
             consumed_before[str(path)] for path in implementation_paths
@@ -1518,6 +1901,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "dense stream is a causal-only control"
         ),
     )
+    parser.add_argument(
+        "--patching-policy",
+        choices=("fixed_stride_v1", "causal_entropy_v1"),
+        default="fixed_stride_v1",
+        help=(
+            "versioned logical byte-to-patch policy; fixed_stride_v1 is the "
+            "control and causal_entropy_v1 requires --entropy-patcher"
+        ),
+    )
+    parser.add_argument(
+        "--entropy-patcher",
+        type=Path,
+        default=None,
+        help="hash-authenticated CausalEntropyPatcher artifact",
+    )
+    parser.add_argument(
+        "--fixed-patch-stride",
+        type=int,
+        default=4,
+        help="fixed_stride_v1 width (the production control is four)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1543,6 +1947,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             not args.close_rows_at_document
             and args.packing_layout == "document_aligned_pages"
         ),
+        patching_policy_name=args.patching_policy,
+        entropy_patcher_path=args.entropy_patcher,
+        fixed_patch_stride=args.fixed_patch_stride,
         command=sys.argv if argv is None else [str(Path(__file__)), *argv],
     )
     print(

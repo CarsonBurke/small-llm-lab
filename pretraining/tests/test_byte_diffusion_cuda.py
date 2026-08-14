@@ -25,6 +25,9 @@ from pretraining.byte_diffusion.data import (
     DeterministicChunkCursor,
     pack_documents,
 )
+from pretraining.byte_diffusion.duo import duo_reverse_posterior
+from pretraining.byte_diffusion.duo_kernels import duo_posterior_sample
+from pretraining.byte_diffusion.duo_model import DuoModel
 from pretraining.byte_diffusion.kernels import (
     categorical_entropy_argmax_confidence,
     categorical_sample_entropy_argmax_confidence,
@@ -263,6 +266,114 @@ def test_triton_categorical_statistics_match_torch() -> None:
         torch.testing.assert_close(
             actual_value, expected_value, rtol=tolerance, atol=tolerance
         )
+
+
+def test_triton_duo_posterior_sampler_matches_exact_torch_oracle() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(108)
+    logits = torch.empty(
+        3, 64, 261, device="cuda", dtype=torch.bfloat16
+    ).uniform_(-1.0, 1.0, generator=generator)
+    noisy = torch.randint(261, (3, 64), device="cuda", generator=generator)
+    active = torch.ones_like(noisy, dtype=torch.bool)
+    active[:, -3:] = False
+    noisy[:, -3:] = 261
+
+    # Place each uniform halfway inside a reference CDF interval so this tests
+    # posterior parity, not unavoidable last-bit exp/reduction boundary ties.
+    safe_noisy = noisy.clamp_max(260)
+    probabilities = logits.float().softmax(-1)
+    posterior = duo_reverse_posterior(probabilities, safe_noisy, 0.73, 0.11)
+    target_ids = torch.randint(261, noisy.shape, device="cuda", generator=generator)
+    cumulative = posterior.cumsum(-1)
+    upper = cumulative.gather(-1, target_ids[..., None]).squeeze(-1)
+    lower_ids = (target_ids - 1).clamp_min(0)
+    lower = cumulative.gather(-1, lower_ids[..., None]).squeeze(-1)
+    lower = torch.where(target_ids.eq(0), torch.zeros_like(lower), lower)
+    uniforms = (lower + upper) * 0.5
+
+    expected = duo_posterior_sample(
+        logits, noisy, 0.73, 0.11, uniforms, active, backend="torch"
+    )
+    actual = duo_posterior_sample(
+        logits, noisy, 0.73, 0.11, uniforms, active, backend="triton"
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual.masked_select(~active), noisy.masked_select(~active))
+
+
+def test_compiled_duo_clean_cache_and_branch_path_match_full_forward() -> None:
+    torch.manual_seed(109)
+    device = torch.device("cuda")
+    model = DuoModel(ByteDiffusionConfig.tiny()).to(device).eval()
+    clean_ids = torch.randint(0, 256, (2, 32), device=device)
+    clean_valid = torch.ones_like(clean_ids, dtype=torch.bool)
+    document_ids = torch.arange(2, device=device)[:, None].expand_as(clean_ids)
+    positions = torch.arange(32, device=device)[None].expand_as(clean_ids)
+    noisy_ids = torch.randint(0, 256, (2, 1, 8), device=device)
+    branch_valid = torch.ones_like(noisy_ids, dtype=torch.bool)
+    branch_starts = torch.full((2, 1), 8, device=device, dtype=torch.long)
+    metadata = model.prepare_attention_metadata(clean_valid, document_ids)
+    compiled_prepare = torch.compile(
+        model.prepare_clean_bank,
+        dynamic=True,
+        fullgraph=False,
+        mode="max-autotune-no-cudagraphs",
+    )
+    compiled_forward = torch.compile(
+        model.forward_prepared,
+        dynamic=True,
+        fullgraph=False,
+        mode="max-autotune-no-cudagraphs",
+    )
+
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        clean_bank = compiled_prepare(
+            clean_ids,
+            clean_valid,
+            document_ids,
+            positions,
+            attention_metadata=metadata,
+        )
+        cache = model.prepare_canvas_cache(
+            clean_bank, branch_valid, branch_starts
+        )
+        for times in (
+            torch.full((2, 1), 0.2, device=device),
+            torch.full((2, 1), 0.8, device=device),
+        ):
+            expected = model(
+                clean_ids,
+                clean_valid,
+                document_ids,
+                positions,
+                noisy_ids,
+                branch_valid,
+                branch_starts,
+                times,
+                attention_metadata=metadata,
+                return_clean_logits=True,
+            )
+            observed = compiled_forward(
+                cache, noisy_ids, times, return_clean_logits=True
+            )
+            torch.testing.assert_close(
+                observed.branch_logits,
+                expected.branch_logits,
+                rtol=3e-2,
+                atol=3e-2,
+            )
+            torch.testing.assert_close(
+                observed.clean_logits,
+                expected.clean_logits,
+                rtol=3e-2,
+                atol=3e-2,
+            )
+            torch.testing.assert_close(
+                observed.branch_patch_states,
+                expected.branch_patch_states,
+                rtol=3e-2,
+                atol=3e-2,
+            )
 
 
 def test_triton_reveal_matches_torch() -> None:

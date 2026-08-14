@@ -56,16 +56,20 @@ def categorical_entropy_argmax_confidence_reference(
     optional CUDA kernel.  The output shapes equal ``logits.shape[:-1]``;
     argmax is int64 and the other outputs are float32.
 
-    Inputs are expected to be finite.  Non-finite values retain PyTorch's
-    native ``log_softmax``/``argmax`` behavior so this function remains fully
-    tensorized and safe to place inside ``torch.compile``.
+    ``-inf`` is a supported exact mask for forbidden output atoms. Zero-mass
+    classes contribute exactly zero entropy instead of the undefined floating
+    expression ``0 * -inf``.
     """
 
     _validate_categorical_logits(logits)
     fp32_logits = logits.float()
     log_probabilities = F.log_softmax(fp32_logits, dim=-1)
     probabilities = log_probabilities.exp()
-    entropy = -(probabilities * log_probabilities).sum(dim=-1)
+    entropy = -torch.where(
+        probabilities > 0,
+        probabilities * log_probabilities,
+        torch.zeros_like(probabilities),
+    ).sum(dim=-1)
     argmax = fp32_logits.argmax(dim=-1)
     confidence = probabilities.gather(-1, argmax.unsqueeze(-1)).squeeze(-1)
     return entropy, argmax, confidence
@@ -168,7 +172,12 @@ def _load_triton_categorical_kernel():
             log_normalizer = tl.log(normalizer)
             log_probabilities = values - maximum - log_normalizer
             entropy = -tl.sum(
-                tl.where(valid, probabilities * log_probabilities, 0.0), axis=0
+                tl.where(
+                    valid & (probabilities > 0.0),
+                    probabilities * log_probabilities,
+                    0.0,
+                ),
+                axis=0,
             )
             argmax = tl.argmax(values, axis=0, tie_break_left=True)
             confidence = tl.sum(
@@ -227,7 +236,12 @@ def _load_triton_categorical_sample_kernel():
             log_normalizer = tl.log(normalizer)
             log_probabilities = values - maximum - log_normalizer
             entropy = -tl.sum(
-                tl.where(valid, probabilities * log_probabilities, 0.0), axis=0
+                tl.where(
+                    valid & (probabilities > 0.0),
+                    probabilities * log_probabilities,
+                    0.0,
+                ),
+                axis=0,
             )
             argmax = tl.argmax(values, axis=0, tie_break_left=True)
             confidence = tl.sum(
@@ -275,6 +289,7 @@ def _load_triton_reveal_kernel():
             active_out,
             revealed_out,
             EOT_ID,
+            ALLOW_SIMULTANEOUS_EOT: tl.constexpr,
             WIDTH: tl.constexpr,
         ):
             row = tl.program_id(0)
@@ -292,7 +307,11 @@ def _load_triton_reveal_kernel():
             # exposes a terminal symbol ahead of unresolved prefix content.
             live_prefix = tl.cumsum(live.to(tl.int32), axis=0)
             earlier_unresolved = live_prefix - live.to(tl.int32)
-            eot_allowed = (sampled != EOT_ID) | (earlier_unresolved == 0)
+            eot_allowed = (
+                (sampled != EOT_ID)
+                | (earlier_unresolved == 0)
+                | ALLOW_SIMULTANEOUS_EOT
+            )
             finite = (
                 (scores == scores)
                 & (scores < float("inf"))
@@ -566,6 +585,7 @@ def reveal_low_entropy_reference(
     quota: int | Tensor,
     *,
     eot_id: int,
+    allow_simultaneous_eot: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Reveal a stable lowest-entropy subset of one 512-position canvas.
 
@@ -585,7 +605,11 @@ def reveal_low_entropy_reference(
     positions = torch.arange(width, device=canvas.device)
     live = unresolved & active
     earlier_unresolved = live.to(torch.int32).cumsum(-1) - live.to(torch.int32)
-    eot_allowed = (samples != eot_id) | (earlier_unresolved == 0)
+    eot_allowed = (
+        (samples != eot_id)
+        | (earlier_unresolved == 0)
+        | allow_simultaneous_eot
+    )
     fp32_entropy = entropy.float()
     eligible = live & eot_allowed & torch.isfinite(fp32_entropy)
     priority = torch.where(
@@ -631,6 +655,7 @@ def _reveal_low_entropy_triton(
     quota: int | Tensor,
     *,
     eot_id: int,
+    allow_simultaneous_eot: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     if canvas.device.type != "cuda":
         raise RuntimeError("the Triton reveal kernel requires CUDA tensors")
@@ -648,6 +673,7 @@ def _reveal_low_entropy_triton(
             active,
             quota,
             eot_id=eot_id,
+            allow_simultaneous_eot=allow_simultaneous_eot,
         )
     width = canvas.shape[1]
     # tl.sort requires a power-of-two compile-time width. Canonical BLT block
@@ -662,6 +688,7 @@ def _reveal_low_entropy_triton(
             active,
             quota,
             eot_id=eot_id,
+            allow_simultaneous_eot=allow_simultaneous_eot,
         )
     quota_rows = _quota_per_row(canvas, quota).clamp(0, width).to(
         torch.int32
@@ -691,6 +718,7 @@ def _reveal_low_entropy_triton(
         active_out,
         revealed_out,
         eot_id,
+        ALLOW_SIMULTANEOUS_EOT=allow_simultaneous_eot,
         WIDTH=width,
         num_warps=8 if width >= 256 else 4,
     )
@@ -706,6 +734,7 @@ def reveal_low_entropy(
     quota: int | Tensor,
     *,
     eot_id: int,
+    allow_simultaneous_eot: bool = False,
     backend: RevealBackend = "auto",
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Portable stable reveal/update with a lazy strict Triton backend."""
@@ -724,6 +753,7 @@ def reveal_low_entropy(
             active,
             quota,
             eot_id=eot_id,
+            allow_simultaneous_eot=allow_simultaneous_eot,
         )
     if backend == "triton":
         if not triton_is_importable():
@@ -736,6 +766,7 @@ def reveal_low_entropy(
             active,
             quota,
             eot_id=eot_id,
+            allow_simultaneous_eot=allow_simultaneous_eot,
         )
     if (
         canvas.device.type == "cuda"
@@ -750,6 +781,7 @@ def reveal_low_entropy(
             active,
             quota,
             eot_id=eot_id,
+            allow_simultaneous_eot=allow_simultaneous_eot,
         )
     return reveal_low_entropy_reference(
         canvas,
@@ -759,6 +791,7 @@ def reveal_low_entropy(
         active,
         quota,
         eot_id=eot_id,
+        allow_simultaneous_eot=allow_simultaneous_eot,
     )
 
 

@@ -349,8 +349,11 @@ class PackedChunk:
                 raise ValueError("clean packed input positions cannot contain MASK or PAD")
             if self.document_indices[index] < 0 or self.document_offsets[index] < 0:
                 raise ValueError("valid positions require document metadata")
-            if not 0 <= self.patch_offsets[index] < PATCH_STRIDE:
-                raise ValueError("valid positions require a patch offset in [0, 4)")
+            # The manifest-bound loader validates the exact maximum.  This
+            # policy-neutral row value also represents entropy patches whose
+            # width is not the legacy fixed stride of four.
+            if not 0 <= self.patch_offsets[index] <= np.iinfo(np.int8).max:
+                raise ValueError("valid positions require a nonnegative int8 patch offset")
             if score and not 0 <= self.target_ids[index] < MASK_ID:
                 raise ValueError("scored packed targets must be clean atomic ids")
             if not score and self.target_ids[index] != PAD_ID:

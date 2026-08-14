@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 import hashlib
+import itertools
 import json
 import math
 from pathlib import Path
@@ -26,8 +27,11 @@ from pretraining.byte_diffusion.data import (
 )
 from pretraining.byte_diffusion.model import ByteDiffusionModel
 from pretraining.byte_diffusion.training import (
+    CAUSAL_CONTROL_PRESET,
     CANONICAL_PRESET,
     CHECKPOINT_SCHEMA,
+    DENSE_FAST_BLT_PRESET,
+    ENTROPY_FAST_BLT_PRESET,
     BltCorruptionPlan,
     ByteDiffusionTrainer,
     CanvasCorruptionPlan,
@@ -36,6 +40,7 @@ from pretraining.byte_diffusion.training import (
     MappedPackedChunkDataset,
     TrainingBatch,
     TrainingRunConfig,
+    ValidationChunkIdentity,
     attention_context,
     chunks_to_batch,
     create_model_optimizer,
@@ -51,6 +56,7 @@ from pretraining.byte_diffusion.training import (
     sample_validation_starts,
     take_distributed_chunks,
     take_uneven_distributed_indices,
+    validation_exact_k_mask,
 )
 from scripts.ablation import compare_results, parse_log_line
 from scripts.benchmark_byte_diffusion_real_data import build_benchmark_run_config
@@ -271,6 +277,56 @@ def _load_document_aligned_artifact(
     )
 
 
+def test_mapped_training_metadata_plans_batches_and_exact_ar_units(
+    tmp_path: Path,
+) -> None:
+    arrays = _valid_document_aligned_artifact()
+    dataset = _load_document_aligned_artifact(tmp_path, arrays)
+
+    groups = dataset.training_batch_groups(
+        [0], max_batch_size=4, physical_token_budget=64
+    )
+    batch = dataset.training_batch(groups[0])
+
+    assert groups == [(0,)]
+    expected = int(batch.ar_targets.ne(-100).sum() + batch.bos_targets.numel())
+    assert dataset.training_ar_units(np.asarray([0], dtype=np.int64)) == expected == 6
+    assert dataset.training_ar_units(np.empty(0, dtype=np.int64)) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_native_mapped_batch_completes_one_logged_update(tmp_path: Path) -> None:
+    arrays = _valid_document_aligned_artifact()
+    dataset = _load_document_aligned_artifact(tmp_path, arrays)
+    run = replace(
+        _run_config(recipe="blt_d", iterations=1),
+        corruption=CorruptionConfig(
+            kind="blt_exact_k", canvas_length=4, branches_per_row=2
+        ),
+        microbatch_per_rank=1,
+        gradient_accumulation=1,
+        attention_policy="flash_sdpa",
+        allow_cpu_reference=False,
+        compile_model=False,
+    )
+    model = ByteDiffusionModel(ByteDiffusionConfig.tiny())
+    trainer = ByteDiffusionTrainer(
+        model,
+        DeterministicChunkCursor(dataset, seed=run.seed, shuffle=False),
+        dataset,
+        run,
+        device=torch.device("cuda"),
+    )
+
+    metrics = trainer.run_update(materialize_metrics=True)
+
+    assert metrics is not None
+    assert metrics.step == 1
+    assert metrics.microsteps == 1
+    assert metrics.max_microbatch == 1
+    assert metrics.max_physical_positions == 16
+
+
 def test_standard_ablation_environment_is_the_run_contract(monkeypatch) -> None:
     monkeypatch.setenv("ITERATIONS", "2000")
     monkeypatch.setenv("VAL_LOSS_EVERY", "20")
@@ -295,6 +351,17 @@ def test_model_ablation_environment_selects_one_explicit_cell(monkeypatch) -> No
         "BYTE_DIFFUSION_DECODER_CONDITIONING", "rmsnorm_projection"
     )
     monkeypatch.setenv("BYTE_DIFFUSION_NGRAM_ENABLED", "1")
+    monkeypatch.setenv("BYTE_DIFFUSION_NGRAM_TABLE_SIZE", "4096")
+    monkeypatch.setenv("BYTE_DIFFUSION_NGRAM_RANK", "8")
+    monkeypatch.setenv("BYTE_DIFFUSION_DECODER_LAYERS", "3")
+    monkeypatch.setenv("BYTE_DIFFUSION_DECODER_FFN_DIM", "48")
+    monkeypatch.setenv("BYTE_DIFFUSION_OUTPUT_TIED", "1")
+    monkeypatch.setenv("BYTE_DIFFUSION_EXPLICIT_TIMESTEP", "1")
+    monkeypatch.setenv("BYTE_DIFFUSION_SELF_CONDITIONING", "1")
+    monkeypatch.setenv("BYTE_DIFFUSION_DECODER_SPLIT_RESIDUAL_SCALE", "0.25")
+    monkeypatch.setenv("BYTE_DUO_TIME_FEATURES", "256")
+    monkeypatch.setenv("BYTE_DUO_TIME_CONDITION_DIM", "128")
+    monkeypatch.setenv("BYTE_DUO_NOISY_NGRAMS", "0")
 
     observed = model_config_from_env(tiny=True)
 
@@ -303,6 +370,17 @@ def test_model_ablation_environment_selects_one_explicit_cell(monkeypatch) -> No
     assert observed.ngram_aggregation == "mean"
     assert observed.decoder_conditioning == "rmsnorm_projection"
     assert observed.ngram_enabled
+    assert observed.ngram_table_size == 4_096
+    assert observed.ngram_rank == 8
+    assert observed.decoder_layers == 3
+    assert observed.decoder_ffn_dim == 48
+    assert observed.output_tied
+    assert observed.explicit_timestep
+    assert observed.self_conditioning
+    assert observed.decoder_split_residual_scale == 0.25
+    assert observed.duo_time_features == 256
+    assert observed.duo_time_condition_dim == 128
+    assert not observed.duo_noisy_ngrams
 
 
 def test_real_data_benchmark_uses_and_checks_production_recipe(monkeypatch) -> None:
@@ -329,12 +407,15 @@ def test_training_source_provenance_is_complete_and_stable() -> None:
     first = training_source_provenance()
     second = training_source_provenance()
     assert first == second
-    assert first["schema"] == "byte_diffusion_source_provenance/v1"
+    assert first["schema"] == "byte_diffusion_source_provenance/v2"
     assert len(first["sha256"]) == 64
     files = first["files"]
     assert "scripts/ablation.py" in files
     assert "scripts/train_byte_diffusion.py" in files
     assert "pretraining/byte_diffusion/training.py" in files
+    assert "pretraining/byte_diffusion/model.py" in files
+    assert "pretraining/byte_diffusion/corruption.py" in files
+    assert "pretraining/byte_diffusion/inference.py" not in files
 
 
 def test_loader_enforces_pinned_dataset_and_source_manifest_hashes(
@@ -413,6 +494,139 @@ def test_canonical_fast_blt_b4_preset_is_fully_pinned(monkeypatch) -> None:
     monkeypatch.setenv("BYTE_DIFFUSION_CANVAS_LENGTH", "8")
     with pytest.raises(ValueError, match="contract mismatch"):
         TrainingRunConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    ("preset", "recipe", "patching_policy", "corruption", "reduction"),
+    [
+        (
+            CAUSAL_CONTROL_PRESET,
+            "causal_only",
+            "fixed_stride_v1",
+            CorruptionConfig.canvas512(),
+            "equal_mean",
+        ),
+        (
+            DENSE_FAST_BLT_PRESET,
+            "blt_d",
+            "fixed_stride_v1",
+            CorruptionConfig(
+                kind="blt_exact_k", canvas_length=4, branches_per_row=2_048
+            ),
+            "row_normalized_sum",
+        ),
+        (
+            ENTROPY_FAST_BLT_PRESET,
+            "blt_d",
+            "causal_entropy_v1",
+            CorruptionConfig.blt_entropy_reference(),
+            "row_normalized_sum",
+        ),
+    ],
+)
+def test_reference_presets_resolve_complete_contracts(
+    monkeypatch, preset, recipe, patching_policy, corruption, reduction
+) -> None:
+    monkeypatch.setenv("BYTE_DIFFUSION_PRESET", preset)
+
+    observed = TrainingRunConfig.from_env()
+
+    assert observed.recipe == recipe
+    assert observed.patching_policy == patching_policy
+    assert observed.corruption == corruption
+    assert observed.objective_reduction == reduction
+    assert observed.global_batch_size == 249
+    assert observed.microbatch_per_rank == 32
+    assert observed.microbatch_token_budget == 278_528
+    assert observed.gradient_accumulation == 8
+
+
+def test_reference_presets_reject_microbatch_drift(monkeypatch) -> None:
+    monkeypatch.setenv("BYTE_DIFFUSION_PRESET", DENSE_FAST_BLT_PRESET)
+    monkeypatch.setenv("BYTE_DIFFUSION_MICROBATCH", "16")
+    with pytest.raises(ValueError, match="microbatch_per_rank"):
+        TrainingRunConfig.from_env()
+
+
+def test_entropy_preset_rejects_fixed_stride_dataset_policy(monkeypatch) -> None:
+    monkeypatch.setenv("BYTE_DIFFUSION_PRESET", ENTROPY_FAST_BLT_PRESET)
+    monkeypatch.setenv("BYTE_DIFFUSION_PATCHING_POLICY", "fixed_stride_v1")
+    with pytest.raises(ValueError, match="patching_policy"):
+        TrainingRunConfig.from_env()
+
+
+def test_entropy_preset_matches_patcher_max_without_changing_branch_budget(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BYTE_DIFFUSION_PRESET", ENTROPY_FAST_BLT_PRESET)
+    entropy = TrainingRunConfig.from_env().corruption
+    dense = CorruptionConfig(
+        kind="blt_exact_k", canvas_length=4, branches_per_row=2_048
+    )
+
+    assert entropy == CorruptionConfig.blt_entropy_reference()
+    assert entropy.canvas_length == 8
+    assert entropy.branches_per_row == 1_024
+    assert entropy.corrupted_positions_per_row == 8_192
+    assert entropy.corrupted_positions_per_row == dense.corrupted_positions_per_row
+
+    monkeypatch.setenv("BYTE_DIFFUSION_CANVAS_LENGTH", "4")
+    monkeypatch.setenv("BYTE_DIFFUSION_BRANCHES", "2048")
+    with pytest.raises(ValueError, match="contract mismatch"):
+        TrainingRunConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    ("block_length", "branches"), [(4, 2_048), (8, 1_024), (16, 512)]
+)
+def test_entropy_recipe_expresses_block_horizons_independent_of_patcher(
+    block_length: int, branches: int
+) -> None:
+    config = CorruptionConfig.blt_entropy_reference(block_length=block_length)
+
+    assert config.canvas_length == block_length
+    assert config.branches_per_row == branches
+    assert config.corrupted_positions_per_row == 8_192
+
+
+def test_entropy_trainer_requires_authenticated_patcher_provenance() -> None:
+    class EntropyChunks(list):
+        patching = training_module.DatasetPatchingSpec(
+            "causal_entropy_v1", None, 8, artifact_sha256="a" * 64
+        )
+
+    chunks = EntropyChunks(_chunks())
+    independent_b4 = replace(
+        _run_config(recipe="blt_d"),
+        patching_policy="causal_entropy_v1",
+        corruption=CorruptionConfig(
+            kind="blt_exact_k", canvas_length=4, branches_per_row=2_048
+        ),
+    )
+    trainer = ByteDiffusionTrainer(
+        ByteDiffusionModel(ByteDiffusionConfig.tiny()),
+        DeterministicChunkCursor(chunks, seed=independent_b4.seed),
+        chunks,
+        independent_b4,
+        device=torch.device("cpu"),
+    )
+    assert trainer.run_config.corruption.canvas_length == 4
+    assert chunks.patching.max_patch_size == 8
+
+    chunks.patching = training_module.DatasetPatchingSpec(
+        "causal_entropy_v1", None, 8
+    )
+    matching = replace(
+        independent_b4, corruption=CorruptionConfig.blt_entropy_reference()
+    )
+    with pytest.raises(ValueError, match="authenticated patcher provenance"):
+        ByteDiffusionTrainer(
+            ByteDiffusionModel(ByteDiffusionConfig.tiny()),
+            DeterministicChunkCursor(chunks, seed=matching.seed),
+            chunks,
+            matching,
+            device=torch.device("cpu"),
+        )
 
 
 def test_canonical_preset_rejects_global_batch_drift(monkeypatch) -> None:
@@ -739,6 +953,73 @@ def test_continuation_page_rejects_blocks_past_storage(
     assert bool((chosen + 8 <= page_width).all())
     assert bool(chosen.ne(0).all())
     assert bool(conditions[selected].ge(0).all())
+
+
+@pytest.mark.parametrize("block_length", [4, 8, 16])
+@pytest.mark.parametrize("ends_with_eot", [False, True])
+def test_variable_blt_tail_requires_full_same_document_block_or_eot(
+    block_length: int,
+    ends_with_eot: bool,
+) -> None:
+    """Page-continuation PAD is not a semantic short-block terminator."""
+
+    width = 24
+    start = 4
+    valid_length = start + block_length - 2
+    valid = torch.arange(width)[None].lt(valid_length)
+    documents = torch.where(valid, torch.zeros_like(valid, dtype=torch.long), -1)
+    ids = torch.full((1, width), 262, dtype=torch.long)
+    ids[valid] = torch.arange(valid_length, dtype=torch.long)
+    if ends_with_eot:
+        ids[0, valid_length - 1] = 256
+    batch = TrainingBatch(
+        ids=ids,
+        valid=valid,
+        ar_targets=torch.full_like(ids, -100),
+        bos_targets=torch.empty(0, dtype=torch.long),
+        positions=torch.arange(width)[None],
+        full_valid=False,
+        document_ids=documents,
+        physical_patch_row_indices=torch.tensor([0]),
+        physical_patch_start_columns=torch.tensor([start]),
+        physical_patch_prior_condition_indices=torch.tensor([0]),
+    )
+
+    starts, priors, eligible = training_module._variable_blt_candidate_matrices(
+        batch, block_length=block_length
+    )
+
+    assert starts.tolist() == [[start]]
+    assert priors.tolist() == [[0]]
+    assert eligible.tolist() == [[ends_with_eot]]
+
+
+@pytest.mark.parametrize("block_length", [4, 8, 16])
+def test_variable_blt_full_same_document_block_remains_eligible(
+    block_length: int,
+) -> None:
+    width = 24
+    start = 4
+    valid = torch.ones((1, width), dtype=torch.bool)
+    ids = torch.arange(width, dtype=torch.long)[None]
+    batch = TrainingBatch(
+        ids=ids,
+        valid=valid,
+        ar_targets=torch.full_like(ids, -100),
+        bos_targets=torch.empty(0, dtype=torch.long),
+        positions=torch.arange(width)[None],
+        full_valid=True,
+        document_ids=torch.zeros_like(ids),
+        physical_patch_row_indices=torch.tensor([0]),
+        physical_patch_start_columns=torch.tensor([start]),
+        physical_patch_prior_condition_indices=torch.tensor([0]),
+    )
+
+    _, _, eligible = training_module._variable_blt_candidate_matrices(
+        batch, block_length=block_length
+    )
+
+    assert eligible.tolist() == [[True]]
 
 
 def test_packed_bos_supervises_every_document_start_in_one_row() -> None:
@@ -1472,6 +1753,37 @@ def test_blt_blocks_never_cross_a_packed_document_boundary() -> None:
         )
 
 
+def test_exhaustive_document_blt_origins_are_ordered_and_rng_free() -> None:
+    ids = torch.tensor(
+        [[65, 66, 67, 256, 72, 73, 74, 256, 80, 81, 82, 256, 88, 89, 90, 256]]
+    )
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    documents = torch.tensor([[0] * 4 + [1] * 4 + [2] * 4 + [3] * 4])
+    positions = torch.tensor([[*range(4), *range(4), *range(4), *range(4)]])
+    layout = training_module._packed_document_layout(valid, documents, positions)
+    generator = torch.Generator().manual_seed(919)
+    before = generator.get_state().clone()
+
+    starts, weight, selected, conditions = (
+        training_module.sample_blt_patch_starts(
+            valid,
+            count=4,
+            block_length=4,
+            patch_stride=4,
+            generator=generator,
+            document_ids=documents,
+            clean_ids=ids,
+            prior_condition_indices=layout[9],
+        )
+    )
+
+    torch.testing.assert_close(generator.get_state(), before)
+    assert starts.tolist() == [[0, 4, 8, 12]]
+    assert bool(selected.all())
+    assert bool(conditions.ge(0).all())
+    torch.testing.assert_close(weight, torch.ones(1))
+
+
 def test_document_packed_blt_branch_cannot_read_another_document() -> None:
     torch.manual_seed(727)
     model = ByteDiffusionModel(ByteDiffusionConfig.tiny()).eval()
@@ -1582,14 +1894,18 @@ def test_document_packed_blt_validation_scores_short_tail_origins() -> None:
 
     assert metrics.ar_targets == 16
     assert metrics.diffusion_chunks == 1
-    # Exhausting all four patch origins includes each full document start and
-    # both short four-byte document tails.
-    assert metrics.diffusion_targets == 24
+    # Exact-K validation supervises a deterministic subset while the ELBO
+    # denominator retains the complete origin-corrected atom coverage.
+    assert 1 <= metrics.diffusion_targets <= 24
+    assert metrics.diffusion_elbo_atoms == 24
+    assert metrics.diffusion_elbo_proxy_bpb is not None
+    assert math.isfinite(metrics.diffusion_elbo_proxy_bpb)
     assert math.isfinite(metrics.bpb)
     assert math.isfinite(metrics.diffusion_loss)
     assert cached_plans
     assert tuple(trainer._validation_blt_plan_cache.values()) == cached_plans
     assert repeated.diffusion_loss == metrics.diffusion_loss
+    assert repeated.diffusion_elbo_proxy_bpb == metrics.diffusion_elbo_proxy_bpb
 
 
 def test_canvas_start_never_crosses_pad_when_a_full_span_exists() -> None:
@@ -1628,6 +1944,64 @@ def test_validation_starts_are_invariant_to_batch_and_rank_order() -> None:
         seed=17,
     )
     torch.testing.assert_close(subset, together[[3, 1]])
+
+
+def test_validation_exact_k_is_batch_invariant_and_never_selects_padding() -> None:
+    eligible = torch.tensor(
+        [
+            [[True, True, True, True], [True, True, False, False]],
+            [[True, False, True, False], [True, True, True, False]],
+            [[True, True, True, False], [False, False, False, False]],
+        ]
+    )
+    chunks = tuple(
+        ValidationChunkIdentity(chunk_index=10 + index, stream_start=31 * index)
+        for index in range(3)
+    )
+    active, t = validation_exact_k_mask(eligible, chunks, seed=19)
+    assert not bool((active & ~eligible).any())
+    counts = eligible.flatten(1).sum(1)
+    selected = active.flatten(1).sum(1)
+    assert bool(((selected >= 1) & (selected <= counts)).all())
+    torch.testing.assert_close(t, selected.float() / counts.float())
+
+    reordered = torch.tensor([2, 0])
+    subset_active, subset_t = validation_exact_k_mask(
+        eligible[reordered],
+        tuple(chunks[index] for index in reordered.tolist()),
+        seed=19,
+    )
+    torch.testing.assert_close(subset_active, active[reordered])
+    torch.testing.assert_close(subset_t, t[reordered])
+
+
+def test_exact_k_and_origin_ht_estimators_match_tiny_analytic_oracles() -> None:
+    per_atom_nll = np.array([0.2, 1.1, 2.3], dtype=np.float64)
+    size = len(per_atom_nll)
+    integrated = 0.0
+    proposal = 0.0
+    for k in range(1, size + 1):
+        subsets = tuple(itertools.combinations(range(size), k))
+        mean_selected_sum = np.mean(
+            [per_atom_nll[np.array(subset)].sum() for subset in subsets]
+        )
+        integrated += mean_selected_sum / k
+        proposal += (size / k) * mean_selected_sum / size
+    assert proposal == pytest.approx(integrated, abs=1e-15)
+
+    # Unequal tail coverage is corrected by the same M/m origin weight for
+    # both numerator and atom denominator before their final ratio.
+    origin_nll = np.array([3.0, 0.8, 0.1], dtype=np.float64)
+    origin_atoms = np.array([4.0, 2.0, 1.0], dtype=np.float64)
+    selections = tuple(itertools.combinations(range(3), 2))
+    ht_nll = np.mean(
+        [1.5 * origin_nll[np.array(selection)].sum() for selection in selections]
+    )
+    ht_atoms = np.mean(
+        [1.5 * origin_atoms[np.array(selection)].sum() for selection in selections]
+    )
+    assert ht_nll == pytest.approx(origin_nll.sum())
+    assert ht_atoms == pytest.approx(origin_atoms.sum())
 
 
 def test_short_rows_retain_partial_diffusion_span_and_ar_targets() -> None:
@@ -1826,6 +2200,73 @@ def test_blt_loss_sums_all_blocks_per_clean_row_before_batch_mean(
     torch.testing.assert_close(loss.total, torch.tensor(expected), rtol=1e-6, atol=1e-6)
 
 
+def test_blt_row_normalized_sum_preserves_signal_ratio_without_raw_scale(
+    monkeypatch,
+) -> None:
+    batch = chunks_to_batch(_chunks()[:1])
+    clean_blocks = torch.zeros(1, 2, 4, dtype=torch.long)
+    active = torch.ones_like(clean_blocks, dtype=torch.bool)
+    plan = BltCorruptionPlan(
+        clean_blocks=clean_blocks,
+        noisy_blocks=clean_blocks.clone(),
+        branch_valid=active,
+        active=active,
+        block_starts=torch.tensor([[0, 4]]),
+        condition_indices=torch.tensor([[0, 1]]),
+        block_length=4,
+        t=torch.tensor([0.5]),
+        sampling_weight=torch.tensor([2.0]),
+    )
+    monkeypatch.setattr(
+        training_module,
+        "prepare_blt_corruption",
+        lambda *args, **kwargs: plan,
+    )
+    desired_nll = torch.tensor([[[1.0] * 4, [3.0] * 4]])
+    probability = torch.exp(-desired_nll)
+    other_probability = (1.0 - probability) / 260
+    diffusion_logits = torch.cat(
+        (
+            probability.log().unsqueeze(-1),
+            other_probability.log().unsqueeze(-1).expand(-1, -1, -1, 260),
+        ),
+        dim=-1,
+    )
+
+    class FixedForward(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            del args, kwargs
+            return (
+                torch.zeros(1, batch.ids.shape[1], 261),
+                diffusion_logits,
+                torch.zeros(1, 261),
+            )
+
+    base = _run_config(recipe="canvas")
+    config = TrainingRunConfig(
+        **{
+            **base.contract_dict(),
+            "corruption": CorruptionConfig(
+                kind="blt_bernoulli", canvas_length=4, branches_per_row=2
+            ),
+            "recipe": "blt_d",
+            "objective_reduction": "row_normalized_sum",
+        }
+    )
+    trainer = _trainer(ByteDiffusionModel(ByteDiffusionConfig.tiny()), config)
+    trainer.forward_model = FixedForward()
+    loss = trainer._compute_loss(batch)
+
+    expected_diffusion = 64.0 / 8.0
+    torch.testing.assert_close(loss.diffusion, torch.tensor(expected_diffusion))
+    torch.testing.assert_close(
+        loss.total,
+        torch.tensor(expected_diffusion + math.log(261)),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
 def test_causal_only_is_a_named_control_and_does_not_consume_corruption_rng() -> None:
     class CountingModel(ByteDiffusionModel):
         def __init__(self):
@@ -1938,9 +2379,14 @@ def test_metrics_are_parseable_by_the_ablation_harness() -> None:
     )
     assert val_entry is not None
     assert val_entry["type"] == "val"
-    assert val_entry["val_bpb"] == pytest.approx(validation.bpb, abs=1e-6)
+    expected_primary_bpb = (
+        validation.diffusion_elbo_proxy_bpb
+        if validation.diffusion_elbo_proxy_bpb is not None
+        else validation.bpb
+    )
+    assert val_entry["val_bpb"] == pytest.approx(expected_primary_bpb, abs=1e-6)
     assert val_entry["val_proxy_bpb"] == pytest.approx(
-        validation.bpb, abs=1e-6
+        expected_primary_bpb, abs=1e-6
     )
     assert val_entry["val_diffusion_loss"] == pytest.approx(
         validation.diffusion_loss, abs=1e-6
@@ -1957,7 +2403,7 @@ def test_metrics_are_parseable_by_the_ablation_harness() -> None:
     )
     assert challenge_entry is not None
     assert challenge_entry["val_challenge_bpb"] == pytest.approx(
-        validation.bpb, abs=1e-6
+        expected_primary_bpb, abs=1e-6
     )
 
 

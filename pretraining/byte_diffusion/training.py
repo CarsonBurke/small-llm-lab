@@ -13,6 +13,7 @@ implicit job launch and CPU tests never initialize CUDA.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from functools import lru_cache
 import hashlib
@@ -60,6 +61,11 @@ from .data import (
 from .kernels import flash_sdpa_only
 from .layers import pack_valid
 from .model import ByteDiffusionModel
+from .variable_patching import (
+    DatasetPatchingSpec,
+    build_variable_patch_layout,
+    load_dataset_patching_spec,
+)
 from .objectives import (
     IGNORE_INDEX,
     ar_cross_entropy,
@@ -74,9 +80,21 @@ from .objectives import (
 
 CHECKPOINT_SCHEMA = "byte_diffusion_training/v10"
 CANONICAL_PRESET = "fast_blt_b4_scratch_v1"
+CAUSAL_CONTROL_PRESET = "causal_v5_scratch_v1"
+DENSE_FAST_BLT_PRESET = "fast_blt_dense_exactk_scratch_v1"
+ENTROPY_FAST_BLT_PRESET = "fast_blt_entropy_exactk_scratch_v1"
+PRODUCTION_PRESETS = frozenset(
+    {
+        CANONICAL_PRESET,
+        CAUSAL_CONTROL_PRESET,
+        DENSE_FAST_BLT_PRESET,
+        ENTROPY_FAST_BLT_PRESET,
+    }
+)
 Recipe = Literal["canvas", "blt_d", "causal_only"]
+PatchingPolicy = Literal["fixed_stride_v1", "causal_entropy_v1"]
 AttentionPolicy = Literal["flash_sdpa", "dense_reference"]
-ObjectiveReduction = Literal["equal_mean", "paper_sum"]
+ObjectiveReduction = Literal["equal_mean", "paper_sum", "row_normalized_sum"]
 CompileMode = Literal["default", "reduce-overhead", "max-autotune-no-cudagraphs"]
 OptimizerKind = Literal["adamw", "nanogpt_muon"]
 
@@ -105,6 +123,7 @@ class TrainingRunConfig:
     initialization_kind: Literal["scratch"] = "scratch"
     seed: int = 1_337
     recipe: Recipe = "canvas"
+    patching_policy: PatchingPolicy = "fixed_stride_v1"
     corruption: CorruptionConfig = CorruptionConfig.canvas512()
     microbatch_per_rank: int = 32
     microbatch_token_budget: int = 278_528
@@ -161,7 +180,7 @@ class TrainingRunConfig:
             )
         if not self.run_id:
             raise ValueError("RUN_ID must be non-empty")
-        if self.preset not in {None, CANONICAL_PRESET}:
+        if self.preset is not None and self.preset not in PRODUCTION_PRESETS:
             raise ValueError(f"unknown byte-diffusion preset {self.preset!r}")
         if self.initialization_kind != "scratch":
             raise ValueError("byte diffusion currently supports scratch lineages only")
@@ -191,9 +210,15 @@ class TrainingRunConfig:
             raise ValueError("max_grad_norm must be positive or None")
         if self.recipe not in {"canvas", "blt_d", "causal_only"}:
             raise ValueError(f"unknown training recipe {self.recipe!r}")
+        if self.patching_policy not in {"fixed_stride_v1", "causal_entropy_v1"}:
+            raise ValueError(f"unknown patching policy {self.patching_policy!r}")
         if not isinstance(self.corruption, CorruptionConfig):
             raise TypeError("corruption must be a CorruptionConfig")
-        if self.objective_reduction not in {"equal_mean", "paper_sum"}:
+        if self.objective_reduction not in {
+            "equal_mean",
+            "paper_sum",
+            "row_normalized_sum",
+        }:
             raise ValueError(
                 f"unknown objective reduction {self.objective_reduction!r}"
             )
@@ -216,19 +241,24 @@ class TrainingRunConfig:
                 "activation checkpointing is incompatible with compiled branch "
                 "training because backward recomputation escapes compiled FlexAttention"
             )
-        if self.objective_reduction == "paper_sum" and self.recipe != "blt_d":
-            raise ValueError("paper_sum is defined only for the BLT-D recipe")
         if (
-            self.objective_reduction == "paper_sum"
+            self.objective_reduction in {"paper_sum", "row_normalized_sum"}
+            and self.recipe != "blt_d"
+        ):
+            raise ValueError(
+                "summed BLT reductions are defined only for the BLT-D recipe"
+            )
+        if (
+            self.objective_reduction in {"paper_sum", "row_normalized_sum"}
             and self.corruption.kind not in {"blt_bernoulli", "blt_exact_k"}
         ):
-            raise ValueError("paper_sum requires a Fast-BLT sum estimator")
+            raise ValueError("summed BLT reductions require a Fast-BLT estimator")
         if self.corruption.kind == "uniform_replacement":
             raise ValueError(
                 "uniform replacement requires the unimplemented reference "
                 "self-conditioning forward and is not a production recipe"
             )
-        if self.preset == CANONICAL_PRESET:
+        if self.preset in PRODUCTION_PRESETS:
             expected = {
                 "iterations": 2_000,
                 "val_loss_every": 20,
@@ -241,12 +271,15 @@ class TrainingRunConfig:
                 "seed": 1_337,
                 "initialization_kind": "scratch",
                 "recipe": "blt_d",
+                "patching_policy": "fixed_stride_v1",
                 "corruption": CorruptionConfig(
                     kind="blt_bernoulli",
                     canvas_length=4,
                     branches_per_row=128,
                 ),
                 "global_batch_size": 249,
+                "microbatch_per_rank": 32,
+                "microbatch_token_budget": 278_528,
                 "learning_rate": 3e-4,
                 "weight_decay": 0.1,
                 "beta1": 0.9,
@@ -272,6 +305,27 @@ class TrainingRunConfig:
                 "cuda_graphs": False,
                 "length_sorted_microbatches": False,
             }
+            if self.preset == CAUSAL_CONTROL_PRESET:
+                expected.update(
+                    recipe="causal_only",
+                    corruption=CorruptionConfig.canvas512(),
+                    objective_reduction="equal_mean",
+                )
+            elif self.preset == DENSE_FAST_BLT_PRESET:
+                expected.update(
+                    corruption=CorruptionConfig(
+                        kind="blt_exact_k",
+                        canvas_length=4,
+                        branches_per_row=2_048,
+                    ),
+                    objective_reduction="row_normalized_sum",
+                )
+            elif self.preset == ENTROPY_FAST_BLT_PRESET:
+                expected.update(
+                    patching_policy="causal_entropy_v1",
+                    corruption=CorruptionConfig.blt_entropy_reference(),
+                    objective_reduction="row_normalized_sum",
+                )
             observed = {name: getattr(self, name) for name in expected}
             mismatches = {
                 name: (observed[name], value)
@@ -280,19 +334,25 @@ class TrainingRunConfig:
             }
             if mismatches:
                 raise ValueError(
-                    f"preset {CANONICAL_PRESET!r} contract mismatch: {mismatches}"
+                    f"preset {self.preset!r} contract mismatch: {mismatches}"
                 )
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "TrainingRunConfig":
         iterations = _positive_int_env("ITERATIONS", 2_000)
         default_warmdown = 1_200 if iterations >= 2_000 else 0
-        recipe = os.environ.get("BYTE_DIFFUSION_RECIPE", "blt_d")
+        preset = os.environ.get("BYTE_DIFFUSION_PRESET") or None
+        default_recipe = (
+            "causal_only" if preset == CAUSAL_CONTROL_PRESET else "blt_d"
+        )
+        recipe = os.environ.get("BYTE_DIFFUSION_RECIPE", default_recipe)
         microbatch = int(os.environ.get("BYTE_DIFFUSION_MICROBATCH", "32"))
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         # 249 full 8192-byte pages matches nanoGPT's measured 2.035M-byte
         # update exposure. Canvas keeps its frozen 256-row ablation contract.
-        default_global_batch = 249 if recipe == "blt_d" else 256
+        default_global_batch = (
+            249 if recipe == "blt_d" or preset in PRODUCTION_PRESETS else 256
+        )
         global_batch = int(
             os.environ.get(
                 "BYTE_DIFFUSION_GLOBAL_BATCH", str(default_global_batch)
@@ -331,9 +391,17 @@ class TrainingRunConfig:
                 os.environ.get("WARMDOWN_ITERS", str(default_warmdown))
             ),
             "run_id": os.environ.get("RUN_ID", "byte_diffusion"),
-            "preset": os.environ.get("BYTE_DIFFUSION_PRESET") or None,
+            "preset": preset,
             "seed": int(os.environ.get("SEED", "1337")),
             "recipe": recipe,
+            "patching_policy": os.environ.get(
+                "BYTE_DIFFUSION_PATCHING_POLICY",
+                (
+                    "causal_entropy_v1"
+                    if preset == ENTROPY_FAST_BLT_PRESET
+                    else "fixed_stride_v1"
+                ),
+            ),
             "microbatch_per_rank": microbatch,
             "microbatch_token_budget": _positive_int_env(
                 "BYTE_DIFFUSION_MICROBATCH_TOKEN_BUDGET", 278_528
@@ -378,7 +446,14 @@ class TrainingRunConfig:
             ),
             "objective_reduction": os.environ.get(
                 "BYTE_DIFFUSION_OBJECTIVE_REDUCTION",
-                "paper_sum" if recipe == "blt_d" else "equal_mean",
+                (
+                    "row_normalized_sum"
+                    if preset in {
+                        DENSE_FAST_BLT_PRESET,
+                        ENTROPY_FAST_BLT_PRESET,
+                    }
+                    else "paper_sum" if recipe == "blt_d" else "equal_mean"
+                ),
             ),
             "attention_policy": os.environ.get(
                 "BYTE_DIFFUSION_ATTENTION_BACKEND", "flash_sdpa"
@@ -405,12 +480,29 @@ class TrainingRunConfig:
             )
             == "1",
         }
-        default_kind = "blt_bernoulli" if recipe == "blt_d" else "absorbing_rb"
-        # Fast-BLT's strongest quality point is B=4.  Use enough unique
-        # origins to keep the HT estimate useful on densely packed pages;
-        # B=8/16 remain explicit speed-frontier ablations.
-        default_length = 4 if recipe == "blt_d" else 512
-        default_branches = 128 if recipe == "blt_d" else 1
+        default_kind = (
+            "blt_exact_k"
+            if preset in {DENSE_FAST_BLT_PRESET, ENTROPY_FAST_BLT_PRESET}
+            else "blt_bernoulli" if recipe == "blt_d" else "absorbing_rb"
+        )
+        # The diffusion horizon is independent of entropy patch geometry.
+        # The pinned entropy preset retains B8; B4/B16 are explicit recipe
+        # variants with the same branch-byte budget.
+        default_length = (
+            8
+            if preset == ENTROPY_FAST_BLT_PRESET
+            else 4 if recipe == "blt_d" else 512
+        )
+        # B4 x 2048 and B8 x 1024 both expose 8192 branch byte-slots per row.
+        # Holding that budget fixed isolates patch geometry from supervision
+        # and decoder-work changes in the entropy reference.
+        default_branches = (
+            1_024
+            if preset == ENTROPY_FAST_BLT_PRESET
+            else 2_048
+            if preset == DENSE_FAST_BLT_PRESET
+            else 128 if recipe == "blt_d" else 1
+        )
         corruption_kind = os.environ.get(
             "BYTE_DIFFUSION_CORRUPTION", default_kind
         )
@@ -429,9 +521,9 @@ class TrainingRunConfig:
         )
         values.update(overrides)
         result = cls(**values)
-        if result.preset == CANONICAL_PRESET and result.global_batch_size != 249:
+        if result.preset in PRODUCTION_PRESETS and result.global_batch_size != 249:
             raise ValueError(
-                f"preset {CANONICAL_PRESET!r} requires global batch 249, "
+                f"preset {result.preset!r} requires global batch 249, "
                 f"observed {result.global_batch_size}"
             )
         if result.global_batch_size is None:
@@ -519,6 +611,13 @@ class TrainingBatch:
     physical_to_global_patch_indices: Tensor | None = None
     bos_condition_indices: Tensor | None = None
     prior_condition_indices: Tensor | None = None
+    patch_offsets: Tensor | None = None
+    patch_byte_cu_seqlens: Tensor | None = None
+    max_patch_size: int | None = None
+    physical_patch_row_indices: Tensor | None = None
+    physical_patch_start_columns: Tensor | None = None
+    physical_patch_lengths: Tensor | None = None
+    physical_patch_prior_condition_indices: Tensor | None = None
 
     def _map_tensors(self, transform) -> "TrainingBatch":
         return TrainingBatch(
@@ -618,6 +717,8 @@ class BltSamplingPlan:
     branch_kv_indices: Tensor | None = None
     branch_query_cu_seqlens: Tensor | None = None
     branch_kv_cu_seqlens: Tensor | None = None
+    validation_active: Tensor | None = None
+    validation_t: Tensor | None = None
 
     def _map_tensors(self, transform) -> "BltSamplingPlan":
         return BltSamplingPlan(
@@ -684,6 +785,9 @@ class ValidationMetrics:
     bpb: float
     atomic_bpb: float
     diffusion_loss: float
+    diffusion_elbo_proxy_bpb: float | None
+    diffusion_elbo_proxy_nats_per_block_atom: float | None
+    diffusion_elbo_atoms: float
     ar_targets: int
     literal_bytes: int
     special_targets: int
@@ -924,6 +1028,9 @@ def chunks_to_batch(
     document_ids = torch.tensor(
         [chunk.document_indices for chunk in chunks], dtype=torch.long
     )
+    patch_offsets = torch.tensor(
+        [chunk.patch_offsets for chunk in chunks], dtype=torch.long
+    )
     bos_targets: list[int] = []
     bos_row_indices: list[int] = []
     for row, chunk in enumerate(chunks):
@@ -968,6 +1075,7 @@ def chunks_to_batch(
         physical_to_global_patch_indices=layout[7],
         bos_condition_indices=layout[8],
         prior_condition_indices=layout[9],
+        patch_offsets=patch_offsets,
     )
 
 
@@ -1214,26 +1322,49 @@ def sample_blt_patch_starts(
         & candidate_priors.ge(0)
     )
     eligible = eligible_mask.sum(1)
-    # A random permutation followed by a prefix samples without replacement.
-    scores = torch.rand(
-        (valid.shape[0], patch_starts.numel()),
-        device=valid.device,
-        generator=generator,
-        dtype=torch.float32,
-    ).masked_fill(~eligible_mask, torch.inf)
-    chosen = scores.topk(count, dim=1, largest=False, sorted=True).indices
-    starts = patch_starts[chosen]
     selected_count = eligible.clamp_max(count)
-    selected = torch.arange(count, device=valid.device)[None] < selected_count[:, None]
-    starts = torch.where(selected, starts, torch.zeros_like(starts))
-    # Keep sampled origins in physical order.  The estimator is permutation
-    # invariant, while ordered branches make Q/K/V tiles and sparse mask
-    # metadata walk the shared clean bank monotonically.
-    physical_order = torch.where(
-        selected, starts, torch.full_like(starts, valid.shape[1])
-    ).argsort(dim=1)
-    starts = torch.gather(starts, 1, physical_order)
-    selected = torch.gather(selected, 1, physical_order)
+    if count >= patch_starts.numel():
+        # The dense estimator requests every physical patch origin.  Drawing
+        # random scores, top-k sorting them, and sorting the selected origins
+        # again is distributionally a no-op in this exhaustive case.  Keep
+        # the already ordered candidate bank and mark its true per-row subset
+        # directly.  This also makes exhaustive topology independent of the
+        # sampling RNG, as it must be.
+        candidates = patch_starts[:count][None].expand(valid.shape[0], -1)
+        candidate_selected = eligible_mask[:, :count]
+        # Stable linear-time compaction keeps active origins first without a
+        # random top-k or comparison sort.  Active and inactive prefix ranks
+        # form one exact permutation of every candidate column.
+        active_rank = candidate_selected.to(torch.long).cumsum(1) - 1
+        inactive_rank = (~candidate_selected).to(torch.long).cumsum(1) - 1
+        destination = torch.where(
+            candidate_selected,
+            active_rank,
+            selected_count[:, None] + inactive_rank,
+        )
+        starts = torch.zeros_like(candidates).scatter(1, destination, candidates)
+        selected = torch.zeros_like(candidate_selected).scatter(
+            1, destination, candidate_selected
+        )
+    else:
+        # A random permutation followed by a prefix samples without
+        # replacement.  Keep sampled origins in physical order so Q/K/V tiles
+        # and sparse-mask metadata walk the shared clean bank monotonically.
+        scores = torch.rand(
+            (valid.shape[0], patch_starts.numel()),
+            device=valid.device,
+            generator=generator,
+            dtype=torch.float32,
+        ).masked_fill(~eligible_mask, torch.inf)
+        chosen = scores.topk(count, dim=1, largest=False, sorted=True).indices
+        starts = patch_starts[chosen]
+        selected = torch.arange(count, device=valid.device)[None] < selected_count[:, None]
+        starts = torch.where(selected, starts, torch.zeros_like(starts))
+        physical_order = torch.where(
+            selected, starts, torch.full_like(starts, valid.shape[1])
+        ).argsort(dim=1)
+        starts = torch.gather(starts, 1, physical_order)
+        selected = torch.gather(selected, 1, physical_order)
     condition_indices = torch.gather(
         prior_condition_indices, 1, starts // patch_stride
     )
@@ -1244,13 +1375,202 @@ def sample_blt_patch_starts(
     return starts, weight, selected, condition_indices
 
 
+def _variable_blt_candidate_matrices(
+    batch: TrainingBatch,
+    *,
+    block_length: int,
+    eot_id: int = 256,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Materialize the authenticated ragged patch population by physical row.
+
+    Entropy patch starts are data, not an implicit fixed-stride arithmetic
+    progression.  This converts the packed patch metadata to one dense CPU
+    candidate bank per page while preserving physical order.  The bank is
+    temporary topology metadata; model execution remains PAD-free and ragged.
+    """
+
+    metadata = (
+        batch.physical_patch_row_indices,
+        batch.physical_patch_start_columns,
+        batch.physical_patch_prior_condition_indices,
+    )
+    if any(value is None for value in metadata):
+        raise ValueError("variable BLT sampling requires physical patch metadata")
+    if batch.document_ids is None:
+        raise ValueError("variable BLT sampling requires document ids")
+    rows, starts, priors = metadata
+    assert rows is not None and starts is not None and priors is not None
+    tensors = (batch.ids, batch.valid, batch.document_ids, rows, starts, priors)
+    if any(tensor.device.type != "cpu" for tensor in tensors):
+        raise ValueError("variable BLT topology must be prepared on CPU")
+    if rows.ndim != 1 or starts.shape != rows.shape or priors.shape != rows.shape:
+        raise ValueError("physical patch metadata must be aligned vectors")
+    if any(tensor.dtype != torch.long for tensor in (rows, starts, priors)):
+        raise TypeError("physical patch metadata must be int64")
+    if block_length <= 0:
+        raise ValueError("variable BLT block length must be positive")
+    batch_size, width = batch.ids.shape
+    if rows.numel() == 0 or bool(((rows < 0) | (rows >= batch_size)).any()):
+        raise ValueError("physical patch rows are empty or out of range")
+    if bool(((starts < 0) | (starts >= width)).any()):
+        raise ValueError("physical patch starts are out of range")
+    if bool((rows[1:] < rows[:-1]).any()):
+        raise ValueError("physical patches are not grouped by row")
+    same_row = rows[1:].eq(rows[:-1])
+    if bool((same_row & starts[1:].le(starts[:-1])).any()):
+        raise ValueError("physical patch starts are not strictly ordered")
+
+    row_counts = torch.bincount(rows, minlength=batch_size)
+    if bool(row_counts.eq(0).any()):
+        raise ValueError("every physical row needs at least one patch")
+    row_offsets = row_counts.cumsum(0) - row_counts
+    slots = torch.arange(rows.numel()) - row_offsets.index_select(0, rows)
+    candidate_width = int(row_counts.max())
+    dense_starts = torch.zeros((batch_size, candidate_width), dtype=torch.long)
+    dense_priors = torch.full_like(dense_starts, -1)
+    present = torch.zeros_like(dense_starts, dtype=torch.bool)
+    dense_starts[rows, slots] = starts
+    dense_priors[rows, slots] = priors
+    present[rows, slots] = True
+
+    start_documents = batch.document_ids[rows, starts]
+    offsets = torch.arange(block_length, dtype=torch.long)
+    columns = starts[:, None] + offsets[None]
+    in_storage = columns.lt(width)
+    safe_columns = columns.clamp_max(width - 1)
+    candidate_rows = rows[:, None].expand_as(safe_columns)
+    suffix_valid = batch.valid[candidate_rows, safe_columns] & in_storage
+    suffix_same_document = suffix_valid & batch.document_ids[
+        candidate_rows, safe_columns
+    ].eq(start_documents[:, None])
+    complete_same_document = suffix_same_document.all(1)
+    # A short block is semantically valid only when its contiguous suffix
+    # reaches this document's EOT. Physical page width and PAD storage are not
+    # evidence that a mid-document continuation has a complete target block.
+    same_document_prefix = suffix_same_document.cumprod(1).to(torch.bool)
+    terminates_at_eot = (
+        same_document_prefix
+        & batch.ids[candidate_rows, safe_columns].eq(eot_id)
+    ).any(1)
+    flat_eligible = (
+        batch.valid[rows, starts]
+        & start_documents.ge(0)
+        & priors.ge(0)
+        & (complete_same_document | terminates_at_eot)
+    )
+    eligible = torch.zeros_like(present)
+    eligible[rows, slots] = flat_eligible
+    return dense_starts, dense_priors, eligible
+
+
+def _select_variable_blt_candidates(
+    starts: Tensor,
+    priors: Tensor,
+    eligible: Tensor,
+    *,
+    count: int,
+    scores: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Select a uniform origin subset and retain exact HT row weights."""
+
+    if count <= 0:
+        raise ValueError("variable BLT branch count must be positive")
+    if (
+        starts.ndim != 2
+        or priors.shape != starts.shape
+        or eligible.shape != starts.shape
+    ):
+        raise ValueError("variable BLT candidate matrices must align")
+    if eligible.dtype != torch.bool:
+        raise TypeError("variable BLT eligibility must be boolean")
+    _, candidate_width = starts.shape
+    eligible_count = eligible.sum(1)
+    selected_count = eligible_count.clamp_max(count)
+    if bool(selected_count.eq(0).any()):
+        raise ValueError("every BLT row needs at least one eligible entropy patch")
+
+    if count < candidate_width:
+        if scores is None or scores.shape != starts.shape:
+            raise ValueError("sampled variable BLT selection requires aligned scores")
+        ranked_scores = scores.masked_fill(~eligible, torch.inf)
+        chosen = ranked_scores.topk(
+            count, dim=1, largest=False, sorted=True
+        ).indices
+        chosen_starts = starts.gather(1, chosen)
+        chosen_priors = priors.gather(1, chosen)
+        selected = eligible.gather(1, chosen)
+        physical_order = torch.where(
+            selected,
+            chosen_starts,
+            torch.full_like(chosen_starts, starts.shape[1]),
+        ).argsort(dim=1, stable=True)
+        chosen_starts = chosen_starts.gather(1, physical_order)
+        chosen_priors = chosen_priors.gather(1, physical_order)
+        selected = selected.gather(1, physical_order)
+    else:
+        # Stable compaction is a linear-time exhaustive path and consumes no
+        # random numbers.  This makes the dense arm independent of an otherwise
+        # distributionally irrelevant topology RNG draw.
+        active_rank = eligible.to(torch.long).cumsum(1) - 1
+        inactive = ~eligible
+        inactive_rank = inactive.to(torch.long).cumsum(1) - 1
+        destination = torch.where(
+            eligible,
+            active_rank,
+            selected_count[:, None] + inactive_rank,
+        )
+        chosen_starts = torch.zeros_like(starts).scatter(1, destination, starts)
+        chosen_priors = torch.full_like(priors, -1).scatter(
+            1, destination, priors
+        )
+        selected = torch.zeros_like(eligible).scatter(1, destination, eligible)
+        if count > candidate_width:
+            padding = count - candidate_width
+            chosen_starts = F.pad(chosen_starts, (0, padding))
+            chosen_priors = F.pad(chosen_priors, (0, padding), value=-1)
+            selected = F.pad(selected, (0, padding))
+        else:
+            chosen_starts = chosen_starts[:, :count]
+            chosen_priors = chosen_priors[:, :count]
+            selected = selected[:, :count]
+
+    chosen_starts = torch.where(selected, chosen_starts, 0)
+    chosen_priors = torch.where(selected, chosen_priors, -1)
+    weight = eligible_count.to(torch.float32) / selected_count.to(torch.float32)
+    return chosen_starts, weight, selected, chosen_priors
+
+
+def sample_variable_blt_patch_starts(
+    batch: TrainingBatch,
+    *,
+    count: int,
+    block_length: int,
+    generator: torch.Generator,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Uniformly sample authenticated entropy-patch origins without replacement."""
+
+    if generator.device.type != "cpu":
+        raise ValueError("variable BLT topology sampling requires a CPU generator")
+    starts, priors, eligible = _variable_blt_candidate_matrices(
+        batch, block_length=block_length
+    )
+    scores = (
+        torch.rand(starts.shape, generator=generator, dtype=torch.float32)
+        if count < starts.shape[1]
+        else None
+    )
+    return _select_variable_blt_candidates(
+        starts, priors, eligible, count=count, scores=scores
+    )
+
+
 def _blt_branch_valid(
     batch: TrainingBatch,
     starts: Tensor,
     selected: Tensor,
     *,
     block_length: int,
- ) -> Tensor:
+) -> Tensor:
     """Resolve exact same-document/PAD branch validity on CPU."""
 
     if batch.ids.device.type != "cpu" or starts.device.type != "cpu":
@@ -1366,20 +1686,32 @@ def prepare_blt_sampling(
 ) -> BltSamplingPlan:
     """Sample BLT origins and attention metadata entirely on CPU."""
 
-    if batch.document_ids is None or batch.prior_condition_indices is None:
+    if batch.document_ids is None:
         raise ValueError("BLT sampling requires document-local prior metadata")
     if generator.device.type != "cpu":
         raise ValueError("BLT topology sampling requires a CPU generator")
-    starts, weight, selected, condition_indices = sample_blt_patch_starts(
-        batch.valid,
-        count=config.branches_per_row,
-        patch_stride=config.patch_stride,
-        generator=generator,
-        document_ids=batch.document_ids,
-        clean_ids=batch.ids,
-        prior_condition_indices=batch.prior_condition_indices,
-        block_length=config.canvas_length,
-    )
+    if batch.physical_patch_start_columns is not None:
+        starts, weight, selected, condition_indices = (
+            sample_variable_blt_patch_starts(
+                batch,
+                count=config.branches_per_row,
+                block_length=config.canvas_length,
+                generator=generator,
+            )
+        )
+    else:
+        if batch.prior_condition_indices is None:
+            raise ValueError("fixed-stride BLT sampling omitted prior metadata")
+        starts, weight, selected, condition_indices = sample_blt_patch_starts(
+            batch.valid,
+            count=config.branches_per_row,
+            patch_stride=config.patch_stride,
+            generator=generator,
+            document_ids=batch.document_ids,
+            clean_ids=batch.ids,
+            prior_condition_indices=batch.prior_condition_indices,
+            block_length=config.canvas_length,
+        )
     branch_valid = _blt_branch_valid(
         batch, starts, selected, block_length=config.canvas_length
     )
@@ -1467,19 +1799,63 @@ def sample_validation_blt_starts(
     count: int,
     patch_stride: int,
     seed: int,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Document-local BLT plans invariant to validation batch composition."""
 
-    if (
-        batch.document_ids is None
-        or batch.prior_condition_indices is None
-        or batch.ids.shape[0] != len(chunks)
-    ):
+    if batch.document_ids is None or batch.ids.shape[0] != len(chunks):
         raise ValueError("BLT validation requires aligned document metadata")
     if batch.valid.device.type != "cpu":
         raise ValueError("validation BLT topology must be prepared on CPU")
     if count <= 0 or patch_stride <= 0 or block_length <= 0:
         raise ValueError("validation BLT dimensions must be positive")
+    if batch.physical_patch_start_columns is not None:
+        candidate_starts, candidate_priors, eligible_tensor = (
+            _variable_blt_candidate_matrices(batch, block_length=block_length)
+        )
+        chunk_indices = np.fromiter(
+            (int(chunk.chunk_index) for chunk in chunks),
+            dtype=np.uint64,
+            count=len(chunks),
+        )
+        stream_starts = np.fromiter(
+            (int(chunk.stream_start) for chunk in chunks),
+            dtype=np.uint64,
+            count=len(chunks),
+        )
+        row_keys = (
+            np.uint64(seed)
+            ^ (chunk_indices * np.uint64(0xD2B74407B1CE6E93))
+            ^ (stream_starts * np.uint64(0xCA5A826395121157))
+        )
+        columns = np.arange(candidate_starts.shape[1], dtype=np.uint64)[None]
+        priorities = row_keys[:, None] + columns * np.uint64(0x9E3779B97F4A7C15)
+        priorities ^= priorities >> np.uint64(30)
+        priorities *= np.uint64(0xBF58476D1CE4E5B9)
+        priorities ^= priorities >> np.uint64(27)
+        priorities *= np.uint64(0x94D049BB133111EB)
+        priorities ^= priorities >> np.uint64(31)
+        eligible = eligible_tensor.numpy()
+        priorities = np.where(eligible, priorities, np.iinfo(np.uint64).max)
+        order = np.argsort(priorities, axis=1, kind="stable")
+        ranks = np.empty_like(order)
+        np.put_along_axis(
+            ranks,
+            order,
+            np.broadcast_to(np.arange(order.shape[1]), order.shape),
+            axis=1,
+        )
+        # Exact integer priority ranks fit losslessly in float64 and let the
+        # shared selector retain its invalid-candidate handling.
+        scores = torch.from_numpy(ranks.astype(np.float64))
+        return _select_variable_blt_candidates(
+            candidate_starts,
+            candidate_priors,
+            eligible_tensor,
+            count=count,
+            scores=scores,
+        )
+    if batch.prior_condition_indices is None:
+        raise ValueError("fixed-stride BLT validation omitted prior metadata")
     width = batch.valid.shape[1]
     candidate_count = max(count, -(-width // patch_stride))
     patch_starts = np.zeros(candidate_count, dtype=np.int64)
@@ -1557,11 +1933,82 @@ def sample_validation_blt_starts(
         priors, chosen_starts // patch_stride, axis=1
     )
     condition_indices = np.where(selected, condition_indices, -1)
+    sampling_weight = eligible.sum(axis=1) / np.maximum(selected_count, 1)
     return (
         torch.from_numpy(chosen_starts),
+        torch.from_numpy(sampling_weight.astype(np.float32)),
         torch.from_numpy(selected),
         torch.from_numpy(condition_indices),
     )
+
+
+def validation_exact_k_mask(
+    eligible: Tensor,
+    chunks: Sequence[PackedChunk | ValidationChunkIdentity],
+    *,
+    seed: int,
+) -> tuple[Tensor, Tensor]:
+    """Deterministic exact-K sample of Fast-BLT's absorbing ELBO.
+
+    A row samples K uniformly from 1..S and a uniform K-subset. Therefore
+    ``sum(masked CE)/(K/S)`` is an unbiased, finite-variance estimator of the
+    continuous-time 1/t objective. Stateless priorities keep this validation
+    draw invariant to microbatching, rank count, and earlier validation calls.
+    """
+
+    if eligible.device.type != "cpu" or eligible.dtype != torch.bool:
+        raise ValueError("validation exact-K eligibility must be a CPU bool tensor")
+    if eligible.ndim != 3 or eligible.shape[0] != len(chunks):
+        raise ValueError("validation exact-K rows and chunk identities must align")
+    shape = tuple(eligible.shape)
+    flat = eligible.numpy().reshape(shape[0], -1)
+    counts = flat.sum(axis=1, dtype=np.int64)
+    if np.any(counts <= 0):
+        raise ValueError("every diffusion validation row needs an eligible atom")
+
+    chunk_indices = np.fromiter(
+        (int(chunk.chunk_index) for chunk in chunks),
+        dtype=np.uint64,
+        count=len(chunks),
+    )
+    stream_starts = np.fromiter(
+        (int(chunk.stream_start) for chunk in chunks),
+        dtype=np.uint64,
+        count=len(chunks),
+    )
+    row_keys = (
+        np.uint64(seed)
+        ^ (chunk_indices * np.uint64(0xD2B74407B1CE6E93))
+        ^ (stream_starts * np.uint64(0xCA5A826395121157))
+    )
+
+    def splitmix64(values: np.ndarray) -> np.ndarray:
+        mixed = values.copy()
+        mixed ^= mixed >> np.uint64(30)
+        mixed *= np.uint64(0xBF58476D1CE4E5B9)
+        mixed ^= mixed >> np.uint64(27)
+        mixed *= np.uint64(0x94D049BB133111EB)
+        mixed ^= mixed >> np.uint64(31)
+        return mixed
+
+    k_hash = splitmix64(row_keys ^ np.uint64(0xA0761D6478BD642F))
+    chosen_k = (k_hash % counts.astype(np.uint64)).astype(np.int64) + 1
+    columns = np.arange(flat.shape[1], dtype=np.uint64)[None]
+    priorities = splitmix64(
+        row_keys[:, None] + columns * np.uint64(0x9E3779B97F4A7C15)
+    )
+    priorities = np.where(flat, priorities, np.iinfo(np.uint64).max)
+    order = np.argsort(priorities, axis=1, kind="stable")
+    ranks = np.empty_like(order)
+    np.put_along_axis(
+        ranks,
+        order,
+        np.broadcast_to(np.arange(flat.shape[1]), order.shape),
+        axis=1,
+    )
+    active = flat & (ranks < chosen_k[:, None])
+    t = chosen_k.astype(np.float32) / counts.astype(np.float32)
+    return torch.from_numpy(active.reshape(shape)), torch.from_numpy(t)
 
 
 def canvas_objective_units(valid: Tensor, config: CorruptionConfig) -> Tensor:
@@ -1611,23 +2058,37 @@ def prepare_blt_corruption(
     *,
     sampling: BltSamplingPlan | None = None,
 ) -> BltCorruptionPlan:
-    if batch.document_ids is None or batch.prior_condition_indices is None:
+    if batch.document_ids is None:
         raise ValueError(
             "BLT corruption requires document-local explicit prior metadata"
         )
     block_length = config.canvas_length
     blocks = config.branches_per_row
     if sampling is None:
-        starts, sampling_weight, selected, condition_indices = sample_blt_patch_starts(
-            batch.valid,
-            count=blocks,
-            patch_stride=config.patch_stride,
-            generator=generator,
-            document_ids=batch.document_ids,
-            clean_ids=batch.ids,
-            prior_condition_indices=batch.prior_condition_indices,
-            block_length=block_length,
-        )
+        if batch.physical_patch_start_columns is not None:
+            starts, sampling_weight, selected, condition_indices = (
+                sample_variable_blt_patch_starts(
+                    batch,
+                    count=blocks,
+                    block_length=block_length,
+                    generator=generator,
+                )
+            )
+        else:
+            if batch.prior_condition_indices is None:
+                raise ValueError("fixed-stride BLT corruption omitted prior metadata")
+            starts, sampling_weight, selected, condition_indices = (
+                sample_blt_patch_starts(
+                    batch.valid,
+                    count=blocks,
+                    patch_stride=config.patch_stride,
+                    generator=generator,
+                    document_ids=batch.document_ids,
+                    clean_ids=batch.ids,
+                    prior_condition_indices=batch.prior_condition_indices,
+                    block_length=block_length,
+                )
+            )
         sampled_branch_valid = None
     else:
         expected = (batch.ids.shape[0], blocks)
@@ -2019,6 +2480,8 @@ class JointForward(nn.Module):
         branch_query_cu_seqlens: Tensor | None = None,
         branch_kv_cu_seqlens: Tensor | None = None,
         branch_block_mask=None,
+        patch_byte_cu_seqlens: Tensor | None = None,
+        max_patch_size: int | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor]:
         del block_length
         if bos_count is None:
@@ -2062,6 +2525,8 @@ class JointForward(nn.Module):
                 global_patch_positions=global_patch_positions,
                 physical_to_global_patch_indices=physical_to_global_patch_indices,
                 bos_condition_indices=bos_condition_indices,
+                patch_byte_cu_seqlens=patch_byte_cu_seqlens,
+                max_patch_size=max_patch_size,
             )
             return output.logits, None, bos_logits_from(output.bos_patch_states)
         if diffusion_mode == int(ModelMode.CANVAS):
@@ -2075,6 +2540,7 @@ class JointForward(nn.Module):
                 starts,
                 positions=positions,
                 assume_full_clean=assume_full_clean,
+                document_ids=document_ids,
             )
             return output.clean_logits, output.branch_logits, bos_logits_from(None)
         if diffusion_mode == int(ModelMode.BLT_D):
@@ -2109,6 +2575,8 @@ class JointForward(nn.Module):
                     and self.model.config.decoder_branch_attention
                     == "shared_flex"
                 ),
+                patch_byte_cu_seqlens=patch_byte_cu_seqlens,
+                max_patch_size=max_patch_size,
             )
             return (
                 output.clean_logits,
@@ -2162,6 +2630,7 @@ class ByteDiffusionTrainer:
         distributed: DistributedContext = DistributedContext(),
         atomic_manifest: AtomicIdManifest | None = None,
         dataset_provenance: Mapping[str, Any] | None = None,
+        source_provenance: Mapping[str, Any] | None = None,
     ) -> None:
         if device.type == "cuda":
             if device.index is None:
@@ -2169,10 +2638,25 @@ class ByteDiffusionTrainer:
             torch.cuda.set_device(device)
         elif not run_config.allow_cpu_reference:
             raise RuntimeError("CPU trainer is available only as an explicit reference")
+        if device.type == "cuda" and run_config.recipe == "canvas":
+            raise ValueError(
+                "the legacy canvas trainer is not safe for packed multi-document "
+                "pages; use the standalone DiffusionGemma recipe"
+            )
         self.model_config = model.config
         self.run_config = run_config
         self.train_cursor = train_cursor
         self.validation_chunks = validation_chunks
+        dataset_patching = getattr(self.train_cursor.chunks, "patching", None)
+        if run_config.patching_policy == "causal_entropy_v1":
+            if (
+                not isinstance(dataset_patching, DatasetPatchingSpec)
+                or dataset_patching.name != "causal_entropy_v1"
+                or not dataset_patching.artifact_sha256
+            ):
+                raise ValueError(
+                    "entropy training requires authenticated patcher provenance"
+                )
         lazy_validation_digest = getattr(validation_chunks, "dataset_sha256", None)
         self.validation_sha256 = (
             str(lazy_validation_digest)
@@ -2192,6 +2676,7 @@ class ByteDiffusionTrainer:
         self.distributed = distributed
         self.atomic_manifest = atomic_manifest or AtomicIdManifest.reference()
         self.dataset_provenance = dict(dataset_provenance or {})
+        self.source_provenance = dict(source_provenance or {})
         if (
             self.atomic_manifest.output_size != model.config.vocab.output_size
             or self.atomic_manifest.mask_id != model.config.vocab.mask_id
@@ -2479,6 +2964,14 @@ class ByteDiffusionTrainer:
             None if blt_plan is None else blt_plan.branch_query_cu_seqlens,
             None if blt_plan is None else blt_plan.branch_kv_cu_seqlens,
             branch_block_mask,
+            **(
+                {}
+                if batch.patch_byte_cu_seqlens is None
+                else {
+                    "patch_byte_cu_seqlens": batch.patch_byte_cu_seqlens,
+                    "max_patch_size": batch.max_patch_size,
+                }
+            ),
         )
         if batch.bos_targets.numel():
             bos_nll = F.cross_entropy(
@@ -2610,13 +3103,14 @@ class ByteDiffusionTrainer:
         if (
             blt_plan is not None
             and self.run_config.corruption.kind in {"blt_bernoulli", "blt_exact_k"}
-            and self.run_config.objective_reduction == "paper_sum"
+            and self.run_config.objective_reduction
+            in {"paper_sum", "row_normalized_sum"}
         ):
             # Fast-BLT equations 5--7: summed clean CE plus the 1/t-weighted
             # masked sum for each clean row, followed by one batch mean.
             if "blt_objective" not in locals():
                 raise AssertionError("paper_sum omitted the BLT objective")
-            total_loss = (
+            combined_rows = (
                 blt_objective.per_row
                 * (
                     blt_plan.sampling_weight
@@ -2624,7 +3118,23 @@ class ByteDiffusionTrainer:
                     else 1.0
                 )
                 + self.run_config.lambda_ar * ar_row_totals
-            ).mean()
+            )
+            if self.run_config.objective_reduction == "row_normalized_sum":
+                row_denominator = ar_row_counts.clamp_min(1).to(
+                    combined_rows.dtype
+                )
+                total_loss = (combined_rows / row_denominator).mean()
+                diffusion = (
+                    blt_objective.per_row
+                    * (
+                        blt_plan.sampling_weight
+                        if blt_plan.sampling_weight is not None
+                        else 1.0
+                    )
+                    / row_denominator
+                ).mean()
+            else:
+                total_loss = combined_rows.mean()
         return StepLoss(
             total=total_loss,
             ar=ar,
@@ -2660,7 +3170,27 @@ class ByteDiffusionTrainer:
                 rotation=self.completed_steps,
             )
         native_batches = getattr(self.train_cursor.chunks, "training_batches", None)
-        if native_batches is None:
+        native_groups = getattr(
+            self.train_cursor.chunks, "training_batch_groups", None
+        )
+        native_ar_units = getattr(
+            self.train_cursor.chunks, "training_ar_units", None
+        )
+        stream_cpu_preparation = (
+            self.device.type == "cuda"
+            and native_groups is not None
+            and native_ar_units is not None
+        )
+        batch_groups: list[tuple[int, ...]] | None = None
+        if stream_cpu_preparation:
+            batch_groups = native_groups(
+                indices,
+                max_batch_size=self.run_config.microbatch_per_rank,
+                physical_token_budget=self.run_config.microbatch_token_budget,
+                sort_by_length=self.run_config.length_sorted_microbatches,
+            )
+            cpu_batches: Sequence[TrainingBatch] = ()
+        elif native_batches is None:
             cpu_batches = [
                 chunks_to_batch(
                     [self.train_cursor.chunk_at(index) for index in indices[start:stop]]
@@ -2677,6 +3207,9 @@ class ByteDiffusionTrainer:
                 physical_token_budget=self.run_config.microbatch_token_budget,
                 sort_by_length=self.run_config.length_sorted_microbatches,
             )
+        microstep_count = (
+            len(batch_groups) if batch_groups is not None else len(cpu_batches)
+        )
         dataset_chunk_size = getattr(self.train_cursor.chunks, "chunk_size", None)
         dataset_branch_bytes = getattr(
             self.train_cursor.chunks, "required_branch_bytes", None
@@ -2714,7 +3247,7 @@ class ByteDiffusionTrainer:
             # count per rank, which DDP cannot accept. Fixed production pages
             # satisfy the bound above by construction, so they avoid two
             # redundant collectives and host synchronizations every update.
-            microsteps_min = torch.tensor(len(cpu_batches), device=self.device)
+            microsteps_min = torch.tensor(microstep_count, device=self.device)
             microsteps_max = microsteps_min.clone()
             dist.all_reduce(microsteps_min, op=dist.ReduceOp.MIN)
             dist.all_reduce(microsteps_max, op=dist.ReduceOp.MAX)
@@ -2723,30 +3256,38 @@ class ByteDiffusionTrainer:
                     "adaptive batching gave ranks different backward-call counts: "
                     f"min={int(microsteps_min)}, max={int(microsteps_max)}"
                 )
-        cpu_blt_sampling = [
-            prepare_blt_sampling(
-                batch,
-                self.run_config.corruption,
-                (
-                    self.corruption_generator
-                    if self.device.type == "cpu"
-                    else self.blt_sampling_generator
-                ),
-                clean_window=self.model_config.decoder_prefix_window,
-                branch_attention=self.model_config.decoder_branch_attention,
-            )
-            for batch in cpu_batches
-        ] if self.run_config.recipe == "blt_d" else [None] * len(cpu_batches)
-        if self.device.type == "cuda":
+        cpu_blt_sampling = (
+            [
+                prepare_blt_sampling(
+                    batch,
+                    self.run_config.corruption,
+                    (
+                        self.corruption_generator
+                        if self.device.type == "cpu"
+                        else self.blt_sampling_generator
+                    ),
+                    clean_window=self.model_config.decoder_prefix_window,
+                    branch_attention=self.model_config.decoder_branch_attention,
+                )
+                for batch in cpu_batches
+            ]
+            if self.run_config.recipe == "blt_d" and not stream_cpu_preparation
+            else [None] * len(cpu_batches)
+        )
+        if self.device.type == "cuda" and not stream_cpu_preparation:
             cpu_batches = tuple(batch.pin_memory() for batch in cpu_batches)
             cpu_blt_sampling = tuple(
                 None if sampling is None else sampling.pin_memory()
                 for sampling in cpu_blt_sampling
             )
-        local_ar_units = sum(
-            int(batch.ar_targets.ne(IGNORE_INDEX).sum())
-            + int(batch.bos_targets.ne(IGNORE_INDEX).sum())
-            for batch in cpu_batches
+        local_ar_units = (
+            int(native_ar_units(indices))
+            if stream_cpu_preparation
+            else sum(
+                int(batch.ar_targets.ne(IGNORE_INDEX).sum())
+                + int(batch.bos_targets.ne(IGNORE_INDEX).sum())
+                for batch in cpu_batches
+            )
         )
         local_objective_units_by_batch: list[int]
         if self.run_config.recipe == "canvas":
@@ -2754,12 +3295,14 @@ class ByteDiffusionTrainer:
                 int(canvas_objective_units(batch.valid, self.run_config.corruption))
                 for batch in cpu_batches
             ]
+        elif self.run_config.recipe == "blt_d" and batch_groups is not None:
+            local_objective_units_by_batch = [len(group) for group in batch_groups]
         elif self.run_config.recipe == "blt_d":
             local_objective_units_by_batch = [
                 batch.ids.shape[0] for batch in cpu_batches
             ]
         else:
-            local_objective_units_by_batch = [0] * len(cpu_batches)
+            local_objective_units_by_batch = [0] * microstep_count
         local_diffusion_units = sum(local_objective_units_by_batch)
         global_units = torch.tensor(
             [local_ar_units, local_diffusion_units],
@@ -2785,126 +3328,215 @@ class ByteDiffusionTrainer:
             noise_bucket_nll = torch.zeros(7, dtype=torch.float64, device=self.device)
         if self.device.type == "cuda" and materialize_metrics:
             torch.cuda.synchronize(self.device)
-        def transfer(microstep: int) -> tuple[TrainingBatch, BltSamplingPlan | None]:
-            cpu_batch = cpu_batches[microstep]
-            cpu_sampling = cpu_blt_sampling[microstep]
+        def prepare_cpu_group(
+            group: tuple[int, ...]
+        ) -> tuple[TrainingBatch, BltSamplingPlan | None]:
+            training_batch = getattr(
+                self.train_cursor.chunks, "training_batch", None
+            )
+            if training_batch is None:
+                raise AssertionError("streaming source lost native batch collation")
+            cpu_batch = training_batch(group)
+            cpu_sampling = (
+                prepare_blt_sampling(
+                    cpu_batch,
+                    self.run_config.corruption,
+                    self.blt_sampling_generator,
+                    clean_window=self.model_config.decoder_prefix_window,
+                    branch_attention=self.model_config.decoder_branch_attention,
+                )
+                if self.run_config.recipe == "blt_d"
+                else None
+            )
+            return (
+                cpu_batch.pin_memory(),
+                None if cpu_sampling is None else cpu_sampling.pin_memory(),
+            )
+
+        def transfer_pair(
+            pair: tuple[TrainingBatch, BltSamplingPlan | None]
+        ) -> tuple[TrainingBatch, BltSamplingPlan | None, torch.cuda.Event | None]:
+            cpu_batch, cpu_sampling = pair
             if self.transfer_stream is None:
                 return (
                     cpu_batch.to(self.device),
                     None if cpu_sampling is None else cpu_sampling.to(self.device),
+                    None,
                 )
             with torch.cuda.stream(self.transfer_stream):
-                return (
-                    cpu_batch.to(self.device, non_blocking=True),
+                batch = cpu_batch.to(self.device, non_blocking=True)
+                sampling = (
                     None
                     if cpu_sampling is None
-                    else cpu_sampling.to(self.device, non_blocking=True),
+                    else cpu_sampling.to(self.device, non_blocking=True)
                 )
+                ready = torch.cuda.Event()
+                ready.record(self.transfer_stream)
+            return batch, sampling, ready
 
-        current_batch, current_sampling = transfer(0)
-        for microstep, local_objective_units in enumerate(
-            local_objective_units_by_batch
-        ):
-            if self.run_config.cuda_graphs:
-                torch.compiler.cudagraph_mark_step_begin()
-            execution_stream = (
-                torch.cuda.current_stream(self.device)
-                if self.transfer_stream is not None
+        producer: ThreadPoolExecutor | None = None
+        pending_cpu = None
+        if batch_groups is not None:
+            producer = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="byte-training-prefetch"
+            )
+            pending_cpu = producer.submit(prepare_cpu_group, batch_groups[0])
+            first_cpu_pair = pending_cpu.result()
+            pending_cpu = (
+                producer.submit(prepare_cpu_group, batch_groups[1])
+                if len(batch_groups) > 1
                 else None
             )
-            if execution_stream is not None:
-                execution_stream.wait_stream(self.transfer_stream)
-                current_batch.record_stream(execution_stream)
-                if current_sampling is not None:
-                    current_sampling.record_stream(execution_stream)
-            next_pair = (
-                transfer(microstep + 1)
-                if microstep + 1 < len(cpu_batches)
-                else None
-            )
-            batch = current_batch
-            blt_sampling = current_sampling
-            synchronize = microstep + 1 == len(cpu_batches)
-            sync_context = (
-                self.forward_model.no_sync()  # type: ignore[attr-defined]
-                if isinstance(self.forward_model, DDP) and not synchronize
-                else nullcontext()
-            )
-            autocast = (
-                torch.autocast("cuda", dtype=torch.bfloat16)
-                if self.device.type == "cuda"
-                else nullcontext()
-            )
-            with sync_context, attention_context(
-                self.run_config.attention_policy,
-                self.device,
-                allow_cpu_reference=self.run_config.allow_cpu_reference,
-            ), autocast:
-                losses = self._compute_loss(
-                    batch,
-                    blt_sampling=blt_sampling,
-                    collect_diagnostics=materialize_metrics,
+        else:
+            first_cpu_pair = (cpu_batches[0], cpu_blt_sampling[0])
+        current_batch, current_sampling, current_ready = transfer_pair(first_cpu_pair)
+        max_microbatch_observed = 0
+        max_physical_positions_observed = 0
+        try:
+            for microstep, local_objective_units in enumerate(
+                local_objective_units_by_batch
+            ):
+                if self.run_config.cuda_graphs:
+                    torch.compiler.cudagraph_mark_step_begin()
+                execution_stream = (
+                    torch.cuda.current_stream(self.device)
+                    if self.transfer_stream is not None
+                    else None
                 )
-                if (
-                    self.run_config.recipe == "blt_d"
-                    and self.run_config.objective_reduction == "paper_sum"
-                ):
-                    scaled = losses.total * (
-                        batch.ids.shape[0] * world_scale / global_units[1]
+                if execution_stream is not None:
+                    if current_ready is None:
+                        raise AssertionError("CUDA transfer omitted its ready event")
+                    execution_stream.wait_event(current_ready)
+                    current_batch.record_stream(execution_stream)
+                    if current_sampling is not None:
+                        current_sampling.record_stream(execution_stream)
+                batch = current_batch
+                blt_sampling = current_sampling
+                batch_rows, batch_width = batch.ids.shape
+                max_microbatch_observed = max(
+                    max_microbatch_observed, batch_rows
+                )
+                max_physical_positions_observed = max(
+                    max_physical_positions_observed,
+                    batch_rows
+                    * (
+                        batch_width
+                        + (
+                            self.run_config.corruption.corrupted_positions_per_row
+                            if self.run_config.recipe != "causal_only"
+                            else 0
+                        )
+                    ),
+                )
+                synchronize = microstep + 1 == microstep_count
+                sync_context = (
+                    self.forward_model.no_sync()  # type: ignore[attr-defined]
+                    if isinstance(self.forward_model, DDP) and not synchronize
+                    else nullcontext()
+                )
+                autocast = (
+                    torch.autocast("cuda", dtype=torch.bfloat16)
+                    if self.device.type == "cuda"
+                    else nullcontext()
+                )
+                with sync_context, attention_context(
+                    self.run_config.attention_policy,
+                    self.device,
+                    allow_cpu_reference=self.run_config.allow_cpu_reference,
+                ), autocast:
+                    losses = self._compute_loss(
+                        batch,
+                        blt_sampling=blt_sampling,
+                        collect_diagnostics=materialize_metrics,
                     )
-                else:
-                    scaled = self.run_config.lambda_ar * losses.ar * (
-                        losses.ar_targets.to(losses.ar.dtype)
-                        * world_scale
-                        / global_units[0]
+                    if (
+                        self.run_config.recipe == "blt_d"
+                        and self.run_config.objective_reduction
+                        in {"paper_sum", "row_normalized_sum"}
+                    ):
+                        scaled = losses.total * (
+                            batch.ids.shape[0] * world_scale / global_units[1]
+                        )
+                    else:
+                        scaled = self.run_config.lambda_ar * losses.ar * (
+                            losses.ar_targets.to(losses.ar.dtype)
+                            * world_scale
+                            / global_units[0]
+                        )
+                        if self.run_config.recipe != "causal_only":
+                            scaled = scaled + losses.diffusion * (
+                                local_objective_units * world_scale / global_units[1]
+                            )
+                scaled.backward()
+                if materialize_metrics:
+                    objective_total += scaled.detach().to(torch.float64) / world_scale
+                    ar_numerator += (
+                        losses.ar.detach().to(torch.float64)
+                        * losses.ar_targets.to(torch.float64)
                     )
                     if self.run_config.recipe != "causal_only":
-                        scaled = scaled + losses.diffusion * (
-                            local_objective_units * world_scale / global_units[1]
+                        diffusion_numerator += (
+                            losses.diffusion.detach().to(torch.float64)
+                            * local_objective_units
                         )
-            scaled.backward()
-            if materialize_metrics:
-                objective_total += scaled.detach().to(torch.float64) / world_scale
-                ar_numerator += (
-                    losses.ar.detach().to(torch.float64)
-                    * losses.ar_targets.to(torch.float64)
-                )
-                if self.run_config.recipe != "causal_only":
-                    diffusion_numerator += (
-                        losses.diffusion.detach().to(torch.float64)
-                        * local_objective_units
+                    ar_target_tensor += losses.ar_targets
+                    diffusion_target_tensor += losses.diffusion_targets
+                    masked_total += losses.noise_masked.sum()
+                    eligible_total += losses.noise_eligible.sum()
+                    all_mask_canvases += (
+                        (losses.noise_eligible > 0)
+                        & (losses.noise_masked == losses.noise_eligible)
+                    ).sum()
+                    canvas_count += losses.noise_eligible.gt(0).sum()
+                if materialize_metrics and losses.noise_eligible.numel():
+                    masked = losses.noise_masked
+                    eligible = losses.noise_eligible
+                    bucket = torch.full_like(masked, 5)
+                    bucket = torch.where(4 * masked <= 3 * eligible, 4, bucket)
+                    bucket = torch.where(2 * masked <= eligible, 3, bucket)
+                    bucket = torch.where(4 * masked <= eligible, 2, bucket)
+                    bucket = torch.where(masked == 0, 1, bucket)
+                    bucket = torch.where(eligible == 0, 0, bucket)
+                    bucket = torch.where(
+                        (eligible > 0) & (masked == eligible), 6, bucket
                     )
-                ar_target_tensor += losses.ar_targets
-                diffusion_target_tensor += losses.diffusion_targets
-                masked_total += losses.noise_masked.sum()
-                eligible_total += losses.noise_eligible.sum()
-                all_mask_canvases += (
-                    (losses.noise_eligible > 0)
-                    & (losses.noise_masked == losses.noise_eligible)
-                ).sum()
-                canvas_count += losses.noise_eligible.gt(0).sum()
-            if materialize_metrics and losses.noise_eligible.numel():
-                masked = losses.noise_masked
-                eligible = losses.noise_eligible
-                bucket = torch.full_like(masked, 5)
-                bucket = torch.where(4 * masked <= 3 * eligible, 4, bucket)
-                bucket = torch.where(2 * masked <= eligible, 3, bucket)
-                bucket = torch.where(4 * masked <= eligible, 2, bucket)
-                bucket = torch.where(masked == 0, 1, bucket)
-                bucket = torch.where(eligible == 0, 0, bucket)
-                bucket = torch.where(
-                    (eligible > 0) & (masked == eligible), 6, bucket
-                )
-                noise_bucket_counts += torch.bincount(bucket, minlength=7)
-                noise_bucket_targets.scatter_add_(0, bucket, masked)
-                noise_bucket_correct.scatter_add_(
-                    0, bucket, losses.noise_correct
-                )
-                noise_bucket_nll.scatter_add_(
-                    0, bucket, losses.noise_nll.detach().to(torch.float64)
-                )
-            if next_pair is not None:
-                current_batch, current_sampling = next_pair
+                    noise_bucket_counts += torch.bincount(bucket, minlength=7)
+                    noise_bucket_targets.scatter_add_(0, bucket, masked)
+                    noise_bucket_correct.scatter_add_(
+                        0, bucket, losses.noise_correct
+                    )
+                    noise_bucket_nll.scatter_add_(
+                        0, bucket, losses.noise_nll.detach().to(torch.float64)
+                    )
+                # Resolve/build the following host batch only after all kernels
+                # for the current backward have been launched.  CPU collation
+                # and the non-default-stream copy then overlap actual GPU work
+                # instead of stalling the host before the current forward.
+                if batch_groups is not None and pending_cpu is not None:
+                    next_pair = transfer_pair(pending_cpu.result())
+                    following = microstep + 2
+                    pending_cpu = (
+                        producer.submit(prepare_cpu_group, batch_groups[following])
+                        if producer is not None and following < len(batch_groups)
+                        else None
+                    )
+                else:
+                    next_pair = (
+                        transfer_pair(
+                            (
+                                cpu_batches[microstep + 1],
+                                cpu_blt_sampling[microstep + 1],
+                            )
+                        )
+                        if batch_groups is None
+                        and microstep + 1 < len(cpu_batches)
+                        else None
+                    )
+                if next_pair is not None:
+                    current_batch, current_sampling, current_ready = next_pair
+        finally:
+            if producer is not None:
+                producer.shutdown(wait=True)
 
         clip_limit = (
             self.run_config.max_grad_norm
@@ -2978,20 +3610,9 @@ class ByteDiffusionTrainer:
             elapsed_ms=self.training_time_ms,
             ar_targets=int(counts[0]),
             diffusion_targets=int(counts[1]),
-            microsteps=len(cpu_batches),
-            max_microbatch=max(batch.ids.shape[0] for batch in cpu_batches),
-            max_physical_positions=max(
-                batch.ids.shape[0]
-                * (
-                    batch.ids.shape[1]
-                    + (
-                        self.run_config.corruption.corrupted_positions_per_row
-                        if self.run_config.recipe != "causal_only"
-                        else 0
-                    )
-                )
-                for batch in cpu_batches
-            ),
+            microsteps=microstep_count,
+            max_microbatch=max_microbatch_observed,
+            max_physical_positions=max_physical_positions_observed,
             preclip_grad_norm=preclip_grad_norm,
             grad_clip_scale=grad_clip_scale,
             mean_noise_fraction=float(counts[2] / counts[3].clamp_min(1)),
@@ -3017,10 +3638,10 @@ class ByteDiffusionTrainer:
         started_at = time.perf_counter()
         was_training = self.joint.training
         self.joint.eval()
-        # [AR NLL, diffusion NLL, AR count, literal count, special count,
-        # diffusion count, diffusion rows]. Keep the whole validation reduction
-        # on device and synchronize exactly once after optional DDP aggregation.
-        totals = torch.zeros(7, dtype=torch.float64, device=self.device)
+        # [AR NLL, masked diagnostic NLL, AR count, literal count, special
+        # count, masked count, diffusion rows, absorbing ELBO NLL, ELBO atom
+        # coverage]. Keep the reduction on device and synchronize once.
+        totals = torch.zeros(9, dtype=torch.float64, device=self.device)
         role_nll = torch.zeros(6, dtype=torch.float64, device=self.device)
         role_counts = torch.zeros(6, dtype=torch.long, device=self.device)
 
@@ -3064,6 +3685,33 @@ class ByteDiffusionTrainer:
                 if self.device.type == "cuda" and not item[0].ids.is_pinned():
                     item = (item[0].pin_memory(), item[1])
                 yield item
+
+        def prefetched_batches(
+            indices: Sequence[int],
+            *,
+            batch_size: int,
+        ) -> Iterable[
+            tuple[TrainingBatch, Sequence[PackedChunk | ValidationChunkIdentity]]
+        ]:
+            source = iter(batches(indices, batch_size=batch_size))
+            if self.device.type != "cuda":
+                yield from source
+                return
+            # Native collation copies/crops memory-mapped rows and pins the
+            # resulting batch. Do that one batch ahead while the GPU consumes
+            # the current batch, bounding retained staging memory to two
+            # batches instead of caching the whole ~946 MiB proxy.
+            sentinel = object()
+            with ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="byte-validation-prefetch"
+            ) as executor:
+                pending = executor.submit(next, source, sentinel)
+                while True:
+                    item = pending.result()
+                    if item is sentinel:
+                        break
+                    pending = executor.submit(next, source, sentinel)
+                    yield item  # type: ignore[misc]
 
         def autocast_context():
             return (
@@ -3146,9 +3794,10 @@ class ByteDiffusionTrainer:
         )
 
         try:
-            # BPB is the promotion metric, so every declared validation row is
-            # evaluated through the cheaper causal path at every interval.
-            for cpu_batch, _ in batches(
+            # Clean causal likelihood is a retained-language anchor. Score it
+            # over every declared row, but diffusion recipes are promoted by
+            # the absorbing-ELBO proxy computed below, not by this AR head.
+            for cpu_batch, _ in prefetched_batches(
                 ar_only_indices,
                 batch_size=self.run_config.ar_validation_microbatch_per_rank,
             ):
@@ -3181,6 +3830,14 @@ class ByteDiffusionTrainer:
                         batch.physical_to_global_patch_indices,
                         batch.bos_condition_indices,
                         None,
+                        **(
+                            {}
+                            if batch.patch_byte_cu_seqlens is None
+                            else {
+                                "patch_byte_cu_seqlens": batch.patch_byte_cu_seqlens,
+                                "max_patch_size": batch.max_patch_size,
+                            }
+                        ),
                     )
                 accumulate_ar(batch, ar_logits, bos_logits)
 
@@ -3189,7 +3846,7 @@ class ByteDiffusionTrainer:
             # masks. Evaluate an evenly spaced, hash-bound subset instead of
             # recomputing the diagnostic over the full BPB proxy.
             if self.run_config.recipe != "causal_only":
-                for cpu_batch, chunks in batches(
+                for cpu_batch, chunks in prefetched_batches(
                     diffusion_indices,
                     batch_size=self.run_config.validation_microbatch_per_rank,
                 ):
@@ -3222,6 +3879,7 @@ class ByteDiffusionTrainer:
                         if blt_sampling_cpu is None:
                             (
                                 starts_cpu,
+                                sampling_weight_cpu,
                                 selected_cpu,
                                 condition_cpu,
                             ) = sample_validation_blt_starts(
@@ -3237,6 +3895,13 @@ class ByteDiffusionTrainer:
                                 starts_cpu,
                                 selected_cpu,
                                 block_length=block_length,
+                            )
+                            validation_active_cpu, validation_t_cpu = (
+                                validation_exact_k_mask(
+                                    branch_valid_cpu,
+                                    chunks,
+                                    seed=self.run_config.seed + 104_729,
+                                )
                             )
                             if (
                                 self.model_config.decoder_branch_attention
@@ -3287,9 +3952,7 @@ class ByteDiffusionTrainer:
                                 )
                             blt_sampling_cpu = BltSamplingPlan(
                                 block_starts=starts_cpu,
-                                sampling_weight=torch.ones(
-                                    starts_cpu.shape[0], dtype=torch.float32
-                                ),
+                                sampling_weight=sampling_weight_cpu,
                                 selected=selected_cpu,
                                 condition_indices=condition_cpu,
                                 branch_valid=branch_valid_cpu,
@@ -3298,6 +3961,8 @@ class ByteDiffusionTrainer:
                                 branch_kv_indices=branch_kv_cpu,
                                 branch_query_cu_seqlens=branch_query_cu_cpu,
                                 branch_kv_cu_seqlens=branch_kv_cu_cpu,
+                                validation_active=validation_active_cpu,
+                                validation_t=validation_t_cpu,
                             )
                             # Only the recurring proxy is retained. Full-split
                             # evaluation streams plans once and releases them.
@@ -3358,12 +4023,28 @@ class ByteDiffusionTrainer:
                             diffusion_clean,
                             self.model_config.vocab.pad_id,
                         )
+                    if self.run_config.recipe == "blt_d":
+                        if (
+                            blt_sampling_device is None
+                            or blt_sampling_device.validation_active is None
+                            or blt_sampling_device.validation_t is None
+                        ):
+                            raise AssertionError(
+                                "BLT validation omitted its exact-K ELBO sample"
+                            )
+                        diffusion_active = (
+                            blt_sampling_device.validation_active & noisy_valid
+                        )
+                    else:
+                        # Canvas objectives do not define Fast-BLT's absorbing
+                        # ELBO. Retain their all-mask reconstruction diagnostic
+                        # without presenting it as a likelihood or BPB.
+                        diffusion_active = noisy_valid
                     noisy = torch.where(
-                        noisy_valid,
+                        diffusion_active,
                         self.model_config.vocab.mask_id,
                         diffusion_clean,
                     )
-                    diffusion_active = noisy_valid
                     branch_block_mask = None
                     if (
                         blt_sampling_device is not None
@@ -3460,6 +4141,14 @@ class ByteDiffusionTrainer:
                                 )
                             ),
                             branch_block_mask,
+                            **(
+                                {}
+                                if batch.patch_byte_cu_seqlens is None
+                                else {
+                                    "patch_byte_cu_seqlens": batch.patch_byte_cu_seqlens,
+                                    "max_patch_size": batch.max_patch_size,
+                                }
+                            ),
                         )
                     if diffusion_logits is None:
                         raise AssertionError("validation diffusion logits are missing")
@@ -3480,6 +4169,16 @@ class ByteDiffusionTrainer:
                     totals[1] += per_target_nll.sum()
                     totals[5] += diffusion_active.sum()
                     totals[6] += batch.ids.shape[0]
+                    if self.run_config.recipe == "blt_d":
+                        assert blt_sampling_device is not None
+                        assert blt_sampling_device.validation_t is not None
+                        row_nll = per_target_nll.flatten(1).sum(1)
+                        inverse_t = blt_sampling_device.validation_t.reciprocal()
+                        origin_weight = blt_sampling_device.sampling_weight
+                        totals[7] += (row_nll * inverse_t * origin_weight).sum()
+                        totals[8] += (
+                            noisy_valid.flatten(1).sum(1) * origin_weight
+                        ).sum()
                     safe_targets = torch.where(diffusion_active, targets, 0)
                     roles = torch.full_like(safe_targets, 3)
                     roles = torch.where(safe_targets <= 0x7F, 0, roles)
@@ -3526,6 +4225,15 @@ class ByteDiffusionTrainer:
         diff_count = int(totals[5])
         diffusion_chunks = int(totals[6])
         diffusion_loss = float(totals[1] / diff_count) if diff_count else 0.0
+        diffusion_elbo_atoms = float(totals[8])
+        diffusion_elbo_proxy_nats_per_block_atom = (
+            float(totals[7] / totals[8]) if diffusion_elbo_atoms else None
+        )
+        diffusion_elbo_proxy_bpb = (
+            diffusion_elbo_proxy_nats_per_block_atom / math.log(2.0)
+            if diffusion_elbo_proxy_nats_per_block_atom is not None
+            else None
+        )
         return ValidationMetrics(
             ar_loss=ar_loss,
             # The challenge byte LUT charges every registered special atom,
@@ -3534,6 +4242,11 @@ class ByteDiffusionTrainer:
             bpb=float(totals[0]) / ar_count / math.log(2.0),
             atomic_bpb=ar_loss / math.log(2.0),
             diffusion_loss=diffusion_loss,
+            diffusion_elbo_proxy_bpb=diffusion_elbo_proxy_bpb,
+            diffusion_elbo_proxy_nats_per_block_atom=(
+                diffusion_elbo_proxy_nats_per_block_atom
+            ),
+            diffusion_elbo_atoms=diffusion_elbo_atoms,
             ar_targets=ar_count,
             literal_bytes=literal_count,
             special_targets=special_count,
@@ -3583,6 +4296,7 @@ class ByteDiffusionTrainer:
                 "atomic_manifest": self.atomic_manifest.to_dict(),
                 "atomic_manifest_sha256": self.atomic_manifest.sha256,
                 "dataset_provenance": self.dataset_provenance,
+                "source_provenance": self.source_provenance,
                 "world_size": self.distributed.world_size,
                 "model": self.joint.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
@@ -3606,6 +4320,7 @@ class ByteDiffusionTrainer:
             "atomic_manifest": self.atomic_manifest.to_dict(),
             "atomic_manifest_sha256": self.atomic_manifest.sha256,
             "dataset_provenance": self.dataset_provenance,
+            "source_provenance": self.source_provenance,
             "world_size": self.distributed.world_size,
         }
         for key, value in expected.items():
@@ -3720,6 +4435,30 @@ class _MappedArtifactPayload:
         return None
 
 
+def _validate_variable_patch_row(
+    columns: np.ndarray,
+    documents: np.ndarray,
+    patch_offsets: np.ndarray,
+    *,
+    max_patch_size: int,
+) -> None:
+    """Validate one v6 row without assuming a fixed physical patch grid."""
+
+    values = patch_offsets[columns].astype(np.int64, copy=False)
+    if values.size == 0 or int(values[0]) != 0:
+        raise ValueError("entropy-patched rows must begin on a patch boundary")
+    starts = np.flatnonzero(values == 0)
+    lengths = np.diff(np.r_[starts, values.size])
+    if bool(((lengths <= 0) | (lengths > max_patch_size)).any()):
+        raise ValueError("entropy patch length exceeds its manifest-bound maximum")
+    expected = np.arange(values.size) - np.repeat(starts, lengths)
+    if not np.array_equal(values, expected):
+        raise ValueError("entropy patch offsets are not contiguous zero-based runs")
+    patch_documents = documents[columns[starts]]
+    if not np.array_equal(documents[columns], np.repeat(patch_documents, lengths)):
+        raise ValueError("one entropy patch mixes multiple documents")
+
+
 class MappedPackedChunkDataset(Sequence[PackedChunk]):
     """Hash-verified view over deterministic row-addressable artifacts.
 
@@ -3757,6 +4496,9 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
         split: str,
         dense_stream: bool,
         document_aligned_pages: bool = False,
+        patching: DatasetPatchingSpec = DatasetPatchingSpec(
+            "fixed_stride_v1", 4, 4
+        ),
         eot_id: int = 256,
         defer_payload_validation: bool = False,
         trust_pinned_row_index: bool = False,
@@ -3773,6 +4515,7 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
         self.split = split
         self.dense_stream = bool(dense_stream)
         self.document_aligned_pages = bool(document_aligned_pages)
+        self.patching = patching
         self.eot_id = int(eot_id)
         self.defer_payload_validation = bool(defer_payload_validation)
         self.trust_pinned_row_index = bool(trust_pinned_row_index)
@@ -4058,7 +4801,9 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                                 != row_documents[columns[:-1]],
                             ]
                         ]
-                        if np.any(starts % 4):
+                        if not self.patching.variable and np.any(
+                            starts % self.patching.max_patch_size
+                        ):
                             raise ValueError(
                                 "document segment does not start on a patch boundary"
                             )
@@ -4080,21 +4825,34 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                                 "mid-page document segment must start at offset zero"
                             )
                         observed_document_starts += int((start_offsets == 0).sum())
-                        if np.any(
-                            row_patch_offsets[columns]
-                            != row_offsets[columns] % 4
-                        ):
-                            raise ValueError("document patch phase did not reset")
-                        for patch_start in range(0, chunk_size, 4):
-                            patch_documents = set(
-                                int(value)
-                                for value in row_documents[
-                                    patch_start : patch_start + 4
-                                ]
-                                if value >= 0
+                        if self.patching.variable:
+                            _validate_variable_patch_row(
+                                columns,
+                                row_documents,
+                                row_patch_offsets,
+                                max_patch_size=self.patching.max_patch_size,
                             )
-                            if len(patch_documents) > 1:
-                                raise ValueError("one patch mixes two documents")
+                            if bool((row_patch_offsets[starts] != 0).any()):
+                                raise ValueError(
+                                    "document segment must begin on an entropy boundary"
+                                )
+                        else:
+                            stride = self.patching.max_patch_size
+                            if np.any(
+                                row_patch_offsets[columns]
+                                != row_offsets[columns] % stride
+                            ):
+                                raise ValueError("document patch phase did not reset")
+                            for patch_start in range(0, chunk_size, stride):
+                                patch_documents = set(
+                                    int(value)
+                                    for value in row_documents[
+                                        patch_start : patch_start + stride
+                                    ]
+                                    if value >= 0
+                                )
+                                if len(patch_documents) > 1:
+                                    raise ValueError("one patch mixes two documents")
                         for left, right in zip(columns[:-1], columns[1:], strict=True):
                             same_document = (
                                 row_documents[left] == row_documents[right]
@@ -4104,7 +4862,10 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                                     row_offsets[right] != row_offsets[left] + 1
                                 ):
                                     raise ValueError("document atoms are not contiguous")
-                            elif right - left - 1 not in range(0, 4):
+                            elif right - left - 1 not in range(
+                                0,
+                                1 if self.patching.variable else self.patching.max_patch_size,
+                            ):
                                 raise ValueError(
                                     "inter-document alignment gap is not zero to three"
                                 )
@@ -4155,12 +4916,16 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                         if ids[row, final_column] == self.eot_id:
                             expected_continuation = None
                         else:
-                            if final_column != chunk_size - 1 or not bool(
-                                halo_valid[row]
+                            if (
+                                (
+                                    not self.patching.variable
+                                    and final_column != chunk_size - 1
+                                )
+                                or not bool(halo_valid[row])
                             ):
                                 raise ValueError(
-                                    "unterminated document segment must fill the page "
-                                    "and carry a halo"
+                                    "unterminated document segment must end at an "
+                                    "allowed row boundary and carry a halo"
                                 )
                             expected_continuation = (
                                 int(row_documents[final_column]),
@@ -4619,7 +5384,9 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                     row_documents[columns[1:]] != row_documents[columns[:-1]],
                 ]
             ]
-            if np.any(starts % 4):
+            if not self.patching.variable and np.any(
+                starts % self.patching.max_patch_size
+            ):
                 raise ValueError("document segment does not start on a patch boundary")
             first = int(row_documents[0]), int(row_offsets[0])
             if expected_continuation is None:
@@ -4630,14 +5397,31 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             start_offsets = row_offsets[starts]
             if np.any(start_offsets[1:] != 0):
                 raise ValueError("mid-page document segment must start at offset zero")
-            if np.any(row_patch_offsets[columns] != row_offsets[columns] % 4):
-                raise ValueError("document patch phase did not reset")
-            patch_documents = row_documents.reshape(-1, 4)
-            patch_present = patch_documents >= 0
-            patch_min = np.where(patch_present, patch_documents, np.iinfo(np.int64).max).min(1)
-            patch_max = np.where(patch_present, patch_documents, -1).max(1)
-            if bool((patch_present.any(1) & (patch_min != patch_max)).any()):
-                raise ValueError("one patch mixes two documents")
+            if self.patching.variable:
+                _validate_variable_patch_row(
+                    columns,
+                    row_documents,
+                    row_patch_offsets,
+                    max_patch_size=self.patching.max_patch_size,
+                )
+                if bool((row_patch_offsets[starts] != 0).any()):
+                    raise ValueError(
+                        "document segment must begin on an entropy boundary"
+                    )
+            else:
+                stride = self.patching.max_patch_size
+                if np.any(
+                    row_patch_offsets[columns] != row_offsets[columns] % stride
+                ):
+                    raise ValueError("document patch phase did not reset")
+                patch_documents = row_documents.reshape(-1, stride)
+                patch_present = patch_documents >= 0
+                patch_min = np.where(
+                    patch_present, patch_documents, np.iinfo(np.int64).max
+                ).min(1)
+                patch_max = np.where(patch_present, patch_documents, -1).max(1)
+                if bool((patch_present.any(1) & (patch_min != patch_max)).any()):
+                    raise ValueError("one patch mixes two documents")
             left = columns[:-1]
             right = columns[1:]
             same_document = row_documents[left] == row_documents[right]
@@ -4652,7 +5436,8 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             ):
                 raise ValueError("document atoms are not contiguous")
             changed_document = ~same_document
-            if bool((changed_document & ((right - left - 1) >= 4)).any()):
+            maximum_gap = 0 if self.patching.variable else self.patching.max_patch_size - 1
+            if bool((changed_document & ((right - left - 1) > maximum_gap)).any()):
                 raise ValueError("inter-document alignment gap is not zero to three")
             if bool(
                 (
@@ -4703,9 +5488,16 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             if ids[row, final_column] == self.eot_id:
                 expected_continuation = None
             else:
-                if final_column != self.chunk_size - 1 or not bool(halo_valid[row]):
+                if (
+                    (
+                        not self.patching.variable
+                        and final_column != self.chunk_size - 1
+                    )
+                    or not bool(halo_valid[row])
+                ):
                     raise ValueError(
-                        "unterminated document segment must fill the page and carry a halo"
+                        "unterminated document segment must end at an allowed row "
+                        "boundary and carry a halo"
                     )
                 expected_continuation = (
                     int(row_documents[final_column]),
@@ -4764,6 +5556,7 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             "score_mask",
             "document_offsets",
             "document_indices",
+            "patch_offsets",
             "chunk_index",
             "stream_start",
             "stream_stop",
@@ -4851,31 +5644,44 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                 self._verify_selected_rows(artifact_index, selected_rows)
             else:
                 raise ValueError(f"unknown integrity scope {integrity_scope!r}")
-        # Hold every shard used by this batch strongly for the whole collation.
-        # Validation subsets can span more shards than the small training LRU;
-        # resolving each field independently otherwise evicts and decompresses
-        # the same NPZ shard once per field.
-        arrays_by_artifact = {
-            int(artifact): self._batch_arrays(int(artifact))
-            for artifact in unique_artifacts
-        }
+        # Stage one mapped shard at a time into contiguous batch arrays. A
+        # validation batch can intentionally sample one row from hundreds of
+        # artifacts; retaining every artifact's eleven memmaps at once exceeds
+        # ordinary process file-descriptor limits. Resolving one shard once and
+        # copying all required fields preserves vectorized collation while the
+        # small LRU bounds live mappings independently of validation size.
+        collated_names = (
+            "input_ids",
+            "target_ids",
+            "valid_mask",
+            "score_mask",
+            "document_offsets",
+            "document_indices",
+            "patch_offsets",
+            "chunk_index",
+            "stream_start",
+        )
+        collated: dict[str, np.ndarray] = {}
+        for artifact in unique_artifacts:
+            artifact_index = int(artifact)
+            selected_positions = np.flatnonzero(artifact_ids == artifact)
+            selected_rows = local_rows[selected_positions]
+            arrays = self._batch_arrays(artifact_index)
+            if not collated:
+                collated = {
+                    name: np.empty(
+                        (global_rows.size, *arrays[name].shape[1:]),
+                        dtype=arrays[name].dtype,
+                    )
+                    for name in collated_names
+                }
+            for name, result in collated.items():
+                result[selected_positions] = arrays[name][selected_rows]
+        if not collated:
+            raise AssertionError("nonempty mapped batch produced no artifact rows")
 
         def rows(name: str) -> np.ndarray:
-            if unique_artifacts.size == 1:
-                artifact = int(unique_artifacts[0])
-                return np.ascontiguousarray(
-                    arrays_by_artifact[artifact][name][local_rows]
-                )
-            exemplar = arrays_by_artifact[int(unique_artifacts[0])][name]
-            result = np.empty(
-                (global_rows.size, *exemplar.shape[1:]), dtype=exemplar.dtype
-            )
-            for artifact in unique_artifacts:
-                selected_positions = artifact_ids == artifact
-                result[selected_positions] = arrays_by_artifact[int(artifact)][name][
-                    local_rows[selected_positions]
-                ]
-            return result
+            return collated[name]
 
         valid_rows = rows("valid_mask")
         max_extent = int(self._physical_extents[global_rows].max())
@@ -4898,6 +5704,9 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
         document_ids = torch.from_numpy(
             rows("document_indices")[:, :width]
         ).to(torch.long)
+        patch_offsets = torch.from_numpy(
+            rows("patch_offsets")[:, :width]
+        ).to(torch.long)
         positions = (
             torch.arange(width, dtype=torch.long)[None].expand(global_rows.size, -1)
             if self.dense_stream
@@ -4916,11 +5725,39 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             bos_locations = starts_document.nonzero(as_tuple=False)
             bos_row_indices = bos_locations[:, 0]
             bos_targets = ids[bos_locations[:, 0], bos_locations[:, 1]]
-        layout = (
-            _packed_document_layout(valid, document_ids, positions)
-            if not self.dense_stream
-            else (None,) * 10
-        )
+        fixed_layout = None
+        variable_layout = None
+        if not self.dense_stream:
+            if self.patching.variable:
+                variable_layout = build_variable_patch_layout(
+                    valid,
+                    document_ids,
+                    document_offsets,
+                    patch_offsets,
+                    max_patch_size=self.patching.max_patch_size,
+                )
+            else:
+                fixed_layout = _packed_document_layout(
+                    valid,
+                    document_ids,
+                    positions,
+                    patch_stride=self.patching.max_patch_size,
+                )
+
+        def fixed(index: int) -> Tensor | None:
+            return None if fixed_layout is None else fixed_layout[index]
+
+        def variable(name: str) -> Tensor | None:
+            return (
+                None
+                if variable_layout is None
+                else getattr(variable_layout, name)
+            )
+
+        def layout_value(name: str, fixed_index: int) -> Tensor | None:
+            value = variable(name)
+            return fixed(fixed_index) if value is None else value
+
         batch = TrainingBatch(
             ids=ids,
             valid=valid,
@@ -4931,16 +5768,31 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             document_ids=document_ids,
             bos_row_indices=bos_row_indices,
             isolate_documents=not self.dense_stream,
-            byte_indices=layout[0],
-            byte_cu_seqlens=layout[1],
-            patch_indices=layout[2],
-            patch_cu_seqlens=layout[3],
-            condition_patch_indices=layout[4],
-            global_patch_sources=layout[5],
-            global_patch_positions=layout[6],
-            physical_to_global_patch_indices=layout[7],
-            bos_condition_indices=layout[8],
-            prior_condition_indices=layout[9],
+            byte_indices=layout_value("byte_indices", 0),
+            byte_cu_seqlens=layout_value("byte_cu_seqlens", 1),
+            patch_indices=fixed(2),
+            patch_cu_seqlens=layout_value("patch_cu_seqlens", 3),
+            condition_patch_indices=layout_value("condition_patch_indices", 4),
+            global_patch_sources=layout_value("global_patch_sources", 5),
+            global_patch_positions=layout_value("global_patch_positions", 6),
+            physical_to_global_patch_indices=layout_value(
+                "physical_to_global_patch_indices", 7
+            ),
+            bos_condition_indices=layout_value("bos_condition_indices", 8),
+            prior_condition_indices=fixed(9),
+            patch_offsets=patch_offsets,
+            patch_byte_cu_seqlens=variable("patch_byte_cu_seqlens"),
+            max_patch_size=(
+                self.patching.max_patch_size if self.patching.variable else None
+            ),
+            physical_patch_row_indices=variable("physical_patch_row_indices"),
+            physical_patch_start_columns=variable(
+                "physical_patch_start_columns"
+            ),
+            physical_patch_lengths=variable("physical_patch_lengths"),
+            physical_patch_prior_condition_indices=variable(
+                "physical_patch_prior_condition_indices"
+            ),
         )
         identities = ()
         if include_identities:
@@ -4962,15 +5814,42 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             integrity_scope="artifact",
         )[0]
 
-    def training_batches(
+    def training_ar_units(self, indices: Sequence[int]) -> int:
+        """Count exact scored AR and virtual-BOS targets without collation."""
+
+        if len(indices) == 0:
+            return 0
+        global_rows = np.asarray(indices, dtype=np.int64)
+        global_rows = np.where(global_rows < 0, global_rows + len(self), global_rows)
+        if bool(((global_rows < 0) | (global_rows >= len(self))).any()):
+            raise IndexError("mapped batch index is out of range")
+        artifact_ids = np.searchsorted(
+            self._artifact_offsets, global_rows, side="right"
+        ).astype(np.int64, copy=False) - 1
+        local_rows = global_rows - self._artifact_offsets[artifact_ids]
+        total = 0
+        for artifact in np.unique(artifact_ids):
+            selected = local_rows[artifact_ids == artifact]
+            arrays = self._batch_arrays(int(artifact))
+            score = arrays["score_mask"][selected]
+            total += int(score.sum(dtype=np.int64))
+            if self.dense_stream:
+                total += int((arrays["stream_start"][selected] == 0).sum())
+            else:
+                valid = arrays["valid_mask"][selected]
+                offsets = arrays["document_offsets"][selected]
+                total += int((valid & (offsets == 0)).sum(dtype=np.int64))
+        return total
+
+    def training_batch_groups(
         self,
         indices: Sequence[int],
         *,
         max_batch_size: int,
         physical_token_budget: int,
         sort_by_length: bool = False,
-    ) -> list[TrainingBatch]:
-        """Partition rows by their exact cropped-bank memory workload."""
+    ) -> list[tuple[int, ...]]:
+        """Partition row ids by memory workload without loading row payloads."""
 
         if len(indices) == 0 or max_batch_size <= 0 or physical_token_budget <= 0:
             raise ValueError("adaptive batching requires positive rows and limits")
@@ -4980,25 +5859,27 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
             * (self.chunk_size + self.required_branch_bytes)
             <= physical_token_budget
         ):
-            # Production aligned pages have one fixed physical width. Avoid
-            # scalar max/while scheduling over every row when the configured
-            # budget proves every full microbatch fits.
             return [
-                self.training_batch(indices[start : start + max_batch_size])
+                tuple(indices[start : start + max_batch_size])
                 for start in range(0, len(indices), max_batch_size)
             ]
+        ordered = tuple(indices)
         if sort_by_length:
             # Rows selected for the optimizer update are unchanged.  Only
             # their microbatch grouping is reordered to avoid mixing the
             # shortest and longest cropped banks in one padded launch.
-            indices = tuple(sorted(indices, key=self._valid_counts.__getitem__))
-        result: list[TrainingBatch] = []
+            ordered = tuple(
+                sorted(ordered, key=self._valid_counts.__getitem__)
+            )
+        result: list[tuple[int, ...]] = []
         start = 0
-        while start < len(indices):
-            count = min(max_batch_size, len(indices) - start)
+        while start < len(ordered):
+            count = min(max_batch_size, len(ordered) - start)
             while count > 1:
-                candidate = indices[start : start + count]
-                max_extent = max(self._physical_extents[index] for index in candidate)
+                candidate = ordered[start : start + count]
+                max_extent = max(
+                    self._physical_extents[index] for index in candidate
+                )
                 clean_width = max(
                     max_extent + self.branch_tail_halo,
                     self.required_branch_bytes,
@@ -5009,7 +5890,7 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                 if count * physical_width <= physical_token_budget:
                     break
                 count -= 1
-            candidate = indices[start : start + count]
+            candidate = tuple(ordered[start : start + count])
             max_valid = max(self._physical_extents[index] for index in candidate)
             clean_width = min(
                 self.chunk_size,
@@ -5027,9 +5908,29 @@ class MappedPackedChunkDataset(Sequence[PackedChunk]):
                 raise ValueError(
                     "one row exceeds the configured physical microbatch token budget"
                 )
-            result.append(self.training_batch(candidate))
+            result.append(candidate)
             start += count
         return result
+
+    def training_batches(
+        self,
+        indices: Sequence[int],
+        *,
+        max_batch_size: int,
+        physical_token_budget: int,
+        sort_by_length: bool = False,
+    ) -> list[TrainingBatch]:
+        """Partition rows by their exact cropped-bank memory workload."""
+
+        return [
+            self.training_batch(group)
+            for group in self.training_batch_groups(
+                indices,
+                max_batch_size=max_batch_size,
+                physical_token_budget=physical_token_budget,
+                sort_by_length=sort_by_length,
+            )
+        ]
 
     def validation_batch(
         self, indices: Sequence[int]
@@ -5136,6 +6037,7 @@ def load_data_directory(
     require_challenge_validation: bool = False,
     expected_payload_sha256: str | None = None,
     expected_source_manifest_sha256: str | None = None,
+    expected_patching_policy: PatchingPolicy | None = None,
     audit_payload_semantics: bool = False,
 ) -> tuple[
     AtomicIdManifest,
@@ -5167,9 +6069,6 @@ def load_data_directory(
             "dataset manifest differs from the pinned run contract: "
             f"expected {expected_payload_sha256}, observed {observed_payload}"
         )
-    dataset_schema = dataset_manifest.get("schema")
-    if dataset_schema != "byte_diffusion_dataset/v5":
-        raise ValueError("training requires the mapped byte-native v5 dataset")
     manifest = AtomicIdManifest.from_dict(dataset_manifest["atomic_vocabulary"])
     packing = dataset_manifest.get("packing", {})
     if int(packing.get("chunk_size", -1)) != chunk_size:
@@ -5272,6 +6171,15 @@ def load_data_directory(
             challenge.get("tokens", -2)
         ):
             raise ValueError("byte validation source length is not challenge-canonical")
+    patching = load_dataset_patching_spec(directory, dataset_manifest)
+    if (
+        expected_patching_policy is not None
+        and patching.name != expected_patching_policy
+    ):
+        raise ValueError(
+            "dataset patching policy differs from the run contract: "
+            f"expected {expected_patching_policy}, observed {patching.name}"
+        )
     artifact_schema = str(dataset_manifest.get("artifact_schema"))
     train = MappedPackedChunkDataset(
         directory,
@@ -5283,6 +6191,7 @@ def load_data_directory(
         split="train",
         dense_stream=dense_stream,
         document_aligned_pages=document_aligned_pages,
+        patching=patching,
         eot_id=manifest.eot_id,
         defer_payload_validation=not audit_payload_semantics,
         trust_pinned_row_index=(
@@ -5299,6 +6208,7 @@ def load_data_directory(
         split="validation",
         dense_stream=dense_stream,
         document_aligned_pages=document_aligned_pages,
+        patching=patching,
         eot_id=manifest.eot_id,
         defer_payload_validation=not audit_payload_semantics,
         trust_pinned_row_index=(
@@ -5412,13 +6322,37 @@ def format_validation_metric(
         raise ValueError(f"unknown validation scope {scope!r}")
     role_nll = metrics.diffusion_role_nll
     role_counts = metrics.diffusion_role_counts
-    scoped_bpb = f"val_{scope}_bpb:{metrics.bpb:.6f}"
+    diffusion_primary = metrics.diffusion_elbo_proxy_bpb is not None
+    primary_bpb = (
+        metrics.diffusion_elbo_proxy_bpb if diffusion_primary else metrics.bpb
+    )
+    primary_loss = (
+        metrics.diffusion_elbo_proxy_nats_per_block_atom
+        if diffusion_primary
+        else metrics.ar_loss
+    )
+    assert primary_bpb is not None and primary_loss is not None
+    scoped_bpb = f"val_{scope}_bpb:{primary_bpb:.6f}"
+    diffusion_elbo = (
+        ""
+        if metrics.diffusion_elbo_proxy_bpb is None
+        else (
+            "val_diffusion_elbo_proxy_bpb:"
+            f"{metrics.diffusion_elbo_proxy_bpb:.6f} "
+            "val_diffusion_elbo_proxy_nats_per_block_atom:"
+            f"{metrics.diffusion_elbo_proxy_nats_per_block_atom:.6f} "
+        )
+    )
     return (
-        f"step:{step}/{iterations} val_loss: {metrics.ar_loss:.6f} "
-        f"val_bpb: {metrics.bpb:.6f} train_time: {training_time_ms:.3f}ms "
+        f"step:{step}/{iterations} val_loss: {primary_loss:.6f} "
+        f"val_bpb: {primary_bpb:.6f} train_time: {training_time_ms:.3f}ms "
         f"{scoped_bpb} "
-        f"val_atomic_bpb:{metrics.atomic_bpb:.6f} "
+        f"val_diffusion_primary:{int(diffusion_primary)} "
+        f"val_ar_anchor_loss:{metrics.ar_loss:.6f} "
+        f"val_ar_anchor_bpb:{metrics.atomic_bpb:.6f} "
         f"val_diffusion_loss:{metrics.diffusion_loss:.6f} "
+        f"{diffusion_elbo}"
+        f"val_diffusion_elbo_atoms:{metrics.diffusion_elbo_atoms:.3f} "
         f"val_ar_targets:{metrics.ar_targets} "
         f"val_literal_bytes:{metrics.literal_bytes} "
         f"val_special_targets:{metrics.special_targets} "

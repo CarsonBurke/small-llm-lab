@@ -105,6 +105,52 @@ def load_bound_tokenizer(provenance: dict):
     reinterpreting old token IDs.
     """
 
+    if provenance.get("kind") == "gpt2":
+        import tokenizers
+        import transformers
+        from transformers import GPT2TokenizerFast
+
+        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2", local_files_only=True)
+        tokenizer.model_max_length = 1 << 30
+        backend = tokenizer.backend_tokenizer.to_str()
+        observed_signature = {
+            "name": "gpt2",
+            "backend_sha256": hashlib.sha256(backend.encode()).hexdigest(),
+            "transformers_version": transformers.__version__,
+            "tokenizers_version": tokenizers.__version__,
+        }
+        if provenance.get("signature") != observed_signature:
+            raise ValueError(
+                "the installed GPT-2 tokenizer differs from checkpoint provenance"
+            )
+        if int(provenance.get("vocab_size", -1)) != GPT2_VOCAB_SIZE or int(
+            provenance.get("eot_id", -1)
+        ) != GPT2_EOT_ID:
+            raise ValueError("checkpoint declares a noncanonical GPT-2 vocabulary")
+
+        class BoundGPT2Tokenizer:
+            vocab_size = GPT2_VOCAB_SIZE
+            eot_id = GPT2_EOT_ID
+
+            class spec:
+                specials: tuple[object, ...] = ()
+
+            @staticmethod
+            def encode(text: str, *, allow_specials: bool = False) -> list[int]:
+                if allow_specials:
+                    raise ValueError("GPT-2 has no registered inline special syntax")
+                return tokenizer.encode(text, add_special_tokens=False)
+
+            @staticmethod
+            def decode(ids: list[int]) -> str:
+                return tokenizer.decode(
+                    ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+
+        return BoundGPT2Tokenizer()
+
     if provenance.get("kind") != "toast_tst":
         raise ValueError(
             "a bound custom tokenizer requires kind='toast_tst', got "

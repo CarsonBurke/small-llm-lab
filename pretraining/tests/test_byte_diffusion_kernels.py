@@ -72,6 +72,28 @@ def test_reference_argmax_uses_the_same_fp32_values_as_probabilities() -> None:
     assert argmax.item() == 0
 
 
+def test_forbidden_negative_infinity_logits_have_zero_mass_and_finite_entropy() -> None:
+    logits = torch.full((2, ATOMIC_OUTPUT_SIZE), -torch.inf)
+    logits[0, 17] = 0
+    logits[1, 3] = 1
+    logits[1, 9] = 1
+    entropy, argmax, confidence = categorical_entropy_argmax_confidence_reference(
+        logits
+    )
+    assert torch.isfinite(entropy).all()
+    torch.testing.assert_close(entropy, torch.tensor([0.0, math.log(2.0)]))
+    assert argmax.tolist() == [17, 3]
+    torch.testing.assert_close(confidence, torch.tensor([1.0, 0.5]))
+
+    sample, sampled_entropy, _, _ = (
+        categorical_sample_entropy_argmax_confidence_reference(
+            logits, torch.tensor([0.75, 0.75])
+        )
+    )
+    assert sample.tolist() == [17, 9]
+    torch.testing.assert_close(sampled_entropy, entropy)
+
+
 @pytest.mark.parametrize(
     "shape",
     [(2, 260), (2, 262), (2, 3, 17)],

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 from torch import Tensor
@@ -141,6 +141,174 @@ class CanvasSample:
     executed_nfe: int
 
 
+@dataclass(frozen=True)
+class BatchedCanvasSample:
+    ids: Tensor
+    active: Tensor
+    useful_nfe: Tensor
+    executed_nfe: int
+
+
+UnmaskingStrategy = Literal["confidence", "entropy_bounded", "fixed_quota"]
+
+
+def unmasking_quota_and_priority(
+    *,
+    strategy: UnmaskingStrategy,
+    entropy: Tensor,
+    confidence: Tensor,
+    samples: Tensor,
+    live: Tensor,
+    fixed_quota: Tensor,
+    force_resolve: bool,
+    confidence_threshold: float,
+    entropy_budget: float,
+    eot_id: int,
+) -> tuple[Tensor, Tensor]:
+    """Select the exact Fast-BLT reveal count and ranking on device."""
+
+    earlier_unresolved = live.to(torch.int32).cumsum(-1) - live.to(torch.int32)
+    eligible = live & ((samples != eot_id) | earlier_unresolved.eq(0))
+    eligible_count = eligible.sum(-1)
+    if strategy == "fixed_quota":
+        if force_resolve:
+            return live.sum(-1), entropy
+        return torch.minimum(fixed_quota, eligible_count), entropy
+    if strategy == "confidence":
+        qualifying = (eligible & confidence.ge(confidence_threshold)).sum(-1)
+        quota = torch.where(eligible_count > 0, qualifying.clamp_min(1), 0)
+        # The reveal kernel selects the lowest priority, so negative
+        # confidence reveals precisely the highest-confidence positions.
+        return quota, -confidence
+    if strategy == "entropy_bounded":
+        eligible_entropy = torch.where(
+            eligible, entropy, torch.full_like(entropy, torch.inf)
+        )
+        cumulative = eligible_entropy.sort(-1).values.cumsum(-1)
+        quota = cumulative.le(entropy_budget).sum(-1)
+        quota = torch.where(eligible_count > 0, quota.clamp_min(1), 0)
+        return torch.minimum(quota, eligible_count), entropy
+    raise ValueError(f"unknown unmasking strategy {strategy!r}")
+
+
+@torch.no_grad()
+def sample_absorbing_canvas_batched(
+    initial_ids: Tensor,
+    denoise: Callable[[Tensor], Tensor],
+    *,
+    steps: int,
+    mask_id: int,
+    eot_id: int,
+    gamma: float = 1.0,
+    generator: torch.Generator | None = None,
+    strategy: UnmaskingStrategy = "confidence",
+    confidence_threshold: float = 0.7,
+    entropy_budget: float = 1.0,
+    row_active: Tensor | None = None,
+    stochastic: bool = True,
+) -> BatchedCanvasSample:
+    """Vectorized Fast-BLT sampling with an independent decision per row.
+
+    Confidence and entropy-bounded modes implement Section 3.1.2 directly:
+    every qualifying position is revealed, with a one-position fallback. The
+    fixed polynomial quota is retained only as an explicitly named ablation.
+    ``steps`` is a hard NFE cap, so its final step resolves every live slot.
+    """
+
+    if initial_ids.ndim != 2 or initial_ids.dtype != torch.long:
+        raise ValueError("batched canvases must be int64 [batch, width]")
+    if strategy not in {"confidence", "entropy_bounded", "fixed_quota"}:
+        raise ValueError(f"unknown unmasking strategy {strategy!r}")
+    if not 0.0 < confidence_threshold <= 1.0:
+        raise ValueError("confidence threshold must lie in (0, 1]")
+    if entropy_budget < 0.0 or not math.isfinite(entropy_budget):
+        raise ValueError("entropy budget must be finite and nonnegative")
+    if row_active is None:
+        row_active = torch.ones(
+            initial_ids.shape[0], dtype=torch.bool, device=initial_ids.device
+        )
+    elif row_active.shape != initial_ids.shape[:1] or row_active.dtype != torch.bool:
+        raise ValueError("row_active must be one boolean per canvas")
+
+    ids = initial_ids.clone()
+    unresolved = ids.eq(mask_id) & row_active[:, None]
+    if strategy != "fixed_quota" and steps < initial_ids.shape[1]:
+        raise ValueError(
+            "paper-exact confidence/entropy sampling requires steps >= canvas width"
+        )
+    active = torch.ones_like(unresolved) & row_active[:, None]
+    useful = torch.zeros(
+        initial_ids.shape[0], dtype=torch.int64, device=initial_ids.device
+    )
+    executed = 0
+    target_remaining = remaining_schedule(initial_ids.shape[1], steps, gamma)[1:]
+    for step_index, target in enumerate(target_remaining):
+        live_before = unresolved & active
+        live_rows = live_before.any(-1)
+        if not bool(live_rows.any()):
+            break
+        base_quota = (live_before.sum(-1) - target).clamp_min(0)
+        if strategy == "fixed_quota" and not bool((base_quota > 0).any()):
+            continue
+        logits = denoise(ids)
+        if logits.shape[:2] != ids.shape:
+            raise ValueError("batched denoiser logits must align with canvases")
+        executed += 1
+        from .kernels import (
+            categorical_entropy_argmax_confidence,
+            categorical_sample_entropy_argmax_confidence,
+            reveal_low_entropy as fused_reveal,
+        )
+
+        if stochastic:
+            uniforms = torch.rand(
+                ids.shape,
+                device=ids.device,
+                generator=generator,
+                dtype=torch.float32,
+            )
+            samples, entropy, _, confidence = (
+                categorical_sample_entropy_argmax_confidence(logits, uniforms)
+            )
+        else:
+            entropy, samples, confidence = categorical_entropy_argmax_confidence(
+                logits
+            )
+        quota, priority = unmasking_quota_and_priority(
+            strategy=strategy,
+            entropy=entropy,
+            confidence=confidence,
+            samples=samples,
+            live=live_before,
+            fixed_quota=base_quota,
+            force_resolve=step_index + 1 == steps,
+            confidence_threshold=confidence_threshold,
+            entropy_budget=entropy_budget,
+            eot_id=eot_id,
+        )
+        ids, unresolved, active, revealed = fused_reveal(
+            ids,
+            samples,
+            priority,
+            unresolved,
+            active,
+            quota,
+            eot_id=eot_id,
+            allow_simultaneous_eot=(
+                strategy == "fixed_quota" and step_index + 1 == steps
+            ),
+        )
+        useful += (revealed & live_before).any(-1)
+    if bool((unresolved & active).any()):
+        raise RuntimeError("absorbing schedule failed to resolve a live canvas")
+    return BatchedCanvasSample(
+        ids=ids,
+        active=active,
+        useful_nfe=useful,
+        executed_nfe=executed,
+    )
+
+
 @torch.no_grad()
 def sample_absorbing_canvas(
     initial_ids: Tensor,
@@ -151,70 +319,37 @@ def sample_absorbing_canvas(
     eot_id: int,
     gamma: float = 1.0,
     generator: torch.Generator | None = None,
-    adaptive_confidence: float | None = None,
-    min_steps: int = 1,
+    strategy: UnmaskingStrategy = "confidence",
+    confidence_threshold: float = 0.7,
+    entropy_budget: float = 1.0,
 ) -> CanvasSample:
-    """Absorbing sampler with fixed quotas and optional adaptive final reveal."""
+    """Single-canvas adapter around the production batched sampler."""
 
-    if adaptive_confidence is not None and not 0.0 < adaptive_confidence <= 1.0:
-        raise ValueError("adaptive confidence must lie in (0, 1]")
-    if not 1 <= min_steps <= steps:
-        raise ValueError("min_steps must lie in [1, steps]")
+    if initial_ids.ndim != 1 or initial_ids.dtype != torch.long:
+        raise ValueError("canvas must be int64 [width]")
 
-    ids = initial_ids.clone()
-    unresolved = ids.eq(mask_id)
-    active = torch.ones_like(unresolved)
-    quotas = reveal_quotas(int(unresolved.sum()), steps, gamma)
-    useful = 0
-    executed = 0
-    for step_index, quota in enumerate(quotas):
-        live_before = unresolved & active
-        if not bool(live_before.any()):
-            break
-        if quota == 0 and adaptive_confidence is None:
-            continue
-        logits = denoise(ids)
-        executed += 1
-        if adaptive_confidence is not None and step_index + 1 >= min_steps:
-            confidence = logits.float().softmax(-1).amax(-1)
-            if bool((confidence[live_before] >= adaptive_confidence).all()):
-                quota = int(live_before.sum())
-        if quota and bool(live_before.any()):
-            uniforms = torch.rand(
-                ids.shape,
-                device=ids.device,
-                generator=generator,
-                dtype=torch.float32,
-            )
-            from .kernels import (
-                categorical_sample_entropy_argmax_confidence,
-                reveal_low_entropy as fused_reveal,
-            )
+    def batched_denoise(ids: Tensor) -> Tensor:
+        logits = denoise(ids[0])
+        if logits.shape[:1] != initial_ids.shape:
+            raise ValueError("denoiser logits must align with the canvas")
+        return logits[None]
 
-            samples, entropy, _, _ = categorical_sample_entropy_argmax_confidence(
-                logits, uniforms
-            )
-            canvas, next_unresolved, next_active, _ = fused_reveal(
-                ids[None],
-                samples[None],
-                entropy[None],
-                unresolved[None],
-                active[None],
-                quota,
-                eot_id=eot_id,
-            )
-            ids, unresolved, active = (
-                canvas[0],
-                next_unresolved[0],
-                next_active[0],
-            )
-            if bool((live_before & ~unresolved).any()):
-                useful += 1
-    if bool(unresolved.any()):
-        raise RuntimeError("absorbing schedule failed to resolve the canvas")
+    sample = sample_absorbing_canvas_batched(
+        initial_ids[None],
+        batched_denoise,
+        steps=steps,
+        mask_id=mask_id,
+        eot_id=eot_id,
+        gamma=gamma,
+        generator=generator,
+        strategy=strategy,
+        confidence_threshold=confidence_threshold,
+        entropy_budget=entropy_budget,
+        stochastic=True,
+    )
     return CanvasSample(
-        ids=ids,
-        active=active,
-        useful_nfe=useful,
-        executed_nfe=executed,
+        ids=sample.ids[0],
+        active=sample.active[0],
+        useful_nfe=int(sample.useful_nfe[0]),
+        executed_nfe=sample.executed_nfe,
     )

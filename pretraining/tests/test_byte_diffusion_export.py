@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import asdict
+import hashlib
 import json
+from pathlib import Path
 import struct
 
 import pytest
@@ -20,11 +23,35 @@ from pretraining.byte_diffusion.export import (
     encode_float16,
     enforce_parameter_cap,
     load_artifact,
+    load_embedded_entropy_patcher,
     parse_artifact,
     quantize_int8,
     quantize_int4,
 )
 from pretraining.byte_diffusion.data import AtomicIdManifest
+from pretraining.byte_diffusion.duo_model import DuoModel
+from pretraining.byte_diffusion.patching import (
+    CausalEntropyPatcher,
+    EntropyPatchConfig,
+    HashedNgramEntropyConfig,
+    HashedNgramEntropyModel,
+)
+from pretraining.byte_diffusion.variable_patching import (
+    ENTROPY_DATASET_SCHEMA,
+    PATCHING_POLICY_SCHEMA,
+)
+from scripts.export_byte_diffusion import checkpoint_patcher_artifact
+from scripts.export_byte_duo import cached_inference_smoke
+
+
+def _entropy_patcher_artifact(*, max_patch_size: int = 4) -> bytes:
+    patcher = CausalEntropyPatcher(
+        HashedNgramEntropyModel(
+            HashedNgramEntropyConfig(vocab_size=261, table_size=8)
+        ),
+        EntropyPatchConfig(max_patch_size=max_patch_size),
+    )
+    return patcher.to_bytes()
 
 
 def test_nibble_roundtrip_odd_tensor_has_declared_error_bound() -> None:
@@ -94,6 +121,158 @@ def test_small_artifact_strict_roundtrip() -> None:
         assert torch.isfinite(parameter).all(), name
 
 
+def test_entropy_artifact_is_self_contained_counted_and_hash_authenticated() -> None:
+    config = ByteDiffusionConfig.tiny()
+    model = ByteDiffusionModel(config)
+    patcher_artifact = _entropy_patcher_artifact(max_patch_size=5)
+    fixed = build_artifact(model, config, code_bytes=1234)
+    assert fixed == build_artifact(
+        model, config, code_bytes=1234, entropy_patcher=None
+    )
+    artifact = build_artifact(
+        model,
+        config,
+        code_bytes=1234,
+        entropy_patcher=patcher_artifact,
+    )
+    report = artifact_size_report(
+        model,
+        config,
+        code_bytes=1234,
+        entropy_patcher=patcher_artifact,
+    )
+    metadata, _ = parse_artifact(artifact)
+    info = metadata["entropy_patcher"]
+
+    assert "entropy_patcher" not in parse_artifact(fixed)[0]
+    assert len(artifact) == report.artifact_bytes
+    assert report.complete_bytes == len(artifact) + 1234
+    assert len(artifact) > len(fixed) + len(patcher_artifact)
+    assert info["payload_bytes"] == len(patcher_artifact)
+    assert info["sha256"] == hashlib.sha256(patcher_artifact).hexdigest()
+    assert info["max_patch_size"] == 5
+    restored = load_embedded_entropy_patcher(artifact)
+    assert restored is not None
+    assert restored.sha256 == hashlib.sha256(patcher_artifact).hexdigest()
+
+
+def test_entropy_artifact_rejects_patcher_tampering_and_counts_it_against_cap() -> None:
+    config = ByteDiffusionConfig.tiny()
+    model = ByteDiffusionModel(config)
+    patcher_artifact = _entropy_patcher_artifact()
+    artifact = build_artifact(model, config, entropy_patcher=patcher_artifact)
+    metadata, _ = parse_artifact(artifact)
+    info = metadata["entropy_patcher"]
+    metadata_bytes = struct.unpack_from("<Q", artifact, len(MAGIC))[0]
+    payload_start = len(MAGIC) + 8 + metadata_bytes
+    corrupted = bytearray(artifact)
+    corrupted[payload_start + int(info["payload_offset"])] ^= 1
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        parse_artifact(bytes(corrupted))
+
+    report = artifact_size_report(
+        model, config, entropy_patcher=patcher_artifact
+    )
+    with pytest.raises(ValueError, match="exceeding"):
+        build_artifact(
+            model,
+            config,
+            code_bytes=ARTIFACT_CAP_BYTES - report.artifact_bytes + 1,
+            entropy_patcher=patcher_artifact,
+        )
+
+
+def test_final_entropy_artifact_requires_matching_embedded_patcher() -> None:
+    config = ByteDiffusionConfig.tiny()
+    model = ByteDiffusionModel(config)
+    patcher_artifact = _entropy_patcher_artifact()
+    patcher_sha256 = hashlib.sha256(patcher_artifact).hexdigest()
+    metrics = {
+        "bpb": 1.23,
+        "literal_bytes": 100,
+        "encoding_plan": {
+            "policy": "uniform_int4",
+            "group_size": 64,
+            "fallbacks": {},
+        },
+    }
+    provenance = {
+        "patching_policy": "causal_entropy_v1",
+        "entropy_patcher_sha256": patcher_sha256,
+    }
+
+    with pytest.raises(ValueError, match="require an embedded"):
+        build_artifact(
+            model,
+            config,
+            post_quantization_metrics=metrics,
+            provenance=provenance,
+            require_evaluation=True,
+        )
+    with pytest.raises(ValueError, match="provenance disagrees"):
+        build_artifact(
+            model,
+            config,
+            post_quantization_metrics=metrics,
+            provenance={**provenance, "entropy_patcher_sha256": "0" * 64},
+            entropy_patcher=patcher_artifact,
+            require_evaluation=True,
+        )
+    artifact = build_artifact(
+        model,
+        config,
+        post_quantization_metrics=metrics,
+        provenance=provenance,
+        entropy_patcher=patcher_artifact,
+        require_evaluation=True,
+    )
+    assert load_embedded_entropy_patcher(artifact) is not None
+
+
+def test_export_loads_patcher_only_from_checkpoint_pinned_dataset(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    patcher_artifact = _entropy_patcher_artifact()
+    patcher = CausalEntropyPatcher.from_bytes(patcher_artifact)
+    artifact_path = dataset / "entropy-patcher.bdpatch"
+    artifact_path.write_bytes(patcher_artifact)
+    manifest = {
+        "schema": ENTROPY_DATASET_SCHEMA,
+        "packing": {"patch_stride": None},
+        "patching": {
+            "schema": PATCHING_POLICY_SCHEMA,
+            "name": "causal_entropy_v1",
+            "patcher_artifact": {
+                "path": artifact_path.name,
+                "sha256": hashlib.sha256(patcher_artifact).hexdigest(),
+                "bytes": len(patcher_artifact),
+            },
+            "entropy_model_config": asdict(patcher.model.config),
+            "boundary_config": asdict(patcher.config),
+            "max_patch_size": patcher.config.max_patch_size,
+        },
+    }
+    payload_sha256 = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest["payload_sha256"] = payload_sha256
+    (dataset / "manifest.json").write_text(json.dumps(manifest))
+    checkpoint = {
+        "run_contract": {
+            "patching_policy": "causal_entropy_v1",
+            "corruption": {"canvas_length": 4},
+        },
+        "dataset_provenance": {"payload_sha256": payload_sha256},
+    }
+
+    assert checkpoint_patcher_artifact(checkpoint, dataset) == patcher_artifact
+    checkpoint["dataset_provenance"]["payload_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="checkpoint-pinned"):
+        checkpoint_patcher_artifact(checkpoint, dataset)
+
+
 def test_mixed_artifact_records_and_exactly_decodes_each_encoding() -> None:
     config = ByteDiffusionConfig.tiny(
         ngram_enabled=True,
@@ -111,7 +290,7 @@ def test_mixed_artifact_records_and_exactly_decodes_each_encoding() -> None:
     assert len(artifact) == report.artifact_bytes
     assert metadata["encoding_policy"] == "mixed_sensitive"
     assert tensors["embedding.weight"].encoding == "float16"
-    assert tensors["mode_embedding.weight"].encoding == "float16"
+    assert "mode_embedding.weight" not in tensors
     assert tensors["output.weight"].encoding == "float16"
     assert tensors["encoder.0.attention_norm.weight"].encoding == "float16"
     assert tensors["decoder.0.condition_gate"].encoding == "float16"
@@ -187,7 +366,7 @@ def test_production_artifact_size_accounting_compares_uniform_and_mixed(
         assert mixed.encoding_parameter_counts["group_int8"] == 524_288
         assert mixed.encoding_fallbacks == {}
     else:
-        assert mixed.parameter_count == 29_403_906
+        assert mixed.parameter_count == 29_403_138
         assert mixed.encoding_parameter_counts["group_int8"] == 0
         assert mixed.encoding_fallbacks == {
             "ngrams.table.weight": "group_int8_to_group_int4_artifact_budget"
@@ -271,6 +450,83 @@ def test_final_artifact_binds_atomic_manifest_and_dequantized_metrics() -> None:
     assert metadata["atomic_manifest"] == manifest.to_dict()
     assert metadata["post_quantization_metrics"] == metrics
     assert metadata["provenance"] == provenance
+
+
+def test_duo_export_cached_inference_smoke_matches_full_forward() -> None:
+    result = cached_inference_smoke(DuoModel(ByteDiffusionConfig.tiny()).eval())
+
+    assert result["finite"] is True
+    assert result["full_vs_cached_max_abs_error"] < 1e-5
+
+
+def test_final_duo_artifact_requires_its_conditional_canvas_metric_not_fake_bpb() -> None:
+    config = ByteDiffusionConfig.tiny()
+    model = DuoModel(config)
+    provenance = {
+        "architecture": "byte_duo_uniform_state_diffusion",
+        "checkpoint_step": 2000,
+        "dataset_payload_sha256": "b" * 64,
+    }
+    metrics = {
+        "conditional_canvas_nelbo_nats_per_atom": 1.75,
+        "targets": 4096,
+        "quantization_delta_bits_per_atom": 0.04,
+        "max_quantization_delta_bits_per_atom": 0.05,
+        "cached_inference_smoke": {
+            "finite": True,
+            "full_vs_cached_max_abs_error": 0.0,
+        },
+        "encoding_plan": {
+            "policy": "uniform_int4",
+            "group_size": 64,
+            "fallbacks": {},
+        },
+    }
+    artifact = build_artifact(
+        model,
+        config,
+        post_quantization_metrics=metrics,
+        provenance=provenance,
+        require_evaluation=True,
+    )
+    metadata, _ = parse_artifact(artifact)
+    assert metadata["post_quantization_metrics"] == metrics
+    with pytest.raises(ValueError, match="conditional-canvas"):
+        build_artifact(
+            model,
+            config,
+            post_quantization_metrics={
+                **metrics,
+                "conditional_canvas_nelbo_nats_per_atom": float("nan"),
+            },
+            provenance=provenance,
+            require_evaluation=True,
+        )
+    with pytest.raises(ValueError, match="degradation threshold"):
+        build_artifact(
+            model,
+            config,
+            post_quantization_metrics={
+                **metrics,
+                "quantization_delta_bits_per_atom": 0.051,
+            },
+            provenance=provenance,
+            require_evaluation=True,
+        )
+    with pytest.raises(ValueError, match="cached inference parity"):
+        build_artifact(
+            model,
+            config,
+            post_quantization_metrics={
+                **metrics,
+                "cached_inference_smoke": {
+                    "finite": True,
+                    "full_vs_cached_max_abs_error": 1e-3,
+                },
+            },
+            provenance=provenance,
+            require_evaluation=True,
+        )
 
 
 def test_parameter_cap_fails_closed() -> None:

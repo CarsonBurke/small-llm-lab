@@ -38,10 +38,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
+from torch._dynamo.utils import counters as dynamo_counters
 
 from pretraining.byte_accounting import load_bound_tokenizer
-from postraining.latent_thought import LatentThoughtModel
+from postraining.latent_thought import DecodeRangeMask, LatentThoughtModel
 from postraining.model_io import load_model
 
 # The canonical OpenAI release, as cached by `datasets`. The repository's own
@@ -228,7 +230,9 @@ def greedy_generate(
     stop_check_every: int,
     stops: tuple[str, ...],
     decode,
-) -> tuple[list[list[int]], dict[str, int]]:
+    max_new_bytes: int | None = None,
+    padded_prompt_width: int | None = None,
+) -> tuple[list[list[int]], dict[str, object]]:
     """Greedy continuation through one cached prefill and token steps.
 
     Prompts are left padded for one batched prefill. The key-valid mask keeps
@@ -241,27 +245,52 @@ def greedy_generate(
     if not prompts or any(not prompt for prompt in prompts):
         raise ValueError("generation prompts must be nonempty")
     batch = len(prompts)
-    prompt_width = max(map(len, prompts))
+    required_prompt_width = max(map(len, prompts))
+    prompt_width = required_prompt_width if padded_prompt_width is None else padded_prompt_width
+    if prompt_width < required_prompt_width:
+        raise ValueError("padded prompt width is shorter than a generation prompt")
     width = prompt_width + max_new_tokens
-    buffer = torch.full(
-        (batch, prompt_width), eot_id, dtype=torch.long, device=device
-    )
-    key_valid = torch.zeros(
-        (batch, prompt_width), dtype=torch.bool, device=device
-    )
+    # Pack once in host memory and issue one transfer. Constructing one CUDA
+    # tensor per row serializes the prefill setup on the Python interpreter.
+    host_buffer = np.full((batch, prompt_width), eot_id, dtype=np.int64)
+    host_valid = np.zeros((batch, prompt_width), dtype=np.bool_)
     for row, ids in enumerate(prompts):
         start = prompt_width - len(ids)
-        buffer[row, start:] = torch.tensor(ids, dtype=torch.long, device=device)
-        key_valid[row, start:] = True
+        host_buffer[row, start:] = ids
+        host_valid[row, start:] = True
+    buffer = torch.from_numpy(host_buffer).to(device=device, non_blocking=True)
+    key_valid = torch.from_numpy(host_valid).to(device=device, non_blocking=True)
 
     finished = torch.zeros(batch, dtype=torch.bool, device=device)
-    generated: list[list[int]] = [[] for _ in range(batch)]
-    caches = model.make_generation_cache(
-        batch, width, device, dtype=torch.bfloat16 if device.type == "cuda" else None
+    generated_ids = torch.full(
+        (batch, max_new_tokens), eot_id, dtype=torch.long, device=device
     )
+    generated_lengths = torch.zeros(batch, dtype=torch.long, device=device)
+    checked_lengths = np.zeros(batch, dtype=np.int64)
+    termination_reasons = np.full(batch, "", dtype=object)
+    eot_stopped = torch.zeros(batch, dtype=torch.bool, device=device)
+    decode_mask = None
+    decode_starts = None
+    if device.type == "cuda":
+        cache_width = -(-width // DecodeRangeMask.DEFAULT_BLOCK_SIZE) * (
+            DecodeRangeMask.DEFAULT_BLOCK_SIZE
+        )
+        caches = model.make_static_generation_cache(
+            batch,
+            cache_width,
+            device,
+            dtype=torch.bfloat16,
+        )
+        decode_mask = DecodeRangeMask(batch, cache_width, device)
+        decode_starts = torch.from_numpy(
+            prompt_width - np.asarray(tuple(map(len, prompts)), dtype=np.int64)
+        ).to(device)
+    else:
+        caches = model.make_generation_cache(batch, width, device, dtype=None)
     output = model.prefill(buffer, caches, key_valid)
     logits = output.logits
     decode_steps = 0
+    position_index = torch.empty((), dtype=torch.long, device=device)
     for step in range(max_new_tokens):
         # Ids the corpus never made a target carry unconstrained logits, and
         # argmax breaks ties toward the low id. That covers the padding above
@@ -269,34 +298,167 @@ def greedy_generate(
         # whose projection rows are bit-identical to the padding.
         logits[:, blocked_ids] = float("-inf")
         chosen = logits.argmax(-1).to(torch.long)
-        # End-of-text terminates the row and is not part of its answer.
-        stopping = chosen == eot_id
-        for row, token in enumerate(chosen.tolist()):
-            if not finished[row] and not stopping[row]:
-                generated[row].append(token)
-        finished |= stopping
-        if bool(finished.all()):
-            break
-        if step % stop_check_every == stop_check_every - 1:
+        # Keep generated state on device. The old implementation converted
+        # `chosen` to a Python list and decoded every live row after every
+        # token, forcing a CUDA synchronization and tokenizer round trip per
+        # step. Host inspection now happens only at the requested stop-check
+        # cadence (and once at the final step).
+        emitting = (~finished) & (chosen != eot_id)
+        generated_ids[:, step] = torch.where(emitting, chosen, eot_id)
+        generated_lengths += emitting
+        newly_eot = (~finished) & (chosen == eot_id)
+        eot_stopped |= newly_eot
+        finished |= newly_eot
+
+        check_now = (
+            step % stop_check_every == stop_check_every - 1
+            or step + 1 == max_new_tokens
+            or device.type != "cuda" and bool(finished.all())
+        )
+        if check_now:
+            host_ids = generated_ids[:, : step + 1].detach().cpu().numpy()
+            host_lengths = generated_lengths.detach().cpu().numpy()
+            host_finished = finished.detach().cpu().numpy()
+            host_eot = eot_stopped.detach().cpu().numpy()
             for row in range(batch):
-                if not finished[row]:
-                    text = decode(generated[row])
-                    if any(stop in text for stop in stops):
-                        finished[row] = True
-            if bool(finished.all()):
+                current = int(host_lengths[row])
+                if host_eot[row] and not termination_reasons[row]:
+                    termination_reasons[row] = "eot"
+                if host_finished[row] and current == int(checked_lengths[row]):
+                    continue
+
+                # TST token byte lengths are context dependent, so an exact
+                # semantic byte cap cannot use a per-token lookup. At most
+                # `stop_check_every` new prefixes are decoded here, outside
+                # the GPU token loop, to retain exact no-overshoot semantics.
+                if max_new_bytes is not None:
+                    safe = int(checked_lengths[row])
+                    for length in range(safe + 1, current + 1):
+                        candidate = decode(host_ids[row, :length].tolist())
+                        byte_count = len(candidate.encode("utf-8"))
+                        if byte_count > max_new_bytes:
+                            current = safe
+                            host_finished[row] = True
+                            termination_reasons[row] = "byte_cap"
+                            break
+                        safe = length
+                        if byte_count == max_new_bytes:
+                            current = safe
+                            host_finished[row] = True
+                            termination_reasons[row] = "byte_cap"
+                            break
+
+                text = decode(host_ids[row, :current].tolist())
+                if any(stop in text for stop in stops):
+                    host_finished[row] = True
+                    if not termination_reasons[row]:
+                        termination_reasons[row] = "text_stop"
+                checked_lengths[row] = current
+                host_lengths[row] = current
+
+            generated_lengths.copy_(torch.from_numpy(host_lengths).to(device))
+            finished.copy_(torch.from_numpy(host_finished).to(device))
+            if bool(host_finished.all()):
                 break
         if step + 1 < max_new_tokens:
             # Finished lanes feed EOT into their private caches. Those caches
             # are never read again; live lanes remain exactly independent.
             chosen = torch.where(finished, eot_id, chosen)
-            output = model.token_step(chosen, caches, prompt_width + step)
+            position_index.fill_(prompt_width + step)
+            block_mask = (
+                None
+                if decode_mask is None
+                else decode_mask.build(
+                    decode_starts,
+                    position_index + 1,
+                    live=~finished,
+                )
+            )
+            if block_mask is None:
+                output = model.token_step(chosen, caches, position_index)
+            else:
+                output = model.token_step(
+                    chosen,
+                    caches,
+                    position_index,
+                    block_mask=block_mask,
+                )
             logits = output.logits
             decode_steps += 1
+    host_ids = generated_ids.detach().cpu().numpy()
+    host_lengths = generated_lengths.detach().cpu().numpy()
+    generated = [
+        host_ids[row, : int(host_lengths[row])].tolist() for row in range(batch)
+    ]
+    realized_bytes = tuple(len(decode(ids).encode("utf-8")) for ids in generated)
+    termination_reasons[termination_reasons == ""] = "token_safety_cap"
     return generated, {
         "prefill_forwards": 1,
         "decode_forwards": decode_steps,
         "model_forwards": 1 + decode_steps,
+        "termination_reasons": tuple(map(str, termination_reasons)),
+        "realized_bytes": realized_bytes,
     }
+
+
+@torch.no_grad()
+def warm_generation_shapes(
+    model: LatentThoughtModel,
+    prompts: list[list[int]],
+    *,
+    max_new_tokens: int,
+    eot_id: int,
+    device: torch.device,
+    padded_prompt_width: int | None = None,
+) -> None:
+    """Compile/warm one prefill and one token-step cache geometry."""
+
+    batch = len(prompts)
+    required_prompt_width = max(map(len, prompts))
+    prompt_width = required_prompt_width if padded_prompt_width is None else padded_prompt_width
+    if prompt_width < required_prompt_width:
+        raise ValueError("padded prompt width is shorter than a warmup prompt")
+    host_ids = np.full((batch, prompt_width), eot_id, dtype=np.int64)
+    host_valid = np.zeros((batch, prompt_width), dtype=np.bool_)
+    for row, ids in enumerate(prompts):
+        start = prompt_width - len(ids)
+        host_ids[row, start:] = ids
+        host_valid[row, start:] = True
+    ids = torch.from_numpy(host_ids).to(device)
+    valid = torch.from_numpy(host_valid).to(device)
+    width = prompt_width + max_new_tokens
+    if device.type == "cuda":
+        cache_width = -(-width // DecodeRangeMask.DEFAULT_BLOCK_SIZE) * (
+            DecodeRangeMask.DEFAULT_BLOCK_SIZE
+        )
+        caches = model.make_static_generation_cache(
+            batch, cache_width, device, dtype=torch.bfloat16
+        )
+        decode_mask = DecodeRangeMask(batch, cache_width, device)
+        decode_starts = torch.from_numpy(
+            prompt_width - np.asarray(tuple(map(len, prompts)), dtype=np.int64)
+        ).to(device)
+    else:
+        caches = model.make_generation_cache(batch, width, device, dtype=None)
+        decode_mask = None
+    output = model.prefill(ids, caches, valid)
+    # Use a known in-vocabulary ordinary token so the step is exercised even
+    # when the untrained checkpoint would greedily emit EOT during warmup.
+    token = torch.zeros(batch, dtype=torch.long, device=device)
+    position = torch.full((), prompt_width, dtype=torch.long, device=device)
+    block_mask = (
+        None
+        if decode_mask is None
+        else decode_mask.build(decode_starts, position + 1)
+    )
+    if block_mask is None:
+        model.token_step(token, caches, position)
+    else:
+        model.token_step(token, caches, position, block_mask=block_mask)
+
+
+def counter_total(name: str) -> int:
+    return int(sum(dynamo_counters[name].values()))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -320,9 +482,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "than one",
     )
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=1_024,
+        help="token safety ceiling; semantic comparison should use --max-new-bytes",
+    )
+    parser.add_argument(
+        "--max-new-bytes",
+        type=int,
+        help="Optional semantic response-byte cap, checked at stop intervals.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--stop-check-every", type=int, default=8)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile the prefill and recurrent token-step cores (default: on)",
+    )
     parser.add_argument(
         "--keep-calculator-annotations",
         action="store_true",
@@ -343,6 +521,8 @@ def main() -> None:
     strip_calculator = not args.keep_calculator_annotations
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be positive; omit it to score everything")
+    if args.max_new_bytes is not None and args.max_new_bytes < 1:
+        raise ValueError("--max-new-bytes must be positive")
     output = Path(args.output) if args.output else None
     if output is not None and output.exists():
         raise ValueError(
@@ -352,6 +532,9 @@ def main() -> None:
 
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = dict(payload["model_config"])
+    checkpoint_data_provenance = config.pop(
+        "pretraining_data_provenance", payload.get("dataset_provenance")
+    )
     provenance = config.get("tokenizer_provenance")
     if not provenance:
         raise ValueError(
@@ -359,8 +542,32 @@ def main() -> None:
             "cannot be tied to a vocabulary"
         )
     tokenizer = load_bound_tokenizer(provenance)
-    backbone = load_model(args.checkpoint, device, payload=payload).eval()
+    load_payload = {**payload, "model_config": config}
+    backbone = load_model(args.checkpoint, device, payload=load_payload).eval()
     model = LatentThoughtModel(backbone).to(device).eval()
+    if args.compile:
+        # Compile the tensor-only surfaces, not the small StepOutput wrappers.
+        # A tensor position keeps the recurrent graph independent of token
+        # index. FlexAttention decode only lowers for static shapes (the
+        # DecodeRangeMask contract says this explicitly), so compile the full
+        # and final partial batches as separate static specializations. Asking
+        # Dynamo for symbolic batch/KV dimensions leaves Flex with no valid
+        # kernel choices on current PyTorch.
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64
+        )
+        model.prefill_core = torch.compile(
+            model.prefill_core,
+            mode="max-autotune-no-cudagraphs",
+            fullgraph=False,
+            dynamic=False,
+        )
+        model.step_core = torch.compile(
+            model.step_core,
+            mode="max-autotune-no-cudagraphs",
+            fullgraph=True,
+            dynamic=False,
+        )
 
     specials = list(range(len(tokenizer.spec.specials)))
     blocked = sorted(
@@ -409,19 +616,51 @@ def main() -> None:
                     f"trained at {train_seq_len}; the trunk would extrapolate"
                 )
 
-            predictions: list[str | None] = []
-            answered: list[bool] = []
-            transcripts: list[str] = []
-            raw_transcripts: list[str] = []
+            order = np.argsort(np.asarray(prompt_lengths), kind="stable")
+            predictions: list[str | None] = [None] * len(prompts)
+            answered: list[bool] = [False] * len(prompts)
+            transcripts: list[str] = [""] * len(prompts)
+            raw_transcripts: list[str] = [""] * len(prompts)
+            terminations: list[str] = [""] * len(prompts)
+            realized_bytes = np.zeros(len(prompts), dtype=np.int64)
             native_work = {
                 "prefill_forwards": 0,
                 "decode_forwards": 0,
                 "model_forwards": 0,
             }
             generated_token_count = 0
+            full_indices = order[: args.batch_size]
+            tail_size = len(prompts) % args.batch_size
+            warm_index_groups = [full_indices]
+            if tail_size and tail_size != len(full_indices):
+                warm_index_groups.append(order[-tail_size:])
+            dynamo_counters.clear()
+            if args.compile:
+                for warm_indices in warm_index_groups:
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=device.type == "cuda",
+                    ):
+                        warm_generation_shapes(
+                            model,
+                            [prompts[int(index)] for index in warm_indices],
+                            max_new_tokens=args.max_new_tokens,
+                            eot_id=tokenizer.eot_id,
+                            device=device,
+                            padded_prompt_width=max(prompt_lengths),
+                        )
+                torch.cuda.synchronize(device)
+            warm_compile_evidence = {
+                "unique_graphs": int(dynamo_counters["stats"]["unique_graphs"]),
+                "graph_breaks": counter_total("graph_break"),
+            }
+            dynamo_counters.clear()
             generation_started = time.perf_counter()
-            for start in range(0, len(prompts), args.batch_size):
-                chunk = prompts[start : start + args.batch_size]
+            scored = 0
+            for start in range(0, len(order), args.batch_size):
+                indices = order[start : start + args.batch_size]
+                chunk = [prompts[int(index)] for index in indices]
                 with torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,
@@ -437,24 +676,40 @@ def main() -> None:
                         stop_check_every=args.stop_check_every,
                         stops=fmt.stops,
                         decode=decode,
+                        max_new_bytes=args.max_new_bytes,
+                        padded_prompt_width=max(prompt_lengths),
                     )
-                for name, value in chunk_work.items():
-                    native_work[name] += value
+                for name in native_work:
+                    native_work[name] += int(chunk_work[name])
                 generated_token_count += sum(map(len, outputs))
-                for ids in outputs:
+                chunk_terminations = chunk_work["termination_reasons"]
+                chunk_realized_bytes = chunk_work["realized_bytes"]
+                for local_index, (original_index, ids) in enumerate(
+                    zip(indices, outputs, strict=True)
+                ):
                     raw = decode(ids)
                     text = truncate_at_stop(raw, fmt.stops)
-                    raw_transcripts.append(raw)
-                    transcripts.append(text)
-                    answered.append(fmt.delimiter in text)
-                    predictions.append(extract_prediction(text, fmt))
+                    index = int(original_index)
+                    raw_transcripts[index] = raw
+                    transcripts[index] = text
+                    answered[index] = fmt.delimiter in text
+                    predictions[index] = extract_prediction(text, fmt)
+                    terminations[index] = str(chunk_terminations[local_index])
+                    realized_bytes[index] = int(chunk_realized_bytes[local_index])
+                scored += len(indices)
                 print(
                     f"shots={shots} seed={seed} "
-                    f"scored {len(predictions)}/{len(prompts)}",
+                    f"scored {scored}/{len(prompts)}",
                     flush=True,
                 )
 
+            torch.cuda.synchronize(device)
             generation_seconds = time.perf_counter() - generation_started
+            measured_compile_evidence = {
+                "unique_graphs": int(dynamo_counters["stats"]["unique_graphs"]),
+                "recompiles": counter_total("recompiles"),
+                "graph_breaks": counter_total("graph_break"),
+            }
 
             correct = sum(
                 1
@@ -479,6 +734,21 @@ def main() -> None:
                 "max_prompt_tokens": max(prompt_lengths),
                 "generation_seconds": generation_seconds,
                 "generated_tokens": generated_token_count,
+                "generated_bytes": sum(
+                    len(text.encode("utf-8")) for text in raw_transcripts
+                ),
+                "termination_counts": {
+                    reason: terminations.count(reason)
+                    for reason in sorted(set(terminations))
+                },
+                "realized_bytes": {
+                    "minimum": int(realized_bytes.min()),
+                    "mean": float(realized_bytes.mean()),
+                    "maximum": int(realized_bytes.max()),
+                },
+                "compiled_generation": args.compile,
+                "warm_compile_evidence": warm_compile_evidence,
+                "measured_compile_evidence": measured_compile_evidence,
                 **native_work,
                 "samples": [
                     {
@@ -487,16 +757,18 @@ def main() -> None:
                         "prediction": p,
                         "answer": t,
                         "raw_generation": r,
+                        "termination": terminations[index],
+                        "generated_bytes": int(realized_bytes[index]),
                     }
-                    for q, g, p, t, r in list(
-                        zip(
+                    for index, (q, g, p, t, r) in enumerate(
+                        list(zip(
                             test["question"],
                             gold,
                             predictions,
                             transcripts,
                             raw_transcripts,
-                        )
-                    )[: args.samples]
+                        ))[: args.samples]
+                    )
                 ],
             }
             print(
@@ -511,13 +783,21 @@ def main() -> None:
     }
     summary = {
         "checkpoint": str(args.checkpoint),
+        "checkpoint_sha256": sha256(Path(args.checkpoint)),
         "completed_steps": payload.get("completed_steps"),
+        "checkpoint_architecture": payload.get("architecture"),
+        "checkpoint_data_path": payload.get("model_config", {}).get(
+            "pretraining_data_path"
+        ),
+        "checkpoint_data_provenance": checkpoint_data_provenance,
         "tokenizer": provenance["name"],
         "prompt_format": fmt.name,
         "gsm8k_train_sha256": sha256(TRAIN_PARQUET),
         "gsm8k_test_sha256": sha256(TEST_PARQUET),
         "seeds": seeds,
         "max_new_tokens": args.max_new_tokens,
+        "max_new_bytes": args.max_new_bytes,
+        "compiled_generation": args.compile,
         "strip_calculator_annotations": strip_calculator,
         "implementation_maturity": "incremental_kv_kda_cache",
         "mean_exact_match_by_shots": {

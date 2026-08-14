@@ -5,6 +5,7 @@ import torch
 
 from pretraining.byte_diffusion import ByteDiffusionConfig, ByteDiffusionModel, ModelMode
 from pretraining.byte_diffusion.layers import (
+    PatchPool,
     RMSNorm,
     pack_rows,
     packed_sequence_offsets,
@@ -12,6 +13,23 @@ from pretraining.byte_diffusion.layers import (
     unpack_rows,
     unpack_valid,
 )
+
+
+def test_ragged_patch_pool_matches_padded_reference() -> None:
+    torch.manual_seed(5)
+    pool = PatchPool(local_dim=8, global_dim=16, heads=2, stride=4)
+    packed = torch.randn(7, 8, requires_grad=True)
+    cu = torch.tensor([0, 3, 7], dtype=torch.int32)
+    ragged = pool.forward_packed(packed, cu, max_patch_size=4)
+
+    padding = torch.randn(1, 8)
+    padded = torch.cat((packed[:3], padding, packed[3:]))[None]
+    valid = torch.tensor([[True, True, True, False, True, True, True, True]])
+    reference = pool(padded, valid)[0]
+
+    torch.testing.assert_close(ragged, reference, rtol=1e-6, atol=1e-7)
+    ragged.square().mean().backward()
+    assert packed.grad is not None and torch.isfinite(packed.grad).all()
 
 
 def test_rms_norm_preserves_low_precision_activation_dtype() -> None:
@@ -87,11 +105,31 @@ def test_packed_causal_logits_match_padded_valid_rows_exactly() -> None:
 
 def test_production_parameter_count_and_atomic_shapes() -> None:
     model = ByteDiffusionModel()
-    assert model.parameter_count() == 23_011_074
+    assert model.parameter_count() == 23_010_306
     assert model.embedding.weight.shape == (263, 256)
     assert model.output is not None
     assert model.output.weight.shape == (261, 256)
     assert torch.count_nonzero(model.embedding.weight[262]) == 0
+
+
+def test_mode_free_cell_removes_type_parameters_and_cues() -> None:
+    config = ByteDiffusionConfig.tiny(mode_embeddings=False)
+    model = ByteDiffusionModel(config)
+    ids = torch.tensor([[65, 66, 67, 256]])
+
+    assert model.mode_embedding is None
+    assert model.parameter_count() == (
+        ByteDiffusionModel(
+            ByteDiffusionConfig.tiny(mode_embeddings=True)
+        ).parameter_count()
+        - len(ModelMode) * config.local_dim
+    )
+    torch.testing.assert_close(
+        model.decoder_embeddings(ids, ModelMode.AR),
+        model.decoder_embeddings(ids, ModelMode.BLT_D),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_tiny_all_modes_forward_backward_and_fresh_decoder_embedding() -> None:
@@ -357,6 +395,50 @@ def test_single_pass_ngram_embedding_matches_independent_order_reference(
     torch.testing.assert_close(ngrams(ids), expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("table_sharing", ["shared", "per_order"])
+@pytest.mark.parametrize("hash_kind", ["blt_prime", "legacy257"])
+def test_single_pass_segmented_ngrams_match_independent_order_reference(
+    table_sharing: str,
+    hash_kind: str,
+) -> None:
+    config = ByteDiffusionConfig.tiny(
+        ngram_enabled=True,
+        ngram_table_size=128,
+        ngram_rank=4,
+        ngram_orders=(3, 4, 5),
+        ngram_table_sharing=table_sharing,
+        ngram_hash=hash_kind,
+    )
+    ngrams = ByteDiffusionModel(config).ngrams
+    assert ngrams is not None
+    ids = torch.tensor([[1, 2, 3, 4, 8, 9, 10, 11, config.vocab.pad_id]])
+    valid = torch.tensor([[True, True, True, True, True, True, True, True, False]])
+    segments = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1, -1]])
+    reference_features = []
+    for index, order in enumerate(ngrams.orders):
+        hashed, active = ngrams._hash_ids(ids, order)
+        same_segment = valid.clone()
+        for offset in range(1, order):
+            prior_valid = torch.zeros_like(valid)
+            prior_segment = torch.zeros_like(segments)
+            prior_valid[:, offset:] = valid[:, :-offset]
+            prior_segment[:, offset:] = segments[:, :-offset]
+            same_segment &= prior_valid & prior_segment.eq(segments)
+        table = ngrams.table if ngrams.table is not None else ngrams.tables[index]
+        reference_features.append(
+            table(hashed) * (active & same_segment)[:, :, None]
+        )
+    expected = torch.einsum(
+        "blor,odr->bld",
+        torch.stack(reference_features, dim=2),
+        ngrams.projection_weights,
+    )
+
+    torch.testing.assert_close(
+        ngrams.forward_segmented(ids, valid, segments), expected, rtol=0, atol=0
+    )
+
+
 def test_scale_matched_ngram_factor_initialization_changes_projection_scale() -> None:
     common = {
         "ngram_enabled": True,
@@ -451,6 +533,27 @@ def test_split_conditioning_routes_over_two_latent_keys() -> None:
     assert not torch.equal(conditioned, states)
 
 
+def test_split_conditioning_residual_scale_only_scales_cross_attention_delta() -> None:
+    torch.manual_seed(42)
+    full = ByteDiffusionModel(
+        ByteDiffusionConfig.tiny(decoder_conditioning="split_cross_attention")
+    )
+    scaled = ByteDiffusionModel(
+        ByteDiffusionConfig.tiny(
+            decoder_conditioning="split_cross_attention",
+            decoder_split_residual_scale=0.25,
+        )
+    )
+    scaled.load_state_dict(full.state_dict())
+    states = torch.randn(2, 3, full.config.local_dim)
+    condition = torch.randn(2, 3, full.config.global_dim)
+
+    full_delta = full.decoder[0]._add_condition(states, condition) - states
+    scaled_delta = scaled.decoder[0]._add_condition(states, condition) - states
+
+    torch.testing.assert_close(scaled_delta, 0.25 * full_delta)
+
+
 def test_virtual_bos_matches_document_packed_global_state() -> None:
     torch.manual_seed(31)
     model = ByteDiffusionModel(ByteDiffusionConfig.tiny())
@@ -513,6 +616,31 @@ def test_canvas_branches_share_prefix_without_cross_branch_or_target_leakage() -
     torch.testing.assert_close(
         baseline.branch_logits[:, 0], changed_target.branch_logits[:, 0], rtol=0, atol=0
     )
+
+
+def test_legacy_canvas_branch_rejects_packed_multiple_documents() -> None:
+    torch.manual_seed(173)
+    model = ByteDiffusionModel(ByteDiffusionConfig.tiny()).eval()
+    clean = torch.tensor(
+        [[65, 66, 67, 68, 69, 70, 71, 256, 80, 81, 82, 83, 84, 85, 86, 256]]
+    )
+    valid = torch.ones_like(clean, dtype=torch.bool)
+    documents = torch.tensor([[0] * 8 + [1] * 8])
+    positions = torch.tensor([[*range(8), *range(8)]])
+    starts = torch.tensor([[12]])
+    noisy = torch.tensor([[[261, 261, 86, 256]]])
+    branch_valid = torch.ones_like(noisy, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="one document per row"):
+        model.forward_canvas_branches(
+            clean,
+            valid,
+            noisy,
+            branch_valid,
+            starts,
+            positions=positions,
+            document_ids=documents,
+        )
 
 
 def test_joint_canvas_clean_logits_match_standalone_ar_with_ngrams() -> None:

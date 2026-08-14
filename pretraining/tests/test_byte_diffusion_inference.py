@@ -8,11 +8,13 @@ from pretraining.byte_diffusion.inference import (
     CachedCanvasGenerator,
     LayerKV,
     _append_layer_kv,
-    _document_start_ar_metadata,
+    _gather_absolute_positions,
     append_clean_block,
     denoise_blt_cached,
     denoise_canvas_cached,
+    document_start_ar_metadata,
     prefill_prefix,
+    prepare_cached_canvas,
 )
 from pretraining.byte_diffusion.model import ByteDiffusionModel, ModelOutput
 from pretraining.byte_diffusion.state import TransactionalDecodeState
@@ -63,6 +65,28 @@ def test_geometric_kv_append_copies_when_branching_from_an_old_prefix() -> None:
     torch.testing.assert_close(descendant.value, descendant_value)
     assert branch.key.flatten().tolist() == [10, 11, 99]
     assert branch.value.flatten().tolist() == [20, 21, 109]
+
+
+def test_ragged_cache_gather_uses_semantic_positions_not_storage_slots() -> None:
+    values = torch.tensor(
+        [
+            [[10.0, 11.0], [20.0, 21.0], [90.0, 91.0], [30.0, 31.0]],
+            [[40.0, 41.0], [80.0, 81.0], [50.0, 51.0], [60.0, 61.0]],
+        ]
+    )
+    valid = torch.tensor([[True, True, False, True], [True, False, True, True]])
+    positions = torch.tensor([[0, 1, 2, 2], [0, 1, 1, 2]])
+    targets = torch.tensor([[2, 0, 7], [1, 2, -1]])
+    gathered = _gather_absolute_positions(
+        values, valid, positions, targets, fill_value=-1
+    )
+    expected = torch.tensor(
+        [
+            [[30.0, 31.0], [10.0, 11.0], [-1.0, -1.0]],
+            [[50.0, 51.0], [60.0, 61.0], [-1.0, -1.0]],
+        ]
+    )
+    torch.testing.assert_close(gathered, expected)
 
 
 @pytest.mark.parametrize("ngram_enabled", [False, True])
@@ -142,7 +166,7 @@ def test_cached_blt_matches_document_branch_reference() -> None:
     branch_valid = torch.ones_like(noisy, dtype=torch.bool)
     starts = torch.tensor([[4]])
 
-    metadata = _document_start_ar_metadata(valid, model.config.patch_stride)
+    metadata = document_start_ar_metadata(valid, model.config.patch_stride)
     expected = model.forward_blt_d_branches(
         clean,
         valid,
@@ -165,6 +189,54 @@ def test_cached_blt_matches_document_branch_reference() -> None:
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+def test_batched_virtual_bos_logits_match_independent_document_forwards() -> None:
+    torch.manual_seed(420)
+    config = ByteDiffusionConfig.tiny()
+    model = ByteDiffusionModel(config).eval()
+    ids = torch.tensor(
+        [
+            [65, 66, 67, config.vocab.pad_id],
+            [70, 71, config.vocab.pad_id, config.vocab.pad_id],
+        ]
+    )
+    valid = ids.ne(config.vocab.pad_id)
+    positions = torch.arange(ids.shape[1])[None].expand_as(ids)
+
+    batched = model.forward_ar_varlen(
+        ids,
+        valid,
+        positions=positions,
+        allow_dense_reference=True,
+        return_padded_logits=False,
+        **document_start_ar_metadata(valid, config.patch_stride),
+    ).logits
+    independent = torch.cat(
+        tuple(
+            model.forward_ar_varlen(
+                ids[row : row + 1],
+                valid[row : row + 1],
+                positions=positions[row : row + 1],
+                allow_dense_reference=True,
+                return_padded_logits=False,
+                **document_start_ar_metadata(
+                    valid[row : row + 1], config.patch_stride
+                ),
+            ).logits
+            for row in range(ids.shape[0])
+        )
+    )
+    without_bos = model.forward_ar_varlen(
+        ids,
+        valid,
+        positions=positions,
+        allow_dense_reference=True,
+        return_padded_logits=False,
+    ).logits
+
+    torch.testing.assert_close(batched, independent, rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(batched, without_bos, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("ngram_enabled", [False, True])
@@ -205,6 +277,133 @@ def test_incremental_clean_append_matches_full_prefill(ngram_enabled: bool) -> N
         torch.testing.assert_close(
             incremental.value, reference.value, rtol=2e-5, atol=2e-5
         )
+
+
+@pytest.mark.parametrize(
+    ("device_name", "allow_dense_reference"),
+    [
+        ("cpu", True),
+        pytest.param(
+            "cuda",
+            False,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_ragged_cached_blt_matches_independent_rows_after_append(
+    device_name: str, allow_dense_reference: bool
+) -> None:
+    """Padding holes must not hide subsequently appended semantic prefix K/V."""
+
+    torch.manual_seed(422)
+    config = ByteDiffusionConfig.tiny()
+    device = torch.device(device_name)
+    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model = ByteDiffusionModel(config).to(device=device, dtype=model_dtype).eval()
+    pad = config.vocab.pad_id
+    ids = torch.tensor(
+        [
+            [65, 66, 67, 68, pad, pad, pad, pad],
+            [70, 71, 72, 73, 74, 75, 76, 77],
+        ]
+    ).to(device)
+    valid = ids.ne(pad)
+    committed = torch.tensor(
+        [[78, 79, 80, 81], [82, 83, 84, 85]]
+    ).to(device)
+    noisy = torch.full(
+        (2, 1, 4), config.vocab.mask_id, dtype=torch.long, device=device
+    )
+
+    batched_cache = append_clean_block(
+        model,
+        prefill_prefix(
+            model, ids, valid=valid, allow_dense_reference=allow_dense_reference
+        ),
+        committed,
+    )
+    starts = batched_cache.valid.sum(1).to(torch.long)[:, None]
+    plan = prepare_cached_canvas(
+        model,
+        batched_cache,
+        starts,
+        4,
+        allow_dense_reference=allow_dense_reference,
+    )
+    # Prefix cutoffs index physical cache storage.  In the first row the
+    # appended semantic positions 4..7 live in physical slots 8..11.
+    assert plan.local_layout.prefix_lengths.tolist() == [[12], [12]]
+    assert plan.global_layout.prefix_lengths.tolist() == [[4], [4]]
+    batched = denoise_blt_cached(
+        model,
+        batched_cache,
+        noisy,
+        starts,
+        allow_dense_reference=allow_dense_reference,
+        plan=plan,
+    )
+
+    independent = []
+    independent_caches = []
+    lengths = valid.sum(1).tolist()
+    for row, length in enumerate(lengths):
+        row_cache = append_clean_block(
+            model,
+            prefill_prefix(
+                model,
+                ids[row : row + 1, :length],
+                allow_dense_reference=allow_dense_reference,
+            ),
+            committed[row : row + 1],
+        )
+        row_start = row_cache.valid.sum(1).to(torch.long)[:, None]
+        independent_caches.append(row_cache)
+        independent.append(
+            denoise_blt_cached(
+                model,
+                row_cache,
+                noisy[row : row + 1],
+                row_start,
+                allow_dense_reference=allow_dense_reference,
+            )
+        )
+
+    tolerance = 2e-2 if device.type == "cuda" else 2e-5
+    torch.testing.assert_close(
+        batched, torch.cat(independent), rtol=tolerance, atol=tolerance
+    )
+
+    second_committed = torch.tensor(
+        [[86, 87, 88, 89], [90, 91, 92, 93]], device=device
+    )
+    batched_cache = append_clean_block(model, batched_cache, second_committed)
+    batched_starts = batched_cache.valid.sum(1).to(torch.long)[:, None]
+    batched = denoise_blt_cached(
+        model,
+        batched_cache,
+        noisy,
+        batched_starts,
+        allow_dense_reference=allow_dense_reference,
+    )
+    independent = []
+    for row, row_cache in enumerate(independent_caches):
+        row_cache = append_clean_block(
+            model, row_cache, second_committed[row : row + 1]
+        )
+        independent.append(
+            denoise_blt_cached(
+                model,
+                row_cache,
+                noisy[row : row + 1],
+                row_cache.valid.sum(1).to(torch.long)[:, None],
+                allow_dense_reference=allow_dense_reference,
+            )
+        )
+    torch.testing.assert_close(
+        batched, torch.cat(independent), rtol=tolerance, atol=tolerance
+    )
 
 
 def test_generator_completes_partial_patch_with_at_most_three_ar_atoms() -> None:

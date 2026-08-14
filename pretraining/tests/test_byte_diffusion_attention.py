@@ -172,6 +172,62 @@ def _canvas_layout(*, windowed: bool = False) -> CanvasBranchLayout:
     )
 
 
+def _document_canvas_layout(*, byte_geometry: bool) -> CanvasBranchLayout:
+    if byte_geometry:
+        document_length, branches, canvas = 128, 2, 128
+    else:
+        document_length, branches, canvas = 16, 4, 8
+    clean_length = 2 * document_length
+    clean_positions = torch.arange(document_length).repeat(2)[None]
+    clean_segments = torch.arange(2).repeat_interleave(document_length)[None]
+    branch_segments = torch.arange(branches) % 2
+    prefix_lengths = (
+        branch_segments * document_length + document_length
+    )[None]
+    branch_positions = (
+        torch.full((branches, 1), document_length)
+        + torch.arange(canvas)[None]
+    )[None]
+    branch_valid = torch.ones(1, branches, canvas, dtype=torch.bool)
+    if not byte_geometry:
+        branch_valid[0, -1, -3:] = False
+    return CanvasBranchLayout(
+        clean_valid=torch.ones(1, clean_length, dtype=torch.bool),
+        branch_valid=branch_valid,
+        prefix_lengths=prefix_lengths,
+        prefix_window=document_length,
+        clean_positions=clean_positions,
+        branch_positions=branch_positions,
+        clean_segment_ids=clean_segments,
+        branch_segment_ids=branch_segments[None],
+    )
+
+
+def _metadata_topology(counts: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    topology = torch.zeros_like(indices, dtype=torch.bool)
+    slots = torch.arange(indices.shape[-1])[None, None, None, :]
+    topology.scatter_(-1, indices.to(torch.long), slots < counts[..., None])
+    return topology[:, 0]
+
+
+def _metadata_token_mask(
+    metadata: attention.CanvasBlockMaskMetadata,
+    token_rule: torch.Tensor,
+) -> torch.Tensor:
+    assert metadata.full_kv_num_blocks is not None
+    assert metadata.full_kv_indices is not None
+    partial = _metadata_topology(metadata.kv_num_blocks, metadata.kv_indices)
+    full = _metadata_topology(
+        metadata.full_kv_num_blocks, metadata.full_kv_indices
+    )
+    q_block, kv_block = metadata.block_size
+    query_blocks = torch.arange(metadata.query_length) // q_block
+    key_blocks = torch.arange(metadata.kv_length) // kv_block
+    partial_tokens = partial[:, query_blocks[:, None], key_blocks[None, :]]
+    full_tokens = full[:, query_blocks[:, None], key_blocks[None, :]]
+    return full_tokens | (partial_tokens & token_rule)
+
+
 def test_canvas_dense_branch_mask_matches_family_oracle() -> None:
     layout = _canvas_layout()
     combined = canvas_branch_mask(
@@ -271,33 +327,121 @@ def test_canvas_metadata_block_mask_matches_dense_oracle() -> None:
     reference = BlockMask.from_kv_blocks(
         metadata.kv_num_blocks,
         metadata.kv_indices,
+        metadata.full_kv_num_blocks,
+        metadata.full_kv_indices,
         BLOCK_SIZE=metadata.block_size,
         mask_mod=block_mask.mask_mod,
         seq_lengths=(metadata.query_length, metadata.kv_length),
     )
     assert torch.equal(metadata.q_num_blocks, reference.q_num_blocks)
     assert torch.equal(metadata.q_indices, reference.q_indices)
+    assert torch.equal(metadata.full_q_num_blocks, reference.full_q_num_blocks)
+    assert torch.equal(metadata.full_q_indices, reference.full_q_indices)
 
     q_block, kv_block = metadata.block_size
-    candidate_blocks = torch.zeros(
-        (
-            layout.batch_size,
-            metadata.kv_num_blocks.shape[-1],
-            metadata.kv_indices.shape[-1],
-        ),
-        dtype=torch.bool,
-    )
-    slots = torch.arange(metadata.kv_indices.shape[-1])[None, None, :]
-    active_slots = slots < metadata.kv_num_blocks[:, 0, :, None]
-    candidate_blocks.scatter_(
-        -1,
-        metadata.kv_indices[:, 0].to(torch.long),
-        active_slots,
+    candidate_blocks = _metadata_topology(
+        metadata.kv_num_blocks, metadata.kv_indices
+    ) | _metadata_topology(
+        metadata.full_kv_num_blocks, metadata.full_kv_indices
     )
     q_blocks = torch.arange(layout.query_length) // q_block
     kv_blocks = torch.arange(layout.kv_length) // kv_block
     candidate_tokens = candidate_blocks[:, q_blocks[:, None], kv_blocks[None, :]]
     assert bool((~canvas_branch_allowed(layout) | candidate_tokens).all())
+
+
+@pytest.mark.parametrize(
+    ("layout", "block_size"),
+    [
+        pytest.param(_canvas_layout(), 2, id="invalid-tail"),
+        pytest.param(_canvas_layout(windowed=True), (3, 4), id="prefix-window"),
+        pytest.param(
+            _document_canvas_layout(byte_geometry=True), 128, id="byte-multidoc"
+        ),
+        pytest.param(
+            _document_canvas_layout(byte_geometry=False), 8, id="patch-multidoc"
+        ),
+    ],
+)
+def test_canvas_metadata_full_blocks_exactly_match_dense_block_oracle(
+    layout: CanvasBranchLayout,
+    block_size: int | tuple[int, int],
+) -> None:
+    allowed = canvas_branch_allowed(layout)
+    metadata = canvas_block_mask_metadata(layout, block_size=block_size)
+    partial = _metadata_topology(metadata.kv_num_blocks, metadata.kv_indices)
+    assert metadata.full_kv_num_blocks is not None
+    assert metadata.full_kv_indices is not None
+    full = _metadata_topology(
+        metadata.full_kv_num_blocks, metadata.full_kv_indices
+    )
+
+    q_block, kv_block = metadata.block_size
+    query_padding = partial.shape[-2] * q_block - layout.query_length
+    key_padding = partial.shape[-1] * kv_block - layout.kv_length
+    blocked = torch.nn.functional.pad(
+        allowed, (0, key_padding, 0, query_padding)
+    ).view(
+        layout.batch_size,
+        partial.shape[-2],
+        q_block,
+        partial.shape[-1],
+        kv_block,
+    ).permute(0, 1, 3, 2, 4)
+    allowed_per_block = blocked.sum((-2, -1))
+    expected_full = allowed_per_block == q_block * kv_block
+    expected_partial = (allowed_per_block > 0) & ~expected_full
+
+    assert torch.equal(full, expected_full)
+    assert not bool((partial & full).any())
+    assert bool((~expected_partial | partial).all())
+    assert torch.equal(_metadata_token_mask(metadata, allowed), allowed)
+
+
+@pytest.mark.parametrize(
+    ("layout", "block_size"),
+    [
+        pytest.param(_canvas_layout(windowed=True), (3, 4), id="window-tail"),
+        pytest.param(
+            _document_canvas_layout(byte_geometry=True), 128, id="byte-multidoc"
+        ),
+        pytest.param(
+            _document_canvas_layout(byte_geometry=False), 8, id="patch-multidoc"
+        ),
+    ],
+)
+def test_canvas_full_block_fast_path_matches_dense_forward_and_gradients(
+    layout: CanvasBranchLayout,
+    block_size: int | tuple[int, int],
+) -> None:
+    allowed = canvas_branch_allowed(layout)
+    metadata = canvas_block_mask_metadata(layout, block_size=block_size)
+    sparse_rule = _metadata_token_mask(metadata, allowed)
+    generator = torch.Generator().manual_seed(91)
+    query = torch.randn(
+        layout.batch_size, 2, layout.query_length, 4, generator=generator
+    )
+    key = torch.randn(
+        layout.batch_size, 1, layout.kv_length, 4, generator=generator
+    )
+    value = torch.randn(
+        layout.batch_size, 1, layout.kv_length, 4, generator=generator
+    )
+    probe = torch.randn(query.shape, generator=generator)
+
+    def forward_and_gradients(rule: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        inputs = tuple(
+            tensor.detach().clone().requires_grad_()
+            for tensor in (query, key, value)
+        )
+        output = attention._dense_attention(*inputs, rule, scale=None)
+        gradients = torch.autograd.grad((output * probe).sum(), inputs)
+        return (output, *gradients)
+
+    expected = forward_and_gradients(allowed)
+    actual = forward_and_gradients(sparse_rule)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
 def test_canvas_metadata_scales_to_2048_branches_without_dense_mask() -> None:

@@ -53,6 +53,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import itertools
+import hashlib
 import json
 import math
 import resource
@@ -282,11 +283,23 @@ def _load_data_shard(file: Path):
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
+    expected_bytes = 256 * 4 + 2 * num_tokens
+    assert file.stat().st_size == expected_bytes, "token shard size does not match header"
     with file.open("rb", buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+        destination = memoryview(tokens.numpy()).cast("B")
+        copied = 0
+        # A single readinto larger than INT_MAX is truncated on some libc/
+        # Python combinations. Chunk the direct pinned-buffer transfer without
+        # introducing Python token lists or an intermediate bytes allocation.
+        while copied < len(destination):
+            end = min(copied + (1 << 30), len(destination))
+            nbytes = f.readinto(destination[copied:end])
+            if not nbytes:
+                break
+            copied += nbytes
+        assert copied == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
 def _data_shard_num_tokens(file: Path) -> int:
@@ -1424,6 +1437,21 @@ print0(f"validation panel: {data_path}/{val_glob}")
 # produce a plausible, meaningless BPB -- for the vocabulary-matched arm the
 # size assert would even pass. `ByteCounter` decodes instead in that case.
 dataset_manifest = read_dataset_manifest(data_path)
+dataset_manifest_path = Path(data_path) / "mix_manifest.json"
+dataset_provenance = {
+    "manifest_sha256": (
+        hashlib.sha256(dataset_manifest_path.read_bytes()).hexdigest()
+        if dataset_manifest_path.is_file()
+        else None
+    ),
+    "payload_sha256": dataset_manifest.get("payload_sha256"),
+    "source_manifest_sha256": dataset_manifest.get("source_manifest", {}).get(
+        "sha256"
+    ),
+    "source_manifest_payload_sha256": dataset_manifest.get(
+        "source_manifest_payload_sha256"
+    ),
+}
 require_matching_vocab_size(dataset_manifest, VOCAB_SIZE)
 byte_counter = ByteCounter(dataset_manifest, device=device)
 if byte_counter.expected_lut_size() is not None:
@@ -2416,6 +2444,7 @@ for trial in range(num_trials):
                 ),
                 pretraining_data_path=data_path,
             ),
+            "dataset_provenance": dataset_provenance,
             "architecture": (
                 f"nanogpt_mini_gpt2vocab_{DELTA_ATTENTION_TYPE}_"
                 + "".join(
