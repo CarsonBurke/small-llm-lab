@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from postraining.core import parse_numeric_answer, top_p_sample
+from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
 from postraining.model_io import load_model
 from postraining.nano_backbone import NanoGPTBackbone
 from postraining.opsd.config import build_arg_parser, validate_args
@@ -525,6 +526,7 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
                 "opsd_prompt_schema": (
                     "privilege_then_bare_problem_token_completion/v3"
                 ),
+                "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
                 "train_sha256": sha256(train),
                 "gate": str(gate),
                 "gate_sha256": sha256(gate),
