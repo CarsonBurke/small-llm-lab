@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import torch
+from checkpointing import RecoveryCheckpointPolicy
 
 from postraining.core import TrajectoryBatch
 from postraining.train_vapo import (
     concatenate_batches,
-    crossed_interval,
     generate_group,
     rollout_diagnostics,
 )
@@ -82,11 +82,15 @@ def test_rollout_gate_reports_positive_groups_eos_and_length_distribution():
     assert metrics["advantage_min"] <= metrics["advantage_mean"] <= metrics["advantage_max"]
 
 
-def test_periodic_actions_are_deferred_to_completed_rollout_boundaries():
-    assert not crossed_interval(64, 96, 100)
-    assert crossed_interval(96, 128, 100)
-    assert crossed_interval(0, 128, 100)
-    assert not crossed_interval(96, 128, 0)
+def test_recovery_checkpoint_is_deferred_to_a_safe_rollout_boundary():
+    now = [0.0]
+    policy = RecoveryCheckpointPolicy(480, clock=lambda: now[0])
+    now[0] = 479.0
+    assert not policy.due()
+    now[0] = 500.0
+    assert policy.due()
+    policy.committed((128, 512))
+    assert not policy.terminal_due((128, 512))
 
 
 class FakeGenerationModel(torch.nn.Module):

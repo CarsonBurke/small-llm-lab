@@ -91,7 +91,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument("--max-grad-norm", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument(
+        "--checkpoint-interval-seconds",
+        type=float,
+        default=480.0,
+        help="elapsed wall time between rolling exact-recovery checkpoints",
+    )
     parser.add_argument("--generation-log-samples", type=int, default=2)
     parser.add_argument(
         "--eval-every",
@@ -154,7 +159,6 @@ def validate_args(args: argparse.Namespace) -> None:
         "max_completion_length",
         "max_prompt_length",
         "logit_chunk_tokens",
-        "save_every",
         "eval_rows",
         "eval_samples",
         "eval_batch_trajectories",
@@ -163,6 +167,10 @@ def validate_args(args: argparse.Namespace) -> None:
     for field in positive_ints:
         if getattr(args, field) < 1:
             raise ValueError(f"--{field.replace('_', '-')} must be positive")
+    if not 300 <= args.checkpoint_interval_seconds <= 600:
+        raise ValueError(
+            "--checkpoint-interval-seconds must be between 300 and 600"
+        )
     if args.rollout_batch_size > args.effective_batch_size:
         raise ValueError(
             "--rollout-batch-size cannot exceed --effective-batch-size"

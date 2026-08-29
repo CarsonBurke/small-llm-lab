@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
+from checkpointing import RecoveryCheckpointPolicy
 from transformers import GPT2TokenizerFast
 
 from postraining.answer_encoder.data import (
@@ -552,6 +553,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("steps/eval_batches must be positive and batch_size must be at least two")
     if args.eval_every < 1 or args.log_every < 1:
         raise ValueError("eval_every and log_every must be positive")
+    if not 300 <= args.checkpoint_interval_seconds <= 600:
+        raise ValueError(
+            "checkpoint_interval_seconds must be between 300 and 600"
+        )
     if args.warmup_steps < 0 or args.warmup_steps >= args.steps:
         raise ValueError("warmup_steps must be nonnegative and smaller than steps")
     if not 0.0 <= args.min_learning_rate <= args.learning_rate:
@@ -729,6 +734,9 @@ def train(args: argparse.Namespace) -> None:
             _manifest(args, len(train_answer_examples), len(val_answer_examples)),
         )
     started = time.perf_counter()
+    checkpoint_policy = RecoveryCheckpointPolicy(
+        args.checkpoint_interval_seconds
+    )
 
     def log_evaluation(step: int) -> dict:
         if args.training_objective == "global-latent":
@@ -808,7 +816,6 @@ def train(args: argparse.Namespace) -> None:
     latest_evaluation = None
     if start_step == 0 and not args.resume:
         latest_evaluation = log_evaluation(0)
-        save_training_state(0)
     model.train()
     if predictor is not None:
         predictor.train()
@@ -880,15 +887,21 @@ def train(args: argparse.Namespace) -> None:
 
         if step % args.eval_every == 0 or step == args.steps:
             latest_evaluation = log_evaluation(step)
-            save_training_state(step)
             model.train()
             if predictor is not None:
                 predictor.train()
+        if checkpoint_policy.due():
+            save_training_state(step)
+            checkpoint_policy.committed(step)
 
+    if checkpoint_policy.terminal_due(args.steps):
+        save_training_state(args.steps)
+        checkpoint_policy.committed(args.steps)
     if latest_evaluation is None:
         raise AssertionError("training completed without a final evaluation")
     checkpoint_path = run_dir / "answer_encoder.pt"
-    torch.save(
+    _atomic_torch_save(
+        checkpoint_path,
         {
             "schema": ANSWER_ENCODER_SCHEMA,
             **_module_state_payload(model, predictor, training=False),
@@ -900,7 +913,6 @@ def train(args: argparse.Namespace) -> None:
             "behavioral_gate_space": args.reward_space,
             "behavioral_gate": latest_evaluation["probes"]["gate"],
         },
-        checkpoint_path,
     )
     result = {
         "schema": ANSWER_ENCODER_SCHEMA,
@@ -1191,6 +1203,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--weight-decay", type=float, default=0.05)
     train_parser.add_argument("--warmup-steps", type=int, default=100)
     train_parser.add_argument("--eval-every", type=int, default=100)
+    train_parser.add_argument(
+        "--checkpoint-interval-seconds", type=float, default=480.0
+    )
     train_parser.add_argument("--eval-batches", type=int, default=4)
     train_parser.add_argument("--log-every", type=int, default=10)
     train_parser.add_argument(

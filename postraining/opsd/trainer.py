@@ -11,6 +11,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from checkpointing import RecoveryCheckpointPolicy
 
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 from postraining.core import (
@@ -669,6 +670,9 @@ class OPSDTrainer:
         data_manifest_contract = validate_data_manifest(args, source_payload)
         validate_authorization(args, source_payload, data_manifest_contract)
         self.args = args
+        self.checkpoint_policy = RecoveryCheckpointPolicy(
+            args.checkpoint_interval_seconds
+        )
         # Keep lineage metadata, not a third long-lived CPU copy of the base
         # weights. The two GPU roles are constructed from ``source_payload``
         # below before the caller releases it.
@@ -1073,66 +1077,70 @@ class OPSDTrainer:
         return emitted_token_rows(batch)
 
     def _save(self, *, final: bool) -> None:
-        export = _export_payload(
-            self.student,
-            self.source_payload,
-            self.args,
-            step=self.step,
-            source_sha256=self.source_sha256,
-            dataset_sha256=self.dataset_sha256,
-            data_manifest_sha256=self.data_manifest_sha256,
-            authorization_sha256=self.authorization_sha256,
-            eval_data_sha256=self.eval_data_sha256,
+        checkpoint_state = (self.step, self.sampler.cursor)
+        export = (
+            _export_payload(
+                self.student,
+                self.source_payload,
+                self.args,
+                step=self.step,
+                source_sha256=self.source_sha256,
+                dataset_sha256=self.dataset_sha256,
+                data_manifest_sha256=self.data_manifest_sha256,
+                authorization_sha256=self.authorization_sha256,
+                eval_data_sha256=self.eval_data_sha256,
+            )
+            if final
+            else None
         )
-        resume_payload = {
-            "schema": OPSD_CHECKPOINT_SCHEMA,
-            "objective_schema": OPSD_OBJECTIVE_SCHEMA,
-            "prompt_schema": OPSD_PROMPT_SCHEMA,
-            "optimizer_schema": OPSD_OPTIMIZER_SCHEMA,
-            "data_order_schema": OPSD_DATA_ORDER_SCHEMA,
-            "answer_fence_prompt_schema": (
-                ANSWER_FENCE_PROMPT_SCHEMA
-                if self.args.answer_fence
-                else None
-            ),
-            "model": export["model"],
-            "teacher_model": _state_dict_cpu(self.teacher),
-            "optimizer": self.optimizer.state_dict(),
-            "step": self.step,
-            "sampler_cursor": self.sampler.cursor,
-            "sampler_source_quotas": (
-                self.sampler.quotas
-                if isinstance(self.sampler, SourceQuotaSampler)
-                else None
-            ),
-            "sampler_source_consumed": (
-                self.sampler.consumed_counts()
-                if isinstance(self.sampler, SourceQuotaSampler)
-                else None
-            ),
-            "rejection_counts": dict(self.rejection_counts),
-            "rollout_rng_state": self.rollout_generator.get_state(),
-            "torch_rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
-            "source_checkpoint_sha256": self.source_sha256,
-            "dataset_sha256": self.dataset_sha256,
-            "data_manifest_sha256": self.data_manifest_sha256,
-            "authorization_sha256": self.authorization_sha256,
-            "eval_data_sha256": self.eval_data_sha256,
-            "args": vars(self.args),
-        }
-        checkpoint_dir = self.output / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-        _atomic_torch_save(
-            export, checkpoint_dir / f"step_{self.step:06d}.pt"
+        model_state = (
+            export["model"]
+            if export is not None
+            else _state_dict_cpu(self.student)
         )
-        # Commit the versioned artifact before advancing exact recovery
-        # state. An interrupted export leaves the older resume point intact;
-        # an interrupted final alias is regenerated from the new resume.
-        _atomic_torch_save(
-            resume_payload, self.output / "opsd_checkpoint.pt"
-        )
-        if final:
+        if self.checkpoint_policy.terminal_due(checkpoint_state):
+            resume_payload = {
+                "schema": OPSD_CHECKPOINT_SCHEMA,
+                "objective_schema": OPSD_OBJECTIVE_SCHEMA,
+                "prompt_schema": OPSD_PROMPT_SCHEMA,
+                "optimizer_schema": OPSD_OPTIMIZER_SCHEMA,
+                "data_order_schema": OPSD_DATA_ORDER_SCHEMA,
+                "answer_fence_prompt_schema": (
+                    ANSWER_FENCE_PROMPT_SCHEMA
+                    if self.args.answer_fence
+                    else None
+                ),
+                "model": model_state,
+                "teacher_model": _state_dict_cpu(self.teacher),
+                "optimizer": self.optimizer.state_dict(),
+                "step": self.step,
+                "sampler_cursor": self.sampler.cursor,
+                "sampler_source_quotas": (
+                    self.sampler.quotas
+                    if isinstance(self.sampler, SourceQuotaSampler)
+                    else None
+                ),
+                "sampler_source_consumed": (
+                    self.sampler.consumed_counts()
+                    if isinstance(self.sampler, SourceQuotaSampler)
+                    else None
+                ),
+                "rejection_counts": dict(self.rejection_counts),
+                "rollout_rng_state": self.rollout_generator.get_state(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state(self.device),
+                "source_checkpoint_sha256": self.source_sha256,
+                "dataset_sha256": self.dataset_sha256,
+                "data_manifest_sha256": self.data_manifest_sha256,
+                "authorization_sha256": self.authorization_sha256,
+                "eval_data_sha256": self.eval_data_sha256,
+                "args": vars(self.args),
+            }
+            _atomic_torch_save(
+                resume_payload, self.output / "opsd_checkpoint.pt"
+            )
+            self.checkpoint_policy.committed(checkpoint_state)
+        if export is not None:
             _atomic_torch_save(export, self.output / "opsd_final_model.pt")
 
     def train(self) -> None:
@@ -1409,8 +1417,8 @@ class OPSDTrainer:
             ):
                 self._evaluate_policy(self.step)
             if (
-                self.step % self.args.save_every == 0
-                and self.step < self.args.steps
+                self.step < self.args.steps
+                and self.checkpoint_policy.due()
             ):
                 self._save(final=False)
 

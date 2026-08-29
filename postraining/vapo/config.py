@@ -454,9 +454,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    # Checkpoint in true actor/critic optimizer-update units.
-    parser.add_argument("--save-every", type=int, default=32)
-    parser.add_argument("--warmup-save-every", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint-interval-seconds",
+        type=float,
+        default=480.0,
+        help="elapsed wall time between rolling exact-recovery checkpoints",
+    )
     # Compile the compute-bound parallel replay surfaces independently of the
     # narrow-cache rollout. The rejected old path coupled compilation to
     # full-5K static attention, which measured 2.6x slower.
@@ -781,8 +784,10 @@ def validate_args(
         parser.error("--post-update-kl-every must be nonnegative")
     if args.replay_bucket < 1:
         parser.error("--replay-bucket must be positive")
-    if args.warmup_save_every < 1:
-        parser.error("--warmup-save-every must be positive")
+    if not 300 <= args.checkpoint_interval_seconds <= 600:
+        parser.error(
+            "--checkpoint-interval-seconds must be between 300 and 600"
+        )
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
     if args.eval_tail_batch < 0:

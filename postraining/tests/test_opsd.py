@@ -965,6 +965,7 @@ def test_config_defaults_and_source_inference():
     assert args.answer_fence is True
     assert args.distillation_temperature == args.temperature
     assert args.rollout_compile is True
+    assert args.checkpoint_interval_seconds == 480.0
 
     mismatch = parser.parse_args(
         ["--name", "unit", "--no-answer-fence"]

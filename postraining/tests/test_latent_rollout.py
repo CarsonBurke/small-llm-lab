@@ -1212,6 +1212,7 @@ def test_shipped_math_evaluations_share_the_250_step_cadence():
     cli = build_arg_parser().parse_args(["--checkpoint", "c", "--output", "o"])
 
     assert cli.aime_every == 250
+    assert cli.checkpoint_interval_seconds == 480.0
     assert cli.bench_every == 250
     # BPB is a cheaper guard with its own cadence, not a math benchmark.
     assert cli.bpb_every == 150

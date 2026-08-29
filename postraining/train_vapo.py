@@ -11,6 +11,11 @@ from pathlib import Path
 import sentencepiece as spm
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from checkpointing import (
+    RecoveryCheckpointPolicy,
+    atomic_link_or_copy,
+    atomic_torch_save,
+)
 
 from postraining.core import (
     JsonlLogger,
@@ -596,8 +601,7 @@ def update_step(
 
 
 def save_checkpoint(path: Path, model, actor_optimizer, critic_optimizer, step: int, cursor: int, args) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    atomic_torch_save(
         {
             "step": step,
             "cursor": cursor,
@@ -615,9 +619,6 @@ def save_checkpoint(path: Path, model, actor_optimizer, critic_optimizer, step: 
     )
 
 
-def crossed_interval(previous: int, current: int, interval: int) -> bool:
-    """Whether a completed rollout crossed a periodic save/eval boundary."""
-    return interval > 0 and current // interval > previous // interval
 
 
 def main() -> None:
@@ -640,7 +641,9 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--actor-lr", type=float, default=1e-6)
     parser.add_argument("--critic-lr", type=float, default=2e-6)
-    parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument(
+        "--checkpoint-interval-seconds", type=float, default=480.0
+    )
     parser.add_argument("--aime-every", type=int, default=100)
     parser.add_argument("--aime-data", default="postraining/data/aime-2024.parquet")
     parser.add_argument("--aime-samples", type=int, default=32)
@@ -654,6 +657,9 @@ def main() -> None:
     parser.add_argument("--gate-max-truncation-fraction", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
+    checkpoint_policy = RecoveryCheckpointPolicy(
+        args.checkpoint_interval_seconds
+    )
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -762,7 +768,12 @@ def main() -> None:
         for key, value in metrics.items():
             tensorboard.add_scalar(f"value_warmup/{key}", value, warmup)
     if not args.resume:
-        save_checkpoint(output / "checkpoints/value_pretrained.pt", model, actor, critic, 0, cursor, args)
+        value_checkpoint = output / "checkpoints/value_pretrained.pt"
+        save_checkpoint(
+            value_checkpoint, model, actor, critic, 0, cursor, args
+        )
+        atomic_link_or_copy(value_checkpoint, output / "vapo_checkpoint.pt")
+        checkpoint_policy.committed((0, cursor))
         if args.aime_every > 0:
             accuracy = deterministic_aime(
                 model, tokenizer, aime_rows, args.aime_samples, args.aime_max_tokens, args.seed
@@ -826,14 +837,32 @@ def main() -> None:
                         samples=len(aime_rows) * args.aime_samples,
                     )
                     tensorboard.add_scalar("aime/accuracy", accuracy, step)
-        # A checkpoint here is an exact restart point: the complete rollout and
-        # every epoch/minibatch derived from it have finished.
-        should_save = (
-            crossed_interval(previous_step, step, args.save_every)
-            or step >= args.steps
+        # The complete rollout and every epoch/minibatch derived from it have
+        # finished, so this is an exact restart boundary.
+        checkpoint_state = (step, cursor)
+        if checkpoint_policy.due():
+            save_checkpoint(
+                output / "vapo_checkpoint.pt",
+                model,
+                actor,
+                critic,
+                step,
+                cursor,
+                args,
+            )
+            checkpoint_policy.committed(checkpoint_state)
+    terminal_checkpoint_state = (step, cursor)
+    if checkpoint_policy.terminal_due(terminal_checkpoint_state):
+        save_checkpoint(
+            output / "vapo_checkpoint.pt",
+            model,
+            actor,
+            critic,
+            step,
+            cursor,
+            args,
         )
-        if should_save:
-            save_checkpoint(output / f"checkpoints/step_{step:05d}.pt", model, actor, critic, step, cursor, args)
+        checkpoint_policy.committed(terminal_checkpoint_state)
     tensorboard.close()
 
 

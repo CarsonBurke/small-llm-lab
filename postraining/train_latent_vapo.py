@@ -71,6 +71,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from checkpointing import RecoveryCheckpointPolicy, atomic_link_or_copy
 
 import train_gpt as baseline
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
@@ -5129,6 +5130,9 @@ def main() -> None:
             aime_eval(0)
         if bench_rows:
             bench_eval(0)
+    checkpoint_policy = RecoveryCheckpointPolicy(
+        args.checkpoint_interval_seconds
+    )
     if start_step == 0 and warmup_step < args.value_warmup_steps:
         for warmup in range(warmup_step + 1, args.value_warmup_steps + 1):
             warmup_started = time.perf_counter()
@@ -5213,20 +5217,15 @@ def main() -> None:
             # overlaps them with the next rollout's KV cache for no benefit.
             zero_optimizers(optimizers, "critic")
             warmup_step = warmup
-            if (
-                warmup % args.warmup_save_every == 0
-                or warmup == args.value_warmup_steps
-            ):
-                # Preserve the clean actor-initial/critic-warm checkpoint.
-                # The rolling checkpoint is overwritten by PPO updates, so
-                # it cannot serve as a trustworthy actor restart point.
-                checkpoint_name = (
-                    "critic_warmup_checkpoint.pt"
-                    if warmup == args.value_warmup_steps
-                    else "latent_vapo_checkpoint.pt"
-                )
+            checkpoint_state = (start_step, warmup_step, sampler.cursor)
+            checkpoint_due = checkpoint_policy.due()
+            if warmup == args.value_warmup_steps:
+                # Preserve the clean actor-initial/critic-warm checkpoint as
+                # a semantic boundary artifact. If recovery is also due, link
+                # the identical serialized payload into the rolling pathname.
+                critic_warm_path = output / "critic_warmup_checkpoint.pt"
                 save_checkpoint(
-                    output / checkpoint_name,
+                    critic_warm_path,
                     wrapper,
                     critic,
                     optimizers,
@@ -5236,6 +5235,24 @@ def main() -> None:
                     warmup_step,
                     actor_init_provenance,
                 )
+                atomic_link_or_copy(
+                    critic_warm_path,
+                    output / "latent_vapo_checkpoint.pt",
+                )
+                checkpoint_policy.committed(checkpoint_state)
+            elif checkpoint_due:
+                save_checkpoint(
+                    output / "latent_vapo_checkpoint.pt",
+                    wrapper,
+                    critic,
+                    optimizers,
+                    start_step,
+                    args,
+                    sampler,
+                    warmup_step,
+                    actor_init_provenance,
+                )
+                checkpoint_policy.committed(checkpoint_state)
 
     def crossed_interval(previous: int, current: int, interval: int) -> bool:
         return interval > 0 and current // interval > previous // interval
@@ -6028,7 +6045,8 @@ def main() -> None:
         if bench_rows and crossed_interval(previous_step, step, args.bench_every):
             with profiler.phase("bench_eval"):
                 bench_eval(step)
-        if crossed_interval(previous_step, step, args.save_every):
+        checkpoint_state = (step, warmup_step, sampler.cursor)
+        if checkpoint_policy.due():
             with profiler.phase("checkpoint_save"):
                 save_started = time.perf_counter()
                 save_checkpoint(
@@ -6036,6 +6054,7 @@ def main() -> None:
                     optimizers, step, args, sampler, warmup_step,
                     actor_init_provenance, zero_reward_frozen_updates,
                 )
+                checkpoint_policy.committed(checkpoint_state)
                 save_seconds = time.perf_counter() - save_started
                 logger.log(type="checkpoint", step=step, seconds=save_seconds)
                 tensorboard.add_scalar(
@@ -6057,11 +6076,14 @@ def main() -> None:
                 "--consume-all-prompts completed without exhausting the "
                 f"target dataset: cursor {sampler.cursor}/{len(math_rows)}"
             )
-    save_checkpoint(
-        output / "latent_vapo_checkpoint.pt", wrapper, critic,
-        optimizers, step, args, sampler, warmup_step,
-        actor_init_provenance, zero_reward_frozen_updates,
-    )
+    terminal_checkpoint_state = (step, warmup_step, sampler.cursor)
+    if checkpoint_policy.terminal_due(terminal_checkpoint_state):
+        save_checkpoint(
+            output / "latent_vapo_checkpoint.pt", wrapper, critic,
+            optimizers, step, args, sampler, warmup_step,
+            actor_init_provenance, zero_reward_frozen_updates,
+        )
+        checkpoint_policy.committed(terminal_checkpoint_state)
     if (
         aime_rows
         and args.aime_every > 0

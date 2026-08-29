@@ -578,6 +578,7 @@ def test_default_training_recipe_uses_standard_multicrop_views_and_projected_rew
     assert args.objective_space == "projection"
     assert args.reward_space == "projection"
     assert args.projector_normalization == "layer"
+    assert args.checkpoint_interval_seconds == 480.0
     assert _resolved_projection_dimension(args) == 16
 
 
