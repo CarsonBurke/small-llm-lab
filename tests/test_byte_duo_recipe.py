@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
+import math
 import random
 from types import SimpleNamespace
 
@@ -9,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from pretraining.byte_diffusion.config import ByteDiffusionConfig
+from pretraining.byte_diffusion.config import ByteDiffusionConfig, model_config_from_env
 from pretraining.byte_diffusion.duo import DuoSchedule
 from pretraining.byte_diffusion.duo_model import (
     DUO_PARAMETER_COUNT,
@@ -30,6 +32,7 @@ from pretraining.byte_diffusion.training_duo import (
     accumulate_duo_validation_stats,
     duo_validation_from_stats,
     duo_loss,
+    duo_mutable_topology_contract,
     duo_objective_contract,
     prepare_duo_inputs,
     prepare_duo_update,
@@ -39,6 +42,9 @@ from pretraining.byte_diffusion.training_duo import (
 )
 from pretraining.byte_diffusion.training import TrainingBatch
 from scripts.train_byte_duo import (
+    REPO_ROOT,
+    _authenticated_entropy_patcher_bytes,
+    _local_imports,
     _recipe_batch,
     capture_rng_state,
     parse_args,
@@ -47,8 +53,35 @@ from scripts.train_byte_duo import (
     source_provenance,
     validate_readiness_evidence,
 )
+from pretraining.byte_diffusion.variable_patching import DatasetPatchingSpec
 import pretraining.byte_diffusion.training_duo as training_duo_module
 import pretraining.byte_diffusion.inference_duo as inference_duo_module
+
+
+def test_local_import_closure_counts_parent_package_initializers() -> None:
+    imports = set(_local_imports(REPO_ROOT / "scripts/train_byte_duo.py"))
+
+    assert (REPO_ROOT / "pretraining/__init__.py").resolve() in imports
+    assert (
+        REPO_ROOT / "pretraining/byte_diffusion/__init__.py"
+    ).resolve() in imports
+
+
+def test_training_preflight_loads_authenticated_entropy_patcher(tmp_path) -> None:
+    payload = b"authenticated entropy patcher"
+    (tmp_path / "patcher.bin").write_bytes(payload)
+    patching = DatasetPatchingSpec(
+        name="causal_entropy_v1",
+        patch_stride=None,
+        max_patch_size=8,
+        artifact_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    manifest = {"patching": {"patcher_artifact": {"path": "patcher.bin"}}}
+
+    assert (
+        _authenticated_entropy_patcher_bytes(tmp_path, manifest, patching)
+        == payload
+    )
 
 
 def test_duo_cli_inherits_ablation_schedule_and_batch_environment(
@@ -97,7 +130,7 @@ def test_production_batch_geometry_eliminates_h100_accumulation() -> None:
 def test_single_gpu_production_microbatch_is_selected_by_readiness() -> None:
     from scripts.train_byte_duo import production_microbatches
 
-    assert production_microbatches(1) == (16, 24, 32)
+    assert production_microbatches(1) == (12, 15, 16, 24, 32)
     assert production_microbatches(8) == (32,)
     with pytest.raises(ValueError):
         production_microbatches(2)
@@ -184,6 +217,49 @@ def test_duo_recipe_uses_physical_patch_offsets_for_short_final_patches() -> Non
     assert batch.attention_metadata.patch_cu_seqlens.shape == (65,)
     assert bool(batch.attention_metadata.byte_cu_seqlens[3:].eq(8).all())
     assert bool(batch.attention_metadata.patch_cu_seqlens[3:].eq(2).all())
+
+
+def test_duo_recipe_builds_ragged_entropy_metadata_without_fixed_patch_axis() -> None:
+    ids = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 262]])
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    native = TrainingBatch(
+        ids=ids,
+        valid=valid,
+        ar_targets=torch.full_like(ids, -100),
+        bos_targets=torch.tensor([10]),
+        positions=torch.arange(8)[None],
+        full_valid=True,
+        document_ids=torch.zeros_like(ids),
+        isolate_documents=True,
+        patch_offsets=torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]]),
+        max_patch_size=4,
+    )
+
+    batch = _recipe_batch(native, patch_stride=4)
+
+    assert batch.attention_metadata is None
+    assert batch.clean_patch_metadata is not None
+    assert batch.clean_patch_metadata.byte_indices.tolist() == list(range(8))
+    assert batch.clean_patch_metadata.pool_byte_indices.tolist() == list(range(8))
+    assert batch.clean_patch_metadata.patch_byte_cu_seqlens.tolist() == [0, 3, 5, 8]
+    assert batch.clean_patch_metadata.patch_ordinals.tolist() == [0, 1, 2]
+    assert batch.patch_offsets is native.patch_offsets
+    assert batch.max_patch_size == 4
+
+
+def test_entropy_clean_policy_requires_full_resolution_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BYTE_DUO_CLEAN_PATCHING", "causal_entropy_v1")
+    monkeypatch.setenv("BYTE_DUO_MUTABLE_TOPOLOGY", "full_resolution_decoder")
+    monkeypatch.setenv("BYTE_DUO_RANDOM_PHASE_TRAINING", "1")
+
+    config = model_config_from_env()
+
+    assert config.duo_clean_patching == "causal_entropy_v1"
+    assert duo_mutable_topology_contract(config)["compile_dynamic_shapes"] is True
+    with pytest.raises(ValueError, match="require full_resolution_decoder"):
+        replace(config, duo_mutable_topology="patched_global")
 
 
 def test_compile_stable_padding_preserves_real_token_and_branch_outputs() -> None:
@@ -281,6 +357,12 @@ def test_production_duo_parameter_and_artifact_budget_has_no_mask_embedding() ->
     assert "time_adaln.bias" in names
     assert not any("encoder_adaln" in name for name in names)
 
+    topology = duo_mutable_topology_contract(model.config)
+    assert topology["mutable_origin_stride"] == 4
+    assert topology["serving_origin_policy"] == (
+        "floor_to_patch_and_carry_clean_phase"
+    )
+
 
 def test_decoder_reallocation_is_parameter_matched_and_under_budget() -> None:
     config = ByteDiffusionConfig(
@@ -293,6 +375,38 @@ def test_decoder_reallocation_is_parameter_matched_and_under_budget() -> None:
     assert model.parameter_count == 24_078_409
     assert 24_094_791 - model.parameter_count == 16_382
     assert model.estimated_quantized_artifact_bytes < 16_000_000
+
+
+def test_full_resolution_reallocation_spends_only_live_time_conditioning_budget() -> None:
+    config = ByteDiffusionConfig(
+        global_layers=8,
+        decoder_layers=4,
+        decoder_ffn_dim=960,
+        duo_mutable_topology="full_resolution_decoder",
+        duo_random_phase_training=True,
+        duo_noisy_ngrams=False,
+    )
+    model = DuoModel(config)
+
+    assert model.parameter_count == 24_052_297
+    assert DUO_PARAMETER_COUNT - model.parameter_count == 42_494
+    assert model.estimated_quantized_artifact_bytes < 16_000_000
+    assert len(model._adaln_widths) == config.decoder_layers + 1
+
+
+def test_full_resolution_environment_selects_authenticated_live_budget_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BYTE_DUO_MUTABLE_TOPOLOGY", "full_resolution_decoder")
+    monkeypatch.setenv("BYTE_DUO_RANDOM_PHASE_TRAINING", "1")
+    config = model_config_from_env()
+    model = DuoModel(config)
+
+    assert config.global_layers == 8
+    assert config.decoder_layers == 4
+    assert config.decoder_ffn_dim == 960
+    assert config.duo_noisy_ngrams is False
+    assert model.parameter_count == 24_052_297
 
 
 def test_model_rejects_mask_and_time_is_mandatory_and_trainable() -> None:
@@ -1742,12 +1856,13 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
                 log_every=10, validation_every=20
             ),
             **duo_objective_contract(PURE_DUO_OBJECTIVE),
-            "schedule_eps": 0.001,
-            "time_sampling": "global_branch_antithetic_striped_uniform_0_1",
+                "schedule_eps": 0.001,
+                "time_sampling": "global_branch_antithetic_striped_uniform_0_1",
+                **duo_mutable_topology_contract(ByteDiffusionConfig()),
         },
         "row_length_bytes": 8_192,
         "global_batch": 249,
-        "candidate_microbatches": [16, 24, 32],
+        "candidate_microbatches": [12, 15, 16, 24, 32],
         "selected_microbatch": 16,
         "selected_validation_batch_size": 16,
         "results": {
@@ -1756,6 +1871,9 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
                 "eligible": True,
                 "microbatch": 16,
                 "global_batch": 249,
+                "microsteps_per_update": 16,
+                "tail_microbatch": 9,
+                "tail_exercised": True,
                 "row_length_bytes": 8_192,
                 "warmup_updates": 2,
                 "measured_updates": 4,
@@ -1805,9 +1923,12 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
             "world_size": 1,
         },
     }
-    for microbatch in (24, 32):
+    for microbatch in (12, 15, 24, 32):
         candidate = json.loads(json.dumps(training["results"]["16"]))
         candidate["microbatch"] = microbatch
+        candidate["microsteps_per_update"] = math.ceil(249 / microbatch)
+        candidate["tail_microbatch"] = 249 % microbatch or microbatch
+        candidate["tail_exercised"] = 249 % microbatch != 0
         candidate["update_ms"] = 2.0 + microbatch
         candidate["validation"]["batch_size"] = 16
         training["results"][str(microbatch)] = candidate
@@ -1817,6 +1938,7 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
         "benchmark_source": benchmark_source_provenance(),
         "model_config": ByteDiffusionConfig().to_dict(),
         "parameter_count": DUO_PARAMETER_COUNT,
+        "serving_origin_policy": "floor_to_patch_and_carry_clean_phase",
         "phase_coverage": [0, 1, 2, 3],
         "canvas_length": canvas_length,
         "branches": branches,
@@ -1880,6 +2002,46 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
     assert evidence is not None
     assert evidence["training_validation"]["selected_microbatch"] == 16
 
+    # MB15 is a first-class authenticated geometry: 16 full slices plus a
+    # nine-row tail. It may be selected when it is the fastest fitting arm.
+    training["results"]["15"]["update_ms"] = 0.5
+    training["selected_microbatch"] = 15
+    training_path.write_text(json.dumps(training))
+    args.batch_size = 15
+    evidence = validate_readiness_evidence(
+        args,
+        source_sha256=source,
+        dataset_payload_sha256=data,
+        parameter_count=DUO_PARAMETER_COUNT,
+    )
+    assert evidence is not None
+    assert evidence["training_validation"]["selected_microbatch"] == 15
+
+    training["results"]["15"]["update_ms"] = 17.0
+    training["selected_microbatch"] = 16
+    args.batch_size = 16
+    missing_fifteen = training["results"].pop("15")
+    training_path.write_text(json.dumps(training))
+    with pytest.raises(ValueError, match="telemetry, provenance, or geometry"):
+        validate_readiness_evidence(
+            args,
+            source_sha256=source,
+            dataset_payload_sha256=data,
+            parameter_count=DUO_PARAMETER_COUNT,
+        )
+    training["results"]["15"] = missing_fifteen
+    training["results"]["15"]["tail_microbatch"] = 8
+    training_path.write_text(json.dumps(training))
+    with pytest.raises(ValueError, match="telemetry, provenance, or geometry"):
+        validate_readiness_evidence(
+            args,
+            source_sha256=source,
+            dataset_payload_sha256=data,
+            parameter_count=DUO_PARAMETER_COUNT,
+        )
+    training["results"]["15"]["tail_microbatch"] = 9
+    training_path.write_text(json.dumps(training))
+
     args.objective = JOINT_DUO_CLEAN_AR_OBJECTIVE
     with pytest.raises(ValueError, match="telemetry, provenance, or geometry"):
         validate_readiness_evidence(
@@ -1927,7 +2089,7 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
     faster = json.loads(json.dumps(training["results"]["16"]))
     faster["microbatch"] = 8
     faster["update_ms"] = 0.5
-    training["candidate_microbatches"] = [8, 16, 24, 32]
+    training["candidate_microbatches"] = [8, 12, 15, 16, 24, 32]
     training["results"]["8"] = faster
     training_path.write_text(json.dumps(training))
     with pytest.raises(ValueError, match="telemetry, provenance, or geometry"):
@@ -1938,7 +2100,7 @@ def test_2k_readiness_gate_authenticates_selected_batches_and_all_phases(
             parameter_count=DUO_PARAMETER_COUNT,
         )
 
-    training["candidate_microbatches"] = [16, 24, 32]
+    training["candidate_microbatches"] = [12, 15, 16, 24, 32]
     training["results"].pop("8")
     training["results"]["16"]["cuda_peak_reserved_bytes"] = (
         total_memory - required_headroom + 1

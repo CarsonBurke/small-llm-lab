@@ -24,6 +24,28 @@ class CleanAttentionBank:
             raise ValueError("cached clean attention K/V must share dtype and device")
 
 
+@dataclass(frozen=True)
+class SplitConditionCache:
+    """Per-layer projected K/V for unique BLT decoder conditions.
+
+    The leading dimension enumerates unique global latents.  Decoder byte
+    positions select from that bank with integer condition indices, avoiding
+    the much larger byte-expanded global projection.  The BOS sentinel is not
+    stored: an index of ``-1`` selects exact zero K/V in the application path.
+    """
+
+    key: Tensor
+    value: Tensor
+
+    def __post_init__(self) -> None:
+        if self.key.ndim != 4 or self.value.shape != self.key.shape:
+            raise ValueError(
+                "cached split condition K/V must be aligned [N,H,S,D]"
+            )
+        if self.key.device != self.value.device or self.key.dtype != self.value.dtype:
+            raise ValueError("cached split condition K/V must share dtype and device")
+
+
 def packed_sequence_offsets(lengths: Tensor) -> Tensor:
     """Build int32 exclusive offsets without Inductor's cumsum matcher.
 
@@ -1274,27 +1296,50 @@ class ConditionedTransformerBlock(nn.Module):
             raise ValueError(f"unsupported conditioning {conditioning!r}")
         self.block = TransformerBlock(local_dim, heads, ffn_dim, rope_theta)
 
+    def _split_condition_key_value(self, condition: Tensor) -> tuple[Tensor, Tensor]:
+        """Project global conditions into normalized per-head split K/V."""
+
+        if self.conditioning != "split_cross_attention":
+            raise ValueError("split condition K/V require split cross-attention")
+        if self.condition_norm is None:
+            raise AssertionError("split cross-attention condition norm is missing")
+        split = self.condition(condition).view(
+            *condition.shape[:-1], self.condition_splits, self.local_dim
+        )
+        split = self.condition_norm(split)
+        key = self.cross_key(split).view(
+            *split.shape[:-2], self.condition_splits, self.heads, self.head_dim
+        ).transpose(-3, -2)
+        value = self.cross_value(split).view(
+            *split.shape[:-2], self.condition_splits, self.heads, self.head_dim
+        ).transpose(-3, -2)
+        return key, value
+
+    def _apply_split_condition(
+        self,
+        x: Tensor,
+        key: Tensor,
+        value: Tensor,
+    ) -> Tensor:
+        """Apply query-dependent split attention to position-aligned K/V."""
+
+        if self.query_norm is None:
+            raise AssertionError("split cross-attention query norm is missing")
+        expected = (*x.shape[:-1], self.heads, self.condition_splits, self.head_dim)
+        if key.shape != expected or value.shape != expected:
+            raise ValueError("split condition K/V and decoder states must align")
+        query = self.cross_query(self.query_norm(x)).view(
+            *x.shape[:-1], self.heads, 1, self.head_dim
+        )
+        scores = (query * key).sum(-1) / math.sqrt(self.head_dim)
+        weights = scores.softmax(-1)
+        attended = (weights[..., None] * value).sum(-2).flatten(-2)
+        return x + self.split_residual_scale * self.cross_output(attended)
+
     def _add_condition(self, x: Tensor, condition: Tensor) -> Tensor:
         if self.conditioning == "split_cross_attention":
-            if self.query_norm is None or self.condition_norm is None:
-                raise AssertionError("split cross-attention norms are missing")
-            keys = self.condition(condition).view(
-                *condition.shape[:-1], self.condition_splits, self.local_dim
-            )
-            keys = self.condition_norm(keys)
-            query = self.cross_query(self.query_norm(x)).view(
-                *x.shape[:-1], self.heads, 1, self.head_dim
-            )
-            key = self.cross_key(keys).view(
-                *keys.shape[:-2], self.condition_splits, self.heads, self.head_dim
-            ).transpose(-3, -2)
-            value = self.cross_value(keys).view(
-                *keys.shape[:-2], self.condition_splits, self.heads, self.head_dim
-            ).transpose(-3, -2)
-            scores = (query * key).sum(-1) / math.sqrt(self.head_dim)
-            weights = scores.softmax(-1)
-            attended = (weights[..., None] * value).sum(-2).flatten(-2)
-            return x + self.split_residual_scale * self.cross_output(attended)
+            key, value = self._split_condition_key_value(condition)
+            return self._apply_split_condition(x, key, value)
         projected = self.condition(condition)
         if self.condition_gate is not None:
             return x + self.condition_gate.to(x.dtype) * projected
@@ -1314,6 +1359,279 @@ class ConditionedTransformerBlock(nn.Module):
         if self.condition_norm is None:
             raise AssertionError("conditioner omitted both scale paths")
         return x + self.condition_norm(projected)
+
+    def project_reusable_condition(self, condition: Tensor) -> Tensor:
+        """Project a condition before broadcasting it over repeated bytes.
+
+        Gated/rmsnorm projection is positionwise, so a branch-constant latent
+        should be projected once per branch rather than once per byte. Split
+        cross-attention has query-dependent work and intentionally fails
+        closed until it has its own cached K/V implementation.
+        """
+
+        if self.conditioning == "split_cross_attention":
+            raise ValueError(
+                "split cross-attention requires its dedicated condition cache"
+            )
+        return self.condition(condition)
+
+    def prepare_split_condition_cache(self, condition: Tensor) -> SplitConditionCache:
+        """Transform each unique global latent into split K/V exactly once.
+
+        ``condition`` is an ``[N, global_dim]`` bank of unique latents.  The
+        returned cache remains differentiable, so repeated byte selections
+        accumulate gradients into the unique latent and projection weights.
+        """
+
+        if self.conditioning != "split_cross_attention":
+            raise ValueError("split condition caching requires split cross-attention")
+        if condition.ndim != 2 or condition.shape[-1] != self.global_dim:
+            raise ValueError("unique split conditions must be [N, global_dim]")
+        key, value = self._split_condition_key_value(condition)
+        return SplitConditionCache(key=key, value=value)
+
+    def add_split_condition_from_cache(
+        self,
+        x: Tensor,
+        cache: SplitConditionCache,
+        condition_indices: Tensor,
+    ) -> Tensor:
+        """Apply cached split attention using per-byte latent assignments.
+
+        ``condition_indices`` matches the leading dimensions of ``x``.  Values
+        in ``[0, N)`` select a unique cached latent; ``-1`` is the virtual BOS
+        condition and contributes exact zero K/V.  Only the compact split K/V
+        bank is gathered per byte—the global-width transform and normalization
+        are never broadcast across decoder positions.
+        """
+
+        if self.conditioning != "split_cross_attention":
+            raise ValueError("split condition caching requires split cross-attention")
+        if x.shape[-1] != self.local_dim:
+            raise ValueError("decoder states have the wrong hidden width")
+        if (
+            condition_indices.shape != x.shape[:-1]
+            or condition_indices.dtype != torch.long
+        ):
+            raise ValueError(
+                "condition indices must be int64 and align with decoder states"
+            )
+        if (
+            cache.key.shape[1:]
+            != (self.heads, self.condition_splits, self.head_dim)
+        ):
+            raise ValueError("split condition cache has incompatible head geometry")
+        if cache.key.device != x.device or condition_indices.device != x.device:
+            raise ValueError("decoder states, cache, and indices must share a device")
+        if cache.key.shape[0] == 0:
+            if not torch.compiler.is_compiling() and bool(
+                (condition_indices != -1).any()
+            ):
+                raise ValueError("an empty latent bank only admits virtual BOS indices")
+            # There is nothing to gather.  Virtual BOS contributes exact-zero
+            # K/V, so split cross-attention is the identity residual in this
+            # degenerate but valid first-patch case.
+            return x
+        if not torch.compiler.is_compiling():
+            invalid = (condition_indices < -1) | (
+                condition_indices >= cache.key.shape[0]
+            )
+            if bool(invalid.any()):
+                raise ValueError("condition index lies outside the cached latent bank")
+
+        flat_indices = condition_indices.reshape(-1)
+        # ``-1`` must not reach index_select.  The subsequent mask makes this
+        # a mathematically exact zero condition and blocks gradient flow into
+        # the temporarily selected cache row.
+        selected = flat_indices.clamp_min(0)
+        key = cache.key.index_select(0, selected).view(
+            *x.shape[:-1], self.heads, self.condition_splits, self.head_dim
+        )
+        value = cache.value.index_select(0, selected).view_as(key)
+        bos = condition_indices == -1
+        key = key.masked_fill(bos[..., None, None, None], 0)
+        value = value.masked_fill(bos[..., None, None, None], 0)
+        return self._apply_split_condition(x, key, value)
+
+    def add_ragged_split_condition_from_cache(
+        self,
+        x: Tensor,
+        cache: SplitConditionCache,
+        clean_condition_indices: Tensor,
+        block_condition_indices: Tensor,
+        *,
+        block_length: int,
+    ) -> Tensor:
+        """Apply one pointwise split-attention bank with per-origin block K/V.
+
+        Clean bytes retain independent latent assignments. Every revisable
+        block shares one prior latent, so its cached K/V is gathered once and
+        broadcast over ``block_length`` queries rather than gathered once per
+        byte. Query and output projections still execute once over the full
+        flattened clean-plus-block state bank.
+        """
+
+        if self.conditioning != "split_cross_attention":
+            raise ValueError("ragged split caching requires split cross-attention")
+        if x.ndim != 2 or x.shape[1] != self.local_dim:
+            raise ValueError("ragged decoder states must be flat [N, local_dim]")
+        if (
+            clean_condition_indices.ndim != 1
+            or block_condition_indices.ndim != 1
+            or clean_condition_indices.dtype != torch.long
+            or block_condition_indices.dtype != torch.long
+            or block_length <= 0
+        ):
+            raise ValueError("ragged split indices must be flat int64 with positive width")
+        clean_count = clean_condition_indices.numel()
+        if x.shape[0] != clean_count + block_condition_indices.numel() * block_length:
+            raise ValueError("ragged split indices do not cover the pointwise state bank")
+        if not (
+            x.device
+            == cache.key.device
+            == clean_condition_indices.device
+            == block_condition_indices.device
+        ):
+            raise ValueError("ragged states, cache, and indices must share a device")
+        if cache.key.shape[1:] != (
+            self.heads,
+            self.condition_splits,
+            self.head_dim,
+        ):
+            raise ValueError("ragged split cache has incompatible head geometry")
+        if cache.key.shape[0] == 0:
+            if not torch.compiler.is_compiling() and bool(
+                (clean_condition_indices.ne(-1).any())
+                | (block_condition_indices.ne(-1).any())
+            ):
+                raise ValueError("an empty latent bank only admits virtual BOS indices")
+            return x
+        if not torch.compiler.is_compiling():
+            invalid_clean = (clean_condition_indices < -1) | (
+                clean_condition_indices >= cache.key.shape[0]
+            )
+            invalid_block = (block_condition_indices < -1) | (
+                block_condition_indices >= cache.key.shape[0]
+            )
+            if bool(invalid_clean.any() | invalid_block.any()):
+                raise ValueError("condition index lies outside the cached latent bank")
+        if self.query_norm is None:
+            raise AssertionError("split cross-attention query norm is missing")
+
+        clean_selected = clean_condition_indices.clamp_min(0)
+        block_selected = block_condition_indices.clamp_min(0)
+        clean_key = cache.key.index_select(0, clean_selected)
+        clean_value = cache.value.index_select(0, clean_selected)
+        block_key = cache.key.index_select(0, block_selected)[:, None]
+        block_value = cache.value.index_select(0, block_selected)[:, None]
+        clean_bos = clean_condition_indices.eq(-1)
+        block_bos = block_condition_indices.eq(-1)
+        clean_key = clean_key.masked_fill(clean_bos[:, None, None, None], 0)
+        clean_value = clean_value.masked_fill(clean_bos[:, None, None, None], 0)
+        block_key = block_key.masked_fill(block_bos[:, None, None, None, None], 0)
+        block_value = block_value.masked_fill(
+            block_bos[:, None, None, None, None], 0
+        )
+
+        query = self.cross_query(self.query_norm(x)).view(
+            x.shape[0], self.heads, 1, self.head_dim
+        )
+        clean_query = query[:clean_count]
+        block_query = query[clean_count:].view(
+            block_condition_indices.numel(),
+            block_length,
+            self.heads,
+            1,
+            self.head_dim,
+        )
+        scale = math.sqrt(self.head_dim)
+        clean_weights = (
+            (clean_query * clean_key).sum(-1) / scale
+        ).softmax(-1)
+        block_weights = (
+            (block_query * block_key).sum(-1) / scale
+        ).softmax(-1)
+        clean_attended = (clean_weights[..., None] * clean_value).sum(-2)
+        block_attended = (block_weights[..., None] * block_value).sum(-2)
+        attended = torch.cat(
+            (
+                clean_attended.flatten(-2),
+                block_attended.flatten(-2).reshape(-1, self.local_dim),
+            ),
+            dim=0,
+        )
+        return x + self.split_residual_scale * self.cross_output(attended)
+
+    def add_block_split_condition_from_cache(
+        self,
+        block_states: Tensor,
+        cache: SplitConditionCache,
+        prior_condition_indices: Tensor,
+        *,
+        block_length: int,
+    ) -> Tensor:
+        """Condition block queries from one cached prior K/V per origin."""
+
+        if self.conditioning != "split_cross_attention":
+            raise ValueError("block split caching requires split cross-attention")
+        if (
+            block_states.ndim != 3
+            or block_states.shape[1] != block_length
+            or block_states.shape[2] != self.local_dim
+            or block_length <= 0
+        ):
+            raise ValueError(
+                "block decoder states must be [origins, block_length, local_dim]"
+            )
+        if (
+            prior_condition_indices.shape != block_states.shape[:1]
+            or prior_condition_indices.dtype != torch.long
+        ):
+            raise ValueError("block prior indices must be int64 [origins]")
+        if not (
+            block_states.device
+            == cache.key.device
+            == prior_condition_indices.device
+        ):
+            raise ValueError("block states, cache, and prior indices must share a device")
+        if cache.key.shape[1:] != (
+            self.heads,
+            self.condition_splits,
+            self.head_dim,
+        ):
+            raise ValueError("block split cache has incompatible head geometry")
+        if cache.key.shape[0] == 0:
+            if not torch.compiler.is_compiling() and bool(
+                prior_condition_indices.ne(-1).any()
+            ):
+                raise ValueError("an empty latent bank only admits virtual BOS indices")
+            return block_states
+        if not torch.compiler.is_compiling():
+            invalid = (prior_condition_indices < -1) | (
+                prior_condition_indices >= cache.key.shape[0]
+            )
+            if bool(invalid.any()):
+                raise ValueError("condition index lies outside the cached latent bank")
+        if self.query_norm is None:
+            raise AssertionError("split cross-attention query norm is missing")
+
+        selected = prior_condition_indices.clamp_min(0)
+        key = cache.key.index_select(0, selected)[:, None]
+        value = cache.value.index_select(0, selected)[:, None]
+        bos = prior_condition_indices.eq(-1)
+        key = key.masked_fill(bos[:, None, None, None, None], 0)
+        value = value.masked_fill(bos[:, None, None, None, None], 0)
+        query = self.cross_query(self.query_norm(block_states)).view(
+            block_states.shape[0],
+            block_length,
+            self.heads,
+            1,
+            self.head_dim,
+        )
+        scores = (query * key).sum(-1) / math.sqrt(self.head_dim)
+        weights = scores.softmax(-1)
+        attended = (weights[..., None] * value).sum(-2).flatten(-2)
+        return block_states + self.split_residual_scale * self.cross_output(attended)
 
     def forward(
         self,
@@ -1402,6 +1720,21 @@ class ConditionedTransformerBlock(nn.Module):
             **kwargs,
         )
 
+    def forward_shared_document_branches_projected_adaln(
+        self,
+        x: Tensor,
+        projected_condition: Tensor,
+        branch_modulation: Tensor,
+        **kwargs,
+    ) -> Tensor:
+        """AdaLN path for conditions projected before byte broadcasting."""
+
+        return self.block.forward_shared_document_branches_adaln(
+            self._add_projected_condition(x, projected_condition),
+            branch_modulation,
+            **kwargs,
+        )
+
     def prepare_clean_bank(
         self, clean: Tensor, condition: Tensor, **kwargs
     ) -> tuple[Tensor, CleanAttentionBank]:
@@ -1409,6 +1742,15 @@ class ConditionedTransformerBlock(nn.Module):
 
         return self.block.prepare_clean_bank(
             self._add_condition(clean, condition), **kwargs
+        )
+
+    def prepare_clean_bank_projected(
+        self, clean: Tensor, projected_condition: Tensor, **kwargs
+    ) -> tuple[Tensor, CleanAttentionBank]:
+        """Cache clean K/V after applying a patch-projected condition."""
+
+        return self.block.prepare_clean_bank(
+            self._add_projected_condition(clean, projected_condition), **kwargs
         )
 
     def forward_branch_from_clean_bank_adaln(
@@ -1421,6 +1763,23 @@ class ConditionedTransformerBlock(nn.Module):
     ) -> Tensor:
         return self.block.forward_branch_from_clean_bank_adaln(
             self._add_condition(branch, condition),
+            branch_modulation,
+            clean_bank,
+            **kwargs,
+        )
+
+    def forward_branch_from_clean_bank_projected_adaln(
+        self,
+        branch: Tensor,
+        projected_condition: Tensor,
+        branch_modulation: Tensor,
+        clean_bank: CleanAttentionBank,
+        **kwargs,
+    ) -> Tensor:
+        """Cached-bank AdaLN path for a preprojected branch condition."""
+
+        return self.block.forward_branch_from_clean_bank_adaln(
+            self._add_projected_condition(branch, projected_condition),
             branch_modulation,
             clean_bank,
             **kwargs,
@@ -1513,10 +1872,12 @@ class PatchPool(nn.Module):
     ) -> Tensor:
         """Pool a document-packed variable-length patch partition.
 
-        ``patch_byte_cu_seqlens`` addresses the packed local-state bank and
-        therefore carries no artificial row padding.  A bounded gather lowers
-        ragged patches to one static ``[patches, max_patch_size, dim]`` bank,
-        which keeps the Perceiver pooling math identical to fixed stride.
+        ``patch_byte_cu_seqlens`` is the complete patch partition of the
+        packed byte bank.  Document boundaries require no special padding:
+        callers concatenate each document's patch lengths, and the cumulative
+        offsets retain those partitions exactly.  The implementation performs
+        segmented max, stable softmax, and reduction directly on ``[bytes,D]``
+        tensors; it never forms a ``[patches,max_patch,D]`` K/V bank.
         """
 
         if local.ndim != 2:
@@ -1534,16 +1895,104 @@ class PatchPool(nn.Module):
                 patch_byte_cu_seqlens[-1]
             ) != local.shape[0]:
                 raise ValueError("patch byte offsets must partition local states")
-        starts = patch_byte_cu_seqlens[:-1].to(torch.long)
         lengths = torch.diff(patch_byte_cu_seqlens).to(torch.long)
         if not torch.compiler.is_compiling() and bool(
             ((lengths <= 0) | (lengths > max_patch_size)).any()
         ):
             raise ValueError("packed patch length lies outside the configured bound")
+        patch_count = lengths.shape[0]
+        patch_ids = torch.repeat_interleave(
+            torch.arange(patch_count, device=local.device),
+            lengths,
+            output_size=local.shape[0],
+        )
+        normalized = self.local_norm(local)
+
+        # Initialize explicitly with -inf so segmented max is identical to a
+        # masked padded amax for every nonempty length-1..max_patch_size patch.
+        pooled = normalized.new_full((patch_count, local.shape[-1]), -torch.inf)
+        pooled = pooled.scatter_reduce(
+            0,
+            patch_ids[:, None].expand_as(normalized),
+            normalized,
+            reduce="amax",
+            include_self=True,
+        )
+        pooled = self.max_projection(pooled)
+        query = self.query(self.global_norm(pooled)).view(
+            patch_count, self.heads, self.head_dim
+        )
+
+        key, value = self.key_value(normalized).chunk(2, dim=-1)
+        key = key.view(local.shape[0], self.heads, self.head_dim)
+        value = value.view_as(key)
+        scores = (
+            query.index_select(0, patch_ids).mul(key).sum(-1)
+            / math.sqrt(self.head_dim)
+        )
+
+        # A numerically stable segmented softmax.  Both reductions operate on
+        # compact [bytes,heads] state; no work scales with max_patch_size.
+        score_max = scores.new_full((patch_count, self.heads), -torch.inf)
+        score_max = score_max.scatter_reduce(
+            0,
+            patch_ids[:, None].expand_as(scores),
+            scores,
+            reduce="amax",
+            include_self=True,
+        )
+        unnormalized = (scores - score_max.index_select(0, patch_ids)).exp()
+        normalizer = scores.new_zeros((patch_count, self.heads)).scatter_add(
+            0,
+            patch_ids[:, None].expand_as(scores),
+            unnormalized,
+        )
+        weights = unnormalized / normalizer.index_select(0, patch_ids)
+
+        weighted_value = weights[..., None] * value
+        attended = value.new_zeros(
+            (patch_count, self.heads, self.head_dim)
+        ).scatter_add(
+            0,
+            patch_ids[:, None, None].expand_as(weighted_value),
+            weighted_value,
+        )
+        return pooled + self.output(attended.flatten(-2))
+
+    def forward_packed_padded_reference(
+        self,
+        local: Tensor,
+        patch_byte_cu_seqlens: Tensor,
+        *,
+        max_patch_size: int,
+    ) -> Tensor:
+        """Small-tensor oracle for validating segmented packed pooling.
+
+        Unlike :meth:`forward_packed`, this deliberately materializes the old
+        padded bank.  Production call sites must use the segmented method.
+        """
+
+        if local.ndim != 2:
+            raise ValueError("packed local states must be rank two")
+        if (
+            patch_byte_cu_seqlens.ndim != 1
+            or patch_byte_cu_seqlens.dtype != torch.int32
+            or patch_byte_cu_seqlens.numel() < 2
+        ):
+            raise ValueError("patch byte offsets must be nonempty rank-1 int32")
+        if max_patch_size <= 0:
+            raise ValueError("max_patch_size must be positive")
+        if int(patch_byte_cu_seqlens[0]) != 0 or int(
+            patch_byte_cu_seqlens[-1]
+        ) != local.shape[0]:
+            raise ValueError("patch byte offsets must partition local states")
+        starts = patch_byte_cu_seqlens[:-1].to(torch.long)
+        lengths = torch.diff(patch_byte_cu_seqlens).to(torch.long)
+        if bool(((lengths <= 0) | (lengths > max_patch_size)).any()):
+            raise ValueError("packed patch length lies outside the configured bound")
         offsets = torch.arange(max_patch_size, device=local.device)
         valid = offsets[None] < lengths[:, None]
-        indices = starts[:, None] + offsets[None]
-        indices = indices.clamp_max(local.shape[0] - 1)
+        indices = (starts[:, None] + offsets[None]).clamp_max(local.shape[0] - 1)
         padded = self.local_norm(local).index_select(0, indices.reshape(-1)).view(
             starts.numel(), max_patch_size, local.shape[-1]
         )

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from checkpointing import atomic_torch_save
 
 from .data import AtomicIdManifest, DeterministicChunkCursor
 from .idlm import IDLMShiftedTargets, IDLMTrainingLayout, auto_balanced_loss, make_training_layout
@@ -737,8 +738,7 @@ class IDLMTrainer:
         )
 
     def save_checkpoint(self, path: Path, *, extra: Mapping[str, object] | None = None) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        atomic_torch_save(
             {
                 "schema": CHECKPOINT_SCHEMA,
                 "model_config": asdict(self.model.config),

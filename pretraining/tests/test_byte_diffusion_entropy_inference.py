@@ -8,12 +8,15 @@ import pytest
 import torch
 
 import pretraining.byte_diffusion.inference as inference_module
+import pretraining.eval_byte_diffusion_gsm8k as gsm_module
 from pretraining.byte_diffusion.config import ByteDiffusionConfig
 from pretraining.byte_diffusion.inference import (
     EntropyPatchedCanvasGenerator,
     _variable_prefix_metadata,
     denoise_entropy_blt_reference,
+    denoise_entropy_blt_reference_batched,
     entropy_next_byte_starts_patch,
+    prepare_entropy_blt_end,
 )
 from pretraining.byte_diffusion.model import ByteDiffusionModel
 from pretraining.byte_diffusion.patching import (
@@ -151,28 +154,39 @@ def test_entropy_blt_block_horizon_is_independent_of_patch_topology(
 
 
 @pytest.mark.parametrize("block_length", [4, 8, 16])
-def test_entropy_generator_ar_aligns_then_commits_the_whole_block(
+def test_entropy_generator_diffuses_immediately_and_commits_the_whole_block(
     monkeypatch: pytest.MonkeyPatch,
     block_length: int,
 ) -> None:
     patcher = _patcher()
     model = ByteDiffusionModel(ByteDiffusionConfig.tiny()).eval()
-    boundary = _arbitrary_boundary(patcher)
-    aligned_prefix = torch.zeros(boundary, dtype=torch.long)
-    assert entropy_next_byte_starts_patch(patcher, aligned_prefix)
+    probe = torch.zeros(24, dtype=torch.long)
+    starts = set(
+        map(
+            int,
+            patcher.patch(
+                probe.numpy(), torch.zeros_like(probe).numpy()
+            ).layout.patch_starts,
+        )
+    )
+    prefix_length = next(index for index in range(2, 20) if index not in starts)
+    prefix = torch.zeros(prefix_length, dtype=torch.long)
+    assert not entropy_next_byte_starts_patch(patcher, prefix)
     seen_prefixes: list[torch.Tensor] = []
 
     def denoise(
         _model: ByteDiffusionModel,
         _patcher: CausalEntropyPatcher,
-        committed: torch.Tensor,
+        committed: tuple[torch.Tensor, ...],
         noisy: torch.Tensor,
+        **_: object,
     ) -> torch.Tensor:
-        seen_prefixes.append(committed.clone())
-        assert not committed.eq(model.config.vocab.mask_id).any()
+        assert len(committed) == 1
+        seen_prefixes.append(committed[0].clone())
+        assert not committed[0].eq(model.config.vocab.mask_id).any()
         assert noisy.eq(model.config.vocab.mask_id).all()
-        assert noisy.shape == (block_length,)
-        return torch.zeros((block_length, model.config.vocab.output_size))
+        assert noisy.shape == (1, block_length)
+        return torch.zeros((1, block_length, model.config.vocab.output_size))
 
     candidate = torch.arange(65, 65 + block_length, dtype=torch.long)[None]
 
@@ -190,7 +204,7 @@ def test_entropy_generator_ar_aligns_then_commits_the_whole_block(
         )
 
     monkeypatch.setattr(
-        inference_module, "denoise_entropy_blt_reference", denoise
+        inference_module, "denoise_entropy_blt_reference_batched", denoise
     )
     monkeypatch.setattr(
         inference_module, "sample_absorbing_canvas_batched", sample
@@ -198,27 +212,29 @@ def test_entropy_generator_ar_aligns_then_commits_the_whole_block(
     generator = EntropyPatchedCanvasGenerator(
         model, patcher, block_length=block_length, seed=7
     )
-    generator.prefill(aligned_prefix)
+    generator.prefill(prefix)
     generated = generator.generate_blt(steps=4, stochastic=False)
 
-    combined = torch.cat((aligned_prefix, candidate[0]))
-    starts = patcher.patch(
-        combined.numpy(), torch.zeros(combined.numel(), dtype=torch.long).numpy()
-    ).layout.patch_starts
-    assert sum(start > boundary for start in starts) >= block_length // 4
+    combined = torch.cat((prefix, candidate[0]))
+    assert not generated.alignment_ids.numel()
     torch.testing.assert_close(generated.committed_canvas_ids, candidate[0])
     assert not generated.overflow_canvas_ids.numel()
     torch.testing.assert_close(generator.ids, combined)
     assert generator.rejected_bytes == 0
     assert len(seen_prefixes) == 1
-    torch.testing.assert_close(seen_prefixes[0], aligned_prefix)
+    torch.testing.assert_close(seen_prefixes[0], prefix)
 
 
-def test_entropy_generator_uses_clean_ar_until_the_next_causal_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_entropy_end_origin_uses_final_open_latent_without_clean_outputs() -> None:
+    torch.manual_seed(19)
     patcher = _patcher()
-    model = ByteDiffusionModel(ByteDiffusionConfig.tiny()).eval()
+    model = ByteDiffusionModel(
+        ByteDiffusionConfig.tiny(
+            decoder_conditioning="split_cross_attention",
+            decoder_prefix_window=None,
+            decoder_branch_attention="shared_flex",
+        )
+    ).eval()
     probe = torch.zeros(24, dtype=torch.long)
     starts = set(
         map(
@@ -230,34 +246,85 @@ def test_entropy_generator_uses_clean_ar_until_the_next_causal_boundary(
     )
     prefix_length = next(index for index in range(2, 20) if index not in starts)
     prefix = torch.zeros(prefix_length, dtype=torch.long)
-    observed: list[torch.Tensor] = []
-
-    def ar_logits(
-        _model: ByteDiffusionModel,
-        _patcher: CausalEntropyPatcher,
-        committed: torch.Tensor,
-    ) -> torch.Tensor:
-        observed.append(committed.clone())
-        assert not committed.eq(model.config.vocab.mask_id).any()
-        logits = torch.full((model.config.vocab.output_size,), -20.0)
-        logits[65] = 20.0
-        return logits
-
-    monkeypatch.setattr(inference_module, "entropy_ar_next_logits", ar_logits)
-    generator = EntropyPatchedCanvasGenerator(
-        model, patcher, block_length=4, seed=11
+    _, prefix_layout = _variable_prefix_metadata(patcher, prefix)
+    expected_final_latent = int(
+        prefix_layout.physical_to_global_patch_indices[-1]
     )
-    generator.prefill(prefix)
-    aligned = generator.align_prefix_ar(stochastic=False)
+    observed: dict[str, object] = {}
+    original = model.forward_blt_d_branches
 
-    assert 1 <= aligned.numel() < patcher.config.max_patch_size
-    assert aligned.tolist() == [65] * aligned.numel()
-    assert entropy_next_byte_starts_patch(patcher, generator.ids)
-    torch.testing.assert_close(observed[0], prefix)
-    assert all(not item.eq(model.config.vocab.mask_id).any() for item in observed)
+    def capture(*args, **kwargs):
+        observed["clean_ids"] = args[0].clone()
+        observed["start"] = int(args[4].item())
+        observed["condition"] = int(kwargs["branch_condition_indices"].item())
+        observed["return_clean_logits"] = kwargs["return_clean_logits"]
+        observed["return_clean_patch_states"] = kwargs["return_clean_patch_states"]
+        output = original(*args, **kwargs)
+        observed["clean_logits_shape"] = tuple(output.clean_logits.shape)
+        observed["clean_patch_shape"] = tuple(output.clean_patch_states.shape)
+        return output
+
+    model.forward_blt_d_branches = capture  # type: ignore[method-assign]
+    logits = denoise_entropy_blt_reference(
+        model,
+        patcher,
+        prefix,
+        torch.full((4,), model.config.vocab.mask_id, dtype=torch.long),
+    )
+
+    clean_ids = observed["clean_ids"]
+    assert isinstance(clean_ids, torch.Tensor)
+    torch.testing.assert_close(clean_ids[0, :prefix_length], prefix)
+    assert int(clean_ids[0, prefix_length]) == 0
+    assert observed["start"] == prefix_length
+    assert observed["condition"] == expected_final_latent
+    assert observed["return_clean_logits"] is False
+    assert observed["return_clean_patch_states"] is False
+    assert observed["clean_logits_shape"] == (1, 0, model.config.vocab.output_size)
+    assert observed["clean_patch_shape"][:2] == (1, 0)
+    assert logits.shape == (4, model.config.vocab.output_size)
 
 
-def test_entropy_eval_stops_alignment_at_the_literal_byte_cap(
+def test_entropy_batched_end_origins_match_independent_rows() -> None:
+    torch.manual_seed(23)
+    patcher = _patcher()
+    model = ByteDiffusionModel(
+        ByteDiffusionConfig.tiny(
+            decoder_conditioning="split_cross_attention",
+            decoder_prefix_window=None,
+            decoder_branch_attention="shared_flex",
+        )
+    ).eval()
+    prefixes = (
+        torch.tensor([65, 66, 67], dtype=torch.long),
+        torch.tensor([70, 71, 72, 73, 74, 75], dtype=torch.long),
+    )
+    noisy = torch.tensor(
+        [
+            [model.config.vocab.mask_id, 80, model.config.vocab.mask_id, 81],
+            [82, model.config.vocab.mask_id, 83, model.config.vocab.mask_id],
+        ],
+        dtype=torch.long,
+    )
+
+    batched = denoise_entropy_blt_reference_batched(
+        model, patcher, prefixes, noisy
+    )
+    plan = prepare_entropy_blt_end(model, patcher, prefixes, noisy.shape[1])
+    planned = denoise_entropy_blt_reference_batched(
+        model, patcher, prefixes, noisy, plan=plan
+    )
+    independent = torch.stack(
+        [
+            denoise_entropy_blt_reference(model, patcher, prefix, canvas)
+            for prefix, canvas in zip(prefixes, noisy, strict=True)
+        ]
+    )
+    torch.testing.assert_close(batched, independent, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(planned, batched, rtol=0, atol=0)
+
+
+def test_entropy_eval_batches_nonboundary_prefixes_and_traces_every_nfe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patcher = _patcher()
@@ -273,17 +340,35 @@ def test_entropy_eval_stops_alignment_at_the_literal_byte_cap(
     )
     prefix_length = next(index for index in range(2, 20) if index not in starts)
 
-    def ar_logits(*_: object) -> torch.Tensor:
-        logits = torch.full((model.config.vocab.output_size,), -20.0)
-        logits[65] = 20.0
+    observed_prefixes: list[tuple[torch.Tensor, ...]] = []
+
+    def denoise(
+        _model: ByteDiffusionModel,
+        _patcher: CausalEntropyPatcher,
+        committed_rows: tuple[torch.Tensor, ...],
+        noisy: torch.Tensor,
+        **_: object,
+    ) -> torch.Tensor:
+        observed_prefixes.append(tuple(row.clone() for row in committed_rows))
+        logits = torch.zeros(
+            (*noisy.shape, model.config.vocab.output_size), dtype=torch.float32
+        )
+        for row in range(noisy.shape[0]):
+            unresolved = noisy[row].eq(model.config.vocab.mask_id).nonzero().flatten()
+            if unresolved.numel():
+                logits[row, unresolved[0], 65] = 20.0
         return logits
 
-    monkeypatch.setattr(inference_module, "entropy_ar_next_logits", ar_logits)
-    result = entropy_blt_generate_bytes(
+    monkeypatch.setattr(gsm_module, "denoise_entropy_blt_reference_batched", denoise)
+    prompts = [bytes(prefix_length), bytes(prefix_length + 1)]
+    traces = [
+        {"alignment_steps": [], "diffusion_blocks": []} for _ in prompts
+    ]
+    results = entropy_blt_generate_bytes(
         model,
         patcher,
-        [bytes(prefix_length)],
-        max_new_bytes=1,
+        prompts,
+        max_new_bytes=3,
         max_native_actions=10,
         context_bytes=32,
         block_length=4,
@@ -295,11 +380,104 @@ def test_entropy_eval_stops_alignment_at_the_literal_byte_cap(
         seed=13,
         stochastic=False,
         device=torch.device("cpu"),
-    )[0]
+        trace_records=traces,
+    )
 
-    assert result.raw == b"A"
-    assert result.termination == "byte_cap"
-    assert result.native_actions == 1
+    assert observed_prefixes
+    assert len(observed_prefixes[0]) == 2
+    for expected, observed in zip(prompts, observed_prefixes[0], strict=True):
+        torch.testing.assert_close(observed, torch.tensor(list(expected)))
+    assert [result.raw for result in results] == [b"AAA", b"AAA"]
+    assert all(result.termination == "byte_cap" for result in results)
+    assert all(result.native_actions == 4 for result in results)
+    assert all(result.model_forwards == 4 for result in results)
+    for trace in traces:
+        assert trace["alignment_steps"] == []
+        blocks = trace["diffusion_blocks"]
+        assert isinstance(blocks, list) and len(blocks) == 1
+        assert len(blocks[0]["steps"]) == 4
+        assert all(step["denoiser_executed"] for step in blocks[0]["steps"])
+        assert blocks[0]["logical_active_nfe"] == 4
+        assert blocks[0]["cohort_physical_nfe"] == 4
+        assert blocks[0]["semantic_actions"] == [65, 65, 65]
+        assert blocks[0]["committed_ids"] == [65, 65, 65]
+        assert blocks[0]["overflow_ids"] == [65]
+        assert blocks[0]["final_retained_output_bytes"] == 3
+        assert trace["final_retained_output_bytes"] == 3
+
+
+def test_entropy_trace_separates_logical_nfe_and_retained_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patcher = _patcher()
+    model = ByteDiffusionModel(ByteDiffusionConfig.tiny()).eval()
+
+    def denoise(
+        _model: ByteDiffusionModel,
+        _patcher: CausalEntropyPatcher,
+        committed_rows: tuple[torch.Tensor, ...],
+        noisy: torch.Tensor,
+        **_: object,
+    ) -> torch.Tensor:
+        assert len(committed_rows) == 2
+        logits = torch.zeros(
+            (*noisy.shape, model.config.vocab.output_size), dtype=torch.float32
+        )
+        unresolved_eot = noisy[0].eq(model.config.vocab.mask_id).nonzero().flatten()
+        if unresolved_eot.numel():
+            logits[0, unresolved_eot[0], model.config.vocab.eot_id] = 20.0
+        unresolved_text = noisy[1].eq(model.config.vocab.mask_id).nonzero().flatten()
+        if unresolved_text.numel():
+            position = int(unresolved_text[0])
+            logits[1, position, 65 + position] = 20.0
+        return logits
+
+    monkeypatch.setattr(gsm_module, "denoise_entropy_blt_reference_batched", denoise)
+    traces = [
+        {"alignment_steps": [], "diffusion_blocks": []},
+        {"alignment_steps": [], "diffusion_blocks": []},
+    ]
+    results = entropy_blt_generate_bytes(
+        model,
+        patcher,
+        [b"prompt one", b"prompt two"],
+        max_new_bytes=4,
+        max_native_actions=8,
+        context_bytes=32,
+        block_length=4,
+        stops=("BC",),
+        diffusion_steps=4,
+        unmasking_strategy="confidence",
+        confidence_threshold=0.7,
+        entropy_budget=1.0,
+        seed=29,
+        stochastic=False,
+        device=torch.device("cpu"),
+        trace_records=traces,
+    )
+
+    assert results[0].termination == "eot" and results[0].raw == b""
+    assert results[0].native_actions == 1
+    assert results[1].termination == "text_stop" and results[1].raw == b"A"
+    assert results[1].native_actions == 4
+    assert all(result.model_forwards == 4 for result in results)
+
+    eot_block = traces[0]["diffusion_blocks"][0]
+    assert len(eot_block["steps"]) == 1
+    assert eot_block["logical_active_nfe"] == 1
+    assert eot_block["cohort_physical_nfe"] == 4
+    assert eot_block["semantic_actions"] == [model.config.vocab.eot_id]
+    assert eot_block["committed_ids"] == []
+    assert eot_block["final_retained_output_bytes"] == 0
+
+    text_block = traces[1]["diffusion_blocks"][0]
+    assert len(text_block["steps"]) == 4
+    assert text_block["logical_active_nfe"] == 4
+    assert text_block["cohort_physical_nfe"] == 4
+    assert text_block["semantic_actions"] == [65, 66, 67]
+    assert text_block["committed_ids"] == [65]
+    assert text_block["overflow_ids"] == [68]
+    assert text_block["final_retained_output_bytes"] == 1
 
 
 def test_entropy_eval_does_not_align_past_the_context_cap(

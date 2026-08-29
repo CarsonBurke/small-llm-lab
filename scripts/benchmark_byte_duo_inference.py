@@ -35,7 +35,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from pretraining.byte_diffusion.duo_model import DuoModel
 from pretraining.byte_diffusion.config import ByteDiffusionConfig, model_config_from_env
-from pretraining.byte_diffusion.inference_duo import sample_duo_canvas
+from pretraining.byte_diffusion.inference_duo import (
+    duo_entropy_clean_metadata,
+    sample_duo_canvas,
+)
+from pretraining.byte_diffusion.patching import CausalEntropyPatcher
+from pretraining.byte_diffusion.variable_patching import load_dataset_patching_spec
 from scripts.train_byte_duo import source_provenance
 from scripts.train_byte_duo import _local_imports
 from pretraining.byte_diffusion.readiness import (
@@ -144,6 +149,19 @@ def _prompt_batch(
     return ids, valid
 
 
+def _serving_canvas_origin(
+    current_length: int, stride: int, *, full_resolution: bool
+) -> tuple[int, int]:
+    """Return the deployed branch start and immutable in-canvas prefix width."""
+
+    if current_length <= 0 or stride <= 0:
+        raise ValueError("serving origin dimensions must be positive")
+    if full_resolution:
+        return current_length, 0
+    start = current_length // stride * stride
+    return start, current_length - start
+
+
 @torch.inference_mode()
 def _run_once(
     model: DuoModel,
@@ -155,6 +173,7 @@ def _run_once(
     requested_atoms: int,
     steps: int,
     seed: int,
+    entropy_patcher: CausalEntropyPatcher | None = None,
 ) -> dict[str, int]:
     """Complete exactly one atom budget without semantic early termination."""
 
@@ -162,14 +181,20 @@ def _run_once(
     stride = model.config.patch_stride
     document_ids = torch.arange(ids.shape[0], device=ids.device)[:, None].expand_as(ids)
     positions = torch.arange(ids.shape[1], device=ids.device)[None].expand_as(ids)
+    full_resolution = (
+        model.config.duo_mutable_topology == "full_resolution_decoder"
+    )
     current_length = prompt_length
     remaining = requested_atoms
     canvases = 0
     model_forwards = 0
     denoised_atom_slots = 0
     while remaining:
-        start = current_length // stride * stride
-        phase = current_length - start
+        start, phase = _serving_canvas_origin(
+            current_length,
+            stride,
+            full_resolution=full_resolution,
+        )
         fresh_count = min(canvas_length - phase, remaining)
         offsets = torch.arange(canvas_length, device=ids.device)[None].expand(
             ids.shape[0], -1
@@ -184,12 +209,23 @@ def _run_once(
         initial = torch.gather(ids, 1, safe_absolute)
         initial = torch.where(visible, initial, model.config.vocab.pad_id)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            if entropy_patcher is None:
+                attention_metadata = model.prepare_attention_metadata(
+                    valid, document_ids
+                )
+                clean_patch_metadata = None
+            else:
+                attention_metadata = None
+                clean_patch_metadata = duo_entropy_clean_metadata(
+                    entropy_patcher, ids, valid, document_ids
+                )
             clean = model.prepare_clean_bank(
                 ids,
                 valid,
                 document_ids,
                 positions,
-                attention_metadata=model.prepare_attention_metadata(valid, document_ids),
+                attention_metadata=attention_metadata,
+                clean_patch_metadata=clean_patch_metadata,
             )
             cache = model.prepare_canvas_cache(
                 clean,
@@ -250,6 +286,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=12)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=REPO_ROOT / "data" / "byte_diffusion_aligned_v5",
+    )
     return parser.parse_args()
 
 
@@ -283,6 +324,20 @@ def main() -> None:
     # provenance artifact agree on the logical device ordinal.
     device = torch.device("cuda", torch.cuda.current_device())
     config = model_config_from_env()
+    dataset_manifest = json.loads((args.data_path / "manifest.json").read_text())
+    patching = load_dataset_patching_spec(args.data_path, dataset_manifest)
+    if patching.name != config.duo_clean_patching:
+        raise ValueError("inference dataset and Duo clean patching policy differ")
+    if patching.variable:
+        artifact = dataset_manifest["patching"]["patcher_artifact"]
+        entropy_patcher = CausalEntropyPatcher.from_bytes(
+            (args.data_path / artifact["path"]).read_bytes()
+        )
+        if entropy_patcher.sha256 != patching.artifact_sha256:
+            raise ValueError("inference entropy patcher authentication failed")
+    else:
+        entropy_patcher = None
+    full_resolution = config.duo_mutable_topology == "full_resolution_decoder"
     model = DuoModel(config).to(device).eval()
     if config == ByteDiffusionConfig():
         model.validate_production_parameterization()
@@ -324,6 +379,7 @@ def main() -> None:
             requested_atoms=args.requested_atoms,
             steps=args.diffusion_steps,
             seed=args.seed + phase,
+            entropy_patcher=entropy_patcher,
         )
         for phase, (ids, valid) in zip(phases, phase_batches, strict=True)
     )
@@ -361,12 +417,17 @@ def main() -> None:
                 requested_atoms=args.requested_atoms,
                 steps=args.diffusion_steps,
                 seed=args.seed + 10_003 * phase + repetition + 1,
+                entropy_patcher=entropy_patcher,
             )
         torch.cuda.synchronize()
         phase_seconds = time.perf_counter() - started
         measured_seconds += phase_seconds
         expected_canvases = math.ceil(
-            (args.requested_atoms + phase) / args.canvas_length
+            (
+                args.requested_atoms
+                + (0 if full_resolution else phase)
+            )
+            / args.canvas_length
         )
         if work != expected or work["canvases"] != expected_canvases:
             raise AssertionError("phase workload did not complete its exact atom budget")
@@ -439,6 +500,17 @@ def main() -> None:
         "benchmark_source": benchmark_source_provenance(),
         "model_config": config.to_dict(),
         "parameter_count": model.parameter_count,
+        "dataset_payload_sha256": dataset_manifest.get("payload_sha256"),
+        "dataset_patching": {
+            "name": patching.name,
+            "max_patch_size": patching.max_patch_size,
+            "patcher_sha256": patching.artifact_sha256,
+        },
+        "serving_origin_policy": (
+            "exact_prompt_length"
+            if full_resolution
+            else "floor_to_patch_and_carry_clean_phase"
+        ),
         "semantic_generation": False,
         "semantic_generation_reason": "fixed compute budget ignores EOT stopping",
         "posterior_backend": "triton",

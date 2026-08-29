@@ -9,6 +9,20 @@ import os
 from typing import Any, Literal
 
 
+FAST_BLT_ENTROPY_B4_COMPLETE_PRESET = "fast_blt_entropy_b4_complete_g6d8_v1"
+FAST_BLT_ENTROPY_B4_COMPLETE_PARAMETER_TARGET = 24_013_824
+FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET = (
+    "fast_blt_entropy_b4_complete_paper_ratio_e1g10d2_v1"
+)
+FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PARAMETER_TARGET = 23_991_296
+FAST_BLT_ENTROPY_B4_COMPLETE_PRESETS = frozenset(
+    {
+        FAST_BLT_ENTROPY_B4_COMPLETE_PRESET,
+        FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET,
+    }
+)
+
+
 class ModelMode(IntEnum):
     AR = 0
     BLT_D = 1
@@ -181,6 +195,12 @@ class ByteDiffusionConfig:
     duo_variable_length_probability: float = 0.01
     duo_noisy_ngrams: bool = True
     duo_random_phase_training: bool = False
+    duo_mutable_topology: Literal[
+        "patched_global", "full_resolution_decoder"
+    ] = "patched_global"
+    duo_clean_patching: Literal[
+        "fixed_stride_v1", "causal_entropy_v1"
+    ] = "fixed_stride_v1"
     validate_production_layout: bool = True
 
     def __post_init__(self) -> None:
@@ -271,6 +291,65 @@ class ByteDiffusionConfig:
             )
         if self.output_tied and self.local_dim <= 0:
             raise ValueError("invalid tied output width")
+        if self.duo_mutable_topology not in {
+            "patched_global",
+            "full_resolution_decoder",
+        }:
+            raise ValueError(
+                f"unsupported duo_mutable_topology {self.duo_mutable_topology!r}"
+            )
+        if self.duo_clean_patching not in {
+            "fixed_stride_v1",
+            "causal_entropy_v1",
+        }:
+            raise ValueError(
+                f"unsupported duo_clean_patching {self.duo_clean_patching!r}"
+            )
+        if (
+            self.duo_clean_patching == "causal_entropy_v1"
+            and self.duo_mutable_topology != "full_resolution_decoder"
+        ):
+            raise ValueError(
+                "causal entropy clean patches require full_resolution_decoder"
+            )
+        if (
+            self.duo_mutable_topology == "full_resolution_decoder"
+            and not self.duo_random_phase_training
+        ):
+            raise ValueError(
+                "full_resolution_decoder requires random-phase training so "
+                "exact prompt-length serving origins are in-distribution"
+            )
+        if (
+            self.duo_mutable_topology == "full_resolution_decoder"
+            and self.duo_noisy_ngrams
+        ):
+            raise ValueError(
+                "full_resolution_decoder forbids noisy n-grams; mutable bytes "
+                "must begin from CleanAtomEmbedding only"
+            )
+
+    @property
+    def duo_origin_stride(self) -> int:
+        """Training-origin granularity for the selected mutable topology.
+
+        The legacy topology is intrinsically patch aligned.  A full-resolution
+        decoder can train at every byte phase when the explicit random-phase
+        control is enabled, matching exact prompt-length serving origins.
+        """
+
+        if self.duo_mutable_topology == "full_resolution_decoder":
+            return 1
+        return self.patch_stride
+
+    @property
+    def duo_mutable_ngrams_enabled(self) -> bool:
+        """Whether revisable bytes consume the causal n-gram tables."""
+
+        return (
+            self.duo_mutable_topology == "patched_global"
+            and self.duo_noisy_ngrams
+        )
 
     @classmethod
     def tiny(cls, **overrides: Any) -> "ByteDiffusionConfig":
@@ -292,20 +371,89 @@ class ByteDiffusionConfig:
         }
         return cls(**values)
 
+    @classmethod
+    def fast_blt_entropy_b4_complete(cls) -> "ByteDiffusionConfig":
+        """Exact capacity-matched Fast-BLT-D4 G6/D8 architecture."""
+
+        return cls(
+            encoder_layers=1,
+            global_layers=6,
+            decoder_layers=8,
+            encoder_ffn_dim=512,
+            global_ffn_dim=512,
+            decoder_ffn_dim=680,
+            decoder_prefix_window=None,
+            ngram_table_size=8_192,
+            ngram_rank=16,
+            ngram_orders=(3, 4, 5, 6, 7, 8),
+            ngram_hash="blt_prime",
+            ngram_factor_init="scale_matched",
+            ngram_aggregation="mean",
+            ngram_table_sharing="per_order",
+            decoder_conditioning="split_cross_attention",
+        )
+
+    @classmethod
+    def fast_blt_entropy_b4_complete_paper_ratio(cls) -> "ByteDiffusionConfig":
+        """Ratio-matched E1/G10/D2 ablation of the complete Fast-BLT cell.
+
+        This preserves every mechanism in the capacity-matched G6/D8 cell and
+        changes only the global/decoder depth allocation and global FFN width.
+        It is an architecture-ratio ablation inspired by Fast-BLT, not an exact
+        reproduction of the paper model.
+        """
+
+        return dataclass_replace(
+            cls.fast_blt_entropy_b4_complete(),
+            global_layers=10,
+            decoder_layers=2,
+            global_ffn_dim=544,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @property
     def production_parameter_target(self) -> int:
-        if self != ByteDiffusionConfig():
-            raise ValueError("the closed parameter target applies only to the default config")
-        return 23_010_306
+        if self == ByteDiffusionConfig():
+            return 23_010_306
+        if self == ByteDiffusionConfig.fast_blt_entropy_b4_complete():
+            return FAST_BLT_ENTROPY_B4_COMPLETE_PARAMETER_TARGET
+        if self == ByteDiffusionConfig.fast_blt_entropy_b4_complete_paper_ratio():
+            return FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PARAMETER_TARGET
+        raise ValueError(
+            "the closed parameter target applies only to a named production config"
+        )
+
+
+def fast_blt_complete_model_config(preset: str) -> ByteDiffusionConfig:
+    """Resolve one exact supported complete Fast-BLT architecture identity."""
+
+    if preset == FAST_BLT_ENTROPY_B4_COMPLETE_PRESET:
+        return ByteDiffusionConfig.fast_blt_entropy_b4_complete()
+    if preset == FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET:
+        return ByteDiffusionConfig.fast_blt_entropy_b4_complete_paper_ratio()
+    raise ValueError(f"unsupported complete Fast-BLT preset {preset!r}")
 
 
 def model_config_from_env(*, tiny: bool = False) -> ByteDiffusionConfig:
     """Build one explicit architecture cell from the ablation environment."""
 
-    base = ByteDiffusionConfig.tiny() if tiny else ByteDiffusionConfig()
+    preset = os.environ.get("BYTE_DIFFUSION_PRESET") or None
+    if preset == FAST_BLT_ENTROPY_B4_COMPLETE_PRESET:
+        if tiny:
+            raise ValueError(
+                f"preset {preset!r} requires its full production architecture"
+            )
+        base = ByteDiffusionConfig.fast_blt_entropy_b4_complete()
+    elif preset == FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET:
+        if tiny:
+            raise ValueError(
+                f"preset {preset!r} requires its full production architecture"
+            )
+        base = ByteDiffusionConfig.fast_blt_entropy_b4_complete_paper_ratio()
+    else:
+        base = ByteDiffusionConfig.tiny() if tiny else ByteDiffusionConfig()
     overrides: dict[str, object] = {}
     string_fields = {
         "BYTE_DIFFUSION_NGRAM_HASH": "ngram_hash",
@@ -315,6 +463,8 @@ def model_config_from_env(*, tiny: bool = False) -> ByteDiffusionConfig:
         "BYTE_DIFFUSION_DECODER_CONDITIONING": "decoder_conditioning",
         "BYTE_DIFFUSION_GLOBAL_FFN_KIND": "global_ffn_kind",
         "BYTE_DIFFUSION_DECODER_BRANCH_ATTENTION": "decoder_branch_attention",
+        "BYTE_DUO_MUTABLE_TOPOLOGY": "duo_mutable_topology",
+        "BYTE_DUO_CLEAN_PATCHING": "duo_clean_patching",
     }
     for environment, field in string_fields.items():
         if environment in os.environ:
@@ -360,6 +510,24 @@ def model_config_from_env(*, tiny: bool = False) -> ByteDiffusionConfig:
         if value not in {"0", "1"}:
             raise ValueError(f"{environment} must be 0 or 1")
         overrides[field] = value == "1"
+    if (
+        overrides.get("duo_mutable_topology") == "full_resolution_decoder"
+        and "BYTE_DUO_NOISY_NGRAMS" not in os.environ
+    ):
+        overrides["duo_noisy_ngrams"] = False
+    if (
+        not tiny
+        and overrides.get("duo_mutable_topology") == "full_resolution_decoder"
+    ):
+        # The production full-resolution cell removes dead encoder/global
+        # AdaLN rows and spends the recovered budget in its live byte decoder.
+        # Keep explicit environment overrides available for named ablations.
+        if "BYTE_DIFFUSION_GLOBAL_LAYERS" not in os.environ:
+            overrides["global_layers"] = 8
+        if "BYTE_DIFFUSION_DECODER_LAYERS" not in os.environ:
+            overrides["decoder_layers"] = 4
+        if "BYTE_DIFFUSION_DECODER_FFN_DIM" not in os.environ:
+            overrides["decoder_ffn_dim"] = 960
     if "BYTE_DIFFUSION_DECODER_SPLIT_RESIDUAL_SCALE" in os.environ:
         overrides["decoder_split_residual_scale"] = float(
             os.environ["BYTE_DIFFUSION_DECODER_SPLIT_RESIDUAL_SCALE"]
@@ -404,4 +572,13 @@ def model_config_from_env(*, tiny: bool = False) -> ByteDiffusionConfig:
         if not orders:
             raise ValueError("BYTE_DIFFUSION_NGRAM_ORDERS cannot be empty")
         overrides["ngram_orders"] = orders
-    return dataclass_replace(base, **overrides)
+    result = dataclass_replace(base, **overrides)
+    if preset in {
+        FAST_BLT_ENTROPY_B4_COMPLETE_PRESET,
+        FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET,
+    } and result != base:
+        raise ValueError(
+            f"preset {preset!r} model contract mismatch: "
+            f"expected {base.to_dict()}, observed {result.to_dict()}"
+        )
+    return result

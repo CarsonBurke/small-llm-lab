@@ -31,13 +31,13 @@ if str(REPO_ROOT) not in sys.path:
 from pretraining.byte_diffusion.data import AtomicIdManifest
 from pretraining.byte_diffusion.inference import (
     CachedCanvasGenerator,
-    EntropyPatchedCanvasGenerator,
     append_clean_block,
     denoise_blt_cached,
+    denoise_entropy_blt_reference_batched,
     document_start_ar_metadata,
-    entropy_next_byte_starts_patch,
     prefill_prefix,
     prepare_cached_canvas,
+    prepare_entropy_blt_end,
 )
 from pretraining.byte_diffusion.patching import CausalEntropyPatcher
 from pretraining.byte_diffusion.duo_model import DuoModel
@@ -64,7 +64,7 @@ from pretraining.byte_diffusion.training import (
     model_config_from_dict,
 )
 from pretraining.byte_diffusion.variable_patching import load_dataset_patching_spec
-from pretraining.eval_fewshot_gsm8k import (
+from pretraining.gsm8k_contract import (
     GSM8K_ROOT,
     PROMPT_FORMATS,
     TEST_PARQUET,
@@ -86,7 +86,7 @@ from scripts.train_byte_diffusion_gemma import (
 from scripts.train_byte_idlm import source_provenance as idlm_source_provenance
 
 
-EVALUATOR_SCHEMA = "byte_diffusion_gsm8k/v9"
+EVALUATOR_SCHEMA = "byte_diffusion_gsm8k/v10"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1068,7 +1068,7 @@ def entropy_blt_generate_bytes(
     device: torch.device,
     trace_records: list[dict[str, object]] | None = None,
 ) -> list[ByteGeneration]:
-    """Reference causal-entropy serving; each row preserves its own topology."""
+    """Paper-exact batched causal-entropy Fast-BLT serving."""
 
     if not prompts or any(not prompt for prompt in prompts):
         raise ValueError("byte prompts must be a nonempty batch of nonempty strings")
@@ -1093,116 +1093,218 @@ def entropy_blt_generate_bytes(
         dtype=torch.long,
         device=device,
     )
-    results: list[ByteGeneration] = []
-    for row, prompt in enumerate(prompts):
-        generator = EntropyPatchedCanvasGenerator(
-            model,
-            patcher,
-            block_length=block_length,
-            seed=seed + 1_000_003 * row,
-            blocked_output_ids=blocked,
-        )
-        generator.prefill(torch.tensor(list(prompt), dtype=torch.long, device=device))
-        generated = bytearray()
-        generated_atoms = 0
-        termination = "native_action_cap"
-        while generator.forwards < max_native_actions:
-            # Close an incomplete patch one clean AR action at a time so a
-            # byte/text/context cap cannot hide later alignment generations.
-            while not entropy_next_byte_starts_patch(patcher, generator.ids):
-                if generator.forwards >= max_native_actions:
-                    break
-                if generator.ids.numel() >= context_bytes:
-                    termination = "context_cap"
-                    break
-                alignment = generator.align_prefix_ar(
-                    stochastic=stochastic, max_forwards=1
-                )
-                if alignment.numel() != 1:
-                    raise AssertionError("entropy AR alignment made no progress")
-                token = int(alignment[0])
-                generated_atoms += 1
-                if trace_records is not None:
-                    alignment_steps = trace_records[row]["alignment_steps"]
-                    if not isinstance(alignment_steps, list):
-                        raise TypeError("trace alignment_steps must be a list")
-                    alignment_steps.append(
-                        {
-                            "prefix_bytes_after": generator.ids.numel(),
-                            "chosen_id": token,
-                        }
-                    )
-                if token == eot_id:
-                    termination = "eot"
-                    break
-                if not 0 <= token < 256:
-                    raise AssertionError(f"unblocked non-byte output id {token}")
-                generated.append(token)
-                if _first_stop(bytes(generated), encoded_stops) is not None:
-                    termination = "text_stop"
-                    break
-                if len(generated) >= max_new_bytes:
-                    termination = "byte_cap"
-                    break
-            if termination != "native_action_cap":
-                break
-            if not entropy_next_byte_starts_patch(patcher, generator.ids):
-                # The only remaining cause is exhaustion of the native-action
-                # budget while a variable patch was still incomplete.
-                break
-            if generator.forwards + diffusion_steps > max_native_actions:
-                break
-            if generator.ids.numel() + block_length > context_bytes:
-                termination = "context_cap"
-                break
+    committed = [
+        torch.tensor(list(prompt), dtype=torch.long, device=device)
+        for prompt in prompts
+    ]
+    generated = [bytearray() for _ in prompts]
+    generated_atoms = [0 for _ in prompts]
+    native_actions = [0 for _ in prompts]
+    denoising_forwards = [0 for _ in prompts]
+    termination = ["native_action_cap" for _ in prompts]
+    live = [True for _ in prompts]
+    physical_forwards = 0
+    generator = torch.Generator(device=device).manual_seed(seed)
 
-            proposal = generator.generate_blt(
-                diffusion_steps,
+    while any(live):
+        cohort: list[int] = []
+        for row in range(len(prompts)):
+            if not live[row]:
+                continue
+            if native_actions[row] + diffusion_steps > max_native_actions:
+                live[row] = False
+                continue
+            if committed[row].numel() + block_length > context_bytes:
+                termination[row] = "context_cap"
+                live[row] = False
+                continue
+            cohort.append(row)
+        if not cohort:
+            break
+
+        initial = torch.full(
+            (len(cohort), block_length),
+            model.config.vocab.mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+        cohort_prefixes = tuple(committed[row] for row in cohort)
+        end_plan = prepare_entropy_blt_end(
+            model, patcher, cohort_prefixes, block_length
+        )
+        logical_nfe_this_block = torch.zeros(
+            len(cohort), dtype=torch.int64, device=device
+        )
+
+        def denoise(canvas: Tensor) -> Tensor:
+            logical_live = canvas.eq(model.config.vocab.mask_id).any(-1) & ~canvas.eq(
+                eot_id
+            ).any(-1)
+            logical_nfe_this_block.add_(logical_live.to(torch.int64))
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                logits = denoise_entropy_blt_reference_batched(
+                    model,
+                    patcher,
+                    cohort_prefixes,
+                    canvas,
+                    plan=end_plan,
+                )
+            if blocked.numel():
+                logits[..., blocked] = -torch.inf
+            return logits
+
+        if trace_records is None:
+            sample = sample_absorbing_canvas_batched(
+                initial,
+                denoise,
+                steps=diffusion_steps,
+                mask_id=model.config.vocab.mask_id,
+                eot_id=eot_id,
+                generator=generator,
                 strategy=unmasking_strategy,
                 confidence_threshold=confidence_threshold,
                 entropy_budget=entropy_budget,
                 stochastic=stochastic,
             )
-            if proposal.canvas is None:
-                termination = "eot"
-                break
-            if trace_records is not None:
-                blocks = trace_records[row]["diffusion_blocks"]
-                if not isinstance(blocks, list):
-                    raise TypeError("trace diffusion_blocks must be a list")
-                blocks.append(
-                    {
-                        "block": len(blocks),
-                        "prompt_bytes_noised": False,
-                        "canvas_width": block_length,
-                        "sample_ids": proposal.canvas.ids.tolist(),
-                        "committed_ids": proposal.committed_canvas_ids.tolist(),
-                        "overflow_ids": proposal.overflow_canvas_ids.tolist(),
-                    }
-                )
-            if not proposal.committed_canvas_ids.numel():
-                raise RuntimeError("entropy BLT generation made no semantic progress")
-            for token in proposal.committed_canvas_ids.tolist():
-                generated_atoms += 1
+            sampled_traces = None
+        else:
+            sample, sampled_traces = sample_absorbing_canvas_batched_traced(
+                initial,
+                denoise,
+                steps=diffusion_steps,
+                mask_id=model.config.vocab.mask_id,
+                eot_id=eot_id,
+                generator=generator,
+                strategy=unmasking_strategy,
+                confidence_threshold=confidence_threshold,
+                entropy_budget=entropy_budget,
+                row_active=torch.ones(
+                    len(cohort), dtype=torch.bool, device=device
+                ),
+                stochastic=stochastic,
+            )
+        physical_forwards += sample.executed_nfe
+        logical_nfe_rows = logical_nfe_this_block.cpu().tolist()
+
+        for cohort_row, output_row in enumerate(cohort):
+            logical_active_nfe = int(logical_nfe_rows[cohort_row])
+            useful_reveal_nfe = int(sample.useful_nfe[cohort_row])
+            native_actions[output_row] += logical_active_nfe
+            denoising_forwards[output_row] += logical_active_nfe
+            sampled_ids = sample.ids[cohort_row]
+            eot = sampled_ids.eq(eot_id).nonzero().flatten()
+            semantic_length = int(eot[0]) + 1 if eot.numel() else block_length
+            semantic = sampled_ids[:semantic_length]
+            if bool(semantic.eq(model.config.vocab.mask_id).any()):
+                raise AssertionError("live entropy canvas retained MASK")
+            prefix_length = committed[output_row].numel()
+            trace = None if sampled_traces is None else sampled_traces[cohort_row]
+            generated_before = len(generated[output_row])
+            semantic_actions: list[int] = []
+            for token in semantic.tolist():
+                semantic_actions.append(token)
+                generated_atoms[output_row] += 1
                 if token == eot_id:
-                    termination = "eot"
+                    termination[output_row] = "eot"
+                    live[output_row] = False
                     break
                 if not 0 <= token < 256:
                     raise AssertionError(f"unblocked non-byte output id {token}")
-                generated.append(token)
-                if _first_stop(bytes(generated), encoded_stops) is not None:
-                    termination = "text_stop"
+                generated[output_row].append(token)
+                if _first_stop(
+                    bytes(generated[output_row]), encoded_stops
+                ) is not None:
+                    termination[output_row] = "text_stop"
+                    live[output_row] = False
                     break
-                if len(generated) >= max_new_bytes:
-                    termination = "byte_cap"
+                if len(generated[output_row]) >= max_new_bytes:
+                    termination[output_row] = "byte_cap"
+                    live[output_row] = False
                     break
-            if termination != "native_action_cap":
-                break
+            committed[output_row] = torch.cat(
+                (
+                    committed[output_row],
+                    semantic.new_tensor(semantic_actions),
+                )
+            )
+            if trace is not None:
+                blocks = trace_records[output_row]["diffusion_blocks"]
+                if not isinstance(blocks, list):
+                    raise TypeError("trace diffusion_blocks must be a list")
+                traced_active_nfe = sum(
+                    bool(step.get("denoiser_executed"))
+                    for step in _trace_steps(trace)
+                )
+                if traced_active_nfe != logical_active_nfe:
+                    raise AssertionError(
+                        "trace and logical active NFE counts diverged"
+                    )
+                trace.update(
+                    {
+                        "block": len(blocks),
+                        "prompt_bytes_noised": False,
+                        "absolute_byte_start": prefix_length,
+                        "generated_bytes_before": generated_before,
+                        "canvas_width": block_length,
+                        "sample_ids": sampled_ids.tolist(),
+                        "semantic_actions": semantic_actions,
+                        # Final retained IDs are filled after global text-stop
+                        # trimming, which may cross a block boundary.
+                        "committed_ids": [],
+                        "overflow_ids": sampled_ids[
+                            len(semantic_actions) :
+                        ].tolist(),
+                        "logical_active_nfe": logical_active_nfe,
+                        "useful_reveal_nfe": useful_reveal_nfe,
+                        "cohort_physical_nfe": sample.executed_nfe,
+                        "generated_bytes_after_untrimmed": len(
+                            generated[output_row]
+                        ),
+                        "termination_after_block": (
+                            None if live[output_row] else termination[output_row]
+                        ),
+                    }
+                )
+                blocks.append(trace)
 
-        raw = bytes(generated[:max_new_bytes])
+    results: list[ByteGeneration] = []
+    for row, raw_buffer in enumerate(generated):
+        raw = bytes(raw_buffer[:max_new_bytes])
         stop = _first_stop(raw, encoded_stops)
         if stop is not None:
             raw = raw[:stop]
+        if trace_records is not None:
+            blocks = trace_records[row]["diffusion_blocks"]
+            if not isinstance(blocks, list):
+                raise TypeError("trace diffusion_blocks must be a list")
+            retained = list(raw)
+            retained_offset = 0
+            for block in blocks:
+                actions = block.get("semantic_actions")
+                if not isinstance(actions, list):
+                    raise TypeError("trace semantic_actions must be a list")
+                action_bytes = [int(value) for value in actions if int(value) < 256]
+                keep = min(
+                    len(action_bytes), len(retained) - retained_offset
+                )
+                committed_ids = action_bytes[:keep]
+                expected = retained[retained_offset : retained_offset + keep]
+                if committed_ids != expected:
+                    raise AssertionError(
+                        "trace retained bytes diverged from returned output"
+                    )
+                retained_offset += keep
+                block["committed_ids"] = committed_ids
+                block["retained_output_bytes_after_block"] = retained_offset
+            if retained_offset != len(retained):
+                raise AssertionError("trace omitted retained output bytes")
+            if blocks:
+                blocks[-1]["final_retained_output_bytes"] = len(retained)
+            trace_records[row]["final_retained_output_bytes"] = len(retained)
         try:
             text = raw.decode("utf-8", errors="strict")
             invalid = False
@@ -1213,13 +1315,13 @@ def entropy_blt_generate_bytes(
             ByteGeneration(
                 raw=raw,
                 text=text,
-                termination=termination,
-                native_actions=generator.forwards,
-                model_forwards=generator.forwards,
+                termination=termination[row],
+                native_actions=native_actions[row],
+                model_forwards=physical_forwards,
                 invalid_utf8=invalid,
-                generated_atoms=generated_atoms,
-                clean_cache_forwards=generator.causal_forwards,
-                denoising_forwards=generator.denoising_forwards,
+                generated_atoms=generated_atoms[row],
+                clean_cache_forwards=0,
+                denoising_forwards=denoising_forwards[row],
             )
         )
     return results
@@ -2034,11 +2136,6 @@ def main() -> None:
         if args.decode_mode in {"causal", "blt"}
         else None
     )
-    if entropy_patcher is not None and args.trace_diffusion:
-        raise ValueError(
-            "--trace-diffusion is not yet supported by the uncached entropy "
-            "reference path because it would omit per-NFE reveal states"
-        )
     validate_serving_contract(
         payload,
         decode_mode=args.decode_mode,

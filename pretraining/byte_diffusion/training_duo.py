@@ -16,7 +16,7 @@ from .attention import (
     build_canvas_block_mask,
     canvas_block_mask_metadata,
 )
-from .config import AtomicVocabulary
+from .config import AtomicVocabulary, ByteDiffusionConfig
 from .diffusion_gemma_model import (
     DiffusionGemmaAttentionMetadata,
     compile_stable_document_metadata,
@@ -30,6 +30,10 @@ from .duo import (
 )
 from .duo_model import DuoModel
 from .training_diffusion_gemma import DocumentCanvasSelection, select_document_canvases
+from .variable_patching import (
+    DuoCleanPatchMetadata,
+    build_duo_clean_patch_metadata,
+)
 
 
 IGNORE_INDEX = -100
@@ -41,6 +45,37 @@ DUO_TRAINING_OBJECTIVES: tuple[DuoTrainingObjective, ...] = (
     PURE_DUO_OBJECTIVE,
     JOINT_DUO_CLEAN_AR_OBJECTIVE,
 )
+
+
+def duo_mutable_topology_contract(
+    config: ByteDiffusionConfig,
+) -> dict[str, object]:
+    """Serialize the effective mutable topology shared by all run evidence."""
+
+    return {
+        "mutable_topology": config.duo_mutable_topology,
+        "mutable_origin_stride": config.duo_origin_stride,
+        "serving_origin_policy": (
+            "exact_prompt_length"
+            if config.duo_mutable_topology == "full_resolution_decoder"
+            else "floor_to_patch_and_carry_clean_phase"
+        ),
+        "mutable_noisy_ngrams": config.duo_mutable_ngrams_enabled,
+        "clean_patching": config.duo_clean_patching,
+        "clean_byte_axis": "compile_stable_physical",
+        "clean_patch_axis": (
+            "dynamic_ragged_no_virtual_bos"
+            if config.duo_clean_patching == "causal_entropy_v1"
+            else "compile_stable_fixed_stride"
+        ),
+        "compile_dynamic_shapes": (
+            config.duo_clean_patching == "causal_entropy_v1"
+        ),
+        # Gated projection is intentionally retained for the first isolated
+        # topology control; this field prevents it being mistaken for BLT's
+        # eventual split-cross-attention cell.
+        "decoder_conditioning_control": config.decoder_conditioning,
+    }
 
 
 def duo_clean_ar_weight(objective: str) -> float:
@@ -84,6 +119,9 @@ class DuoBatch:
     ar_targets: Tensor
     bos_targets: Tensor
     attention_metadata: DiffusionGemmaAttentionMetadata | None = None
+    clean_patch_metadata: DuoCleanPatchMetadata | None = None
+    patch_offsets: Tensor | None = None
+    max_patch_size: int | None = None
     row_ids: Tensor | None = None
     bos_row_indices: Tensor | None = None
 
@@ -130,6 +168,20 @@ class DuoBatch:
                 )
             ):
                 raise ValueError("Duo BOS row indices must be ordered and in range")
+        entropy_fields = (
+            self.clean_patch_metadata,
+            self.patch_offsets,
+            self.max_patch_size,
+        )
+        if sum(value is not None for value in entropy_fields) not in {0, 3}:
+            raise ValueError("entropy-patched Duo metadata must be supplied together")
+        if self.clean_patch_metadata is not None:
+            if self.attention_metadata is not None:
+                raise ValueError("Duo clean patch policies are mutually exclusive")
+            if self.patch_offsets is None or self.patch_offsets.shape != shape:
+                raise ValueError("Duo patch offsets must align with clean bytes")
+            if self.patch_offsets.dtype != torch.long:
+                raise TypeError("Duo patch offsets must be int64")
         if check_values:
             active = self.clean_ids.masked_select(self.clean_valid)
             if not torch.compiler.is_compiling() and bool(
@@ -157,6 +209,17 @@ class DuoBatch:
             ar_targets=self.ar_targets.to(device, non_blocking=non_blocking),
             bos_targets=self.bos_targets.to(device, non_blocking=non_blocking),
             attention_metadata=metadata,
+            clean_patch_metadata=(
+                None
+                if self.clean_patch_metadata is None
+                else self.clean_patch_metadata.to(device, non_blocking=non_blocking)
+            ),
+            patch_offsets=(
+                None
+                if self.patch_offsets is None
+                else self.patch_offsets.to(device, non_blocking=non_blocking)
+            ),
+            max_patch_size=self.max_patch_size,
             # Authentication metadata stays on the host so validation's
             # uniqueness checks do not synchronize CUDA every microbatch.
             row_ids=self.row_ids,
@@ -188,6 +251,15 @@ class DuoBatch:
                     metadata.physical_layout,
                 )
             ),
+            clean_patch_metadata=(
+                None
+                if self.clean_patch_metadata is None
+                else self.clean_patch_metadata.pin_memory()
+            ),
+            patch_offsets=(
+                None if self.patch_offsets is None else pin(self.patch_offsets)
+            ),
+            max_patch_size=self.max_patch_size,
             row_ids=None if self.row_ids is None else pin(self.row_ids),
             bos_row_indices=(
                 None if self.bos_row_indices is None else pin(self.bos_row_indices)
@@ -217,8 +289,44 @@ class DuoBatch:
         if include_ar_bos and self.bos_targets.numel() and self.bos_row_indices is None:
             raise ValueError("joint Duo row slicing requires BOS row indices")
         metadata = self.attention_metadata
+        entropy_metadata = self.clean_patch_metadata
+        if metadata is None and entropy_metadata is None:
+            raise ValueError("Duo row slicing requires authenticated clean metadata")
+        if entropy_metadata is not None:
+            if self.patch_offsets is None or self.max_patch_size is None:
+                raise AssertionError("entropy patch reconstruction metadata disappeared")
+            clean_valid = self.clean_valid[start:stop]
+            document_ids = self.document_ids[start:stop]
+            sliced_patch_offsets = self.patch_offsets[start:stop]
+            sliced_entropy = build_duo_clean_patch_metadata(
+                clean_valid,
+                document_ids,
+                sliced_patch_offsets,
+                max_patch_size=self.max_patch_size,
+            )
+            if include_ar_bos and self.bos_row_indices is not None:
+                selected_bos = self.bos_row_indices.ge(start) & self.bos_row_indices.lt(stop)
+                bos_targets = self.bos_targets.masked_select(selected_bos)
+                bos_row_indices = self.bos_row_indices.masked_select(selected_bos) - start
+            else:
+                bos_targets = self.bos_targets.new_empty((0,))
+                bos_row_indices = None
+            return DuoBatch(
+                clean_ids=self.clean_ids[start:stop],
+                clean_valid=clean_valid,
+                document_ids=document_ids,
+                positions=self.positions[start:stop],
+                ar_targets=self.ar_targets[start:stop],
+                bos_targets=bos_targets,
+                attention_metadata=None,
+                clean_patch_metadata=sliced_entropy,
+                patch_offsets=sliced_patch_offsets,
+                max_patch_size=self.max_patch_size,
+                row_ids=(None if self.row_ids is None else self.row_ids[start:stop]),
+                bos_row_indices=bos_row_indices,
+            )
         if metadata is None:
-            raise ValueError("Duo row slicing requires compile-stable attention metadata")
+            raise AssertionError("fixed patch metadata disappeared")
         if metadata.byte_indices.numel() != rows * width:
             raise ValueError("Duo row slicing requires physical byte metadata")
         if metadata.patch_indices.numel() % rows:
@@ -253,6 +361,9 @@ class DuoBatch:
                 patch_stride=patch_stride,
                 max_segments_per_row=(metadata.byte_cu_seqlens.numel() - 1) // rows,
             ),
+            clean_patch_metadata=None,
+            patch_offsets=None,
+            max_patch_size=None,
             row_ids=None if self.row_ids is None else self.row_ids[start:stop],
             bos_row_indices=bos_row_indices,
         )
@@ -275,6 +386,10 @@ class DuoBatch:
                 self.attention_metadata.patch_cu_seqlens,
             ):
                 value.record_stream(stream)
+        if self.clean_patch_metadata is not None:
+            self.clean_patch_metadata.record_stream(stream)
+        if self.patch_offsets is not None:
+            self.patch_offsets.record_stream(stream)
         if self.bos_row_indices is not None:
             self.bos_row_indices.record_stream(stream)
 
@@ -630,6 +745,15 @@ class PreparedDuoValidationBatch:
             ar_targets=pin(batch.ar_targets),
             bos_targets=pin(batch.bos_targets),
             attention_metadata=pinned_metadata,
+            clean_patch_metadata=(
+                None
+                if batch.clean_patch_metadata is None
+                else batch.clean_patch_metadata.pin_memory()
+            ),
+            patch_offsets=(
+                None if batch.patch_offsets is None else pin(batch.patch_offsets)
+            ),
+            max_patch_size=batch.max_patch_size,
             row_ids=batch.row_ids,
             bos_row_indices=(
                 None if batch.bos_row_indices is None else pin(batch.bos_row_indices)
@@ -697,22 +821,31 @@ def _duo_canvas_layouts(
     model: DuoModel,
     batch: DuoBatch,
     selection: DocumentCanvasSelection,
-) -> tuple[CanvasBranchLayout, CanvasBranchLayout]:
+) -> tuple[CanvasBranchLayout, CanvasBranchLayout | None]:
     """Construct the exact byte and patch branch layouts on any device."""
 
     branches = selection.valid.shape[1]
     canvas_length = selection.valid.shape[2]
     branch_segments = selection.document_ids[:, :, 0]
+    full_resolution = (
+        model.config.duo_mutable_topology == "full_resolution_decoder"
+    )
     local_layout = CanvasBranchLayout(
         batch.clean_valid,
         selection.valid,
         selection.starts,
-        model.config.local_window,
+        (
+            model.config.decoder_prefix_window
+            if full_resolution
+            else model.config.local_window
+        ),
         batch.positions,
         selection.positions,
         batch.document_ids,
         branch_segments,
     )
+    if full_resolution:
+        return local_layout, None
     stride = model.config.patch_stride
     rows, length = batch.clean_valid.shape
     clean_patch_valid = batch.clean_valid.view(
@@ -755,7 +888,11 @@ def _duo_block_mask_metadata(
     local_layout, global_layout = _duo_canvas_layouts(model, batch, selection)
     return (
         canvas_block_mask_metadata(local_layout),
-        canvas_block_mask_metadata(global_layout),
+        (
+            None
+            if global_layout is None
+            else canvas_block_mask_metadata(global_layout)
+        ),
     )
 
 
@@ -804,8 +941,18 @@ def prepare_duo_validation_inputs(
     unit_times = (strata.to(torch.float32) + jitter) / total_branches
     branch_times = unit_times.clamp_min(torch.finfo(unit_times.dtype).eps)
 
+    # Preserve a topology-independent, patch-aligned canonical ledger for
+    # causal ablation comparisons.  The separately named serving-distribution
+    # ledger uses the selected topology's actual origin stride: every byte for
+    # full-resolution Duo, or the legacy clean-prefix phase representation for
+    # patched-global Duo.
+    origin_stride = (
+        model.config.duo_origin_stride
+        if expose_random_phase
+        else model.config.patch_stride
+    )
     candidates = batch.clean_valid & batch.positions.remainder(
-        model.config.patch_stride
+        origin_stride
     ).eq(0)
     candidate_counts = candidates.sum(1)
     if not torch.compiler.is_compiling() and bool(candidate_counts.eq(0).any()):
@@ -849,7 +996,7 @@ def prepare_duo_validation_inputs(
     if expose_random_phase:
         phase = (
             _counter_hash(branch_ids.flatten(), seed, 4)
-            % model.config.patch_stride
+            % origin_stride
         )[:, None]
         fixed_clean = flat_active & offsets[None].lt(phase)
         flat_active = flat_active & ~fixed_clean
@@ -947,7 +1094,7 @@ def prepare_duo_inputs(
         batch.positions,
         canvas_length=canvas_length,
         branches=branches,
-        patch_stride=model.config.patch_stride,
+        patch_stride=model.config.duo_origin_stride,
         pad_id=model.config.vocab.pad_id,
         generator=generator,
     )
@@ -969,7 +1116,10 @@ def prepare_duo_inputs(
     active = selection.valid.flatten(0, 1)
     offsets = torch.arange(canvas_length, device=active.device)[None]
     fixed_clean = torch.zeros_like(active)
-    if model.config.duo_random_phase_training:
+    if (
+        model.config.duo_random_phase_training
+        and model.config.duo_mutable_topology == "patched_global"
+    ):
         phases = torch.randint(
             model.config.patch_stride,
             (active.shape[0], 1),
@@ -1131,7 +1281,6 @@ def duo_loss(
     if (
         batch.clean_ids.device.type == "cuda"
         and prepared.local_block_mask_metadata is not None
-        and prepared.global_block_mask_metadata is not None
     ):
         local_layout, global_layout = _duo_canvas_layouts(
             model, batch, selection
@@ -1139,9 +1288,12 @@ def duo_loss(
         local_block_mask = build_canvas_block_mask(
             local_layout, metadata=prepared.local_block_mask_metadata
         )
-        global_block_mask = build_canvas_block_mask(
-            global_layout, metadata=prepared.global_block_mask_metadata
-        )
+        if prepared.global_block_mask_metadata is not None:
+            if global_layout is None:
+                raise AssertionError("global metadata exists without a global layout")
+            global_block_mask = build_canvas_block_mask(
+                global_layout, metadata=prepared.global_block_mask_metadata
+            )
     output = model(
         batch.clean_ids,
         batch.clean_valid,
@@ -1152,6 +1304,7 @@ def duo_loss(
         selection.starts,
         branch_times,
         attention_metadata=batch.attention_metadata,
+        clean_patch_metadata=batch.clean_patch_metadata,
         local_block_mask_metadata=prepared.local_block_mask_metadata,
         global_block_mask_metadata=prepared.global_block_mask_metadata,
         local_block_mask=local_block_mask,

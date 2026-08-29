@@ -26,6 +26,10 @@ import shutil
 from pathlib import Path
 
 import torch
+from checkpointing import (
+    RecoveryCheckpointPolicy,
+    atomic_link_or_copy,
+)
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
@@ -939,6 +943,9 @@ def build_run_metadata() -> dict:
                 "train_seq_len",
             )
         },
+        "checkpoint_interval_seconds": float(
+            os.environ.get("FRESH_CHECKPOINT_INTERVAL_SECONDS", "480")
+        ),
         "grad_accum_steps": int(os.environ.get("GRAD_ACCUM_STEPS", "8")),
         "sigreg_compute_dtype": "float32",
     }
@@ -1045,7 +1052,9 @@ def main() -> None:
         tracked_models.append(model)
         return model
 
-    checkpoint_every = int(os.environ.get("FRESH_CHECKPOINT_EVERY", "0"))
+    checkpoint_policy = RecoveryCheckpointPolicy(
+        float(os.environ.get("FRESH_CHECKPOINT_INTERVAL_SECONDS", "480"))
+    )
     resume_pending = bool(resume_from)
     last_completed_local_step = 0
     original_eval_val = baseline.eval_val
@@ -1117,10 +1126,9 @@ def main() -> None:
             else None
         )
         if (
-            checkpoint_every > 0
+            checkpoint_policy.due()
             and isinstance(step, int)
             and 0 < step <= FreshHyperparameters.iterations
-            and cumulative_step % checkpoint_every == 0
             and "quant_state" not in caller
             and int(os.environ.get("RANK", "0")) == 0
             and "RUN_ID" in os.environ
@@ -1135,6 +1143,7 @@ def main() -> None:
             save_pretraining_checkpoint(
                 run_dir, cumulative_step, model_state, tracked_optimizers
             )
+            checkpoint_policy.committed(cumulative_step)
         return result
 
     baseline.Hyperparameters = FreshHyperparameters
@@ -1159,19 +1168,29 @@ def main() -> None:
         if "RUN_ID" in os.environ:
             run_dir = REPO_ROOT / "ablation_results" / os.environ["RUN_ID"]
             run_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2("final_model.pt", run_dir / "final_model.pt")
+            atomic_link_or_copy(
+                Path("final_model.pt"), run_dir / "final_model.pt"
+            )
             if Path("final_model.int8.ptz").exists():
-                shutil.copy2("final_model.int8.ptz", run_dir / "final_model.int8.ptz")
+                atomic_link_or_copy(
+                    Path("final_model.int8.ptz"),
+                    run_dir / "final_model.int8.ptz",
+                )
             shutil.copy2(metadata_path, run_dir / metadata_path.name)
             shutil.copy2(EXPERIMENT_SOURCE, run_dir / EXPERIMENT_SOURCE.name)
-            save_pretraining_checkpoint(
-                run_dir,
-                cumulative_training_step(
-                    completed_steps, last_completed_local_step
-                ),
-                torch.load("final_model.pt", map_location="cpu", weights_only=True),
-                tracked_optimizers,
+            terminal_step = cumulative_training_step(
+                completed_steps, last_completed_local_step
             )
+            if checkpoint_policy.terminal_due(terminal_step):
+                save_pretraining_checkpoint(
+                    run_dir,
+                    terminal_step,
+                    torch.load(
+                        "final_model.pt", map_location="cpu", weights_only=True
+                    ),
+                    tracked_optimizers,
+                )
+                checkpoint_policy.committed(terminal_step)
 
 
 if __name__ == "__main__":

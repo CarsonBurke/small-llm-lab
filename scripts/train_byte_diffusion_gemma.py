@@ -20,6 +20,7 @@ import time
 
 import numpy as np
 import torch
+from checkpointing import RecoveryCheckpointPolicy, atomic_torch_save
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -189,7 +190,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compile", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--checkpoint-every", type=int, default=200)
+    parser.add_argument(
+        "--checkpoint-interval-seconds", type=float, default=480.0
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
@@ -271,6 +274,9 @@ def _prepared_validation_ledger(
 
 def main() -> None:
     args = parse_args()
+    checkpoint_policy = RecoveryCheckpointPolicy(
+        args.checkpoint_interval_seconds
+    )
     provenance = source_provenance()
     if args.print_provenance:
         print(json.dumps(provenance, indent=2, sort_keys=True))
@@ -286,7 +292,7 @@ def main() -> None:
         args.val_every,
         args.validation_rows,
         args.validation_batch_size,
-        args.checkpoint_every,
+        args.checkpoint_interval_seconds,
     )
     if any(value <= 0 for value in positive):
         raise ValueError("canvas, logging, validation, and checkpoint values must be positive")
@@ -434,6 +440,7 @@ def main() -> None:
         "warmdown_steps": args.warmdown_steps,
         "max_grad_norm": args.max_grad_norm,
         "compile": args.compile,
+        "checkpoint_interval_seconds": args.checkpoint_interval_seconds,
         "diagnostic_cadence": diagnostic_cadence_contract(
             log_every=args.log_every,
             validation_every=args.val_every,
@@ -486,8 +493,7 @@ def main() -> None:
         completed_steps = int(checkpoint["steps"])
 
     def save_checkpoint(step: int) -> None:
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        atomic_torch_save(
             {
                 "schema": "byte_diffusion_gemma_checkpoint/v3",
                 "model_config": config.to_dict(),
@@ -502,6 +508,7 @@ def main() -> None:
             },
             checkpoint_path,
         )
+        checkpoint_policy.committed(step)
 
     validation_ledger = _prepared_validation_ledger(
         model,
@@ -729,7 +736,9 @@ def main() -> None:
                 )
             if step % args.val_every == 0 or step == args.steps:
                 validate(step)
-            if step % args.checkpoint_every == 0 or step == args.steps:
+            if checkpoint_policy.due() or (
+                step == args.steps and checkpoint_policy.terminal_due(step)
+            ):
                 save_checkpoint(step)
     result = {
         "schema": "byte_diffusion_gemma_result/v3",

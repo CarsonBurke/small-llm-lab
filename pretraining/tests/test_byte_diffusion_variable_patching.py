@@ -18,10 +18,12 @@ from pretraining.byte_diffusion.patching import (
     HashedNgramEntropyModel,
 )
 from pretraining.byte_diffusion.variable_patching import (
+    DuoCleanPatchMetadata,
     DatasetPatchingSpec,
     ENTROPY_DATASET_SCHEMA,
     PATCHING_POLICY_SCHEMA,
     build_variable_patch_layout,
+    build_duo_clean_patch_metadata,
     load_dataset_patching_spec,
 )
 from pretraining.byte_diffusion.data import AtomicIdManifest
@@ -146,6 +148,74 @@ def test_variable_patch_layout_maps_pooling_bos_and_causal_conditions() -> None:
     torch.testing.assert_close(
         layout.physical_patch_prior_condition_indices, torch.tensor([0, 1, 3])
     )
+
+
+def test_duo_entropy_layout_has_no_virtual_bos_and_document_local_ordinals() -> None:
+    valid, documents, _, patch_offsets = _variable_inputs()
+    layout = build_duo_clean_patch_metadata(
+        valid,
+        documents,
+        patch_offsets,
+        max_patch_size=3,
+    )
+
+    assert isinstance(layout, DuoCleanPatchMetadata)
+    torch.testing.assert_close(
+        layout.patch_byte_cu_seqlens,
+        torch.tensor([0, 2, 3, 6], dtype=torch.int32),
+    )
+    # Exactly three physical patches: no synthetic BOS entries.
+    torch.testing.assert_close(
+        layout.patch_cu_seqlens, torch.tensor([0, 2, 3], dtype=torch.int32)
+    )
+    assert layout.max_patch_seqlen == 2
+    torch.testing.assert_close(layout.patch_ordinals, torch.tensor([0, 1, 0]))
+    # A clean byte receives its current latent only when that patch closes.
+    torch.testing.assert_close(
+        layout.byte_condition_indices, torch.tensor([-1, 0, 1, -1, -1, 2])
+    )
+    # A mutable origin never receives the patch containing the origin.
+    torch.testing.assert_close(
+        layout.origin_condition_indices,
+        torch.tensor([[-1, -1, 0, -1, -1, -1, -1, -1]]),
+    )
+
+
+def test_duo_entropy_keeps_byte_axis_static_while_pool_axis_is_ragged() -> None:
+    documents = torch.tensor(
+        [[0] * 8, [1] * 8], dtype=torch.long
+    )
+    valid_a = torch.tensor(
+        [[True] * 6 + [False] * 2, [True] * 4 + [False] * 4]
+    )
+    valid_b = torch.tensor(
+        [[True] * 8, [True] * 4 + [False] * 4]
+    )
+
+    def build(valid: torch.Tensor) -> DuoCleanPatchMetadata:
+        offsets = torch.where(valid, torch.zeros_like(documents), -1)
+        return build_duo_clean_patch_metadata(
+            valid,
+            documents,
+            offsets,
+            max_patch_size=1,
+            max_segments_per_row=4,
+        )
+
+    a, b = build(valid_a), build(valid_b)
+    torch.testing.assert_close(a.byte_indices, torch.arange(16))
+    torch.testing.assert_close(a.byte_indices, b.byte_indices)
+    torch.testing.assert_close(
+        a.byte_cu_seqlens,
+        torch.tensor([0, 8, 16, 16, 16, 16, 16, 16, 16], dtype=torch.int32),
+    )
+    torch.testing.assert_close(a.byte_cu_seqlens, b.byte_cu_seqlens)
+    assert a.pool_byte_indices.numel() == 10
+    assert b.pool_byte_indices.numel() == 12
+    assert a.patch_ordinals.numel() == 10
+    assert b.patch_ordinals.numel() == 12
+    assert a.max_patch_seqlen == 6
+    assert b.max_patch_seqlen == 8
 
 
 def test_entropy_origins_are_exhaustive_and_preserve_overflow_validity() -> None:

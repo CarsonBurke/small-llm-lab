@@ -7,14 +7,24 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .config import ByteDiffusionConfig, ModelMode
-from .attention import CanvasBranchLayout, build_canvas_block_mask
+from .attention import (
+    CanvasBranchLayout,
+    PackedCleanQKV,
+    RaggedBltLayout,
+    build_canvas_block_mask,
+    build_ragged_blt_block_mask,
+    packed_clean_attention,
+    ragged_blt_attention,
+)
 from .layers import (
     ConditionedTransformerBlock,
     PatchPool,
     RMSNorm,
     TransformerBlock,
+    apply_rotary,
     pack_valid,
     pack_rows,
     packed_sequence_offsets,
@@ -47,6 +57,18 @@ class BltBranchOutput:
     branch_logits: Tensor
     clean_patch_states: Tensor
     bos_patch_states: Tensor | None = None
+
+
+@dataclass(frozen=True)
+class BltRaggedOutput:
+    """Fast-BLT projections or normalized states over the ragged banks."""
+
+    clean_logits: Tensor
+    block_logits: Tensor
+    clean_patch_states: Tensor
+    bos_patch_states: Tensor | None = None
+    clean_decoder_states: Tensor | None = None
+    block_decoder_states: Tensor | None = None
 
 
 class CausalNgramEmbedding(nn.Module):
@@ -1321,9 +1343,7 @@ class ByteDiffusionModel(nn.Module):
             return states
 
         if self.activation_checkpointing and self.training:
-            from torch.utils.checkpoint import checkpoint
-
-            patches = checkpoint(
+            patches = activation_checkpoint(
                 global_forward,
                 patches,
                 use_reentrant=False,
@@ -1454,6 +1474,347 @@ class ByteDiffusionModel(nn.Module):
         )
         return ModelOutput(logits=logits, byte_states=byte_states, patch_states=patch_states)
 
+    def forward_blt_d_ragged(
+        self,
+        clean_ids: Tensor,
+        clean_valid: Tensor,
+        noisy_blocks: Tensor,
+        block_rows: Tensor,
+        block_starts: Tensor,
+        prior_condition_indices: Tensor,
+        row_cu_offsets: Tensor,
+        block_valid: Tensor,
+        *,
+        positions: Tensor | None = None,
+        document_ids: Tensor,
+        byte_indices: Tensor,
+        byte_cu_seqlens: Tensor,
+        patch_cu_seqlens: Tensor,
+        condition_patch_indices: Tensor,
+        global_patch_sources: Tensor,
+        global_patch_positions: Tensor,
+        physical_to_global_patch_indices: Tensor,
+        bos_condition_indices: Tensor | None = None,
+        patch_byte_cu_seqlens: Tensor,
+        max_patch_size: int,
+        ragged_block_mask=None,
+        return_clean_patch_states: bool = False,
+        return_logits: bool = True,
+        return_decoder_states: bool = False,
+        allow_dense_reference: bool | None = None,
+    ) -> BltRaggedOutput:
+        """Run every selected Fast-BLT origin in one flat sparse decoder bank.
+
+        The clean local/global encoder and clean decoder stream execute once.
+        Flat blocks contain exactly four physical byte slots, with validity
+        masking for document tails.  At every decoder layer a block attends
+        bidirectionally within itself and to the original, same-document clean
+        stream strictly before its origin.  The physical clean K/V bank is
+        flattened once, never gathered or duplicated per origin.
+
+        CUDA is sparse-only.  ``allow_dense_reference`` exists solely for
+        small CPU forward/backward parity tests and is rejected on CUDA.
+        """
+
+        if self.config.decoder_conditioning != "split_cross_attention":
+            raise ValueError(
+                "ragged Fast-BLT requires complete split cross-attention conditioning"
+            )
+        if noisy_blocks.ndim != 2 or noisy_blocks.shape[1] != 4:
+            raise ValueError("ragged Fast-BLT noisy blocks must have shape [T, 4]")
+        if block_valid.shape != noisy_blocks.shape or block_valid.dtype != torch.bool:
+            raise ValueError("ragged Fast-BLT validity must be boolean [T, 4]")
+        blocks = noisy_blocks.shape[0]
+        for name, value in (
+            ("block_rows", block_rows),
+            ("block_starts", block_starts),
+            ("prior_condition_indices", prior_condition_indices),
+        ):
+            if value.shape != (blocks,) or value.dtype != torch.long:
+                raise ValueError(f"{name} must be int64 [T]")
+        if clean_ids.shape != clean_valid.shape or clean_valid.dtype != torch.bool:
+            raise ValueError("clean ids and boolean validity must align")
+        if document_ids.shape != clean_ids.shape or document_ids.dtype != torch.long:
+            raise ValueError("document ids must be int64 and align with clean ids")
+        if positions is None:
+            positions = torch.arange(
+                clean_ids.shape[1], device=clean_ids.device, dtype=torch.long
+            )[None].expand_as(clean_ids)
+        if positions.shape != clean_ids.shape or positions.dtype != torch.long:
+            raise ValueError("original byte positions must be int64 and align with clean ids")
+        if byte_indices.ndim != 1 or byte_indices.dtype != torch.long:
+            raise ValueError("packed clean byte indices must be rank-1 int64")
+        if condition_patch_indices.shape != byte_indices.shape:
+            raise ValueError("clean condition indices must align with packed clean bytes")
+        if condition_patch_indices.dtype != torch.long:
+            raise ValueError("clean condition indices must be int64")
+
+        layout = RaggedBltLayout(
+            clean_valid=clean_valid,
+            clean_positions=positions,
+            clean_segment_ids=document_ids,
+            block_valid=block_valid,
+            block_rows=block_rows,
+            block_starts=block_starts,
+            row_cu_offsets=row_cu_offsets,
+        )
+        if not torch.compiler.is_compiling():
+            layout.validate_values()
+        if allow_dense_reference is None:
+            allow_dense_reference = clean_ids.device.type != "cuda"
+        if clean_ids.is_cuda and allow_dense_reference:
+            raise RuntimeError("CUDA ragged Fast-BLT cannot materialize dense scores")
+        if not return_logits and not return_decoder_states:
+            raise ValueError("ragged Fast-BLT must return logits or decoder states")
+        if (
+            self.require_compiled_training
+            and self.training
+            and clean_ids.is_cuda
+            and not torch.compiler.is_compiling()
+        ):
+            raise RuntimeError(
+                "production ragged Fast-BLT training escaped torch.compile"
+            )
+        if not allow_dense_reference and ragged_block_mask is None:
+            ragged_block_mask = build_ragged_blt_block_mask(layout)
+
+        (
+            _,
+            clean_patch_states,
+            _,
+            _,
+            _,
+            clean_indices,
+            packed_patch_states,
+        ) = self._encode_clean_varlen(
+            clean_ids,
+            clean_valid,
+            positions=positions,
+            allow_dense_reference=allow_dense_reference,
+            document_ids=document_ids,
+            byte_indices=byte_indices,
+            byte_cu_seqlens=byte_cu_seqlens,
+            patch_cu_seqlens=patch_cu_seqlens,
+            global_patch_sources=global_patch_sources,
+            global_patch_positions=global_patch_positions,
+            physical_to_global_patch_indices=physical_to_global_patch_indices,
+            patch_byte_cu_seqlens=patch_byte_cu_seqlens,
+            max_patch_size=max_patch_size,
+            materialize_padded_patches=return_clean_patch_states,
+        )
+        if not torch.compiler.is_compiling():
+            invalid_prior = (prior_condition_indices < -1) | (
+                prior_condition_indices >= packed_patch_states.shape[0]
+            )
+            invalid_clean = (condition_patch_indices < -1) | (
+                condition_patch_indices >= packed_patch_states.shape[0]
+            )
+            if bool(invalid_prior.any()):
+                raise ValueError("a prior condition index lies outside the patch bank")
+            if bool(invalid_clean.any()):
+                raise ValueError("a clean condition index lies outside the patch bank")
+
+        # Decoder conditions stay as compact latent indices.  Each layer
+        # transforms the unique packed latent bank once, then selects its
+        # split K/V at byte width through the native cache API.
+        clean_condition_indices = torch.full(
+            clean_ids.shape, -1, dtype=torch.long, device=clean_ids.device
+        )
+        clean_condition_indices.reshape(-1).index_copy_(
+            0, byte_indices, condition_patch_indices
+        )
+        clean_states = self.decoder_embeddings(clean_ids, ModelMode.AR)
+        block_states = self.decoder_embeddings(noisy_blocks, ModelMode.BLT_D)
+        branch_positions = layout.branch_positions
+        clean_length = clean_ids.shape[1]
+        heads = self.config.local_heads
+        head_dim = self.config.local_dim // heads
+
+        # Bind each module through a factory: a loop-local lambda would close
+        # over the final decoder layer when non-reentrant checkpointing invokes
+        # its FFN again during backward. Attention and split conditioning stay
+        # outside recomputation, including the immutable ragged BlockMask.
+        def bind_decoder_layer(conditioned: ConditionedTransformerBlock):
+            def decoder_iteration(
+                clean_input: Tensor,
+                block_input: Tensor,
+                patch_input: Tensor,
+            ) -> tuple[Tensor, Tensor]:
+                condition_cache = conditioned.prepare_split_condition_cache(
+                    patch_input
+                )
+                clean_pointwise = conditioned.add_split_condition_from_cache(
+                    clean_input,
+                    condition_cache,
+                    clean_condition_indices,
+                )
+                block_pointwise = conditioned.add_block_split_condition_from_cache(
+                    block_input,
+                    condition_cache,
+                    prior_condition_indices,
+                    block_length=4,
+                )
+                attention = conditioned.block.attention
+                # The clean and branch streams have different attention
+                # topology and have independent symbolic row products. Keep
+                # their shared-weight pointwise calls separate: concatenating
+                # those products creates an unsplittable mixed symbolic extent
+                # in Inductor (the job-2800 CantSplit regression).
+                clean_qkv = attention.qkv(
+                    conditioned.block.attention_norm(clean_pointwise)
+                ).view(
+                    clean_ids.shape[0], clean_length, 3, heads, head_dim
+                )
+                block_qkv = attention.qkv(
+                    conditioned.block.attention_norm(block_pointwise)
+                ).view(
+                    blocks, 4, 3, heads, head_dim
+                )
+                clean_q, clean_k, clean_v = (
+                    value.transpose(1, 2) for value in clean_qkv.unbind(2)
+                )
+                block_q, block_k, block_v = (
+                    value.transpose(1, 2) for value in block_qkv.unbind(2)
+                )
+                clean_q, clean_k = apply_rotary(
+                    clean_q, clean_k, positions, attention.rope_theta
+                )
+                block_q, block_k = apply_rotary(
+                    block_q, block_k, branch_positions, attention.rope_theta
+                )
+
+                clean_q_rows = clean_q.transpose(1, 2).reshape(
+                    -1, heads, head_dim
+                )
+                clean_k_rows = clean_k.transpose(1, 2).reshape_as(clean_q_rows)
+                clean_v_rows = clean_v.transpose(1, 2).reshape_as(clean_q_rows)
+                packed_clean = PackedCleanQKV(
+                    query=clean_q_rows.index_select(0, clean_indices),
+                    key=clean_k_rows.index_select(0, clean_indices),
+                    value=clean_v_rows.index_select(0, clean_indices),
+                    cu_seqlens=byte_cu_seqlens,
+                    absolute_positions=positions.reshape(-1).index_select(
+                        0, clean_indices
+                    ),
+                    max_seqlen=clean_length,
+                )
+                clean_attended = packed_clean_attention(
+                    packed_clean,
+                    window=None,
+                    backend=(
+                        "dense_reference"
+                        if allow_dense_reference
+                        else "varlen_flash"
+                    ),
+                    allow_dense_reference=allow_dense_reference,
+                )
+                clean_output = unpack_rows(
+                    clean_attended,
+                    clean_indices,
+                    clean_attended.new_empty(
+                        (*clean_ids.shape, heads, head_dim)
+                    ),
+                )
+
+                # Flatten row-major under each head. This is a view of one
+                # clean projection bank, not T gathered prefixes; branch
+                # gradients flow through these K/V tensors into clean states.
+                shared_clean_k = clean_k.permute(1, 0, 2, 3).reshape(
+                    1, heads, layout.clean_bank_length, head_dim
+                )
+                shared_clean_v = clean_v.permute(1, 0, 2, 3).reshape_as(
+                    shared_clean_k
+                )
+                flat_block_q = block_q.permute(1, 0, 2, 3).reshape(
+                    1, heads, layout.query_length, head_dim
+                )
+                flat_block_k = block_k.permute(1, 0, 2, 3).reshape_as(
+                    flat_block_q
+                )
+                flat_block_v = block_v.permute(1, 0, 2, 3).reshape_as(
+                    flat_block_q
+                )
+                block_attended = ragged_blt_attention(
+                    flat_block_q,
+                    shared_clean_k,
+                    shared_clean_v,
+                    flat_block_k,
+                    flat_block_v,
+                    layout,
+                    backend=(
+                        "dense_reference" if allow_dense_reference else "flex"
+                    ),
+                    block_mask=ragged_block_mask,
+                    allow_dense_reference=allow_dense_reference,
+                ).view(heads, blocks, 4, head_dim).permute(1, 2, 0, 3)
+
+                clean_pointwise = clean_pointwise + attention.output(
+                    clean_output.flatten(-2)
+                )
+                block_pointwise = block_pointwise + attention.output(
+                    block_attended.flatten(-2)
+                )
+                clean_ffn_input = conditioned.block.ffn_norm(clean_pointwise)
+                block_ffn_input = conditioned.block.ffn_norm(block_pointwise)
+                if (
+                    self.activation_checkpointing
+                    and self.training
+                    and torch.is_grad_enabled()
+                ):
+                    # Keep independent pure FFN HOPs for the clean and branch
+                    # symbolic extents. Norm, conditioning, and both attention
+                    # kernels remain saved outside recomputation.
+                    clean_ffn = activation_checkpoint(
+                        conditioned.block.ffn,
+                        clean_ffn_input,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                    block_ffn = activation_checkpoint(
+                        conditioned.block.ffn,
+                        block_ffn_input,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    clean_ffn = conditioned.block.ffn(clean_ffn_input)
+                    block_ffn = conditioned.block.ffn(block_ffn_input)
+                return clean_pointwise + clean_ffn, block_pointwise + block_ffn
+
+            return decoder_iteration
+
+        for conditioned in self.decoder:
+            decoder_iteration = bind_decoder_layer(conditioned)
+            clean_states, block_states = decoder_iteration(
+                clean_states, block_states, packed_patch_states
+            )
+
+        clean_states = self.decoder_norm(clean_states)
+        block_states = self.decoder_norm(block_states)
+        if return_logits:
+            if self.output is None:
+                output_weight = self.embedding.weight[: self.config.vocab.output_size]
+                clean_logits = F.linear(clean_states, output_weight)
+                block_logits = F.linear(block_states, output_weight)
+            else:
+                clean_logits = self.output(clean_states)
+                block_logits = self.output(block_states)
+        else:
+            clean_logits = clean_states.new_empty((*clean_states.shape[:-1], 0))
+            block_logits = block_states.new_empty((*block_states.shape[:-1], 0))
+        return BltRaggedOutput(
+            clean_logits=clean_logits,
+            block_logits=block_logits,
+            clean_patch_states=clean_patch_states,
+            bos_patch_states=(
+                None
+                if bos_condition_indices is None
+                else packed_patch_states.index_select(0, bos_condition_indices)
+            ),
+            clean_decoder_states=(clean_states if return_decoder_states else None),
+            block_decoder_states=(block_states if return_decoder_states else None),
+        )
+
     def forward_blt_d_branches(
         self,
         clean_ids: Tensor,
@@ -1481,6 +1842,7 @@ class ByteDiffusionModel(nn.Module):
         branch_kv_cu_seqlens: Tensor | None = None,
         branch_block_mask=None,
         return_clean_patch_states: bool = True,
+        return_clean_logits: bool = True,
         patch_byte_cu_seqlens: Tensor | None = None,
         max_patch_size: int | None = None,
     ) -> BltBranchOutput:
@@ -1865,24 +2227,56 @@ class ByteDiffusionModel(nn.Module):
                     block_mask=block_mask,
                 )
         if shared_document_attention:
-            clean_states = self.decoder_norm(states[:, :clean_length])
-            branch_states = self.decoder_norm(states[:, clean_length:])
-            if self.output is None:
-                output_weight = self.embedding.weight[: self.config.vocab.output_size]
-                clean_logits = F.linear(clean_states, output_weight)
-                branch_logits = F.linear(branch_states, output_weight)
+            if return_clean_logits:
+                clean_states = self.decoder_norm(states[:, :clean_length])
+                branch_states = self.decoder_norm(states[:, clean_length:])
+                if self.output is None:
+                    output_weight = self.embedding.weight[
+                        : self.config.vocab.output_size
+                    ]
+                    clean_logits = F.linear(clean_states, output_weight)
+                    branch_logits = F.linear(branch_states, output_weight)
+                else:
+                    clean_logits = self.output(clean_states)
+                    branch_logits = self.output(branch_states)
             else:
-                clean_logits = self.output(clean_states)
-                branch_logits = self.output(branch_states)
+                branch_states = self.decoder_norm(states[:, clean_length:])
+                branch_logits = (
+                    F.linear(
+                        branch_states,
+                        self.embedding.weight[: self.config.vocab.output_size],
+                    )
+                    if self.output is None
+                    else self.output(branch_states)
+                )
+                clean_logits = branch_logits.new_empty(
+                    (batch, 0, self.config.vocab.output_size)
+                )
         else:
-            states = self.decoder_norm(states)
-            logits = (
-                F.linear(states, self.embedding.weight[: self.config.vocab.output_size])
-                if self.output is None
-                else self.output(states)
-            )
-            clean_logits = logits[:, :clean_length]
-            branch_logits = logits[:, clean_length:]
+            if return_clean_logits:
+                states = self.decoder_norm(states)
+                logits = (
+                    F.linear(
+                        states, self.embedding.weight[: self.config.vocab.output_size]
+                    )
+                    if self.output is None
+                    else self.output(states)
+                )
+                clean_logits = logits[:, :clean_length]
+                branch_logits = logits[:, clean_length:]
+            else:
+                branch_states = self.decoder_norm(states[:, clean_length:])
+                branch_logits = (
+                    F.linear(
+                        branch_states,
+                        self.embedding.weight[: self.config.vocab.output_size],
+                    )
+                    if self.output is None
+                    else self.output(branch_states)
+                )
+                clean_logits = branch_logits.new_empty(
+                    (batch, 0, self.config.vocab.output_size)
+                )
         return BltBranchOutput(
             clean_logits=clean_logits,
             branch_logits=branch_logits.reshape(

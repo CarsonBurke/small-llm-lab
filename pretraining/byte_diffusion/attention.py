@@ -287,6 +287,157 @@ BranchLayout = CanvasBranchLayout | IntrospectionBranchLayout
 
 
 @dataclass(frozen=True)
+class RaggedBltLayout:
+    """Flat Fast-BLT blocks attending one shared physical clean bank.
+
+    Blocks are packed in row-major order and are never padded to a per-row
+    branch capacity.  The K/V bank contains the physical ``[rows, clean]``
+    storage once followed by the flat block bank once.  ``row_cu_offsets``
+    makes the row grouping explicit for collation and validation; attention
+    routing uses ``block_rows`` directly so no data-dependent repeat is needed
+    in the CUDA forward.
+    """
+
+    clean_valid: Tensor
+    clean_positions: Tensor
+    clean_segment_ids: Tensor
+    block_valid: Tensor
+    block_rows: Tensor
+    block_starts: Tensor
+    row_cu_offsets: Tensor
+
+    def __post_init__(self) -> None:
+        _require_bool("clean_valid", self.clean_valid, 2)
+        _require_bool("block_valid", self.block_valid, 2)
+        rows, clean_length = self.clean_valid.shape
+        blocks, block_length = self.block_valid.shape
+        if block_length != 4:
+            raise ValueError("ragged Fast-BLT currently requires four-byte blocks")
+        if (
+            self.clean_positions.shape != self.clean_valid.shape
+            or self.clean_positions.dtype != torch.int64
+        ):
+            raise ValueError("clean_positions must be int64 [rows, clean_length]")
+        if (
+            self.clean_segment_ids.shape != self.clean_valid.shape
+            or self.clean_segment_ids.dtype != torch.int64
+        ):
+            raise ValueError("clean_segment_ids must be int64 [rows, clean_length]")
+        for name, value in (
+            ("block_rows", self.block_rows),
+            ("block_starts", self.block_starts),
+        ):
+            if value.shape != (blocks,) or value.dtype != torch.int64:
+                raise ValueError(f"{name} must be int64 [blocks]")
+        if (
+            self.row_cu_offsets.shape != (rows + 1,)
+            or self.row_cu_offsets.dtype != torch.int32
+        ):
+            raise ValueError("row_cu_offsets must be int32 [rows + 1]")
+        _require_same_device(
+            "ragged BLT layout",
+            (
+                self.clean_valid,
+                self.clean_positions,
+                self.clean_segment_ids,
+                self.block_valid,
+                self.block_rows,
+                self.block_starts,
+                self.row_cu_offsets,
+            ),
+        )
+        if rows <= 0 or clean_length <= 0 or blocks <= 0:
+            raise ValueError("ragged BLT requires nonempty rows, clean storage, and blocks")
+
+    @property
+    def rows(self) -> int:
+        return self.clean_valid.shape[0]
+
+    @property
+    def clean_length(self) -> int:
+        return self.clean_valid.shape[1]
+
+    @property
+    def blocks(self) -> int:
+        return self.block_valid.shape[0]
+
+    @property
+    def block_length(self) -> int:
+        return self.block_valid.shape[1]
+
+    @property
+    def query_length(self) -> int:
+        return self.blocks * self.block_length
+
+    @property
+    def clean_bank_length(self) -> int:
+        return self.rows * self.clean_length
+
+    @property
+    def kv_length(self) -> int:
+        return self.clean_bank_length + self.query_length
+
+    @property
+    def branch_positions(self) -> Tensor:
+        origins = self.clean_positions[self.block_rows, self.block_starts]
+        offsets = torch.arange(
+            self.block_length, device=origins.device, dtype=torch.int64
+        )
+        return origins[:, None] + offsets[None]
+
+    @property
+    def block_segment_ids(self) -> Tensor:
+        return self.clean_segment_ids[self.block_rows, self.block_starts]
+
+    def validate_values(self) -> None:
+        """Check collation invariants outside compiled production forwards."""
+
+        offsets = self.row_cu_offsets.detach().cpu()
+        if int(offsets[0]) != 0 or int(offsets[-1]) != self.blocks:
+            raise ValueError("row_cu_offsets must span every flat block")
+        if bool((offsets[1:] < offsets[:-1]).any()):
+            raise ValueError("row_cu_offsets must be nondecreasing")
+        expected_rows = torch.repeat_interleave(
+            torch.arange(self.rows), torch.diff(offsets).to(torch.long)
+        )
+        if not torch.equal(self.block_rows.detach().cpu(), expected_rows):
+            raise ValueError("flat blocks must be grouped in row-CU order")
+        if bool(((self.block_starts < 0) | (self.block_starts >= self.clean_length)).any()):
+            raise ValueError("a ragged BLT block start lies outside clean storage")
+        if bool(((self.block_rows < 0) | (self.block_rows >= self.rows)).any()):
+            raise ValueError("a ragged BLT block row is out of range")
+        if bool((~self.block_valid.any(-1)).any()):
+            raise ValueError("every ragged BLT block needs a valid target byte")
+        if bool((~self.clean_valid[self.block_rows, self.block_starts]).any()):
+            raise ValueError("every ragged BLT block must start on a valid clean byte")
+        byte_offsets = torch.arange(
+            self.block_length, device=self.block_starts.device
+        )
+        block_columns = self.block_starts[:, None] + byte_offsets[None]
+        in_bounds = block_columns < self.clean_length
+        safe_columns = block_columns.clamp_max(self.clean_length - 1)
+        origin_segments = self.block_segment_ids
+        origin_positions = self.clean_positions[
+            self.block_rows, self.block_starts
+        ]
+        expected_valid = (
+            in_bounds
+            & self.clean_valid[self.block_rows[:, None], safe_columns]
+            & self.clean_segment_ids[
+                self.block_rows[:, None], safe_columns
+            ].eq(origin_segments[:, None])
+            & self.clean_positions[
+                self.block_rows[:, None], safe_columns
+            ].eq(origin_positions[:, None] + byte_offsets[None])
+        )
+        if not torch.equal(self.block_valid, expected_valid):
+            raise ValueError(
+                "ragged BLT validity must exactly clip each physical block "
+                "at its document boundary"
+            )
+
+
+@dataclass(frozen=True)
 class CanvasBlockMaskMetadata:
     """Exact sparse block topology independent of attention values.
 
@@ -462,6 +613,110 @@ class CanvasBlockMaskMetadata:
         ):
             if value is not None:
                 value.record_stream(stream)
+
+
+@dataclass(frozen=True)
+class RaggedBltBlockMaskMetadata:
+    """Compact exact block topology for exhaustive Fast-BLT attention.
+
+    Unlike :class:`CanvasBlockMaskMetadata`, the index capacity is the maximum
+    *populated* degree, not the total number of physical blocks on the opposite
+    axis.  Both the forward and transposed sparse lists are built explicitly,
+    so Flex's dense block-topology transpose is neither needed nor allocated.
+    """
+
+    kv_num_blocks: Tensor
+    kv_indices: Tensor
+    q_num_blocks: Tensor
+    q_indices: Tensor
+    block_size: tuple[int, int]
+    query_length: int
+    kv_length: int
+    full_kv_num_blocks: Tensor
+    full_kv_indices: Tensor
+    full_q_num_blocks: Tensor
+    full_q_indices: Tensor
+
+    def __post_init__(self) -> None:
+        values = (
+            self.kv_num_blocks,
+            self.kv_indices,
+            self.q_num_blocks,
+            self.q_indices,
+            self.full_kv_num_blocks,
+            self.full_kv_indices,
+            self.full_q_num_blocks,
+            self.full_q_indices,
+        )
+        if any(value.dtype != torch.int32 for value in values):
+            raise ValueError("ragged BLT block metadata must be int32")
+        if self.kv_num_blocks.ndim != 3 or self.kv_indices.ndim != 4:
+            raise ValueError("ragged BLT K/V metadata must have [1,1,Q(,K)] shape")
+        if self.q_num_blocks.ndim != 3 or self.q_indices.ndim != 4:
+            raise ValueError("ragged BLT Q metadata must have [1,1,K(,Q)] shape")
+        if self.kv_num_blocks.shape != self.kv_indices.shape[:-1]:
+            raise ValueError("ragged BLT K/V counts and indices do not align")
+        if self.q_num_blocks.shape != self.q_indices.shape[:-1]:
+            raise ValueError("ragged BLT Q counts and indices do not align")
+        if (
+            self.full_kv_num_blocks.shape != self.kv_num_blocks.shape
+            or self.full_q_num_blocks.shape != self.q_num_blocks.shape
+            or self.full_kv_indices.shape[:-1] != self.kv_num_blocks.shape
+            or self.full_q_indices.shape[:-1] != self.q_num_blocks.shape
+        ):
+            raise ValueError("full and partial ragged BLT metadata do not align")
+        if self.kv_num_blocks.shape[:2] != (1, 1):
+            raise ValueError("ragged BLT metadata must use its single physical bank")
+        q_block, kv_block = self.block_size
+        if q_block <= 0 or kv_block <= 0:
+            raise ValueError("ragged BLT block sizes must be positive")
+        query_blocks = math.ceil(self.query_length / q_block)
+        kv_blocks = math.ceil(self.kv_length / kv_block)
+        if self.kv_num_blocks.shape[-1] != query_blocks:
+            raise ValueError("ragged BLT metadata omits a physical query block")
+        if self.q_num_blocks.shape[-1] != kv_blocks:
+            raise ValueError("ragged BLT metadata omits a physical K/V block")
+        for counts, indices, limit in (
+            (self.kv_num_blocks, self.kv_indices, kv_blocks),
+            (self.full_kv_num_blocks, self.full_kv_indices, kv_blocks),
+            (self.q_num_blocks, self.q_indices, query_blocks),
+            (self.full_q_num_blocks, self.full_q_indices, query_blocks),
+        ):
+            if counts.device.type != "cpu":
+                continue
+            capacity = indices.shape[-1]
+            if bool(((counts < 0) | (counts > capacity)).any()):
+                raise ValueError("ragged BLT block count exceeds sparse capacity")
+            slots = torch.arange(capacity)[None, None, None]
+            populated = slots < counts[..., None]
+            selected = indices[populated]
+            if bool(((selected < 0) | (selected >= limit)).any()):
+                raise ValueError("ragged BLT block index lies outside physical capacity")
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> "RaggedBltBlockMaskMetadata":
+        moved = tuple(
+            value.to(device, non_blocking=non_blocking)
+            for value in (
+                self.kv_num_blocks,
+                self.kv_indices,
+                self.q_num_blocks,
+                self.q_indices,
+                self.full_kv_num_blocks,
+                self.full_kv_indices,
+                self.full_q_num_blocks,
+                self.full_q_indices,
+            )
+        )
+        return RaggedBltBlockMaskMetadata(
+            moved[0], moved[1], moved[2], moved[3],
+            self.block_size, self.query_length, self.kv_length,
+            moved[4], moved[5], moved[6], moved[7],
+        )
 
 
 def canvas_block_mask_metadata(
@@ -717,6 +972,257 @@ def canvas_block_mask_metadata(
     )
 
 
+def _ordered_sparse_pairs(
+    outer: Tensor,
+    inner: Tensor,
+    *,
+    outer_blocks: int,
+    inner_blocks: int,
+) -> tuple[Tensor, Tensor]:
+    """Pack unique COO pairs into Flex's counted ordered-row format."""
+
+    if outer.numel() != inner.numel():
+        raise ValueError("sparse block pair axes differ")
+    if outer.numel():
+        order = torch.argsort(outer * inner_blocks + inner, stable=True)
+        outer = outer[order]
+        inner = inner[order]
+    counts_long = torch.bincount(outer, minlength=outer_blocks)
+    capacity = max(1, int(counts_long.max().item()))
+    indices = torch.zeros(
+        (outer_blocks, capacity), dtype=torch.int32, device=outer.device
+    )
+    if outer.numel():
+        row_starts = torch.cumsum(counts_long, 0) - counts_long
+        slots = torch.arange(outer.numel(), device=outer.device) - row_starts[outer]
+        indices[outer, slots] = inner.to(torch.int32)
+    return counts_long.to(torch.int32)[None, None], indices[None, None]
+
+
+def ragged_blt_block_mask_metadata(
+    layout: RaggedBltLayout,
+    *,
+    block_size: int | tuple[int, int] = 128,
+) -> RaggedBltBlockMaskMetadata:
+    """Build exact compact Flex metadata for a flat exhaustive Fast-BLT bank.
+
+    Candidate blocks are emitted from each branch's contiguous document prefix
+    and its own four-byte bank interval, then coalesced by physical query tile.
+    This uses O(blocks * prefix_blocks) temporary storage and O(nonzero block
+    pairs) persistent metadata; it never forms a query-token by key-token mask.
+    Full blocks are proven from independent query/key tile summaries.  Every
+    boundary, mixed-document, invalid-tail, or own-B4 diagonal tile remains a
+    partial block governed by :func:`_ragged_blt_mask_mod`.
+    """
+
+    q_block, kv_block = (
+        (block_size, block_size) if isinstance(block_size, int) else block_size
+    )
+    if q_block <= 0 or kv_block <= 0:
+        raise ValueError("ragged BLT block sizes must be positive")
+    device = layout.clean_valid.device
+    query_blocks = math.ceil(layout.query_length / q_block)
+    kv_blocks = math.ceil(layout.kv_length / kv_block)
+
+    branch_numbers = torch.arange(layout.blocks, device=device, dtype=torch.long)
+    byte_numbers = torch.arange(layout.block_length, device=device)
+    branch_query_blocks = torch.div(
+        branch_numbers[:, None] * layout.block_length + byte_numbers[None],
+        q_block,
+        rounding_mode="floor",
+    )
+
+    # In a packed byte row, document-relative positions identify the physical
+    # document start without scanning other rows or documents.  The interval is
+    # [document_start, origin), so the target itself never enters the prefix.
+    origin_positions = layout.clean_positions[
+        layout.block_rows, layout.block_starts
+    ]
+    # A page may begin in the middle of a document, in which case its first
+    # stored byte has a document-relative position greater than zero.  The
+    # unseen portion lives on the preceding page, not at negative physical
+    # columns in this clean bank.
+    document_starts = (layout.block_starts - origin_positions).clamp_min(0)
+    flat_prefix_starts = layout.block_rows * layout.clean_length + document_starts
+    flat_prefix_stops = layout.block_rows * layout.clean_length + layout.block_starts
+    first_clean_block = torch.div(
+        flat_prefix_starts, kv_block, rounding_mode="floor"
+    )
+    last_clean_block = torch.div(
+        (flat_prefix_stops - 1).clamp_min(0), kv_block, rounding_mode="floor"
+    )
+    max_clean_blocks = math.ceil(layout.clean_length / kv_block) + 1
+    clean_offsets = torch.arange(max_clean_blocks, device=device)
+    clean_candidates = first_clean_block[:, None] + clean_offsets[None]
+    clean_candidate_valid = (
+        (flat_prefix_stops > flat_prefix_starts)[:, None]
+        & (clean_candidates <= last_clean_block[:, None])
+    )
+
+    branch_bank_starts = (
+        layout.clean_bank_length + branch_numbers * layout.block_length
+    )
+    branch_key_positions = (
+        branch_bank_starts[:, None]
+        + torch.arange(layout.block_length, device=device)[None]
+    )
+    branch_candidates = torch.div(
+        branch_key_positions, kv_block, rounding_mode="floor"
+    )
+    branch_candidate_valid = layout.block_valid
+
+    clean_pair_valid = (
+        layout.block_valid[:, :, None] & clean_candidate_valid[:, None, :]
+    )
+    branch_pair_valid = (
+        layout.block_valid[:, :, None] & branch_candidate_valid[:, None, :]
+    )
+    candidate_query = torch.cat(
+        (
+            branch_query_blocks[:, :, None].expand_as(clean_pair_valid)[
+                clean_pair_valid
+            ],
+            branch_query_blocks[:, :, None].expand_as(branch_pair_valid)[
+                branch_pair_valid
+            ],
+        )
+    )
+    candidate_key = torch.cat(
+        (
+            clean_candidates[:, None, :].expand_as(clean_pair_valid)[
+                clean_pair_valid
+            ],
+            branch_candidates[:, None, :].expand_as(branch_pair_valid)[
+                branch_pair_valid
+            ],
+        )
+    )
+    encoded = torch.unique(candidate_query * kv_blocks + candidate_key, sorted=True)
+    pair_query = torch.div(encoded, kv_blocks, rounding_mode="floor")
+    pair_key = encoded.remainder(kv_blocks)
+
+    # Query-axis summaries.  Invalid physical tail queries make the whole tile
+    # partial, but safe indices keep the setup branch-free on CUDA.
+    q_physical = (
+        torch.arange(query_blocks, device=device)[:, None] * q_block
+        + torch.arange(q_block, device=device)[None]
+    )
+    q_in_bounds = q_physical < layout.query_length
+    q_safe = q_physical.clamp_max(layout.query_length - 1)
+    q_branches = torch.div(q_safe, layout.block_length, rounding_mode="floor")
+    q_offsets = q_safe.remainder(layout.block_length)
+    q_valid = q_in_bounds & layout.block_valid[q_branches, q_offsets]
+    q_all_valid = q_valid.all(-1)
+    q_rows = layout.block_rows[q_branches]
+    q_segments = layout.block_segment_ids[q_branches]
+    q_origins = layout.clean_positions[
+        q_rows, layout.block_starts[q_branches]
+    ]
+    q_row_min, q_row_max = q_rows.amin(-1), q_rows.amax(-1)
+    q_segment_min, q_segment_max = q_segments.amin(-1), q_segments.amax(-1)
+    q_origin_min = q_origins.amin(-1)
+    q_branch_min, q_branch_max = q_branches.amin(-1), q_branches.amax(-1)
+
+    # Key-axis summaries.  Clean and branch portions are summarized separately
+    # so a physical tile straddling the bank boundary is still classified
+    # exactly rather than pessimistically or as an unsafe full block.
+    k_physical = (
+        torch.arange(kv_blocks, device=device)[:, None] * kv_block
+        + torch.arange(kv_block, device=device)[None]
+    )
+    k_in_bounds = k_physical < layout.kv_length
+    clean_key = k_in_bounds & (k_physical < layout.clean_bank_length)
+    clean_safe = k_physical.clamp_max(layout.clean_bank_length - 1)
+    clean_rows = torch.div(
+        clean_safe, layout.clean_length, rounding_mode="floor"
+    )
+    clean_offsets_physical = clean_safe.remainder(layout.clean_length)
+    clean_values_valid = layout.clean_valid[clean_rows, clean_offsets_physical]
+    clean_all_valid = (~clean_key | clean_values_valid).all(-1)
+    clean_present = clean_key.any(-1)
+    int64_max = torch.iinfo(torch.int64).max
+    int64_min = torch.iinfo(torch.int64).min
+    clean_row_min = clean_rows.masked_fill(~clean_key, int64_max).amin(-1)
+    clean_row_max = clean_rows.masked_fill(~clean_key, int64_min).amax(-1)
+    clean_segments = layout.clean_segment_ids[clean_rows, clean_offsets_physical]
+    clean_segment_min = clean_segments.masked_fill(~clean_key, int64_max).amin(-1)
+    clean_segment_max = clean_segments.masked_fill(~clean_key, int64_min).amax(-1)
+    clean_positions = layout.clean_positions[clean_rows, clean_offsets_physical]
+    clean_position_max = clean_positions.masked_fill(~clean_key, int64_min).amax(-1)
+
+    branch_key = k_in_bounds & ~clean_key
+    branch_physical = (k_physical - layout.clean_bank_length).clamp_min(0)
+    branch_safe = branch_physical.clamp_max(layout.query_length - 1)
+    key_branches = torch.div(
+        branch_safe, layout.block_length, rounding_mode="floor"
+    )
+    key_offsets = branch_safe.remainder(layout.block_length)
+    branch_values_valid = layout.block_valid[key_branches, key_offsets]
+    branch_all_valid = (~branch_key | branch_values_valid).all(-1)
+    branch_present = branch_key.any(-1)
+    key_branch_min = key_branches.masked_fill(~branch_key, layout.blocks).amin(-1)
+    key_branch_max = key_branches.masked_fill(~branch_key, -1).amax(-1)
+
+    pq, pk = pair_query, pair_key
+    clean_full = (~clean_present[pk]) | (
+        clean_all_valid[pk]
+        & q_row_min[pq].eq(q_row_max[pq])
+        & clean_row_min[pk].eq(clean_row_max[pk])
+        & q_row_min[pq].eq(clean_row_min[pk])
+        & q_segment_min[pq].eq(q_segment_max[pq])
+        & clean_segment_min[pk].eq(clean_segment_max[pk])
+        & q_segment_min[pq].eq(clean_segment_min[pk])
+        & clean_position_max[pk].lt(q_origin_min[pq])
+    )
+    branch_full = (~branch_present[pk]) | (
+        branch_all_valid[pk]
+        & q_branch_min[pq].eq(q_branch_max[pq])
+        & key_branch_min[pk].eq(key_branch_max[pk])
+        & q_branch_min[pq].eq(key_branch_min[pk])
+    )
+    full = q_all_valid[pq] & k_in_bounds[pk].all(-1) & clean_full & branch_full
+
+    partial_q, partial_k = pq[~full], pk[~full]
+    full_q, full_k = pq[full], pk[full]
+    kv_counts, kv_indices = _ordered_sparse_pairs(
+        partial_q,
+        partial_k,
+        outer_blocks=query_blocks,
+        inner_blocks=kv_blocks,
+    )
+    q_counts, q_indices = _ordered_sparse_pairs(
+        partial_k,
+        partial_q,
+        outer_blocks=kv_blocks,
+        inner_blocks=query_blocks,
+    )
+    full_kv_counts, full_kv_indices = _ordered_sparse_pairs(
+        full_q,
+        full_k,
+        outer_blocks=query_blocks,
+        inner_blocks=kv_blocks,
+    )
+    full_q_counts, full_q_indices = _ordered_sparse_pairs(
+        full_k,
+        full_q,
+        outer_blocks=kv_blocks,
+        inner_blocks=query_blocks,
+    )
+    return RaggedBltBlockMaskMetadata(
+        kv_counts,
+        kv_indices,
+        q_counts,
+        q_indices,
+        (q_block, kv_block),
+        layout.query_length,
+        layout.kv_length,
+        full_kv_counts,
+        full_kv_indices,
+        full_q_counts,
+        full_q_indices,
+    )
+
+
 def canvas_branch_allowed(layout: CanvasBranchLayout) -> Tensor:
     """Dense ``[batch, branch_query, clean_plus_branch_key]`` canvas oracle."""
 
@@ -767,6 +1273,54 @@ def canvas_branch_allowed(layout: CanvasBranchLayout) -> Tensor:
     return torch.cat((clean_allowed, branch_allowed), dim=-1).reshape(
         batch, layout.query_length, layout.kv_length
     )
+
+
+def ragged_blt_allowed(layout: RaggedBltLayout) -> Tensor:
+    """Dense ``[1, flat_query, shared_clean_plus_block_key]`` oracle.
+
+    The clean bank is flattened row-major exactly once.  Every valid block
+    query sees all valid bytes from its own document whose original position
+    is strictly before the block origin, plus every valid byte in its own
+    four-byte block.  It cannot see another row, document, or block.
+    """
+
+    device = layout.clean_valid.device
+    block = layout.block_length
+    query_physical = torch.arange(layout.query_length, device=device)
+    query_block = torch.div(query_physical, block, rounding_mode="floor")
+    query_offset = query_physical.remainder(block)
+    query_valid = layout.block_valid[query_block, query_offset]
+
+    clean_physical = torch.arange(layout.clean_bank_length, device=device)
+    clean_rows = torch.div(
+        clean_physical, layout.clean_length, rounding_mode="floor"
+    )
+    clean_offsets = clean_physical.remainder(layout.clean_length)
+    origin_positions = layout.clean_positions[
+        layout.block_rows[query_block], layout.block_starts[query_block]
+    ]
+    origin_segments = layout.block_segment_ids[query_block]
+    clean_allowed = (
+        query_valid[:, None]
+        & layout.clean_valid[clean_rows, clean_offsets][None]
+        & clean_rows[None].eq(layout.block_rows[query_block, None])
+        & layout.clean_segment_ids[clean_rows, clean_offsets][None].eq(
+            origin_segments[:, None]
+        )
+        & layout.clean_positions[clean_rows, clean_offsets][None].lt(
+            origin_positions[:, None]
+        )
+    )
+
+    branch_physical = torch.arange(layout.query_length, device=device)
+    key_block = torch.div(branch_physical, block, rounding_mode="floor")
+    key_offset = branch_physical.remainder(block)
+    branch_allowed = (
+        query_valid[:, None]
+        & key_block[None].eq(query_block[:, None])
+        & layout.block_valid[key_block, key_offset][None]
+    )
+    return torch.cat((clean_allowed, branch_allowed), dim=-1)[None]
 
 
 def introspection_branch_allowed(layout: IntrospectionBranchLayout) -> Tensor:
@@ -886,6 +1440,53 @@ def _introspection_mask_mod(layout: IntrospectionBranchLayout):
     return mask_mod
 
 
+def _ragged_blt_mask_mod(layout: RaggedBltLayout):
+    clean_bank_length = layout.clean_bank_length
+    clean_length = layout.clean_length
+    block_length = layout.block_length
+    blocks = layout.blocks
+
+    def mask_mod(batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
+        del batch, head
+        query_block = torch.div(
+            query, block_length, rounding_mode="floor"
+        ).clamp(0, blocks - 1)
+        query_offset = query.remainder(block_length)
+        query_valid = layout.block_valid[query_block, query_offset]
+
+        clean_key = key < clean_bank_length
+        clean_physical = key.clamp(0, clean_bank_length - 1)
+        clean_row = torch.div(
+            clean_physical, clean_length, rounding_mode="floor"
+        )
+        clean_offset = clean_physical.remainder(clean_length)
+        query_row = layout.block_rows[query_block]
+        origin = layout.block_starts[query_block]
+        query_segment = layout.clean_segment_ids[query_row, origin]
+        origin_position = layout.clean_positions[query_row, origin]
+        from_clean = (
+            clean_key
+            & clean_row.eq(query_row)
+            & layout.clean_valid[clean_row, clean_offset]
+            & layout.clean_segment_ids[clean_row, clean_offset].eq(query_segment)
+            & layout.clean_positions[clean_row, clean_offset].lt(origin_position)
+        )
+
+        branch_physical = (key - clean_bank_length).clamp_min(0)
+        key_block = torch.div(
+            branch_physical, block_length, rounding_mode="floor"
+        ).clamp(0, blocks - 1)
+        key_offset = branch_physical.remainder(block_length)
+        from_branch = (
+            ~clean_key
+            & key_block.eq(query_block)
+            & layout.block_valid[key_block, key_offset]
+        )
+        return query_valid & (from_clean | from_branch)
+
+    return mask_mod
+
+
 @torch.compiler.disable
 def build_canvas_block_mask(
     layout: CanvasBranchLayout,
@@ -933,6 +1534,42 @@ def build_canvas_block_mask(
         BLOCK_SIZE=block_size,
         _compile=compile_mask,
         separate_full_blocks=True,
+    )
+
+
+@torch.compiler.disable
+def build_ragged_blt_block_mask(
+    layout: RaggedBltLayout,
+    *,
+    block_size: int | tuple[int, int] = 128,
+    compile_mask: bool | None = None,
+    metadata: RaggedBltBlockMaskMetadata | None = None,
+):
+    """Build exact sparse routing without a dense token/block mask pass."""
+
+    try:
+        from torch.nn.attention.flex_attention import BlockMask
+    except Exception as error:
+        raise RuntimeError("FlexAttention BlockMask construction is unavailable") from error
+    del compile_mask  # Retained at the public boundary; no mask compiler is used.
+    if metadata is None:
+        metadata = ragged_blt_block_mask_metadata(layout, block_size=block_size)
+    if metadata.query_length != layout.query_length or metadata.kv_length != layout.kv_length:
+        raise ValueError("ragged BLT block metadata does not match layout geometry")
+    if metadata.kv_num_blocks.device != layout.clean_valid.device:
+        raise ValueError("ragged BLT block metadata and layout must share a device")
+    return BlockMask(
+        seq_lengths=(layout.query_length, layout.kv_length),
+        kv_num_blocks=metadata.kv_num_blocks,
+        kv_indices=metadata.kv_indices,
+        full_kv_num_blocks=metadata.full_kv_num_blocks,
+        full_kv_indices=metadata.full_kv_indices,
+        q_num_blocks=metadata.q_num_blocks,
+        q_indices=metadata.q_indices,
+        full_q_num_blocks=metadata.full_q_num_blocks,
+        full_q_indices=metadata.full_q_indices,
+        BLOCK_SIZE=metadata.block_size,
+        mask_mod=_ragged_blt_mask_mod(layout),
     )
 
 
@@ -1228,18 +1865,115 @@ def branch_attention(
     )
 
 
+def ragged_blt_attention(
+    query: Tensor,
+    clean_key: Tensor,
+    clean_value: Tensor,
+    branch_key: Tensor,
+    branch_value: Tensor,
+    layout: RaggedBltLayout,
+    *,
+    scale: float | None = None,
+    backend: BranchBackend = "auto",
+    block_mask=None,
+    block_size: int | tuple[int, int] = 128,
+    capabilities: AttentionBackendCapabilities | None = None,
+    allow_dense_reference: bool = False,
+    dense_reference_limit: int = DEFAULT_DENSE_REFERENCE_LIMIT,
+) -> Tensor:
+    """Attend flat BLT blocks to one nonduplicated clean-plus-block bank.
+
+    All tensors use ``[1, heads, sequence, head_dim]``.  CUDA execution is
+    Flex-only and therefore cannot accidentally allocate a dense
+    ``(4T) x (BL + 4T)`` score tensor.  The dense path is an explicitly opted
+    in, size-limited CPU correctness oracle.
+    """
+
+    tensors = (query, clean_key, clean_value, branch_key, branch_value)
+    if any(tensor.ndim != 4 for tensor in tensors):
+        raise ValueError("ragged BLT Q/K/V must have rank four")
+    _require_same_device("ragged BLT attention", tensors)
+    if not all(tensor.is_floating_point() for tensor in tensors):
+        raise TypeError("ragged BLT Q/K/V must be floating point")
+    if len({tensor.dtype for tensor in tensors}) != 1:
+        raise ValueError("ragged BLT Q/K/V dtypes must match")
+    if clean_key.shape != clean_value.shape or branch_key.shape != branch_value.shape:
+        raise ValueError("ragged BLT K/V shapes differ")
+    if query.shape[0] != 1 or query.shape[2] != layout.query_length:
+        raise ValueError("ragged BLT query does not match its flat layout")
+    if clean_key.shape[0] != 1 or clean_key.shape[2] != layout.clean_bank_length:
+        raise ValueError("ragged BLT clean K/V does not match its flat layout")
+    if branch_key.shape[0] != 1 or branch_key.shape[2] != layout.query_length:
+        raise ValueError("ragged BLT branch K/V does not match its flat layout")
+    if query.shape[-1] != clean_key.shape[-1] or query.shape[-1] != branch_key.shape[-1]:
+        raise ValueError("ragged BLT head dimensions differ")
+    if clean_key.shape[1] != branch_key.shape[1]:
+        raise ValueError("ragged BLT clean and branch K/V head counts differ")
+    if query.shape[1] % clean_key.shape[1]:
+        raise ValueError("ragged BLT query heads must divide K/V heads")
+    if layout.clean_valid.device != query.device:
+        raise ValueError("ragged BLT layout and Q/K/V must share a device")
+
+    selected = _resolve_backend(
+        backend,
+        pattern=AttentionPattern.BRANCH,
+        device=query.device,
+        sequence_length=layout.kv_length,
+        capabilities=capabilities,
+        allow_dense_reference=allow_dense_reference,
+        dense_reference_limit=dense_reference_limit,
+        production=AttentionBackend.FLEX,
+    )
+    bank_key = torch.cat((clean_key, branch_key), dim=2)
+    bank_value = torch.cat((clean_value, branch_value), dim=2)
+    if selected is AttentionBackend.DENSE_REFERENCE:
+        if query.is_cuda:
+            raise RuntimeError(
+                "CUDA ragged Fast-BLT cannot materialize dense attention scores"
+            )
+        return _dense_attention(
+            query,
+            bank_key,
+            bank_value,
+            ragged_blt_allowed(layout),
+            scale=scale,
+        )
+
+    try:
+        from torch.nn.attention.flex_attention import flex_attention
+    except Exception as error:
+        raise RuntimeError("FlexAttention is unavailable") from error
+    if block_mask is None:
+        block_mask = build_ragged_blt_block_mask(layout, block_size=block_size)
+    return flex_attention(
+        query,
+        bank_key,
+        bank_value,
+        block_mask=block_mask,
+        scale=scale,
+        enable_gqa=query.shape[1] != bank_key.shape[1],
+        kernel_options={"BACKEND": "TRITON", "ROWS_GUARANTEED_SAFE": False},
+    )
+
+
 __all__ = [
     "BranchLayout",
     "CanvasBlockMaskMetadata",
     "CanvasBranchLayout",
     "IntrospectionBranchLayout",
     "PackedCleanQKV",
+    "RaggedBltBlockMaskMetadata",
+    "RaggedBltLayout",
     "branch_attention",
     "build_canvas_block_mask",
+    "build_ragged_blt_block_mask",
     "canvas_block_mask_metadata",
     "build_introspection_block_mask",
     "canvas_branch_allowed",
     "dense_packed_clean_attention",
     "introspection_branch_allowed",
     "packed_clean_attention",
+    "ragged_blt_allowed",
+    "ragged_blt_attention",
+    "ragged_blt_block_mask_metadata",
 ]

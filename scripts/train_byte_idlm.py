@@ -21,6 +21,7 @@ import random
 import sys
 
 import torch
+from checkpointing import RecoveryCheckpointPolicy
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -310,6 +311,13 @@ def main() -> None:
         )
         if args.resume is not None:
             trainer.load_checkpoint(args.resume)
+        checkpoint_policy = RecoveryCheckpointPolicy(
+            float(
+                os.environ.get(
+                    "BYTE_IDLM_CHECKPOINT_INTERVAL_SECONDS", "480"
+                )
+            )
+        )
 
         result_directory = REPO_ROOT / "ablation_results" / run_id
         result_directory.mkdir(parents=True, exist_ok=True)
@@ -323,6 +331,9 @@ def main() -> None:
             "training_diagnostic_cadence": diagnostic_cadence_contract(
                 log_every=log_every,
                 validation_every=val_every,
+            ),
+            "checkpoint_interval_seconds": (
+                checkpoint_policy.interval_seconds
             ),
             "serving": {
                 "trained_stride": model_config.block_size,
@@ -343,7 +354,6 @@ def main() -> None:
             "byte_idlm_contract " + json.dumps(contract, sort_keys=True), flush=True
         )
 
-        checkpoint_every = _positive_env("BYTE_IDLM_CHECKPOINT_EVERY", 200)
         if trainer.completed_steps == 0:
             metric = trainer.validate()
             print(
@@ -373,7 +383,10 @@ def main() -> None:
                     ),
                     flush=True,
                 )
-            if next_step % checkpoint_every == 0 or next_step == iterations:
+            if checkpoint_policy.due() or (
+                next_step == iterations
+                and checkpoint_policy.terminal_due(next_step)
+            ):
                 trainer.save_checkpoint(
                     checkpoint,
                     extra={
@@ -382,6 +395,7 @@ def main() -> None:
                         "dataset_payload_sha256": expected_data,
                     },
                 )
+                checkpoint_policy.committed(next_step)
     finally:
         trainer.close()
 

@@ -73,6 +73,7 @@ from pretraining.byte_diffusion.training_duo import (
     PreparedDuoUpdate,
     duo_clean_ar_weight,
     duo_loss,
+    duo_mutable_topology_contract,
     duo_objective_contract,
     prepare_duo_update,
     prepare_duo_validation_batch,
@@ -113,7 +114,8 @@ def readiness_workload_contract(
             "diagnostic_cadence": diagnostic_cadence_contract(),
             "objective": "proposal_plus_clean_exact_optimizer_step_balance",
         }
-    model = ByteDiffusionConfig().to_dict()
+    config = model_config_from_env() if architecture == "duo" else ByteDiffusionConfig()
+    model = config.to_dict()
     if architecture == "diffusion_gemma":
         return model, {
             "branches": 1,
@@ -131,6 +133,7 @@ def readiness_workload_contract(
             **duo_objective_contract(duo_objective),
             "schedule_eps": 0.001,
             "time_sampling": "global_branch_antithetic_striped_uniform_0_1",
+            **duo_mutable_topology_contract(config),
         }
     raise ValueError(f"unknown architecture {architecture!r}")
 
@@ -472,6 +475,18 @@ class DuoUpdateHarness:
         batch_prefetcher: DeviceBatchPrefetcher,
     ) -> None:
         self.config = model_config_from_env()
+        train_patching = getattr(train_dataset, "patching", None)
+        validation_patching = getattr(validation_dataset, "patching", None)
+        if (
+            train_patching is None
+            or train_patching != validation_patching
+            or getattr(train_patching, "name", None)
+            != self.config.duo_clean_patching
+        ):
+            raise ValueError(
+                "Byte-Duo readiness dataset omitted or mismatched its "
+                "authenticated clean patching policy"
+            )
         if (
             manifest.output_size != self.config.vocab.output_size
             or manifest.pad_id != self.config.vocab.pad_id
@@ -482,7 +497,9 @@ class DuoUpdateHarness:
         if self.config == ByteDiffusionConfig():
             self.model.validate_production_parameterization()
         self.execution_model = torch.compile(
-            self.model, dynamic=False, fullgraph=False
+            self.model,
+            dynamic=self.config.duo_clean_patching == "causal_entropy_v1",
+            fullgraph=False,
         )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -1182,6 +1199,12 @@ def main() -> None:
     )
     if args.architecture == "duo":
         model_contract = model_config_from_env().to_dict()
+        patching = train_dataset.patching
+        workload_contract["dataset_patching"] = {
+            "name": patching.name,
+            "max_patch_size": patching.max_patch_size,
+            "patcher_sha256": patching.artifact_sha256,
+        }
     report = {
         "schema": "byte_diffusion_architecture_readiness/v1",
         "architecture": args.architecture,
@@ -1192,6 +1215,7 @@ def main() -> None:
         "workload": workload_contract,
         "benchmark_harness_source": benchmark_harness_provenance(),
         "dataset_payload_sha256": expected_data,
+        "dataset_patching": workload_contract.get("dataset_patching"),
         "row_length_bytes": args.row_length,
         "global_batch": args.global_batch,
         "duo_branches": args.duo_branches,

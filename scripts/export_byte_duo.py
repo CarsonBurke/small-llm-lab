@@ -21,8 +21,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from pretraining.byte_diffusion.config import ByteDiffusionConfig
 from pretraining.byte_diffusion.duo_model import DuoModel
 from pretraining.byte_diffusion.export import build_artifact, load_artifact, parse_artifact, write_artifact
+from pretraining.byte_diffusion.inference_duo import duo_entropy_clean_metadata
+from pretraining.byte_diffusion.patching import CausalEntropyPatcher
 from pretraining.byte_diffusion.training import load_data_directory, model_config_from_dict
 from pretraining.byte_diffusion.training_duo import (
     PreparedDuoValidationBatch,
@@ -55,20 +58,86 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def checkpoint_entropy_patcher_artifact(
+    payload: dict[str, object], data_path: Path
+) -> bytes | None:
+    """Recover only the dataset- and checkpoint-authenticated Duo patcher."""
+
+    config = model_config_from_dict(payload["model_config"])
+    training = payload.get("training")
+    binding = training.get("dataset_patching") if isinstance(training, dict) else None
+    if not isinstance(binding, dict):
+        raise ValueError("Duo checkpoint omitted its dataset patching contract")
+    if binding.get("name") != config.duo_clean_patching:
+        raise ValueError("Duo checkpoint patching policy differs from model config")
+    if config.duo_clean_patching == "fixed_stride_v1":
+        if binding.get("patcher_sha256") is not None:
+            raise ValueError("fixed-stride Duo checkpoint claims an entropy patcher")
+        return None
+    manifest = json.loads((data_path / "manifest.json").read_text())
+    patching = manifest.get("patching")
+    if not isinstance(patching, dict) or patching.get("name") != (
+        "causal_entropy_v1"
+    ):
+        raise ValueError("Duo export dataset omitted causal entropy patching")
+    artifact_info = patching.get("patcher_artifact")
+    if not isinstance(artifact_info, dict):
+        raise ValueError("Duo export dataset omitted its patcher artifact")
+    relative = Path(str(artifact_info.get("path", "")))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Duo entropy patcher path must stay within its dataset")
+    dataset_root = data_path.resolve()
+    artifact_path = (data_path / relative).resolve()
+    if not artifact_path.is_relative_to(dataset_root):
+        raise ValueError("Duo entropy patcher path escaped through a symlink")
+    artifact = artifact_path.read_bytes()
+    patcher = CausalEntropyPatcher.from_bytes(artifact)
+    expected_sha256 = binding.get("patcher_sha256")
+    if expected_sha256 != patcher.sha256 or artifact_info.get("sha256") != (
+        patcher.sha256
+    ):
+        raise ValueError("Duo entropy patcher differs from authenticated provenance")
+    if int(binding.get("max_patch_size", -1)) != patcher.config.max_patch_size:
+        raise ValueError("Duo entropy patcher maximum size differs from checkpoint")
+    return artifact
+
+
 @torch.no_grad()
-def cached_inference_smoke(model: DuoModel) -> dict[str, object]:
+def cached_inference_smoke(
+    model: DuoModel, entropy_patcher: CausalEntropyPatcher | None = None
+) -> dict[str, object]:
     """Verify the artifact's deployed cached path against its full forward."""
 
+    if (model.config.duo_clean_patching == "causal_entropy_v1") != (
+        entropy_patcher is not None
+    ):
+        raise ValueError("cached smoke requires its policy-matched entropy patcher")
     stride = model.config.patch_stride
-    clean_length = 2 * stride
+    full_resolution = (
+        model.config.duo_mutable_topology == "full_resolution_decoder"
+    )
+    smoke_phase = 1 if full_resolution else 0
+    clean_atoms = 2 * stride + smoke_phase
+    clean_length = 3 * stride
     clean_ids = torch.arange(clean_length, dtype=torch.long).remainder(256)[None]
-    clean_valid = torch.ones_like(clean_ids, dtype=torch.bool)
+    clean_ids[:, clean_atoms:] = model.config.vocab.pad_id
+    clean_valid = torch.arange(clean_length)[None] < clean_atoms
     document_ids = torch.zeros_like(clean_ids)
     positions = torch.arange(clean_length, dtype=torch.long)[None]
     noisy_ids = torch.arange(stride, dtype=torch.long)[None, None]
     branch_valid = torch.ones_like(noisy_ids, dtype=torch.bool)
-    branch_starts = torch.full((1, 1), clean_length - stride, dtype=torch.long)
+    branch_start = clean_atoms
+    if branch_start != int(clean_valid.sum()):
+        raise AssertionError("cached smoke canvas must begin at the exact clean length")
+    branch_starts = torch.full((1, 1), branch_start, dtype=torch.long)
     times = torch.full((1, 1), 0.5)
+    clean_patch_metadata = (
+        duo_entropy_clean_metadata(
+            entropy_patcher, clean_ids, clean_valid, document_ids
+        )
+        if entropy_patcher is not None
+        else None
+    )
     full = model(
         clean_ids,
         clean_valid,
@@ -78,9 +147,16 @@ def cached_inference_smoke(model: DuoModel) -> dict[str, object]:
         branch_valid,
         branch_starts,
         times,
+        clean_patch_metadata=clean_patch_metadata,
         allow_synthetic_branch_suffix=True,
     ).branch_logits
-    bank = model.prepare_clean_bank(clean_ids, clean_valid, document_ids, positions)
+    bank = model.prepare_clean_bank(
+        clean_ids,
+        clean_valid,
+        document_ids,
+        positions,
+        clean_patch_metadata=clean_patch_metadata,
+    )
     cache = model.prepare_canvas_cache(
         bank,
         branch_valid,
@@ -96,9 +172,59 @@ def cached_inference_smoke(model: DuoModel) -> dict[str, object]:
     return {
         "full_vs_cached_max_abs_error": maximum_error,
         "finite": bool(torch.isfinite(cached).all()),
-        "clean_atoms": clean_length,
+        "clean_atoms": clean_atoms,
         "canvas_atoms": stride,
+        "branch_start": branch_start,
+        "origin_phase": smoke_phase,
+        "origin_stride": model.config.duo_origin_stride,
+        "origin_policy": (
+            "exact_non_aligned_prompt"
+            if full_resolution
+            else "legacy_patch_aligned_prompt"
+        ),
+        "patching_policy": model.config.duo_clean_patching,
+        "entropy_patcher_sha256": (
+            entropy_patcher.sha256 if entropy_patcher is not None else None
+        ),
     }
+
+
+def validation_compile_contract(
+    config: ByteDiffusionConfig, device: torch.device
+) -> dict[str, object]:
+    """Describe the graph-shape policy used for quantized validation."""
+
+    entropy_patching = config.duo_clean_patching == "causal_entropy_v1"
+    return {
+        "compiled": device.type == "cuda",
+        "dynamic_shapes": entropy_patching if device.type == "cuda" else False,
+        "patching_policy": config.duo_clean_patching,
+        "shape_reason": (
+            "ragged_causal_entropy_patch_counts"
+            if entropy_patching
+            else "fixed_stride_patch_counts"
+        ),
+    }
+
+
+def prepare_validation_model(
+    candidate_model: DuoModel, device: torch.device
+) -> DuoModel:
+    """Move and compile a model under its patching-policy shape contract."""
+
+    candidate_model = candidate_model.to(device).eval()
+    contract = validation_compile_contract(candidate_model.config, device)
+    if not contract["compiled"]:
+        return candidate_model
+    # FlexAttention's eager fallback materializes the 4K×12K score matrix and
+    # cannot fit. Entropy patch counts are data-dependent, so their deployed
+    # validation graph must retain dynamic shapes.
+    candidate_model.forward = torch.compile(  # type: ignore[method-assign]
+        candidate_model.forward,
+        dynamic=bool(contract["dynamic_shapes"]),
+        fullgraph=False,
+    )
+    return candidate_model
 
 
 def main() -> None:
@@ -122,6 +248,12 @@ def main() -> None:
     dataset_sha256 = dataset_manifest.get("payload_sha256")
     if dataset_sha256 != payload.get("dataset_payload_sha256"):
         raise ValueError("export dataset differs from Byte-Duo checkpoint")
+    entropy_patcher = checkpoint_entropy_patcher_artifact(payload, args.data_path)
+    entropy_patcher_model = (
+        CausalEntropyPatcher.from_bytes(entropy_patcher)
+        if entropy_patcher is not None
+        else None
+    )
     atomic_manifest, _, validation = load_data_directory(
         args.data_path,
         chunk_size=int(training.get("chunk_size", 8192)),
@@ -140,24 +272,16 @@ def main() -> None:
         encoding_policy=args.encoding_policy,
         code_bytes=code_bytes,
         atomic_manifest=atomic_manifest,
+        entropy_patcher=entropy_patcher,
     )
     quantized = DuoModel(config, schedule_eps=float(training["schedule_eps"]))
     load_artifact(quantized, candidate)
-    cached_smoke = cached_inference_smoke(quantized.eval())
+    cached_smoke = cached_inference_smoke(
+        quantized.eval(), entropy_patcher_model
+    )
     if not args.cpu_reference and not torch.cuda.is_available():
         raise RuntimeError("CUDA export evaluation requires mlq; use --cpu-reference in tests")
     device = torch.device("cpu" if args.cpu_reference else "cuda")
-    def prepare_for_validation(candidate_model: DuoModel) -> DuoModel:
-        candidate_model = candidate_model.to(device).eval()
-        if device.type != "cuda":
-            return candidate_model
-        # FlexAttention's eager fallback materializes the 4K×12K score matrix
-        # and cannot fit. The shipped inference/training path is compiled; the
-        # post-quantization check must exercise that same fused path.
-        candidate_model.forward = torch.compile(  # type: ignore[method-assign]
-            candidate_model.forward, dynamic=False, fullgraph=False
-        )
-        return candidate_model
     evaluated_rows = min(args.validation_rows, len(validation))
     validation_batches = tuple(
         _validation_batches(
@@ -183,7 +307,7 @@ def main() -> None:
         )
         for batch in validation_batches
     )
-    model = prepare_for_validation(model)
+    model = prepare_validation_model(model, device)
     float_evaluation = asdict(
         validate_duo(
             model,
@@ -198,7 +322,7 @@ def main() -> None:
     model = model.to("cpu")
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    quantized = prepare_for_validation(quantized)
+    quantized = prepare_validation_model(quantized, device)
     evaluation = asdict(
         validate_duo(
             quantized,
@@ -225,6 +349,9 @@ def main() -> None:
         args.max_quantization_delta_bits
     )
     evaluation["cached_inference_smoke"] = cached_smoke
+    evaluation["validation_compile_contract"] = validation_compile_contract(
+        config, device
+    )
     candidate_metadata, _ = parse_artifact(candidate)
     evaluation["encoding_plan"] = {
         "policy": candidate_metadata["encoding_policy"],
@@ -241,6 +368,13 @@ def main() -> None:
         "source_sha256": provenance["sha256"],
         "complete_code": complete_code_provenance(),
         "metric_semantics": "conditional_canvas_duo_nelbo_not_ar_bpb",
+        "canvas_length": int(training["canvas_length"]),
+        "patching_policy": config.duo_clean_patching,
+        "entropy_patcher_sha256": (
+            hashlib.sha256(entropy_patcher).hexdigest()
+            if entropy_patcher is not None
+            else None
+        ),
     }
     artifact = build_artifact(
         model,
@@ -251,6 +385,7 @@ def main() -> None:
         atomic_manifest=atomic_manifest,
         post_quantization_metrics=evaluation,
         provenance=artifact_provenance,
+        entropy_patcher=entropy_patcher,
         require_evaluation=True,
     )
     digest = write_artifact(args.output, artifact)

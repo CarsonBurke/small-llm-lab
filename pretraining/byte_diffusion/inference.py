@@ -127,6 +127,18 @@ class EntropyCanvasGeneration:
     overflow_canvas_ids: Tensor
 
 
+@dataclass(frozen=True)
+class EntropyBltEndPlan:
+    """Reusable finite-prefix topology shared by every block denoising NFE."""
+
+    clean_ids: Tensor
+    metadata: dict[str, Tensor]
+    starts: Tensor
+    prior_condition_indices: Tensor
+    branch_valid: Tensor
+    branch_block_mask: object | None
+
+
 def _entropy_patch_plan(
     patcher: CausalEntropyPatcher, ids: Tensor
 ) -> EntropyPatchPlan:
@@ -182,6 +194,93 @@ def _variable_prefix_metadata(
     return metadata, layout
 
 
+def _finite_prefix_end_metadata(
+    patcher: CausalEntropyPatcher,
+    prefixes: tuple[Tensor, ...],
+    *,
+    physical_stride: int,
+    pad_id: int,
+) -> tuple[Tensor, dict[str, Tensor], VariablePatchLayout, Tensor]:
+    """Close each finite prefix and materialize its paper-exact end origin.
+
+    Fast-BLT segments the finite committed prefix and immediately appends a
+    masked block conditioned on the prefix's final latent.  The extra clean
+    dummy below is only a structural origin for the shared branch API: forcing
+    its patch offset to zero closes the preceding (possibly open) final patch.
+    Causal encoder/global states before the dummy are unchanged, and the
+    decoder branch mask excludes the dummy from its clean K/V prefix.
+    """
+
+    if not prefixes:
+        raise ValueError("finite-prefix BLT requires at least one row")
+    device = prefixes[0].device
+    if any(
+        prefix.ndim != 1
+        or prefix.dtype != torch.long
+        or not prefix.numel()
+        or prefix.device != device
+        for prefix in prefixes
+    ):
+        raise ValueError("finite prefixes must be nonempty aligned int64 rows")
+
+    lengths = torch.tensor(
+        [prefix.numel() for prefix in prefixes], dtype=torch.long
+    )
+    if physical_stride <= 0:
+        raise ValueError("physical stride must be positive")
+    required_width = int(lengths.max()) + 1
+    width = -(-required_width // physical_stride) * physical_stride
+    rows = len(prefixes)
+    clean_ids = torch.full((rows, width), pad_id, dtype=torch.long)
+    valid = torch.zeros((rows, width), dtype=torch.bool)
+    document_ids = torch.full((rows, width), -1, dtype=torch.long)
+    positions = torch.zeros((rows, width), dtype=torch.long)
+    patch_offsets = torch.full((rows, width), -1, dtype=torch.long)
+
+    for row, prefix in enumerate(prefixes):
+        length = prefix.numel()
+        host_prefix = prefix.detach().to(device="cpu", dtype=torch.long)
+        plan = _entropy_patch_plan(patcher, host_prefix)
+        byte_indices = torch.arange(length, dtype=torch.long)
+        starts = torch.from_numpy(plan.layout.patch_starts)
+        byte_to_patch = torch.from_numpy(plan.layout.byte_to_patch)
+        offsets = byte_indices - starts.index_select(0, byte_to_patch)
+        clean_ids[row, :length] = host_prefix
+        # The dummy value cannot affect any consumed state because it begins a
+        # forced new patch and both encoder and global attention are causal.
+        clean_ids[row, length] = 0
+        valid[row, : length + 1] = True
+        document_ids[row, : length + 1] = 0
+        positions[row, : length + 1] = torch.arange(length + 1)
+        patch_offsets[row, :length] = offsets
+        patch_offsets[row, length] = 0
+
+    layout = build_variable_patch_layout(
+        valid,
+        document_ids,
+        positions,
+        patch_offsets,
+        max_patch_size=patcher.config.max_patch_size,
+    )
+    metadata = {
+        "valid": valid.to(device),
+        "positions": positions.to(device),
+        "document_ids": document_ids.to(device),
+        "byte_indices": layout.byte_indices.to(device),
+        "byte_cu_seqlens": layout.byte_cu_seqlens.to(device),
+        "patch_cu_seqlens": layout.patch_cu_seqlens.to(device),
+        "condition_patch_indices": layout.condition_patch_indices.to(device),
+        "global_patch_sources": layout.global_patch_sources.to(device),
+        "global_patch_positions": layout.global_patch_positions.to(device),
+        "physical_to_global_patch_indices": (
+            layout.physical_to_global_patch_indices.to(device)
+        ),
+        "bos_condition_indices": layout.bos_condition_indices.to(device),
+        "patch_byte_cu_seqlens": layout.patch_byte_cu_seqlens.to(device),
+    }
+    return clean_ids.to(device), metadata, layout, lengths.to(device)
+
+
 def entropy_next_byte_starts_patch(
     patcher: CausalEntropyPatcher, committed_ids: Tensor
 ) -> bool:
@@ -223,11 +322,11 @@ def denoise_entropy_blt_reference(
     committed_ids: Tensor,
     noisy_ids: Tensor,
 ) -> Tensor:
-    """Uncached Fast-BLT denoising with the trained variable-patch topology.
+    """Uncached paper-exact Fast-BLT denoising at a finite prefix end.
 
-    A clean dummy atom materializes the next patch origin for the existing
-    clean-plus-branch model API.  The decoder prefix cutoff is immediately
-    before that slot, so neither it nor any noisy candidate can enter the
+    The finite final patch is closed even when the online patcher would have
+    continued it.  A structural dummy then materializes the end origin for the
+    shared branch API, while the decoder cutoff excludes that dummy from the
     immutable clean context.
     """
 
@@ -236,32 +335,57 @@ def denoise_entropy_blt_reference(
     canvas_length = noisy_ids.numel()
     if canvas_length <= 0:
         raise ValueError("entropy BLT canvas must be nonempty")
-    if not entropy_next_byte_starts_patch(patcher, committed_ids):
-        raise ValueError("entropy BLT branch requires a patch-aligned prefix")
+    return denoise_entropy_blt_reference_batched(
+        model, patcher, (committed_ids,), noisy_ids[None]
+    )[0]
 
-    start = committed_ids.numel()
-    clean_ids = torch.cat((committed_ids, committed_ids.new_zeros(1)))
-    metadata, layout = _variable_prefix_metadata(patcher, clean_ids)
-    origins = layout.physical_patch_start_columns.eq(start).nonzero().flatten()
-    if origins.numel() != 1:
-        raise AssertionError("next entropy patch origin was not unique")
+
+@torch.no_grad()
+def prepare_entropy_blt_end(
+    model: ByteDiffusionModel,
+    patcher: CausalEntropyPatcher,
+    committed_rows: tuple[Tensor, ...],
+    canvas_length: int,
+) -> EntropyBltEndPlan:
+    """Prepare immutable paper-exact end-origin metadata once per block."""
+
+    if canvas_length <= 0:
+        raise ValueError("entropy BLT canvas width must be positive")
+    if patcher.model.config.vocab_size != model.config.vocab.output_size:
+        raise ValueError("entropy patcher vocabulary differs from the model")
+
+    clean_ids, metadata, layout, lengths = _finite_prefix_end_metadata(
+        patcher,
+        committed_rows,
+        physical_stride=model.config.patch_stride,
+        pad_id=model.config.vocab.pad_id,
+    )
+    host_lengths = lengths.cpu()
+    physical_rows = layout.physical_patch_row_indices
+    physical_starts = layout.physical_patch_start_columns
+    matches = physical_rows[:, None].eq(
+        torch.arange(len(committed_rows), dtype=torch.long)[None]
+    ) & physical_starts[:, None].eq(host_lengths[None])
+    if not bool(matches.any(0).all()) or bool(matches.sum(0).ne(1).any()):
+        raise AssertionError("finite-prefix end origin was not unique per row")
+    origins = matches.to(torch.long).argmax(0)
     prior = layout.physical_patch_prior_condition_indices.index_select(
         0, origins
-    ).to(committed_ids.device)[None]
-    starts = torch.tensor(
-        [[start]], dtype=torch.long, device=committed_ids.device
-    )
+    ).to(clean_ids.device)[:, None]
+    starts = lengths[:, None]
     branch_valid = torch.ones(
-        (1, 1, canvas_length), dtype=torch.bool, device=committed_ids.device
+        (len(committed_rows), 1, canvas_length),
+        dtype=torch.bool,
+        device=clean_ids.device,
     )
     branch_mask = None
     if (
-        committed_ids.device.type == "cuda"
+        clean_ids.device.type == "cuda"
         and model.config.decoder_branch_attention == "shared_flex"
     ):
         positions = metadata["positions"]
         branch_positions = starts[:, :, None] + torch.arange(
-            canvas_length, device=committed_ids.device
+            canvas_length, device=clean_ids.device
         )[None, None]
         branch_layout = CanvasBranchLayout(
             clean_valid=metadata["valid"],
@@ -274,20 +398,62 @@ def denoise_entropy_blt_reference(
             branch_segment_ids=torch.zeros_like(starts),
         )
         branch_mask = build_canvas_block_mask(branch_layout)
+    return EntropyBltEndPlan(
+        clean_ids=clean_ids,
+        metadata=metadata,
+        starts=starts,
+        prior_condition_indices=prior,
+        branch_valid=branch_valid,
+        branch_block_mask=branch_mask,
+    )
+
+
+@torch.no_grad()
+def denoise_entropy_blt_reference_batched(
+    model: ByteDiffusionModel,
+    patcher: CausalEntropyPatcher,
+    committed_rows: tuple[Tensor, ...],
+    noisy_ids: Tensor,
+    *,
+    plan: EntropyBltEndPlan | None = None,
+) -> Tensor:
+    """Paper-exact finite-prefix Fast-BLT denoising for a row cohort."""
+
+    if noisy_ids.ndim != 2 or noisy_ids.dtype != torch.long:
+        raise ValueError("batched entropy BLT canvases must be int64 [batch, width]")
+    if noisy_ids.shape[0] != len(committed_rows) or not noisy_ids.shape[1]:
+        raise ValueError("entropy BLT canvases and committed rows must align")
+    if any(row.device != noisy_ids.device for row in committed_rows):
+        raise ValueError("entropy BLT prefixes and canvases must share a device")
+    if plan is None:
+        plan = prepare_entropy_blt_end(
+            model, patcher, committed_rows, noisy_ids.shape[1]
+        )
+    if (
+        plan.clean_ids.shape[0] != noisy_ids.shape[0]
+        or plan.branch_valid.shape != (noisy_ids.shape[0], 1, noisy_ids.shape[1])
+        or plan.clean_ids.device != noisy_ids.device
+    ):
+        raise ValueError("entropy BLT plan and canvases do not align")
+    metadata = dict(plan.metadata)
 
     output = model.forward_blt_d_branches(
-        clean_ids[None],
+        plan.clean_ids,
         metadata.pop("valid"),
-        noisy_ids[None, None],
-        branch_valid,
-        starts,
+        noisy_ids[:, None],
+        plan.branch_valid,
+        plan.starts,
         document_ids=metadata.pop("document_ids"),
-        branch_condition_indices=prior,
-        branch_block_mask=branch_mask,
+        branch_condition_indices=plan.prior_condition_indices,
+        branch_block_mask=plan.branch_block_mask,
+        return_clean_logits=False,
+        return_clean_patch_states=False,
         max_patch_size=patcher.config.max_patch_size,
         **metadata,
     )
-    return output.branch_logits[0, 0]
+    if output.clean_logits.shape[1] or output.clean_patch_states.shape[1]:
+        raise AssertionError("serving materialized unused clean outputs")
+    return output.branch_logits[:, 0]
 
 
 class EntropyPatchedCanvasGenerator:
@@ -343,7 +509,6 @@ class EntropyPatchedCanvasGenerator:
         )
         self.forwards = 0
         self.denoising_forwards = 0
-        self.causal_forwards = 0
         self.rejected_bytes = 0
 
     def _masked_logits(self, logits: Tensor) -> Tensor:
@@ -365,45 +530,6 @@ class EntropyPatchedCanvasGenerator:
             raise ValueError("entropy generation prompt cannot contain EOT")
         self.ids = prefix.to(self.ids.device).clone()
 
-    def _choose(self, logits: Tensor, *, stochastic: bool) -> Tensor:
-        logits = self._masked_logits(logits.float())
-        if not stochastic:
-            return logits.argmax(-1, keepdim=True).to(torch.long)
-        return torch.multinomial(
-            logits.softmax(-1), 1, generator=self.generator
-        ).to(torch.long)
-
-    @torch.no_grad()
-    def align_prefix_ar(
-        self,
-        *,
-        stochastic: bool = False,
-        max_forwards: int | None = None,
-    ) -> Tensor:
-        """Close an incomplete variable patch without noising prompt bytes."""
-
-        if not self.ids.numel():
-            raise RuntimeError("prefill must run before entropy generation")
-        if max_forwards is not None and max_forwards < 0:
-            raise ValueError("AR alignment forward budget cannot be negative")
-        generated: list[Tensor] = []
-        for _ in range(self.patcher.config.max_patch_size):
-            if entropy_next_byte_starts_patch(self.patcher, self.ids):
-                break
-            if max_forwards is not None and len(generated) >= max_forwards:
-                break
-            logits = entropy_ar_next_logits(self.model, self.patcher, self.ids)
-            self.forwards += 1
-            self.causal_forwards += 1
-            chosen = self._choose(logits, stochastic=stochastic)
-            self.ids = torch.cat((self.ids, chosen))
-            generated.append(chosen)
-            if int(chosen) == self.model.config.vocab.eot_id:
-                break
-        else:
-            raise AssertionError("entropy patcher exceeded its maximum patch size")
-        return torch.cat(generated) if generated else self.ids.new_empty((0,))
-
     @torch.no_grad()
     def generate_blt(
         self,
@@ -418,12 +544,9 @@ class EntropyPatchedCanvasGenerator:
 
         if steps <= 0:
             raise ValueError("diffusion steps must be positive")
-        alignment = self.align_prefix_ar(stochastic=stochastic)
-        if int(self.ids[-1]) == self.model.config.vocab.eot_id:
-            empty = self.ids.new_empty((0,))
-            return EntropyCanvasGeneration(alignment, None, empty, empty)
-        if not entropy_next_byte_starts_patch(self.patcher, self.ids):
-            raise AssertionError("AR alignment did not close the variable patch")
+        if not self.ids.numel():
+            raise RuntimeError("prefill must run before entropy generation")
+        alignment = self.ids.new_empty((0,))
 
         canvas_length = self.block_length
         initial = torch.full(
@@ -432,13 +555,20 @@ class EntropyPatchedCanvasGenerator:
             dtype=torch.long,
             device=self.ids.device,
         )
+        end_plan = prepare_entropy_blt_end(
+            self.model, self.patcher, (self.ids,), canvas_length
+        )
 
         def denoise(canvas: Tensor) -> Tensor:
             return self._masked_logits(
-                denoise_entropy_blt_reference(
-                    self.model, self.patcher, self.ids, canvas[0]
+                denoise_entropy_blt_reference_batched(
+                    self.model,
+                    self.patcher,
+                    (self.ids,),
+                    canvas,
+                    plan=end_plan,
                 )
-            )[None]
+            )
 
         sampled = sample_absorbing_canvas_batched(
             initial,
@@ -1566,6 +1696,7 @@ __all__ = [
     "CachedCanvasGenerator",
     "CachedCanvasPlan",
     "CanvasGeneration",
+    "EntropyBltEndPlan",
     "EntropyCanvasGeneration",
     "EntropyPatchedCanvasGenerator",
     "HierarchicalPrefixCache",
@@ -1574,9 +1705,11 @@ __all__ = [
     "denoise_blt_cached",
     "denoise_canvas_cached",
     "denoise_entropy_blt_reference",
+    "denoise_entropy_blt_reference_batched",
     "document_start_ar_metadata",
     "entropy_ar_next_logits",
     "entropy_next_byte_starts_patch",
     "prefill_prefix",
+    "prepare_entropy_blt_end",
     "prepare_cached_canvas",
 ]

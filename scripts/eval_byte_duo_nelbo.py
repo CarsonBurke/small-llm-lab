@@ -51,9 +51,13 @@ def parse_args() -> argparse.Namespace:
         help="comma-separated independent deterministic validation ledgers",
     )
     parser.add_argument(
-        "--phase-robustness",
+        "--serving-distribution",
         action="store_true",
-        help="Evaluate a separate deterministic 0--3 fixed-prefix phase ledger.",
+        help=(
+            "Evaluate the topology's serving-origin distribution: exact byte "
+            "origins for full-resolution Duo, or deterministic clean-prefix "
+            "phases for legacy patched-global Duo."
+        ),
     )
     parser.add_argument(
         "--native-training-geometry",
@@ -103,6 +107,20 @@ def main() -> None:
     if data_sha256 != payload.get("dataset_payload_sha256"):
         raise ValueError("NELBO evaluation dataset differs from the checkpoint")
     config = model_config_from_dict(payload["model_config"])
+    serving_distribution = bool(args.serving_distribution)
+    if serving_distribution:
+        if config.duo_mutable_topology == "full_resolution_decoder":
+            evaluation_origin_policy = "exact_byte_origins"
+            evaluation_origin_stride = config.duo_origin_stride
+            fixed_clean_phase_policy = "none"
+        else:
+            evaluation_origin_policy = "patch_origin_with_clean_prefix_phase"
+            evaluation_origin_stride = config.patch_stride
+            fixed_clean_phase_policy = "deterministic_0_to_patch_stride_minus_1"
+    else:
+        evaluation_origin_policy = "canonical_patch_aligned"
+        evaluation_origin_stride = config.patch_stride
+        fixed_clean_phase_policy = "none"
     model = DuoModel(config, schedule_eps=float(training["schedule_eps"]))
     model.load_state_dict(payload["model"], strict=True)
     model = model.to("cuda").eval()
@@ -132,7 +150,7 @@ def main() -> None:
             schedule=schedule,
             device=torch.device("cuda"),
             row_indices=np.arange(evaluated_rows, dtype=np.int64),
-            expose_random_phase=args.phase_robustness,
+            expose_random_phase=serving_distribution,
         )
         metric = validate_duo(
             execution_model,  # type: ignore[arg-type]
@@ -160,13 +178,16 @@ def main() -> None:
     report = {
         "schema": "byte_duo_nelbo_multiledger/v1",
         "metric_semantics": (
-            "random_phase_conditional_canvas_duo_nelbo_not_canonical_or_ar_bpb"
-            if args.phase_robustness
+            "serving_distribution_conditional_canvas_duo_nelbo_not_ar_bpb"
+            if serving_distribution
             else "native_geometry_conditional_canvas_duo_nelbo_diagnostic_not_ar_bpb"
             if args.native_training_geometry
             else "conditional_canvas_duo_nelbo_not_ar_bpb"
         ),
-        "phase_robustness": args.phase_robustness,
+        "serving_distribution": serving_distribution,
+        "evaluation_origin_policy": evaluation_origin_policy,
+        "evaluation_origin_stride": evaluation_origin_stride,
+        "fixed_clean_phase_policy": fixed_clean_phase_policy,
         "evaluation_geometry": evaluation_geometry,
         "evaluation_canvas_length": eval_canvas,
         "evaluation_branches": eval_branches,

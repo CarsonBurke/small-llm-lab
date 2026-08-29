@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pretraining.byte_diffusion.config import ByteDiffusionConfig
+from pretraining.byte_diffusion.config import model_config_from_env
 from pretraining.byte_diffusion.data import DeterministicChunkCursor
 from pretraining.byte_diffusion.duo import (
     DuoSchedule,
@@ -64,6 +64,7 @@ from pretraining.byte_diffusion.training_duo import (
     accumulate_duo_validation_stats,
     duo_clean_ar_weight,
     duo_loss,
+    duo_mutable_topology_contract,
     duo_objective_contract,
     prepare_duo_update,
 )
@@ -98,6 +99,7 @@ def distributed_readiness_workload_contract(
 ) -> dict[str, object]:
     """Return the exact workload mapping consumed by the trainer validator."""
 
+    config = model_config_from_env()
     return {
         **duo_geometry_contract(canvas_length, branches),
         "diagnostic_cadence": diagnostic_cadence_contract(
@@ -106,6 +108,7 @@ def distributed_readiness_workload_contract(
         **duo_objective_contract(objective),
         "schedule_eps": SCHEDULE_EPS,
         "time_sampling": "global_branch_antithetic_striped_uniform_0_1",
+        **duo_mutable_topology_contract(config),
     }
 
 
@@ -334,7 +337,18 @@ def _run(args: argparse.Namespace, context: DistributedContext) -> None:
         validation_chunk_limit=VALIDATION_ROWS,
         expected_payload_sha256=args.expected_data_sha256,
     )
-    config = ByteDiffusionConfig()
+    config = model_config_from_env()
+    train_patching = getattr(train_chunks, "patching", None)
+    validation_patching = getattr(validation_chunks, "patching", None)
+    if (
+        train_patching is None
+        or train_patching != validation_patching
+        or getattr(train_patching, "name", None) != config.duo_clean_patching
+    ):
+        raise ValueError(
+            "distributed readiness dataset omitted or mismatched its "
+            "authenticated clean patching policy"
+        )
     if (
         manifest.output_size != config.vocab.output_size
         or manifest.pad_id != config.vocab.pad_id
@@ -345,8 +359,13 @@ def _run(args: argparse.Namespace, context: DistributedContext) -> None:
         raise ValueError("distributed readiness requires 256 validation rows")
 
     model = DuoModel(config, schedule_eps=SCHEDULE_EPS).to(device)
-    model.validate_production_parameterization()
-    execution_model = torch.compile(model, dynamic=False, fullgraph=False)
+    if config == ByteDiffusionConfig():
+        model.validate_production_parameterization()
+    execution_model = torch.compile(
+        model,
+        dynamic=config.duo_clean_patching == "causal_entropy_v1",
+        fullgraph=False,
+    )
     forward_model = DDP(
         execution_model,
         device_ids=[device.index],
@@ -661,6 +680,18 @@ def _run(args: argparse.Namespace, context: DistributedContext) -> None:
         records = [record for record in gathered if record is not None]
         records.sort(key=lambda record: int(record["rank"]))
         aggregate = _distributed_aggregate(records)
+        workload = distributed_readiness_workload_contract(
+            canvas_length=args.canvas_length,
+            branches=args.branches,
+            objective=args.objective,
+            log_every=args.log_every,
+            validation_every=args.validation_every,
+        )
+        workload["dataset_patching"] = {
+            "name": train_patching.name,
+            "max_patch_size": train_patching.max_patch_size,
+            "patcher_sha256": train_patching.artifact_sha256,
+        }
         report = {
             "schema": DUO_DISTRIBUTED_READINESS_SCHEMA,
             "architecture": "duo",
@@ -672,12 +703,7 @@ def _run(args: argparse.Namespace, context: DistributedContext) -> None:
             "dataset_payload_sha256": args.expected_data_sha256,
             "model_config": config.to_dict(),
             "parameter_count": model.parameter_count,
-            "workload": distributed_readiness_workload_contract(
-                canvas_length=args.canvas_length,
-                branches=args.branches,
-                objective=args.objective,
-                log_every=args.log_every, validation_every=args.validation_every
-            ),
+            "workload": workload,
             "geometry": distributed_readiness_geometry(),
             "runtime": {
                 "compiled": True,

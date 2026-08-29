@@ -130,6 +130,266 @@ class VariablePatchLayout:
     physical_patch_prior_condition_indices: Tensor
 
 
+@dataclass(frozen=True)
+class DuoCleanPatchMetadata:
+    """PAD-free causal clean topology for Byte-Duo entropy patches.
+
+    Unlike :class:`VariablePatchLayout`, this layout has no virtual BOS token.
+    The global sequence contains only physical patches, RoPE positions are
+    document-local patch ordinals, and ``-1`` denotes the exact zero condition
+    before a document's first closed patch.  ``origin_condition_indices`` is a
+    padded physical-byte lookup used by arbitrary full-resolution canvas
+    origins; it always names the last patch that closes strictly before the
+    mutable origin.
+
+    The physical byte axis and cumulative-length capacity are compile-stable;
+    only the valid-byte pool selection and resulting patch axis are dynamic.
+    Callers must not present this metadata as evidence for a fully static
+    ``dynamic=False`` executable.
+    """
+
+    byte_indices: Tensor
+    byte_cu_seqlens: Tensor
+    pool_byte_indices: Tensor
+    patch_byte_cu_seqlens: Tensor
+    patch_cu_seqlens: Tensor
+    patch_ordinals: Tensor
+    byte_condition_indices: Tensor
+    origin_condition_indices: Tensor
+    physical_patch_row_indices: Tensor
+    physical_patch_start_columns: Tensor
+    physical_patch_lengths: Tensor
+    max_patch_size: int
+    max_patch_seqlen: int
+
+    def _map(self, transform) -> "DuoCleanPatchMetadata":
+        return DuoCleanPatchMetadata(
+            byte_indices=transform(self.byte_indices),
+            byte_cu_seqlens=transform(self.byte_cu_seqlens),
+            pool_byte_indices=transform(self.pool_byte_indices),
+            patch_byte_cu_seqlens=transform(self.patch_byte_cu_seqlens),
+            patch_cu_seqlens=transform(self.patch_cu_seqlens),
+            patch_ordinals=transform(self.patch_ordinals),
+            byte_condition_indices=transform(self.byte_condition_indices),
+            origin_condition_indices=transform(self.origin_condition_indices),
+            physical_patch_row_indices=transform(
+                self.physical_patch_row_indices
+            ),
+            physical_patch_start_columns=transform(
+                self.physical_patch_start_columns
+            ),
+            physical_patch_lengths=transform(self.physical_patch_lengths),
+            max_patch_size=self.max_patch_size,
+            max_patch_seqlen=self.max_patch_seqlen,
+        )
+
+    def to(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> "DuoCleanPatchMetadata":
+        return self._map(
+            lambda value: value.to(device, non_blocking=non_blocking)
+        )
+
+    def pin_memory(self) -> "DuoCleanPatchMetadata":
+        return self._map(lambda value: value.contiguous().pin_memory())
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        for value in (
+            self.byte_indices,
+            self.byte_cu_seqlens,
+            self.pool_byte_indices,
+            self.patch_byte_cu_seqlens,
+            self.patch_cu_seqlens,
+            self.patch_ordinals,
+            self.byte_condition_indices,
+            self.origin_condition_indices,
+            self.physical_patch_row_indices,
+            self.physical_patch_start_columns,
+            self.physical_patch_lengths,
+        ):
+            value.record_stream(stream)
+
+
+def build_duo_clean_patch_metadata(
+    valid: Tensor,
+    document_ids: Tensor,
+    patch_offsets: Tensor,
+    *,
+    max_patch_size: int,
+    max_segments_per_row: int = 64,
+    next_byte_starts_patch: Tensor | None = None,
+) -> DuoCleanPatchMetadata:
+    """Build Duo's no-BOS entropy-patched clean hierarchy on CPU.
+
+    Every valid byte belongs to exactly one authenticated physical patch.  A
+    clean byte consumes the current patch latent only at that patch's final
+    byte; earlier bytes consume the preceding closed patch.  A mutable origin
+    always consumes the patch preceding the patch containing the origin.
+    These two conditions are intentionally distinct.
+    """
+
+    tensors = (valid, document_ids, patch_offsets)
+    if any(value.device.type != "cpu" for value in tensors):
+        raise ValueError("Duo clean patch metadata must be collated on CPU")
+    if valid.ndim != 2 or any(value.shape != valid.shape for value in tensors[1:]):
+        raise ValueError("Duo clean patch metadata must align as [B,L]")
+    if valid.dtype != torch.bool:
+        raise TypeError("valid must be boolean")
+    if document_ids.dtype != torch.long or patch_offsets.dtype != torch.long:
+        raise TypeError("document ids and patch offsets must be int64")
+    if max_patch_size <= 0:
+        raise ValueError("max_patch_size must be positive")
+    if max_segments_per_row <= 0:
+        raise ValueError("max_segments_per_row must be positive")
+    if next_byte_starts_patch is not None and (
+        next_byte_starts_patch.device.type != "cpu"
+        or next_byte_starts_patch.shape != valid.shape[:1]
+        or next_byte_starts_patch.dtype != torch.bool
+    ):
+        raise ValueError("next-byte boundary flags must be aligned CPU booleans")
+
+    pool_byte_indices = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
+    if pool_byte_indices.numel() == 0:
+        raise ValueError("Duo clean patch metadata requires at least one valid byte")
+    if bool((~valid[:, :-1] & valid[:, 1:]).any()):
+        raise ValueError("Duo entropy rows must have one contiguous valid prefix")
+    width = valid.shape[1]
+    rows = torch.div(pool_byte_indices, width, rounding_mode="floor")
+    columns = pool_byte_indices.remainder(width)
+    documents = document_ids.reshape(-1).index_select(0, pool_byte_indices)
+    offsets = patch_offsets.reshape(-1).index_select(0, pool_byte_indices)
+    if bool((documents < 0).any()):
+        raise ValueError("valid bytes require nonnegative document ids")
+    adjacent_valid = valid[:, 1:] & valid[:, :-1]
+    if bool(
+        (
+            adjacent_valid
+            & document_ids[:, 1:].lt(document_ids[:, :-1])
+        ).any()
+    ):
+        raise ValueError("document ids must be nondecreasing within physical rows")
+    if bool(((offsets < 0) | (offsets >= max_patch_size)).any()):
+        raise ValueError("patch offset lies outside the authenticated maximum")
+
+    segment_boundary = torch.ones(pool_byte_indices.numel(), dtype=torch.bool)
+    segment_boundary[1:] = (rows[1:] != rows[:-1]) | (
+        documents[1:] != documents[:-1]
+    )
+    if bool(offsets.masked_select(segment_boundary).ne(0).any()):
+        raise ValueError("every packed document segment must begin on a patch boundary")
+    # The local encoder/decoder axes stay compile-stable: every physical byte
+    # slot participates and the invalid row tail is assigned to the preceding
+    # document.  Empty sequence capacity is represented by repeated terminal
+    # cumulative offsets, matching native varlen attention's static contract.
+    physical_documents = torch.where(valid, document_ids, -1).cummax(1).values
+    if bool(physical_documents[:, 0].lt(0).any()):
+        raise ValueError("a physical Duo row cannot begin with padding")
+    physical_boundary = torch.ones_like(valid)
+    physical_boundary[:, 1:] = (
+        physical_documents[:, 1:] != physical_documents[:, :-1]
+    )
+    segment_counts = physical_boundary.sum(1)
+    if bool(segment_counts.gt(max_segments_per_row).any()):
+        raise ValueError("Duo row exceeds compile-stable document capacity")
+    physical_flat = physical_documents.reshape(-1)
+    physical_rows = torch.arange(valid.shape[0])[:, None].expand_as(valid).reshape(-1)
+    flat_boundary = torch.ones(physical_flat.numel(), dtype=torch.bool)
+    flat_boundary[1:] = (physical_rows[1:] != physical_rows[:-1]) | (
+        physical_flat[1:] != physical_flat[:-1]
+    )
+    byte_segment_starts = torch.nonzero(flat_boundary, as_tuple=False).flatten()
+    byte_segment_stops = torch.cat(
+        (byte_segment_starts[1:], byte_segment_starts.new_tensor([valid.numel()]))
+    )
+    byte_cu = torch.full(
+        (valid.shape[0] * max_segments_per_row + 1,),
+        valid.numel(),
+        dtype=torch.int32,
+    )
+    byte_cu[0] = 0
+    byte_cu[1 : byte_segment_stops.numel() + 1] = byte_segment_stops.to(torch.int32)
+    byte_indices = torch.arange(valid.numel(), dtype=torch.long)
+
+    patch_starts = torch.nonzero(offsets.eq(0), as_tuple=False).flatten()
+    patch_byte_cu = torch.cat(
+        (
+            patch_starts.to(torch.int32),
+            patch_starts.new_tensor([pool_byte_indices.numel()]).to(torch.int32),
+        )
+    )
+    patch_lengths = torch.diff(patch_byte_cu).to(torch.long)
+    if bool(((patch_lengths <= 0) | (patch_lengths > max_patch_size)).any()):
+        raise ValueError("variable patch length lies outside the authenticated bound")
+    expected_offsets = torch.arange(pool_byte_indices.numel()) - torch.repeat_interleave(
+        patch_starts, patch_lengths
+    )
+    if not torch.equal(offsets, expected_offsets):
+        raise ValueError("patch offsets do not form contiguous zero-based runs")
+
+    patch_rows = rows.index_select(0, patch_starts)
+    patch_documents = documents.index_select(0, patch_starts)
+    if not torch.equal(
+        documents, torch.repeat_interleave(patch_documents, patch_lengths)
+    ):
+        raise ValueError("one entropy patch mixes multiple documents")
+    patch_columns = columns.index_select(0, patch_starts)
+    patch_cu = _segment_cu(patch_rows, patch_documents)
+    segment_starts = patch_cu[:-1].to(torch.long)
+    segment_lengths = torch.diff(patch_cu).to(torch.long)
+    ordinals = torch.arange(patch_starts.numel()) - torch.repeat_interleave(
+        segment_starts, segment_lengths
+    )
+    byte_to_patch = torch.repeat_interleave(
+        torch.arange(patch_starts.numel(), dtype=torch.long), patch_lengths
+    )
+    prior = torch.where(ordinals.gt(0), torch.arange(ordinals.numel()) - 1, -1)
+    byte_prior = torch.repeat_interleave(prior, patch_lengths)
+    patch_final = offsets.eq(torch.repeat_interleave(patch_lengths - 1, patch_lengths))
+    byte_condition = torch.where(patch_final, byte_to_patch, byte_prior)
+
+    origin_condition = torch.full(valid.shape, -1, dtype=torch.long)
+    origin_condition.reshape(-1).index_copy_(0, pool_byte_indices, byte_prior)
+    if next_byte_starts_patch is not None:
+        row_lengths = valid.sum(1)
+        if bool(row_lengths.ge(width).any()):
+            raise ValueError("runtime entropy metadata requires one suffix slot per row")
+        if bool(
+            torch.where(valid, document_ids, document_ids[:, :1])
+            .ne(document_ids[:, :1])
+            .any()
+        ):
+            raise ValueError("runtime entropy metadata supports one document per row")
+        packed_row_stops = row_lengths.cumsum(0)
+        packed_last = packed_row_stops - 1
+        last_patch = byte_to_patch.index_select(0, packed_last)
+        last_prior = byte_prior.index_select(0, packed_last)
+        open_tail = ~next_byte_starts_patch
+        byte_condition = byte_condition.clone()
+        byte_condition.index_copy_(
+            0,
+            packed_last,
+            torch.where(open_tail, last_prior, last_patch),
+        )
+        origin_condition[
+            torch.arange(valid.shape[0]), row_lengths
+        ] = torch.where(next_byte_starts_patch, last_patch, last_prior)
+    return DuoCleanPatchMetadata(
+        byte_indices=byte_indices,
+        byte_cu_seqlens=byte_cu,
+        pool_byte_indices=pool_byte_indices,
+        patch_byte_cu_seqlens=patch_byte_cu,
+        patch_cu_seqlens=patch_cu,
+        patch_ordinals=ordinals,
+        byte_condition_indices=byte_condition,
+        origin_condition_indices=origin_condition,
+        physical_patch_row_indices=patch_rows,
+        physical_patch_start_columns=patch_columns,
+        physical_patch_lengths=patch_lengths,
+        max_patch_size=max_patch_size,
+        max_patch_seqlen=int(segment_lengths.max().item()),
+    )
+
+
 def _segment_cu(rows: Tensor, documents: Tensor) -> Tensor:
     boundary = torch.ones(documents.numel(), dtype=torch.bool)
     boundary[1:] = (rows[1:] != rows[:-1]) | (documents[1:] != documents[:-1])

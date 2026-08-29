@@ -17,8 +17,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import pretraining.byte_diffusion.model as model_module
 import pretraining.byte_diffusion.training as training_module
-from pretraining.byte_diffusion.config import ByteDiffusionConfig, CorruptionConfig
+from pretraining.byte_diffusion.config import (
+    FAST_BLT_ENTROPY_B4_COMPLETE_PRESET,
+    FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET,
+    ByteDiffusionConfig,
+    CorruptionConfig,
+)
 from pretraining.byte_diffusion.data import (
     AtomicDocument,
     AtomicIdManifest,
@@ -26,6 +32,7 @@ from pretraining.byte_diffusion.data import (
     pack_documents,
 )
 from pretraining.byte_diffusion.model import ByteDiffusionModel
+from pretraining.byte_diffusion.variable_patching import DatasetPatchingSpec
 from pretraining.byte_diffusion.training import (
     CAUSAL_CONTROL_PRESET,
     CANONICAL_PRESET,
@@ -67,6 +74,7 @@ from scripts.build_byte_diffusion_dataset import (
     write_deterministic_mapped_artifact,
 )
 from scripts.train_byte_diffusion import (
+    expected_model_config_for_run,
     model_config_from_env,
     training_source_provenance,
 )
@@ -91,6 +99,65 @@ def _chunks(*, offset: int = 0):
         for index in range(4)
     ]
     return pack_documents(documents, manifest, chunk_size=8)
+
+
+def _hand_enumerated_entropy_batch() -> TrainingBatch:
+    ids = torch.tensor(
+        [
+            [65, 66, 256, 70, 71, 72, 73, 256],
+            [80, 81, 82, 83, 84, 85, 86, 256],
+        ],
+        dtype=torch.long,
+    )
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    documents = torch.tensor(
+        [[0, 0, 0, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2, 2, 2]],
+        dtype=torch.long,
+    )
+    positions = torch.tensor(
+        [[0, 1, 2, 0, 1, 2, 3, 4], [0, 1, 2, 3, 4, 5, 6, 7]],
+        dtype=torch.long,
+    )
+    patch_offsets = torch.tensor(
+        [[0, 1, 2, 0, 1, 0, 1, 2], [0, 1, 0, 1, 2, 3, 0, 1]],
+        dtype=torch.long,
+    )
+    layout = training_module.build_variable_patch_layout(
+        valid,
+        documents,
+        positions,
+        patch_offsets,
+        max_patch_size=4,
+    )
+    return TrainingBatch(
+        ids=ids,
+        valid=valid,
+        ar_targets=torch.full_like(ids, -100),
+        bos_targets=torch.tensor([65, 70, 80]),
+        positions=positions,
+        full_valid=False,
+        document_ids=documents,
+        bos_row_indices=torch.tensor([0, 0, 1]),
+        isolate_documents=True,
+        byte_indices=layout.byte_indices,
+        byte_cu_seqlens=layout.byte_cu_seqlens,
+        patch_cu_seqlens=layout.patch_cu_seqlens,
+        condition_patch_indices=layout.condition_patch_indices,
+        global_patch_sources=layout.global_patch_sources,
+        global_patch_positions=layout.global_patch_positions,
+        physical_to_global_patch_indices=(
+            layout.physical_to_global_patch_indices
+        ),
+        bos_condition_indices=layout.bos_condition_indices,
+        patch_offsets=patch_offsets,
+        patch_byte_cu_seqlens=layout.patch_byte_cu_seqlens,
+        max_patch_size=4,
+        physical_patch_row_indices=layout.physical_patch_row_indices,
+        physical_patch_start_columns=layout.physical_patch_start_columns,
+        physical_patch_prior_condition_indices=(
+            layout.physical_patch_prior_condition_indices
+        ),
+    )
 
 
 def _document_model_metadata(layout):
@@ -415,6 +482,8 @@ def test_training_source_provenance_is_complete_and_stable() -> None:
     assert "pretraining/byte_diffusion/training.py" in files
     assert "pretraining/byte_diffusion/model.py" in files
     assert "pretraining/byte_diffusion/corruption.py" in files
+    assert "pretraining/__init__.py" in files
+    assert "pretraining/byte_diffusion/__init__.py" in files
     assert "pretraining/byte_diffusion/inference.py" not in files
 
 
@@ -548,6 +617,107 @@ def test_reference_presets_reject_microbatch_drift(monkeypatch) -> None:
         TrainingRunConfig.from_env()
 
 
+@pytest.mark.parametrize(
+    "preset",
+    [
+        FAST_BLT_ENTROPY_B4_COMPLETE_PRESET,
+        FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET,
+    ],
+)
+def test_fast_blt_complete_presets_pin_all_origin_entropy_d4_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    preset: str,
+) -> None:
+    monkeypatch.setenv("BYTE_DIFFUSION_PRESET", preset)
+
+    observed = TrainingRunConfig.from_env()
+
+    assert observed.preset == preset
+    assert observed.recipe == "blt_d"
+    assert observed.patching_policy == "causal_entropy_v1"
+    assert observed.blt_origin_policy == "all_entropy_patch_starts"
+    assert observed.corruption == CorruptionConfig(
+        kind="blt_bernoulli",
+        canvas_length=4,
+        branches_per_row=2_048,
+    )
+    assert observed.corruption.corrupted_positions_per_row == 8_192
+    assert observed.objective_reduction == "paper_sum"
+    assert observed.global_batch_size == 249
+    assert observed.microbatch_per_rank == 32
+    assert observed.microbatch_token_budget == 212_992
+    assert observed.gradient_accumulation == 8
+    assert observed.activation_checkpointing is True
+    expected_model = expected_model_config_for_run(observed)
+    if preset == FAST_BLT_ENTROPY_B4_COMPLETE_PRESET:
+        assert expected_model == ByteDiffusionConfig.fast_blt_entropy_b4_complete()
+    else:
+        assert expected_model == (
+            ByteDiffusionConfig.fast_blt_entropy_b4_complete_paper_ratio()
+        )
+
+
+def test_paper_ratio_complete_changes_only_model_allocation_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "BYTE_DIFFUSION_PRESET", FAST_BLT_ENTROPY_B4_COMPLETE_PRESET
+    )
+    retained = TrainingRunConfig.from_env()
+    monkeypatch.setenv(
+        "BYTE_DIFFUSION_PRESET",
+        FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET,
+    )
+    paper_ratio = TrainingRunConfig.from_env()
+
+    retained_contract = retained.contract_dict()
+    paper_contract = paper_ratio.contract_dict()
+    retained_contract.pop("preset")
+    paper_contract.pop("preset")
+    assert paper_contract == retained_contract
+
+
+@pytest.mark.parametrize(
+    ("environment", "value"),
+    [
+        ("BYTE_DIFFUSION_PATCHING_POLICY", "fixed_stride_v1"),
+        ("BYTE_DIFFUSION_BLT_ORIGIN_POLICY", "sampled"),
+        ("BYTE_DIFFUSION_CORRUPTION", "blt_exact_k"),
+        ("BYTE_DIFFUSION_CANVAS_LENGTH", "8"),
+        ("BYTE_DIFFUSION_BRANCHES", "1024"),
+        ("BYTE_DIFFUSION_OBJECTIVE_REDUCTION", "row_normalized_sum"),
+        ("BYTE_DIFFUSION_MICROBATCH_TOKEN_BUDGET", "278528"),
+        ("BYTE_DIFFUSION_ACTIVATION_CHECKPOINTING", "0"),
+    ],
+)
+@pytest.mark.parametrize(
+    "preset",
+    [
+        FAST_BLT_ENTROPY_B4_COMPLETE_PRESET,
+        FAST_BLT_ENTROPY_B4_COMPLETE_PAPER_RATIO_PRESET,
+    ],
+)
+def test_fast_blt_complete_presets_reject_training_contract_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+    value: str,
+    preset: str,
+) -> None:
+    monkeypatch.setenv("BYTE_DIFFUSION_PRESET", preset)
+    monkeypatch.setenv(environment, value)
+
+    with pytest.raises(
+        ValueError,
+        match="contract mismatch|requires BLT-D|only by the named complete ragged",
+    ):
+        TrainingRunConfig.from_env()
+
+
+def test_all_origin_policy_rejects_non_entropy_training() -> None:
+    with pytest.raises(ValueError, match="requires BLT-D with causal entropy"):
+        TrainingRunConfig(blt_origin_policy="all_entropy_patch_starts")
+
+
 def test_entropy_preset_rejects_fixed_stride_dataset_policy(monkeypatch) -> None:
     monkeypatch.setenv("BYTE_DIFFUSION_PRESET", ENTROPY_FAST_BLT_PRESET)
     monkeypatch.setenv("BYTE_DIFFUSION_PATCHING_POLICY", "fixed_stride_v1")
@@ -651,9 +821,52 @@ def test_training_lineage_is_explicitly_scratch() -> None:
         TrainingRunConfig(initialization_kind="warm_start")  # type: ignore[arg-type]
 
 
-def test_compiled_branch_training_rejects_activation_checkpointing() -> None:
-    with pytest.raises(ValueError, match="escapes compiled FlexAttention"):
+def test_non_complete_training_rejects_activation_checkpointing() -> None:
+    with pytest.raises(ValueError, match="only by the named complete ragged Fast-BLT"):
         TrainingRunConfig(activation_checkpointing=True)
+
+
+def test_activation_checkpointing_rejects_partial_fast_blt_lookalikes() -> None:
+    corruption = CorruptionConfig(
+        kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+    )
+    with pytest.raises(ValueError, match="only by the named complete ragged Fast-BLT"):
+        TrainingRunConfig(
+            preset=None,
+            recipe="blt_d",
+            patching_policy="causal_entropy_v1",
+            blt_origin_policy="all_entropy_patch_starts",
+            corruption=corruption,
+            activation_checkpointing=True,
+        )
+
+
+def test_canvas_global_stack_honors_activation_checkpointing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = ByteDiffusionModel(ByteDiffusionConfig.tiny()).train()
+    model.activation_checkpointing = True
+    calls: list[tuple[bool, bool]] = []
+
+    def record_checkpoint(function, states, *, use_reentrant, preserve_rng_state):
+        calls.append((use_reentrant, preserve_rng_state))
+        return function(states)
+
+    monkeypatch.setattr(model_module, "activation_checkpoint", record_checkpoint)
+    clean = torch.tensor([[65, 66, 67, 68, 69, 70, 71, 256]])
+    valid = torch.ones_like(clean, dtype=torch.bool)
+    noisy = torch.tensor([[[261, 261, 71, 256]]])
+    branch_valid = torch.ones_like(noisy, dtype=torch.bool)
+
+    model.forward_canvas_branches(
+        clean,
+        valid,
+        noisy,
+        branch_valid,
+        torch.tensor([[4]]),
+    )
+
+    assert calls == [(False, False)]
 
 
 def test_blt_environment_defaults_to_128_independent_four_byte_blocks(
@@ -1379,6 +1592,34 @@ def test_validation_subset_evenly_covers_and_binds_the_full_split() -> None:
     assert changed.dataset_sha256 != subset.dataset_sha256
 
 
+def test_validation_subset_preserves_authenticated_patching_contract() -> None:
+    class SourceWithPatching:
+        def __init__(self) -> None:
+            self.rows = tuple(_chunks(offset=10 * group)[0] for group in range(10))
+            self.patching = object()
+            self.chunk_size = 8
+
+        def __len__(self) -> int:
+            return len(self.rows)
+
+        def __getitem__(self, index: int):
+            return self.rows[index]
+
+        def training_blt_origin_counts(self, indices, *, block_length, eot_id):
+            assert block_length == 4
+            assert eot_id == 256
+            return np.asarray(indices, dtype=np.int64) + 1
+
+    source = SourceWithPatching()
+    subset = DeterministicSubsetChunkDataset(source, 3)
+    assert subset.patching is source.patching
+    assert subset.chunk_size == 8
+    np.testing.assert_array_equal(
+        subset.training_blt_origin_counts((0, 2), block_length=4, eot_id=256),
+        subset.indices[[0, 2]] + 1,
+    )
+
+
 def test_mixed_scratch_update_has_both_losses_and_changes_parameters() -> None:
     torch.manual_seed(7)
     model = ByteDiffusionModel(ByteDiffusionConfig.tiny())
@@ -1693,6 +1934,714 @@ def test_blt_plan_samples_reference_patch_origins_with_ht_weight() -> None:
     torch.testing.assert_close(
         plan.noisy_blocks[~plan.active], plan.clean_blocks[~plan.active]
     )
+
+
+def test_exhaustive_entropy_plan_is_exact_ragged_m_minus_one_population() -> None:
+    batch = _hand_enumerated_entropy_batch()
+    config = CorruptionConfig(
+        kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+    )
+    row_t = torch.tensor([0.25, 0.75])
+    generator = torch.Generator().manual_seed(101)
+    plan = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        config,
+        ByteDiffusionConfig.tiny().vocab,
+        generator,
+        row_t=row_t,
+    )
+
+    assert plan.clean_blocks.shape == (6, 4)
+    assert plan.noisy_blocks.shape == plan.clean_blocks.shape
+    assert plan.block_valid.shape == plan.clean_blocks.shape
+    assert plan.active.shape == plan.clean_blocks.shape
+    assert plan.block_rows.tolist() == [0, 0, 0, 1, 1, 1]
+    assert plan.block_starts.tolist() == [0, 3, 5, 0, 2, 6]
+    assert batch.document_ids[plan.block_rows, plan.block_starts].tolist() == [
+        0,
+        1,
+        1,
+        2,
+        2,
+        2,
+    ]
+    # Each document has one virtual BOS latent plus 1, 2, and 3 physical
+    # patches respectively, so all M-1 physical starts total six blocks.
+    assert plan.clean_blocks.shape[0] == (2 - 1) + (3 - 1) + (4 - 1)
+    assert plan.block_starts.unique().numel() < plan.block_starts.numel()
+    assert len(set(zip(plan.block_rows.tolist(), plan.block_starts.tolist()))) == 6
+    assert plan.condition_indices.tolist() == (
+        batch.physical_patch_prior_condition_indices.tolist()
+    )
+    assert bool(plan.condition_indices.ge(0).all())
+    assert plan.row_cu_seqlens.tolist() == [0, 3, 6]
+    assert plan.row_block_counts.tolist() == [3, 3]
+    assert plan.block_valid.sum(1).tolist() == [3, 4, 3, 4, 4, 2]
+    assert plan.clean_blocks[0].tolist() == [65, 66, 256, 262]
+    assert plan.clean_blocks[2].tolist() == [72, 73, 256, 262]
+    assert plan.clean_blocks[5].tolist() == [86, 256, 262, 262]
+    torch.testing.assert_close(plan.row_t, row_t)
+    torch.testing.assert_close(
+        plan.block_t, torch.tensor([0.25, 0.25, 0.25, 0.75, 0.75, 0.75])
+    )
+    assert plan.row_physical_positions.tolist() == [20, 20]
+    assert not hasattr(plan, "sampling_weight")
+
+
+def test_exhaustive_entropy_topology_consumes_only_bernoulli_rng() -> None:
+    batch = _hand_enumerated_entropy_batch()
+    config = CorruptionConfig(
+        kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+    )
+    row_t = torch.tensor([0.25, 0.75])
+    left_generator = torch.Generator().manual_seed(211)
+    right_generator = torch.Generator().manual_seed(307)
+    left = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        config,
+        ByteDiffusionConfig.tiny().vocab,
+        left_generator,
+        row_t=row_t,
+    )
+    right = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        config,
+        ByteDiffusionConfig.tiny().vocab,
+        right_generator,
+        row_t=row_t,
+    )
+
+    for name in (
+        "clean_blocks",
+        "block_valid",
+        "block_rows",
+        "block_starts",
+        "condition_indices",
+        "row_cu_seqlens",
+        "row_physical_positions",
+    ):
+        torch.testing.assert_close(getattr(left, name), getattr(right, name))
+
+    expected_generator = torch.Generator().manual_seed(211)
+    torch.rand(left.clean_blocks.shape, generator=expected_generator)
+    torch.testing.assert_close(left_generator.get_state(), expected_generator.get_state())
+
+
+def test_stateless_exhaustive_noise_is_invariant_to_row_grouping() -> None:
+    keys = torch.tensor([101, 202], dtype=torch.long)
+    rows = torch.tensor([0, 0, 1, 1, 1], dtype=torch.long)
+    starts = torch.tensor([3, 9, 1, 4, 12], dtype=torch.long)
+    full_t, full_uniforms = training_module._stateless_exhaustive_blt_uniforms(
+        keys, rows, starts, block_length=4, seed=1337
+    )
+    first_t, first_uniforms = training_module._stateless_exhaustive_blt_uniforms(
+        keys[:1], torch.zeros(2, dtype=torch.long), starts[:2],
+        block_length=4, seed=1337,
+    )
+    second_t, second_uniforms = training_module._stateless_exhaustive_blt_uniforms(
+        keys[1:], torch.zeros(3, dtype=torch.long), starts[2:],
+        block_length=4, seed=1337,
+    )
+    torch.testing.assert_close(full_t, torch.cat((first_t, second_t)), rtol=0, atol=0)
+    torch.testing.assert_close(
+        full_uniforms, torch.cat((first_uniforms, second_uniforms)), rtol=0, atol=0
+    )
+    assert bool(((full_t > 0) & (full_t < 1)).all())
+    assert bool(((full_uniforms > 0) & (full_uniforms < 1)).all())
+
+
+def test_stateless_exhaustive_plan_does_not_consume_generator_state() -> None:
+    batch = _hand_enumerated_entropy_batch()
+    generator = torch.Generator().manual_seed(701)
+    before = generator.get_state().clone()
+    identities = ((11, 101), (12, 202))
+    plan = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        CorruptionConfig(
+            kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+        ),
+        ByteDiffusionConfig.tiny().vocab,
+        generator,
+        stateless_row_keys=training_module.validation_row_identity_keys(identities),
+        stateless_seed=1337 + 104_729,
+    )
+    torch.testing.assert_close(generator.get_state(), before)
+    assert plan.row_t.shape == (2,)
+    assert plan.active.shape == plan.clean_blocks.shape
+    torch.testing.assert_close(
+        plan.active_flat_indices,
+        torch.nonzero(plan.active.reshape(-1), as_tuple=False).flatten(),
+    )
+    torch.testing.assert_close(
+        plan.active_targets,
+        plan.clean_blocks.reshape(-1).index_select(0, plan.active_flat_indices),
+    )
+    with pytest.raises(ValueError, match="indices do not match"):
+        replace(
+            plan,
+            active_flat_indices=plan.active_flat_indices.flip(0),
+        )
+    with pytest.raises(ValueError, match="unique keys"):
+        training_module.validation_row_identity_keys(((11, 101), (11, 101)))
+
+
+def test_exhaustive_entropy_paper_sum_reduces_blocks_to_clean_rows() -> None:
+    batch = _hand_enumerated_entropy_batch()
+    plan = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        CorruptionConfig(
+            kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+        ),
+        ByteDiffusionConfig.tiny().vocab,
+        torch.Generator().manual_seed(401),
+        row_t=torch.tensor([0.25, 0.75]),
+    )
+    all_active_indices = torch.nonzero(
+        plan.block_valid.reshape(-1), as_tuple=False
+    ).flatten()
+    all_active = replace(
+        plan,
+        active=plan.block_valid,
+        active_flat_indices=all_active_indices,
+        active_targets=plan.clean_blocks.reshape(-1).index_select(
+            0, all_active_indices
+        ),
+    )
+    rows = training_module.exhaustive_blt_paper_sum_rows(
+        torch.ones_like(plan.clean_blocks, dtype=torch.float32), all_active
+    )
+    torch.testing.assert_close(rows, torch.tensor([40.0, 40.0 / 3.0]))
+
+    none_active = replace(
+        plan,
+        active=torch.zeros_like(plan.active),
+        active_flat_indices=torch.empty(0, dtype=torch.long),
+        active_targets=torch.empty(0, dtype=torch.long),
+    )
+    zero = training_module.exhaustive_blt_paper_sum_rows(
+        torch.full_like(plan.clean_blocks, float("inf"), dtype=torch.float32),
+        none_active,
+    )
+    torch.testing.assert_close(zero, torch.zeros(2))
+    assert bool(torch.isfinite(zero).all())
+
+    active_nll = torch.arange(
+        1,
+        plan.active_flat_indices.numel() + 1,
+        dtype=torch.float32,
+    )
+    dense_nll = torch.zeros_like(plan.clean_blocks, dtype=torch.float32)
+    dense_nll.reshape(-1).index_copy_(
+        0, plan.active_flat_indices, active_nll
+    )
+    torch.testing.assert_close(
+        training_module.exhaustive_blt_active_paper_sum_rows(active_nll, plan),
+        training_module.exhaustive_blt_paper_sum_rows(dense_nll, plan),
+    )
+
+
+def test_joint_forward_and_trainer_loss_consume_exhaustive_ragged_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EntropyChunks(tuple):
+        patching = DatasetPatchingSpec(
+            "causal_entropy_v1", None, 4, "1" * 64
+        )
+
+    batch = replace(
+        _hand_enumerated_entropy_batch(),
+        ar_targets=torch.tensor(
+            [
+                [66, 256, -100, 71, 72, 73, 256, -100],
+                [81, 82, 83, 84, 85, 86, 256, -100],
+            ]
+        ),
+    )
+    plan = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        CorruptionConfig(
+            kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+        ),
+        ByteDiffusionConfig.tiny().vocab,
+        torch.Generator().manual_seed(503),
+        row_t=torch.tensor([0.25, 0.75]),
+    )
+    model_config = replace(
+        ByteDiffusionConfig.tiny(),
+        decoder_conditioning="split_cross_attention",
+        decoder_prefix_window=None,
+    )
+    run = TrainingRunConfig(
+        iterations=1,
+        val_loss_every=1,
+        train_log_every=1,
+        validation_chunks=2,
+        validation_microbatch_per_rank=1,
+        ar_validation_microbatch_per_rank=1,
+        diffusion_validation_chunks=2,
+        warmdown_iters=0,
+        run_id="ragged-loss-oracle",
+        recipe="blt_d",
+        patching_policy="causal_entropy_v1",
+        blt_origin_policy="all_entropy_patch_starts",
+        corruption=CorruptionConfig(
+            kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+        ),
+        microbatch_per_rank=1,
+        microbatch_token_budget=128,
+        gradient_accumulation=1,
+        global_batch_size=1,
+        objective_reduction="paper_sum",
+        attention_policy="dense_reference",
+        allow_cpu_reference=True,
+        compile_model=False,
+    )
+    chunks = EntropyChunks(_chunks()[:2])
+    trainer = ByteDiffusionTrainer(
+        ByteDiffusionModel(model_config),
+        DeterministicChunkCursor(chunks, seed=run.seed),
+        chunks,
+        run,
+        device=torch.device("cpu"),
+    )
+    dense_oracle = copy.deepcopy(trainer.joint.model)
+    original_linear_ce = F.linear_cross_entropy
+    projected_rows: list[tuple[int, int]] = []
+
+    def record_linear_ce(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        target: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        projected_rows.append(
+            (input.shape[0], int(target.ne(kwargs.get("ignore_index", -1)).sum()))
+        )
+        return original_linear_ce(input, weight, target, **kwargs)
+
+    monkeypatch.setattr(training_module.F, "linear_cross_entropy", record_linear_ce)
+    dense_projection_rows: list[int] = []
+    assert trainer.joint.model.output is not None
+    hook = trainer.joint.model.output.register_forward_pre_hook(
+        lambda _module, inputs: dense_projection_rows.append(inputs[0].shape[0])
+    )
+    try:
+        losses = trainer._compute_loss(batch, blt_sampling=plan)
+    finally:
+        hook.remove()
+    assert projected_rows == [
+        (batch.ar_targets.numel(), int(batch.ar_targets.ne(-100).sum())),
+        (int(plan.active.sum()), int(plan.active.sum())),
+    ]
+    assert dense_projection_rows == [batch.bos_targets.numel()]
+    dense = dense_oracle.forward_blt_d_ragged(
+        batch.ids,
+        batch.valid,
+        plan.noisy_blocks,
+        plan.block_rows,
+        plan.block_starts,
+        plan.condition_indices,
+        plan.row_cu_seqlens,
+        plan.block_valid,
+        positions=batch.positions,
+        document_ids=batch.document_ids,
+        byte_indices=batch.byte_indices,
+        byte_cu_seqlens=batch.byte_cu_seqlens,
+        patch_cu_seqlens=batch.patch_cu_seqlens,
+        condition_patch_indices=batch.condition_patch_indices,
+        global_patch_sources=batch.global_patch_sources,
+        global_patch_positions=batch.global_patch_positions,
+        physical_to_global_patch_indices=(
+            batch.physical_to_global_patch_indices
+        ),
+        bos_condition_indices=batch.bos_condition_indices,
+        patch_byte_cu_seqlens=batch.patch_byte_cu_seqlens,
+        max_patch_size=batch.max_patch_size,
+        return_clean_patch_states=False,
+        allow_dense_reference=True,
+    )
+    dense_ar = training_module.cross_entropy_per_row(
+        dense.clean_logits, batch.ar_targets
+    )
+    assert dense.bos_patch_states is not None
+    dense_bos_logits = dense_oracle.forward_bos_logits(
+        dense.bos_patch_states, allow_dense_reference=True
+    )
+    dense_bos_nll = F.cross_entropy(
+        dense_bos_logits, batch.bos_targets, reduction="none"
+    )
+    dense_ar_rows = dense_ar.total.clone()
+    dense_ar_rows.scatter_add_(
+        0, batch.bos_row_indices, dense_bos_nll
+    )
+    dense_ar_count = batch.ar_targets.ne(-100).sum() + batch.bos_targets.numel()
+    dense_ar_mean = dense_ar_rows.sum() / dense_ar_count
+    dense_targets = training_module.same_position_targets(
+        plan.clean_blocks,
+        plan.active,
+        output_size=model_config.vocab.output_size,
+    )
+    dense_diffusion_nll = training_module.masked_cross_entropy_per_target(
+        dense.block_logits, dense_targets, plan.active
+    )
+    dense_diffusion_rows = training_module.exhaustive_blt_paper_sum_rows(
+        dense_diffusion_nll, plan
+    )
+    dense_total = (
+        dense_diffusion_rows + run.lambda_ar * dense_ar_rows
+    ).mean()
+
+    torch.testing.assert_close(losses.total, dense_total, rtol=2e-6, atol=2e-7)
+    torch.testing.assert_close(losses.ar, dense_ar_mean, rtol=2e-6, atol=2e-7)
+    torch.testing.assert_close(
+        losses.diffusion, dense_diffusion_rows.mean(), rtol=2e-6, atol=2e-7
+    )
+    torch.testing.assert_close(losses.noise_nll, dense_diffusion_nll.sum(1))
+    torch.testing.assert_close(
+        losses.noise_correct,
+        (
+            dense.block_logits.argmax(-1).eq(dense_targets)
+            & plan.active
+        ).sum(1),
+    )
+    assert losses.total.ndim == 0
+    assert losses.diffusion.ndim == 0
+    assert losses.diffusion_targets == plan.active.sum()
+    assert losses.noise_masked.shape == (plan.clean_blocks.shape[0],)
+    assert bool(torch.isfinite(losses.total))
+    losses.total.backward()
+    dense_total.backward()
+    dense_parameters = dict(dense_oracle.named_parameters())
+    for name, parameter in trainer.joint.model.named_parameters():
+        dense_parameter = dense_parameters[name]
+        if parameter.grad is None or dense_parameter.grad is None:
+            assert parameter.grad is None and dense_parameter.grad is None, name
+            continue
+        torch.testing.assert_close(
+            parameter.grad,
+            dense_parameter.grad,
+            rtol=3e-5,
+            atol=3e-7,
+        )
+    for block in trainer.joint.model.decoder:
+        assert block.cross_key.weight.grad is not None
+        assert bool(block.cross_key.weight.grad.abs().sum() > 0)
+
+
+def test_active_linear_cross_entropy_compiles_fullgraph_on_cpu() -> None:
+    torch.manual_seed(509)
+    states = torch.randn(3, 4, 16, requires_grad=True)
+    targets = torch.randint(0, 19, (3, 4))
+    active = torch.tensor(
+        [
+            [True, False, True, False],
+            [False, True, True, True],
+            [True, False, False, True],
+        ]
+    )
+    active_indices = torch.nonzero(active.reshape(-1), as_tuple=False).flatten()
+    active_targets = targets.reshape(-1).index_select(0, active_indices)
+    weight = torch.randn(19, 16, requires_grad=True)
+    bias = torch.randn(19, requires_grad=True)
+
+    def cell(
+        hidden: torch.Tensor,
+        indices: torch.Tensor,
+        labels: torch.Tensor,
+        projection: torch.Tensor,
+        projection_bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nll, correct = training_module.active_linear_cross_entropy(
+            hidden,
+            indices,
+            labels,
+            projection,
+            projection_bias,
+            collect_correct=True,
+        )
+        assert correct is not None
+        return nll, correct
+
+    compiled = torch.compile(cell, backend="aot_eager", fullgraph=True)
+    nll, correct = compiled(
+        states, active_indices, active_targets, weight, bias
+    )
+    assert nll.shape == active_targets.shape
+    assert correct.shape == active_targets.shape
+    nll.sum().backward()
+    assert states.grad is not None
+    assert weight.grad is not None
+    assert bias.grad is not None
+
+
+def test_active_linear_cross_entropy_uses_precomputed_index_select(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = torch.randn(3, 4, 8)
+    active = torch.tensor(
+        [
+            [True, False, False, True],
+            [False, True, False, False],
+            [True, False, True, False],
+        ]
+    )
+    targets = torch.randint(0, 11, active.shape)
+    indices = torch.nonzero(active.reshape(-1), as_tuple=False).flatten()
+    active_targets = targets.reshape(-1).index_select(0, indices)
+    weight = torch.randn(11, 8)
+    observed: list[tuple[tuple[int, ...], torch.Tensor]] = []
+    original_index_select = torch.index_select
+
+    def record_index_select(input, dim, index, *, out=None):
+        if input.shape == (12, 8):
+            observed.append((tuple(input.shape), index.clone()))
+        return original_index_select(input, dim, index, out=out)
+
+    monkeypatch.setattr(training_module.torch, "index_select", record_index_select)
+    nll, _ = training_module.active_linear_cross_entropy(
+        states,
+        indices,
+        active_targets,
+        weight,
+        None,
+    )
+
+    assert len(observed) == 1
+    torch.testing.assert_close(observed[0][1], indices)
+    assert nll.shape == active_targets.shape
+
+
+def test_active_linear_cross_entropy_bounds_diagnostic_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_count = training_module.DIAGNOSTIC_LINEAR_CHUNK_SIZE + 7
+    states = torch.randn(active_count, 4)
+    indices = torch.arange(active_count)
+    targets = torch.randint(0, 9, (active_count,))
+    weight = torch.randn(9, 4)
+    projected_rows: list[int] = []
+    original_linear = F.linear
+
+    def record_linear(input, projection, bias=None):
+        projected_rows.append(input.shape[0])
+        return original_linear(input, projection, bias)
+
+    monkeypatch.setattr(
+        training_module.F,
+        "linear_cross_entropy",
+        lambda input, _weight, _target, **_kwargs: input.new_zeros(
+            input.shape[0]
+        ),
+    )
+    monkeypatch.setattr(training_module.F, "linear", record_linear)
+    _, correct = training_module.active_linear_cross_entropy(
+        states,
+        indices,
+        targets,
+        weight,
+        None,
+        collect_correct=True,
+    )
+
+    assert correct is not None
+    assert projected_rows == [
+        training_module.DIAGNOSTIC_LINEAR_CHUNK_SIZE,
+        7,
+    ]
+    assert max(projected_rows) <= training_module.DIAGNOSTIC_LINEAR_CHUNK_SIZE
+
+
+def test_active_linear_cross_entropy_accepts_zero_active_atoms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_projection(*_args, **_kwargs):
+        raise AssertionError("zero-active objective must not launch a projection")
+
+    monkeypatch.setattr(training_module.F, "linear_cross_entropy", reject_projection)
+    monkeypatch.setattr(training_module.F, "linear", reject_projection)
+    nll, correct = training_module.active_linear_cross_entropy(
+        torch.randn(2, 3, 8),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        torch.randn(11, 8),
+        None,
+        collect_correct=True,
+    )
+
+    torch.testing.assert_close(nll, torch.zeros_like(nll))
+    assert correct is not None
+    assert not bool(correct.any())
+
+
+@pytest.mark.parametrize("output_tied", [False, True])
+def test_linear_ce_projection_preserves_registered_gradient_owner(
+    output_tied: bool,
+) -> None:
+    class DdpLikeWrapper(torch.nn.Module):
+        def __init__(self, module: torch.nn.Module) -> None:
+            super().__init__()
+            self.module = module
+
+    model = ByteDiffusionModel(
+        ByteDiffusionConfig.tiny(output_tied=output_tied)
+    )
+    wrapped = DdpLikeWrapper(training_module.JointForward(model))
+    weight, bias = training_module._byte_output_projection(wrapped)
+    states = torch.randn(2, 3, model.config.local_dim, requires_grad=True)
+    targets = torch.randint(0, model.config.vocab.output_size, (2, 3))
+    active = torch.tensor([[True, False, True], [False, True, False]])
+    active_indices = torch.nonzero(active.reshape(-1), as_tuple=False).flatten()
+    active_targets = targets.reshape(-1).index_select(0, active_indices)
+
+    nll, _ = training_module.active_linear_cross_entropy(
+        states,
+        active_indices,
+        active_targets,
+        weight,
+        bias,
+    )
+    nll.sum().backward()
+
+    assert bias is None
+    if output_tied:
+        assert weight.data_ptr() == model.embedding.weight.data_ptr()
+        assert model.embedding.weight.grad is not None
+        assert bool(model.embedding.weight.grad.abs().sum() > 0)
+    else:
+        assert model.output is not None
+        assert weight is model.output.weight
+        assert model.output.weight.grad is not None
+        assert bool(model.output.weight.grad.abs().sum() > 0)
+
+
+def test_ragged_workload_grouping_uses_actual_unbounded_origin_counts() -> None:
+    workloads = np.array(
+        [
+            8_192 + 4 * 2_047,
+            8_192 + 4 * 2_309,
+            8_192 + 4 * 2_738,
+        ],
+        dtype=np.int64,
+    )
+    groups = training_module.group_rows_by_ragged_physical_workload(
+        (10, 11, 12),
+        workloads,
+        max_batch_size=3,
+        physical_token_budget=int(2 * workloads.max()),
+    )
+    np.testing.assert_array_equal(groups.ordered_rows, np.array([10, 11, 12]))
+    np.testing.assert_array_equal(groups.row_cu_seqlens, np.array([0, 2, 3]))
+    np.testing.assert_array_equal(
+        groups.group_physical_positions,
+        np.array([workloads[0] + workloads[1], workloads[2]]),
+    )
+    assert groups.group_count == 2
+    assert not groups.ordered_rows.flags.writeable
+    assert not groups.row_cu_seqlens.flags.writeable
+    assert not groups.group_physical_positions.flags.writeable
+    assert workloads[2] > 8_192 + 4 * 2_048
+    assert training_module.require_equal_ragged_microsteps((2, 2, 2)) == 2
+    with pytest.raises(ValueError, match="different backward-call counts"):
+        training_module.require_equal_ragged_microsteps((2, 3))
+
+
+def test_ragged_grouping_uses_cumulative_work_and_can_equalize_ddp_calls() -> None:
+    workloads = np.array([19_200, *([16_000] * 30)], dtype=np.int64)
+    groups = training_module.group_rows_by_ragged_physical_workload(
+        tuple(range(31)),
+        workloads,
+        max_batch_size=32,
+        physical_token_budget=278_528,
+    )
+    assert groups.group_count == 2
+    assert groups.row_cu_seqlens.tolist() == [0, 15, 31]
+    assert bool((groups.group_physical_positions <= 278_528).all())
+
+    original = tuple(
+        tuple(int(value) for value in groups.ordered_rows[start:stop])
+        for start, stop in zip(
+            groups.row_cu_seqlens[:-1],
+            groups.row_cu_seqlens[1:],
+            strict=True,
+        )
+    )
+    equalized = training_module.split_ragged_groups_to_count(original, 3)
+    assert len(equalized) == 3
+    assert tuple(value for group in equalized for value in group) == tuple(range(31))
+    assert all(group for group in equalized)
+
+
+def test_ragged_grouping_rebalances_a_singleton_tail_without_reordering() -> None:
+    rows = np.arange(14, dtype=np.int64) + 100
+    workloads = np.full(14, 15_000, dtype=np.int64)
+    groups = training_module.group_rows_by_ragged_physical_workload(
+        rows,
+        workloads,
+        max_batch_size=13,
+        physical_token_budget=195_000,
+    )
+
+    np.testing.assert_array_equal(groups.ordered_rows, rows)
+    np.testing.assert_array_equal(groups.row_cu_seqlens, np.array([0, 7, 14]))
+    np.testing.assert_array_equal(
+        groups.group_physical_positions,
+        np.array([105_000, 105_000]),
+    )
+    assert int(np.diff(groups.row_cu_seqlens).min()) > 1
+    assert groups.ordered_rows.tolist() == list(range(100, 114))
+
+
+def test_ragged_grouping_keeps_an_already_balanced_final_pair() -> None:
+    rows = np.arange(12, dtype=np.int64)
+    workloads = np.array(
+        [12_000, 13_000, 14_000, 15_000, 16_000, 17_000] * 2,
+        dtype=np.int64,
+    )
+    groups = training_module.group_rows_by_ragged_physical_workload(
+        rows,
+        workloads,
+        max_batch_size=6,
+        physical_token_budget=100_000,
+    )
+
+    np.testing.assert_array_equal(groups.ordered_rows, rows)
+    np.testing.assert_array_equal(groups.row_cu_seqlens, np.array([0, 6, 12]))
+    np.testing.assert_array_equal(
+        groups.group_physical_positions,
+        np.array([87_000, 87_000]),
+    )
+    assert bool((np.diff(groups.row_cu_seqlens) <= 6).all())
+    assert bool((groups.group_physical_positions <= 100_000).all())
+
+
+def test_exhaustive_fast_blt_pads_a_non_eot_training_sequence_tail() -> None:
+    ids = torch.tensor([[65, 66, 67, 68, 69, 70, 71, 72]])
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    documents = torch.zeros_like(ids)
+    batch = TrainingBatch(
+        ids=ids,
+        valid=valid,
+        ar_targets=torch.full_like(ids, -100),
+        bos_targets=torch.empty(0, dtype=torch.long),
+        positions=torch.arange(8)[None],
+        full_valid=True,
+        document_ids=documents,
+        physical_patch_row_indices=torch.tensor([0, 0]),
+        physical_patch_start_columns=torch.tensor([0, 6]),
+        physical_patch_prior_condition_indices=torch.tensor([-1, 0]),
+    )
+    plan = training_module.prepare_exhaustive_blt_corruption(
+        batch,
+        CorruptionConfig(
+            kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+        ),
+        ByteDiffusionConfig.tiny().vocab,
+        torch.Generator().manual_seed(607),
+        row_t=torch.tensor([0.5]),
+    )
+    assert plan.block_starts.tolist() == [6]
+    assert plan.block_valid.tolist() == [[True, True, False, False]]
+    assert plan.clean_blocks.tolist() == [[71, 72, 262, 262]]
 
 
 def test_blt_blocks_never_cross_a_packed_document_boundary() -> None:
@@ -2453,6 +3402,7 @@ def test_validation_reuses_joint_forward_for_diffusion_subset_ar_scores() -> Non
 
         def forward(self, clean_ids, _valid, _positions, noisy_ids, *args):
             del args
+            assert not torch.is_grad_enabled()
             batch, length = clean_ids.shape
             if noisy_ids is None:
                 self.ar_batches.append(batch)
@@ -2479,6 +3429,66 @@ def test_validation_reuses_joint_forward_for_diffusion_subset_ar_scores() -> Non
     assert metrics.diffusion_targets == 16
 
 
+def test_all_origin_validation_schedule_is_immutable_and_cached() -> None:
+    class EntropyChunks(tuple):
+        patching = DatasetPatchingSpec(
+            "causal_entropy_v1", None, 4, "1" * 64
+        )
+        chunk_size = 8
+
+        def __new__(cls, chunks):
+            instance = super().__new__(cls, chunks)
+            instance.origin_count_calls = 0
+            return instance
+
+        def training_blt_origin_counts(
+            self, indices, *, block_length, eot_id
+        ):
+            self.origin_count_calls += 1
+            assert block_length == 4
+            assert eot_id == 256
+            return np.asarray(indices, dtype=np.int64) + 1
+
+    chunks = EntropyChunks(_chunks())
+    config = replace(
+        _run_config(recipe="blt_d"),
+        patching_policy="causal_entropy_v1",
+        blt_origin_policy="all_entropy_patch_starts",
+        corruption=CorruptionConfig(
+            kind="blt_bernoulli", canvas_length=4, branches_per_row=2_048
+        ),
+        objective_reduction="paper_sum",
+        diffusion_validation_chunks=2,
+        validation_microbatch_per_rank=2,
+        microbatch_token_budget=128,
+    )
+    trainer = ByteDiffusionTrainer(
+        ByteDiffusionModel(ByteDiffusionConfig.tiny()),
+        DeterministicChunkCursor(chunks, seed=config.seed),
+        chunks,
+        config,
+        device=torch.device("cpu"),
+    )
+
+    first = trainer._validation_schedule()
+    second = trainer._validation_schedule()
+
+    assert first is second
+    assert chunks.origin_count_calls == 1
+    assert not first.all_indices.flags.writeable
+    assert not first.diffusion_indices.flags.writeable
+    assert not first.ar_only_indices.flags.writeable
+    assert tuple(first.all_indices) == tuple(range(len(chunks)))
+    assert set(first.ar_only_indices).isdisjoint(first.diffusion_indices)
+    assert sorted((*first.ar_only_indices, *first.diffusion_indices)) == list(
+        range(len(chunks))
+    )
+    assert first.diffusion_groups is not None
+    assert tuple(value for group in first.diffusion_groups for value in group) == tuple(
+        first.diffusion_indices
+    )
+
+
 def test_update_can_skip_unlogged_metric_materialization() -> None:
     trainer = _trainer(
         ByteDiffusionModel(ByteDiffusionConfig.tiny()),
@@ -2487,8 +3497,28 @@ def test_update_can_skip_unlogged_metric_materialization() -> None:
 
     assert trainer.run_update(materialize_metrics=False) is None
     assert trainer.completed_steps == 1
+    ledger = trainer.last_execution_ledger
+    assert ledger is not None
+    assert ledger.step == 1
+    assert ledger.rows == ledger.group_row_cu_seqlens[-1]
+    assert ledger.group_row_cu_seqlens[0] == 0
+    assert ledger.microsteps == len(ledger.group_physical_positions)
+    assert ledger.microsteps == len(ledger.group_row_cu_seqlens) - 1
+    assert ledger.max_microbatch == max(
+        stop - start
+        for start, stop in zip(
+            ledger.group_row_cu_seqlens[:-1],
+            ledger.group_row_cu_seqlens[1:],
+            strict=True,
+        )
+    )
+    assert ledger.max_physical_positions == max(
+        ledger.group_physical_positions
+    )
     metrics = trainer.run_update(materialize_metrics=True)
 
     assert metrics is not None
     assert metrics.step == 2
+    assert trainer.last_execution_ledger is not None
+    assert trainer.last_execution_ledger.step == 2
     assert trainer.training_time_ms > 0

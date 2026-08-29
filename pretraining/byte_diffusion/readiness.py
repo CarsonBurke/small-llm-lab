@@ -411,6 +411,25 @@ def _distributed_aggregate(
     }
 
 
+def _candidate_tail_geometry_passes(
+    candidate: Mapping[str, object],
+    *,
+    global_batch_size: int,
+    microbatch_size: int,
+) -> bool:
+    """Bind a readiness record to its exact full-batch partition."""
+
+    microsteps = math.ceil(global_batch_size / microbatch_size)
+    tail = global_batch_size - (microsteps - 1) * microbatch_size
+    return bool(
+        candidate.get("microbatch") == microbatch_size
+        and candidate.get("global_batch") == global_batch_size
+        and candidate.get("microsteps_per_update") == microsteps
+        and candidate.get("tail_microbatch") == tail
+        and candidate.get("tail_exercised") is (tail != microbatch_size)
+    )
+
+
 def _candidate_passes(
     candidate: Mapping[str, object],
     *,
@@ -430,8 +449,11 @@ def _candidate_passes(
         validation_headroom = total_memory - validation_peak_reserved
         training_ok = (
             candidate.get("status") == "ok"
-            and candidate.get("microbatch") == microbatch_size
-            and candidate.get("global_batch") == global_batch_size
+            and _candidate_tail_geometry_passes(
+                candidate,
+                global_batch_size=global_batch_size,
+                microbatch_size=microbatch_size,
+            )
             and candidate.get("row_length_bytes") == 8_192
             and int(candidate["warmup_updates"]) >= 2
             and int(candidate["measured_updates"]) >= 4
@@ -504,6 +526,7 @@ def validate_architecture_readiness(
         results.get(str(selected)) if isinstance(results, Mapping) else None
     )
     candidates = report.get("candidate_microbatches")
+    candidate_records_complete = False
     recomputed_eligible: list[tuple[int, float]] = []
     if (
         isinstance(candidates, list)
@@ -512,6 +535,16 @@ def validate_architecture_readiness(
         and isinstance(gpu, Mapping)
         and "total_memory_bytes" in gpu
     ):
+        expected_keys = {str(microbatch) for microbatch in candidates}
+        candidate_records_complete = set(results) == expected_keys and all(
+            isinstance(results.get(str(microbatch)), Mapping)
+            and _candidate_tail_geometry_passes(
+                results[str(microbatch)],
+                global_batch_size=global_batch_size,
+                microbatch_size=int(microbatch),
+            )
+            for microbatch in candidates
+        )
         for microbatch in candidates:
             record = results.get(str(microbatch))
             if isinstance(record, Mapping) and _candidate_passes(
@@ -541,6 +574,7 @@ def validate_architecture_readiness(
         or report.get("workload") != _json_native(dict(workload))
         or report.get("row_length_bytes") != 8_192
         or report.get("global_batch") != global_batch_size
+        or not candidate_records_complete
         or (
             required_microbatches is not None
             and candidates != list(required_microbatches)
@@ -754,6 +788,8 @@ def validate_duo_inference_readiness(
     model_config: Mapping[str, object],
     parameter_count: int,
     branches: int = 8,
+    dataset_payload_sha256: str | None = None,
+    dataset_patching: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Authenticate Byte-Duo inference telemetry and implementation closure."""
 
@@ -770,9 +806,16 @@ def validate_duo_inference_readiness(
     peak_reserved = int(report.get("cuda_peak_reserved_bytes", -1))
     observed_headroom = total_memory - peak_reserved
     geometry = duo_geometry_contract(canvas_length, branches)
+    full_resolution = (
+        model_config.get("duo_mutable_topology") == "full_resolution_decoder"
+    )
     expected_canvases = [
         math.ceil(
-            (DUO_CANONICAL_VALIDATION_CANVAS_LENGTH + phase) / canvas_length
+            (
+                DUO_CANONICAL_VALIDATION_CANVAS_LENGTH
+                + (0 if full_resolution else phase)
+            )
+            / canvas_length
         )
         for phase in range(4)
     ]
@@ -801,6 +844,21 @@ def validate_duo_inference_readiness(
         and all(report.get(key) == value for key, value in geometry.items())
         and report.get("model_config") == _json_native(model_config)
         and report.get("parameter_count") == parameter_count
+        and (
+            dataset_payload_sha256 is None
+            or report.get("dataset_payload_sha256") == dataset_payload_sha256
+        )
+        and (
+            dataset_patching is None
+            or report.get("dataset_patching")
+            == _json_native(dict(dataset_patching))
+        )
+        and report.get("serving_origin_policy")
+        == (
+            "exact_prompt_length"
+            if full_resolution
+            else "floor_to_patch_and_carry_clean_phase"
+        )
         and report.get("posterior_backend") == "triton"
         and report.get("semantic_generation") is False
         and report.get("sustained_gpu_policy") == SUSTAINED_GPU_POLICY

@@ -17,6 +17,7 @@ from scripts.train_byte_duo import (
     distributed_microstep_count,
     distributed_rank_positions,
     rank_checkpoint_path,
+    prune_stale_rank_checkpoints,
     restore_rank_state,
 )
 
@@ -155,6 +156,16 @@ def test_rank_sidecar_path_and_rng_resume_are_rank_local(tmp_path: Path) -> None
         rank_checkpoint_path(checkpoint, 7, step=200).name
         == "checkpoint.step00000200.rank00007.pt"
     )
+
+    for step in (100, 200, 300):
+        rank_checkpoint_path(checkpoint, 7, step=step).touch()
+    other_rank = rank_checkpoint_path(checkpoint, 8, step=100)
+    other_rank.touch()
+    prune_stale_rank_checkpoints(checkpoint, 7, committed_step=200)
+    assert rank_checkpoint_path(checkpoint, 7, step=200).exists()
+    assert not rank_checkpoint_path(checkpoint, 7, step=100).exists()
+    assert not rank_checkpoint_path(checkpoint, 7, step=300).exists()
+    assert other_rank.exists()
 
     torch.manual_seed(157)
     time_generator = torch.Generator().manual_seed(163)

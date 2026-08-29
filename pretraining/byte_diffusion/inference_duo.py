@@ -10,6 +10,85 @@ from torch import Tensor
 from .duo import DuoSchedule
 from .duo_kernels import DuoPosteriorBackend, duo_posterior_sample
 from .duo_model import DuoCanvasCache, DuoModel
+from .patching import CausalEntropyPatcher
+from .variable_patching import (
+    DuoCleanPatchMetadata,
+    build_duo_clean_patch_metadata,
+)
+
+
+def duo_entropy_clean_metadata(
+    patcher: CausalEntropyPatcher,
+    clean_ids: Tensor,
+    clean_valid: Tensor,
+    document_ids: Tensor,
+) -> DuoCleanPatchMetadata:
+    """Reproduce the authenticated causal clean topology for serving.
+
+    One causal probe byte per row determines whether the final clean fragment
+    is closed at the mutable origin.  Its value is arbitrary because the
+    patcher's decision for that position consumes only the preceding prefix.
+    The probe never enters the model or a pooled patch.
+    """
+
+    if clean_ids.ndim != 2 or clean_valid.shape != clean_ids.shape:
+        raise ValueError("entropy clean ids and validity must align as [B,L]")
+    if clean_ids.dtype != torch.long or clean_valid.dtype != torch.bool:
+        raise TypeError("entropy clean ids must be int64 and validity boolean")
+    if document_ids.shape != clean_ids.shape or document_ids.dtype != torch.long:
+        raise ValueError("entropy document ids must be aligned int64")
+    host_ids = clean_ids.detach().to(device="cpu", dtype=torch.long)
+    host_valid = clean_valid.detach().to(device="cpu", dtype=torch.bool)
+    lengths = host_valid.sum(1)
+    width = host_ids.shape[1]
+    columns = torch.arange(width)
+    if bool(lengths.le(0).any()) or not torch.equal(
+        host_valid, columns[None] < lengths[:, None]
+    ):
+        raise ValueError("entropy serving requires nonempty contiguous clean prefixes")
+    if bool(lengths.ge(width).any()):
+        raise ValueError("entropy serving requires one clean suffix storage slot")
+
+    probe_storage = torch.zeros((host_ids.shape[0], width + 1), dtype=torch.long)
+    probe_storage[:, :width] = host_ids
+    probe_storage[torch.arange(host_ids.shape[0]), lengths] = 0
+    probe_columns = torch.arange(width + 1)
+    probe_valid = probe_columns[None] <= lengths[:, None]
+    probe_documents = torch.arange(host_ids.shape[0])[:, None].expand_as(
+        probe_storage
+    )
+    packed_ids = probe_storage.masked_select(probe_valid)
+    packed_documents = probe_documents.masked_select(probe_valid)
+    plan = patcher.patch(packed_ids.numpy(), packed_documents.numpy())
+    starts = torch.from_numpy(plan.starts)
+    packed_byte_to_patch = torch.from_numpy(plan.layout.byte_to_patch)
+    packed_patch_starts = torch.from_numpy(plan.layout.patch_starts)
+    packed_offsets = torch.arange(packed_ids.numel()) - packed_patch_starts.index_select(
+        0, packed_byte_to_patch
+    )
+    packed_columns = probe_columns[None].expand_as(probe_storage).masked_select(
+        probe_valid
+    )
+    # Compare against an equally packed row-length ledger rather than relying
+    # on physical padding.
+    packed_lengths = lengths.repeat_interleave(lengths + 1)
+    clean_packed = packed_columns < packed_lengths
+    patch_offsets = torch.full_like(host_ids, -1)
+    clean_rows = probe_documents.masked_select(probe_valid)[clean_packed]
+    clean_columns = packed_columns[clean_packed]
+    patch_offsets[clean_rows, clean_columns] = packed_offsets[clean_packed]
+    probe_packed = ~clean_packed
+    next_starts = starts[probe_packed]
+    if next_starts.shape != lengths.shape:
+        raise AssertionError("entropy probe ledger did not preserve one boundary per row")
+    metadata = build_duo_clean_patch_metadata(
+        host_valid,
+        document_ids.detach().to(device="cpu", dtype=torch.long),
+        patch_offsets,
+        max_patch_size=patcher.config.max_patch_size,
+        next_byte_starts_patch=next_starts,
+    )
+    return metadata.to(clean_ids.device)
 
 
 @dataclass(frozen=True)
@@ -82,6 +161,7 @@ def sample_duo_canvas(
     return_trajectory: bool = True,
     posterior_backend: DuoPosteriorBackend = "auto",
     prepared_cache: DuoCanvasCache | None = None,
+    clean_patch_metadata: DuoCleanPatchMetadata | None = None,
 ) -> DuoGeneration:
     """Sample one canvas per row from a uniform clean-atom prior.
 
@@ -163,6 +243,16 @@ def sample_duo_canvas(
         canvas_cache = prepared_cache
         metadata = None
     elif cache_backed:
+        entropy_clean = model.config.duo_clean_patching == "causal_entropy_v1"
+        if entropy_clean != (clean_patch_metadata is not None):
+            raise ValueError(
+                "Duo clean patch policy and entropy metadata disagree"
+            )
+        attention_metadata = (
+            None
+            if entropy_clean
+            else model.prepare_attention_metadata(clean_valid, document_ids)
+        )
         with torch.autocast(
             device_type=clean_ids.device.type,
             dtype=torch.bfloat16,
@@ -173,9 +263,8 @@ def sample_duo_canvas(
                 clean_valid,
                 document_ids,
                 positions,
-                attention_metadata=model.prepare_attention_metadata(
-                    clean_valid, document_ids
-                ),
+                attention_metadata=attention_metadata,
+                clean_patch_metadata=clean_patch_metadata,
             )
             canvas_cache = model.prepare_canvas_cache(
                 clean_bank,
@@ -459,6 +548,7 @@ def generate_duo_continuation(
     posterior_backend: DuoPosteriorBackend = "auto",
     stop_sequences: tuple[bytes, ...] = (),
     max_new_bytes: int | None = None,
+    entropy_patcher: CausalEntropyPatcher | None = None,
 ) -> DuoContinuation:
     """Generate ragged multi-canvas continuations without corrupting prompts."""
 
@@ -470,7 +560,15 @@ def generate_duo_continuation(
     ):
         raise ValueError("prompt ids/validity must be aligned rank-2 tensors")
     stride = model.config.patch_stride
-    if canvas_length <= 0 or canvas_length % stride:
+    full_resolution = (
+        model.config.duo_mutable_topology == "full_resolution_decoder"
+    )
+    entropy_clean = model.config.duo_clean_patching == "causal_entropy_v1"
+    if entropy_clean != (entropy_patcher is not None):
+        raise ValueError(
+            "Duo clean patch policy and authenticated entropy patcher disagree"
+        )
+    if canvas_length <= 0 or (not full_resolution and canvas_length % stride):
         raise ValueError("canvas length must be a positive patch multiple")
     if max_new_atoms <= 0 or steps <= 0:
         raise ValueError("generation length and diffusion steps must be positive")
@@ -570,7 +668,11 @@ def generate_duo_continuation(
         row_positions = positions.index_select(0, rows)
         row_lengths = lengths.index_select(0, rows)
         row_limits = limits.index_select(0, rows)
-        starts = torch.div(row_lengths, stride, rounding_mode="floor") * stride
+        starts = (
+            row_lengths
+            if full_resolution
+            else torch.div(row_lengths, stride, rounding_mode="floor") * stride
+        )
         phase = row_lengths - starts
         offsets = torch.arange(canvas_length, device=ids.device)[None]
         fresh = (offsets >= phase[:, None]) & (
@@ -589,28 +691,43 @@ def generate_duo_continuation(
         initial = torch.gather(row_ids, 1, safe)
         initial = torch.where(visible, initial, model.config.vocab.pad_id)
         prepared_cache = None
+        clean_patch_metadata = None
         if cache_backed:
             with torch.autocast(
                 device_type=ids.device.type,
                 dtype=torch.bfloat16,
                 enabled=ids.device.type == "cuda",
             ):
+                if entropy_patcher is None:
+                    attention_metadata = model.prepare_attention_metadata(
+                        row_valid, row_documents
+                    )
+                else:
+                    attention_metadata = None
+                    clean_patch_metadata = duo_entropy_clean_metadata(
+                        entropy_patcher,
+                        row_ids,
+                        row_valid,
+                        row_documents,
+                    )
                 clean_bank = model.prepare_clean_bank(
                     row_ids,
                     row_valid,
                     row_documents,
                     row_positions,
-                    attention_metadata=model.prepare_attention_metadata(
-                        row_valid, row_documents
-                    ),
+                    attention_metadata=attention_metadata,
+                    clean_patch_metadata=clean_patch_metadata,
                 )
-            prepared_cache = model.prepare_canvas_cache(
+                # The clean bank is BF16 under CUDA autocast. Project the
+                # branch-constant latent in that same policy so the cached
+                # condition matches FP32 module weights without dtype drift.
+                prepared_cache = model.prepare_canvas_cache(
                     clean_bank,
                     visible[:, None],
                     starts[:, None],
-                allow_synthetic_branch_suffix=True,
-                validate_inputs=False,
-            )
+                    allow_synthetic_branch_suffix=True,
+                    validate_inputs=False,
+                )
             if canvases == 0:
                 clean_prefill_forwards += 1
             else:
@@ -634,6 +751,7 @@ def generate_duo_continuation(
             return_trajectory=return_trajectories,
             posterior_backend=posterior_backend,
             prepared_cache=prepared_cache,
+            clean_patch_metadata=clean_patch_metadata,
         )
         if trajectories is not None:
             if canvas.trajectory is None:
@@ -829,4 +947,5 @@ __all__ = (
     "DuoGeneration",
     "generate_duo_continuation",
     "sample_duo_canvas",
+    "duo_entropy_clean_metadata",
 )

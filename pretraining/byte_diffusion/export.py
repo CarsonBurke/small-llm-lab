@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import struct
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Mapping
@@ -24,6 +25,8 @@ MAGIC = b"BDI4\x03\x00\x00\x00"
 # code while allowing a 12-layer 512-wide global trunk.
 PARAMETER_CAP = 29_410_000
 ARTIFACT_CAP_BYTES = 16_000_000
+MAX_ENTROPY_PATCHER_RAW_BYTES = 8 * 1024 * 1024
+ENTROPY_PATCHER_ENCODING = "zlib"
 
 TensorEncoding = Literal["group_int4", "group_int8", "float16"]
 ArtifactEncodingPolicy = Literal["uniform_int4", "mixed_sensitive"]
@@ -59,6 +62,14 @@ class _ArtifactPlan:
     fallbacks: Mapping[str, str]
     metadata: Mapping[str, object]
     artifact_bytes: int
+    entropy_patcher_payload: bytes | None
+
+
+@dataclass(frozen=True)
+class _EncodedEntropyPatcher:
+    raw: bytes
+    compressed: bytes
+    metadata: Mapping[str, object]
 
 
 def parameter_table(model: nn.Module) -> dict[str, int]:
@@ -273,6 +284,7 @@ def _metadata_for_plan(
     post_quantization_metrics: Mapping[str, object] | None,
     provenance: Mapping[str, object] | None,
     entropy_patcher_metadata: Mapping[str, object] | None,
+    duo_serving_metadata: Mapping[str, object] | None,
 ) -> dict[str, object]:
     encoding_counts, encoding_parameter_counts = _encoding_summaries(
         parameters, encodings
@@ -325,6 +337,8 @@ def _metadata_for_plan(
             **entropy_patcher_metadata,
             "payload_offset": payload_offset,
         }
+    if duo_serving_metadata is not None:
+        metadata["duo_serving"] = dict(duo_serving_metadata)
     return metadata
 
 
@@ -348,24 +362,67 @@ def _planned_artifact_bytes(metadata: Mapping[str, object]) -> int:
     return len(MAGIC) + 8 + len(_metadata_bytes(metadata)) + payload_bytes
 
 
-def _validated_patcher_metadata(
+def _encoded_entropy_patcher(
     artifact: bytes | None,
-) -> dict[str, object] | None:
+) -> _EncodedEntropyPatcher | None:
     if artifact is None:
         return None
     if not artifact:
         raise ValueError("embedded entropy patcher artifact cannot be empty")
+    if len(artifact) > MAX_ENTROPY_PATCHER_RAW_BYTES:
+        raise ValueError(
+            "embedded entropy patcher exceeds the bounded decompression limit"
+        )
     try:
         patcher = CausalEntropyPatcher.from_bytes(artifact)
     except (TypeError, ValueError) as error:
         raise ValueError("embedded entropy patcher artifact is invalid") from error
-    return {
-        "schema": "causal_entropy_patcher/v1",
-        "payload_bytes": len(artifact),
+    compressed = zlib.compress(artifact, level=9)
+    metadata = {
+        "schema": "causal_entropy_patcher/v2",
+        "encoding": ENTROPY_PATCHER_ENCODING,
+        "raw_bytes": len(artifact),
+        "compressed_bytes": len(compressed),
+        "payload_bytes": len(compressed),
+        "raw_sha256": hashlib.sha256(artifact).hexdigest(),
+        # Retain the generic provenance spelling used by final-export checks.
         "sha256": hashlib.sha256(artifact).hexdigest(),
         "boundary_config": asdict(patcher.config),
         "entropy_model_config": asdict(patcher.model.config),
         "max_patch_size": patcher.config.max_patch_size,
+    }
+    return _EncodedEntropyPatcher(artifact, compressed, metadata)
+
+
+def _duo_serving_metadata(
+    model: nn.Module,
+    config: ByteDiffusionConfig,
+    patcher: _EncodedEntropyPatcher | None,
+) -> dict[str, object] | None:
+    schedule_eps = getattr(model, "schedule_eps", None)
+    if schedule_eps is None:
+        return None
+    if (
+        not isinstance(schedule_eps, (float, int))
+        or not math.isfinite(float(schedule_eps))
+        or not 0.0 < float(schedule_eps) < 0.5
+    ):
+        raise ValueError("Duo artifact schedule_eps must lie in (0, 0.5)")
+    policy = config.duo_clean_patching
+    if policy == "causal_entropy_v1" and patcher is None:
+        raise ValueError("entropy-patched Duo artifacts require an embedded patcher")
+    if policy == "fixed_stride_v1" and patcher is not None:
+        raise ValueError("fixed-stride Duo artifacts cannot embed an entropy patcher")
+    return {
+        "schema": "byte_duo_serving/v1",
+        "schedule_eps": float(schedule_eps),
+        "patching_policy": policy,
+        "entropy_patcher_sha256": (
+            patcher.metadata["raw_sha256"] if patcher is not None else None
+        ),
+        "entropy_patcher_max_patch_size": (
+            patcher.metadata["max_patch_size"] if patcher is not None else None
+        ),
     }
 
 
@@ -394,7 +451,15 @@ def _make_plan(
         for name, parameter in parameters.items()
     }
     fallbacks: dict[str, str] = {}
-    entropy_patcher_metadata = _validated_patcher_metadata(entropy_patcher)
+    encoded_entropy_patcher = _encoded_entropy_patcher(entropy_patcher)
+    entropy_patcher_metadata = (
+        encoded_entropy_patcher.metadata
+        if encoded_entropy_patcher is not None
+        else None
+    )
+    duo_serving_metadata = _duo_serving_metadata(
+        model, config, encoded_entropy_patcher
+    )
 
     def materialize_metadata() -> dict[str, object]:
         return _metadata_for_plan(
@@ -410,6 +475,7 @@ def _make_plan(
             post_quantization_metrics=post_quantization_metrics,
             provenance=provenance,
             entropy_patcher_metadata=entropy_patcher_metadata,
+            duo_serving_metadata=duo_serving_metadata,
         )
 
     metadata = materialize_metadata()
@@ -442,7 +508,17 @@ def _make_plan(
             artifact_bytes = _planned_artifact_bytes(metadata)
             if artifact_bytes + code_bytes <= ARTIFACT_CAP_BYTES:
                 break
-    return _ArtifactPlan(dict(encodings), dict(fallbacks), metadata, artifact_bytes)
+    return _ArtifactPlan(
+        dict(encodings),
+        dict(fallbacks),
+        metadata,
+        artifact_bytes,
+        (
+            encoded_entropy_patcher.compressed
+            if encoded_entropy_patcher is not None
+            else None
+        ),
+    )
 
 
 def artifact_size_report(
@@ -659,15 +735,15 @@ def build_artifact(
             raise AssertionError("encoded scale length drifted from its size plan")
         payload.extend(tensor.packed)
         payload.extend(tensor.scales)
-    if entropy_patcher is not None:
+    if plan.entropy_patcher_payload is not None:
         patcher_info = plan.metadata.get("entropy_patcher")
         if not isinstance(patcher_info, Mapping):
             raise AssertionError("entropy patcher disappeared from the size plan")
         if len(payload) != int(patcher_info["payload_offset"]):
             raise AssertionError("entropy patcher offset drifted from its size plan")
-        if len(entropy_patcher) != int(patcher_info["payload_bytes"]):
+        if len(plan.entropy_patcher_payload) != int(patcher_info["payload_bytes"]):
             raise AssertionError("entropy patcher length drifted from its size plan")
-        payload.extend(entropy_patcher)
+        payload.extend(plan.entropy_patcher_payload)
     metadata_bytes = _metadata_bytes(plan.metadata)
     artifact = MAGIC + struct.pack("<Q", len(metadata_bytes)) + metadata_bytes + bytes(payload)
     if len(artifact) != plan.artifact_bytes:
@@ -759,20 +835,34 @@ def _validate_embedded_entropy_patcher(
         raise ValueError("artifact entropy patcher metadata must be an object")
     try:
         schema = str(info["schema"])
+        encoding = str(info["encoding"])
         offset = int(info["payload_offset"])
         payload_bytes = int(info["payload_bytes"])
-        expected_sha256 = str(info["sha256"])
+        compressed_bytes = int(info["compressed_bytes"])
+        raw_bytes = int(info["raw_bytes"])
+        expected_sha256 = str(info["raw_sha256"])
+        compatibility_sha256 = str(info["sha256"])
         max_patch_size = int(info["max_patch_size"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid embedded entropy patcher metadata") from error
-    if schema != "causal_entropy_patcher/v1":
+    if schema != "causal_entropy_patcher/v2":
         raise ValueError("unsupported embedded entropy patcher schema")
-    if offset != cursor or payload_bytes <= 0:
+    if encoding != ENTROPY_PATCHER_ENCODING:
+        raise ValueError("unsupported embedded entropy patcher encoding")
+    if payload_bytes != compressed_bytes or compressed_bytes <= 0:
+        raise ValueError("embedded entropy patcher compressed size mismatch")
+    if raw_bytes <= 0 or raw_bytes > MAX_ENTROPY_PATCHER_RAW_BYTES:
+        raise ValueError("embedded entropy patcher raw size exceeds its bound")
+    if compatibility_sha256 != expected_sha256:
+        raise ValueError("embedded entropy patcher sha256 metadata disagrees")
+    if offset != cursor:
         raise ValueError("embedded entropy patcher leaves a gap or overlap")
     stop = offset + payload_bytes
     if stop > len(payload):
         raise ValueError("embedded entropy patcher lies outside the artifact")
-    artifact = payload[offset:stop]
+    artifact = _strict_zlib_decompress(
+        payload[offset:stop], expected_size=raw_bytes
+    )
     if hashlib.sha256(artifact).hexdigest() != expected_sha256:
         raise ValueError("embedded entropy patcher sha256 mismatch")
     try:
@@ -786,6 +876,72 @@ def _validate_embedded_entropy_patcher(
     if info.get("entropy_model_config") != asdict(patcher.model.config):
         raise ValueError("embedded entropy model metadata mismatch")
     return stop
+
+
+def _strict_zlib_decompress(payload: bytes, *, expected_size: int) -> bytes:
+    """Decompress one zlib stream without permitting bombs or hidden trailers."""
+
+    if not 0 < expected_size <= MAX_ENTROPY_PATCHER_RAW_BYTES:
+        raise ValueError("embedded entropy patcher raw size exceeds its bound")
+    decoder = zlib.decompressobj()
+    try:
+        decoded = decoder.decompress(payload, expected_size + 1)
+        if len(decoded) > expected_size or decoder.unconsumed_tail:
+            raise ValueError("embedded entropy patcher exceeds its declared raw size")
+        remaining = expected_size + 1 - len(decoded)
+        decoded += decoder.flush(remaining)
+    except zlib.error as error:
+        raise ValueError("embedded entropy patcher zlib payload is invalid") from error
+    if len(decoded) != expected_size:
+        raise ValueError("embedded entropy patcher raw size mismatch")
+    if not decoder.eof:
+        raise ValueError("embedded entropy patcher zlib stream is truncated")
+    if decoder.unused_data or decoder.unconsumed_tail:
+        raise ValueError("embedded entropy patcher contains trailing compressed data")
+    return decoded
+
+
+def duo_serving_contract(metadata: Mapping[str, object]) -> dict[str, object]:
+    """Validate and return the artifact-only Byte-Duo runtime contract."""
+
+    info = metadata.get("duo_serving")
+    if not isinstance(info, Mapping):
+        raise ValueError("artifact omitted its Byte-Duo serving contract")
+    try:
+        schema = str(info["schema"])
+        schedule_eps = float(info["schedule_eps"])
+        patching_policy = str(info["patching_policy"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid Byte-Duo serving contract") from error
+    if schema != "byte_duo_serving/v1":
+        raise ValueError("unsupported Byte-Duo serving contract schema")
+    if not math.isfinite(schedule_eps) or not 0.0 < schedule_eps < 0.5:
+        raise ValueError("Byte-Duo serving schedule_eps must lie in (0, 0.5)")
+    if patching_policy not in {"fixed_stride_v1", "causal_entropy_v1"}:
+        raise ValueError("unknown Byte-Duo serving patching policy")
+    config = metadata.get("config")
+    if not isinstance(config, Mapping) or config.get("duo_clean_patching") != (
+        patching_policy
+    ):
+        raise ValueError("Byte-Duo serving policy disagrees with model config")
+    patcher = metadata.get("entropy_patcher")
+    if patching_policy == "fixed_stride_v1":
+        if patcher is not None:
+            raise ValueError("fixed-stride Byte-Duo artifact embeds an entropy patcher")
+        if info.get("entropy_patcher_sha256") is not None:
+            raise ValueError("fixed-stride Byte-Duo artifact claims patcher provenance")
+        if info.get("entropy_patcher_max_patch_size") is not None:
+            raise ValueError("fixed-stride Byte-Duo artifact claims a patch size")
+    else:
+        if not isinstance(patcher, Mapping):
+            raise ValueError("entropy Byte-Duo artifact omitted its patcher")
+        if info.get("entropy_patcher_sha256") != patcher.get("raw_sha256"):
+            raise ValueError("Byte-Duo serving patcher sha256 mismatch")
+        if info.get("entropy_patcher_max_patch_size") != patcher.get(
+            "max_patch_size"
+        ):
+            raise ValueError("Byte-Duo serving patch size mismatch")
+    return dict(info)
 
 
 def parse_artifact(
@@ -815,6 +971,8 @@ def parse_artifact(
     cursor = _validate_embedded_entropy_patcher(metadata, payload, cursor)
     if cursor != len(payload):
         raise ValueError("artifact contains unclaimed payload bytes")
+    if "duo_serving" in metadata:
+        duo_serving_contract(metadata)
     return metadata, tensors
 
 
@@ -832,7 +990,10 @@ def load_embedded_entropy_patcher(
     _, payload = _artifact_metadata_and_payload(artifact)
     offset = int(info["payload_offset"])
     stop = offset + int(info["payload_bytes"])
-    return CausalEntropyPatcher.from_bytes(payload[offset:stop])
+    raw = _strict_zlib_decompress(
+        payload[offset:stop], expected_size=int(info["raw_bytes"])
+    )
+    return CausalEntropyPatcher.from_bytes(raw)
 
 
 def load_artifact(

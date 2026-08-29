@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 import hashlib
@@ -22,6 +23,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from checkpointing import RecoveryCheckpointPolicy
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,10 +73,46 @@ from pretraining.byte_diffusion.training_duo import (
     duo_validation_from_stats,
     duo_clean_ar_weight,
     duo_loss,
+    duo_mutable_topology_contract,
     duo_objective_contract,
     prepare_duo_update,
     prepare_duo_validation_batch,
 )
+from pretraining.byte_diffusion.variable_patching import (
+    DatasetPatchingSpec,
+    build_duo_clean_patch_metadata,
+)
+
+
+def _authenticated_entropy_patcher_bytes(
+    data_path: Path,
+    dataset_manifest: Mapping[str, object],
+    dataset_patching: DatasetPatchingSpec,
+) -> bytes | None:
+    """Load only the patcher already authenticated by the dataset contract."""
+
+    if not dataset_patching.variable:
+        return None
+    patching_record = dataset_manifest.get("patching")
+    artifact_record = (
+        patching_record.get("patcher_artifact")
+        if isinstance(patching_record, Mapping)
+        else None
+    )
+    relative_path = (
+        artifact_record.get("path")
+        if isinstance(artifact_record, Mapping)
+        else None
+    )
+    if not isinstance(relative_path, str) or not relative_path:
+        raise ValueError("entropy dataset omitted its patcher artifact path")
+    patcher_path = (data_path / relative_path).resolve()
+    if not patcher_path.is_relative_to(data_path.resolve()):
+        raise ValueError("entropy patcher artifact escaped its dataset directory")
+    payload = patcher_path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != dataset_patching.artifact_sha256:
+        raise ValueError("entropy patcher bytes differ from the dataset contract")
+    return payload
 
 
 def _local_imports(path: Path) -> tuple[Path, ...]:
@@ -85,9 +123,20 @@ def _local_imports(path: Path) -> tuple[Path, ...]:
         if not parts:
             return
         module = REPO_ROOT.joinpath(*parts)
+        resolved = False
         for candidate in (module.with_suffix(".py"), module / "__init__.py"):
             if candidate.is_file():
                 candidates.add(candidate.resolve())
+                resolved = True
+        if not resolved:
+            return
+        # Importing a nested module executes every package initializer on its
+        # path.  They are therefore part of the executable artifact even when
+        # the source spells only the leaf module.
+        for depth in range(1, len(parts)):
+            initializer = REPO_ROOT.joinpath(*parts[:depth], "__init__.py")
+            if initializer.is_file():
+                candidates.add(initializer.resolve())
 
     package = list(path.relative_to(REPO_ROOT).with_suffix("").parts[:-1])
     for node in ast.walk(tree):
@@ -128,7 +177,7 @@ def counted_duo_code_paths() -> tuple[Path, ...]:
             Path(__file__),
             REPO_ROOT / "pretraining/byte_diffusion/inference_duo.py",
             REPO_ROOT / "scripts/export_byte_duo.py",
-            REPO_ROOT / "pretraining/eval_byte_diffusion_gsm8k.py",
+            REPO_ROOT / "pretraining/eval_byte_duo_gsm8k.py",
         )
     )
 
@@ -276,6 +325,18 @@ def rank_checkpoint_path(path: Path, rank: int, *, step: int) -> Path:
         f"{path.stem}.step{step:08d}.rank{rank:05d}{path.suffix}"
     )
 
+def prune_stale_rank_checkpoints(
+    path: Path, rank: int, *, committed_step: int
+) -> None:
+    """Retain only the sidecar referenced by the committed main checkpoint."""
+
+    current = rank_checkpoint_path(path, rank, step=committed_step)
+    for candidate in path.parent.glob(
+        f"{path.stem}.step*.rank{rank:05d}{path.suffix}"
+    ):
+        if candidate != current:
+            candidate.unlink(missing_ok=True)
+
 
 def capture_rank_state(
     time_generator: torch.Generator,
@@ -357,14 +418,30 @@ def _attach_duo_interface(wrapper: DDP, model: DuoModel) -> None:
 def _recipe_batch(batch: TrainingBatch, *, patch_stride: int) -> DuoBatch:
     if batch.document_ids is None:
         raise ValueError("Byte-Duo requires document-isolated byte pages")
-    if batch.byte_indices is None or batch.byte_cu_seqlens is None or batch.patch_indices is None:
-        raise ValueError("Byte-Duo requires prepacked document metadata")
-    metadata = compile_stable_document_metadata(
-        batch.valid,
-        batch.document_ids,
-        patch_stride=patch_stride,
-        max_segments_per_row=64,
-    )
+    if batch.max_patch_size is not None:
+        if batch.patch_offsets is None:
+            raise ValueError("entropy-patched Byte-Duo requires patch offsets")
+        entropy_metadata = build_duo_clean_patch_metadata(
+            batch.valid,
+            batch.document_ids,
+            batch.patch_offsets,
+            max_patch_size=batch.max_patch_size,
+        )
+        metadata = None
+    else:
+        if (
+            batch.byte_indices is None
+            or batch.byte_cu_seqlens is None
+            or batch.patch_indices is None
+        ):
+            raise ValueError("Byte-Duo requires prepacked document metadata")
+        entropy_metadata = None
+        metadata = compile_stable_document_metadata(
+            batch.valid,
+            batch.document_ids,
+            patch_stride=patch_stride,
+            max_segments_per_row=64,
+        )
     return DuoBatch(
         clean_ids=batch.ids,
         clean_valid=batch.valid,
@@ -373,6 +450,9 @@ def _recipe_batch(batch: TrainingBatch, *, patch_stride: int) -> DuoBatch:
         ar_targets=batch.ar_targets,
         bos_targets=batch.bos_targets,
         attention_metadata=metadata,
+        clean_patch_metadata=entropy_metadata,
+        patch_offsets=batch.patch_offsets if entropy_metadata is not None else None,
+        max_patch_size=batch.max_patch_size,
         bos_row_indices=batch.bos_row_indices,
     )
 
@@ -389,7 +469,12 @@ def production_batch_geometry(world_size: int) -> tuple[int, int]:
 def production_microbatches(world_size: int) -> tuple[int, ...]:
     """Return eligible microbatches; readiness selects the fastest fitting one."""
 
-    candidates = {1: (16, 24, 32), 8: (32,)}
+    # Twelve and fifteen are measured fallbacks for deeper full-resolution
+    # cells on the 32 GiB development GPU.  Keep the larger candidates in the
+    # authenticated sweep so shallower cells still select their fastest
+    # eligible geometry rather than inheriting a fallback unconditionally.
+    # The global batch remains exactly 249 for every candidate.
+    candidates = {1: (12, 15, 16, 24, 32), 8: (32,)}
     if world_size not in candidates:
         raise ValueError("production Byte-Duo supports world size 1 or 8")
     return candidates[world_size]
@@ -451,7 +536,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--checkpoint-every", type=int, default=200)
+    parser.add_argument(
+        "--checkpoint-interval-seconds", type=float, default=480.0
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
@@ -474,12 +561,14 @@ def validate_readiness_evidence(
     *,
     source_sha256: str,
     dataset_payload_sha256: str,
+    dataset_patching: DatasetPatchingSpec | None = None,
     parameter_count: int | None = None,
     world_size: int | None = None,
     rank: int = 0,
 ) -> dict[str, object] | None:
     """Authenticate the systems evidence required by a production 2k run."""
 
+    config = model_config_from_env()
     paths = (args.readiness_report, args.inference_readiness_report)
     if args.steps >= 2_000 and any(path is None for path in paths):
         raise ValueError(
@@ -506,7 +595,19 @@ def validate_readiness_evidence(
         **duo_objective_contract(args.objective),
         "schedule_eps": args.schedule_eps,
         "time_sampling": "global_branch_antithetic_striped_uniform_0_1",
+        **duo_mutable_topology_contract(config),
     }
+    patching_contract = (
+        None
+        if dataset_patching is None
+        else {
+            "name": dataset_patching.name,
+            "max_patch_size": dataset_patching.max_patch_size,
+            "patcher_sha256": dataset_patching.artifact_sha256,
+        }
+    )
+    if patching_contract is not None:
+        workload["dataset_patching"] = patching_contract
     if observed_world_size == 1:
         training_evidence = validate_architecture_readiness(
             training_path,
@@ -516,7 +617,7 @@ def validate_readiness_evidence(
             global_batch_size=args.global_batch_size,
             microbatch_size=args.batch_size,
             validation_batch_size=args.validation_batch_size,
-            model_config=model_config_from_env().to_dict(),
+            model_config=config.to_dict(),
             workload=workload,
             runtime={
                 "compiled": args.compile,
@@ -533,7 +634,7 @@ def validate_readiness_evidence(
             training_path,
             source_sha256=source_sha256,
             dataset_payload_sha256=dataset_payload_sha256,
-            model_config=model_config_from_env().to_dict(),
+            model_config=config.to_dict(),
             parameter_count=parameter_count,
             workload=workload,
             rank=rank,
@@ -542,13 +643,22 @@ def validate_readiness_evidence(
         raise ValueError("Byte-Duo readiness supports world size 1 or 8")
 
     if observed_world_size == 1:
+        # Dataset/patcher authentication is mandatory for real training (the
+        # loader always supplies a DatasetPatchingSpec).  Keeping these
+        # expectations absent only supports synthetic readiness-unit fixtures
+        # that do not represent a loadable dataset.
+        inference_data_sha256 = (
+            dataset_payload_sha256 if dataset_patching is not None else None
+        )
         inference_evidence = validate_duo_inference_readiness(
             inference_path,
             source_sha256=source_sha256,
             canvas_length=args.canvas_length,
             branches=args.branches,
-            model_config=model_config_from_env().to_dict(),
+            model_config=config.to_dict(),
             parameter_count=int(parameter_count or 0),
+            dataset_payload_sha256=inference_data_sha256,
+            dataset_patching=patching_contract,
         )
     else:
         # Inference readiness is a single-GPU benchmark. Authenticate it once
@@ -563,8 +673,14 @@ def validate_readiness_evidence(
                         source_sha256=source_sha256,
                         canvas_length=args.canvas_length,
                         branches=args.branches,
-                        model_config=model_config_from_env().to_dict(),
+                        model_config=config.to_dict(),
                         parameter_count=int(parameter_count or 0),
+                        dataset_payload_sha256=(
+                            dataset_payload_sha256
+                            if dataset_patching is not None
+                            else None
+                        ),
+                        dataset_patching=patching_contract,
                     )
                 }
             except Exception as error:  # propagate before any rank can continue
@@ -741,6 +857,20 @@ def _run(
     )
     dataset_manifest = json.loads((args.data_path / "manifest.json").read_text())
     config = model_config_from_env()
+    dataset_patching = getattr(train_chunks, "patching", None)
+    validation_patching = getattr(validation_chunks, "patching", None)
+    if not isinstance(dataset_patching, DatasetPatchingSpec):
+        raise ValueError("Byte-Duo dataset omitted its authenticated patching policy")
+    if dataset_patching != validation_patching:
+        raise ValueError("training and validation patching policies differ")
+    if dataset_patching.name != config.duo_clean_patching:
+        raise ValueError(
+            "dataset patching policy differs from the Duo clean hierarchy: "
+            f"expected {config.duo_clean_patching}, observed {dataset_patching.name}"
+        )
+    entropy_patcher_bytes = _authenticated_entropy_patcher_bytes(
+        args.data_path, dataset_manifest, dataset_patching
+    )
     train_exposure = dataset_manifest.get("splits", {}).get("train", {})
     special_targets = int(train_exposure.get("special_atomic_tokens", -1))
     eot_targets = int(train_exposure.get("eot_atomic_tokens", -2))
@@ -804,14 +934,16 @@ def _run(
             model,
             config,
             code_bytes=code_bytes + 128 * 1024,
+            entropy_patcher=entropy_patcher_bytes,
         )
         if size.complete_bytes > ARTIFACT_CAP_BYTES:
             raise ValueError(
                 "2k Byte-Duo variant cannot fit the complete 16 MB artifact: "
                 f"{size.complete_bytes:,} bytes"
             )
+    dynamic_compile = config.duo_clean_patching == "causal_entropy_v1"
     execution_model: torch.nn.Module = (
-        torch.compile(model, dynamic=False, fullgraph=False)
+        torch.compile(model, dynamic=dynamic_compile, fullgraph=False)
         if device.type == "cuda" and args.compile
         else model
     )
@@ -873,6 +1005,7 @@ def _run(
         args,
         source_sha256=str(provenance["sha256"]),
         dataset_payload_sha256=str(dataset_payload_sha256),
+        dataset_patching=dataset_patching,
         parameter_count=model.parameter_count,
         world_size=distributed.world_size,
         rank=distributed.rank,
@@ -906,11 +1039,21 @@ def _run(
         "learning_rate": args.learning_rate,
         **duo_objective_contract(args.objective),
         "schedule_eps": args.schedule_eps,
+        "random_phase_training": config.duo_random_phase_training,
+        "canonical_validation_origin_stride": config.patch_stride,
+        "serving_distribution_validation_origin_stride": config.duo_origin_stride,
+        **duo_mutable_topology_contract(config),
         "allow_unused_diffusion_controls": allow_unused_controls,
         "time_sampling": "global_branch_antithetic_striped_uniform_0_1",
         "warmdown_steps": args.warmdown_steps,
         "max_grad_norm": args.max_grad_norm,
         "compile": args.compile,
+        "compile_dynamic_shapes": dynamic_compile,
+        "dataset_patching": {
+            "name": dataset_patching.name,
+            "max_patch_size": dataset_patching.max_patch_size,
+            "patcher_sha256": dataset_patching.artifact_sha256,
+        },
         "diagnostic_cadence": diagnostic_cadence_contract(
             log_every=args.log_every,
             validation_every=args.val_every,
@@ -921,7 +1064,7 @@ def _run(
         "validation_rows": args.validation_rows,
         "validation_batch_size": args.validation_batch_size,
         "validation_seed": args.seed + 10_000,
-        "checkpoint_every": args.checkpoint_every,
+        "checkpoint_interval_seconds": args.checkpoint_interval_seconds,
         "world_size": distributed.world_size,
         "base_rank_row_counts": distributed_local_counts(
             args.global_batch_size, distributed.world_size
@@ -1013,6 +1156,9 @@ def _run(
         )
         distributed.barrier()
 
+    checkpoint_policy = RecoveryCheckpointPolicy(
+        args.checkpoint_interval_seconds
+    )
     committed_host_state: dict[str, object] | None = None
 
     def save_checkpoint(step: int) -> None:
@@ -1063,6 +1209,11 @@ def _run(
             torch.save(payload, temporary)
             temporary.replace(checkpoint_path)
         distributed.barrier()
+        prune_stale_rank_checkpoints(
+            checkpoint_path, distributed.rank, committed_step=step
+        )
+        distributed.barrier()
+        checkpoint_policy.committed(step)
 
     validation_rows = min(args.validation_rows, len(validation_chunks))
     rank_validation_rows = distributed_rank_positions(
@@ -1392,7 +1543,20 @@ def _run(
                     )
             if step % args.val_every == 0 or step == args.steps:
                 validate(step)
-            if step % args.checkpoint_every == 0 or step == args.steps:
+            checkpoint_due = (
+                checkpoint_policy.due()
+                if distributed.is_primary
+                else False
+            )
+            if distributed.world_size > 1:
+                due_flag = torch.tensor(
+                    int(checkpoint_due), device=device, dtype=torch.int32
+                )
+                dist.broadcast(due_flag, src=0)
+                checkpoint_due = bool(due_flag.item())
+            if checkpoint_due or (
+                step == args.steps and checkpoint_policy.terminal_due(step)
+            ):
                 save_checkpoint(step)
     finally:
         batch_prefetcher.close()

@@ -30,7 +30,8 @@ from .diffusion_gemma_model import (
     _packed_document_metadata,
     _patch_metadata,
 )
-from .layers import CleanAttentionBank
+from .layers import CleanAttentionBank, pack_rows, unpack_rows
+from .variable_patching import DuoCleanPatchMetadata
 
 
 DUO_TIME_FEATURES = 64
@@ -46,12 +47,12 @@ class DuoCleanBank:
     clean_valid: Tensor
     document_ids: Tensor
     positions: Tensor
-    attention_metadata: DiffusionGemmaAttentionMetadata
+    attention_metadata: DiffusionGemmaAttentionMetadata | DuoCleanPatchMetadata
     encoder: tuple[CleanAttentionBank, ...]
     global_blocks: tuple[CleanAttentionBank, ...]
     decoder: tuple[CleanAttentionBank, ...]
     clean_patch_states: Tensor
-    decoder_condition: Tensor
+    decoder_condition: Tensor | None
     clean_decoder_states: Tensor
 
     @property
@@ -72,12 +73,13 @@ class DuoCanvasCache:
     branch_starts: Tensor
     source_positions: Tensor
     branch_segments: Tensor
-    local_layout: CanvasBranchLayout
+    local_layout: CanvasBranchLayout | None
     local_block_mask: object | None
-    global_layout: CanvasBranchLayout
+    global_layout: CanvasBranchLayout | None
     global_block_mask: object | None
     decoder_layout: CanvasBranchLayout
     decoder_block_mask: object | None
+    decoder_projected_branch_conditions: tuple[Tensor, ...] | None
 
     @property
     def canvas_length(self) -> int:
@@ -184,12 +186,22 @@ class DuoModel(DiffusionGemmaModel):
         # All block modulations consume one shared [B,M,C] condition.
         # One packed projection replaces thirteen launch-bound GEMMs while
         # retaining independent output parameters for every block.
-        self._adaln_widths = (
-            *((6 * config.local_dim,) * config.encoder_layers),
-            *((6 * config.global_dim,) * config.global_layers),
-            *((6 * config.local_dim,) * config.decoder_layers),
-            2 * config.local_dim,
-        )
+        if config.duo_mutable_topology == "full_resolution_decoder":
+            # The clean encoder/global hierarchy is time independent and the
+            # mutable stream bypasses both stacks.  Do not reserve modulation
+            # rows that can never participate in a forward or receive a
+            # gradient; those parameters are material under a 16 MB budget.
+            self._adaln_widths = (
+                *((6 * config.local_dim,) * config.decoder_layers),
+                2 * config.local_dim,
+            )
+        else:
+            self._adaln_widths = (
+                *((6 * config.local_dim,) * config.encoder_layers),
+                *((6 * config.global_dim,) * config.global_layers),
+                *((6 * config.local_dim,) * config.decoder_layers),
+                2 * config.local_dim,
+            )
         self.time_adaln = nn.Linear(
             config.duo_time_condition_dim, sum(self._adaln_widths), bias=True
         )
@@ -271,16 +283,21 @@ class DuoModel(DiffusionGemmaModel):
         # -log(alpha(t)), a monotone continuous-time coordinate.
         alpha = 1.0 - (1.0 - self.schedule_eps) * row_time
         sigma = -alpha.log()
-        return F.silu(
-            self.time_embedding(
-                sinusoidal_time_features(sigma, self.config.duo_time_features)
-            )
-        )
+        # Trigonometric features are evaluated in FP32 even when the model is
+        # explicitly stored in BF16, then cast only at the MLP boundary.  This
+        # avoids quantizing high-frequency phases before sin/cos while keeping
+        # the conditioner usable outside autocast as well.
+        features = sinusoidal_time_features(
+            sigma, self.config.duo_time_features
+        ).to(self.time_embedding[0].weight.dtype)
+        return F.silu(self.time_embedding(features))
 
     def _adaln_modulations(
         self, time_condition: Tensor
     ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], Tensor]:
         values = self.time_adaln(time_condition).split(self._adaln_widths, dim=-1)
+        if self.config.duo_mutable_topology == "full_resolution_decoder":
+            return (), (), values[:-1], values[-1]
         encoder_stop = self.config.encoder_layers
         global_stop = encoder_stop + self.config.global_layers
         decoder_stop = global_stop + self.config.decoder_layers
@@ -343,6 +360,7 @@ class DuoModel(DiffusionGemmaModel):
         positions: Tensor,
         *,
         attention_metadata: DiffusionGemmaAttentionMetadata | None = None,
+        clean_patch_metadata: DuoCleanPatchMetadata | None = None,
     ) -> DuoCleanBank:
         """Run the time-independent clean encoder/global/decoder exactly once."""
 
@@ -352,91 +370,151 @@ class DuoModel(DiffusionGemmaModel):
             raise ValueError("clean ids and valid must be aligned rank-2 tensors")
         if document_ids.shape != clean_ids.shape or positions.shape != clean_ids.shape:
             raise ValueError("document ids and positions must align with clean ids")
-        if clean_ids.shape[1] % self.config.patch_stride:
+        expects_entropy = self.config.duo_clean_patching == "causal_entropy_v1"
+        if expects_entropy != (clean_patch_metadata is not None):
+            raise ValueError(
+                "Duo model config and supplied clean patch metadata disagree"
+            )
+        if clean_patch_metadata is None and clean_ids.shape[1] % self.config.patch_stride:
             raise ValueError("clean length must be patch aligned")
-        if attention_metadata is None:
+        if attention_metadata is not None and clean_patch_metadata is not None:
+            raise ValueError("Duo clean patch policies are mutually exclusive")
+        if attention_metadata is None and clean_patch_metadata is None:
             attention_metadata = _packed_document_metadata(
                 clean_valid,
                 document_ids,
                 patch_stride=self.config.patch_stride,
             )
 
-        local = self.embedding(clean_ids)
-        if self.ngrams is not None:
-            local = local + self._isolated_ngram_features(
-                clean_ids, clean_valid, document_ids
+        effective_metadata = (
+            clean_patch_metadata
+            if clean_patch_metadata is not None
+            else attention_metadata
+        )
+        if effective_metadata is None:
+            raise AssertionError("clean attention metadata disappeared")
+        if (
+            clean_patch_metadata is not None
+            and self.config.duo_mutable_topology != "full_resolution_decoder"
+        ):
+            raise ValueError(
+                "entropy clean patches require the full-resolution Duo decoder"
             )
-            if self.config.ngram_aggregation == "mean":
-                local = local / (len(self.config.ngram_orders) + 1)
         encoder_banks: list[CleanAttentionBank] = []
-        for block in self.encoder:
-            local, bank = block.prepare_clean_bank(
-                local,
-                clean_indices=attention_metadata.byte_indices,
-                clean_cu_seqlens=attention_metadata.byte_cu_seqlens,
-                assume_physical_clean=attention_metadata.physical_layout,
-                positions=positions,
-                clean_window=self.config.local_window,
-                allow_dense_reference=clean_ids.device.type == "cpu",
+        global_banks: list[CleanAttentionBank] = []
+        if self.config.duo_mutable_topology == "full_resolution_decoder":
+            # Mutable bytes never query encoder/global K/V. Run the causal
+            # clean hierarchy without constructing or retaining those banks;
+            # only decoder clean K/V is reused by reverse NFEs.
+            clean_patch_states, decoder_condition = self._clean_hierarchy(
+                clean_ids,
+                clean_valid,
+                document_ids,
+                positions,
+                attention_metadata,
+                clean_patch_metadata,
             )
-            encoder_banks.append(bank)
+        else:
+            local = self.embedding(clean_ids)
+            if self.ngrams is not None:
+                local = local + self._isolated_ngram_features(
+                    clean_ids, clean_valid, document_ids
+                )
+                if self.config.ngram_aggregation == "mean":
+                    local = local / (len(self.config.ngram_orders) + 1)
+            for block in self.encoder:
+                local, bank = block.prepare_clean_bank(
+                    local,
+                    clean_indices=attention_metadata.byte_indices,
+                    clean_cu_seqlens=attention_metadata.byte_cu_seqlens,
+                    assume_physical_clean=attention_metadata.physical_layout,
+                    positions=positions,
+                    clean_window=self.config.local_window,
+                    allow_dense_reference=clean_ids.device.type == "cpu",
+                )
+                encoder_banks.append(bank)
 
-        patches = self.pool(local, clean_valid)
-        clean_patch_valid, clean_patch_documents, clean_patch_positions = (
-            _patch_metadata(
+            patches = self.pool(local, clean_valid)
+            _, clean_patch_documents, clean_patch_positions = _patch_metadata(
                 clean_valid,
                 document_ids,
                 positions,
                 self.config.patch_stride,
             )
-        )
-
-        global_banks: list[CleanAttentionBank] = []
-        for block in self.global_blocks:
-            patches, bank = block.prepare_clean_bank(
-                patches,
-                clean_indices=attention_metadata.patch_indices,
-                clean_cu_seqlens=attention_metadata.patch_cu_seqlens,
-                assume_physical_clean=attention_metadata.physical_layout,
-                positions=clean_patch_positions,
-                clean_window=self.config.global_window,
-                allow_dense_reference=clean_ids.device.type == "cpu",
+            for block in self.global_blocks:
+                patches, bank = block.prepare_clean_bank(
+                    patches,
+                    clean_indices=attention_metadata.patch_indices,
+                    clean_cu_seqlens=attention_metadata.patch_cu_seqlens,
+                    assume_physical_clean=attention_metadata.physical_layout,
+                    positions=clean_patch_positions,
+                    clean_window=self.config.global_window,
+                    allow_dense_reference=clean_ids.device.type == "cpu",
+                )
+                global_banks.append(bank)
+            clean_patch_states = self.global_norm(patches)
+            decoder_condition = self._aligned_clean_condition(
+                clean_patch_states,
+                document_ids,
+                positions,
+                clean_patch_documents,
             )
-            global_banks.append(bank)
-        clean_patch_states = self.global_norm(patches)
-        decoder_condition = self._aligned_clean_condition(
-            clean_patch_states,
-            document_ids,
-            positions,
-            clean_patch_documents,
-        )
 
         decoder_states = self.embedding(clean_ids)
         decoder_banks: list[CleanAttentionBank] = []
-        for block in self.decoder:
-            decoder_states, bank = block.prepare_clean_bank(
-                decoder_states,
-                decoder_condition,
-                clean_indices=attention_metadata.byte_indices,
-                clean_cu_seqlens=attention_metadata.byte_cu_seqlens,
-                assume_physical_clean=attention_metadata.physical_layout,
-                positions=positions,
-                clean_window=self.config.decoder_prefix_window,
-                allow_dense_reference=clean_ids.device.type == "cpu",
+        assume_physical_clean = (
+            clean_patch_metadata is not None
+            or (
+                attention_metadata.physical_layout
+                if attention_metadata is not None
+                else False
             )
+        )
+        for block in self.decoder:
+            kwargs = {
+                "clean_indices": effective_metadata.byte_indices,
+                "clean_cu_seqlens": effective_metadata.byte_cu_seqlens,
+                "assume_physical_clean": assume_physical_clean,
+                "positions": positions,
+                "clean_window": self.config.decoder_prefix_window,
+                "allow_dense_reference": clean_ids.device.type == "cpu",
+            }
+            if (
+                self.config.duo_mutable_topology == "full_resolution_decoder"
+                and block.conditioning != "split_cross_attention"
+            ):
+                projected_patches = block.project_reusable_condition(
+                    clean_patch_states
+                )
+                projected_condition = self._clean_byte_condition(
+                    projected_patches,
+                    clean_valid,
+                    document_ids,
+                    positions,
+                    clean_patch_metadata,
+                )
+                decoder_states, bank = block.prepare_clean_bank_projected(
+                    decoder_states, projected_condition, **kwargs
+                )
+            else:
+                if decoder_condition is None:
+                    raise AssertionError("raw decoder condition is unavailable")
+                decoder_states, bank = block.prepare_clean_bank(
+                    decoder_states, decoder_condition, **kwargs
+                )
             decoder_banks.append(bank)
         return DuoCleanBank(
-            clean_ids,
-            clean_valid,
-            document_ids,
-            positions,
-            attention_metadata,
-            tuple(encoder_banks),
-            tuple(global_banks),
-            tuple(decoder_banks),
-            clean_patch_states,
-            decoder_condition,
-            decoder_states,
+            clean_ids=clean_ids,
+            clean_valid=clean_valid,
+            document_ids=document_ids,
+            positions=positions,
+            attention_metadata=effective_metadata,
+            encoder=tuple(encoder_banks),
+            global_blocks=tuple(global_banks),
+            decoder=tuple(decoder_banks),
+            clean_patch_states=clean_patch_states,
+            decoder_condition=decoder_condition,
+            clean_decoder_states=decoder_states,
         )
 
     def _ngram_features(
@@ -470,6 +548,227 @@ class DuoModel(DiffusionGemmaModel):
             starts,
         )
 
+    def _clean_hierarchy(
+        self,
+        clean_ids: Tensor,
+        clean_valid: Tensor,
+        document_ids: Tensor,
+        positions: Tensor,
+        attention_metadata: DiffusionGemmaAttentionMetadata | None,
+        clean_patch_metadata: DuoCleanPatchMetadata | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Run the selected immutable clean encoder/global hierarchy.
+
+        Mutable states deliberately never enter this helper.  Clean bytes and
+        patches use the existing document-packed causal kernels, so the full-
+        resolution control changes only the revisable topology.
+        """
+
+        batch, length = clean_ids.shape
+        local_padded = self.embedding(clean_ids)
+        if self.ngrams is not None:
+            local_padded = local_padded + self._isolated_ngram_features(
+                clean_ids, clean_valid, document_ids
+            )
+            if self.config.ngram_aggregation == "mean":
+                local_padded = local_padded / (len(self.config.ngram_orders) + 1)
+        if (attention_metadata is None) == (clean_patch_metadata is None):
+            raise ValueError("exactly one Duo clean patch policy is required")
+        metadata = (
+            clean_patch_metadata
+            if clean_patch_metadata is not None
+            else attention_metadata
+        )
+        if metadata is None:
+            raise AssertionError("clean hierarchy metadata disappeared")
+        physical = (
+            clean_patch_metadata is not None
+            or (
+                attention_metadata.physical_layout
+                if attention_metadata is not None
+                else False
+            )
+        )
+        local = (
+            local_padded.reshape(-1, self.config.local_dim)
+            if physical
+            else pack_rows(local_padded, metadata.byte_indices)
+        )
+        packed_positions = (
+            positions.reshape(-1)
+            if physical
+            else pack_rows(positions, metadata.byte_indices)
+        )
+        for block in self.encoder:
+            local = block.forward_packed(
+                local,
+                cu_seqlens=metadata.byte_cu_seqlens,
+                positions=packed_positions,
+                max_seqlen=length,
+                window=self.config.local_window,
+                allow_dense_reference=clean_ids.device.type == "cpu",
+            )
+        local_padded = (
+            local.view(batch, length, self.config.local_dim)
+            if physical
+            else unpack_rows(local, metadata.byte_indices, local_padded)
+        )
+        if clean_patch_metadata is not None:
+            pool_local = local.index_select(
+                0, clean_patch_metadata.pool_byte_indices
+            )
+            packed_patches = self.pool.forward_packed(
+                pool_local,
+                clean_patch_metadata.patch_byte_cu_seqlens,
+                max_patch_size=clean_patch_metadata.max_patch_size,
+            )
+            packed_patch_positions = clean_patch_metadata.patch_ordinals
+            patch_cu_seqlens = clean_patch_metadata.patch_cu_seqlens
+            max_patch_seqlen = clean_patch_metadata.max_patch_seqlen
+            patches = packed_patches
+            patch_documents = None
+        else:
+            if attention_metadata is None:
+                raise AssertionError("fixed clean metadata disappeared")
+            patches = self.pool(local_padded, clean_valid)
+            _, patch_documents, patch_positions = _patch_metadata(
+                clean_valid, document_ids, positions, self.config.patch_stride
+            )
+            packed_patches = (
+                patches.reshape(-1, self.config.global_dim)
+                if physical
+                else pack_rows(patches, attention_metadata.patch_indices)
+            )
+            packed_patch_positions = (
+                patch_positions.reshape(-1)
+                if physical
+                else pack_rows(patch_positions, attention_metadata.patch_indices)
+            )
+            patch_cu_seqlens = attention_metadata.patch_cu_seqlens
+            max_patch_seqlen = patches.shape[1]
+        for block in self.global_blocks:
+            packed_patches = block.forward_packed(
+                packed_patches,
+                cu_seqlens=patch_cu_seqlens,
+                positions=packed_patch_positions,
+                max_seqlen=max_patch_seqlen,
+                window=self.config.global_window,
+                allow_dense_reference=clean_ids.device.type == "cpu",
+            )
+        packed_patches = self.global_norm(packed_patches)
+        if clean_patch_metadata is not None:
+            clean_patch_states = packed_patches
+        elif physical:
+            clean_patch_states = packed_patches.view_as(patches)
+        else:
+            if attention_metadata is None:
+                raise AssertionError("fixed clean metadata disappeared")
+            clean_patch_states = unpack_rows(
+                packed_patches, attention_metadata.patch_indices, patches
+            )
+        decoder_condition = (
+            self._clean_byte_condition(
+                clean_patch_states,
+                clean_valid,
+                document_ids,
+                positions,
+                clean_patch_metadata,
+            )
+            if any(
+                block.conditioning == "split_cross_attention"
+                for block in self.decoder
+            )
+            else None
+        )
+        return clean_patch_states, decoder_condition
+
+    def _clean_byte_condition(
+        self,
+        patch_states: Tensor,
+        clean_valid: Tensor,
+        document_ids: Tensor,
+        positions: Tensor,
+        clean_patch_metadata: DuoCleanPatchMetadata | None,
+    ) -> Tensor:
+        """Align a latent only after its complete physical patch is visible."""
+
+        if clean_patch_metadata is None:
+            _, patch_documents, _ = _patch_metadata(
+                clean_valid,
+                document_ids,
+                positions,
+                self.config.patch_stride,
+            )
+            return self._aligned_clean_condition(
+                patch_states, document_ids, positions, patch_documents
+            )
+        indices = clean_patch_metadata.byte_condition_indices
+        safe = indices.clamp_min(0)
+        selected = patch_states.index_select(0, safe)
+        selected = torch.where(indices[:, None].ge(0), selected, 0)
+        padded = selected.new_zeros(
+            (*clean_valid.shape, selected.shape[-1])
+        )
+        return unpack_rows(
+            selected,
+            clean_patch_metadata.pool_byte_indices,
+            padded,
+        )
+
+    def _preceding_patch_condition(
+        self,
+        clean_patch_states: Tensor,
+        clean_valid: Tensor,
+        document_ids: Tensor,
+        positions: Tensor,
+        branch_starts: Tensor,
+        clean_patch_metadata: DuoCleanPatchMetadata | None = None,
+    ) -> Tensor:
+        """Select the last fully closed clean patch for each branch origin.
+
+        An origin inside a physical patch cannot use that patch's latent: it
+        contains bytes at or after the origin.  Thus every phase in physical
+        patch ``p`` uses ``p-1``.  Starts in a document's first patch receive
+        the exact zero virtual-BOS condition.
+        """
+
+        if clean_patch_metadata is not None:
+            chosen = torch.gather(
+                clean_patch_metadata.origin_condition_indices,
+                1,
+                branch_starts,
+            )
+            safe = chosen.clamp_min(0)
+            gathered = clean_patch_states.index_select(
+                0, safe.reshape(-1)
+            ).view(*safe.shape, clean_patch_states.shape[-1])
+            return torch.where(chosen[..., None].ge(0), gathered, 0)
+        stride = self.config.patch_stride
+        chosen = torch.div(branch_starts, stride, rounding_mode="floor") - 1
+        safe = chosen.clamp_min(0)
+        gathered = torch.gather(
+            clean_patch_states,
+            1,
+            safe[..., None].expand(-1, -1, clean_patch_states.shape[-1]),
+        )
+        patch_valid = clean_valid.view(
+            clean_valid.shape[0], -1, stride
+        ).any(-1)
+        patch_documents = document_ids.view(
+            document_ids.shape[0], -1, stride
+        )[:, :, 0]
+        chosen_valid = torch.gather(patch_valid, 1, safe)
+        chosen_documents = torch.gather(patch_documents, 1, safe)
+        branch_documents = torch.gather(document_ids, 1, branch_starts)
+        branch_positions = torch.gather(positions, 1, branch_starts)
+        available = (
+            chosen.ge(0)
+            & chosen_valid
+            & chosen_documents.eq(branch_documents)
+            & branch_positions.ge(stride)
+        )
+        return torch.where(available[..., None], gathered, 0)
+
     def prepare_canvas_cache(
         self,
         clean: DuoCleanBank,
@@ -488,10 +787,15 @@ class DuoModel(DiffusionGemmaModel):
         batch, branches, canvas = branch_valid.shape
         if batch != clean.batch_size or branch_starts.shape != (batch, branches):
             raise ValueError("branch starts must align with the cached clean batch")
-        if canvas % self.config.patch_stride:
+        full_resolution = (
+            self.config.duo_mutable_topology == "full_resolution_decoder"
+        )
+        if not full_resolution and canvas % self.config.patch_stride:
             raise ValueError("canvas length must be patch aligned")
         if validate_inputs and not torch.compiler.is_compiling():
-            if bool((branch_starts % self.config.patch_stride).any()):
+            if not full_resolution and bool(
+                (branch_starts % self.config.patch_stride).any()
+            ):
                 raise ValueError("branch starts must be physical-patch aligned")
             if bool(((branch_starts < 0) | (branch_starts >= clean.length)).any()):
                 raise ValueError("canvas origins must lie inside the clean row")
@@ -511,8 +815,8 @@ class DuoModel(DiffusionGemmaModel):
             clean.clean_valid[:, None, :].expand(-1, branches, -1), 2, safe
         ) & exists & source_document.eq(branch_segments[:, :, None])
         if validate_inputs and not torch.compiler.is_compiling():
+            contiguous = offsets < branch_valid.sum(-1, keepdim=True)
             if allow_synthetic_branch_suffix:
-                contiguous = offsets < branch_valid.sum(-1, keepdim=True)
                 valid_documents = torch.where(
                     clean.clean_valid,
                     clean.document_ids,
@@ -527,61 +831,20 @@ class DuoModel(DiffusionGemmaModel):
                     raise ValueError(
                         "synthetic inference suffix must follow one contiguous clean document"
                     )
-            elif not torch.equal(branch_valid, expected_valid):
+            elif not torch.equal(branch_valid, contiguous) or bool(
+                (branch_valid & ~expected_valid).any()
+            ):
                 raise ValueError(
-                    "branch validity crosses a document or disagrees with clean data"
+                    "branch validity must be a contiguous same-document source prefix"
                 )
 
-        local_layout = CanvasBranchLayout(
-            clean.clean_valid,
-            branch_valid,
-            branch_starts,
-            self.config.local_window,
-            clean.positions,
-            source_positions,
-            clean.document_ids,
-            branch_segments,
-        )
-        local_mask = (
-            None
-            if clean.clean_ids.device.type == "cpu"
-            else build_canvas_block_mask(local_layout)
-        )
-        clean_patch_valid, clean_patch_documents, clean_patch_positions = (
-            _patch_metadata(
-                clean.clean_valid,
-                clean.document_ids,
-                clean.positions,
-                self.config.patch_stride,
-            )
-        )
-        canvas_patches = canvas // self.config.patch_stride
-        branch_patch_valid = branch_valid.view(
-            batch, branches, canvas_patches, self.config.patch_stride
-        ).any(-1)
-        branch_patch_positions = (
-            source_positions[:, :, :: self.config.patch_stride]
-            // self.config.patch_stride
-        )
-        global_layout = CanvasBranchLayout(
-            clean_patch_valid,
-            branch_patch_valid,
-            branch_starts // self.config.patch_stride,
-            self.config.global_window,
-            clean_patch_positions,
-            branch_patch_positions,
-            clean_patch_documents,
-            branch_segments,
-        )
-        global_mask = (
-            None
-            if clean.clean_ids.device.type == "cpu"
-            else build_canvas_block_mask(global_layout)
-        )
-        if self.config.decoder_prefix_window == self.config.local_window:
-            decoder_layout = local_layout
-            decoder_mask = local_mask
-        else:
+        if full_resolution:
+            # Mutable bytes enter only the full-resolution decoder.  Do not
+            # construct dead local/global branch layouts or their BlockMasks.
+            local_layout = None
+            local_mask = None
+            global_layout = None
+            global_mask = None
             decoder_layout = CanvasBranchLayout(
                 clean.clean_valid,
                 branch_valid,
@@ -597,6 +860,93 @@ class DuoModel(DiffusionGemmaModel):
                 if clean.clean_ids.device.type == "cpu"
                 else build_canvas_block_mask(decoder_layout)
             )
+            preceding = self._preceding_patch_condition(
+                clean.clean_patch_states,
+                clean.clean_valid,
+                clean.document_ids,
+                clean.positions,
+                branch_starts,
+                (
+                    clean.attention_metadata
+                    if isinstance(clean.attention_metadata, DuoCleanPatchMetadata)
+                    else None
+                ),
+            )
+            decoder_projected_branch_conditions = tuple(
+                (
+                    preceding
+                    if block.conditioning == "split_cross_attention"
+                    else block.project_reusable_condition(preceding)
+                )
+                for block in self.decoder
+            )
+        else:
+            decoder_projected_branch_conditions = None
+            local_layout = CanvasBranchLayout(
+                clean.clean_valid,
+                branch_valid,
+                branch_starts,
+                self.config.local_window,
+                clean.positions,
+                source_positions,
+                clean.document_ids,
+                branch_segments,
+            )
+            local_mask = (
+                None
+                if clean.clean_ids.device.type == "cpu"
+                else build_canvas_block_mask(local_layout)
+            )
+            clean_patch_valid, clean_patch_documents, clean_patch_positions = (
+                _patch_metadata(
+                    clean.clean_valid,
+                    clean.document_ids,
+                    clean.positions,
+                    self.config.patch_stride,
+                )
+            )
+            canvas_patches = canvas // self.config.patch_stride
+            branch_patch_valid = branch_valid.view(
+                batch, branches, canvas_patches, self.config.patch_stride
+            ).any(-1)
+            branch_patch_positions = (
+                source_positions[:, :, :: self.config.patch_stride]
+                // self.config.patch_stride
+            )
+            global_layout = CanvasBranchLayout(
+                clean_patch_valid,
+                branch_patch_valid,
+                branch_starts // self.config.patch_stride,
+                self.config.global_window,
+                clean_patch_positions,
+                branch_patch_positions,
+                clean_patch_documents,
+                branch_segments,
+            )
+            global_mask = (
+                None
+                if clean.clean_ids.device.type == "cpu"
+                else build_canvas_block_mask(global_layout)
+            )
+            if self.config.decoder_prefix_window == self.config.local_window:
+                decoder_layout = local_layout
+                decoder_mask = local_mask
+            else:
+                decoder_layout = CanvasBranchLayout(
+                    clean.clean_valid,
+                    branch_valid,
+                    branch_starts,
+                    self.config.decoder_prefix_window,
+                    clean.positions,
+                    source_positions,
+                    clean.document_ids,
+                    branch_segments,
+                )
+                decoder_mask = (
+                    None
+                    if clean.clean_ids.device.type == "cpu"
+                    else build_canvas_block_mask(decoder_layout)
+                )
         return DuoCanvasCache(
             clean,
             branch_valid,
@@ -609,6 +959,7 @@ class DuoModel(DiffusionGemmaModel):
             global_mask,
             decoder_layout,
             decoder_mask,
+            decoder_projected_branch_conditions,
         )
 
     def forward_prepared(
@@ -636,6 +987,81 @@ class DuoModel(DiffusionGemmaModel):
         encoder_modulations, global_modulations, decoder_modulations, final_modulation = (
             self._adaln_modulations(time_condition)
         )
+        if self.config.duo_mutable_topology == "full_resolution_decoder":
+            del encoder_modulations, global_modulations
+            decoder = self.embedding(noisy_ids).flatten(1, 2)
+            branch_positions = cache.source_positions.flatten(1, 2)
+            projected_conditions = cache.decoder_projected_branch_conditions
+            if projected_conditions is None or len(projected_conditions) != len(
+                self.decoder
+            ):
+                raise AssertionError("full-resolution condition cache is incomplete")
+            for index, (block, bank, projected) in enumerate(
+                zip(self.decoder, clean.decoder, projected_conditions)
+            ):
+                projected = projected[:, :, None, :].expand(
+                    -1, -1, canvas, -1
+                ).flatten(1, 2)
+                if block.conditioning == "split_cross_attention":
+                    decoder = block.forward_branch_from_clean_bank_adaln(
+                        decoder,
+                        projected,
+                        decoder_modulations[index],
+                        bank,
+                        positions=branch_positions,
+                        layout=cache.decoder_layout,
+                        allow_dense_reference=noisy_ids.device.type == "cpu",
+                        block_mask=cache.decoder_block_mask,
+                    )
+                else:
+                    decoder = block.forward_branch_from_clean_bank_projected_adaln(
+                        decoder,
+                        projected,
+                        decoder_modulations[index],
+                        bank,
+                        positions=branch_positions,
+                        layout=cache.decoder_layout,
+                        allow_dense_reference=noisy_ids.device.type == "cpu",
+                        block_mask=cache.decoder_block_mask,
+                    )
+            final_shift, final_scale = final_modulation.chunk(2, dim=-1)
+            branch_states = self.decoder_norm(
+                decoder.view(batch, branches, canvas, self.config.local_dim)
+            )
+            branch_states = (
+                branch_states * (1 + final_scale[:, :, None])
+                + final_shift[:, :, None]
+            ).flatten(1, 2)
+            branch_logits = (
+                F.linear(
+                    branch_states,
+                    self.embedding.weight[: self.config.vocab.output_size],
+                )
+                if self.output is None
+                else self.output(branch_states)
+            )
+            clean_logits = (
+                self._logits(clean.clean_decoder_states)
+                if return_clean_logits
+                else branch_logits.new_empty(
+                    (batch, 0, self.config.vocab.output_size)
+                )
+            )
+            return DiffusionGemmaOutput(
+                clean_logits=clean_logits,
+                branch_logits=branch_logits.view(
+                    batch, branches, canvas, self.config.vocab.output_size
+                ),
+                clean_patch_states=clean.clean_patch_states,
+                branch_patch_states=clean.clean_patch_states.new_empty(
+                    (batch, branches, 0, self.config.global_dim)
+                ),
+                clean_decoder_states=(
+                    self.decoder_norm(clean.clean_decoder_states)
+                    if return_clean_states
+                    else None
+                ),
+            )
         branch = self.embedding(noisy_ids).flatten(1, 2)
         ngrams = self._branch_ngram_features(
             clean, noisy_ids, cache.branch_valid, cache.branch_starts
@@ -741,6 +1167,7 @@ class DuoModel(DiffusionGemmaModel):
         t: Tensor,
         *,
         attention_metadata=None,
+        clean_patch_metadata: DuoCleanPatchMetadata | None = None,
         local_block_mask_metadata: CanvasBlockMaskMetadata | None = None,
         global_block_mask_metadata: CanvasBlockMaskMetadata | None = None,
         local_block_mask=None,
@@ -757,6 +1184,25 @@ class DuoModel(DiffusionGemmaModel):
         encoder_modulations, global_modulations, decoder_modulations, final_modulation = (
             self._adaln_modulations(time_condition)
         )
+        if self.config.duo_mutable_topology == "full_resolution_decoder":
+            return self._forward_full_resolution_decoder(
+                clean_ids,
+                clean_valid,
+                document_ids,
+                positions,
+                noisy_ids,
+                branch_valid,
+                branch_starts,
+                attention_metadata=attention_metadata,
+                clean_patch_metadata=clean_patch_metadata,
+                decoder_block_mask_metadata=local_block_mask_metadata,
+                decoder_block_mask=local_block_mask,
+                return_clean_logits=return_clean_logits,
+                return_clean_states=return_clean_states,
+                allow_synthetic_branch_suffix=allow_synthetic_branch_suffix,
+                decoder_modulations=decoder_modulations,
+                final_modulation=final_modulation,
+            )
         return self._forward_branches(
             clean_ids,
             clean_valid,
@@ -777,6 +1223,266 @@ class DuoModel(DiffusionGemmaModel):
             global_modulations=global_modulations,
             decoder_modulations=decoder_modulations,
             final_modulation=final_modulation,
+        )
+
+    def _forward_full_resolution_decoder(
+        self,
+        clean_ids: Tensor,
+        clean_valid: Tensor,
+        document_ids: Tensor,
+        positions: Tensor,
+        noisy_ids: Tensor,
+        branch_valid: Tensor,
+        branch_starts: Tensor,
+        *,
+        attention_metadata: DiffusionGemmaAttentionMetadata | None,
+        clean_patch_metadata: DuoCleanPatchMetadata | None,
+        decoder_block_mask_metadata: CanvasBlockMaskMetadata | None,
+        decoder_block_mask,
+        return_clean_logits: bool,
+        return_clean_states: bool,
+        allow_synthetic_branch_suffix: bool,
+        decoder_modulations: tuple[Tensor, ...],
+        final_modulation: Tensor,
+    ) -> DiffusionGemmaOutput:
+        """Causal clean hierarchy plus an unpatched mutable byte decoder."""
+
+        if clean_ids.ndim != 2 or clean_ids.shape != clean_valid.shape:
+            raise ValueError("clean ids and valid must be aligned rank-2 tensors")
+        if document_ids.shape != clean_ids.shape or positions.shape != clean_ids.shape:
+            raise ValueError("document ids and positions must align with clean ids")
+        if noisy_ids.ndim != 3 or noisy_ids.shape != branch_valid.shape:
+            raise ValueError("noisy ids and validity must be aligned [B,M,C]")
+        expects_entropy = self.config.duo_clean_patching == "causal_entropy_v1"
+        if expects_entropy != (clean_patch_metadata is not None):
+            raise ValueError(
+                "Duo model config and supplied clean patch metadata disagree"
+            )
+        batch, branches, canvas = noisy_ids.shape
+        length = clean_ids.shape[1]
+        if canvas <= 0:
+            raise ValueError("full-resolution canvas length must be positive")
+        if clean_patch_metadata is None and length % self.config.patch_stride:
+            raise ValueError("clean length must remain patch aligned")
+        if branch_starts.shape != (batch, branches):
+            raise ValueError("branch starts must align [B,M]")
+        if len(decoder_modulations) != len(self.decoder):
+            raise ValueError("decoder AdaLN module count differs from decoder depth")
+        if not torch.compiler.is_compiling():
+            if bool(((branch_starts < 0) | (branch_starts >= length)).any()):
+                raise ValueError("canvas origins must lie inside the clean row")
+            if bool(
+                noisy_ids.masked_select(~branch_valid)
+                .ne(self.config.vocab.pad_id)
+                .any()
+            ):
+                raise ValueError("inactive branch positions must contain PAD")
+
+        if attention_metadata is not None and clean_patch_metadata is not None:
+            raise ValueError("Duo clean patch policies are mutually exclusive")
+        if attention_metadata is None and clean_patch_metadata is None:
+            attention_metadata = _packed_document_metadata(
+                clean_valid,
+                document_ids,
+                patch_stride=self.config.patch_stride,
+            )
+        clean_metadata = (
+            clean_patch_metadata
+            if clean_patch_metadata is not None
+            else attention_metadata
+        )
+        if clean_metadata is None:
+            raise AssertionError("clean metadata disappeared")
+        if clean_metadata.byte_indices.device != clean_ids.device:
+            raise ValueError("attention metadata and inputs must share a device")
+
+        offsets = torch.arange(canvas, device=clean_ids.device)
+        indices = branch_starts[:, :, None] + offsets
+        exists = indices.lt(length)
+        safe = indices.clamp_max(length - 1)
+        source_documents = torch.gather(
+            document_ids[:, None, :].expand(-1, branches, -1), 2, safe
+        )
+        branch_segments = torch.gather(document_ids, 1, branch_starts)
+        origin_positions = torch.gather(positions, 1, branch_starts)
+        source_positions = origin_positions[:, :, None] + offsets
+        expected_valid = (
+            torch.gather(
+                clean_valid[:, None, :].expand(-1, branches, -1), 2, safe
+            )
+            & exists
+            & source_documents.eq(branch_segments[:, :, None])
+        )
+        if not torch.compiler.is_compiling():
+            contiguous = offsets < branch_valid.sum(-1, keepdim=True)
+            if allow_synthetic_branch_suffix:
+                # Synthetic continuation is permitted only for rows already
+                # authenticated as a single clean document.  This flag never
+                # relaxes the attention layout's document or strict-prefix rule.
+                valid_documents = torch.where(
+                    clean_valid, document_ids, branch_segments[:, :1]
+                )
+                single_document = valid_documents.eq(
+                    branch_segments[:, :1]
+                ).all(1)
+                if (
+                    not torch.equal(branch_valid, contiguous)
+                    or bool((expected_valid & ~branch_valid).any())
+                    or not bool(single_document.all())
+                ):
+                    raise ValueError(
+                        "synthetic inference suffix must follow one contiguous clean document"
+                    )
+            elif not torch.equal(branch_valid, contiguous) or bool(
+                (branch_valid & ~expected_valid).any()
+            ):
+                raise ValueError(
+                    "branch validity must be a contiguous same-document source prefix"
+                )
+
+        clean_patch_states, clean_condition = self._clean_hierarchy(
+            clean_ids,
+            clean_valid,
+            document_ids,
+            positions,
+            attention_metadata,
+            clean_patch_metadata,
+        )
+        preceding = self._preceding_patch_condition(
+            clean_patch_states,
+            clean_valid,
+            document_ids,
+            positions,
+            branch_starts,
+            clean_patch_metadata,
+        )
+        physical_ids = torch.cat((clean_ids, noisy_ids.flatten(1, 2)), dim=1)
+        physical_positions = torch.cat(
+            (positions, source_positions.flatten(1, 2)), dim=1
+        )
+        decoder_states = self.embedding(physical_ids)
+        decoder_layout = CanvasBranchLayout(
+            clean_valid,
+            branch_valid,
+            branch_starts,
+            self.config.decoder_prefix_window,
+            positions,
+            source_positions,
+            document_ids,
+            branch_segments,
+        )
+        if decoder_block_mask is None and clean_ids.device.type != "cpu":
+            decoder_block_mask = build_canvas_block_mask(
+                decoder_layout, metadata=decoder_block_mask_metadata
+            )
+        for index, block in enumerate(self.decoder):
+            if block.conditioning == "split_cross_attention":
+                if clean_condition is None:
+                    raise AssertionError("split decoder condition is unavailable")
+                branch_condition = preceding[:, :, None, :].expand(
+                    -1, -1, canvas, -1
+                ).flatten(1, 2)
+                condition = torch.cat((clean_condition, branch_condition), dim=1)
+                decoder_states = block.forward_shared_document_branches_adaln(
+                    decoder_states,
+                    condition,
+                    decoder_modulations[index],
+                    positions=physical_positions,
+                    clean_length=length,
+                    clean_indices=clean_metadata.byte_indices,
+                    clean_cu_seqlens=clean_metadata.byte_cu_seqlens,
+                    assume_physical_clean=(
+                        clean_patch_metadata is not None
+                        or (
+                            attention_metadata.physical_layout
+                            if attention_metadata is not None
+                            else False
+                        )
+                    ),
+                    layout=decoder_layout,
+                    clean_window=self.config.decoder_prefix_window,
+                    allow_dense_reference=clean_ids.device.type == "cpu",
+                    block_mask=decoder_block_mask,
+                )
+                continue
+            projected_patches = block.project_reusable_condition(
+                clean_patch_states
+            )
+            clean_projected = self._clean_byte_condition(
+                projected_patches,
+                clean_valid,
+                document_ids,
+                positions,
+                clean_patch_metadata,
+            )
+            branch_projected = block.project_reusable_condition(preceding)
+            branch_projected = branch_projected[:, :, None, :].expand(
+                -1, -1, canvas, -1
+            ).flatten(1, 2)
+            projected_condition = torch.cat(
+                (clean_projected, branch_projected), dim=1
+            )
+            decoder_states = block.forward_shared_document_branches_projected_adaln(
+                decoder_states,
+                projected_condition,
+                decoder_modulations[index],
+                positions=physical_positions,
+                clean_length=length,
+                clean_indices=clean_metadata.byte_indices,
+                clean_cu_seqlens=clean_metadata.byte_cu_seqlens,
+                assume_physical_clean=(
+                    clean_patch_metadata is not None
+                    or (
+                        attention_metadata.physical_layout
+                        if attention_metadata is not None
+                        else False
+                    )
+                ),
+                layout=decoder_layout,
+                clean_window=self.config.decoder_prefix_window,
+                allow_dense_reference=clean_ids.device.type == "cpu",
+                block_mask=decoder_block_mask,
+            )
+
+        branch_states = decoder_states[:, length:].view(
+            batch, branches, canvas, self.config.local_dim
+        )
+        final_shift, final_scale = final_modulation.chunk(2, dim=-1)
+        branch_states = self.decoder_norm(branch_states)
+        branch_states = (
+            branch_states * (1 + final_scale[:, :, None])
+            + final_shift[:, :, None]
+        ).flatten(1, 2)
+        branch_logits = (
+            F.linear(
+                branch_states,
+                self.embedding.weight[: self.config.vocab.output_size],
+            )
+            if self.output is None
+            else self.output(branch_states)
+        )
+        clean_decoder_states = decoder_states[:, :length]
+        clean_logits = (
+            self._logits(clean_decoder_states)
+            if return_clean_logits
+            else decoder_states.new_empty(
+                (batch, 0, self.config.vocab.output_size)
+            )
+        )
+        return DiffusionGemmaOutput(
+            clean_logits=clean_logits,
+            branch_logits=branch_logits.view(
+                batch, branches, canvas, self.config.vocab.output_size
+            ),
+            clean_patch_states=clean_patch_states,
+            branch_patch_states=clean_patch_states.new_empty(
+                (batch, branches, 0, self.config.global_dim)
+            ),
+            clean_decoder_states=(
+                self.decoder_norm(clean_decoder_states)
+                if return_clean_states
+                else None
+            ),
         )
 
 

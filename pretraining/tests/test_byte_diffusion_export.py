@@ -147,8 +147,12 @@ def test_entropy_artifact_is_self_contained_counted_and_hash_authenticated() -> 
     assert "entropy_patcher" not in parse_artifact(fixed)[0]
     assert len(artifact) == report.artifact_bytes
     assert report.complete_bytes == len(artifact) + 1234
-    assert len(artifact) > len(fixed) + len(patcher_artifact)
-    assert info["payload_bytes"] == len(patcher_artifact)
+    assert len(artifact) < len(fixed) + len(patcher_artifact)
+    assert info["encoding"] == "zlib"
+    assert info["raw_bytes"] == len(patcher_artifact)
+    assert info["compressed_bytes"] == info["payload_bytes"]
+    assert info["compressed_bytes"] < info["raw_bytes"]
+    assert info["raw_sha256"] == hashlib.sha256(patcher_artifact).hexdigest()
     assert info["sha256"] == hashlib.sha256(patcher_artifact).hexdigest()
     assert info["max_patch_size"] == 5
     restored = load_embedded_entropy_patcher(artifact)
@@ -167,7 +171,7 @@ def test_entropy_artifact_rejects_patcher_tampering_and_counts_it_against_cap() 
     payload_start = len(MAGIC) + 8 + metadata_bytes
     corrupted = bytearray(artifact)
     corrupted[payload_start + int(info["payload_offset"])] ^= 1
-    with pytest.raises(ValueError, match="sha256 mismatch"):
+    with pytest.raises(ValueError, match="zlib payload|sha256 mismatch"):
         parse_artifact(bytes(corrupted))
 
     report = artifact_size_report(

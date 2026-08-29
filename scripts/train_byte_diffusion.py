@@ -24,14 +24,25 @@ import random
 import sys
 
 import torch
+from checkpointing import RecoveryCheckpointPolicy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pretraining.byte_diffusion.config import ByteDiffusionConfig, model_config_from_env
+from pretraining.byte_diffusion.config import (
+    FAST_BLT_ENTROPY_B4_COMPLETE_PRESETS,
+    ByteDiffusionConfig,
+    fast_blt_complete_model_config,
+    model_config_from_env,
+)
 from pretraining.byte_diffusion.data import DeterministicChunkCursor
 from pretraining.byte_diffusion.model import ByteDiffusionModel
+from pretraining.byte_diffusion.readiness_fast_blt import (
+    FastBltGeometry,
+    require_fast_blt_allocator_environment,
+    validate_fast_blt_readiness,
+)
 from pretraining.byte_diffusion.training import (
     PRODUCTION_PRESETS,
     ByteDiffusionTrainer,
@@ -50,6 +61,14 @@ def _local_imports(path: Path) -> tuple[Path, ...]:
     tree = ast.parse(path.read_text(), filename=str(path))
     candidates: set[Path] = set()
 
+    def add_package_initializers(target: Path) -> None:
+        parent = target.parent
+        while parent != REPO_ROOT and parent.is_relative_to(REPO_ROOT):
+            initializer = parent / "__init__.py"
+            if initializer.is_file():
+                candidates.add(initializer.resolve())
+            parent = parent.parent
+
     def add_module(parts: list[str]) -> None:
         if not parts:
             return
@@ -57,6 +76,7 @@ def _local_imports(path: Path) -> tuple[Path, ...]:
         for candidate in (module_path.with_suffix(".py"), module_path / "__init__.py"):
             if candidate.is_file():
                 candidates.add(candidate.resolve())
+                add_package_initializers(candidate)
 
     relative = path.relative_to(REPO_ROOT).with_suffix("")
     package = list(relative.parts[:-1])
@@ -123,6 +143,15 @@ def training_source_provenance() -> dict[str, object]:
     }
 
 
+def expected_model_config_for_run(run: TrainingRunConfig) -> ByteDiffusionConfig:
+    """Resolve the exact model identity required by a production run."""
+
+    if run.preset in FAST_BLT_ENTROPY_B4_COMPLETE_PRESETS:
+        assert run.preset is not None
+        return fast_blt_complete_model_config(run.preset)
+    return ByteDiffusionConfig()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -145,11 +174,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cpu-reference", action="store_true")
     parser.add_argument("--tiny", action="store_true")
+    parser.add_argument(
+        "--fast-blt-readiness-report",
+        type=Path,
+        default=(
+            Path(os.environ["BYTE_DIFFUSION_FAST_BLT_READINESS_REPORT"])
+            if "BYTE_DIFFUSION_FAST_BLT_READINESS_REPORT" in os.environ
+            else None
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if os.environ.get("BYTE_DIFFUSION_PRESET") in FAST_BLT_ENTROPY_B4_COMPLETE_PRESETS:
+        # Validate before the first CUDA query/allocation.  Setting an allocator
+        # variable here would be too late to establish a process-start contract.
+        require_fast_blt_allocator_environment()
     cpu_reference = args.cpu_reference or os.environ.get(
         "BYTE_DIFFUSION_ALLOW_CPU_REFERENCE", "0"
     ) == "1"
@@ -202,9 +244,13 @@ def main() -> None:
                 or os.environ.get("BYTE_DIFFUSION_TINY", "0") == "1"
             )
         )
-        if run.preset in PRODUCTION_PRESETS and model_config != ByteDiffusionConfig():
+        expected_model_config = expected_model_config_for_run(run)
+        if (
+            run.preset in PRODUCTION_PRESETS
+            and model_config != expected_model_config
+        ):
             raise ValueError(
-                f"preset {run.preset!r} requires the production model config"
+                f"preset {run.preset!r} requires its exact production model config"
             )
         chunk_size = int(
             os.environ.get(
@@ -257,6 +303,57 @@ def main() -> None:
             or manifest.eot_id != model_config.vocab.eot_id
         ):
             raise ValueError("data atomic manifest does not match the model vocabulary")
+        readiness_evidence: dict[str, object] | None = None
+        if run.preset in FAST_BLT_ENTROPY_B4_COMPLETE_PRESETS:
+            if args.fast_blt_readiness_report is None:
+                raise ValueError(
+                    "the complete Fast-BLT preset requires "
+                    "--fast-blt-readiness-report"
+                )
+            source_manifests = dataset_manifest.get("source_manifests")
+            patching = getattr(train_chunks, "patching", None)
+            if (
+                not isinstance(source_manifests, list)
+                or len(source_manifests) != 1
+                or not isinstance(source_manifests[0], dict)
+                or patching is None
+            ):
+                raise ValueError(
+                    "complete Fast-BLT data omitted source or patcher identity"
+                )
+            from scripts.benchmark_byte_diffusion_fast_blt import (
+                build_benchmark_run_config,
+            )
+
+            selected_microbatch = 32
+            selected_run = build_benchmark_run_config(
+                run, selected_microbatch
+            )
+            readiness_evidence = validate_fast_blt_readiness(
+                args.fast_blt_readiness_report,
+                source_sha256=str(source_provenance["sha256"]),
+                dataset_payload_sha256=str(dataset_payload_sha256),
+                source_manifest_sha256=str(source_manifests[0]["sha256"]),
+                atomic_manifest_sha256=manifest.sha256,
+                train_dataset_sha256=str(
+                    getattr(train_chunks, "dataset_sha256", "")
+                ),
+                validation_dataset_sha256=str(
+                    getattr(validation_chunks, "dataset_sha256", "")
+                ),
+                patcher_sha256=str(patching.artifact_sha256),
+                max_patch_size=int(patching.max_patch_size),
+                model_config=model_config,
+                production_run_config=run,
+                selected_run_config=selected_run,
+                geometry=FastBltGeometry(),
+                candidate_microbatches=(selected_microbatch,),
+                selected_microbatch=selected_microbatch,
+            )
+            dataset_provenance = {
+                **dataset_provenance,
+                "fast_blt_readiness": readiness_evidence,
+            }
         cursor = DeterministicChunkCursor(train_chunks, seed=run.seed, shuffle=True)
         effective_global_batch = run.global_batch_size or (
             run.microbatch_per_rank
@@ -288,11 +385,13 @@ def main() -> None:
         checkpoint = args.checkpoint or (
             REPO_ROOT / "ablation_results" / run.run_id / "checkpoint.pt"
         )
-        checkpoint_every = int(
-            os.environ.get("BYTE_DIFFUSION_CHECKPOINT_EVERY", "200")
+        checkpoint_policy = RecoveryCheckpointPolicy(
+            float(
+                os.environ.get(
+                    "BYTE_DIFFUSION_CHECKPOINT_INTERVAL_SECONDS", "480"
+                )
+            )
         )
-        if checkpoint_every <= 0:
-            raise ValueError("BYTE_DIFFUSION_CHECKPOINT_EVERY must be positive")
         if args.resume is not None:
             trainer.load_checkpoint(args.resume)
 
@@ -352,7 +451,11 @@ def main() -> None:
                         "world_size": distributed.world_size,
                         "initialization_kind": run.initialization_kind,
                         "resumed": args.resume is not None,
+                        "checkpoint_interval_seconds": (
+                            checkpoint_policy.interval_seconds
+                        ),
                         "causal_only_control": run.recipe == "causal_only",
+                        "fast_blt_readiness": readiness_evidence,
                     },
                     sort_keys=True,
                 ),
@@ -403,14 +506,25 @@ def main() -> None:
                         ),
                         flush=True,
                     )
-                # Validation remains intentionally frequent for 2k ablation
-                # curves, but serializing the ~276 MB model+optimizer payload
-                # at every validation point creates a synchronous host/GPU
-                # bubble every 20 updates.  Recovery checkpoints have their
-                # own, much sparser cadence; the terminal update is always
-                # durable.
-                if step % checkpoint_every == 0 or step == run.iterations:
-                    trainer.save_checkpoint(checkpoint)
+            # Recovery is independent of validation and is checked at every
+            # completed exact-resume update boundary.
+            checkpoint_due = (
+                checkpoint_policy.due()
+                if distributed.is_primary
+                else False
+            )
+            if distributed.world_size > 1:
+                due_flag = torch.tensor(
+                    int(checkpoint_due), device=device, dtype=torch.int32
+                )
+                torch.distributed.broadcast(due_flag, src=0)
+                checkpoint_due = bool(due_flag.item())
+            if checkpoint_due or (
+                step == run.iterations
+                and checkpoint_policy.terminal_due(step)
+            ):
+                trainer.save_checkpoint(checkpoint)
+                checkpoint_policy.committed(step)
     finally:
         distributed.close()
 

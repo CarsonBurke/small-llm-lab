@@ -59,6 +59,23 @@ not a substitute for the paper.
 | Fast-dLLM v2 | `papers/fast_dllm_v2_2509.26328.pdf` | `9e3dcb349e0269fee8ac8c525131284a6408e506900c69940bb898f41274d49f` |
 | Scaling Beyond Masked Diffusion Language Models | `papers/scaling_beyond_masked_diffusion_language_models_2602.15014.pdf` | `c08d5d7d00a9f67b6989fdf6305fb4d729a58e5c6f77bf7e3aae9908d350f3e1` |
 
+Executable reference checkouts are pinned beside this repository. They are
+read-only design evidence and are not imported by the training package:
+
+| Reference implementation | Local checkout | Revision | Scope |
+|---|---|---|---|
+| Meta BLT | `../blt` | `9774ed4fcc78313f9f218295f3d7e4decdadf2ae` | Official entropy patcher, byte/patch hierarchy, pooling, and local cross-attention |
+| I-DLM | `../I-DLM` | `a23c1a12ef997c7f3ad616b25bcfb62db39ded68` | Official all-masked causal training and introspective serving implementation |
+| Fast-dLLM v1/v2 | `../Fast-dLLM` | `a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b` | Official prefix/dual cache, confidence-parallel decoding, and hierarchical block cache |
+| Scaling-dLLMs | `../scaling-dllms` | `9e09467d738cdfee44a1063a4af022c15feb9353` | Official masked, uniform-state Duo, and interpolating training/sampling code |
+| DiffusionGemma Transformers | `../transformers-diffusiongemma` | `0cdd8a1908949037cf7718769ffc03dbdf9d9fd6` | Paper-designated reference model and generation implementation |
+| DiffusionGemma vLLM | `../vllm-diffusiongemma` | `ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9` | Paper-designated optimized serving implementation |
+
+As of 2026-08-13, Fast-BLT does not publish BLT-D/BLT-DV source. The
+official Meta BLT checkout predates the Fast-BLT paper and contains no BLT-D
+implementation. Fast-BLT fidelity must therefore be checked against the PDF
+plus executable BLT primitives rather than claimed from unavailable code.
+
 The papers answer different questions:
 
 - BLT and Fast BLT define the byte hierarchy, causal entropy patching, and a
@@ -73,6 +90,69 @@ The papers answer different questions:
 - Scaling-dLLMs supplies the promoted mask-free forward process, exact
   lower-variance NELBO, exact reverse posterior, and explicit time
   conditioning.
+
+### Executable-reference decision
+
+The checked-out implementations rule out treating one hybrid as if it copied
+all references. The scratch primary cell uses the following explicit
+copy/adapt/reject policy.
+
+Copy from Scaling-dLLMs/Duo:
+
+- one categorical state per mutable byte or typed control;
+- uniform-state corruption, continuous time, exact lower-variance NELBO, and
+  the exact reverse posterior;
+- per-block and final zero-initialized AdaLN modulation; and
+- an untied, zero-initialized categorical output head.
+
+Adapt from BLT and Fast-BLT:
+
+- entropy-patch only immutable clean bytes;
+- keep the clean local encoder continuous and causal across patch boundaries;
+- pool each clean variable-length patch once and use sequential latent
+  positions in the global transformer;
+- keep each noisy future byte at full resolution, with its original byte
+  position, instead of sending noisy bytes through the patch pool/global
+  hierarchy;
+- let the noisy block attend bidirectionally within itself, causally to clean
+  prefix state, and by split cross-attention to the preceding clean latent;
+  and
+- incrementally cache closed clean patches while carrying and recomputing only
+  the final open clean patch across commits.
+
+Keep as separate complete controls:
+
+- Fast-BLT's absorbing MASK, clean causal next-byte loss, and `1/t`-weighted
+  masked reconstruction;
+- DiffusionGemma's dense clean-target CE, 50% self-conditioning, uniform
+  replacement sampler, and conversion/post-training pipeline; and
+- I-DLM/Fast-dLLM's causal proposal, introspective verification, and
+  AR-compatible caches.
+
+Reject in the primary cell:
+
+- fixed or overlapping latent patches on mutable bytes;
+- target-derived entropy boundaries on noisy bytes;
+- boundaries recomputed from corrupted bytes;
+- causal n-gram features over corrupted garbage;
+- a serving-only prompt-phase workaround that training never sees; and
+- sampler mechanisms borrowed from a different training objective without
+  their matching training procedure.
+
+This is an informed adaptation, not an exact reproduction. Scaling-dLLMs and
+DiffusionGemma use flat full-resolution backbones; Fast-BLT keeps the noisy
+block only in its local decoder and validates block sizes 4, 8, and 16. The
+hybrid retains BLT's efficient clean hierarchy but gives a large mutable byte
+canvas a capacity-matched full-resolution decoder. Block width remains an
+ablation variable rather than assuming that 512 is optimal.
+
+“Byte carry” must not conflate two mechanisms. BLT's official implementation
+keeps causal local-byte context continuous across patch boundaries and seeds
+its local decoder with local-encoder states. Fast-BLT explicitly changes the
+diffusion decoder input to a fresh embedding lookup over the concatenated clean
+and corrupted byte sequences. The faithful Fast-BLT control therefore uses
+fresh decoder embeddings; an encoder-to-decoder skip is a separately named
+BLT/U-Net ablation, not silently mixed into it.
 
 ## Representation
 
@@ -160,6 +240,48 @@ local encoder layer, nine global blocks, and two decoder blocks. The clean
 prefix is document-isolated and causal; a noisy branch sees that prefix and
 its own branch bidirectionally, never another branch or future clean targets.
 
+Executable-source inspection sharpens an important limitation of this layout.
+No reference groups a large mutable diffusion canvas into disjoint fixed
+four-byte patches:
+
+- BLT entropy-patches clean bytes and pools only bytes assigned to each
+  variable patch;
+- Fast-BLT keeps its B4/B8/B16 corrupted future block in the local decoder;
+  its unavailable BLT-D source cannot justify a different implementation;
+- DiffusionGemma recomputes every canvas token independently with the full
+  shared backbone against a read-only causal prefix cache;
+- Scaling-dLLMs applies a flat bidirectional DiT directly to tokenizer-token
+  positions; and
+- I-DLM avoids the issue with strict token-causal proposal topology.
+
+Byte-Duo's fixed stride four is therefore an efficient large-canvas adaptation,
+not a paper mechanism and not a UTF-8 boundary. It does not cut local byte
+communication at four-byte edges: the branch local encoder and decoder each
+attend bidirectionally across the complete 512-byte branch. The stride affects
+only how those already contextualized byte states are compressed into the
+global route and assigned back to decoder positions.
+
+An eight-byte-overlap/stride-four proposal was rejected before integration.
+It would have changed compression and unpooling without restoring any missing
+local byte continuity, and no reference uses that construction. The two
+reference-supported alternatives are structurally different: BLT uses causal
+dynamic patches for the clean sequence, while Fast-BLT keeps its consecutive
+noisy future block out of the local encoder and global patch transformer and
+runs it directly through the full-resolution local decoder conditioned on the
+preceding clean latent. DiffusionGemma and Scaling-dLLMs instead use a flat
+full-resolution backbone with no patch lattice. These alternatives must be
+tested as complete cells rather than approximated by overlapping fixed groups.
+
+The ablation order isolates these claims. First, keep the authenticated v5
+corpus, fixed clean-prefix hierarchy, corruption ledger, optimizer, and
+8-global/4-decoder allocation, but bypass pooling/global processing for the
+mutable branch. This tests only mutable topology. Next, if it passes, replace
+the clean fixed lattice with authenticated causal entropy patches and
+document-local patch-ordinal RoPE. Only then reallocate additional global
+capacity into the full-resolution decoder and sweep block width. The final
+design is not allowed to retain the fixed clean lattice merely because the
+first topology control does.
+
 Parameter counts for the default cells are:
 
 | Cell | Parameters |
@@ -193,9 +315,13 @@ compare the fused path to the transparent formula.
 
 Byte-Duo has an explicit sinusoidal time embedding followed by a small MLP.
 One packed zero-initialized projection produces independent per-layer AdaLN
-shift, scale, and gate slices for the branch path. Packing preserves the
-parameterization while replacing dozens of small projection launches with one
-GEMM. The clean bank is time-independent and cacheable. This is
+shift, scale, and gate slices for the mutable branch path. The legacy topology
+modulates encoder, global, and decoder blocks because mutable states traverse
+all three. The full-resolution topology emits only decoder and final-norm
+slices: its clean encoder/global hierarchy is time independent, so allocating
+those modulation rows would create about 0.86M dead parameters. Packing the
+live slices replaces small projection launches with one GEMM. The clean bank
+is time-independent and cacheable. This is
 one of the principal differences from Fast BLT, whose absorbing corruption
 does not require the same explicit uniform-state time parameterization.
 The completed baseline uses 64 Fourier features and condition width 32. The
@@ -363,6 +489,48 @@ for the measured high-noise denoising bottleneck. It uses the same canonical
 Cross-run promotion requires a five-ledger improvement greater than 0.005
 bits/atom; failed likelihood arms do not receive GSM/NFE follow-ups.
 
+The promoted full-resolution mutable-topology control uses one clean encoder,
+six clean-global blocks, eight byte-decoder blocks, decoder FFN width 880, and
+24,025,677 parameters. Mutable bytes remain at all 512 byte positions through
+all eight decoder blocks; they are never pooled into a 128-state stride-four
+lattice. Only the immutable clean bank is pooled. Branch-constant preceding
+latents are projected once per branch and decoder layer, then broadcast over
+the 512 bytes; inference caches those projected conditions across denoising
+transitions. Random-phase training and a separate exact-byte-origin serving
+ledger close the former aligned-origin train/serve mismatch.
+
+This control completed 2,000 updates with an online final NELBO of `2.510111`
+bits/atom in 6,483.73 seconds. Its five-ledger canonical mean is `2.533413`
+bits/atom with approximate 95% interval `[2.528974, 2.537853]`; the exact-byte-
+origin serving mean is `2.534914` with interval `[2.530762, 2.539066]`. The
+previous pooled 8-global/4-decoder result was `2.569715` on its five-ledger
+canonical evaluation, so the improvement is about `0.0363` bits/atom and is
+well beyond ledger noise. The tradeoff is measured training time: 6,483.73
+seconds versus 5,082.60 seconds for that pooled predecessor, about 27.6% slower.
+Eight-step categorical GSM8K remains `0/3957` exact with only two parsed
+answers, so better conditional likelihood has not yet produced mathematical
+reasoning at this pretraining scale.
+
+The next isolated ablation changes only the immutable clean-bank patch policy
+from fixed groups of four to authenticated causal-entropy patches of length
+one through eight, targeting mean length four. It retains the exact same
+24,025,677 trainable parameters and full-resolution mutable canvas. Patches
+use document-local ordinal positions, add no virtual BOS latent, and expose a
+patch latent to a clean byte only when that byte closes the patch; otherwise
+the byte sees the preceding closed patch or the exact zero prior. An arbitrary
+mutable origin is conditioned on its preceding closed patch. A prompt ending
+inside an open patch retains those clean bytes as direct decoder K/V but
+withholds the unfinished patch latent. Thus entropy patching changes clean
+compression boundaries without reintroducing mutable-byte pooling or target
+lookahead.
+
+The fresh same-source 9-global/2-decoder pure-Duo control was terminated at
+step 630 rather than completed. At the last shared checkpoint, step 600, its
+fixed validation ledger was `3.162384` bits/atom versus `3.061337` for the
+8-global/4-decoder candidate, a candidate delta of `-0.101047`. This is strong
+early rejection evidence under the run-killing policy, but it is not a
+2,000-step or five-ledger comparison and must not be reported as one.
+
 The joint-objective cell changes no architecture, data, corruption, schedule,
 or sampler setting. It optimizes the fixed equal-weight sum of two separately
 global-normalized terms: exact Duo NELBO over active corrupted atoms, plus
@@ -421,6 +589,18 @@ selected documents. Its manifest explicitly records
 `selection_unit=utf8_bytes`. Thus “2k corpus” means enough deterministic source
 for 2,000 matched updates; it is tokenized separately for each model only
 after document selection.
+
+The clean-entropy ablation uses `data/byte_diffusion_entropy_v6_b4`, payload
+SHA-256 `c9f57d27f0910f0751bc9c5b0989203ee6a668f80ce72bd09febdd15ff45772b`,
+and patcher SHA-256
+`1409df540343409c9186d8f4ec674636d159f74e3a72af214e6d9b991cb2472c`.
+It contains the same selected 4,194,303,930 training atoms and 3,263,762
+documents, including MathGLM v6, but repacks physical pages so an entropy patch
+does not cross an 8,192-byte page cut. That removes artificial continuation
+padding and is semantically preferable, but it means a v6-versus-v5 training
+delta is not a perfectly isolated causal estimate. A marginal result requires
+a paired logical-coordinate ledger or a fresh fixed-patch control on the v6
+packing before attribution.
 
 ## Metrics
 
@@ -548,24 +728,50 @@ training-throughput reference, not a generation benchmark.
 ### Next complete paper cells
 
 The next Fast-BLT control is capacity-matched rather than assembled from the
-individually tested partial features. It uses one encoder block, eight global
-blocks, two decoder blocks, FFN widths `512/600/512`, distinct rank-16 hash
-tables for orders 3 through 8 with `/7` mean aggregation, split decoder
-cross-attention, causal entropy patches, Bernoulli absorbing corruption, and
-the paper-sum AR plus denoising objective. This configuration has 23,010,304
-parameters, two fewer than the 23,010,306-parameter Fast-BLT base. Removing
-one 704-wide global block saves 2,130,944 parameters and narrowing the eight
-remaining global SwiGLUs from 704 to 600 saves 1,277,952, exactly compensating
-for the 3,408,894 parameters added by per-order n-grams and split attention.
-The diffusion block length is independent of the entropy patcher's maximum
-patch size; B4, B8, and B16 use 2,048, 1,024, and 512 branches respectively so
-each row retains an 8,192-byte branch budget. Uniform group-32 int4 is the
-preferred export preflight: the current complete-size estimate is 15,246,952
-bytes, leaving 753,048 bytes under the 16 MB cap. This remains a compressed
-paper-faithful control because its n-gram tables and count-based entropy model
-are much smaller than the reference systems. It requires a dedicated preset,
-real-topology readiness support, and cached split-attention conditions before
-its 2,000-update ablation.
+individually tested partial features. The closed
+`fast_blt_entropy_b4_complete_g6d8_v1` cell uses one encoder block, six global
+blocks, eight decoder blocks, FFN widths `512/512/680`, distinct rank-16 hash
+tables for orders 3 through 8 with BLT-prime hashing and `/7` mean aggregation,
+and split decoder cross-attention before every decoder layer. It has 24,013,824
+parameters, 11,853 fewer than the retained 24,025,677-parameter G6/D8 Duo.
+The two compressed departures from BLT are explicit: 8,192-entry rank-16
+per-order tables instead of full-width 500k tables, and the authenticated
+count-based causal entropy model instead of BLT's large neural entropy model.
+
+The training population is ragged, not a rectangular `B4×2048` bank. For each
+clean row, every physical entropy patch start with a local preceding latent is
+one four-byte block. The first physical patch of a document is valid because
+its preceding latent is the local virtual-BOS patch; only a continuation-page
+start whose prior latent lives on the previous page is omitted. A block may
+cross any number of entropy patches and may split a UTF-8 code point. If it
+extends past the finite 8,192-byte training sequence, the available
+same-document prefix is supervised and the rest is PAD, matching Fast-BLT's
+finite-sequence rule. Clean bytes remain one continuous causal stream across
+patch boundaries. Every row draws one `t`; all block bytes use independent
+Bernoulli masks at that `t`; the objective is the paper's summed clean CE plus
+`1/t` masked reconstruction sum, followed by a row mean. There is no origin
+sampling or importance weight.
+
+The implementation uses compact segmented Perceiver pooling, one shared clean
+byte K/V bank, exhaustive flat branch storage, and cached two-key split
+conditions. Training and validation group rows by measured physical work
+`8192 + 4M`, not by a fictional fixed branch count. Exact cumulative grouping
+and real-group splitting keep DDP backward-call counts equal without dummy
+supervision. Readiness must authenticate the actual per-update origin counts,
+branch atoms, microsteps, physical work, mask-construction cost, graph reuse,
+VRAM, utilization, and power before the 2,000-update ablation.
+
+That complete D4 result is the decision point for further patching work. The
+next patch ablations, each separately named and holding the complete cell
+fixed, are: (1) project entropy cuts onto valid UTF-8 code-point starts, using
+the last complete-codepoint boundary before max size and a raw-byte fallback
+for invalid streams; (2) BLT monotonic/jump entropy boundaries; (3) the
+official BLT BPE and whitespace/static patchers. UTF-safe cuts are not a
+reference mechanism and must not be mixed into the first Fast-BLT result.
+Likewise, a 512-byte decoder-prefix window is a separately named systems
+adaptation if the paper-faithful unbounded prefix is too slow; it must not be
+silently substituted into the complete cell. B8 and B16 follow only after D4
+establishes whether the full mechanism is useful.
 
 DiffusionGemma's next implementation is inference-only persistent hierarchical
 prefix caching, not another training-objective hybrid. For prompt length `L`,
@@ -585,14 +791,21 @@ CE must never be relabeled as BPB.
 
 ## Memory, export, and readiness
 
-The completed group-32 int4 Byte-Duo artifact is `13,584,549` model bytes and
-`15,576,571` bytes with its exact counted executable closure, leaving
-`423,429` bytes. It improves on group 64 by `0.00768` nats/atom, but its
-post-quantization NELBO is still `1.87978` nats/atom versus `1.83321` for the
-matched float ledger, a material regression that must not be hidden. The entropy Fast-BLT artifact embeds
-its authenticated 1,069,713-byte patcher; measured production accounting is
-14,445,439 total bytes including 1,132,603 code bytes, leaving 1,554,561 bytes.
-The parser authenticates patcher SHA/configuration and payload contiguity.
+The completed historical group-32 int4 Byte-Duo artifact is `13,584,549`
+model bytes and `15,576,571` bytes with its then-current executable closure,
+leaving `423,429` bytes. It improves on group 64 by `0.00768` nats/atom, but
+its post-quantization NELBO is still `1.87978` nats/atom versus `1.83321` for
+the matched float ledger, a material regression that must not be hidden.
+
+The current 6-global/8-decoder clean-entropy preflight is `14,768,783` complete
+bytes including the exact executable closure and a 128 KiB reserve, leaving
+`1,231,217` bytes below the 16 MB cap. The authenticated 1,069,713-byte entropy
+patcher is stored losslessly as a 492,660-byte zlib stream. Loading is bounded
+and rejects corrupt, truncated, trailing, or oversized streams; the raw SHA,
+configuration, schedule epsilon, patch policy, and atomic manifest are all
+bound. A dedicated Duo serving/GSM entry point keeps independent I-DLM,
+DiffusionGemma, JEPA, post-training, and nanoGPT stacks out of the counted
+deployment closure rather than hiding them with accounting exclusions.
 
 Training is not allowed to start merely because it fits memory. The readiness
 report must authenticate source, data, model, objective, global batch,
@@ -628,8 +841,9 @@ or utilization would reward a larger batch instead of a faster trajectory.
 
 1. Pass strict Byte-Duo training/validation readiness and inference readiness.
 2. Run exactly 2,000 updates through the standard ablation runner with frozen
-   source/data hashes: the readiness-selected microbatch (currently M16) on the 32 GiB development
-   GPU and a single M32 local batch on each 8×H100 rank.
+   source/data hashes: the readiness-selected microbatch on the 32 GiB
+   development GPU and an independently qualified local batch on each 8×H100
+   rank.
 3. Evaluate conditional-canvas NELBO on at least five independent 2,048-row
    ledgers.
 4. Run 5-shot GSM8K over seeds 0, 1, and 2 with categorical Duo sampling and a
