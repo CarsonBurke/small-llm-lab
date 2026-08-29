@@ -5365,3 +5365,476 @@ Superseded and not to be used: `data/mathglm/v1` and `v2` contain the false
 arithmetic outright; `v3` and `v4` are lossy from defects 1 and 2; `v5` admits
 the wide-product errors of defect 4. `data/math_drills/v1` through `v3` predate
 the panel binding.
+
+## 2026-08-18: DiffusionBlocks conversion of the KDA hybrid — design and pre-registration
+
+DiffusionBlocks (Shing et al., ICLR 2026, arXiv:2506.14202; reference code in
+`../DiffusionBlocks`) reinterprets residual connections as Euler steps of a
+reverse diffusion over the hidden state and trains each block of layers as an
+independent denoiser over its own equal-probability-mass slice of the EDM
+lognormal noise schedule (P_mean -1.2, P_std 1.2, sigma in [0.002, 80],
+sigma_data 0.5, gamma 0.1 log-overlap). Exactly one block receives gradients
+per optimizer step, so gradient/activation/optimizer memory scales with
+num_layers/num_blocks; the paper's LM adaptation noises the unit-L2-normalized
+embedding of the *next* token and conditions on the clean prefix, reporting
+LM1B PPL 14.58 -> 12.32 on a 12-layer Llama-2-style model with B=4.
+
+New trainer: `pretraining/nanogpt_mini/nanogpt_mini_gpt2vocab_kda_dblock_train.py`
+with importable math in `pretraining/nanogpt_mini/nanogpt_mini_dblock.py`.
+Block partition follows the architecture: every maximal run of KDA mixers plus
+the dense attention layer that closes it is one diffusion block (default 24L
+3:1 schedule -> 6 blocks of KDA,KDA,KDA,dense). The paper's
+sequence-concatenation trick assumes dense attention, so the recurrent mixers
+required a new construction: the residual stream is [clean(T), noisy(T)];
+dense layers use a flex_attention mask where the noisy slot for target i
+(acting at RoPE position i+1) attends clean keys j<=i plus itself; KDA layers
+interleave [c_0, n_0, c_1, n_1, ...] through one chunk_kda call with the
+noisy slots' decay and beta logits forced to -30000, which the in-kernel
+sigmoids turn into decay 1 / write 0. The clean state trajectory is therefore
+bit-identical to a clean-only pass and each noisy slot reads the state after
+its inclusive clean prefix (CPU-proved against the pure-PyTorch KDA oracle in
+`pretraining/tests/test_nanogpt_mini_dblock.py`, 20 tests; CUDA kernel parity
+in `pretraining/tests/test_nanogpt_mini_dblock_gpu.py`). Short convs give the
+noisy branch the window [c_{i-2}, c_{i-1}, c_i, n_i]. Zero-init AdaLN
+shift/scale from a DiT sigma embedder modulates only the noisy half, so clean
+computation is sigma-independent and the trunk stays exactly paired with the
+baseline's init RNG. Known deliberate deviation: read-only KDA slots drop the
+delta-rule self-write a committed step would add before its own read; dense
+keeps the self key; both are identical at train and inference time.
+
+Validation is not training reward: it is the honest generative chain —
+num_blocks Euler steps from pure per-row-seeded noise, each level routed to
+the block owning its sigma, softmax-expectation denoising over the normalized
+embedding table, and the final level's teacher-forced CE reported as
+val_loss/val_bpb, directly comparable to the baseline trainer's numbers.
+
+Hypothesis: at matched total FLOPs the blockwise regime trades some quality
+for a large cut in training-step VRAM (roughly num_layers/num_blocks of the
+grad-live stack, minus the 2x sequence width) and converts the freed memory
+into larger microbatches and higher throughput. Success criterion: training
+peak VRAM materially below baseline (>=2x) with chain val_bpb on the shared
+fineweb panel within striking distance of the baseline's teacher-forced
+val_bpb at matched FLOPs; failure modes pre-registered: chain CE dominated by
+error accumulation across levels (visible in per-level CE telemetry),
+low-sigma blocks starved by the EDM weight profile, or KDA read-only slots
+providing too little context mixing for late blocks. FLOPs accounting: one
+dblock step touches ~2T tokens x L/B layers ~ 1/3 of a baseline step at B=6,
+so matched-FLOPs arms run 3x the steps; per-block update count is then still
+half the baseline's per-layer count.
+
+Arms (all on `data/datasets/fineweb10B_gpt2`, SEED 1337, global batch 524288
+tokens, seq 1024, VAL_TOKENS 4194304, VAL_LOSS_EVERY 100, stable_linear):
+A baseline trainer 24L 1000 steps (MBS 8); B dblock 24L B=6 3000 steps
+(MBS 8, ~matched FLOPs); C dblock as B but MBS raised to exploit freed VRAM
+(throughput arm). A GPU parity suite and a 12-step engineering shakeout
+(shapes/compile only, not evidence) gate the arms; mlq jobs 3070/3071.
+
+modded-nanogpt caveat, recorded up front: their records require the fixed
+teacher-forced eval; the dblock chain changes evaluation semantics, so any
+upstream submission is an experimental/discussion contribution, not a record
+claim.
+
+### Amendment (same day): schedule-matched arms
+
+The original A(1000) vs B(3000) pairing confounded blockwise training with a
+different LR-schedule horizon and 3x the consumed tokens (stable_linear
+anneals over each run's own step count). Corrected design compares only
+within matched-schedule pairs, all else identical (SEED 1337, data stream,
+global batch 524288, seq 1024, panel, val cadence):
+
+- 1000-step pair — A1000 baseline (mlq 3080) vs B1000 dblock (3083): the
+  controlled test of blockwise training itself at matched steps, data, and
+  schedule; dblock spends ~1/3 the FLOPs and trains each block ~167 times.
+- 3000-step trio — A3000 baseline control (3086), B3000 dblock (3084;
+  FLOPs-matched to A1000 but quality claims stay within this trio), C3000
+  dblock MBS 32 (3085; throughput arm).
+
+Jobs 3081/3082 were cancelled before start and resubmitted as 3084/3085.
+
+### Amendment 2 (same day): microbatch shape and run naming
+
+The first launcher used MBS=8 at seq 1024 (64 microbatches per 524288-token
+step): 4.3 s/step at 54% GPU / 305 W — launch-bound, far off the machine's
+known envelope (previous 524288-token runs at MBS=32 sustain ~1.25 s/step
+near 500 W). All arms were cancelled (baseline had reached step 580; its
+partial log logs/dblockA_base24L_1k.txt is retained but is not evidence) and
+resubmitted at MBS=32, throughput arm at MBS=64. Names now separate the pure
+AR control from DiffusionBlocks arms: ar_base24L_1k_mbs32 (mlq 3088),
+dblock_db6_1k_mbs32 (3089), dblock_db6_3k_mbs32 (3090), dblock_db6_3k_mbs64
+(3091), ar_base24L_3k_mbs32 (3092). MBS is a gradient-accumulation detail:
+losses are token sums and chain-validation noise is per-absolute-row, so
+results are MBS-invariant; only throughput and peak VRAM depend on it.
+
+### Results: 1000-step matched pair, and diagnosis of the dblock chain
+
+Completed runs: ar_base24L_1k_mbs32 (mlq 3088) and dblock_db6_1k_mbs32
+(3089), identical seed/data/schedule/panel.
+
+- Baseline: val_loss 3.59192 (1.1701 bpb) at step 1000; 2.38 s/step; peak
+  14355 MiB allocated.
+- Dblock: chain val_loss 8.327 at its step-300 minimum, then monotone
+  worsening to 9.36522 (3.0508 bpb) at step 1000. Efficiency claims held:
+  1.30 s/step (1.83x faster) and 8652 MiB training-window peak (~40% less
+  allocated VRAM); the freed memory is real but currently buys nothing.
+
+The failure is not distributed uniformly. Per-block training CE is healthy
+to excellent (blocks 0/1 ~5.0-5.7 at high sigma; block 3 -> 0.86; blocks
+4/5 -> ~0.05-0.07), and chain level 0 — whose input is pure noise, so its
+CE measures context-only prediction by a 4-layer block — improves steadily
+to 5.53. But mid/low-sigma chain levels sit at or far above the uniform CE
+of 10.83 (level3 13.68, level4 16.88 at step 1000): those blocks are
+confidently wrong on chain inputs while near-perfect on training inputs.
+
+Working diagnosis — train/inference input mismatch, not mis-wiring. In
+training, every block receives z = y + sigma*eps with y the true unit-norm
+target embedding; at sigma <= 0.2 nearest-neighbour decoding over ~50k
+near-orthogonal embeddings is trivial, so the low-sigma half of the network
+learns to read the target out of its own noisy input (train CE 0.05)
+instead of modelling context. At inference the Euler chain instead delivers
+the previous level's softmax-expectation embedding; with per-token posterior
+perplexity in the tens-to-hundreds that expectation is a near-zero-norm
+mixture, and leak-trained blocks decode a wrong nearest token from it with
+high confidence — CE above uniform, worsening as upstream blocks sharpen.
+
+Literature check: the reference implementation's diffusion_step matches our
+chain exactly (equi-mass grid, steps = blocks by default, expectation
+denoising, final denoise at sigma_min), but the paper evaluates its AR
+text models only with MAUVE and teacher-scored generative perplexity of
+sampled text, stating that traditional perplexity "is not derived from
+ELBO" and is non-trivial for the framework. Teacher-forced chain CE — our
+pre-registered success metric — is a question the paper deliberately does
+not answer, and its released code covers only image classification, where
+sharp posteriors hide the mechanism.
+
+Actions: queued 3k arms 3090/3091 and control 3092 cancelled before start
+(no point burning ~5 GPU-h on a diverging recipe). Added an env-gated
+DBLOCK_DIAG evaluation mode to the dblock trainer (subagent-reviewed; the
+expectation-mode probe is a line-for-line replica of chain_validation_loss
+and must reproduce val_loss as a self-check) and queued mlq 3102 on the
+final checkpoint with four probes: per-level oracle inputs y + sigma*eps
+(clears or convicts wiring), renormalized-expectation chain (isolates the
+norm collapse), sampled-token-embedding chain (stays on the training
+manifold; candidate cheap fix), and a 24-step fine chain (tests Euler
+discretization coarseness). Verdict between "implementation bug" and
+"method property under likelihood evaluation" is deferred to those probes;
+the modded-nanogpt submission idea is off the table either way unless the
+chain metric is repaired. Partial logs of the cancelled arms and the
+superseded MBS=8 attempt remain non-evidence.
+
+### Amendment 3: reference-code audit found two fidelity gaps; DiT arm queued
+
+Line-by-line comparison of the trainer against the DiffusionBlocks reference
+(vit.py / model.py) and the paper's Appendix E.4 ("augmented with time
+conditioning as in DiT") found the port faithful on the chain protocol, EDM
+coefficients, equal-mass bands, gamma overlap, CE-for-L2 swap, normalized
+embeddings, and pre-combine layernorm — but unfaithful in two places:
+
+1. The reference sigma-conditions the OUTPUT HEAD: forward_output_embeddings
+   applies a per-sigma shift/scale (zero-init) to the EDM denoised estimate
+   before the classifier. Our shared vocab head saw raw denoised vectors
+   whose scale varies roughly 10x across blocks (c_out*normed-hidden at
+   sigma 80 vs c_skip*z at sigma 0.002) with no adaptation mechanism.
+2. The reference modulates EVERY token per layer (DiT adaLN on context and
+   noisy alike, plus zero-init residual gates); ours modulated only the
+   noisy stream, keeping context features sigma-independent.
+
+Honest prior: per-block training CE was already excellent, so the head and
+context conditioning evidently suffice in-distribution; these gaps are
+unlikely to be the whole explanation for the chain divergence, whose
+mechanism (expectation-embedding norm collapse feeding leak-trained blocks)
+is orthogonal. But they are the two concrete infidelities a "faithful
+implementation" claim must not carry, so they get an arm.
+
+New env flag DBLOCK_DIT_FIDELITY=1 (default off; recorded in checkpoints,
+resume-validated): per-layer AdaLN emits clean+noisy shift/scale pairs
+(4*dim) and modulates both halves, and a zero-init head_ada
+(BiasFreeLinear cond -> 2*dim, shared, Muon) modulates the denoised
+estimate before proj. Zero init preserves the paired baseline init at step
+0. Residual gates are deliberately not adopted: zero-init gates would zero
+every layer output at init and destroy init pairing; noted as a remaining
+deviation. Queued as dblock_db6dit_1k_mbs32 (mlq 3108), identical recipe to
+dblock_db6_1k_mbs32 otherwise; runs after the diagnostic eval (mlq 3102).
+Success criterion: materially better chain val trajectory than 9.365 at
+step 1000; failure keeps the negative-result conclusion with the fidelity
+objection removed.
+
+### Diagnostic results (mlq 3102): wiring definitively cleared; chain is the failure
+
+Self-check passed: the expectation-mode probe chain reproduced the run's
+val_loss exactly (9.3652). Probe results on the dblock_db6_1k final
+checkpoint, val panel, per-level CE (chain sigma levels 0..5 route to
+blocks 0..5):
+
+- Oracle inputs (z = y + sigma*eps at the exact chain sigmas): 5.53, 4.84,
+  3.03, 0.54, 0.0057, 0.83. Every block is near-perfect on its training
+  distribution at its inference sigma — no routing, mask, conditioning, or
+  head defect. The chain CEs at the same sigmas are 5.53, 6.54, 8.81,
+  13.68, 16.88, 9.37.
+- Expectation telemetry: the chain estimate's cosine to the true target
+  embedding starts at 0.293 after block 0 and DECREASES monotonically to
+  0.123 by level 4 while its norm rises 0.25 -> 0.89. Every level after the
+  first destroys alignment while gaining confidence; chain level-0 CE
+  (5.53) is the best any level achieves. The diffusion refinement is
+  strictly anti-productive for teacher-forced prediction.
+- Renormalized-expectation chain: worse (final 9.41; level4 19.0). Norm
+  collapse is not the binding constraint; direction is.
+- Sampled-token chain: worse (final 9.55; level4 20.0; sampled-token cos
+  0.096 at level 0 — the sample is nearly always wrong at high sigma, and
+  low-sigma blocks lock onto it).
+- 24-step fine chain: no better (final 9.53); cos telemetry plateaus at
+  0.124 through all low-sigma levels — finer Euler discretization adds
+  nothing because the blocks do not implement the true posterior mean on
+  chain-distributed inputs.
+
+Verdict: the implementation is correct end-to-end; the failure is the
+method's training distribution. Blocks trained only on y + sigma*eps never
+learn to refine realistic uncertain estimates, and the low-sigma half of
+the network learns a nearly deterministic read of the leaked target that
+is confidently wrong on anything else. Consistent with the paper avoiding
+held-out perplexity for its AR models. The DBLOCK_DIT_FIDELITY arm (3108)
+stays queued to close the conditioning-fidelity objection; given oracle
+CE of 0.0057 in-distribution, extra conditioning capacity is not expected
+to change the conclusion.
+
+### Closure: DiT-fidelity arm cancelled before start
+
+mlq 3108 (dblock_db6dit_1k_mbs32) was cancelled before start from outside
+this session (0/1 attempts; the queue is shared and actively managed). Not
+resubmitted. The negative-result verdict rests on the mlq 3102 diagnostics
+alone, which already cleared the implementation and localized the failure
+to the method's training distribution; the conditioning-fidelity objection
+remains formally untested but is bounded by the oracle result (CE 0.0057
+in-distribution — capacity is demonstrably not the constraint). The
+DBLOCK_DIT_FIDELITY flag stays in the trainer, checkpoint-recorded and
+resume-validated, should the arm ever be wanted.
+
+### Chain-consistent training: the repair arm (mlq 3111)
+
+The mlq-3102 diagnosis localizes the failure to the training input
+distribution, so the repair changes exactly that and nothing else.
+DBLOCK_CHAIN_TRAIN=1: for the step's sampled block b, each microbatch
+Euler-propagates fresh noise (global training RNG) through inference
+levels 0..b-1 with the current weights under no_grad, and block b trains
+with plain CE on that exact chain state at its fixed inference sigma.
+Properties:
+
+- No leak by construction: the training z never contains the target
+  embedding, only predecessor beliefs plus scheduled noise, identical to
+  what validation hands the block. Train and eval objectives coincide up
+  to noise seeding (validation keeps per-row panel seeds).
+- Memory claim preserved: the prefix runs gradient-free; gradients and
+  optimizer state still exist for one block plus shared modules.
+- EDM weighting dropped in this mode (weight = 1): each block sees one
+  fixed sigma, making the weight a per-block constant absorbed by the
+  per-block optimizers. Band sampling and gamma overlap are unused.
+- Startup invariants: DBLOCK_INFER_STEPS == NUM_BLOCKS and a verified 1:1
+  level-to-block routing, since the per-step block sample doubles as the
+  trained chain level.
+- DBLOCK_COND_HEAD=1 accompanies it: the sigma-conditioned head shift/scale
+  (0.5M params, ~0.5%) without DIT_FIDELITY's per-layer widening, which is
+  degenerate under fixed per-block sigmas. Zero-init, shared, Muon-owned.
+- Known risk, accepted: nonstationary inputs (block b's input distribution
+  shifts as predecessors improve). Watch per-level val CEs for oscillation.
+- Interpretation shift, recorded honestly: with chain-consistent inputs the
+  model is a blockwise-trained 6-stage iterative refiner whose stages pass
+  a 512-dim belief vector; the diffusion machinery is its parameterization.
+  This departs from the paper (which never trains on chain states) and is
+  our extension, not a reproduction.
+
+Queued as dblock_chain_1k_mbs32 (mlq 3111), otherwise identical recipe to
+dblock_db6_1k_mbs32 (SEED 1337, 1000 steps, batch 524288, seq 1024,
+MBS 32, same panels and cadence). Hypothesis: chain val_loss now tracks
+training and improves monotonically; success = materially closing the gap
+toward the AR baseline's 3.592 (the 9.365 of the leak-trained arm is the
+floor to beat by a wide margin). Expected cost: prefix adds ~2.5 no-grad
+block forwards plus head/expectation per step; step time should stay under
+the AR baseline's 2.38 s.
+
+### Fused-cascade chain training (DBLOCK_CHAIN_TRAIN=all, mlq 3112)
+
+Interim 3111 verdict at step 800: the mechanism works — chain val_loss
+tracks training and falls monotonically (7.696 @100 -> 6.499 @800 vs the
+leak arm's 9.82 @100 diverging), already far below the leak arm's
+best-ever 8.33. Two problems, both structural to one-block-per-step:
+
+- Cost estimate was wrong: step_avg ~3.9-4.2 s (vs 1.30 s leak arm,
+  2.38 s AR baseline). The prefix is not "cheap no-grad forwards" — each
+  prefix level pays a 50k-vocab head projection plus fp32 softmax and
+  expectation GEMM (~40 head+expectation evaluations per step at MBS 32),
+  and it buys gradient signal for only one block per step.
+- Final-block lag: levels 0-4 improve fast (CE ~4.6-4.8 @800) but block 5
+  — trained on ~1/6 of steps against predecessors that keep moving — makes
+  the level-4 estimate *worse* (4.76 -> 6.50). The graded output is
+  bottlenecked on the least-trained, most-nonstationary block.
+
+DBLOCK_CHAIN_TRAIN=all fixes both with one rollout per microbatch that
+trains every block in level order: block b's logits are computed with
+grad, graded with plain CE, backpropagated immediately (one block's graph
+alive at a time — the activation-memory claim survives), then reused
+detached for the Euler step producing block b+1's input. The prefix is
+never recomputed; every block sees every batch (baseline update density);
+all shared+block optimizers step each step. denoised_expectation now does
+the softmax in fp32 and the vocab contraction on bf16 tensor cores
+(bounded ~2^-9 relative error on unit-norm expectations; train and val
+share the operator, so chain consistency is preserved by construction —
+val numbers before/after this change differ imperceptibly but are not
+bit-identical). Config records dblock_chain_train as the string
+"0"/"1"/"all"; resume rejects bool-era checkpoints loudly (3111's
+checkpoint is a historical control, not a resume source).
+
+Adversarial review (subagent, full checklist): no critical/moderate
+findings; gradient isolation across levels, level-to-block invariant,
+all-param grad coverage, parser-safe logging (ce_l0..ce_l5), and loud
+resume rejection all confirmed. Flagged transient-VRAM risk of the
+uncompiled CE (three fp32 logits-sized buffers per level) is why the
+cascade runs MBS=16 (identical gradients and global batch; ~14 GB peak
+instead of ~27 GB on the 32 GB card).
+
+Queued as dblock_chainall_1k_mbs16 (mlq 3112) behind 3111 (which runs to
+completion as the one-block-per-step control), otherwise identical recipe
+(SEED 1337, 1000 steps, batch 524288, seq 1024, DBLOCK_COND_HEAD=1, same
+panels/cadence). Hypothesis: per-step val improvement at least matches
+3111 with level 5 no longer degrading level 4 (watch val_level4 vs
+val_level5); step time expected between 3111's ~4 s and ~2x that (six
+grad blocks + six heads per microbatch, minus the redundant prefix) — to
+be measured, not assumed. train_loss in this mode is the unweighted
+level-mean CE (not comparable to mode-0's EDM-weighted train_loss);
+train_ce remains the final-level CE, unit-comparable to val_loss.
+
+### Result: dblock_chain_1k_mbs32 (mlq 3111, one-block-per-step control)
+
+Completed 1000/1000, checkpoint logs/dblock_chain_1k_mbs32_final_model.pt.
+Final chain val_loss 6.16985 (bpb 2.0099), step_avg 3880 ms, peak alloc
+17.3 GiB. Monotone val trajectory: 7.696 @100, 7.281 @500, 6.499 @800,
+6.170 @1000 — chain-consistent training decisively repairs the leak-arm
+divergence (9.365 final, never below 8.33). Still 2.58 above the AR
+baseline's 3.592, and the signature bottleneck held to the end: levels 0-4
+plateau near CE 4.55-4.71 while the final graded block *degrades* its
+input estimate (level4 4.650 -> level5 6.170), consistent with block 5
+receiving ~1/6 of the updates against a nonstationary predecessor chain.
+This is the control the fused cascade (mlq 3112) must beat: same recipe,
+all blocks updated every step.
+
+### Closure 3112, relaunch as fused-tail cascade (mlq 3113)
+
+dblock_chainall_1k_mbs16 (3112) measured 13.5 s/step marginal (steps
+20->40) — the eager fp32 cross-entropy plus the separate eager expectation
+pass over the 50304 vocab, run 6x per microbatch, cost ~6 s/step on their
+own. Its 60 steps already showed the cascade's qualitative win: per-level
+train CEs are ordered and healthy with no final-block cliff (ce_l4 6.95 ->
+ce_l5 7.67 at step 60, versus 3111's persistent +1.5 val gap). Killed at
+~step 65 as an engineering iteration, not a scientific arm.
+
+Fix: `loss_tail_chain` — a compiled tail (rebound next to loss_tail)
+computing the level's plain-CE sum and, except at the final level, the
+detached posterior expectation (fp32 softmax -> bf16 probs @ bf16 table ->
+fp32) in one fused softmax pipeline; `dblock_cascade_level` orchestrates
+_run_block + tail per level. The normalized bf16 table is hoisted to
+once per step. Numerics identical to eager `denoised_expectation` up to
+GEMM tiling order (both fp32-accumulated); validation and diagnostics
+keep the eager operator unchanged. Focused adversarial review (subagent):
+no findings — gradient isolation, two-bool compile specialization,
+level->block invariant, and train/val operator parity all confirmed;
+fused-tail peak memory at or below the eager path.
+
+Relaunched as dblock_chainallf_1k_mbs16 (mlq 3113), recipe identical to
+3112. Expectation: ~4-6 s/step saved vs 3112; the remaining cost (six
+2-layer two-stream grad passes plus six vocab heads per microbatch) is
+the honest price of full-coverage cascade training at this vocab size.
+
+### Result: dblock_chainallf_1k_mbs16 (mlq 3113, fused cascade)
+
+Completed 1000/1000, checkpoint logs/dblock_chainallf_1k_mbs16_final_model.pt.
+Final chain val_loss 4.16706 (bpb 1.3574), step_avg 8797 ms (marginal
+~8.8 s from step 20 on), train-phase peak alloc 6.65 GiB. Trajectory:
+7.587 @100, 5.693 @300 (already past 3111's final 6.170), 4.757 @500,
+4.167 @1000 — monotone throughout. Per-level CEs converged to a tight,
+ordered band (3.949-3.974 for levels 0-4) with the final graded level at
+4.167; the final-level gap shrank monotonically after step 200
+(1.90 -> 0.21), consistent with the mixture-flattening explanation (at
+sigma 0.002 the EDM head has c_skip ~ 1, c_out ~ 0.002, so the last block
+mostly re-projects the incoming posterior expectation; as predecessor
+posteriors sharpen the projection loses less).
+
+Cross-arm ledger (identical data, seed, schedule, panels):
+- leak-trained dblock (mode 0):   val 9.365, 1.30 s/step, diverging
+- chain single-block (3111):      val 6.170, 3.88 s/step, final-block cliff
+- fused cascade (3113):           val 4.167, 8.80 s/step, no cliff
+- AR baseline (arbase_1k):        val 3.592, 2.38 s/step
+
+Honest verdict: chain-consistent cascade training makes DiffusionBlocks
+*work* — val tracks train, scales with steps, and the one-block-graph
+memory claim is real (6.65 GiB train peak vs ~17-22 GiB for the other
+arms/baseline). It does not yet beat the AR baseline: 0.575 nats worse at
+3.7x the step time on this 1k-step budget. Remaining known levers, in
+expected-value order: (1) the final-level readout parameterization — the
+residual 0.21 gap between level-4 and the graded level is structural
+(c_out = 0.002 strangles the last block's correction; a sigma-free or
+learnable-scale final readout is the principled fix and could recover
+most of it); (2) MBS 32-64 (~10 GiB-25 GiB peak, est. ~10% step-time
+saving from fewer launches); (3) the per-signal economics already favor
+the cascade (1.47 s per block-update vs 3.88), so longer budgets close
+quality gaps faster than the single-block mode ever could.
+
+### Pre-registration: dblock_chainall_cpg_1k_mbs32 (clean propagation + readout gain)
+
+Context: the user's requirement is DiffusionBlocks faster than the AR
+baseline at equal-or-better bpb. Reference-code audit (this session)
+settled the paper question: the released DiffusionBlocks repo is image
+classification only (ViT/CIFAR, B=3) — the LM variant was never released.
+The released code is exactly our leak arm (z = y + sigma*eps per sampled
+block, raw clean context re-embedded per block, EDM-weighted CE through a
+shared head, vocab softmax->expectation round-trip each sampler step), so
+the paper's training-speed claim comes from the rule mlq-3102 proved
+divergent under likelihood grading. Per-step chain-consistent training has
+a FLOP floor of ~2x baseline trunk + per-level head work, so the route to
+"faster overall" is a cheap-mode/cascade mixture — which is only worth
+building if the cascade's quality ceiling rises first. This arm is that
+gate.
+
+Hypothesis: two defects account for much of 3113's remaining 0.575-nat
+gap to the AR baseline. (1) Every block restarts clean context from
+norm1(embed(inputs)), so context is only ever processed by 4 layers
+(vs 24 in the baseline) and cross-block information flows solely through
+the model_dim noisy bottleneck. (2) At the final sigma (0.002) the EDM
+readout gives the last block's hidden state a fixed 0.002 weight against
+c_skip ~ 1 on z (the measured 0.21 residual final-level gap).
+
+Change (nanogpt_mini_gpt2vocab_kda_dblock_train.py, new config axes,
+resume/eval-validated, checkpoint-recorded):
+- DBLOCK_CLEAN_PROP=1: _run_block accepts/returns the clean-half residual;
+  in-order sweeps (cascade training, val chain, oracle) thread block b's
+  clean output into block b+1, detached between levels so gradients stay
+  blockwise. Clean context thus accumulates the baseline's full 24-layer
+  trunk depth (the clean trajectory is z- and sigma-independent: read-only
+  KDA noisy slots, clean-only flex attention for clean queries,
+  noisy-half-only AdaLN; DIT_FIDELITY+CLEAN_PROP rejected at config
+  time). diagnostic_chain_loss uses harvest_clean_inputs (one in-order
+  zero-noisy sweep) because fine grids revisit blocks. Known tradeoff:
+  the embedding now receives context gradients only through block 0's
+  pass (deeper clean states are detached) — watch for embed undertraining.
+- DBLOCK_READOUT_GAIN=1: per-level learnable scalar g_b (zero-init) in
+  the head: denoised = c_skip*z + (c_out + g_b)*hidden. Indexed outside
+  the compiled head (one graph, gradient via indexing); shared Adam scalar
+  group (lr 0.015); logged per level on val lines as rgain_l{k}.
+- Eval-only loads now validate the dblock config axes like resume does
+  (evaluating a cleanprop checkpoint without the flag would silently score
+  a different chain). Pre-axis checkpoints (3111/3113) are loudly rejected
+  by both paths; their embedded log source remains the way to re-eval them.
+
+Run: identical recipe to 3113 except MBS=32 (3113 peaks: 6.65 GiB train
+/ 8.55 GiB val at MBS=16 -> ~13/17 GiB expected; fewer launches, est.
+~10% step time) plus the two new flags. Cost estimate ~8 s/step, ~2.4 h.
+
+Success criteria (matched panels, same seed/schedule/data):
+- Primary: final chain val_loss meaningfully below 3113's 4.167; the
+  final-level gap (graded level minus level-4 CE) collapses toward 0 and
+  rgain_l5 moves materially off 0.
+- Directional target: closing toward the AR baseline's 3.592. If the arm
+  lands near the baseline, build the leak/cascade mixture for wall-clock;
+  if it barely moves, the context-depth hypothesis is wrong and the
+  honest negative verdict stands.
+Failure modes to watch: embed undertraining (val plateau with healthy
+per-level CEs), gain instability at high-sigma levels (rgain_l0 drifting
+large), later-block input-distribution churn from the now-evolving
+propagated clean stream (per-level CE oscillation).
