@@ -7,7 +7,7 @@ from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope import
 from postraining.hl_gauss import HLGaussSupport, anchored_unit_geometry
 from postraining.latent_rollout import (
     PAD_SLOT,
-    generated_slot_mask,
+    THOUGHT_SLOT,
     rollout_continuations,
     trim_stream,
 )
@@ -128,28 +128,28 @@ def test_hiddens_reach_the_critic_through_its_own_combiner():
         # type bias), so liven the content channel before perturbing hiddens.
         critic.combiner.carry.weight.normal_(std=0.05)
     batch = _batch()
-    carried_slots = int(generated_slot_mask(batch).sum())
+    carried_slots = int((batch.kind == THOUGHT_SLOT).sum())
     if carried_slots == 0:
         raise AssertionError("rollout stored no carried hiddens; change the seed")
     with torch.no_grad():
         baseline_values = critic.values(batch)
-        batch.hiddens.add_(torch.randn_like(batch.hiddens))
+        batch.thoughts.add_(torch.randn_like(batch.thoughts))
         perturbed_values = critic.values(batch)
     assert not torch.equal(baseline_values, perturbed_values)
 
 
-def test_critic_combiner_is_identity_at_init_on_uncarried_slots():
-    """Prompt slots and the first generation step take the plain token path."""
+def test_critic_routes_exact_stored_raw_actions_at_thought_slots():
     critic = _critic()
     batch = _batch()
     token_latent = critic.trunk.embed_tokens(batch.token_ids)
     pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
-    inputs = critic.assemble_inputs(batch)
-    carried = generated_slot_mask(batch)
-    expected_plain = token_latent * pad_scale
-    assert torch.equal(inputs[~carried], expected_plain[~carried])
-    # At init the combiner is an exact identity, so carried slots match too.
-    assert torch.equal(inputs, expected_plain)
+    thought_slots = batch.kind == THOUGHT_SLOT
+    expected = torch.where(
+        thought_slots[..., None],
+        batch.thoughts.to(token_latent.dtype),
+        token_latent,
+    ) * pad_scale
+    assert torch.equal(critic.assemble_inputs(batch), expected)
 
 
 def test_critic_dense_masked_inputs_match_combiner_routing():
@@ -162,33 +162,30 @@ def test_critic_dense_masked_inputs_match_combiner_routing():
     batch = _batch()
     token_latent = critic.trunk.embed_tokens(batch.token_ids)
     pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
-    expected = critic.combiner(
-        token_latent, batch.hiddens, generated_slot_mask(batch)
+    thought_base = batch.thoughts.to(token_latent.dtype)
+    thought_input = critic.combiner(thought_base, batch.thoughts)
+    expected = torch.where(
+        (batch.kind == THOUGHT_SLOT)[..., None], thought_input, token_latent
     ) * pad_scale
     torch.testing.assert_close(critic.assemble_inputs(batch), expected)
 
 
-def test_critic_zero_width_hiddens_take_the_plain_token_path():
+def test_critic_refuses_missing_raw_thought_actions():
     critic = _critic()
     batch = _batch()
-    batch.hiddens = batch.hiddens[..., :0]
-    # Zero-width storage is legitimate only for pinned token-only rollouts,
-    # which never inject a carry in the first place.
-    batch.carry_injected = False
+    batch.thoughts = batch.thoughts[..., :0]
+    with pytest.raises(ValueError, match="stored raw thought actions"):
+        critic.assemble_inputs(batch)
+
+
+def test_critic_token_path_handles_zero_width_pinned_storage():
+    critic = _critic()
+    batch = _batch()
+    batch.thoughts = batch.thoughts[..., :0]
+    batch.kind[batch.kind == THOUGHT_SLOT] = PAD_SLOT
     token_latent = critic.trunk.embed_tokens(batch.token_ids)
     pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
     assert torch.equal(critic.assemble_inputs(batch), token_latent * pad_scale)
-
-
-def test_critic_refuses_a_latent_batch_that_discarded_its_carry():
-    """replay_storage=False keeps carry_injected: valuing it would silently
-    score token inputs the behavior policy never saw."""
-    critic = _critic()
-    batch = _batch()
-    assert batch.carry_injected
-    batch.hiddens = batch.hiddens[..., :0]
-    with pytest.raises(ValueError, match="discarded its carried hiddens"):
-        critic.assemble_inputs(batch)
 
 
 def test_all_critic_parameters_receive_value_gradients():

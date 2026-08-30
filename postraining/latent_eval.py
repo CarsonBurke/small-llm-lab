@@ -1,4 +1,4 @@
-"""Shared batched evaluation for the hidden-carry latent math policy."""
+"""Shared batched evaluation for forced-initial latent-thought policies."""
 
 from __future__ import annotations
 
@@ -25,10 +25,10 @@ from postraining.latent_rollout import (
     rollout_continuations,
     trim_stream,
 )
-from postraining.latent_thought import LatentThoughtModel
+from postraining.latent_thought import THINK, LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
-LATENT_EVAL_METRIC_SCHEMA = "deterministic_hidden_carry_token_actions/v5"
+LATENT_EVAL_METRIC_SCHEMA = "forced_initial_isotropic_thought_policy/v6"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
@@ -106,15 +106,13 @@ def evaluate_latent_math(
 ) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
 
-    ``pin_emit`` evaluates a token-only (cot/none reasoning mode) policy: no
-    belief is ever carried between steps. ``prompt_suffix_ids`` are
-    teacher-forced onto the END of every truncated prompt (the none-mode
-    ``Answer:`` prefix) and rejoin the decoded solution before verification.
+    ``pin_emit`` evaluates cot/none token-only policy semantics: gate, noise,
+    and thought slots are bypassed. ``prompt_suffix_ids`` are teacher-forced
+    onto the end of every truncated prompt and rejoin the decoded solution.
 
-    Generation runs the deterministic hidden-carry rollout, so the evaluated
-    policy is exactly the trained one — including its latent thinking. RNG
-    state is saved and restored so evaluation never perturbs training
-    reproducibility.
+    Latent generation takes the mandatory first thought and one-way gate used
+    in training. RNG state is saved and restored so evaluation never perturbs
+    training reproducibility.
     AIME callers use temperature 1.0 / top-p 0.7 per the VAPO protocol;
     standalone inspection may pass other explicit sampling settings.
 
@@ -198,6 +196,9 @@ def evaluate_latent_math(
     emitted_counts: list[int] = []
     stream_action_counts: list[int] = []
     recurrent_steps_per_rollout: list[int] = []
+    total_thought_counts: list[int] = []
+    continued_thought_counts: list[int] = []
+    forced_first_counts: list[int] = []
     terminated_total = 0
     if compiled_step_core is not None and getattr(
         compiled_step_core, "_latent_eval_disabled", False
@@ -295,6 +296,25 @@ def evaluate_latent_math(
                 stream_action_counts.extend(
                     int(count)
                     for count in batch.action_mask.sum(-1).cpu().tolist()
+                )
+                thought_actions = (
+                    (batch.actions == THINK) & batch.action_mask.bool()
+                )
+                total_thought_counts.extend(
+                    int(count)
+                    for count in thought_actions.sum(-1).cpu().tolist()
+                )
+                continued_thought_counts.extend(
+                    int(count)
+                    for count in (
+                        thought_actions & batch.stop_mask.bool()
+                    ).sum(-1).cpu().tolist()
+                )
+                forced_first_counts.extend(
+                    int(count)
+                    for count in (
+                        thought_actions & ~batch.stop_mask.bool()
+                    ).sum(-1).cpu().tolist()
                 )
                 emitted_rows = emitted_token_rows(batch)
                 for flat_member, emitted in enumerate(emitted_rows):
@@ -516,6 +536,16 @@ def evaluate_latent_math(
         **summarize(emitted_counts, "emitted_tokens"),
         **summarize(stream_action_counts, "stream_actions"),
         **summarize(recurrent_steps_per_rollout, "recurrent_steps_per_rollout"),
+        **summarize(total_thought_counts, "total_thoughts"),
+        **summarize(continued_thought_counts, "continued_thoughts"),
+        "forced_first_thought_fraction": (
+            sum(count == 1 for count in forced_first_counts)
+            / max(len(forced_first_counts), 1)
+        ),
+        "thought_sigma": None if pin_emit else wrapper.thought_sigma,
+        "thought_component_std": (
+            None if pin_emit else wrapper.thought_component_std
+        ),
         "compiled": compiled_step_core is not None,
         "compile_fallback": False,
         "pin_emit": pin_emit,

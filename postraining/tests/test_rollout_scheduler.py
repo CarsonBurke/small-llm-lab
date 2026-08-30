@@ -5,11 +5,11 @@ from types import SimpleNamespace
 import torch
 
 from postraining.latent_rollout import (
-    generated_slot_mask,
+    THOUGHT_SLOT,
     replay_beliefs,
     split_rollout_groups,
 )
-from postraining.latent_thought import LatentThoughtModel, StepOutput
+from postraining.latent_thought import EMIT, THINK, LatentThoughtModel, StepOutput
 from postraining.rollout_scheduler import (
     ContinuousScheduleStats,
     _decode_execution_width,
@@ -38,6 +38,19 @@ class _FakeContinuousModel:
     def __init__(self, *, stochastic_tokens: bool = False):
         self.backbone = SimpleNamespace(
             tok_emb=SimpleNamespace(embedding_dim=3)
+        )
+        self.gate = SimpleNamespace(
+            stop_logit=lambda belief: torch.full(
+                belief.shape[:-1],
+                80.0,
+                dtype=belief.dtype,
+                device=belief.device,
+            )
+        )
+        self.transition = SimpleNamespace(
+            per_dim_log_prob=lambda action, mean, log_sigma: torch.zeros_like(
+                action
+            )
         )
         self.stochastic_tokens = stochastic_tokens
         self.bank_builds = 0
@@ -74,6 +87,8 @@ class _FakeContinuousModel:
             logits[stop, 1] = 80.0
         return StepOutput(
             belief=belief,
+            predicted=torch.zeros_like(belief),
+            thought_log_sigma=torch.zeros_like(belief),
             input_latent=torch.zeros_like(belief),
             logits=logits,
             caches=[],
@@ -143,6 +158,10 @@ class _FakeContinuousModel:
         return token_ids.float()[..., None].expand(*token_ids.shape, 3)
 
     @staticmethod
+    def thought_input(thought):
+        return thought[:, None, :]
+
+    @staticmethod
     def combined_input(token_ids, hidden):
         return token_ids.float()[..., None, None].expand(
             *token_ids.shape, 1, 3
@@ -178,7 +197,7 @@ def _run(
         prompt_repeats=repeats,
         capacity_rows=capacity,
         max_new_tokens=max_new_tokens,
-        max_stream_steps=max_new_tokens,
+        max_stream_steps=max_new_tokens if pin_emit else 4 * max_new_tokens,
         temperature=1.0,
         top_p=top_p,
         seed=seed,
@@ -426,7 +445,7 @@ def test_nucleus_sampling_remains_request_stable():
         )
 
 
-def test_latent_rng_is_stable_without_replay_hidden_storage():
+def test_latent_gate_token_and_noise_rng_are_request_stable():
     chunks = [_chunk(1), _chunk(1), _chunk(1)]
     narrow = _run(
         _FakeContinuousModel(),
@@ -436,7 +455,7 @@ def test_latent_rng_is_stable_without_replay_hidden_storage():
         max_new_tokens=2,
         seed=71,
         pin_emit=False,
-        replay_storage=False,
+        replay_storage=True,
     )
     wide = _run(
         _FakeContinuousModel(),
@@ -446,15 +465,33 @@ def test_latent_rng_is_stable_without_replay_hidden_storage():
         max_new_tokens=2,
         seed=71,
         pin_emit=False,
-        replay_storage=False,
+        replay_storage=True,
     )
     for left, right in zip(narrow, wide, strict=True):
-        assert left.hiddens.size(-1) == 0
+        torch.testing.assert_close(left.thoughts, right.thoughts, rtol=0, atol=0)
+        torch.testing.assert_close(left.kind, right.kind, rtol=0, atol=0)
+        boundary = left.prompt_length - 1
+        assert (left.actions[:, boundary] == THINK).all()
+        assert (left.kind[:, boundary + 1] == THOUGHT_SLOT).all()
+        assert (left.actions[:, boundary + 1] == EMIT).all()
         torch.testing.assert_close(
             left.token_ids, right.token_ids, rtol=0, atol=0
         )
+    discarded = _run(
+        _FakeContinuousModel(),
+        chunks,
+        repeats=1,
+        capacity=1,
+        max_new_tokens=2,
+        seed=71,
+        pin_emit=False,
+        replay_storage=False,
+    )
+    for stored, unstored in zip(narrow, discarded, strict=True):
+        assert unstored.thoughts.size(-1) == 0
+        torch.testing.assert_close(stored.kind, unstored.kind, rtol=0, atol=0)
         torch.testing.assert_close(
-            left.action_mask, right.action_mask, rtol=0, atol=0
+            stored.token_ids, unstored.token_ids, rtol=0, atol=0
         )
 
 
@@ -499,32 +536,40 @@ def test_real_paged_model_runs_refill_with_independent_positions():
     assert stats.evicted_rows == 6
 
 
-def _assert_split_groups_replay_carries(model, results, chunk_lengths, repeats):
-    """Split each chunk batch per group, then check carries against replay.
+def _assert_split_groups_replay_actions(model, results, chunk_lengths, repeats):
+    """Check request-stable raw actions against exact dense replay pricing.
 
-    Replay parity holds for the batches the trainer actually replays: the
-    per-group, pad-trimmed splits from ``split_rollout_groups``. The raw
-    per-chunk batch is an intermediate — its left-padded rows replay
-    differently on any trunk with live projections, because the rollout
-    excludes pad positions structurally (kv_starts / prefill masking) while
-    the parallel replay only zeroes their inputs, and residual biases
-    re-inflate them from the first block on. The trainer never replays a
-    chunk batch, so neither do these tests.
+    Replay parity holds for the pad-trimmed per-group batches consumed by the
+    trainer. Chunk intermediates may include structurally omitted left pads,
+    whereas dense replay zeroes those inputs.
     """
     checked = 0
     for batch, lengths in zip(results, chunk_lengths, strict=True):
         expanded = lengths.repeat_interleave(repeats)
         for group in split_rollout_groups(batch, repeats, expanded):
-            carried = generated_slot_mask(group)
+            carried = group.kind == THOUGHT_SLOT
             assert bool(carried.any())
-            assert group.hiddens.size(-1) == model.backbone.tok_emb.embedding_dim
-            assert float(group.hiddens[~carried].abs().sum()) == 0.0
+            assert group.thoughts.size(-1) == model.backbone.tok_emb.embedding_dim
+            assert float(group.thoughts[~carried].abs().sum()) == 0.0
             with torch.no_grad():
                 _, beliefs = replay_beliefs(model, group)
+                means = model.transition.predict_mean(beliefs[:, :-1])
+                log_sigmas = model.transition.predict_log_sigma(
+                    beliefs[:, :-1]
+                )
+                replayed = model.transition.per_dim_log_prob(
+                    group.thoughts[:, 1:], means, log_sigmas
+                )
             tail = carried[:, 1:]
             torch.testing.assert_close(
-                group.hiddens[:, 1:][tail],
-                beliefs[:, :-1][tail],
+                group.old_thought_means[:, :-1][tail],
+                means[tail],
+                rtol=1e-4,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(
+                group.old_thought_logprobs[:, :-1][tail],
+                replayed[tail],
                 rtol=1e-4,
                 atol=1e-5,
             )
@@ -532,18 +577,8 @@ def _assert_split_groups_replay_carries(model, results, chunk_lengths, repeats):
     assert checked == sum(lengths.numel() for lengths in chunk_lengths)
 
 
-def test_real_paged_model_hidden_carry_matches_dense_replay():
-    """Scheduler-stored carries must equal the dense replay reconstruction.
-
-    The paged decode loop and ``replay_beliefs`` are independent code paths;
-    the stored hidden at slot t is the belief that emitted token t, so it
-    must match the replayed belief at t-1 wherever the carry flag is set. A
-    live combiner makes the carried content feed back into later beliefs,
-    so a corrupted store shows up as a cascading mismatch, not a no-op. The
-    trunk projections are livened too: the fresh init's zeroed outputs make
-    the blocks an identity residual stream, which would vacuously hide any
-    disagreement between the paged rollout and the replay.
-    """
+def test_real_paged_model_raw_actions_match_dense_replay():
+    """Paged rollout and dense replay price the same stored raw actions."""
     model = LatentThoughtModel(_backbone()).eval()
     with torch.no_grad():
         for block in model.backbone.blocks:
@@ -563,7 +598,7 @@ def test_real_paged_model_hidden_carry_matches_dense_replay():
         prompt_repeats=2,
         capacity_rows=4,
         max_new_tokens=3,
-        max_stream_steps=3,
+        max_stream_steps=12,
         temperature=1.0,
         top_p=1.0,
         seed=101,
@@ -572,7 +607,7 @@ def test_real_paged_model_hidden_carry_matches_dense_replay():
     )
 
     assert results
-    _assert_split_groups_replay_carries(model, results, chunk_lengths, 2)
+    _assert_split_groups_replay_actions(model, results, chunk_lengths, 2)
 
 
 def test_real_kda_model_runs_refill_with_independent_positions():
@@ -611,16 +646,8 @@ def test_real_kda_model_runs_refill_with_independent_positions():
     assert stats.evicted_rows == 6
 
 
-def test_real_kda_model_hidden_carry_matches_dense_replay():
-    """Paged recurrent decode must agree with the full-sequence replay.
-
-    The strongest end-to-end statement for the KDA port: the scheduler's
-    decode loop advances lane-gathered conv windows and delta-rule state one
-    token at a time, while ``replay_beliefs`` re-prices the same stream
-    through the parallel reference recurrence. A live combiner feeds stored
-    carries back into later beliefs, so any lane-state corruption cascades
-    into a mismatch instead of cancelling out.
-    """
+def test_real_kda_model_raw_actions_match_dense_replay():
+    """Paged recurrent decode and dense replay price the same raw actions."""
     model = LatentThoughtModel(_kda_backbone()).eval()
     with torch.no_grad():
         model.combiner.carry.weight.normal_(std=0.02)
@@ -637,7 +664,7 @@ def test_real_kda_model_hidden_carry_matches_dense_replay():
         prompt_repeats=2,
         capacity_rows=4,
         max_new_tokens=3,
-        max_stream_steps=3,
+        max_stream_steps=12,
         temperature=1.0,
         top_p=1.0,
         seed=101,
@@ -646,7 +673,7 @@ def test_real_kda_model_hidden_carry_matches_dense_replay():
     )
 
     assert results
-    _assert_split_groups_replay_carries(model, results, chunk_lengths, 2)
+    _assert_split_groups_replay_actions(model, results, chunk_lengths, 2)
 
 
 def test_kda_padded_decode_width_changes_nothing_a_live_row_can_observe():
@@ -682,7 +709,7 @@ def test_kda_padded_decode_width_changes_nothing_a_live_row_can_observe():
             prompt_repeats=1,
             capacity_rows=4,
             max_new_tokens=4,
-            max_stream_steps=4,
+            max_stream_steps=16,
             temperature=1.0,
             top_p=1.0,
             seed=101,
@@ -697,7 +724,7 @@ def test_kda_padded_decode_width_changes_nothing_a_live_row_can_observe():
         assert torch.equal(left.token_ids, right.token_ids)
         assert torch.equal(left.old_token_logprobs, right.old_token_logprobs)
         torch.testing.assert_close(
-            left.hiddens, right.hiddens, rtol=1e-5, atol=1e-5
+            left.thoughts, right.thoughts, rtol=1e-5, atol=1e-5
         )
 
 
@@ -765,7 +792,7 @@ def test_warmup_decode_width_buckets_covers_and_preserves() -> None:
         assert torch.equal(
             warmed_batch.old_token_logprobs, fresh_batch.old_token_logprobs
         )
-        assert torch.equal(warmed_batch.hiddens, fresh_batch.hiddens)
+        assert torch.equal(warmed_batch.thoughts, fresh_batch.thoughts)
 
 
 def test_warmup_decode_width_buckets_preserves_kda_arenas() -> None:
@@ -815,4 +842,4 @@ def test_warmup_decode_width_buckets_preserves_kda_arenas() -> None:
         assert torch.equal(
             warmed_batch.old_token_logprobs, fresh_batch.old_token_logprobs
         )
-        assert torch.equal(warmed_batch.hiddens, fresh_batch.hiddens)
+        assert torch.equal(warmed_batch.thoughts, fresh_batch.thoughts)

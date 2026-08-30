@@ -180,7 +180,13 @@ def main() -> None:
         v_min=value_v_min,
         v_max=value_v_max,
         prior_value=saved_args.get("value_prior", 0.05),
-        **combiner_init_kwargs_from_checkpoint(payload),
+        **{
+            key: value
+            for key, value in combiner_init_kwargs_from_checkpoint(
+                payload
+            ).items()
+            if key in {"mlp_hidden", "num_blocks"}
+        },
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()

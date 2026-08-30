@@ -65,9 +65,8 @@ def _pinned_rollout(wrapper, **overrides):
 
 
 def test_reasoning_budgets_cover_latent_cot_and_answer_only_modes():
-    # Thinking rides inside the carried belief rather than occupying stream
-    # slots, so the stream cap always equals the emitted-token cap.
-    assert mode_rollout_budget("latent", 700, answer_tokens=24) == (700, 700)
+    # Latent stream slots account separately for mandatory/continued thoughts.
+    assert mode_rollout_budget("latent", 700, answer_tokens=24) == (700, 2800)
     assert mode_rollout_budget("cot", 700, answer_tokens=24) == (700, 700)
     assert mode_rollout_budget("none", 700, answer_tokens=24) == (24, 24)
     with pytest.raises(ValueError, match="unknown reasoning mode"):
@@ -75,7 +74,21 @@ def test_reasoning_budgets_cover_latent_cot_and_answer_only_modes():
 
     assert training_rollout_budget(
         "latent", 1024, answer_tokens=24
-    ) == (1024, 1024)
+    ) == (1024, 4096)
+    assert training_rollout_budget(
+        "latent",
+        256,
+        answer_tokens=24,
+        prompt_tokens=512,
+        context_tokens=1024,
+    ) == (256, 512)
+    assert mode_rollout_budget(
+        "latent",
+        256,
+        answer_tokens=24,
+        prompt_tokens=512,
+        context_tokens=1024,
+    ) == (256, 512)
     assert training_rollout_budget(
         "none", 1024, answer_tokens=24
     ) == (24, 24)
@@ -93,7 +106,7 @@ def test_reasoning_budgets_cover_latent_cot_and_answer_only_modes():
         ),
         (
             {"reasoning_mode": "latent", "continuation_tokens": 1024},
-            (1024, 1024),
+            (1024, 4096),
         ),
         (
             {"reasoning_mode": "cot", "continuation_tokens": 700},
@@ -120,7 +133,7 @@ def test_pin_emit_rollout_invariants():
     assert bool((batch.kind != PAD_SLOT).any())
     # Zero-width hidden storage even with replay_storage=True (the default):
     # the pinned policy never carries a belief, so there is nothing to store.
-    assert batch.hiddens.size(-1) == 0
+    assert batch.thoughts.size(-1) == 0
     assert float(batch.action_mask.sum()) > 0.0
 
 
@@ -132,7 +145,7 @@ def test_pin_emit_nano_backbone_rollout():
     wrapper = LatentThoughtModel(backbone).eval()
     with torch.no_grad():
         batch = _pinned_rollout(wrapper)
-    assert batch.hiddens.size(-1) == 0
+    assert batch.thoughts.size(-1) == 0
     assert float(batch.action_mask.sum()) >= 2.0
 
 
@@ -165,7 +178,7 @@ def test_pin_emit_refresh_and_age0_update_clip_zero():
         batch.reward_scalar
     )
     refresh_old_statistics(wrapper, critic, batch)
-    assert batch.hiddens.size(-1) == 0
+    assert batch.thoughts.size(-1) == 0
     optimizers = build_optimizers(wrapper, critic, 1e-4, fused=False)
     metrics = update_minibatch(wrapper, critic, batch, optimizers)
     assert metrics["policy_clip_fraction"] == 0.0
@@ -195,7 +208,11 @@ def test_update_minibatch_rejects_unrefreshed_batches_in_both_modes():
     for pin_emit in (True, False):
         torch.manual_seed(23)
         batch = trim_stream(
-            _pinned_rollout(wrapper, pin_emit=pin_emit)
+            _pinned_rollout(
+                wrapper,
+                pin_emit=pin_emit,
+                max_stream_steps=4 if pin_emit else 8,
+            )
         )
         assert batch.statistics_refreshed is False
         with pytest.raises(RuntimeError, match="requires refresh"):
@@ -238,10 +255,17 @@ def test_score_math_rollout_prepends_answer_prefix():
     batch = LatentRolloutBatch(
         kind=kind,
         token_ids=token_ids,
-        hiddens=torch.zeros(1, stream, 0),
+        thoughts=torch.zeros(1, stream, 0),
+        actions=torch.ones((1, stream), dtype=torch.long),
         action_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+        stop_mask=zeros.clone(),
+        emit_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+        old_stop_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
         old_token_log_odds=zeros.clone(),
+        old_thought_logprobs=torch.zeros(1, stream, 0),
+        old_thought_means=torch.zeros(1, stream, 0),
+        old_thought_log_sigmas=torch.zeros(1, stream, 0),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(1),
@@ -537,6 +561,6 @@ def test_build_optimizers_nano_backbone_three_group_layout():
     assert not trunk_ids & renderer_ids
     # Trunk + renderer must exactly cover the backbone's parameters.
     assert trunk_ids | renderer_ids == {id(p) for p in backbone.parameters()}
-    combiner_ids = {id(p) for p in groups[1]["params"]}
-    assert combiner_ids == {id(p) for p in wrapper.combiner.parameters()}
+    latent_policy_ids = {id(p) for p in groups[1]["params"]}
+    assert latent_policy_ids == {id(p) for p in wrapper.new_parameters()}
     assert all(len(group["params"]) > 0 for group in groups)

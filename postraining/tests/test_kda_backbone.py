@@ -383,17 +383,17 @@ def test_replay_reproduces_kda_rollout_logprobs():
             .gather(-1, token_targets[..., None])
             .squeeze(-1)
         )
-    actions = batch.action_mask.bool()
-    assert bool(actions.any())
+    emits = batch.emit_mask.bool()
+    assert bool(emits.any())
     torch.testing.assert_close(
-        token_logprobs[actions],
-        batch.old_token_logprobs[actions],
+        token_logprobs[emits],
+        batch.old_token_logprobs[emits],
         rtol=2e-4,
         atol=2e-4,
     )
     # Latent rollouts on the KDA trunk store their carried beliefs like any
     # other backbone: the hidden channel is architecture-independent.
-    assert batch.carry_injected and batch.hiddens.size(-1) == wrapper.backbone.model_dim
+    assert batch.thoughts.size(-1) == wrapper.backbone.model_dim
 
 
 def test_fresh_kda_trunk_initializes_every_parameter():

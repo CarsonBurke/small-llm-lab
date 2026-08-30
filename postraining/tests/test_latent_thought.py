@@ -13,6 +13,7 @@ from postraining.latent_thought import (
     RENDERER_FEATURES_SCHEMA,
     ROLLOUT_POLICY_SCHEMA,
     THOUGHT_INPUT_SCHEMA,
+    THOUGHT_DISTRIBUTION_SCHEMA,
     combiner_init_kwargs_from_checkpoint,
     validate_renderer_checkpoint,
 )
@@ -622,6 +623,7 @@ def test_renderer_checkpoint_schema_rejects_old_semantics():
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": ROLLOUT_POLICY_SCHEMA,
         "thought_input_schema": THOUGHT_INPUT_SCHEMA,
+        "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
     }
     validate_renderer_checkpoint(current, "current.pt")
     # No migrations: untagged payloads and every pre-hidden-carry schema tag
@@ -677,16 +679,18 @@ def test_combiner_init_kwargs_recover_saved_geometry():
         "args": {
             "combined_mlp_hidden": 1024,
             "combined_mlp_blocks": 2,
+            "thought_sigma": 2.0,
+            "init_stop_thinking_probability": 0.8,
         }
     }
     assert combiner_init_kwargs_from_checkpoint(payload) == {
         "mlp_hidden": 1024,
         "num_blocks": 2,
+        "thought_sigma": 2.0,
+        "init_stop_thinking_probability": 0.8,
     }
-    assert combiner_init_kwargs_from_checkpoint({"args": {}}) == {
-        "mlp_hidden": None,
-        "num_blocks": 1,
-    }
+    with pytest.raises(ValueError, match="stochastic policy arguments"):
+        combiner_init_kwargs_from_checkpoint({"args": {}})
 
 
 def test_fresh_combiner_is_bitwise_identity_and_flag_selects_exactly():
@@ -800,3 +804,25 @@ def test_new_parameters_exclude_backbone_and_strict_load_round_trips():
     wrapper.load_backbone_checkpoint(
         {key: value.clone() for key, value in backbone.state_dict().items()}
     )
+
+
+def test_vector_sigma_scales_components_by_runtime_width():
+    sigma = 2.0
+    wrapper = LatentThoughtModel(_pope_model(), thought_sigma=sigma)
+    assert wrapper.transition.component_std == pytest.approx(
+        sigma / KWARGS["model_dim"] ** 0.5
+    )
+    belief = torch.randn(2, KWARGS["model_dim"])
+    assert torch.equal(wrapper.transition.predict_mean(belief), belief)
+    mean = torch.zeros(1, KWARGS["model_dim"])
+    log_sigma = wrapper.transition.predict_log_sigma(mean)
+    deterministic_action = mean + log_sigma.exp()
+    noise = deterministic_action - mean
+    assert float(noise.square().sum()) == pytest.approx(sigma**2)
+    factors = wrapper.transition.per_dim_log_prob(
+        deterministic_action, mean, log_sigma
+    )
+    assert factors.shape == mean.shape
+    assert torch.equal(factors.sum(-1), wrapper.transition.log_prob(
+        deterministic_action, mean, log_sigma
+    ))

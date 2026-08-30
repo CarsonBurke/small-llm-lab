@@ -1,26 +1,20 @@
-"""Latent-thought policy modules layered over the backbone.
+"""Forced-initial stochastic latent-thought policy over the backbone.
 
-A thought is the deterministic hidden state that produced a generated token:
-the post-final-norm belief, exactly what the CE readout consumes. When a
-generated token is fed back as input, its producing belief rides along as a
-gated residual on the token embedding —
-``combined = embed(x) + has_thought * (g * W(h) + b)`` — followed by a
-prenorm-residual relu^2 MLP stack before the trunk. Prompt (read) tokens carry
-no hidden, and neither does the input of the step that produces the first
-output token: a hidden exists only where the input token was itself generated
-by the model.
+Every latent trajectory first samples one continuous THINK action. After that
+mandatory action, a Bernoulli gate may CONTINUE_THINK or STOP_AND_EMIT while
+thinking remains active; STOP is irreversible. Raw Gaussian actions are the
+replay data and are adapted into stream inputs through the current combined
+embedding stack. Pinned-EMIT modes bypass the gate, Gaussian, and thought
+slots entirely.
 
-The carried hidden is detached rollout data, so training needs no BPTT and no
-thought-specific objective: the only actions are tokens and the update is
-standard VAPO. The stream has no thought slots — every position is a token
-position, so stream length equals prompt plus emitted tokens.
-
-Deferred by design: test-time-read-compute (carrying hiddens for read
-tokens).
+``thought_sigma`` is the expected isotropic vector-magnitude scale. For a
+runtime hidden width ``d`` the Gaussian component standard deviation is
+``thought_sigma / sqrt(d)``, so ``E[||noise||²] = thought_sigma²``.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -30,9 +24,10 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from pretraining.nanogpt_mini import nanogpt_mini_model
 
+THINK, EMIT = 0, 1
 RENDERER_FEATURES_SCHEMA = "combined_input+belief/v1"
-ROLLOUT_POLICY_SCHEMA = "deterministic_hidden_carry/v1"
-# Pinned-EMIT reasoning modes never inject a hidden: the rollout is a plain
+ROLLOUT_POLICY_SCHEMA = "forced_initial_think_one_way_stop_isotropic/v3"
+# Pinned-EMIT reasoning modes never sample a gate or thought: the rollout is
 # token policy. The tag embeds the mode because cot and none differ in their
 # trained emission budgets, so their checkpoints are not one policy.
 PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS = {
@@ -51,20 +46,29 @@ def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}") from None
 
 
-THOUGHT_INPUT_SCHEMA = "zero_init_hidden_residual_prenorm_mlp/v2"
+THOUGHT_INPUT_SCHEMA = "combined_raw_gaussian_prenorm_mlp/v3"
+THOUGHT_DISTRIBUTION_SCHEMA = (
+    "belief_centered_isotropic_vector_sigma_over_sqrt_dim/v2"
+)
 
 
 def combiner_init_kwargs_from_checkpoint(payload: dict) -> dict:
-    """Recover combiner geometry before constructing a checkpoint wrapper.
-
-    The combiner's tensor shapes are fixed by the saved CLI arguments, so a
-    caller must rebuild the wrapper with the recorded geometry before strict
-    loading rather than relying on shape checks.
-    """
+    """Recover strict policy geometry and stochastic semantics."""
     saved_args = payload.get("args", {})
+    try:
+        thought_sigma = float(saved_args["thought_sigma"])
+        stop_probability = float(
+            saved_args["init_stop_thinking_probability"]
+        )
+    except KeyError as error:
+        raise ValueError(
+            "latent-policy checkpoint lacks stochastic policy arguments"
+        ) from error
     return {
         "mlp_hidden": saved_args.get("combined_mlp_hidden"),
         "num_blocks": saved_args.get("combined_mlp_blocks", 1),
+        "thought_sigma": thought_sigma,
+        "init_stop_thinking_probability": stop_probability,
     }
 
 
@@ -79,10 +83,7 @@ def validate_renderer_checkpoint(
     if actual != RENDERER_FEATURES_SCHEMA:
         raise ValueError(
             f"incompatible latent-policy checkpoint {checkpoint!r}: renderer "
-            f"schema is {actual!r}, expected {RENDERER_FEATURES_SCHEMA!r}. "
-            "Checkpoints predating deterministic hidden carry (including "
-            "every stochastic-thought policy) cannot be resumed or evaluated "
-            "as this policy."
+            f"schema is {actual!r}, expected {RENDERER_FEATURES_SCHEMA!r}."
         )
     rollout_policy = payload.get("rollout_policy_schema")
     if rollout_policy != expected_rollout_policy_schema:
@@ -93,16 +94,21 @@ def validate_renderer_checkpoint(
             "under a different reasoning mode or deployed policy and cannot "
             "be resumed or evaluated as this policy."
         )
-    thought_input = payload.get("thought_input_schema")
-    if thought_input != THOUGHT_INPUT_SCHEMA:
-        raise ValueError(
-            f"incompatible latent-policy checkpoint {checkpoint!r}: thought "
-            f"input schema is {thought_input!r}, expected "
-            f"{THOUGHT_INPUT_SCHEMA!r}. The checkpoint injected thoughts "
-            "through a different input path and cannot be resumed or "
-            "evaluated as this policy."
-        )
-
+    if expected_rollout_policy_schema == ROLLOUT_POLICY_SCHEMA:
+        thought_input = payload.get("thought_input_schema")
+        if thought_input != THOUGHT_INPUT_SCHEMA:
+            raise ValueError(
+                f"incompatible latent-policy checkpoint {checkpoint!r}: "
+                f"thought input schema is {thought_input!r}, expected "
+                f"{THOUGHT_INPUT_SCHEMA!r}."
+            )
+        distribution = payload.get("thought_distribution_schema")
+        if distribution != THOUGHT_DISTRIBUTION_SCHEMA:
+            raise ValueError(
+                f"incompatible latent-policy checkpoint {checkpoint!r}: "
+                f"thought distribution schema is {distribution!r}, expected "
+                f"{THOUGHT_DISTRIBUTION_SCHEMA!r}."
+            )
 
 class CombinedEmbedding(nn.Module):
     """Token+thought combined-embedding stack shared by actor and critic.
@@ -203,6 +209,129 @@ class CombinedEmbedding(nn.Module):
         if has_thought is None:
             return mixed
         return torch.where(has_thought[..., None], mixed, base)
+
+class GaussianTransitionHead(nn.Module):
+    """Belief-centered Gaussian policy with fixed isotropic component scale.
+
+    The deterministic latent policy's action is the current belief. SAC
+    exploration adds a learned zero-initialized residual mean and isotropic
+    noise around that established action instead of replacing it with a fresh
+    random direction. The configured sigma is a vector-level noise magnitude.
+    Raw actions and likelihoods remain fp32; only the adapted stream input is
+    rounded to the backbone embedding dtype.
+    """
+
+    def __init__(self, model_dim: int, vector_sigma: float):
+        super().__init__()
+        if not math.isfinite(vector_sigma) or vector_sigma <= 0.0:
+            raise ValueError("thought sigma must be finite and positive")
+        self.model_dim = model_dim
+        self.vector_sigma = float(vector_sigma)
+        self.mean_head = nn.Linear(model_dim, model_dim)
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+
+    @property
+    def component_std(self) -> float:
+        return self.vector_sigma / math.sqrt(self.model_dim)
+
+    def predict_mean(self, belief: Tensor) -> Tensor:
+        with torch.autocast(device_type=belief.device.type, enabled=False):
+            belief_fp32 = belief.float()
+            return belief_fp32 + self.mean_head(belief_fp32)
+
+    def predict_log_sigma(self, belief: Tensor) -> Tensor:
+        return torch.full_like(
+            belief, math.log(self.component_std), dtype=torch.float32
+        )
+
+    def sample_latent(
+        self,
+        mean: Tensor,
+        log_sigma: Tensor,
+        generator: torch.Generator | None = None,
+        *,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        if noise is None:
+            noise = torch.randn(
+                mean.shape,
+                dtype=torch.float32,
+                device=mean.device,
+                generator=generator,
+            )
+        return mean.float() + log_sigma.float().exp() * noise.float()
+
+    def per_dim_log_prob(
+        self, sample: Tensor, mean: Tensor, log_sigma: Tensor
+    ) -> Tensor:
+        log_sigma = log_sigma.float()
+        normalized = (sample.float() - mean.float()) * (-log_sigma).exp()
+        return (
+            -0.5 * normalized.square()
+            - log_sigma
+            - 0.5 * math.log(2.0 * math.pi)
+        )
+
+    def log_prob(
+        self, sample: Tensor, mean: Tensor, log_sigma: Tensor
+    ) -> Tensor:
+        return self.per_dim_log_prob(sample, mean, log_sigma).sum(-1)
+
+
+class StopThinkingGate(nn.Module):
+    """Bernoulli CONTINUE/STOP policy; action 1 means stop and emit."""
+
+    def __init__(self, model_dim: int, stop_probability: float):
+        super().__init__()
+        if (
+            not math.isfinite(stop_probability)
+            or not 0.0 < stop_probability < 1.0
+        ):
+            raise ValueError(
+                "initial stop-thinking probability must be strictly in (0, 1)"
+            )
+        self.head = nn.Linear(model_dim, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.constant_(
+            self.head.bias,
+            math.log(stop_probability / (1.0 - stop_probability)),
+        )
+
+    def stop_logit(self, belief: Tensor) -> Tensor:
+        with torch.autocast(device_type=belief.device.type, enabled=False):
+            return self.head(belief.float()).squeeze(-1)
+
+    def sample(
+        self, belief: Tensor, generator: torch.Generator | None = None
+    ) -> tuple[Tensor, Tensor]:
+        logit = self.stop_logit(belief)
+        probability = logit.sigmoid()
+        uniform = torch.rand(
+            probability.shape,
+            device=probability.device,
+            dtype=probability.dtype,
+            generator=generator,
+        )
+        action = (uniform < probability).long()
+        return action, self.log_prob(action, belief)
+
+    def log_prob(self, action: Tensor, belief: Tensor) -> Tensor:
+        return -F.binary_cross_entropy_with_logits(
+            self.stop_logit(belief), action.float(), reduction="none"
+        )
+
+    def sample_action(
+        self, belief: Tensor, generator: torch.Generator | None = None
+    ) -> Tensor:
+        probability = self.stop_logit(belief).sigmoid()
+        uniform = torch.rand(
+            probability.shape,
+            device=probability.device,
+            dtype=probability.dtype,
+            generator=generator,
+        )
+        return (uniform < probability).long()
 
 
 def kv_range_blocks(
@@ -470,13 +599,14 @@ class DecodeRangeMask:
 class StepOutput:
     """Everything one stream step exposes to rollout and training code.
 
-    ``belief`` is the post-final-norm hidden — the thought the next generated
-    token carries. No value: the critic is a separate model that scores stored
-    streams in parallel (``refresh_old_statistics``); the stepwise path never
-    values.
+    ``belief`` is the post-final-norm state. ``predicted`` and
+    ``thought_log_sigma`` parameterize the raw continuous action policy at
+    that state. The critic remains a separate replay-only model.
     """
 
     belief: Tensor
+    predicted: Tensor
+    thought_log_sigma: Tensor
     input_latent: Tensor
     logits: Tensor
     caches: list[tuple[Tensor, ...]]
@@ -687,16 +817,22 @@ class LatentThoughtModel(nn.Module):
         *,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
+        thought_sigma: float = 1.0,
+        init_stop_thinking_probability: float = 0.9,
     ):
         super().__init__()
         self.backbone = backbone
         model_dim = backbone.tok_emb.embedding_dim
         self.thought_input_schema = THOUGHT_INPUT_SCHEMA
         self.combiner = CombinedEmbedding(
-            model_dim,
-            mlp_hidden=mlp_hidden,
-            num_blocks=num_blocks,
+            model_dim, mlp_hidden=mlp_hidden, num_blocks=num_blocks
         )
+        self.transition = GaussianTransitionHead(model_dim, thought_sigma)
+        self.gate = StopThinkingGate(
+            model_dim, init_stop_thinking_probability
+        )
+        self.thought_sigma = float(thought_sigma)
+        self.thought_component_std = self.transition.component_std
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.backbone.embed_tokens(token_ids)
@@ -913,8 +1049,8 @@ class LatentThoughtModel(nn.Module):
         block_mask: BlockMask,
         cache_addresses: Tensor,
         lane_rows: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """Compiled fixed-capacity surface for independently advancing rows."""
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Compiled fixed-capacity policy surface."""
         backbone = self.backbone
         x = input_latent
         skips: list[Tensor] = []
@@ -947,10 +1083,14 @@ class LatentThoughtModel(nn.Module):
                 lane_rows,
             )
         belief = backbone.final_norm(x)
+        predicted = self.transition.predict_mean(belief.squeeze(1))
+        thought_log_sigma = self.transition.predict_log_sigma(
+            belief.squeeze(1)
+        )
         logits = backbone.logits_from_features(
             self.renderer_features(input_latent, belief)
         ).squeeze(1)
-        return belief.squeeze(1), logits
+        return belief.squeeze(1), predicted, thought_log_sigma, logits
 
     def paged_step(
         self,
@@ -1005,7 +1145,7 @@ class LatentThoughtModel(nn.Module):
                     "live mask so dead rows are redirected to scratch lanes"
                 )
         block_mask = cache.block_mask(slot_ids, kv_lengths)
-        belief, logits = self.paged_step_core(
+        belief, predicted, thought_log_sigma, logits = self.paged_step_core(
             input_latent,
             cache.layers,
             positions,
@@ -1015,6 +1155,8 @@ class LatentThoughtModel(nn.Module):
         )
         return StepOutput(
             belief=belief,
+            predicted=predicted,
+            thought_log_sigma=thought_log_sigma,
             input_latent=input_latent.squeeze(1),
             logits=logits,
             caches=cache.layers,
@@ -1236,6 +1378,8 @@ class LatentThoughtModel(nn.Module):
 
         return StepOutput(
             belief=select_state(bank.output.belief),
+            predicted=select_state(bank.output.predicted),
+            thought_log_sigma=select_state(bank.output.thought_log_sigma),
             input_latent=select_state(bank.output.input_latent),
             logits=select_state(bank.output.logits),
             caches=cache.layers,
@@ -1273,8 +1417,8 @@ class LatentThoughtModel(nn.Module):
         position: int | Tensor,
         key_mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """The compiled surface: belief and logits.
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """The compiled policy surface: belief, Gaussian parameters, logits.
 
         Caches are mutated strictly in place.
 
@@ -1319,25 +1463,33 @@ class LatentThoughtModel(nn.Module):
                 block_mask,
             )
         belief = backbone.final_norm(x)
+        predicted = self.transition.predict_mean(belief.squeeze(1))
+        thought_log_sigma = self.transition.predict_log_sigma(
+            belief.squeeze(1)
+        )
         features = self.renderer_features(input_latent, belief)
         logits = backbone.logits_from_features(features).squeeze(1)
-        return belief.squeeze(1), logits
+        return belief.squeeze(1), predicted, thought_log_sigma, logits
 
     def prefill_core(
         self,
         input_latent: Tensor,
         caches: list[tuple[Tensor, ...]],
         key_valid: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Densely ingest a deterministic prefix and expose its final state."""
         belief = self.backbone.prefill_belief(
             input_latent, caches, key_valid
         )[:, -1:]
         final_input = input_latent[:, -1:]
+        predicted = self.transition.predict_mean(belief.squeeze(1))
+        thought_log_sigma = self.transition.predict_log_sigma(
+            belief.squeeze(1)
+        )
         logits = self.backbone.logits_from_features(
             self.renderer_features(final_input, belief)
         ).squeeze(1)
-        return belief.squeeze(1), logits
+        return belief.squeeze(1), predicted, thought_log_sigma, logits
 
     def prefill(
         self,
@@ -1347,9 +1499,13 @@ class LatentThoughtModel(nn.Module):
     ) -> StepOutput:
         """Populate prefix caches without running policy heads per token."""
         input_latent = self.embed_tokens(token_ids)
-        belief, logits = self.prefill_core(input_latent, caches, key_valid)
+        belief, predicted, thought_log_sigma, logits = self.prefill_core(
+            input_latent, caches, key_valid
+        )
         return StepOutput(
             belief=belief,
+            predicted=predicted,
+            thought_log_sigma=thought_log_sigma,
             input_latent=input_latent[:, -1],
             logits=logits,
             caches=list(caches),
@@ -1364,11 +1520,13 @@ class LatentThoughtModel(nn.Module):
         block_mask: BlockMask | None = None,
     ) -> StepOutput:
         """Advance one stream position from an embedded input."""
-        belief, logits = self.step_core(
+        belief, predicted, thought_log_sigma, logits = self.step_core(
             input_latent, caches, position, key_mask, block_mask
         )
         return StepOutput(
             belief=belief,
+            predicted=predicted,
+            thought_log_sigma=thought_log_sigma,
             input_latent=input_latent.squeeze(1),
             logits=logits,
             caches=list(caches),
@@ -1390,22 +1548,27 @@ class LatentThoughtModel(nn.Module):
             block_mask,
         )
 
-    def combined_input(self, token_ids: Tensor, hidden: Tensor) -> Tensor:
-        """The decode-side combined embedding for one generated token per row.
+    def thought_mean(self, belief: Tensor) -> Tensor:
+        return self.transition.predict_mean(belief)
 
-        Every decode input past the first generation step feeds back a token
-        the model generated, so the hasThought flag is implicitly all-ones
-        here; pinned modes bypass this method entirely. The injection branch
-        runs in fp32 and is rounded to the base dtype inside the combiner —
-        the same op order as ``assemble_stream_latents`` — so rollout and
-        replay agree exactly.
-        """
+    def adapt_thought_action(self, thought: Tensor) -> Tensor:
+        """Adapt raw fp32 Gaussian actions with the current combiner stack."""
+        base = thought.to(self.backbone.tok_emb.weight.dtype)
+        return self.combiner(base, thought)
+
+    def thought_input(self, thought: Tensor) -> Tensor:
+        adapted = self.adapt_thought_action(thought)
+        return adapted[:, None] if adapted.dim() == 2 else adapted
+
+    def combined_input(self, token_ids: Tensor, hidden: Tensor) -> Tensor:
+        """Retained model primitive for direct combiner probes."""
         base = self.embed_tokens(token_ids[:, None])
         return self.combiner(base, hidden[:, None])
 
     def new_parameters(self):
-        """Post-training parameters that do not exist in the pretrained checkpoint."""
-        yield from self.combiner.parameters()
+        """Post-training parameters absent from the pretrained checkpoint."""
+        for module in (self.combiner, self.transition, self.gate):
+            yield from module.parameters()
 
     def load_backbone_checkpoint(self, state: dict[str, Tensor]) -> None:
         """Strict backbone load: every checkpoint key must land in the backbone."""

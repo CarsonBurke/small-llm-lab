@@ -41,6 +41,88 @@ use lockstep. CPU parity/integration tests live in
 (kernel-vs-reference, dense-vs-decode logits, left-pad invariance) is
 `postraining/kda_gpu_parity.py`, run through mlq.
 
+## MiniCPM5 native-token VAPO
+
+`train_hf_vapo` is an additional standard-token VAPO path; it does not change
+the nano, latent-thinking, or OPSD trainers. It defaults to the pinned final
+`openbmb/MiniCPM5-1B` RL+OPD checkpoint because its existing math success rate
+provides useful sparse-reward variation and its post-training reduces overlong
+responses. The checkpoint remains a native `LlamaForCausalLM`: its tokenizer,
+thinking chat template, attention blocks, GQA layout, and static HF KV cache
+are used directly.
+
+Rank-16 LoRA adapters and a separate 256-wide value head train. LoRA reduces
+trainable state and optimizer memory; rollout still executes the complete
+1.08B-parameter transformer. The 130,560-token embedding and output matrices
+stay frozen. Host replay stores int32 token ids plus fp32 selected-token
+log-probabilities and precomputed advantages, never full logits. Replay
+reconstructs exact selected-token probabilities in 128-token output-head chunks
+and length-buckets transformer forwards under a padded-token budget.
+
+Each rollout left-pads four prompts, repeats each prompt for sixteen samples,
+and generates all 64 trajectories in one model/cache call per decode position.
+Explicit attention masks hide left padding, while per-row position ids preserve
+each prompt's semantic RoPE positions. One 64-row, 5,120-position MiniCPM cache
+uses exactly 7.5 GiB in bf16. The trainer rejects cache configurations consuming
+more than 70% of currently free VRAM rather than silently serializing groups.
+CPU decoding and reward verification run across the four completed prompt
+groups after the single GPU rollout.
+
+MiniCPM VAPO always uses the checkpoint's native thinking template and its
+recommended temperature of 0.9. Thinking is part of the policy being trained,
+not an inference toggle. The default 4,096-token response budget keeps the
+fully parallel 64-row static cache inside the 32 GiB device. Longer contexts
+must pass the explicit cache-memory check.
+
+Nucleus sampling is exact without repeatedly sorting the 130,560-token
+vocabulary. It proposes from the full temperature-scaled categorical and
+rejects tokens outside a deterministic top-p nucleus. Conditioning gives the
+same nucleus distribution, with acceptance probability at least 0.95 and about
+1.053 proposals per accepted token on average. Equal logits use ascending token
+id as the deterministic tie-break.
+
+Each of the ten critic warmup steps collects a distinct four-prompt,
+64-trajectory rollout before updating the value head. Warmup never reuses one
+rollout as ten nominally different observations.
+
+NextLat and Jacobi drafting were removed from this path. Their shared static
+cursor required an entire 16-row block position to accept before reuse; NextLat
+accepted no complete position through step 5 and slowed rollouts by about 6%.
+Expanding that rule to 64 rows only lowers joint acceptance, while each draft
+also pays another 130,560-token output-head projection. Jacobi accepted only
+194/13,645 positions (1.42%) and reduced throughput from 412.66 to 226.23
+tokens/s. Exact per-row speculation would require a paged cache with independent
+row cursors; it is not represented as a fast path until such an implementation
+has measured benefit.
+TensorBoard is the live metric surface. It writes decode progress every 256
+steps plus rollout, gate, warmup, optimizer, and attributable NVML power/SM
+utilization/clock summaries under
+`postraining/runs/<run-name>/tensorboard/`; configuration scalars are flushed
+before model execution begins. The JSONL stream remains only as a durable
+offline comparison. Use `--no-device-telemetry` only when an external profiler
+owns `nvidia-smi`.
+
+Establish the pinned native checkpoint baseline before running the integrated
+learnability gate:
+
+```bash
+mlq submit --name minicpm5_native_aime_baseline --cwd "$PWD" \
+  --max-parallel-runs 1 --time-limit 4h -- \
+  python3 -m postraining.eval_hf_math \
+    --model openbmb/MiniCPM5-1B --suite aime_2024 --thinking \
+    --samples-per-problem 4 --max-problems 30 \
+    --prompt-tokens 1024 --max-new-tokens 4096 \
+    --batch-trajectories 4 --no-autotune-batch-trajectories \
+    --temperature 0.9 --top-p 0.95 \
+    --output postraining/runs/minicpm5_native_baseline
+
+mlq submit --name minicpm5_vapo_gate --cwd "$PWD" \
+  --max-parallel-runs 1 --time-limit 4h -- \
+  python3 -m postraining.train_hf_vapo \
+    --rollout-only \
+    --output postraining/runs/minicpm5_vapo_gate
+```
+
 Run every GPU workload through `mlq`. Before a new training campaign, run the
 frozen-policy learnability gate:
 
@@ -111,36 +193,40 @@ reward/evaluation. The prompt schema is recorded in SFT and RL checkpoints and
 enforced on initialization and exact resume; regenerate the canonical SFT
 corpus and retrain SFT when this schema changes.
 
-## Latent thinking: deterministic hidden carry
+## Latent thinking: forced-initial stochastic policy
 
-`--reasoning-mode latent` trains the hidden-carry policy (execution schema
-v28). A "thought" is the post-final-norm belief that produced a generated
-token; when that token feeds back as input, its producing belief rides along
-as a residual on the token embedding:
+`--reasoning-mode latent` uses execution schema v29. Every trajectory takes
+one mandatory continuous `THINK` action before its first emitted token. After
+that action, a learned Bernoulli gate chooses `CONTINUE_THINK` or
+`STOP_AND_EMIT`; stopping is irreversible, so all later actions are emitted
+tokens. `cot`, `none`, and OPSD `pin_emit` rollouts bypass the gate, noise, and
+thought slots completely.
+
+The Gaussian transition is centered on the deterministic latent policy's
+current belief plus a learned zero-initialized residual. It samples one raw
+fp32 action, so exploration does not replace the established latent direction
+with a fresh random projection. That exact vector is stored once and reused
+by live decode, actor replay, and the separate critic; replay never redraws
+noise. `--thought-sigma` is the isotropic vector-magnitude scale, not a
+per-component standard deviation. For runtime embedding width `d`:
 
 ```
-combined = embed(token) + hasThought * (W(belief) + type_bias)
-input    = combined + MLP(RMSNorm(combined))   # per block, relu^2, identity at init
+component_std = thought_sigma / sqrt(d)
+E[||noise||^2] = thought_sigma^2
 ```
 
-`hasThought` is 1 exactly where the input token was model-generated (prompt
-tokens and the first generation step carry no hidden). `W` is
-zero-initialized, so a fresh run is bit-exact with the pretrained token
-policy while `W` gets a full-rank gradient from the first step. (The v1
-form gated an orthogonal `W` behind one zero-init scalar gain — a
-multiplicative saddle neither factor escaped in practice.) There is no
-stochastic thought channel: the only actions are tokens, training defaults to
-token-level DG with an HL-Gauss critic, and the carried belief is
-detached replay data — no BPTT. The separate critic re-derives combined
-embeddings with its own combiner weights. `cot` and `none` remain token-only
-control modes with zero-width hidden storage. Combiner geometry is set by
-`--combined-mlp-hidden` (default 2048) and `--combined-mlp-blocks`
-(default 1; 0 ablates to the pure residual).
+Raw actions are adapted through the current combined-embedding stack before
+entering the trunk. `--combined-mlp-hidden` (default 2048) and
+`--combined-mlp-blocks` (default 1; 0 keeps only the residual adapter) retain
+the current combiner geometry. `--init-stop-thinking-probability` explicitly
+sets the fresh gate's STOP bias; it never removes the mandatory first thought.
 
-Checkpoints from the pre-v28 stochastic thought/gate policy cannot be
-resumed or evaluated; there are no migrations. Test-time-read-compute
-(carrying hiddens for read tokens) is deliberately out of scope for this
-schema.
+The standard clipped VAPO arm is selected with
+`--no-delightful-policy-gradient`. DG and TPO retain their current token
+objectives and add the scored gate/Gaussian factors without changing their
+selection flags. Checkpoint, manifest, replay, evaluation, and exact-resume
+schemas are strict; deterministic-carry and older stochastic checkpoints have
+no migration into v29.
 
 The campaign uses GPT-2 BPE with token 50256 as both BOS and EOS. The final
 checkpoint records its exact architecture, corpus manifest, and maximum

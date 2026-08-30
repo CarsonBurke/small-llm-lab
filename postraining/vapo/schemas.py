@@ -6,25 +6,24 @@ from postraining.muon import MUON_ALGORITHM_SCHEMA
 
 
 EXECUTION_SCHEMA = (
-    "unique_prefix_compact_tail_shuffled_pool1024_disjoint_b256_deterministic_hidden_carry_token_clip_anchored_value_general_lr_sequential_data/v28"
+    "unique_prefix_compact_tail_broad_mixture_forced_initial_think_"
+    "one_way_stop_vector_sigma_isotropic_trajectory_position_rng/v29"
 )
 CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX = (
-    "+request_stable_continuous_refill_paged_flex_attention_cdf_right/v2"
+    "+request_stable_gate_token_gaussian_refill_paged_flex/v3"
 )
 PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 ACTOR_OBJECTIVE_SCHEMA = (
-    "vapo_token_clip_no_positive_example_lm_token_denominator/v3"
+    "vapo_joint_gate_token_gaussian_clip_token_denominator/v4"
 )
 DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
-    "delightful_policy_gradient_current_token_surprisal_eta1_"
-    "detached_gate_no_importance_ratio/v1"
+    "delightful_token_policy_plus_vapo_gate_gaussian/v2"
 )
 TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA = (
-    "target_policy_intra_trajectory_executed_token_raw_gae_"
-    "old_policy_odds_target_global_token_mean_eta_controlled_no_pg_aux/v6"
+    "target_policy_token_odds_plus_vapo_gate_gaussian/v7"
 )
 REPLAY_NUMERICS_SCHEMA = (
-    "compact_token_logprob_and_target_vs_rest_logodds_next_slot_targets/v3"
+    "compact_emit_gate_raw_gaussian_next_slot_exact_replay/v4"
 )
 ADAMW_ALGORITHM_SCHEMA = (
     "torch_adamw_betas0.9_0.999_eps1e-8_amsgrad_false_weight_decay0/v1"
@@ -70,18 +69,16 @@ def resume_execution_schema_compatible(
     *,
     expected_execution_schema: str = EXECUTION_SCHEMA,
 ) -> bool:
-    """Resume compatible policy state at a complete rollout-pool boundary.
+    """Require the exact stochastic-policy execution contract.
 
-    v28 replaced the stochastic thought/gate policy with the deterministic
-    hidden carry; no saved state from any earlier schema has a sound
-    interpretation under it, so compatibility is strict equality — there
-    are no migrations.
+    The v29 stream, RNG, and policy semantics are incompatible with every
+    deterministic-carry checkpoint. There are no migrations.
     """
     return payload.get("execution_schema") == expected_execution_schema
 
 
 def resume_replay_schema_compatible(payload: dict) -> bool:
-    """Strict replay-numerics match; pre-v28 layouts are never migrated."""
+    """Strict replay-numerics match; old stream layouts are never migrated."""
     return payload.get("replay_numerics_schema") == REPLAY_NUMERICS_SCHEMA
 
 

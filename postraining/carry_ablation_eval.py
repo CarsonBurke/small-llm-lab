@@ -1,21 +1,8 @@
-"""Ablate the recurrent hidden carry on a trained latent-VAPO policy.
+"""Ablate raw stochastic thought content on a trained latent-VAPO policy.
 
-Answers "is the carried hidden actually helping?" with three policy arms
-evaluated on the SAME prompt panel, the same seed, and paired per-prompt
-statistics:
-
-- ``full``        the checkpoint exactly as trained;
-- ``no_content``  ``combiner.carry.weight`` zeroed — the recurrent CONTENT
-                  channel is off, but the hasThought ``type_bias`` and the
-                  combiner MLP stack still fire at generated positions;
-- ``token_only``  ``pin_emit=True`` — no hidden is ever carried, and because
-                  the whole combiner path applies only at hasThought
-                  positions, generated tokens re-enter as plain embeddings
-                  (the combiner is bypassed entirely).
-
-``full`` vs ``no_content`` isolates what the hidden's content contributes;
-``no_content`` vs ``token_only`` isolates the type-bias/MLP "this token was
-generated" pathway the trunk may have co-adapted to.
+The full arm reproduces the checkpoint policy, ``no_content`` disables the
+combiner's learned residual over raw thought inputs, and ``token_only`` uses
+``pin_emit=True`` to bypass gate, noise, and thought slots entirely.
 
 Per-prompt correct counts from ``evaluate_latent_math`` give paired deltas;
 significance comes from a sign-flip permutation test on the per-prompt mean
@@ -23,13 +10,11 @@ delta plus a bootstrap CI, both resampled over prompts (the independent
 sampling unit — samples within a prompt are exchangeable but not
 independent evidence about the panel).
 
-Separately, mechanistic probes on freshly rolled trained-policy trajectories
-quantify what the actor and critic READ from the carry, through the exact
-production replay path (``refresh_old_statistics``): recompute
-``old_token_logprobs``/``old_values`` with stored hiddens, zero
-``batch.hiddens``, recompute, and diff at the consumed action slots. The
-injection magnitude ``rms(W h) / rms(embed)`` is reported alongside. The
-probes deliberately roll at the TRAINING operating point (the checkpoint's
+Separately, mechanistic probes use the production replay path:
+``refresh_old_statistics`` consumes the stored raw fp32 thought actions, then
+the probe zeros ``batch.thoughts`` and recomputes actor/critic statistics. The
+contrast measures dependence on action content without any redraw.
+The probes deliberately roll at the TRAINING operating point (the checkpoint's
 saved temperature/top-p) because they measure what PPO and GAE consumed
 during training; the behavioral arms use the evaluation protocol
 (temperature 1.0, top-p 0.7) like the trainer's bench/AIME evals. Both
@@ -77,7 +62,7 @@ from postraining.core import (
 from postraining.hl_gauss import anchored_unit_geometry
 from postraining.latent_eval import evaluate_latent_math
 from postraining.latent_rollout import (
-    generated_slot_mask,
+    THOUGHT_SLOT,
     refresh_old_statistics,
     rollout_continuations,
     trim_stream,
@@ -230,20 +215,11 @@ def hidden_probes(
     device: torch.device,
     stop_ids: tuple[int, ...],
 ) -> dict[str, object]:
-    """What the actor and critic read from the carried hidden, mechanistically.
+    """Measure actor/critic dependence on stored raw thought actions.
 
-    Rolls trained-policy trajectories (training sampling settings, hiddens
-    stored), refreshes ``old_token_logprobs``/``old_values`` through the
-    production replay path, then zeroes ``batch.hiddens`` in place and
-    refreshes again. The delta at consumed action slots is exactly the
-    carry-content contribution as seen by PPO and GAE. ``type_bias`` and the
-    combiner MLP still fire at generated slots in both passes, so the
-    contrast matches the ``full`` vs ``no_content`` arm pair — but at the
-    training operating point (saved temperature/top-p), not the arms'
-    evaluation protocol, because these numbers describe the training
-    process. The refreshes run under ``torch.no_grad()``: the trainer keeps
-    them grad-enabled only to share a torch.compile artifact with the update
-    step, and this script compiles nothing (eager numerics are identical).
+    Rollout samples each fp32 raw action once. Refresh first uses those exact
+    vectors, then zeroes the stored actions and refreshes again; no path redraws
+    noise.
     """
     max_new_tokens = saved_args["resolved_train_max_new_tokens"]
     max_stream_steps = saved_args["resolved_train_max_stream_steps"]
@@ -313,10 +289,10 @@ def hidden_probes(
         )
         action = batch.action_mask.bool()
         with torch.no_grad():
-            carried = generated_slot_mask(batch)
+            carried = batch.kind == THOUGHT_SLOT
             if bool(carried.any()):
-                hiddens = batch.hiddens[carried].float()
-                base = wrapper.embed_tokens(batch.token_ids)[carried].float()
+                hiddens = batch.thoughts[carried].float()
+                base = hiddens
                 injected = F.linear(
                     hiddens, wrapper.combiner.carry.weight.float()
                 )
@@ -331,7 +307,7 @@ def hidden_probes(
             refresh_old_statistics(wrapper, critic, batch, **refresh_budgets)
             logp_full = batch.old_token_logprobs.clone()
             values_full = batch.old_values.clone()
-            batch.hiddens.zero_()
+            batch.thoughts.zero_()
             refresh_old_statistics(wrapper, critic, batch, **refresh_budgets)
 
         logp_delta = (logp_full - batch.old_token_logprobs)[action].float()
@@ -503,7 +479,13 @@ def main() -> None:
         v_min=value_v_min,
         v_max=value_v_max,
         prior_value=saved_args.get("value_prior", 0.05),
-        **combiner_init_kwargs_from_checkpoint(payload),
+        **{
+            key: value
+            for key, value in combiner_init_kwargs_from_checkpoint(
+                payload
+            ).items()
+            if key in {"mlp_hidden", "num_blocks"}
+        },
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()

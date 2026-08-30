@@ -4,19 +4,24 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from postraining.eval_hf_math import (
     _causal_conv1d_reference,
     _causal_conv1d_update_reference,
     has_terminal_loop,
     last_boxed_answer,
+    load_vapo_adapter_for_evaluation,
     normalized_token_ids,
+    left_padded_position_ids,
     prepare_prompt_ids,
     relaxed_verify,
     repeated_ngram_fraction,
     resolved_eos_ids,
     summarize_attempts,
     truncate_prompt,
+    write_suite_metrics_to_tensorboard,
 )
 
 
@@ -44,6 +49,14 @@ def test_truncate_prompt_preserves_bos_and_tail() -> None:
     assert truncate_prompt([1, 2], 4, 1) == [1, 2]
     with pytest.raises(ValueError, match="positive"):
         truncate_prompt([1], 0, 1)
+
+
+def test_left_padded_positions_restart_at_first_real_token() -> None:
+    mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+    assert left_padded_position_ids(mask).tolist() == [
+        [0, 0, 0, 1, 2],
+        [0, 1, 2, 3, 4],
+    ]
 
 
 def test_generation_token_diagnostics_detect_repetition() -> None:
@@ -99,6 +112,129 @@ def test_prepare_chat_prompt_accepts_mapping_tokenizer_output() -> None:
         prompt_mode="chat",
         prompt_tokens=8,
     ) == [17, 20, 21]
+
+
+def test_prepare_chat_prompt_forwards_native_thinking_mode() -> None:
+    class ThinkingTokenizer:
+        bos_token_id = 17
+        received: dict = {}
+
+        @classmethod
+        def apply_chat_template(cls, *args, **kwargs):
+            cls.received = kwargs
+            return [17, 8, 20]
+
+    assert prepare_prompt_ids(
+        ThinkingTokenizer(),
+        "problem",
+        prompt_mode="chat",
+        prompt_tokens=8,
+        enable_thinking=True,
+    ) == [17, 8, 20]
+    assert ThinkingTokenizer.received["enable_thinking"] is True
+
+
+def test_prepare_raw_prompt_rejects_thinking_mode() -> None:
+    with pytest.raises(ValueError, match="chat prompt"):
+        prepare_prompt_ids(
+            SimpleNamespace(bos_token_id=17),
+            "problem",
+            prompt_mode="raw",
+            prompt_tokens=8,
+            enable_thinking=True,
+        )
+
+def test_vapo_adapter_evaluation_loads_bf16_policy_weights(tmp_path) -> None:
+    class TinyPolicy(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            for name in (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ):
+                setattr(self, name, nn.Linear(4, 4, bias=False))
+
+    from postraining.hf_vapo import (
+        LoRAConfig,
+        adapter_state_dict,
+        inject_lora,
+    )
+
+    config = LoRAConfig(rank=2, alpha=4.0)
+    source = TinyPolicy()
+    inject_lora(source, config)
+    with torch.no_grad():
+        for name, parameter in source.named_parameters():
+            if name.endswith("lora_b"):
+                parameter.fill_(0.25)
+    checkpoint = tmp_path / "adapter.pt"
+    torch.save(
+        {
+            "policy": {
+                "model_id": "model",
+                "revision": "revision",
+                "lora_config": {
+                    "rank": config.rank,
+                    "alpha": config.alpha,
+                    "targets": config.targets,
+                },
+                "adapter": adapter_state_dict(source),
+            },
+            "step": 7,
+            "args": {"thinking": True},
+        },
+        checkpoint,
+    )
+    target = TinyPolicy().to(dtype=torch.bfloat16)
+    metadata = load_vapo_adapter_for_evaluation(
+        target,
+        checkpoint,
+        model_id="model",
+        revision="revision",
+    )
+    assert metadata["step"] == 7
+    assert metadata["thinking"] is True
+    adapter_parameters = {
+        name: parameter
+        for name, parameter in target.named_parameters()
+        if name.endswith(("lora_a", "lora_b"))
+    }
+    assert adapter_parameters
+    assert all(
+        parameter.dtype == torch.bfloat16
+        for parameter in adapter_parameters.values()
+    )
+    assert all(
+        torch.all(parameter == torch.tensor(0.25, dtype=torch.bfloat16))
+        for name, parameter in adapter_parameters.items()
+        if name.endswith("lora_b")
+    )
+
+
+def test_periodic_suite_metrics_append_to_training_tensorboard(tmp_path) -> None:
+    write_suite_metrics_to_tensorboard(
+        tmp_path,
+        5,
+        {
+            "aime_2024": {
+                "contract_accuracy": 0.25,
+                "relaxed_accuracy": 0.3,
+                "terminated_fraction": 0.8,
+                "capped_fraction": 0.2,
+            }
+        },
+    )
+    accumulator = EventAccumulator(str(tmp_path))
+    accumulator.Reload()
+    accuracy = accumulator.Scalars("aime_2024/accuracy")
+    assert [(entry.step, entry.value) for entry in accuracy] == [
+        (5, pytest.approx(0.25))
+    ]
 
 
 def test_reference_causal_convolution_updates_state_consistently() -> None:

@@ -20,6 +20,7 @@ from postraining.core import (
 )
 from postraining.latent_rollout import (
     PAD_SLOT,
+    THOUGHT_SLOT,
     TOKEN_SLOT,
     LatentRolloutBatch,
     assemble_stream_latents,
@@ -32,7 +33,6 @@ from postraining.latent_rollout import (
     pack_rollout_groups_for_replay,
     continuation_reward,
     emitted_token_rows,
-    generated_slot_mask,
     iter_length_aware_microbatches,
     iter_planned_replay_microbatches,
     plan_length_aware_shards,
@@ -48,6 +48,8 @@ from postraining.latent_rollout import (
     trim_stream,
 )
 from postraining.latent_thought import (
+    EMIT,
+    THINK,
     THOUGHT_INPUT_SCHEMA,
     DecodeRangeMask,
     LatentThoughtModel,
@@ -206,24 +208,32 @@ def test_stream_storage_is_internally_consistent():
     batch = _rollout(wrapper, batch=4)
     prompt = batch.prompt_length
     assert torch.all(batch.kind[:, :prompt] == TOKEN_SLOT)
-    # The first action decides at the last prompt slot; its consequence (the
-    # first generated token, with the belief that produced it) lands at the
-    # next slot — the codebase's "+1 shift" convention.
+    # The last prompt slot always chooses the mandatory THINK. Its exact raw
+    # fp32 action is consumed at the next explicit thought slot.
     assert torch.all(batch.action_mask[:, prompt - 1] == 1)
-    assert torch.all(batch.kind[:, prompt] == TOKEN_SLOT)
-    # Every recorded action produced a generated-token slot right after it,
-    # which is exactly where the hasThought flag derives from.
-    action_positions = batch.action_mask.nonzero()
-    carried = generated_slot_mask(batch)
-    for row, position in action_positions.tolist():
-        assert int(batch.kind[row, position + 1]) == TOKEN_SLOT
-        assert bool(carried[row, position + 1])
-    # Prompt slots and the first action slot carry no hidden.
-    assert not carried[:, :prompt].any()
-    # PAD slots carry no hiddens, no actions, no rewards.
+    assert torch.all(batch.actions[:, prompt - 1] == THINK)
+    assert torch.all(batch.kind[:, prompt] == THOUGHT_SLOT)
+    assert not batch.stop_mask[:, prompt - 1].any()
+    for row, position in batch.action_mask.nonzero().tolist():
+        expected = (
+            THOUGHT_SLOT
+            if int(batch.actions[row, position]) == THINK
+            else TOKEN_SLOT
+        )
+        assert int(batch.kind[row, position + 1]) == expected
+    for row in range(batch.kind.size(0)):
+        stopped = (
+            (batch.actions[row] == EMIT) & batch.stop_mask[row].bool()
+        ).nonzero()
+        if stopped.numel():
+            stop = int(stopped[0])
+            later = batch.action_mask[row].bool()
+            later[: stop + 1] = False
+            assert torch.all(batch.actions[row, later] == EMIT)
+            assert not batch.stop_mask[row, later].any()
     pads = batch.kind == PAD_SLOT
     assert float(batch.action_mask[pads].sum()) == 0.0
-    assert float(batch.hiddens[pads].abs().sum()) == 0.0
+    assert float(batch.thoughts[pads].abs().sum()) == 0.0
 
 
 def test_emit_token_logprobs_helper_matches_the_explicit_readout():
@@ -328,18 +338,18 @@ def test_replay_reproduces_rollout_logprobs():
     # The rollout never values: old_values stay zero until the separate
     # critic fills them in refresh_old_statistics.
     assert float(batch.old_values.abs().sum()) == 0.0
-    actions = batch.action_mask.bool()
+    emits = batch.emit_mask.bool()
     torch.testing.assert_close(
-        token_logprobs[actions], batch.old_token_logprobs[actions],
+        token_logprobs[emits], batch.old_token_logprobs[emits],
         rtol=2e-4, atol=2e-4,
     )
 
 
-def test_assembled_latents_zero_pads_and_route_hiddens_through_combiner():
+def test_assembled_latents_zero_pad_and_route_raw_thoughts_through_combiner():
     wrapper = _wrapper()
     with torch.no_grad():
         # A fresh combiner is an exact identity; give it a live content
-        # channel so the carried-hidden routing is observable.
+        # channel so raw thought-action routing is observable.
         wrapper.combiner.carry.weight.normal_(std=0.02)
         wrapper.combiner.type_bias.normal_(std=0.02)
     batch = _rollout(wrapper)
@@ -347,22 +357,22 @@ def test_assembled_latents_zero_pads_and_route_hiddens_through_combiner():
         latents = assemble_stream_latents(wrapper, batch)
     pads = batch.kind == PAD_SLOT
     assert float(latents[pads].abs().sum()) == 0.0
-    carried = generated_slot_mask(batch)
+    thought_slots = batch.kind == THOUGHT_SLOT
     token_latent = wrapper.embed_tokens(batch.token_ids)
     with torch.no_grad():
-        expected = wrapper.combiner(token_latent, batch.hiddens, carried)
-    torch.testing.assert_close(latents[carried], expected[carried])
-    # Uncarried non-pad slots are bitwise the plain token path.
-    plain = ~carried & (batch.kind != PAD_SLOT)
+        expected = wrapper.thought_input(batch.thoughts)
+    torch.testing.assert_close(latents[thought_slots], expected[thought_slots])
+    # Non-thought, non-pad slots are bitwise the plain token path.
+    plain = ~thought_slots & (batch.kind != PAD_SLOT)
     assert torch.equal(latents[plain], token_latent[plain])
 
 
-def test_discarded_carry_batches_refuse_replay():
-    """Zero-width hiddens are replayable only for pinned token-only modes.
+def test_discarded_thought_batches_refuse_replay():
+    """Zero-width thoughts are replayable only for pinned token-only modes.
 
-    A latent rollout with ``replay_storage=False`` injected carries the
-    stored stream no longer contains; replaying it would silently rebuild
-    plain token inputs the behavior policy never saw, so it must raise.
+    A latent rollout with ``replay_storage=False`` used raw actions that the
+    stored stream no longer contains. Replay must not silently rebuild plain
+    token inputs that differ from the behavior policy.
     """
     wrapper = _wrapper()
     prompt_ids = torch.randint(0, 32, (2, 5))
@@ -374,8 +384,8 @@ def test_discarded_carry_batches_refuse_replay():
                 generator=generator, replay_storage=False,
             )
         )
-    assert discarded.carry_injected and discarded.hiddens.size(-1) == 0
-    with pytest.raises(ValueError, match="discarded its carried hiddens"):
+    assert discarded.thoughts.size(-1) == 0
+    with pytest.raises(ValueError, match="stored raw thought actions"):
         assemble_stream_latents(wrapper, discarded)
     generator = torch.Generator().manual_seed(7)
     with torch.no_grad():
@@ -385,8 +395,7 @@ def test_discarded_carry_batches_refuse_replay():
                 generator=generator, replay_storage=False, pin_emit=True,
             )
         )
-        assert not pinned.carry_injected
-        # Pinned token-only rollouts replay through the plain token path.
+        assert pinned.thoughts.size(-1) == 0
         assemble_stream_latents(wrapper, pinned)
 
 
@@ -485,7 +494,7 @@ def test_delightful_default_retains_actor_signal_for_zero_reward_source():
     assert (
         metrics["delightful_positive_count"]
         + metrics["delightful_negative_count"]
-        == metrics["action_count"]
+        == metrics["emit_action_count"]
     )
     assert metrics["renderer_grad_norm"] > 0.0
 
@@ -680,7 +689,7 @@ def test_tpo_update_uses_raw_gae_without_candidates_or_action_q():
     )
     assert metrics["policy_clip_fraction"] == 0.0
     assert metrics["token_abs_log_ratio_max"] == 0.0
-    assert metrics["tpo_active_count"] == metrics["action_count"]
+    assert metrics["tpo_active_count"] == metrics["emit_action_count"]
     assert metrics["tpo_target_log_odds_shift_abs_mean"] > 0.0
     assert metrics["tpo_target_log_odds_shift_abs_mean"] <= 0.5
     assert metrics["tpo_pre_update_probability_residual_abs_mean"] > 0.0
@@ -733,7 +742,7 @@ def test_tpo_default_retains_actor_targets_for_zero_reward_source():
         target_policy_optimization=True,
     )
     assert metrics["actor_active_trajectory_fraction"] == 1.0
-    assert metrics["tpo_active_count"] == metrics["action_count"]
+    assert metrics["tpo_active_count"] == metrics["emit_action_count"]
     assert metrics["tpo_target_move_abs_mean"] > 0.0
 
 
@@ -785,10 +794,17 @@ def _decode_group(row_actions: list[int], prompt: int, bucket: int = 1):
     return LatentRolloutBatch(
         kind=torch.full((rows, stream), TOKEN_SLOT, dtype=torch.long),
         token_ids=torch.zeros((rows, stream), dtype=torch.long),
-        hiddens=torch.zeros(rows, stream, 0),
+        thoughts=torch.zeros(rows, stream, 0),
+        actions=torch.zeros((rows, stream), dtype=torch.long),
         action_mask=action_mask,
+        stop_mask=zeros.clone(),
+        emit_mask=action_mask.clone(),
+        old_stop_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
         old_token_log_odds=zeros.clone(),
+        old_thought_logprobs=torch.zeros(rows, stream, 0),
+        old_thought_means=torch.zeros(rows, stream, 0),
+        old_thought_log_sigmas=torch.zeros(rows, stream, 0),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(rows),
@@ -913,24 +929,24 @@ def test_refresh_old_statistics_matches_the_update_code_path_exactly():
             wrapper, batch
         )
         values = critic.values(batch).float()
-        action_mask = batch.action_mask.bool()
-        action_features = wrapper.renderer_features(
-            stream_inputs[action_mask], beliefs[action_mask]
+        emit_mask = batch.emit_mask.bool()
+        emit_features = wrapper.renderer_features(
+            stream_inputs[emit_mask], beliefs[emit_mask]
         )
         compact_token_logprobs = (
-            backbone.logits_from_features(action_features)
+            backbone.logits_from_features(emit_features)
             .float()
             .log_softmax(-1)
             .gather(
                 -1,
                 compact_next_slots(
-                    batch.token_ids, slot_index(action_mask)
+                    batch.token_ids, slot_index(emit_mask)
                 )[..., None],
             )
             .squeeze(-1)
         )
         token_logprobs = torch.zeros_like(batch.old_token_logprobs)
-        token_logprobs[action_mask] = compact_token_logprobs
+        token_logprobs[emit_mask] = compact_token_logprobs
     assert torch.equal(batch.old_values, values)
     assert torch.equal(batch.old_token_logprobs, token_logprobs)
 
@@ -1784,14 +1800,14 @@ def test_optimizer_layout_partitions_trainable_parameters_exactly_once():
     critic_probe_ids = {id(p) for p in wrapper.backbone.critic_probe.parameters()}
     assert critic_probe_ids
     assert critic_probe_ids.isdisjoint({id(p) for p in actor_params})
-    # Three groups: trunk, combiner, renderer probe. Every actor component
-    # uses the same general learning rate as the critic.
+    # Three groups: trunk, stochastic latent policy, renderer probe. Every
+    # actor component uses the same general learning rate as the critic.
     lrs = [group["lr"] for group in optimizers["actor"].param_groups]
     assert lrs == [1e-3] * 3
     assert optimizers["critic"].param_groups[0]["lr"] == 1e-3
-    combiner_group = optimizers["actor"].param_groups[1]["params"]
-    assert {id(p) for p in combiner_group} == {
-        id(p) for p in wrapper.combiner.parameters()
+    latent_policy_group = optimizers["actor"].param_groups[1]["params"]
+    assert {id(p) for p in latent_policy_group} == {
+        id(p) for p in wrapper.new_parameters()
     }
     renderer_group = optimizers["actor"].param_groups[2]["params"]
     assert {id(p) for p in renderer_group} == {
@@ -1976,7 +1992,7 @@ def test_rollout_replay_and_update_run_under_the_bf16_load_policy():
     # The carried hidden is stored fp32 even under a bf16 backbone: the
     # combiner computes its injection in fp32 and casts once, so storage
     # must not round the belief first.
-    assert batch.hiddens.dtype == torch.float32
+    assert batch.thoughts.dtype == torch.float32
     refresh_old_statistics(wrapper, critic, batch)
     assign_terminal_rewards(batch, torch.rand(2))
     metrics = update_minibatch(
@@ -2357,7 +2373,7 @@ def test_finished_row_compaction_preserves_original_row_attribution():
             wrapper,
             prompt_ids,
             max_new_tokens=1,
-            max_stream_steps=1,
+            max_stream_steps=2,
             temperature=1.0,
             top_p=1e-6,
             compact_finished=compact_finished,
@@ -2368,7 +2384,7 @@ def test_finished_row_compaction_preserves_original_row_attribution():
     for field in (
         "kind",
         "token_ids",
-        "hiddens",
+        "thoughts",
         "action_mask",
     ):
         torch.testing.assert_close(getattr(compact, field), getattr(reference, field))
@@ -2663,7 +2679,14 @@ def _deterministic_nano_wrapper() -> LatentThoughtModel:
     with torch.no_grad():
         backbone.proj.weight.normal_(std=0.05)
         backbone.proj.bias.normal_(std=0.05)
-    return LatentThoughtModel(backbone)
+    wrapper = LatentThoughtModel(backbone)
+    wrapper.transition.sample_latent = (
+        lambda mean, log_sigma, generator=None, noise=None: mean.float()
+    )
+    with torch.no_grad():
+        wrapper.gate.head.weight.zero_()
+        wrapper.gate.head.bias.fill_(100.0)
+    return wrapper
 
 
 def test_flex_decode_mask_reproduces_the_boolean_row_mask(monkeypatch):
@@ -2873,16 +2896,9 @@ def test_a_short_chunk_pads_up_to_the_arena_without_changing_a_row(monkeypatch):
     --consume-all-prompts takes an arbitrary count. Rejecting those (the first
     shape of this flag) kills every fresh run at its first warmup rollout, and
     running them narrower records a second graph at a second shape, which is
-    the cost the arena exists to remove. They pad up instead. This pins that
-    the padding is invisible: the returned batch holds exactly the real rows,
-    and every one is identical to the same chunk on an exactly-sized arena.
-
-    Row-for-row equality holds here because sampling is patched to argmax.
-    Under real sampling it would not: every draw runs at the PADDED row count,
-    so a short chunk's real rows diverge from the same chunk unpadded after
-    the first step. That is a reproducibility property of the flag, not a
-    defect -- the arena width is fixed by config -- but it is why this test
-    pins the plumbing rather than the samples.
+    the cost the arena exists to remove. They pad up instead. The returned
+    batch holds exactly the real rows, and trajectory/position RNG ensures
+    appended filler rows cannot perturb a real row's policy draws.
     """
     wrapper = _deterministic_nano_wrapper()
     generator = torch.Generator().manual_seed(31)
@@ -3013,7 +3029,7 @@ def test_flex_decode_main_loop_matches_the_boolean_rollout(monkeypatch):
     assert torch.equal(flex.action_mask, boolean.action_mask)
     assert torch.equal(flex.kind[mask], boolean.kind[mask])
     assert torch.equal(flex.token_ids[mask], boolean.token_ids[mask])
-    assert torch.isfinite(flex.hiddens).all()
+    assert torch.isfinite(flex.thoughts).all()
 
 
 def test_flex_decode_bucket_rounds_the_survivor_count_up(monkeypatch):
@@ -3236,7 +3252,7 @@ def test_dynamic_compiled_step_accepts_tensor_positions_and_prompt_masks():
         tensor_positions=True,
         replay_storage=False,
     )
-    assert batch.hiddens.shape == (2, 11, 0)
+    assert batch.thoughts.shape == (2, 11, 0)
     assert batch.action_mask.sum() >= 2
     wrapper.step_core = original
 
@@ -3265,8 +3281,8 @@ def test_eval_only_sampling_is_policy_identical_to_replay_rollout():
         "action_mask",
     ):
         assert torch.equal(getattr(evaluation, field), getattr(replay, field))
-    assert evaluation.hiddens.shape[-1] == 0
-    assert replay.hiddens.shape[-1] == KWARGS["model_dim"]
+    assert evaluation.thoughts.shape[-1] == 0
+    assert replay.thoughts.shape[-1] == KWARGS["model_dim"]
 
 
 def test_evaluation_compile_failure_restarts_eager_and_restores_capture(monkeypatch):
@@ -4357,7 +4373,7 @@ def test_static_cache_rollout_matches_the_dynamic_rollout_and_is_reusable():
         assert torch.equal(static.kind, dynamic.kind)
         assert torch.equal(static.token_ids, dynamic.token_ids)
         assert torch.equal(static.action_mask, dynamic.action_mask)
-        torch.testing.assert_close(static.hiddens, dynamic.hiddens)
+        torch.testing.assert_close(static.thoughts, dynamic.thoughts)
         torch.testing.assert_close(
             static.old_token_logprobs, dynamic.old_token_logprobs
         )
@@ -4385,7 +4401,7 @@ def test_explicit_rollout_generator_is_independent_of_global_rng(top_p):
     second = roll(1000)
     assert torch.equal(first.kind, second.kind)
     assert torch.equal(first.token_ids, second.token_ids)
-    torch.testing.assert_close(first.hiddens, second.hiddens)
+    torch.testing.assert_close(first.thoughts, second.thoughts)
 
 
 def test_preallocated_caches_that_do_not_fit_are_rejected():
@@ -4463,7 +4479,7 @@ def test_trim_stream_releases_the_full_capacity_backing_storage():
 
     trimmed = trim_stream(full)
     assert trimmed.stream_length < full.stream_length
-    for name in ("kind", "token_ids", "hiddens", "old_values"):
+    for name in ("kind", "token_ids", "thoughts", "old_values"):
         original = getattr(full, name)
         compact = getattr(trimmed, name)
         assert compact.untyped_storage().data_ptr() != original.untyped_storage().data_ptr(), name
@@ -4481,12 +4497,18 @@ def test_refresh_runs_grad_enabled_but_stores_detached_statistics():
     ):
         stored = getattr(batch, name)
         assert not stored.requires_grad, name
-        assert stored.grad_fn is None, name
 
 
 def _deterministic_wrapper() -> LatentThoughtModel:
-    """Argmax token draws make trajectories RNG-independent."""
-    return _wrapper()
+    """Deterministic STOP gate and mean-only thought action."""
+    wrapper = _wrapper()
+    wrapper.transition.sample_latent = (
+        lambda mean, log_sigma, generator=None, noise=None: mean.float()
+    )
+    with torch.no_grad():
+        wrapper.gate.head.weight.zero_()
+        wrapper.gate.head.bias.fill_(100.0)
+    return wrapper
 
 
 def test_left_padded_batched_rollout_matches_the_sequential_rollouts():
@@ -4528,7 +4550,7 @@ def test_left_padded_batched_rollout_matches_the_sequential_rollouts():
         assert torch.equal(group.kind, expected.kind)
         assert torch.equal(group.token_ids, expected.token_ids)
         assert torch.equal(group.action_mask, expected.action_mask)
-        torch.testing.assert_close(group.hiddens, expected.hiddens)
+        torch.testing.assert_close(group.thoughts, expected.thoughts)
         torch.testing.assert_close(
             group.old_token_logprobs,
             expected.old_token_logprobs,
@@ -4594,7 +4616,7 @@ def test_combined_replay_batch_right_pads_without_changing_beliefs():
         for name in (
             "kind",
             "token_ids",
-            "hiddens",
+            "thoughts",
             "action_mask",
             "rewards",
         ):
@@ -4828,7 +4850,14 @@ def test_replay_plan_matches_canonical_action_masks_and_targets():
         planned_rows.extend(shard.host_rows)
         torch.testing.assert_close(
             shard.emit_index,
-            slot_index(microbatch.action_mask.bool()),
+            slot_index(microbatch.emit_mask.bool()),
+        )
+        torch.testing.assert_close(
+            shard.think_index,
+            slot_index(
+                (microbatch.actions == THINK)
+                & microbatch.action_mask.bool()
+            ),
         )
         rows = torch.div(
             shard.emit_index,
@@ -4923,7 +4952,7 @@ def test_clip_bounds_are_the_same_constants_without_the_host_copy():
 
 
 def test_resume_schema_compatibility_is_strict_equality():
-    """v28 has no migrations: every pre-hidden-carry schema is refused."""
+    """v29 has no migrations: every pre-stochastic schema is refused."""
     lockstep = execution_schema_for_rollout_scheduler("lockstep")
     refill = execution_schema_for_rollout_scheduler("continuous_refill")
     assert lockstep == EXECUTION_SCHEMA

@@ -83,11 +83,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(module-tagged datasets only); names absent from the data are an error",
     )
     # The reasoning mode fixes the rollout policy family for the whole run:
-    # "latent" carries each generated token's producing belief back into its
-    # input through the gated combined embedding; "cot" is the token-only
-    # control (no hidden carry) with the full token budget; "none" is
-    # token-only, teacher-forces an "Answer:" prefix onto the prompt, and
-    # budgets only the answer itself.
+    # "latent" takes one mandatory raw Gaussian THINK action, then samples a
+    # one-way continuation gate until STOP_AND_EMIT; "cot" and "none" are
+    # token-only controls that bypass the entire gate/noise/thought path.
     parser.add_argument(
         "--reasoning-mode",
         choices=("latent", "cot", "none"),
@@ -222,18 +220,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # which the near-frozen bias (AdamW at 2e-5) then takes many steps to
     # unwind through head.weight alone.
     parser.add_argument("--value-prior", type=float, default=0.0)
-    # Combined-embedding geometry (reasoning mode "latent"). The carry matrix
-    # is zero-initialized, so the injected carry vanishes and step 0
-    # reproduces the pretrained token path bit-for-bit while the matrix gets
-    # a full-rank first-step gradient (loss direction outer hidden). No
-    # scalar gate: the v1 gain*W factorization was a multiplicative saddle
-    # neither factor escaped.
-    # Prenorm-residual relu^2 MLP blocks applied to the combined embedding at
-    # hasThought positions, identity at init (zeroed proj). 0 is the
-    # pure-gated-residual ablation arm.
+    # Latent policy noise is specified at vector scale. At runtime width d,
+    # components use std = sigma/sqrt(d), hence E||noise||² = sigma².
+    parser.add_argument(
+        "--thought-sigma",
+        type=float,
+        default=1.0,
+        help="expected L2 magnitude scale of isotropic latent-action noise",
+    )
+    parser.add_argument(
+        "--init-stop-thinking-probability",
+        type=float,
+        default=0.9,
+        help="initial Bernoulli STOP probability after the forced first thought",
+    )
+    # Combined-embedding geometry used to adapt raw Gaussian thought slots.
     parser.add_argument("--combined-mlp-blocks", type=int, default=1)
-    # Hidden width of each combiner MLP block; 2048 matches the trunk's own
-    # 4x blocks.
     parser.add_argument("--combined-mlp-hidden", type=int, default=2048)
     # Length-adaptive GAE lambda (core.length_adaptive_lambda): VAPO's
     # horizon alpha*l with a floor of min(l, 1/alpha).  The raw alpha=0.05
@@ -705,6 +707,15 @@ def validate_args(
         parser.error("--combined-mlp-blocks must be nonnegative")
     if args.combined_mlp_hidden < 1:
         parser.error("--combined-mlp-hidden must be positive")
+    if not math.isfinite(args.thought_sigma) or args.thought_sigma <= 0.0:
+        parser.error("--thought-sigma must be finite and positive")
+    if (
+        not math.isfinite(args.init_stop_thinking_probability)
+        or not 0.0 < args.init_stop_thinking_probability < 1.0
+    ):
+        parser.error(
+            "--init-stop-thinking-probability must be strictly in (0, 1)"
+        )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         parser.error("--learning-rate must be finite and positive")
     if args.critic_learning_rate is None:

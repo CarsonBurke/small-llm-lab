@@ -248,11 +248,15 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "token_behavior_kl": 0.02,
         "policy_behavior_kl_per_action": 0.04,
         "policy_clip_fraction": 0.1,
+        "stochastic_policy_loss": 0.25,
+        "stochastic_policy_clip_fraction": 0.05,
         "token_abs_log_ratio_max": 0.7,
         "harmful_positive_log_ratio_max": 0.4,
         "trunk_grad_norm": 1.0,
         "renderer_grad_norm": 2.0,
         "combiner_grad_norm": 3.0,
+        "gate_grad_norm": 3.5,
+        "thought_mean_grad_norm": 4.0,
         "critic_grad_norm": 5.0,
     }
     metrics.update(overrides)
@@ -314,6 +318,10 @@ def test_actor_dashboard_is_compact_and_uses_correct_weights() -> None:
     assert dashboard["grad/renderer"] == pytest.approx(2.0)
     assert dashboard["grad/combiner"] == pytest.approx(3.0)
     assert dashboard["grad/critic"] == pytest.approx(21.0)
+    assert dashboard["loss/stochastic_policy"] == pytest.approx(0.5)
+    assert dashboard["clip/stochastic_policy"] == pytest.approx(0.1)
+    assert dashboard["grad/gate"] == pytest.approx(3.5)
+    assert dashboard["grad/thought_mean"] == pytest.approx(4.0)
     assert "grad/critic_mean" not in dashboard
     assert all(
         not tag.startswith("train/") and not tag.startswith("rollout/")
@@ -456,6 +464,11 @@ def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:
         "partial_reward_fraction": 0.6,
         "ended_fraction": 0.8,
         "actions_per_trajectory": 16.0,
+        "thoughts_per_trajectory": 2.0,
+        "continued_thoughts": 512,
+        "forced_first_thought_fraction": 1.0,
+        "continuation_fraction": 0.5,
+        "gate_stop_fraction": 0.5,
         "trajectories": 512,
     }
     dashboard = rollout_tensorboard_metrics(raw)
@@ -470,6 +483,11 @@ def test_rollout_dashboard_drops_duplicate_and_constant_plumbing() -> None:
         "reward/partial_fraction",
         "reward/ended_fraction",
         "behavior/actions_per_trajectory",
+        "behavior/thoughts_per_trajectory",
+        "behavior/continued_thoughts",
+        "behavior/forced_first_thought_fraction",
+        "behavior/continuation_fraction",
+        "behavior/gate_stop_fraction",
     }
 
 

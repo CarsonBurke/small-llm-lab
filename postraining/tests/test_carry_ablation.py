@@ -91,7 +91,7 @@ class _ProbeTokenizer:
 
 _PROBE_SAVED_ARGS = {
     "resolved_train_max_new_tokens": 4,
-    "resolved_train_max_stream_steps": 4,
+    "resolved_train_max_stream_steps": 5,
     "prompt_tokens": 6,
     "nearby_reward_max": 0.1,
     "temperature": 1.0,
@@ -111,7 +111,7 @@ _PROBE_ROWS = [
 ]
 
 
-def test_hidden_probes_detect_content_and_null_out_with_zero_carry():
+def test_hidden_probes_retain_raw_action_signal_with_zero_carry():
     wrapper = _wrapper()
     critic = _critic()
     with torch.no_grad():
@@ -119,7 +119,7 @@ def test_hidden_probes_detect_content_and_null_out_with_zero_carry():
         critic.combiner.carry.weight.normal_(std=0.05)
         # Fresh nano readouts are zero-initialized, which makes every token
         # distribution uniform no matter the input — a live readout is what
-        # lets a hidden-content change move the replayed logprobs at all.
+        # lets a raw-thought change move the replayed logprobs at all.
         wrapper.backbone.policy_probe.output.weight.normal_(std=0.02)
 
     probes = hidden_probes(
@@ -131,7 +131,7 @@ def test_hidden_probes_detect_content_and_null_out_with_zero_carry():
     assert probes["trajectories"] == 4
     assert probes["carried_hidden_rms"] > 0.0
     assert probes["injection_to_embedding_rms_ratio"] > 0.0
-    # A live carry matrix means zeroing the stored hiddens must move the
+    # A live carry matrix means zeroing the stored raw thoughts must move the
     # replayed logprobs and critic values somewhere.
     assert probes["token_logprob_delta_abs_max"] > 0.0
     assert probes["critic_value_delta_abs_max"] > 0.0
@@ -144,10 +144,10 @@ def test_hidden_probes_detect_content_and_null_out_with_zero_carry():
         saved_args=_PROBE_SAVED_ARGS, seed=9,
         device=torch.device("cpu"), stop_ids=(5,),
     )
-    # With the content channel dead, hiddens-present and hiddens-zeroed
-    # replays are the same computation: the probe must report exact nulls.
-    assert nulled["token_logprob_delta_abs_max"] == 0.0
-    assert nulled["critic_value_delta_abs_max"] == 0.0
+    # The raw thought is also the base input to the thought adapter. Disabling
+    # the carry matrix removes only its residual, not the direct action path.
+    assert nulled["token_logprob_delta_abs_max"] > 0.0
+    assert nulled["critic_value_delta_abs_max"] > 0.0
 
 
 def test_prompt_correct_counts_keep_original_row_order(monkeypatch):
@@ -189,7 +189,7 @@ def test_prompt_correct_counts_keep_original_row_order(monkeypatch):
     monkeypatch.setattr(latent_eval, "verify_terminated_answer", _by_truth)
     metrics = evaluate_latent_math(
         wrapper, _Tokenizer(), rows, samples=3, max_new_tokens=2,
-        max_stream_steps=2, chunk=3, seed=5, device=torch.device("cpu"),
+        max_stream_steps=3, chunk=3, seed=5, device=torch.device("cpu"),
         prompt_tokens=8, batch_trajectories=4,
     )
     assert metrics["prompt_correct_counts"] == [3, 0]

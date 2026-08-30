@@ -1,14 +1,9 @@
 """Separate from-scratch critic for latent VAPO.
 
 A fresh trunk (same architecture class as the policy backbone, random init,
-fully trainable) that reads the identical rollout stream — prompt and emitted
-tokens through its own embeddings, carried hiddens through its own
-combined-embedding stack — and predicts value alone.  No SIGReg,
-no next-latent
-prediction, no shared parameters with the policy: its only loss is HL-Gauss
-cross-entropy on [0, 1] value targets (cleanrl iterthink v215 critic recipe:
-softmax-CE to a Gaussian-smoothed two-hot, expected-scalar decode, zero-weight
-head with the prior projected into the bias, no value clipping).
+fully trainable) reads the identical token/thought stream. Raw fp32 Gaussian
+actions stored by the actor are adapted by the critic's own combined-embedding
+stack; they are never redrawn. No parameters are shared with the policy.
 
 The trainer passes ``hl_gauss.anchored_unit_geometry`` for v_min/v_max/
 num_bins by default, putting bin centers at exactly 0 and 1 with margin bins
@@ -24,8 +19,8 @@ from torch import Tensor, nn
 from postraining.hl_gauss import HLGaussSupport
 from postraining.latent_rollout import (
     PAD_SLOT,
+    THOUGHT_SLOT,
     LatentRolloutBatch,
-    generated_slot_mask,
 )
 from postraining.latent_thought import CombinedEmbedding
 
@@ -62,30 +57,22 @@ class SeparateCritic(nn.Module):
             )
 
     def assemble_inputs(self, batch: LatentRolloutBatch) -> Tensor:
-        """The rollout stream in the critic's own latent space.
-
-        Mirrors ``assemble_stream_latents`` but through this model's
-        embeddings and combiner — the critic shares no weights with the
-        policy, so it maps the stored stream (token ids plus the actor's
-        behavior-time hiddens) into its own representation. The carried
-        hidden is stored data here as everywhere: the value loss reaches the
-        critic's combiner, never the actor's forward.
-        """
+        """Rebuild the exact token/thought stream in the critic's latent space."""
         token_latent = self.trunk.embed_tokens(batch.token_ids)
         pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
-        if batch.hiddens.size(-1) == 0:
-            if batch.carry_injected:
+        if batch.thoughts.size(-1) == 0:
+            if bool((batch.kind == THOUGHT_SLOT).any()):
                 raise ValueError(
-                    "latent rollout discarded its carried hiddens "
-                    "(replay_storage=False); the stream cannot be valued"
+                    "latent critic replay requires stored raw thought actions"
                 )
-            # Pinned-EMIT rollouts store zero-width hiddens and never
-            # inject; the combiner cannot consume a zero-width carry.
             return token_latent * pad_scale
-        # The dense flag-select keeps static shapes, avoiding boolean
-        # indexing's dynamic-shape nonzero graph break inside torch.compile.
-        inputs = self.combiner(
-            token_latent, batch.hiddens, generated_slot_mask(batch)
+        raw = batch.thoughts
+        thought_base = raw.to(token_latent.dtype)
+        thought_latent = self.combiner(thought_base, raw)
+        inputs = torch.where(
+            (batch.kind == THOUGHT_SLOT)[..., None],
+            thought_latent,
+            token_latent,
         )
         return inputs * pad_scale
 

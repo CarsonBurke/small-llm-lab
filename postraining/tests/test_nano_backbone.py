@@ -510,11 +510,25 @@ def test_cuda_ragged_prefill_uses_varlen_and_matches_independent_rows(
         2, width + 2, device, dtype=torch.bfloat16
     )
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        compiled_belief, compiled_logits = compiled_prefill(
+        (
+            compiled_belief,
+            compiled_predicted,
+            compiled_log_sigma,
+            compiled_logits,
+        ) = compiled_prefill(
             wrapper.embed_tokens(ids), compiled_caches, key_valid
         )
     torch.testing.assert_close(
         compiled_belief, batched.belief, rtol=3e-2, atol=3e-2
+    )
+    torch.testing.assert_close(
+        compiled_predicted, batched.predicted, rtol=3e-2, atol=3e-2
+    )
+    torch.testing.assert_close(
+        compiled_log_sigma,
+        batched.thought_log_sigma,
+        rtol=3e-2,
+        atol=3e-2,
     )
     torch.testing.assert_close(
         compiled_logits, batched.logits, rtol=3e-2, atol=3e-2
@@ -598,10 +612,19 @@ def test_nano_critic_smoke():
     batch = LatentRolloutBatch(
         kind=kind,
         token_ids=torch.randint(0, KWARGS["vocab_size"], (batch_size, stream)),
-        hiddens=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
+        thoughts=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
+        actions=torch.zeros((batch_size, stream), dtype=torch.long),
         action_mask=torch.zeros(batch_size, stream, dtype=torch.bool),
+        stop_mask=zeros.clone(),
+        emit_mask=zeros.clone(),
+        old_stop_logprobs=zeros.clone(),
         old_token_logprobs=zeros.clone(),
         old_token_log_odds=zeros.clone(),
+        old_thought_logprobs=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
+        old_thought_means=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
+        old_thought_log_sigmas=torch.zeros(
+            batch_size, stream, KWARGS["model_dim"]
+        ),
         old_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(batch_size),

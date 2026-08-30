@@ -1,11 +1,7 @@
-"""Measure a checkpoint's best-case DAPO-Math verifier hit rate.
+"""Measure the forced-initial latent policy's DAPO verifier hit rate.
 
-Fresh-combiner hidden-carry rollouts (identity at init, so exactly the
-pretrained token policy) over many prompts and samples; reports verifier
-hits, within-group reward variance, and the extracted-answer distribution.
-This is the cheap go/no-go probe before an RL run: zero within-group
-variance means a zero policy gradient, so DAPO RL cannot start from that
-checkpoint.
+The fresh Gaussian mean, current combiner, mandatory first thought, and
+one-way continuation gate match a new latent-VAPO run.
 
     python3 -m postraining.dapo_hit_rate_probe \
         --checkpoint ablation_results/<run>/pretraining_checkpoint.pt
@@ -57,6 +53,10 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
+    parser.add_argument("--thought-sigma", type=float, default=1.0)
+    parser.add_argument(
+        "--init-stop-thinking-probability", type=float, default=0.9
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.samples < 1:
@@ -88,13 +88,20 @@ def main() -> None:
             if is_nano
             else POSTTRAIN_RESPONSE_TOKENS
         )
+    max_stream_steps = min(
+        4 * args.max_new_tokens, context_tokens - args.prompt_tokens
+    )
     validate_posttraining_context_budget(
-        args.prompt_tokens, args.max_new_tokens, context_tokens
+        args.prompt_tokens, max_stream_steps, context_tokens
     )
     backbone.eval()
-    # A fresh combiner is an exact identity, so this rollout is the pretrained
-    # token policy with the hidden carry plumbed but inert.
-    wrapper = LatentThoughtModel(backbone).to(device).eval()
+    wrapper = LatentThoughtModel(
+        backbone,
+        thought_sigma=args.thought_sigma,
+        init_stop_thinking_probability=(
+            args.init_stop_thinking_probability
+        ),
+    ).to(device).eval()
 
     # An SFT base checkpoint may be fence-trained; grading it through a
     # fence-less tokenizer decodes the fence ids away and reads near-zero.
@@ -146,7 +153,7 @@ def main() -> None:
                     wrapper,
                     prompt_ids.expand(args.samples, -1),
                     args.max_new_tokens,
-                    args.max_new_tokens,
+                    max_stream_steps,
                     args.temperature,
                     args.top_p,
                     stop_ids=stop_ids or None,

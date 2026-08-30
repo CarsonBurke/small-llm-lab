@@ -1,10 +1,8 @@
-"""Sample the hidden-carry latent policy on demand and inspect its outputs.
+"""Sample the forced-initial latent-thought policy on demand.
 
-Generates through the same deterministic hidden-carry rollout the trainer and
-the AIME eval use, so what you see is exactly the trained policy — every
-generated token's producing belief rides back in on the next input. Works
-against the pretraining checkpoint alone (fresh identity combiner) or with a
-latent-VAPO checkpoint layered on top.
+The sampler uses the trainer's exact raw Gaussian, one-way gate, and stored
+thought-slot rollout. Wrapper checkpoints reconstruct sigma, gate bias, and
+combiner geometry strictly.
 
     # An AIME problem by index, 4 samples (the base --checkpoint is resolved
     # from the run's manifest.json when omitted):
@@ -95,6 +93,11 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens", type=int, default=POSTTRAIN_RESPONSE_TOKENS
     )
+    parser.add_argument("--max-stream-steps", type=int, default=None)
+    parser.add_argument("--thought-sigma", type=float, default=1.0)
+    parser.add_argument(
+        "--init-stop-thinking-probability", type=float, default=0.9
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument(
@@ -116,16 +119,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--emit-only", action="store_true",
-        help="evaluate the token-only policy with no carried belief",
+        help="token-only policy: bypass gate, noise, and thought slots",
     )
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
-    # Every action is a token under the deterministic hidden carry, so the
-    # stream budget always equals the emitted-token cap.
-    stream_steps = args.max_new_tokens
+    stream_steps = (
+        args.max_stream_steps
+        if args.max_stream_steps is not None
+        else args.max_new_tokens if args.emit_only else 4 * args.max_new_tokens
+    )
     validate_posttraining_context_budget(args.prompt_tokens, stream_steps)
     modes = sum(
         value is not None
@@ -185,11 +190,17 @@ def main() -> None:
                 "sample it with --emit-only"
             )
     else:
-        wrapper = LatentThoughtModel(backbone).to(device)
-        print("policy: fresh identity combiner over the pretraining checkpoint")
+        wrapper = LatentThoughtModel(
+            backbone,
+            thought_sigma=args.thought_sigma,
+            init_stop_thinking_probability=(
+                args.init_stop_thinking_probability
+            ),
+        ).to(device)
+        print("policy: fresh forced-initial Gaussian policy")
     wrapper.eval()
     if args.emit_only:
-        print("token-only policy: no belief is carried between steps")
+        print("token-only policy: gate, noise, and thought slots bypassed")
 
     # Fence flags come from the RL run's saved args when a wrapper
     # checkpoint is loaded, else from the base checkpoint's SFT

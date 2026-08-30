@@ -47,7 +47,7 @@ import torch.nn.functional as F
 # silently selecting the very slow reference SSM.
 os.environ["USE_HUB_KERNELS"] = "NO"
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from postraining.core import (
     answer_style,
@@ -56,6 +56,7 @@ from postraining.core import (
     load_unique_math_rows,
     verify_answer,
 )
+from postraining.hf_runtime import prepare_text_only_transformers_runtime
 from postraining.train_vapo import prompt_text
 
 
@@ -64,6 +65,7 @@ DEFAULT_MODELS = (
     "tiiuae/Falcon-H1-Tiny-R-90M",
     "tiiuae/Falcon-H1-Tiny-90M-Base",
     "tiiuae/Falcon-H1-Tiny-90M-Instruct-Curriculum-pre-DPO",
+    "openbmb/MiniCPM5-1B",
 )
 MODEL_REVISIONS = {
     "tiiuae/Falcon-H1-Tiny-R-90M":
@@ -72,6 +74,8 @@ MODEL_REVISIONS = {
         "7994372e93b62822ae25f8bfb19f653649cea3a3",
     "tiiuae/Falcon-H1-Tiny-90M-Instruct-Curriculum-pre-DPO":
         "008dc03d2adc558ffa899aa6929bd2d6ecbdb896",
+    "openbmb/MiniCPM5-1B":
+        "87179e5c1f455ef22e6223592d2d61351b525bfc",
 }
 
 
@@ -124,6 +128,31 @@ def _atomic_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     temporary.replace(path)
+
+
+def write_suite_metrics_to_tensorboard(
+    log_dir: str | Path,
+    step: int,
+    suite_metrics: dict[str, dict[str, Any]],
+) -> None:
+    """Append fixed-suite quality metrics to a training dashboard."""
+    from torch.utils.tensorboard import SummaryWriter
+
+    tensorboard = SummaryWriter(log_dir)
+    for suite_name, metrics in suite_metrics.items():
+        tensorboard.add_scalar(
+            f"{suite_name}/accuracy", metrics["contract_accuracy"], step
+        )
+        for name in (
+            "contract_accuracy",
+            "relaxed_accuracy",
+            "terminated_fraction",
+            "capped_fraction",
+        ):
+            tensorboard.add_scalar(
+                f"{suite_name}/{name}", metrics[name], step
+            )
+    tensorboard.close()
 
 
 def model_slug(model: str) -> str:
@@ -246,12 +275,17 @@ def prepare_prompt_ids(
     *,
     prompt_mode: str,
     prompt_tokens: int,
+    enable_thinking: bool | None = None,
 ) -> list[int]:
     if prompt_mode == "chat":
+        template_options: dict[str, Any] = {}
+        if enable_thinking is not None:
+            template_options["enable_thinking"] = enable_thinking
         encoded = tokenizer.apply_chat_template(
             [{"role": "user", "content": text}],
             tokenize=True,
             add_generation_prompt=True,
+            **template_options,
         )
         ids = (
             encoded["input_ids"]
@@ -259,6 +293,8 @@ def prepare_prompt_ids(
             else encoded
         )
     elif prompt_mode == "raw":
+        if enable_thinking is not None:
+            raise ValueError("thinking mode requires a chat prompt")
         ids = tokenizer.encode(text, add_special_tokens=True)
     else:
         raise ValueError(f"unknown prompt mode {prompt_mode!r}")
@@ -392,16 +428,10 @@ def _causal_conv1d_update_reference(
     return output.to(input_dtype)
 
 
-def prepare_falcon_h1_runtime() -> None:
-    """Install text-only import and Blackwell-compatible Falcon-H1 shims."""
-    # Transformers imports torchvision while resolving a text-only Falcon
-    # class.  The machine's optional torchvision wheel targets an older Torch
-    # ABI, so prevent that unrelated package from breaking model discovery.
-    import transformers.utils
-    import transformers.utils.import_utils as import_utils
 
-    import_utils.is_torchvision_available = lambda: False
-    transformers.utils.is_torchvision_available = lambda: False
+def prepare_falcon_h1_runtime() -> None:
+    """Install Blackwell-compatible Falcon-H1 shims."""
+    prepare_text_only_transformers_runtime()
 
     spec = importlib.util.find_spec("mamba_ssm")
     if spec is None or not spec.submodule_search_locations:
@@ -448,6 +478,9 @@ def assert_fast_falcon_h1_runtime(model) -> None:
             "Falcon-H1 fast Mamba path is unavailable; refusing a misleading "
             "naive-SSM evaluation"
         )
+def left_padded_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    positions = attention_mask.to(torch.long).cumsum(dim=-1) - 1
+    return positions.masked_fill(attention_mask == 0, 0)
 
 
 @torch.inference_mode()
@@ -458,7 +491,7 @@ def validate_left_padded_logits(
     pad_token_id: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    """Ensure recurrent padding masks preserve each prompt's final-token logits."""
+    """Ensure padding and position ids preserve final-token logits."""
     if len(prompt_ids) < 2:
         raise ValueError("left-padding validation requires two prompts")
     selected = sorted(prompt_ids, key=len)
@@ -471,9 +504,14 @@ def validate_left_padded_logits(
     for index, ids in enumerate(selected):
         batch[index, -len(ids):] = torch.tensor(ids, device=device)
         mask[index, -len(ids):] = 1
-    batched_logits = model(
-        input_ids=batch, attention_mask=mask, use_cache=False
-    ).logits[:, -1].float()
+    batched_arguments: dict[str, Any] = {
+        "input_ids": batch,
+        "attention_mask": mask,
+        "use_cache": False,
+    }
+    if getattr(model.config, "model_type", None) == "llama":
+        batched_arguments["position_ids"] = left_padded_position_ids(mask)
+    batched_logits = model(**batched_arguments).logits[:, -1].float()
     individual_logits = torch.stack(
         [
             model(
@@ -502,9 +540,7 @@ def validate_left_padded_logits(
         "argmax_equal": argmax_equal,
     }
     if relative_l2 > 0.02 or not all(argmax_equal):
-        raise RuntimeError(
-            f"left-padded Falcon logits failed validation: {result}"
-        )
+        raise RuntimeError(f"left-padded logits failed validation: {result}")
     return result
 
 
@@ -517,6 +553,7 @@ def autotune_batch_trajectories(
     suite: Suite,
     prompt_mode: str,
     prompt_tokens: int,
+    enable_thinking: bool | None,
     maximum_batch_trajectories: int,
     temperature: float,
     top_p: float,
@@ -540,6 +577,7 @@ def autotune_batch_trajectories(
             prompt_text(row),
             prompt_mode=prompt_mode,
             prompt_tokens=prompt_tokens,
+            enable_thinking=enable_thinking,
         )
         for row in selected_rows
     ]
@@ -846,6 +884,7 @@ def evaluate_suite(
     suite: Suite,
     prompt_mode: str,
     prompt_tokens: int,
+    enable_thinking: bool | None,
     max_new_tokens: int,
     batch_trajectories: int,
     temperature: float,
@@ -866,6 +905,7 @@ def evaluate_suite(
                 prompt_text(row),
                 prompt_mode=prompt_mode,
                 prompt_tokens=prompt_tokens,
+                enable_thinking=enable_thinking,
             ),
         )
         for original_index, row in enumerate(rows)
@@ -983,14 +1023,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--revision",
-        help="immutable model revision; known Falcon candidates are pinned by default",
+        help="immutable model revision; known candidates are pinned by default",
+    )
+    parser.add_argument(
+        "--adapter-checkpoint",
+        help="native VAPO adapter checkpoint to apply before evaluation",
     )
     parser.add_argument("--output", default="postraining/runs/hf_falcon_eval")
     parser.add_argument(
         "--prompt-mode", choices=("auto", "raw", "chat"), default="auto"
     )
+    parser.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="forward enable_thinking to the checkpoint's native chat template",
+    )
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--samples-per-problem",
+        type=int,
+        default=0,
+        help="override suite sample counts; zero keeps each suite default",
+    )
+    parser.add_argument(
+        "--max-problems",
+        type=int,
+        default=0,
+        help="deterministically limit each suite; zero keeps its default",
+    )
     parser.add_argument("--batch-trajectories", type=int, default=128)
     parser.add_argument(
         "--autotune-batch-trajectories",
@@ -1007,21 +1069,92 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(suite.name for suite in DEFAULT_SUITES),
         help="suite(s) to run; repeat the flag, or omit it for all",
     )
+    parser.add_argument(
+        "--tensorboard-log-dir",
+        help="optional training TensorBoard directory to receive suite metrics",
+    )
+    parser.add_argument(
+        "--tensorboard-step",
+        type=int,
+        help="training step attached to --tensorboard-log-dir metrics",
+    )
     return parser
+
+def load_vapo_adapter_for_evaluation(
+    model,
+    checkpoint_path: str | Path,
+    *,
+    model_id: str,
+    revision: str,
+) -> dict[str, Any]:
+    """Apply a native VAPO adapter while preserving rollout bf16 arithmetic."""
+    from postraining.hf_vapo import (
+        LoRAConfig,
+        inject_lora,
+        load_adapter_state_dict,
+    )
+
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    policy = checkpoint["policy"]
+    if policy["model_id"] != model_id or policy["revision"] != revision:
+        raise ValueError("adapter base checkpoint differs from evaluation model")
+    config = dict(policy["lora_config"])
+    config["targets"] = tuple(config["targets"])
+    inject_lora(model, LoRAConfig(**config))
+    load_adapter_state_dict(model, policy["adapter"])
+    model_dtype = next(
+        parameter.dtype
+        for name, parameter in model.named_parameters()
+        if not name.endswith(("lora_a", "lora_b"))
+    )
+    for name, parameter in model.named_parameters():
+        if name.endswith(("lora_a", "lora_b")):
+            parameter.data = parameter.data.to(dtype=model_dtype)
+            parameter.requires_grad_(False)
+    return {
+        "path": str(checkpoint_path),
+        "step": int(checkpoint["step"]),
+        "thinking": bool(checkpoint["args"]["thinking"]),
+        "lora_config": config,
+    }
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if (args.tensorboard_log_dir is None) != (args.tensorboard_step is None):
+        raise ValueError(
+            "--tensorboard-log-dir and --tensorboard-step must be set together"
+        )
+    if args.tensorboard_step is not None and args.tensorboard_step < 0:
+        raise ValueError("--tensorboard-step must be non-negative")
     if args.prompt_tokens < 1 or args.max_new_tokens < 1:
         raise ValueError("prompt and generation budgets must be positive")
     if args.batch_trajectories < 1:
         raise ValueError("batch trajectory budget must be positive")
     if not 0 < args.temperature or not 0 < args.top_p <= 1:
         raise ValueError("temperature must be positive and top-p must be in (0, 1]")
+    if args.samples_per_problem < 0 or args.max_problems < 0:
+        raise ValueError("sample and problem overrides must be nonnegative")
     selected = set(args.suite or ())
-    suites = [
-        suite for suite in DEFAULT_SUITES if not selected or suite.name in selected
-    ]
+    suites = []
+    for suite in DEFAULT_SUITES:
+        if selected and suite.name not in selected:
+            continue
+        samples = args.samples_per_problem or suite.samples
+        maximum = suite.max_rows
+        if args.max_problems:
+            maximum = min(maximum, args.max_problems) if maximum else args.max_problems
+        suites.append(
+            Suite(
+                name=suite.name,
+                path=suite.path,
+                samples=samples,
+                max_rows=maximum,
+                answer_style_override=suite.answer_style_override,
+            )
+        )
 
     device = torch.device("cuda")
     torch.set_float32_matmul_precision("high")
@@ -1033,23 +1166,45 @@ def main() -> None:
         raise ValueError(
             "an immutable --revision is required for an unrecognized model"
         )
-    prepare_falcon_h1_runtime()
+    prepare_text_only_transformers_runtime()
+    checkpoint_config = AutoConfig.from_pretrained(args.model, revision=revision)
+    if getattr(checkpoint_config, "model_type", None) == "falcon_h1":
+        prepare_falcon_h1_runtime()
     load_started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=revision)
     tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=revision,
+        config=checkpoint_config,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
         low_cpu_mem_usage=True,
-    ).to(device).eval()
+    )
+    adapter = None
+    if args.adapter_checkpoint:
+        adapter = load_vapo_adapter_for_evaluation(
+            model,
+            args.adapter_checkpoint,
+            model_id=args.model,
+            revision=revision,
+        )
+        if args.thinking is None:
+            args.thinking = adapter["thinking"]
+        elif bool(args.thinking) != adapter["thinking"]:
+            raise ValueError(
+                "evaluation thinking mode differs from adapter training"
+            )
+    model = model.to(device).eval()
     assert_fast_falcon_h1_runtime(model)
     load_seconds = time.perf_counter() - load_started
     prompt_mode = resolve_prompt_mode(tokenizer, args.prompt_mode)
     eos_ids = resolved_eos_ids(model, tokenizer, prompt_mode)
 
-    destination = Path(args.output) / model_slug(args.model)
+    destination_name = model_slug(args.model)
+    if adapter is not None:
+        destination_name += f"-vapo-step-{adapter['step']}"
+    destination = Path(args.output) / destination_name
     suite_metrics: dict[str, dict[str, Any]] = {}
     padding_validation = None
     batch_autotune = None
@@ -1057,13 +1212,18 @@ def main() -> None:
     for suite in suites:
         rows = load_unique_math_rows(suite.path)
         rows = deterministic_math_subset(rows, suite.max_rows)
-        if padding_validation is None:
+        uses_left_padding = (
+            args.autotune_batch_trajectories
+            or args.batch_trajectories > suite.samples
+        )
+        if padding_validation is None and uses_left_padding:
             candidate_ids = [
                 prepare_prompt_ids(
                     tokenizer,
                     prompt_text(row),
                     prompt_mode=prompt_mode,
                     prompt_tokens=args.prompt_tokens,
+                    enable_thinking=args.thinking,
                 )
                 for row in rows[:8]
             ]
@@ -1095,6 +1255,7 @@ def main() -> None:
                 suite=suite,
                 prompt_mode=prompt_mode,
                 prompt_tokens=args.prompt_tokens,
+                enable_thinking=args.thinking,
                 maximum_batch_trajectories=args.batch_trajectories,
                 temperature=args.temperature,
                 top_p=args.top_p,
@@ -1118,6 +1279,7 @@ def main() -> None:
             suite=suite,
             prompt_mode=prompt_mode,
             prompt_tokens=args.prompt_tokens,
+            enable_thinking=args.thinking,
             max_new_tokens=args.max_new_tokens,
             batch_trajectories=selected_batch_trajectories,
             temperature=args.temperature,
@@ -1136,13 +1298,23 @@ def main() -> None:
             flush=True,
         )
 
+    if padding_validation is None:
+        padding_validation = {
+            "skipped": True,
+            "reason": "one_prompt_per_batch",
+        }
+
     config = model.config
     summary = {
         "schema": EVALUATION_SCHEMA,
         "model": args.model,
         "revision": revision,
         "model_slug": model_slug(args.model),
+        "adapter": adapter,
         "prompt_mode": prompt_mode,
+        "enable_thinking": args.thinking,
+        "samples_per_problem_override": args.samples_per_problem,
+        "max_problems_override": args.max_problems,
         "load_seconds": load_seconds,
         "dtype": str(next(model.parameters()).dtype),
         "model_type": getattr(config, "model_type", None),
@@ -1162,6 +1334,13 @@ def main() -> None:
         "suites": suite_metrics,
     }
     _atomic_json(destination / "summary.json", summary)
+    if args.tensorboard_log_dir is not None:
+        assert args.tensorboard_step is not None
+        write_suite_metrics_to_tensorboard(
+            args.tensorboard_log_dir,
+            args.tensorboard_step,
+            suite_metrics,
+        )
     print(json.dumps(summary, indent=2), flush=True)
 
 
