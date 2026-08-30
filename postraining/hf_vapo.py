@@ -155,6 +155,44 @@ class ValueHead(nn.Module):
     def forward(self, hidden: Tensor) -> Tensor:
         return self.output(F.silu(self.input(self.norm(hidden.float())))).squeeze(-1)
 
+class NextLatDraftHead(nn.Module):
+    """Reference NextLat residual dynamics model over target hidden states."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        projection_factor: float = 1.6,
+    ) -> None:
+        super().__init__()
+        if (
+            hidden_size < 1
+            or not math.isfinite(projection_factor)
+            or projection_factor <= 0
+        ):
+            raise ValueError("NextLat dimensions must be finite and positive")
+        input_size = 2 * hidden_size
+        width = 128 * round(projection_factor * input_size / 128)
+        self.hidden_size = hidden_size
+        self.projection_factor = projection_factor
+        self.norm = nn.RMSNorm(input_size, eps=1e-6, dtype=torch.float32)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, width, dtype=torch.float32),
+            nn.GELU(),
+            nn.Linear(width, width, dtype=torch.float32),
+            nn.GELU(),
+            nn.Linear(width, hidden_size, dtype=torch.float32),
+        )
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, hidden: Tensor, next_token_embedding: Tensor) -> Tensor:
+        inputs = torch.cat((next_token_embedding, hidden), dim=-1)
+        delta = self.mlp(self.norm(inputs.float()))
+        return hidden + delta.to(hidden.dtype)
+
 
 
 
@@ -167,6 +205,7 @@ class MiniCPMVAPOPolicy(nn.Module):
         lora_config: LoRAConfig,
         *,
         critic_width: int = 256,
+        nextlat_projection_factor: float = 1.6,
     ) -> None:
         super().__init__()
         self.causal_lm = causal_lm
@@ -181,6 +220,10 @@ class MiniCPMVAPOPolicy(nn.Module):
         self.lora_config = lora_config
         self.lora_modules = inject_lora(causal_lm, lora_config)
         self.critic = ValueHead(int(config.hidden_size), critic_width)
+        self.nextlat_projection_factor = nextlat_projection_factor
+        self.nextlat_head = NextLatDraftHead(
+            int(config.hidden_size), nextlat_projection_factor
+        )
         self.model_id = MINICPM5_MODEL_ID
         self.revision = MINICPM5_REVISION
         self.causal_lm.config.use_cache = False
@@ -194,6 +237,7 @@ class MiniCPMVAPOPolicy(nn.Module):
         device: torch.device,
         lora_config: LoRAConfig,
         critic_width: int = 256,
+        nextlat_projection_factor: float = 1.6,
         gradient_checkpointing: bool = True,
     ) -> tuple["MiniCPMVAPOPolicy", Any]:
         prepare_text_only_transformers_runtime()
@@ -208,7 +252,12 @@ class MiniCPMVAPOPolicy(nn.Module):
             low_cpu_mem_usage=True,
         )
         causal_lm = loaded.to(device)
-        policy = cls(causal_lm, lora_config, critic_width=critic_width).to(device)
+        policy = cls(
+            causal_lm,
+            lora_config,
+            critic_width=critic_width,
+            nextlat_projection_factor=nextlat_projection_factor,
+        ).to(device)
         policy.model_id = model_id
         policy.revision = revision
         if len(tokenizer) != int(causal_lm.config.vocab_size):
@@ -234,6 +283,12 @@ class MiniCPMVAPOPolicy(nn.Module):
             for name, parameter in self.causal_lm.named_parameters()
             if name.endswith(("lora_a", "lora_b")) and parameter.requires_grad
         )
+
+    def token_embeddings(self, token_ids: Tensor) -> Tensor:
+        return self.causal_lm.get_input_embeddings()(token_ids)
+
+    def nextlat_hidden(self, hidden: Tensor, token_ids: Tensor) -> Tensor:
+        return self.nextlat_head(hidden, self.token_embeddings(token_ids))
 
 
     def replay_hidden(
@@ -272,15 +327,20 @@ class MiniCPMVAPOPolicy(nn.Module):
 
     def checkpoint_payload(self) -> dict[str, Any]:
         return {
-            "schema": "minicpm5_hf_vapo_adapter/v3",
+            "schema": "minicpm5_hf_vapo_adapter/v4",
             "model_id": self.model_id,
             "revision": self.revision,
             "lora_config": asdict(self.lora_config),
             "lora_modules": list(self.lora_modules),
+            "nextlat_projection_factor": self.nextlat_projection_factor,
             "adapter": adapter_state_dict(self.causal_lm),
             "critic": {
                 name: tensor.detach().cpu()
                 for name, tensor in self.critic.state_dict().items()
+            },
+            "nextlat_head": {
+                name: tensor.detach().cpu()
+                for name, tensor in self.nextlat_head.state_dict().items()
             },
         }
 
@@ -456,6 +516,84 @@ def exact_top_p_sample(
             nucleus_mass_lower_bound=top_p,
         ),
     )
+
+@torch.no_grad()
+def dense_top_p_probabilities(
+    logits: Tensor,
+    *,
+    temperature: float,
+    top_p: float,
+) -> Tensor:
+    """Materialize the exact deterministic nucleus distribution for coupling."""
+    if logits.ndim != 2:
+        raise ValueError("sampling logits must be [batch, vocabulary]")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    if not 0 < top_p <= 1:
+        raise ValueError("top_p must lie in (0, 1]")
+    scaled = logits.float().div(temperature)
+    if top_p == 1.0:
+        return scaled.softmax(dim=-1)
+    sorted_logits, sorted_ids = torch.sort(
+        scaled,
+        dim=-1,
+        descending=True,
+        stable=True,
+    )
+    sorted_probabilities = sorted_logits.softmax(dim=-1)
+    preceding_mass = (
+        sorted_probabilities.cumsum(dim=-1) - sorted_probabilities
+    )
+    sorted_probabilities.masked_fill_(preceding_mass >= top_p, 0.0)
+    sorted_probabilities.div_(
+        sorted_probabilities.sum(dim=-1, keepdim=True)
+    )
+    probabilities = torch.zeros_like(sorted_probabilities)
+    probabilities.scatter_(1, sorted_ids, sorted_probabilities)
+    return probabilities
+
+
+@torch.no_grad()
+def maximal_coupling_verify(
+    target_probabilities: Tensor,
+    draft_probabilities: Tensor,
+    proposals: Tensor,
+    active: Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Verify independent proposals and directly sample rejected residuals."""
+    if target_probabilities.shape != draft_probabilities.shape:
+        raise ValueError("target and draft distributions must have equal shapes")
+    if proposals.shape != active.shape:
+        raise ValueError("proposal and active masks must have equal shapes")
+    target = target_probabilities.gather(1, proposals[:, None]).squeeze(1)
+    draft = draft_probabilities.gather(1, proposals[:, None]).squeeze(1)
+    accepted = (
+        torch.rand(
+            active.shape,
+            device=target.device,
+            generator=generator,
+        )
+        < (target / draft.clamp_min(1e-30)).clamp_max(1.0)
+    ) & active
+    rejected = active & ~accepted
+    committed = proposals.clone()
+    if bool(rejected.any()):
+        residual = (
+            target_probabilities[rejected] - draft_probabilities[rejected]
+        ).clamp_min_(0.0)
+        residual_mass = residual.sum(dim=-1, keepdim=True)
+        fallback = residual_mass.squeeze(1) <= 0
+        residual.div_(residual_mass.clamp_min(1e-30))
+        if bool(fallback.any()):
+            residual[fallback] = target_probabilities[rejected][fallback]
+        committed[rejected] = torch.multinomial(
+            residual,
+            1,
+            generator=generator,
+        ).squeeze(1)
+    return committed, accepted
 
 def _precompute_advantages(old_values: Tensor, correct: bool) -> Tensor:
     """Vectorized VAPO GAE for one terminal-reward trajectory."""
