@@ -25,6 +25,7 @@ class NextLatDecodeStats:
     accepted_tokens_pos2plus: int = 0
     speculative_cycles: int = 0
 
+    proposed_tokens_pos2plus: int = 0
 
 class RaggedStaticCacheLayer:
     """Dense static K/V tensors updated at independent positions per row."""
@@ -171,6 +172,7 @@ class NextLatSpeculativeEngine:
         self.prompts_per_rollout = prompts_per_rollout
         self.samples_per_prompt = samples_per_prompt
         self.batch_size = prompts_per_rollout * samples_per_prompt
+        self.cache_length = cache_length
         self.draft_length = draft_length
         self.temperature = temperature
         self.top_p = top_p
@@ -303,6 +305,7 @@ class NextLatSpeculativeEngine:
         proposed = 0
         accepted = 0
         accepted_pos2plus = 0
+        proposed_pos2plus = 0
         cycles = 0
 
         while not bool(finished.all()):
@@ -382,6 +385,8 @@ class NextLatSpeculativeEngine:
                 if offset > 0:
                     accepted_pos2plus += int(accepted_mask.sum())
                 output_positions = response_lengths + cycle_count
+                if offset > 0:
+                    proposed_pos2plus += int(active.sum())
                 rows = active.nonzero(as_tuple=False).squeeze(1)
                 if rows.numel():
                     responses[rows, output_positions[rows]] = committed[rows]
@@ -503,6 +508,7 @@ class NextLatSpeculativeEngine:
                 proposed_tokens=proposed,
                 accepted_tokens=accepted,
                 accepted_tokens_pos2plus=accepted_pos2plus,
+                proposed_tokens_pos2plus=proposed_pos2plus,
                 speculative_cycles=cycles,
             ),
         )
