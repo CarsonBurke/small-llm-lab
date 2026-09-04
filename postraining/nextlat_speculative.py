@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
-import time
 
 import torch
 from torch import Tensor
 
-from postraining.hf_vapo import (
+from postraining.minicpm_vapo import (
     MiniCPMVAPOPolicy,
     dense_top_p_probabilities,
     maximal_coupling_verify,
@@ -26,6 +26,11 @@ class NextLatDecodeStats:
     speculative_cycles: int = 0
 
     proposed_tokens_pos2plus: int = 0
+    speculative_row_cycles: int = 0
+    proposed_by_position: tuple[int, ...] = ()
+    accepted_by_position: tuple[int, ...] = ()
+    prefill_seconds: float = 0.0
+    decode_seconds: float = 0.0
 
 class RaggedStaticCacheLayer:
     """Dense static K/V tensors updated at independent positions per row."""
@@ -78,6 +83,7 @@ class RaggedStaticCacheLayer:
         self.write_positions = None
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        del query_length
         return self.max_cache_len, 0
 
     def get_seq_length(self) -> int:
@@ -179,7 +185,25 @@ class NextLatSpeculativeEngine:
         self.stop_ids = stop_ids
         self.primary_stop = stop_ids[0]
         device = next(policy.parameters()).device
+        self.device_type = device.type
         config: Any = policy.causal_lm.config
+        self.estimated_cache_bytes = (
+            self.batch_size
+            * cache_length
+            * int(config.num_hidden_layers)
+            * 2
+            * int(config.num_key_value_heads)
+            * int(config.head_dim)
+            * torch.tensor([], dtype=torch.bfloat16).element_size()
+        )
+        if device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            if self.estimated_cache_bytes > int(0.7 * free_bytes):
+                raise MemoryError(
+                    "ragged NextLat cache requires "
+                    f"{self.estimated_cache_bytes / 2**30:.2f} GiB with only "
+                    f"{free_bytes / 2**30:.2f} GiB free"
+                )
         self.cache = RaggedStaticCache(
             config,
             batch_size=self.batch_size,
@@ -191,6 +215,10 @@ class NextLatSpeculativeEngine:
             (self.batch_size, cache_length), dtype=torch.bool, device=device
         )
         self.stop_tensor = torch.tensor(stop_ids, device=device)
+        self.inactive_token = int(config.pad_token_id)
+        self.inactive_token_tensor = torch.tensor(
+            self.inactive_token, device=device
+        )
 
         def cached_forward(
             token_ids: Tensor,
@@ -205,18 +233,17 @@ class NextLatSpeculativeEngine:
                 attention_mask=attention_mask,
                 position_ids=positions,
             )
-            return hidden, policy.logits(hidden), policy.critic(hidden)
+            return hidden, policy.logits(hidden), policy.rollout_values(hidden)
 
-        if compile_decode:
-            self.verify_forward = torch.compile(
+        target_forward = (
+            torch.compile(
                 cached_forward, mode="reduce-overhead", fullgraph=False
             )
-            self.commit_forward = torch.compile(
-                cached_forward, mode="reduce-overhead", fullgraph=False
-            )
-        else:
-            self.verify_forward = cached_forward
-            self.commit_forward = cached_forward
+            if compile_decode
+            else cached_forward
+        )
+        self.verify_forward = target_forward
+        self.commit_forward = target_forward
 
     def release_cache(self) -> None:
         self.cache.reset()
@@ -267,7 +294,11 @@ class NextLatSpeculativeEngine:
         self.valid_keys.zero_()
         self.valid_keys[:, :width] = positions < lengths[:, None]
         mask = ragged_causal_mask(self.valid_keys, positions)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(
+            device_type=self.device_type,
+            dtype=torch.bfloat16,
+            enabled=self.device_type == "cuda",
+        ):
             hidden, logits, values = self.commit_forward(inputs, positions, mask)
         rows = torch.arange(self.batch_size, device=device)
         last = lengths - 1
@@ -281,9 +312,38 @@ class NextLatSpeculativeEngine:
         max_new_tokens: int,
         progress_callback: Callable[[int, dict[str, float | int]], None] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, int, float, NextLatDecodeStats]:
+        if max_new_tokens < 1:
+            raise ValueError("generation length must be positive")
+        longest_prompt = max(
+            (int(prompt.numel()) for prompt in prompt_ids_cpu),
+            default=0,
+        )
+        if longest_prompt + max_new_tokens > self.cache_length:
+            raise ValueError(
+                "prompt plus generation length exceeds the NextLat cache"
+            )
         started = time.perf_counter()
         device = self.valid_keys.device
+        gpu_started = (
+            torch.cuda.Event(enable_timing=True)
+            if self.device_type == "cuda"
+            else None
+        )
+        prefill_complete = (
+            torch.cuda.Event(enable_timing=True)
+            if self.device_type == "cuda"
+            else None
+        )
+        decode_complete = (
+            torch.cuda.Event(enable_timing=True)
+            if self.device_type == "cuda"
+            else None
+        )
+        if gpu_started is not None:
+            gpu_started.record()
         hidden, logits, state_values, cursors = self._prefill(prompt_ids_cpu)
+        if prefill_complete is not None:
+            prefill_complete.record()
         responses = torch.full(
             (self.batch_size, max_new_tokens),
             self.primary_stop,
@@ -302,71 +362,126 @@ class NextLatSpeculativeEngine:
         )
         target_calls = 0
         target_positions = 0
-        proposed = 0
-        accepted = 0
-        accepted_pos2plus = 0
-        proposed_pos2plus = 0
+        row_cycles = torch.zeros((), dtype=torch.long, device=device)
+        proposed_by_position = torch.zeros(
+            self.draft_length, dtype=torch.long, device=device
+        )
+        accepted_by_position = torch.zeros_like(proposed_by_position)
+        proposed = torch.zeros((), dtype=torch.long, device=device)
+        accepted = torch.zeros_like(proposed)
+        accepted_pos2plus = torch.zeros_like(proposed)
+        proposed_pos2plus = torch.zeros_like(proposed)
         cycles = 0
+        pending_tokens = torch.full_like(
+            response_lengths, self.inactive_token
+        )
+        pending_base_hidden = hidden.clone()
+        has_pending = False
 
-        while not bool(finished.all()):
+        while True:
             remaining = max_new_tokens - response_lengths
-            if int(remaining.max()) <= 0:
+            active, minimum_remaining = torch.stack(
+                (
+                    (~finished).any().to(remaining.dtype),
+                    remaining.masked_fill(finished, self.draft_length + 1).min(),
+                )
+            ).tolist()
+            if not active:
                 break
-            steps = min(
-                self.draft_length,
-                int(remaining[~finished].min()),
-            )
+            row_cycles += (~finished).sum()
+            steps = min(self.draft_length, minimum_remaining)
             cycles += 1
 
             draft_tokens: list[Tensor] = []
             draft_probabilities: list[Tensor] = []
-            draft_state = hidden
-            draft_logits = logits
-            for _ in range(steps):
-                q = self._behavior_probabilities(draft_logits)
-                token = torch.multinomial(q, 1).squeeze(1)
-                token = torch.where(finished, self.stop_tensor[0], token)
-                draft_tokens.append(token)
-                draft_probabilities.append(q)
-                draft_state = self.policy.nextlat_hidden(draft_state, token)
-                draft_logits = self.policy.logits(draft_state)
+            with torch.autocast(
+                device_type=self.device_type,
+                dtype=torch.bfloat16,
+                enabled=self.device_type == "cuda",
+            ):
+                if has_pending:
+                    draft_state = self.policy.nextlat_hidden(
+                        pending_base_hidden, pending_tokens
+                    )
+                    draft_logits = self.policy.logits(draft_state)
+                else:
+                    draft_state = hidden
+                    draft_logits = logits
+                for _ in range(steps):
+                    q = self._behavior_probabilities(draft_logits)
+                    token = torch.multinomial(q, 1).squeeze(1)
+                    token = torch.where(
+                        finished, self.inactive_token_tensor, token
+                    )
+                    draft_tokens.append(token)
+                    draft_probabilities.append(q)
+                    draft_state = self.policy.nextlat_hidden(draft_state, token)
+                    draft_logits = self.policy.logits(draft_state)
             drafts = torch.stack(draft_tokens, dim=1)
             offsets = torch.arange(steps, device=device)
             verify_positions = cursors[:, None] + offsets[None]
-            active_drafts = (~finished)[:, None] & (offsets[None] < remaining[:, None])
+            active_drafts = (
+                (~finished)[:, None] & (offsets[None] < remaining[:, None])
+            )
+            if has_pending:
+                target_tokens = torch.cat((pending_tokens[:, None], drafts), dim=1)
+                target_positions_tensor = torch.cat(
+                    ((cursors - 1)[:, None], verify_positions), dim=1
+                )
+                active_inputs = torch.cat(
+                    ((~finished)[:, None], active_drafts), dim=1
+                )
+                prefix_steps = 1
+            else:
+                target_tokens = drafts
+                target_positions_tensor = verify_positions
+                active_inputs = active_drafts
+                prefix_steps = 0
             safe_positions = torch.where(
-                active_drafts,
-                verify_positions,
+                active_inputs,
+                target_positions_tensor,
                 (cursors - 1).clamp_min(0)[:, None],
             )
-            self.valid_keys.scatter_(1, safe_positions, active_drafts)
+            self.valid_keys.scatter_(1, safe_positions, active_inputs)
             verify_mask = ragged_causal_mask(self.valid_keys, safe_positions)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(
+                device_type=self.device_type,
+                dtype=torch.bfloat16,
+                enabled=self.device_type == "cuda",
+            ):
                 verify_hidden, verify_logits, verify_values = self.verify_forward(
-                    drafts, safe_positions, verify_mask
+                    target_tokens, safe_positions, verify_mask
                 )
             target_calls += 1
-            target_positions += steps
+            target_positions += steps + prefix_steps
 
-            target_logits = [logits]
-            target_state_values = [state_values]
-            for offset in range(1, steps):
-                target_logits.append(verify_logits[:, offset - 1])
-                target_state_values.append(verify_values[:, offset - 1])
-            target_probabilities = [
-                self._behavior_probabilities(step_logits)
-                for step_logits in target_logits
-            ]
-            bonus_probabilities = self._behavior_probabilities(
-                verify_logits[:, steps - 1]
-            )
+            target_logits: list[Tensor] = []
+            target_state_values: list[Tensor] = []
+            target_hidden_states: list[Tensor] = []
+            target_probabilities: list[Tensor] = []
+            for offset in range(steps):
+                if prefix_steps == 0 and offset == 0:
+                    step_hidden = hidden
+                    step_logits = logits
+                    step_values = state_values
+                    step_probabilities = draft_probabilities[0]
+                else:
+                    target_index = prefix_steps + offset - 1
+                    step_hidden = verify_hidden[:, target_index]
+                    step_logits = verify_logits[:, target_index]
+                    step_values = verify_values[:, target_index]
+                    step_probabilities = self._behavior_probabilities(step_logits)
+                target_hidden_states.append(step_hidden)
+                target_logits.append(step_logits)
+                target_state_values.append(step_values)
+                target_probabilities.append(step_probabilities)
+            bonus_index = prefix_steps + steps - 1
+            bonus_logits = verify_logits[:, bonus_index]
+            bonus_probabilities = self._behavior_probabilities(bonus_logits)
 
             cycle_count = torch.zeros_like(response_lengths)
             rejected = torch.zeros_like(finished)
             cycle_finished = finished.clone()
-            final_tokens = torch.full_like(response_lengths, self.primary_stop)
-            final_positions = (cursors - 1).clamp_min(0)
-            final_required = torch.zeros_like(finished)
 
             for offset in range(steps):
                 active = (
@@ -380,58 +495,117 @@ class NextLatSpeculativeEngine:
                     drafts[:, offset],
                     active,
                 )
-                proposed += int(active.sum())
-                accepted += int(accepted_mask.sum())
+                proposed_at_position = active.sum()
+                accepted_at_position = accepted_mask.sum()
+                proposed_by_position[offset] += proposed_at_position
+                accepted_by_position[offset] += accepted_at_position
+                proposed += proposed_at_position
+                accepted += accepted_at_position
                 if offset > 0:
-                    accepted_pos2plus += int(accepted_mask.sum())
+                    proposed_pos2plus += proposed_at_position
+                    accepted_pos2plus += accepted_at_position
                 output_positions = response_lengths + cycle_count
-                if offset > 0:
-                    proposed_pos2plus += int(active.sum())
-                rows = active.nonzero(as_tuple=False).squeeze(1)
-                if rows.numel():
-                    responses[rows, output_positions[rows]] = committed[rows]
-                    logprobs[rows, output_positions[rows]] = self._raw_logprob(
-                        target_logits[offset][rows], committed[rows]
-                    )
-                    values[rows, output_positions[rows]] = target_state_values[
-                        offset
-                    ][rows]
+                safe_output_positions = output_positions.clamp_max(
+                    max_new_tokens - 1
+                )[:, None]
+                responses.scatter_(
+                    1,
+                    safe_output_positions,
+                    torch.where(
+                        active,
+                        committed,
+                        responses.gather(1, safe_output_positions).squeeze(1),
+                    )[:, None],
+                )
+                committed_logprobs = self._raw_logprob(
+                    target_logits[offset], committed
+                )
+                logprobs.scatter_(
+                    1,
+                    safe_output_positions,
+                    torch.where(
+                        active,
+                        committed_logprobs,
+                        logprobs.gather(1, safe_output_positions).squeeze(1),
+                    )[:, None],
+                )
+                committed_values = target_state_values[offset].float()
+                values.scatter_(
+                    1,
+                    safe_output_positions,
+                    torch.where(
+                        active,
+                        committed_values,
+                        values.gather(1, safe_output_positions).squeeze(1),
+                    )[:, None],
+                )
                 cycle_count += active.long()
                 newly_rejected = active & ~accepted_mask
-                final_tokens[newly_rejected] = committed[newly_rejected]
-                final_positions[newly_rejected] = cursors[newly_rejected] + offset
-                final_required |= newly_rejected
+                pending_tokens = torch.where(
+                    newly_rejected, committed, pending_tokens
+                )
+                pending_base_hidden = torch.where(
+                    newly_rejected[:, None],
+                    target_hidden_states[offset],
+                    pending_base_hidden,
+                )
                 rejected |= newly_rejected
                 emitted_stop = active & (
                     committed[:, None] == self.stop_tensor[None]
                 ).any(dim=1)
                 cycle_finished |= emitted_stop
-                if not bool((~cycle_finished & ~rejected).any()):
-                    break
 
             bonus_active = (
                 ~cycle_finished
                 & ~rejected
                 & (cycle_count < remaining)
             )
-            if bool(bonus_active.any()):
-                bonus = torch.multinomial(bonus_probabilities, 1).squeeze(1)
-                output_positions = response_lengths + cycle_count
-                rows = bonus_active.nonzero(as_tuple=False).squeeze(1)
-                responses[rows, output_positions[rows]] = bonus[rows]
-                logprobs[rows, output_positions[rows]] = self._raw_logprob(
-                    verify_logits[rows, steps - 1], bonus[rows]
-                )
-                values[rows, output_positions[rows]] = verify_values[
-                    rows, steps - 1
-                ]
-                cycle_count += bonus_active.long()
-                final_tokens[bonus_active] = bonus[bonus_active]
-                final_positions[bonus_active] = cursors[bonus_active] + steps
-                final_required |= bonus_active
-                cycle_finished |= bonus_active & (
-                    bonus[:, None] == self.stop_tensor[None]
-                ).any(dim=1)
+            bonus = torch.multinomial(bonus_probabilities, 1).squeeze(1)
+            output_positions = response_lengths + cycle_count
+            safe_output_positions = output_positions.clamp_max(
+                max_new_tokens - 1
+            )[:, None]
+            responses.scatter_(
+                1,
+                safe_output_positions,
+                torch.where(
+                    bonus_active,
+                    bonus,
+                    responses.gather(1, safe_output_positions).squeeze(1),
+                )[:, None],
+            )
+            bonus_logprobs = self._raw_logprob(bonus_logits, bonus)
+            logprobs.scatter_(
+                1,
+                safe_output_positions,
+                torch.where(
+                    bonus_active,
+                    bonus_logprobs,
+                    logprobs.gather(1, safe_output_positions).squeeze(1),
+                )[:, None],
+            )
+            bonus_values = verify_values[:, bonus_index].float()
+            values.scatter_(
+                1,
+                safe_output_positions,
+                torch.where(
+                    bonus_active,
+                    bonus_values,
+                    values.gather(1, safe_output_positions).squeeze(1),
+                )[:, None],
+            )
+            cycle_count += bonus_active.long()
+            pending_tokens = torch.where(
+                bonus_active, bonus, pending_tokens
+            )
+            pending_base_hidden = torch.where(
+                bonus_active[:, None],
+                verify_hidden[:, bonus_index],
+                pending_base_hidden,
+            )
+            cycle_finished |= bonus_active & (
+                bonus[:, None] == self.stop_tensor[None]
+            ).any(dim=1)
 
             tentative = verify_positions.clamp_max(self.cache_length - 1)
             self.valid_keys.scatter_(
@@ -443,38 +617,10 @@ class NextLatSpeculativeEngine:
             safe_committed = committed_positions.clamp_max(self.cache_length - 1)
             self.valid_keys.scatter_(1, safe_committed, committed_mask)
 
-            safe_final_positions = torch.where(
-                final_required,
-                final_positions,
-                (cursors + cycle_count - 1).clamp_min(0),
-            )
-            safe_final_tokens = torch.where(
-                final_required,
-                final_tokens,
-                responses[
-                    torch.arange(self.batch_size, device=device),
-                    (response_lengths + cycle_count - 1).clamp_min(0),
-                ],
-            )
-            commit_mask = ragged_causal_mask(
-                self.valid_keys, safe_final_positions[:, None]
-            )
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                committed_hidden, committed_logits, committed_values = (
-                    self.commit_forward(
-                        safe_final_tokens[:, None],
-                        safe_final_positions[:, None],
-                        commit_mask,
-                    )
-                )
-            target_calls += 1
-            target_positions += 1
-            hidden = committed_hidden[:, 0]
-            logits = committed_logits[:, 0]
-            state_values = committed_values[:, 0]
             cursors += cycle_count
             response_lengths += cycle_count
             finished = cycle_finished | (response_lengths >= max_new_tokens)
+            has_pending = True
 
             if progress_callback is not None:
                 elapsed = time.perf_counter() - started
@@ -490,25 +636,45 @@ class NextLatSpeculativeEngine:
                         )
                         / max(elapsed, 1e-9),
                         "nextlat_cycles": cycles,
-                        "nextlat_proposed_tokens": proposed,
-                        "nextlat_accepted_tokens": accepted,
+                        "nextlat_proposed_tokens": int(proposed),
+                        "nextlat_accepted_tokens": int(accepted),
                     },
                 )
 
         width = int(response_lengths.max())
+        if decode_complete is not None:
+            decode_complete.record()
+        response_output = responses[:, :width].cpu()
+        logprob_output = logprobs[:, :width].cpu()
+        value_output = values[:, :width].cpu()
+        prefill_seconds = (
+            gpu_started.elapsed_time(prefill_complete) / 1_000.0
+            if gpu_started is not None and prefill_complete is not None
+            else 0.0
+        )
+        decode_seconds = (
+            prefill_complete.elapsed_time(decode_complete) / 1_000.0
+            if prefill_complete is not None and decode_complete is not None
+            else 0.0
+        )
         return (
-            responses[:, :width].cpu(),
-            logprobs[:, :width].cpu(),
-            values[:, :width].cpu(),
+            response_output,
+            logprob_output,
+            value_output,
             int(self.policy.causal_lm.config.vocab_size),
             self.top_p,
             NextLatDecodeStats(
                 target_decode_calls=target_calls,
                 target_decode_positions=target_positions,
-                proposed_tokens=proposed,
-                accepted_tokens=accepted,
-                accepted_tokens_pos2plus=accepted_pos2plus,
-                proposed_tokens_pos2plus=proposed_pos2plus,
+                proposed_tokens=int(proposed),
+                accepted_tokens=int(accepted),
+                accepted_tokens_pos2plus=int(accepted_pos2plus),
+                proposed_tokens_pos2plus=int(proposed_pos2plus),
                 speculative_cycles=cycles,
+                speculative_row_cycles=int(row_cycles),
+                proposed_by_position=tuple(proposed_by_position.tolist()),
+                accepted_by_position=tuple(accepted_by_position.tolist()),
+                prefill_seconds=prefill_seconds,
+                decode_seconds=decode_seconds,
             ),
         )

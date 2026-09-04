@@ -1,0 +1,85 @@
+{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "engine": "mtp",
+  "speculative_tokens": 2,
+  "dtype": "bfloat16",
+  "quantization": null,
+  "logprobs": true,
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "top_k": 20,
+  "seed": 17291,
+  "warmup_tokens_per_stream": 64,
+  "measured_tokens_per_stream": 512,
+  "measurement_repetitions": 3,
+  "max_model_len": 4096,
+  "vllm_version": "0.28.1rc1.dev168+gf5e441de1",
+  "results": [
+    {
+      "batch_size": 1,
+      "prompt_tokens_min": 28,
+      "prompt_tokens_max": 28,
+      "median_aggregate_tokens_per_second": 690.2989235944673,
+      "median_tokens_per_second_per_stream": 690.2989235944673,
+      "repetitions": [
+        {
+          "repetition": 0,
+          "elapsed_seconds": 0.7417076609854121,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 690.2989235944673,
+          "tokens_per_second_per_stream": 690.2989235944673,
+          "generated_token_ids_sha256": "b29164cf396e95070ae68ef0a03e10f00e94cc9b79d0882383dc280b1df2e746"
+        },
+        {
+          "repetition": 1,
+          "elapsed_seconds": 0.7410429500159808,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 690.9181174842277,
+          "tokens_per_second_per_stream": 690.9181174842277,
+          "generated_token_ids_sha256": "b29164cf396e95070ae68ef0a03e10f00e94cc9b79d0882383dc280b1df2e746"
+        },
+        {
+          "repetition": 2,
+          "elapsed_seconds": 0.7471796970057767,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 685.2434589052298,
+          "tokens_per_second_per_stream": 685.2434589052298,
+          "generated_token_ids_sha256": "b29164cf396e95070ae68ef0a03e10f00e94cc9b79d0882383dc280b1df2e746"
+        }
+      ]
+    },
+    {
+      "batch_size": 64,
+      "prompt_tokens_min": 27,
+      "prompt_tokens_max": 35,
+      "median_aggregate_tokens_per_second": 17322.661426311093,
+      "median_tokens_per_second_per_stream": 270.66658478611083,
+      "repetitions": [
+        {
+          "repetition": 0,
+          "elapsed_seconds": 1.9314122089999728,
+          "generated_tokens": 32768,
+          "aggregate_tokens_per_second": 16965.824202264044,
+          "tokens_per_second_per_stream": 265.0910031603757,
+          "generated_token_ids_sha256": "e4b82e8e819ae2e0132272dbb16643dee00c49c7671dc1087b5d8bfcb6d3cb6a"
+        },
+        {
+          "repetition": 1,
+          "elapsed_seconds": 1.891626188007649,
+          "generated_tokens": 32768,
+          "aggregate_tokens_per_second": 17322.661426311093,
+          "tokens_per_second_per_stream": 270.66658478611083,
+          "generated_token_ids_sha256": "18de39533cf109d7d88227aab0a4e239a11d153e1671f7261678b0f5415746f7"
+        },
+        {
+          "repetition": 2,
+          "elapsed_seconds": 1.8831505400012247,
+          "generated_tokens": 32768,
+          "aggregate_tokens_per_second": 17400.626930218063,
+          "tokens_per_second_per_stream": 271.88479578465723,
+          "generated_token_ids_sha256": "85f1e9e7bf8beda9c93d032851565829022306fa19418d817d19ab65d9ca58f6"
+        }
+      ]
+    }
+  ]
+}

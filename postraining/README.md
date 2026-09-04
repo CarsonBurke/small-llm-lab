@@ -43,64 +43,82 @@ use lockstep. CPU parity/integration tests live in
 
 ## MiniCPM5 native-token VAPO
 
-`train_hf_vapo` is an additional standard-token VAPO path; it does not change
+`train_minicpm_vapo` is an additional standard-token VAPO path; it does not change
 the nano, latent-thinking, or OPSD trainers. It defaults to the pinned final
 `openbmb/MiniCPM5-1B` RL+OPD checkpoint because its existing math success rate
 provides useful sparse-reward variation and its post-training reduces overlong
 responses. The checkpoint remains a native `LlamaForCausalLM`: its tokenizer,
-thinking chat template, attention blocks, GQA layout, and static HF KV cache
+thinking chat template, attention blocks, GQA layout, and Transformers KV cache
 are used directly.
 
-Rank-16 LoRA adapters and a separate 256-wide value head train. LoRA reduces
-trainable state and optimizer memory; rollout still executes the complete
-1.08B-parameter transformer. The 130,560-token embedding and output matrices
-stay frozen. Host replay stores int32 token ids plus fp32 selected-token
-log-probabilities and precomputed advantages, never full logits. Replay
-reconstructs exact selected-token probabilities in 128-token output-head chunks
-and length-buckets transformer forwards under a padded-token budget.
+Actor and critic use separate rank-16 LoRA adapters and trainable heads over
+shared immutable MiniCPM embedding and transformer storage. The critic has its
+own 256-wide scalar value head and never consumes actor hidden states. Its
+unused 130,560-way output projection is removed. Only adapters, value head, and
+auxiliary heads are serialized.
 
-Each rollout left-pads four prompts, repeats each prompt for sixteen samples,
-and generates all 64 trajectories in one model/cache call per decode position.
-Explicit attention masks hide left padding, while per-row position ids preserve
-each prompt's semantic RoPE positions. One 64-row, 5,120-position MiniCPM cache
-uses exactly 7.5 GiB in bf16. The trainer rejects cache configurations consuming
-more than 70% of currently free VRAM rather than silently serializing groups.
-CPU decoding and reward verification run across the four completed prompt
-groups after the single GPU rollout.
+Rollout remains actor-only. After generation, length-bucketed teacher-forced
+actor and critic passes materialize replay-consistent behavior-policy
+log-probabilities, fixed behavior values, and advantages. Host replay stores
+int32 token ids plus fp32 selected-token log-probabilities and advantages,
+never full logits. Replay reconstructs selected-token probabilities in
+128-token output-head chunks under a padded-token budget.
 
-MiniCPM VAPO always uses the checkpoint's native thinking template and its
-recommended temperature of 0.9. Thinking is part of the policy being trained,
-not an inference toggle. The default 4,096-token response budget keeps the
-fully parallel 64-row static cache inside the 32 GiB device. Longer contexts
-must pass the explicit cache-memory check.
+Each rollout collects four distinct prompts with sixteen responses apiece. All
+64 trajectories occupy one physical GPU batch and one KV cache; the trainer
+does not double the logical rollout by running a second wave. With four
+optimizer minibatches, each actor and critic step therefore consumes a
+disjoint 16-trajectory quarter of the rollout.
 
-Nucleus sampling is exact without repeatedly sorting the 130,560-token
-vocabulary. It proposes from the full temperature-scaled categorical and
-rejects tokens outside a deterministic top-p nucleus. Conditioning gives the
-same nucleus distribution, with acceptance probability at least 0.95 and about
-1.053 proposals per accepted token on average. Equal logits use ascending token
-id as the deterministic tie-break.
+One PPO epoch uses four true optimizer minibatches. Each contains a disjoint
+quarter of the rollout; length-bucketed replay batches are only memory shards
+whose gradients accumulate inside that optimizer minibatch. Actor and critic
+therefore each take four AdamW steps per rollout. Their default learning rates
+are 1e-6 and 2e-6 respectively, matching VAPO's actor/critic scale. Fixed
+behavior log-probabilities make KL, ratios, and clipping meaningful after the
+first minibatch. Exact post-update behavior KL is measured every ten rollouts.
 
-Each of the ten critic warmup steps collects a distinct four-prompt,
-64-trajectory rollout before updating the value head. Warmup never reuses one
-rollout as ten nominally different observations.
+Actor and critic each own a canonical residual NextLat dynamics MLP. It consumes
+the current hidden state and next-token embedding, predicts the next hidden
+state, and uses Smooth L1 plus categorical KL against detached targets. Up to 64
+response transitions per optimizer minibatch are distributed across its memory
+shards, keeping auxiliary cost fixed when replay sharding changes. On each side,
+the NextLat loss is downscaled to at most the policy or weighted-value loss
+magnitude. Its transformer gradient is measured separately and capped to the
+primary objective's parameter-gradient norm before the two are accumulated, so
+NextLat cannot dominate the LoRA update even when the losses have different
+conditioning. Actor and critic parameter gradients are then clipped
+independently to norm 1.0 before each step. Speculative decoding is not part of
+this training path.
 
-NextLat and Jacobi drafting were removed from this path. Their shared static
-cursor required an entire 16-row block position to accept before reuse; NextLat
-accepted no complete position through step 5 and slowed rollouts by about 6%.
-Expanding that rule to 64 rows only lowers joint acceptance, while each draft
-also pays another 130,560-token output-head projection. Jacobi accepted only
-194/13,645 positions (1.42%) and reduced throughput from 412.66 to 226.23
-tokens/s. Exact per-row speculation would require a paged cache with independent
-row cursors; it is not represented as a fast path until such an implementation
-has measured benefit.
-TensorBoard is the live metric surface. It writes decode progress every 256
-steps plus rollout, gate, warmup, optimizer, and attributable NVML power/SM
-utilization/clock summaries under
-`postraining/runs/<run-name>/tensorboard/`; configuration scalars are flushed
-before model execution begins. The JSONL stream remains only as a durable
-offline comparison. Use `--no-device-telemetry` only when an external profiler
-owns `nvidia-smi`.
+The default rollout path keeps a fused inference-only actor replica resident on
+the GPU. QKV and gate/up projections stay fused, and one decode step—including
+top-k sampling and replay-buffer writes—is captured as a CUDA graph.
+Left-padded prefill K/V is compacted into per-row contiguous prefixes, then
+fixed-shape FA4 varlen decode reads the persistent sequence-major cache using
+device-resident sequence lengths. No critic model or critic KV cache runs
+during autoregressive decoding. The actor replica weights remain resident
+across rollout and replay, while phase-local KV state is released before
+replay. Replay uses an 8,192-token packed budget, stable segmented SDPA, and
+checkpoints every second actor and critic decoder layer. The
+`--replay-attention-backend fa4` path remains available only for profiling;
+SM120 FA4 varlen backward produced NaNs in production. Retaining the other
+activations cuts recomputation without exceeding 32 GiB.
+
+MiniCPM VAPO uses the checkpoint's native thinking template, temperature 0.9,
+top-k 20, and top-p 0.95. The default 4,096-token response budget keeps the
+64-row static cache inside the 32 GiB device. `--top-k 0 --no-fast-rollout`
+retains the slower exact full-vocabulary nucleus sampler. Production aborts if
+steady scheduled decode throughput falls below
+`--min-rollout-tokens-per-second`.
+
+TensorBoard is the only live metric stream. Semantic categories cover rollout
+quality, rollout performance, refill efficiency, sampling, replay, actor,
+critic, advantages, KL, ratios, clipping, gradients, auxiliary NextLat,
+optimization time, and system telemetry. Every category is capped at twelve
+charts. Configuration and correct/incorrect response samples are text
+summaries. Scalar writers rely on TensorBoard's asynchronous flush interval
+instead of synchronously flushing every progress callback.
 
 Establish the pinned native checkpoint baseline before running the integrated
 learnability gate:
@@ -118,9 +136,22 @@ mlq submit --name minicpm5_native_aime_baseline --cwd "$PWD" \
 
 mlq submit --name minicpm5_vapo_gate --cwd "$PWD" \
   --max-parallel-runs 1 --time-limit 4h -- \
-  python3 -m postraining.train_hf_vapo \
+  python3 -m postraining.train_minicpm_vapo \
     --rollout-only \
     --output postraining/runs/minicpm5_vapo_gate
+```
+
+Before resuming, run the CPU-only preflight. It validates the v6 schema,
+dataset bytes, output ownership, and target step without loading either model
+or reserving the GPU. It prints the complete `mlq submit` command; `--steps`
+in the trainer is an absolute actor-step target, while the preflight also
+accepts the less error-prone additional-step form:
+
+```bash
+python3 scripts/preflight_minicpm_vapo.py \
+  --resume postraining/runs/source/vapo_adapter_checkpoint.pt \
+  --output postraining/runs/minicpm5_vapo_continuation \
+  --additional-steps 200
 ```
 
 Run every GPU workload through `mlq`. Before a new training campaign, run the

@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "benchmark": "equivalent_lora_actor_update",
+  "model_key": "minicpm",
+  "model": {
+    "model_id": "openbmb/MiniCPM5-1B",
+    "revision": "87179e5c1f455ef22e6223592d2d61351b525bfc",
+    "model_class": "LlamaForCausalLM",
+    "lora_targets": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_module_count": 168,
+    "hidden_size": 1536,
+    "vocab_size": 130560,
+    "num_hidden_layers": 24
+  },
+  "methodology": {
+    "base_dtype": "bfloat16",
+    "adapter_dtype": "float32",
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "gradient_checkpointing": "non_reentrant",
+    "attention_implementation": "sdpa",
+    "optimizer": "torch.optim.AdamW(fused=True)",
+    "learning_rate": 5e-05,
+    "logit_loss": "exact selected-token log-probability for every next token",
+    "logit_chunk_tokens": 128,
+    "warmup_steps_per_length": 1,
+    "measure_steps_per_length": 3,
+    "seed": 1234
+  },
+  "parameters": {
+    "total": 1091839488,
+    "frozen": 1080632832,
+    "trainable": 11206656,
+    "frozen_bytes": 2161265664,
+    "frozen_mib": 2061.1435546875,
+    "trainable_bytes": 44826624,
+    "trainable_mib": 42.75,
+    "buffer_bytes": 512,
+    "buffer_mib": 0.00048828125
+  },
+  "memory_after_model_load": {
+    "allocated_bytes": 2206093312,
+    "allocated_mib": 2103.89453125
+  },
+  "environment": {
+    "python": "3.12.13",
+    "torch": "2.13.0+cu132",
+    "cuda_runtime": "13.2",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "fla_installed": true,
+    "flash_qla_installed": true,
+    "causal_conv1d_installed": false
+  },
+  "measurements": [
+    {
+      "sequence_length": 1024,
+      "batch_size": 1,
+      "action_tokens": 1023,
+      "median_step_seconds": 0.07754088001092896,
+      "step_seconds": [
+        0.07754088001092896,
+        0.08423379700980149,
+        0.0660770560207311
+      ],
+      "input_tokens_per_second": 13205.937305014759,
+      "action_tokens_per_second": 13193.04088186533,
+      "loss_last": 12.994793891906738,
+      "steady_allocated_bytes": 2363035648,
+      "steady_allocated_mib": 2253.56640625,
+      "peak_allocated_bytes": 2719045632,
+      "peak_allocated_mib": 2593.083984375,
+      "peak_working_bytes": 356009984,
+      "peak_working_mib": 339.517578125,
+      "final_allocated_bytes": 2363035648,
+      "final_allocated_mib": 2253.56640625,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    },
+    {
+      "sequence_length": 2048,
+      "batch_size": 1,
+      "action_tokens": 2047,
+      "median_step_seconds": 0.11316758999601007,
+      "step_seconds": [
+        0.11316758999601007,
+        0.11510249102138914,
+        0.112928937014658
+      ],
+      "input_tokens_per_second": 18097.054113038954,
+      "action_tokens_per_second": 18088.217660835322,
+      "loss_last": 12.544127464294434,
+      "steady_allocated_bytes": 2363043840,
+      "steady_allocated_mib": 2253.57421875,
+      "peak_allocated_bytes": 2807678976,
+      "peak_allocated_mib": 2677.611328125,
+      "peak_working_bytes": 444635136,
+      "peak_working_mib": 424.037109375,
+      "final_allocated_bytes": 2363043840,
+      "final_allocated_mib": 2253.57421875,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    },
+    {
+      "sequence_length": 4096,
+      "batch_size": 1,
+      "action_tokens": 4095,
+      "median_step_seconds": 0.23613733699312434,
+      "step_seconds": [
+        0.23726519601768814,
+        0.23613733699312434,
+        0.23601834598230198
+      ],
+      "input_tokens_per_second": 17345.838028652215,
+      "action_tokens_per_second": 17341.603204914754,
+      "loss_last": 12.282811164855957,
+      "steady_allocated_bytes": 2363060224,
+      "steady_allocated_mib": 2253.58984375,
+      "peak_allocated_bytes": 3059087360,
+      "peak_allocated_mib": 2917.373046875,
+      "peak_working_bytes": 696027136,
+      "peak_working_mib": 663.783203125,
+      "final_allocated_bytes": 2363060224,
+      "final_allocated_mib": 2253.58984375,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    },
+    {
+      "sequence_length": 5120,
+      "batch_size": 1,
+      "action_tokens": 5119,
+      "median_step_seconds": 0.3024667599820532,
+      "step_seconds": [
+        0.30540205602301285,
+        0.30237205798039213,
+        0.3024667599820532
+      ],
+      "input_tokens_per_second": 16927.479899952625,
+      "action_tokens_per_second": 16924.173751534665,
+      "loss_last": 12.105586051940918,
+      "steady_allocated_bytes": 2363068416,
+      "steady_allocated_mib": 2253.59765625,
+      "peak_allocated_bytes": 3232917504,
+      "peak_allocated_mib": 3083.150390625,
+      "peak_working_bytes": 869849088,
+      "peak_working_mib": 829.552734375,
+      "final_allocated_bytes": 2363068416,
+      "final_allocated_mib": 2253.59765625,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    },
+    {
+      "sequence_length": 8192,
+      "batch_size": 1,
+      "action_tokens": 8191,
+      "median_step_seconds": 0.5564674659981392,
+      "step_seconds": [
+        0.5586178390076384,
+        0.5532565930043347,
+        0.5564674659981392
+      ],
+      "input_tokens_per_second": 14721.435664358127,
+      "action_tokens_per_second": 14719.63861410613,
+      "loss_last": 12.04938793182373,
+      "steady_allocated_bytes": 2363092992,
+      "steady_allocated_mib": 2253.62109375,
+      "peak_allocated_bytes": 3754407936,
+      "peak_allocated_mib": 3580.482421875,
+      "peak_working_bytes": 1391314944,
+      "peak_working_mib": 1326.861328125,
+      "final_allocated_bytes": 2363092992,
+      "final_allocated_mib": 2253.62109375,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    }
+  ]
+}

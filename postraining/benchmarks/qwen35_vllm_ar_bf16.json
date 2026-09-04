@@ -1,0 +1,85 @@
+{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "engine": "autoregressive",
+  "speculative_tokens": 0,
+  "dtype": "bfloat16",
+  "quantization": null,
+  "logprobs": true,
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "top_k": 20,
+  "seed": 17291,
+  "warmup_tokens_per_stream": 64,
+  "measured_tokens_per_stream": 512,
+  "measurement_repetitions": 3,
+  "max_model_len": 4096,
+  "vllm_version": "0.28.1rc1.dev168+gf5e441de1",
+  "results": [
+    {
+      "batch_size": 1,
+      "prompt_tokens_min": 28,
+      "prompt_tokens_max": 28,
+      "median_aggregate_tokens_per_second": 538.9646725781514,
+      "median_tokens_per_second_per_stream": 538.9646725781514,
+      "repetitions": [
+        {
+          "repetition": 0,
+          "elapsed_seconds": 0.9531947750074323,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 537.1410056208164,
+          "tokens_per_second_per_stream": 537.1410056208164,
+          "generated_token_ids_sha256": "95b262ed2d39f5eb7845996c38834f23d0f005f0256e4c916e51c54d514ccd8c"
+        },
+        {
+          "repetition": 1,
+          "elapsed_seconds": 0.9499694990226999,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 538.9646725781514,
+          "tokens_per_second_per_stream": 538.9646725781514,
+          "generated_token_ids_sha256": "95b262ed2d39f5eb7845996c38834f23d0f005f0256e4c916e51c54d514ccd8c"
+        },
+        {
+          "repetition": 2,
+          "elapsed_seconds": 0.9478930229961406,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 540.1453408546553,
+          "tokens_per_second_per_stream": 540.1453408546553,
+          "generated_token_ids_sha256": "95b262ed2d39f5eb7845996c38834f23d0f005f0256e4c916e51c54d514ccd8c"
+        }
+      ]
+    },
+    {
+      "batch_size": 64,
+      "prompt_tokens_min": 27,
+      "prompt_tokens_max": 35,
+      "median_aggregate_tokens_per_second": 16123.17492371522,
+      "median_tokens_per_second_per_stream": 251.9246081830503,
+      "repetitions": [
+        {
+          "repetition": 0,
+          "elapsed_seconds": 2.0166134730097838,
+          "generated_tokens": 32768,
+          "aggregate_tokens_per_second": 16249.02364214296,
+          "tokens_per_second_per_stream": 253.89099440848375,
+          "generated_token_ids_sha256": "f45787a42874fb0a9677e5e2bad6738361c1ec62866a5b976b71b47f0cca0724"
+        },
+        {
+          "repetition": 1,
+          "elapsed_seconds": 2.215625952987466,
+          "generated_tokens": 32768,
+          "aggregate_tokens_per_second": 14789.499985688863,
+          "tokens_per_second_per_stream": 231.08593727638848,
+          "generated_token_ids_sha256": "9ac6341bc7ad864fbdabf2d8be689f6f5988961aa395bcc30638be49190a8e12"
+        },
+        {
+          "repetition": 2,
+          "elapsed_seconds": 2.032354058988858,
+          "generated_tokens": 32768,
+          "aggregate_tokens_per_second": 16123.17492371522,
+          "tokens_per_second_per_stream": 251.9246081830503,
+          "generated_token_ids_sha256": "f45787a42874fb0a9677e5e2bad6738361c1ec62866a5b976b71b47f0cca0724"
+        }
+      ]
+    }
+  ]
+}

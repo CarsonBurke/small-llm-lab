@@ -1,0 +1,52 @@
+{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "engine": "mtp",
+  "speculative_tokens": 2,
+  "dtype": "bfloat16",
+  "quantization": "fp8_per_tensor",
+  "logprobs": true,
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "top_k": 20,
+  "seed": 17291,
+  "warmup_tokens_per_stream": 64,
+  "measured_tokens_per_stream": 512,
+  "measurement_repetitions": 3,
+  "max_model_len": 4096,
+  "vllm_version": "0.28.1rc1.dev168+gf5e441de1",
+  "results": [
+    {
+      "batch_size": 1,
+      "prompt_tokens_min": 28,
+      "prompt_tokens_max": 28,
+      "median_aggregate_tokens_per_second": 702.885082990934,
+      "median_tokens_per_second_per_stream": 702.885082990934,
+      "repetitions": [
+        {
+          "repetition": 0,
+          "elapsed_seconds": 0.7284263279871084,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 702.885082990934,
+          "tokens_per_second_per_stream": 702.885082990934,
+          "generated_token_ids_sha256": "5c5e411df519e5941a79988417abb41a56c5831cfafbce7e587ab79d767ae026"
+        },
+        {
+          "repetition": 1,
+          "elapsed_seconds": 0.7575009590073023,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 675.9067350501722,
+          "tokens_per_second_per_stream": 675.9067350501722,
+          "generated_token_ids_sha256": "5c5e411df519e5941a79988417abb41a56c5831cfafbce7e587ab79d767ae026"
+        },
+        {
+          "repetition": 2,
+          "elapsed_seconds": 0.7248546869959682,
+          "generated_tokens": 512,
+          "aggregate_tokens_per_second": 706.3484711975765,
+          "tokens_per_second_per_stream": 706.3484711975765,
+          "generated_token_ids_sha256": "5c5e411df519e5941a79988417abb41a56c5831cfafbce7e587ab79d767ae026"
+        }
+      ]
+    }
+  ]
+}

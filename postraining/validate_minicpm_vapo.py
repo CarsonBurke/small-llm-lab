@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from postraining.hf_runtime import prepare_text_only_transformers_runtime
-from postraining.hf_vapo import (
+from postraining.minicpm_vapo import (
     MINICPM5_MODEL_ID,
     MINICPM5_REVISION,
     LoRAConfig,
@@ -77,7 +77,7 @@ def main() -> None:
     parser.add_argument("--revision", default=MINICPM5_REVISION)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument(
-        "--output", default="postraining/runs/minicpm5_hf_vapo_parity.json"
+        "--output", default="postraining/runs/minicpm5_vapo_parity.json"
     )
     args = parser.parse_args()
     if args.max_new_tokens < 1:
@@ -180,7 +180,7 @@ def main() -> None:
         )
 
     result = {
-        "schema": "minicpm5_hf_vapo_native_parity/v1",
+        "schema": "minicpm5_vapo_native_parity/v1",
         "model": args.model,
         "revision": args.revision,
         "max_new_tokens": args.max_new_tokens,

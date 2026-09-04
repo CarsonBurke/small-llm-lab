@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "benchmark": "equivalent_lora_actor_update",
+  "model_key": "qwen35",
+  "model": {
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "model_class": "Qwen3_5ForCausalLM",
+    "lora_targets": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj",
+      "in_proj_qkv",
+      "in_proj_z",
+      "in_proj_b",
+      "in_proj_a",
+      "out_proj"
+    ],
+    "lora_module_count": 186,
+    "hidden_size": 1024,
+    "vocab_size": 248320,
+    "num_hidden_layers": 24
+  },
+  "methodology": {
+    "base_dtype": "bfloat16",
+    "adapter_dtype": "float32",
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "gradient_checkpointing": "non_reentrant",
+    "attention_implementation": "sdpa",
+    "optimizer": "torch.optim.AdamW(fused=True)",
+    "learning_rate": 5e-05,
+    "logit_loss": "exact selected-token log-probability for response tokens",
+    "logit_chunk_tokens": 128,
+    "max_action_tokens": 4096,
+    "warmup_steps_per_length": 1,
+    "measure_steps_per_length": 3,
+    "seed": 1234
+  },
+  "parameters": {
+    "total": 763215680,
+    "frozen": 752393024,
+    "trainable": 10822656,
+    "frozen_bytes": 1504786048,
+    "frozen_mib": 1435.0758056640625,
+    "trainable_bytes": 43290624,
+    "trainable_mib": 41.28515625,
+    "buffer_bytes": 256,
+    "buffer_mib": 0.000244140625
+  },
+  "memory_after_model_load": {
+    "allocated_bytes": 1548099584,
+    "allocated_mib": 1476.3828125,
+    "reserved_bytes": 1568669696,
+    "reserved_mib": 1496.0
+  },
+  "environment": {
+    "python": "3.12.13",
+    "torch": "2.13.0+cu132",
+    "cuda_runtime": "13.2",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "fla_installed": true,
+    "flash_qla_installed": true,
+    "causal_conv1d_installed": false
+  },
+  "measurements": [
+    {
+      "sequence_length": 5120,
+      "batch_size": 1,
+      "action_tokens": 4096,
+      "median_step_seconds": 0.3569402940047439,
+      "step_seconds": [
+        0.3556981790170539,
+        0.35858419502619654,
+        0.3569402940047439
+      ],
+      "input_tokens_per_second": 14344.13566077231,
+      "action_tokens_per_second": 11475.308528617848,
+      "loss_last": 13.535327911376953,
+      "steady_allocated_bytes": 1702021120,
+      "steady_allocated_mib": 1623.173828125,
+      "steady_reserved_bytes": 1797259264,
+      "steady_reserved_mib": 1714.0,
+      "peak_allocated_bytes": 2642051584,
+      "peak_allocated_mib": 2519.65673828125,
+      "peak_working_bytes": 940030464,
+      "peak_working_mib": 896.48291015625,
+      "peak_reserved_bytes": 2797600768,
+      "peak_reserved_mib": 2668.0,
+      "final_allocated_bytes": 1702021120,
+      "final_allocated_mib": 1623.173828125,
+      "final_reserved_bytes": 2797600768,
+      "final_reserved_mib": 2668.0,
+      "optimizer_state_bytes": 86582736,
+      "optimizer_state_mib": 82.57173156738281
+    },
+    {
+      "sequence_length": 8192,
+      "batch_size": 1,
+      "action_tokens": 4096,
+      "median_step_seconds": 0.5635199960088357,
+      "step_seconds": [
+        0.5597077909915242,
+        0.5635199960088357,
+        0.564380482013803
+      ],
+      "input_tokens_per_second": 14537.194878656184,
+      "action_tokens_per_second": 7268.597439328092,
+      "loss_last": 12.857053756713867,
+      "steady_allocated_bytes": 1702045696,
+      "steady_allocated_mib": 1623.197265625,
+      "steady_reserved_bytes": 1797259264,
+      "steady_reserved_mib": 1714.0,
+      "peak_allocated_bytes": 3204620800,
+      "peak_allocated_mib": 3056.16455078125,
+      "peak_working_bytes": 1502575104,
+      "peak_working_mib": 1432.96728515625,
+      "peak_reserved_bytes": 3386900480,
+      "peak_reserved_mib": 3230.0,
+      "final_allocated_bytes": 1702045696,
+      "final_allocated_mib": 1623.197265625,
+      "final_reserved_bytes": 3386900480,
+      "final_reserved_mib": 3230.0,
+      "optimizer_state_bytes": 86582736,
+      "optimizer_state_mib": 82.57173156738281
+    }
+  ]
+}

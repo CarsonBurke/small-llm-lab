@@ -5838,3 +5838,61 @@ Failure modes to watch: embed undertraining (val plateau with healthy
 per-level CEs), gain instability at high-sigma levels (rgain_l0 drifting
 large), later-block input-distribution churn from the now-evolving
 propagated clean stream (per-level CE oscillation).
+
+## 2026-09-02: MiniCPM VAPO v6 — canonical NextLat with shared-resident replay
+
+The stopped step-203 MiniCPM5 VAPO checkpoint now has a consumable v6
+continuation at
+`postraining/runs/minicpm5_dapo_vapo_criticpretrain_fa4_batchedkv_8k_production/vapo_adapter_checkpoint_v6.pt`.
+The migration preserves the actor adapter, actor NextLat head, value head,
+completed-boundary cursor/RNG state, and every existing optimizer moment. It
+initializes a separate critic adapter and separate critic NextLat head; the
+writer remaps nonempty legacy NextLat optimizer moments into the actor's
+appended optimizer group.
+
+NextLat now matches `../NextLat`'s 1B configuration and objective: factor-1.6
+2D-to-4864 residual MLP, bias-free LayerNorm/Linear layers, GELU, horizon 2,
+SmoothL1 weight 1, and exact teacher-to-student categorical KL weight 1 through
+the detached LM head. Actor and critic each own an independent 46,074,880
+parameter dynamics head. Training samples 64 valid response states per
+optimizer minibatch, recursively evaluates both horizons without crossing
+packed-sequence boundaries, and computes the exact 130,560-way KL in
+recomputed row chunks rather than retaining vocabulary logits.
+
+Memory/residency changes:
+- Actor and critic LoRA/value/NextLat trainables are disjoint, while every
+  immutable critic backbone parameter aliases the actor's storage.
+- The fused rollout replica remains GPU-resident. Phase transitions release
+  only its 6+ GiB KV/CUDAGraph state; no policy is parked on CPU.
+- Rollout KV is an explicit compiled-decode input and FA4 consumes the passed
+  key/value tensors, so compiled code no longer owns evicted cache backing.
+- Replay is unpadded FA4 varlen packing under a sum-of-real-tokens budget,
+  with per-trajectory position resets and cumulative sequence lengths.
+- Exact actor behavior log-probabilities are captured during rollout. Replay
+  refresh therefore runs only the independent critic.
+- NextLat sampling selects one capacity-weighted replay shard and performs a
+  dense 64-row head call, avoiding 46M-parameter MLP launches on one or two
+  rows per shard.
+
+Production-shape proof is mlq job 4641, two full 4-prompt x 16-sample x
+4096-token cycles from step 203, with the 12,288-real-token replay budget.
+It completed step 205 and wrote a clean v6 checkpoint with no pending replay,
+340 actor optimizer states, 345 critic optimizer states, and independent actor
+and critic NextLat storage. At the matched 199,844-action first cycle:
+- phase sum: 94.93 s versus the prior 100.7 s total, 5.73% lower;
+- critic refresh: 7.86 -> 5.32 s and 44 -> 18 shards;
+- update: 30.62 -> 24.86 s and 45 -> 20 shards, despite now training both
+  canonical NextLat heads;
+- rollout: 60.23 -> 64.76 s, the explicit cost of capturing exact behavior
+  log-probabilities instead of performing a second actor replay.
+
+The second cycle completed in 76.87 s phase-sum (57.09 rollout, 2.63 critic
+refresh, 17.15 update) on 152,189 actions. Allocated VRAM after update was
+identical on both cycles at 14,304,929,792 bytes; second-cycle update peak was
+24,858,605,568 bytes. This is the cache-lifetime regression check: residency
+does not grow across cycles. Focused CPU coverage is 69 passing tests, including
+dense value/gradient parity for chunked KL, packed attention layout and replay
+subsets, exact rollout log-probabilities, shared-storage/disjoint-trainable
+invariants, checkpoint migration, and slow-rollout SDPA switching. Pyright is
+clean on the model, trainer, and migrator. An independent follow-up review
+found no remaining concrete defect.

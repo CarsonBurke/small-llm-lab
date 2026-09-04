@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "benchmark": "equivalent_lora_actor_update",
+  "model_key": "minicpm",
+  "model": {
+    "model_id": "openbmb/MiniCPM5-1B",
+    "revision": "87179e5c1f455ef22e6223592d2d61351b525bfc",
+    "model_class": "LlamaForCausalLM",
+    "lora_targets": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_module_count": 168,
+    "hidden_size": 1536,
+    "vocab_size": 130560,
+    "num_hidden_layers": 24
+  },
+  "methodology": {
+    "base_dtype": "bfloat16",
+    "adapter_dtype": "float32",
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "gradient_checkpointing": "non_reentrant",
+    "attention_implementation": "sdpa",
+    "optimizer": "torch.optim.AdamW(fused=True)",
+    "learning_rate": 5e-05,
+    "logit_loss": "exact selected-token log-probability for response tokens",
+    "logit_chunk_tokens": 128,
+    "max_action_tokens": 4096,
+    "warmup_steps_per_length": 1,
+    "measure_steps_per_length": 3,
+    "seed": 1234
+  },
+  "parameters": {
+    "total": 1091839488,
+    "frozen": 1080632832,
+    "trainable": 11206656,
+    "frozen_bytes": 2161265664,
+    "frozen_mib": 2061.1435546875,
+    "trainable_bytes": 44826624,
+    "trainable_mib": 42.75,
+    "buffer_bytes": 512,
+    "buffer_mib": 0.00048828125
+  },
+  "memory_after_model_load": {
+    "allocated_bytes": 2206093312,
+    "allocated_mib": 2103.89453125,
+    "reserved_bytes": 2222981120,
+    "reserved_mib": 2120.0
+  },
+  "environment": {
+    "python": "3.12.13",
+    "torch": "2.13.0+cu132",
+    "cuda_runtime": "13.2",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "fla_installed": true,
+    "flash_qla_installed": true,
+    "causal_conv1d_installed": false
+  },
+  "measurements": [
+    {
+      "sequence_length": 5120,
+      "batch_size": 1,
+      "action_tokens": 4096,
+      "median_step_seconds": 0.28673451699432917,
+      "step_seconds": [
+        0.2882727429969236,
+        0.28623119500116445,
+        0.28673451699432917
+      ],
+      "input_tokens_per_second": 17856.23877330841,
+      "action_tokens_per_second": 14284.99101864673,
+      "loss_last": 12.776758193969727,
+      "steady_allocated_bytes": 2363068416,
+      "steady_allocated_mib": 2253.59765625,
+      "steady_reserved_bytes": 2466250752,
+      "steady_reserved_mib": 2352.0,
+      "peak_allocated_bytes": 3232913408,
+      "peak_allocated_mib": 3083.146484375,
+      "peak_working_bytes": 869844992,
+      "peak_working_mib": 829.548828125,
+      "peak_reserved_bytes": 3330277376,
+      "peak_reserved_mib": 3176.0,
+      "final_allocated_bytes": 2363068416,
+      "final_allocated_mib": 2253.59765625,
+      "final_reserved_bytes": 3330277376,
+      "final_reserved_mib": 3176.0,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    },
+    {
+      "sequence_length": 8192,
+      "batch_size": 1,
+      "action_tokens": 4096,
+      "median_step_seconds": 0.5050587940204423,
+      "step_seconds": [
+        0.5050587940204423,
+        0.5046411110088229,
+        0.506034902005922
+      ],
+      "input_tokens_per_second": 16219.893796500113,
+      "action_tokens_per_second": 8109.946898250057,
+      "loss_last": 12.511327743530273,
+      "steady_allocated_bytes": 2363092992,
+      "steady_allocated_mib": 2253.62109375,
+      "steady_reserved_bytes": 2466250752,
+      "steady_reserved_mib": 2352.0,
+      "peak_allocated_bytes": 3754391552,
+      "peak_allocated_mib": 3580.466796875,
+      "peak_working_bytes": 1391298560,
+      "peak_working_mib": 1326.845703125,
+      "peak_reserved_bytes": 3831496704,
+      "peak_reserved_mib": 3654.0,
+      "final_allocated_bytes": 2363092992,
+      "final_allocated_mib": 2253.62109375,
+      "final_reserved_bytes": 3831496704,
+      "final_reserved_mib": 3654.0,
+      "optimizer_state_bytes": 89654592,
+      "optimizer_state_mib": 85.50128173828125
+    }
+  ]
+}

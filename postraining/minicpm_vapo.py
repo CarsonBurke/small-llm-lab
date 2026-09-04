@@ -1,9 +1,8 @@
-"""Memory-bounded Hugging Face policy support for standard-token VAPO.
+"""Memory-efficient MiniCPM5 policy support for standard-token VAPO.
 
-This path deliberately does not reuse latent-thought slots or nano backbone
-assumptions. MiniCPM5 stays a native ``LlamaForCausalLM`` with its own tokenizer,
-chat template, attention implementation, and KV cache. Only LoRA adapters and a
-small, separately optimized value head train.
+MiniCPM5 remains a native ``LlamaForCausalLM``. Actor and critic own disjoint
+LoRA adapters and heads while aliasing the immutable pretrained parameters.
+NextLat follows the reference residual dynamics model and objective geometry.
 """
 
 from __future__ import annotations
@@ -11,7 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 import math
-from typing import Any
+from importlib import import_module
+from typing import Any, cast
 import numpy as np
 from scipy.signal import lfilter
 
@@ -114,6 +114,181 @@ def inject_lora(model: nn.Module, config: LoRAConfig) -> tuple[str, ...]:
     return tuple(name for name, _ in replacements)
 
 
+def share_frozen_parameters_(
+    destination: nn.Module, source: nn.Module
+) -> tuple[str, ...]:
+    """Alias every immutable destination parameter to matching source storage."""
+
+    source_parameters = dict(source.named_parameters())
+    shared: list[str] = []
+    for name, parameter in list(destination.named_parameters()):
+        if parameter.requires_grad:
+            continue
+        source_parameter = source_parameters.get(name)
+        if source_parameter is None:
+            raise ValueError(f"shared backbone source is missing {name}")
+        if source_parameter.requires_grad:
+            raise ValueError(f"shared backbone source parameter is trainable: {name}")
+        if (
+            source_parameter.shape != parameter.shape
+            or source_parameter.dtype != parameter.dtype
+        ):
+            raise ValueError(f"shared backbone parameter differs: {name}")
+        if "." in name:
+            parent_name, child_name = name.rsplit(".", 1)
+            parent = destination.get_submodule(parent_name)
+        else:
+            child_name = name
+            parent = destination
+        setattr(parent, child_name, source_parameter)
+        shared.append(name)
+    if not shared:
+        raise ValueError("no immutable backbone parameters were shared")
+    return tuple(shared)
+
+
+def _packed_replay_mask(**_: Any) -> None:
+    return None
+
+
+@torch.compiler.disable
+def _packed_replay_attention(
+    module: nn.Module,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    **_: Any,
+) -> tuple[Tensor, None]:
+    if query.shape[0] != 1 or attention_mask is not None or dropout:
+        raise ValueError("packed replay attention requires one unpadded sequence batch")
+    attention = cast(Any, module)
+    boundaries = attention._packed_sequence_boundaries
+    if boundaries is None:
+        boundaries = tuple(int(item) for item in attention._packed_cu_seqlens.tolist())
+    outputs = []
+    for start, stop in zip(boundaries, boundaries[1:]):
+        query_slice = query[:, :, start:stop]
+        key_slice = key[:, :, start:stop]
+        value_slice = value[:, :, start:stop]
+        outputs.append(
+            F.scaled_dot_product_attention(
+                query_slice,
+                key_slice,
+                value_slice,
+                dropout_p=0.0,
+                is_causal=True,
+                scale=scaling,
+                enable_gqa=query_slice.shape[1] != key_slice.shape[1],
+            )
+        )
+    return torch.cat(outputs, dim=2).transpose(1, 2), None
+
+
+@torch.compiler.disable
+def _packed_replay_attention_fa4(
+    module: nn.Module,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    **_: Any,
+) -> tuple[Tensor, None]:
+    if query.shape[0] != 1 or attention_mask is not None or dropout:
+        raise ValueError("packed replay attention requires one unpadded sequence batch")
+    attention = cast(Any, module)
+    query_varlen = query.transpose(1, 2).squeeze(0).contiguous()
+    key_varlen = key.transpose(1, 2).squeeze(0).contiguous()
+    value_varlen = value.transpose(1, 2).squeeze(0).contiguous()
+    output = attention._packed_flash_varlen(
+        query_varlen,
+        key_varlen,
+        value_varlen,
+        cu_seqlens_q=attention._packed_cu_seqlens,
+        cu_seqlens_k=attention._packed_cu_seqlens,
+        max_seqlen_q=attention._packed_max_sequence_length,
+        max_seqlen_k=attention._packed_max_sequence_length,
+        softmax_scale=scaling,
+        causal=True,
+        pack_gqa=True,
+    )
+    if isinstance(output, tuple):
+        output = output[0]
+    return output.unsqueeze(0), None
+
+
+def enable_packed_replay_attention(
+    causal_lm: nn.Module, *, backend: str = "sdpa"
+) -> None:
+    """Install segmented SDPA or experimental FA4 for packed trajectories."""
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    implementations = {
+        "sdpa": ("parameter_golf_sdpa_packed_replay", _packed_replay_attention),
+        "fa4": ("parameter_golf_fa4_packed_replay", _packed_replay_attention_fa4),
+    }
+    if backend not in implementations:
+        raise ValueError(f"unsupported packed replay attention backend: {backend}")
+    implementation, attention_function = implementations[backend]
+    ALL_ATTENTION_FUNCTIONS.register(implementation, attention_function)
+    ALL_MASK_ATTENTION_FUNCTIONS.register(implementation, _packed_replay_mask)
+    flash_varlen = (
+        cast(Any, import_module("flash_attn.cute.interface")).flash_attn_varlen_func
+        if backend == "fa4"
+        else None
+    )
+    cast(Any, causal_lm).config._attn_implementation = implementation
+    cast(Any, causal_lm)._packed_replay_attention_implementation = implementation
+    for layer in cast(Any, causal_lm).model.layers:
+        attention = cast(Any, layer.self_attn)
+        attention._packed_flash_varlen = flash_varlen
+        attention._packed_cu_seqlens = None
+        attention._packed_sequence_boundaries = None
+        attention._packed_max_sequence_length = 0
+
+
+def use_packed_replay_attention(causal_lm: nn.Module, *, enabled: bool) -> None:
+    """Switch a prepared model between packed replay and ordinary SDPA."""
+    implementation = getattr(
+        causal_lm, "_packed_replay_attention_implementation", None
+    )
+    if not isinstance(implementation, str):
+        raise RuntimeError("packed replay attention was not installed")
+    cast(Any, causal_lm).config._attn_implementation = (
+        implementation if enabled else "sdpa"
+    )
+
+
+def merge_lora_for_inference(model: nn.Module) -> tuple[str, ...]:
+    """Fold every LoRA update into its frozen base weight and remove the wrappers."""
+
+    replacements = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, LoRALinear)
+    ]
+    with torch.no_grad():
+        for name, module in replacements:
+            if torch.count_nonzero(module.lora_b):
+                update = module.lora_b @ module.lora_a
+                module.base.weight.add_(
+                    update.to(module.base.weight.dtype), alpha=module.scaling
+                )
+            if "." in name:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                child_name = name
+                parent = model
+            setattr(parent, child_name, module.base)
+    return tuple(name for name, _ in replacements)
+
+
 def adapter_state_dict(model: nn.Module) -> dict[str, Tensor]:
     return {
         name: parameter.detach().cpu()
@@ -140,7 +315,7 @@ def load_adapter_state_dict(model: nn.Module, state: dict[str, Tensor]) -> None:
 
 
 class ValueHead(nn.Module):
-    """Independent critic over frozen actor features; no parameters are shared."""
+    """Scalar return readout owned exclusively by the critic."""
 
     def __init__(self, hidden_size: int, width: int = 256) -> None:
         super().__init__()
@@ -152,59 +327,58 @@ class ValueHead(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
+    def features(self, hidden: Tensor) -> Tensor:
+        return F.silu(self.input(self.norm(hidden.float())))
+
     def forward(self, hidden: Tensor) -> Tensor:
-        return self.output(F.silu(self.input(self.norm(hidden.float())))).squeeze(-1)
+        return self.output(self.features(hidden)).squeeze(-1)
 
-class NextLatDraftHead(nn.Module):
-    """Reference NextLat residual dynamics model over target hidden states."""
 
-    def __init__(
-        self,
-        hidden_size: int,
-        projection_factor: float = 1.6,
-    ) -> None:
+class NextLatAuxiliaryHead(nn.Module):
+    """Reference NextLat residual dynamics MLP."""
+
+    def __init__(self, hidden_size: int, projection_factor: float = 1.6) -> None:
         super().__init__()
-        if (
-            hidden_size < 1
-            or not math.isfinite(projection_factor)
-            or projection_factor <= 0
-        ):
-            raise ValueError("NextLat dimensions must be finite and positive")
-        input_size = 2 * hidden_size
-        width = 128 * round(projection_factor * input_size / 128)
+        if hidden_size < 1 or not math.isfinite(projection_factor) or projection_factor <= 0:
+            raise ValueError("NextLat dimensions must be positive")
+        input_size = hidden_size * 2
+        projected_size = max(
+            128, 128 * round(projection_factor * input_size / 128)
+        )
         self.hidden_size = hidden_size
         self.projection_factor = projection_factor
-        self.norm = nn.RMSNorm(input_size, eps=1e-6, dtype=torch.float32)
+        self.norm = nn.LayerNorm(
+            input_size,
+            eps=1e-5,
+            elementwise_affine=True,
+            bias=False,
+            dtype=torch.float32,
+        )
         self.mlp = nn.Sequential(
-            nn.Linear(input_size, width, dtype=torch.float32),
+            nn.Linear(input_size, projected_size, bias=False, dtype=torch.float32),
             nn.GELU(),
-            nn.Linear(width, width, dtype=torch.float32),
+            nn.Linear(projected_size, projected_size, bias=False, dtype=torch.float32),
             nn.GELU(),
-            nn.Linear(width, hidden_size, dtype=torch.float32),
+            nn.Linear(projected_size, hidden_size, bias=False, dtype=torch.float32),
         )
         for module in self.mlp:
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
 
     def forward(self, hidden: Tensor, next_token_embedding: Tensor) -> Tensor:
-        inputs = torch.cat((next_token_embedding, hidden), dim=-1)
-        delta = self.mlp(self.norm(inputs.float()))
+        combined = torch.cat((next_token_embedding.float(), hidden.float()), dim=-1)
+        delta = self.mlp(self.norm(combined))
         return hidden + delta.to(hidden.dtype)
 
 
-
-
 class MiniCPMVAPOPolicy(nn.Module):
-    """Native MiniCPM causal LM plus LoRA actor and separate value head."""
+    """MiniCPM actor with its own LoRA and NextLat dynamics model."""
 
     def __init__(
         self,
         causal_lm: Any,
         lora_config: LoRAConfig,
         *,
-        critic_width: int = 256,
         nextlat_projection_factor: float = 1.6,
     ) -> None:
         super().__init__()
@@ -219,9 +393,8 @@ class MiniCPMVAPOPolicy(nn.Module):
             )
         self.lora_config = lora_config
         self.lora_modules = inject_lora(causal_lm, lora_config)
-        self.critic = ValueHead(int(config.hidden_size), critic_width)
         self.nextlat_projection_factor = nextlat_projection_factor
-        self.nextlat_head = NextLatDraftHead(
+        self.nextlat_head = NextLatAuxiliaryHead(
             int(config.hidden_size), nextlat_projection_factor
         )
         self.model_id = MINICPM5_MODEL_ID
@@ -236,7 +409,6 @@ class MiniCPMVAPOPolicy(nn.Module):
         revision: str = MINICPM5_REVISION,
         device: torch.device,
         lora_config: LoRAConfig,
-        critic_width: int = 256,
         nextlat_projection_factor: float = 1.6,
         gradient_checkpointing: bool = True,
     ) -> tuple["MiniCPMVAPOPolicy", Any]:
@@ -255,7 +427,6 @@ class MiniCPMVAPOPolicy(nn.Module):
         policy = cls(
             causal_lm,
             lora_config,
-            critic_width=critic_width,
             nextlat_projection_factor=nextlat_projection_factor,
         ).to(device)
         policy.model_id = model_id
@@ -290,13 +461,26 @@ class MiniCPMVAPOPolicy(nn.Module):
     def nextlat_hidden(self, hidden: Tensor, token_ids: Tensor) -> Tensor:
         return self.nextlat_head(hidden, self.token_embeddings(token_ids))
 
-
     def replay_hidden(
-        self, input_ids: Tensor, attention_mask: Tensor | None
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        position_ids: Tensor | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_sequence_length: int = 0,
     ) -> Tensor:
+        if cu_seqlens is not None:
+            boundaries = tuple(int(item) for item in cu_seqlens.tolist())
+            for layer in self.causal_lm.model.layers:
+                attention = cast(Any, layer.self_attn)
+                attention._packed_cu_seqlens = cu_seqlens
+                attention._packed_max_sequence_length = max_sequence_length
+                attention._packed_sequence_boundaries = boundaries
         outputs = self.causal_lm.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             use_cache=False,
             return_dict=True,
         )
@@ -325,20 +509,156 @@ class MiniCPMVAPOPolicy(nn.Module):
     def logits(self, hidden: Tensor) -> Tensor:
         return self.causal_lm.lm_head(hidden)
 
+    def rollout_values(self, hidden: Tensor) -> Tensor:
+        """Value placeholder; the independent critic refreshes returns post-rollout."""
+        return torch.zeros(hidden.shape[:-1], dtype=torch.float32, device=hidden.device)
+
+
     def checkpoint_payload(self) -> dict[str, Any]:
         return {
-            "schema": "minicpm5_hf_vapo_adapter/v4",
             "model_id": self.model_id,
             "revision": self.revision,
             "lora_config": asdict(self.lora_config),
             "lora_modules": list(self.lora_modules),
             "nextlat_projection_factor": self.nextlat_projection_factor,
             "adapter": adapter_state_dict(self.causal_lm),
-            "critic": {
+            "nextlat": {
                 name: tensor.detach().cpu()
-                for name, tensor in self.critic.state_dict().items()
+                for name, tensor in self.nextlat_head.state_dict().items()
             },
-            "nextlat_head": {
+        }
+
+
+class MiniCPMVAPOCritic(nn.Module):
+    """Independent critic adapters over actor-shared immutable base weights."""
+
+    def __init__(
+        self,
+        causal_lm: Any,
+        lora_config: LoRAConfig,
+        *,
+        critic_width: int = 256,
+        nextlat_projection_factor: float = 1.6,
+    ) -> None:
+        super().__init__()
+        self.causal_lm = causal_lm
+        config: Any = causal_lm.config
+        if getattr(config, "model_type", None) != "llama":
+            raise ValueError("MiniCPM critic requires a standard LlamaForCausalLM")
+        if not isinstance(causal_lm.lm_head, nn.Linear):
+            raise TypeError("MiniCPM critic output head layout differs")
+        self.lora_config = lora_config
+        self.lora_modules = inject_lora(causal_lm, lora_config)
+        self.value_head = ValueHead(int(config.hidden_size), critic_width)
+        self.nextlat_projection_factor = nextlat_projection_factor
+        self.nextlat_head = NextLatAuxiliaryHead(
+            int(config.hidden_size), nextlat_projection_factor
+        )
+        self.shared_frozen_parameters: tuple[str, ...] = ()
+        self.model_id = MINICPM5_MODEL_ID
+        self.revision = MINICPM5_REVISION
+        self.causal_lm.config.use_cache = False
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        *,
+        model_id: str = MINICPM5_MODEL_ID,
+        revision: str = MINICPM5_REVISION,
+        device: torch.device,
+        lora_config: LoRAConfig,
+        critic_width: int = 256,
+        nextlat_projection_factor: float = 1.6,
+        gradient_checkpointing: bool = True,
+        shared_frozen_source: nn.Module | None = None,
+    ) -> "MiniCPMVAPOCritic":
+        prepare_text_only_transformers_runtime()
+        from transformers import AutoModelForCausalLM
+
+        loaded: Any = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            revision=revision,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            low_cpu_mem_usage=True,
+        )
+        critic = cls(
+            loaded,
+            lora_config,
+            critic_width=critic_width,
+            nextlat_projection_factor=nextlat_projection_factor,
+        )
+        if shared_frozen_source is not None:
+            critic.shared_frozen_parameters = share_frozen_parameters_(
+                critic.causal_lm, shared_frozen_source
+            )
+        critic.to(device)
+        critic.model_id = model_id
+        critic.revision = revision
+        if gradient_checkpointing:
+            critic.causal_lm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        return critic
+
+    def backbone_parameters(self) -> Iterable[nn.Parameter]:
+        return (
+            parameter
+            for name, parameter in self.causal_lm.named_parameters()
+            if name.endswith(("lora_a", "lora_b")) and parameter.requires_grad
+        )
+
+    @property
+    def lm_head_weight(self) -> Tensor:
+        weight = self.causal_lm.lm_head.weight
+        if weight.requires_grad:
+            raise RuntimeError("the critic lexical grounding head must remain frozen")
+        return weight
+
+    def replay_hidden(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        position_ids: Tensor | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_sequence_length: int = 0,
+    ) -> Tensor:
+        if cu_seqlens is not None:
+            boundaries = tuple(int(item) for item in cu_seqlens.tolist())
+            for layer in self.causal_lm.model.layers:
+                attention = cast(Any, layer.self_attn)
+                attention._packed_cu_seqlens = cu_seqlens
+                attention._packed_max_sequence_length = max_sequence_length
+                attention._packed_sequence_boundaries = boundaries
+        outputs = self.causal_lm.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            return_dict=True,
+        )
+        return outputs.last_hidden_state
+
+    def token_embeddings(self, token_ids: Tensor) -> Tensor:
+        return self.causal_lm.get_input_embeddings()(token_ids)
+
+    def values(self, hidden: Tensor) -> Tensor:
+        return self.value_head(hidden)
+
+    def checkpoint_payload(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "revision": self.revision,
+            "lora_config": asdict(self.lora_config),
+            "lora_modules": list(self.lora_modules),
+            "nextlat_projection_factor": self.nextlat_projection_factor,
+            "adapter": adapter_state_dict(self.causal_lm),
+            "value_head": {
+                name: tensor.detach().cpu()
+                for name, tensor in self.value_head.state_dict().items()
+            },
+            "nextlat": {
                 name: tensor.detach().cpu()
                 for name, tensor in self.nextlat_head.state_dict().items()
             },
@@ -524,7 +844,12 @@ def dense_top_p_probabilities(
     temperature: float,
     top_p: float,
 ) -> Tensor:
-    """Materialize the exact deterministic nucleus distribution for coupling."""
+    """Materialize an exact nucleus distribution with adaptive top-k search.
+
+    The top-k search only locates the boundary logit. Membership is then
+    reconstructed over the full vocabulary, including ascending-token-id tie
+    handling, so the result exactly matches :func:`_nucleus_membership`.
+    """
     if logits.ndim != 2:
         raise ValueError("sampling logits must be [batch, vocabulary]")
     if not math.isfinite(temperature) or temperature <= 0:
@@ -532,24 +857,48 @@ def dense_top_p_probabilities(
     if not 0 < top_p <= 1:
         raise ValueError("top_p must lie in (0, 1]")
     scaled = logits.float().div(temperature)
+    probabilities = scaled.softmax(dim=-1)
     if top_p == 1.0:
-        return scaled.softmax(dim=-1)
-    sorted_logits, sorted_ids = torch.sort(
-        scaled,
-        dim=-1,
-        descending=True,
-        stable=True,
+        return probabilities
+
+    vocabulary = scaled.shape[1]
+    search_width = min(256, vocabulary)
+    while True:
+        top_logits, top_ids = torch.topk(
+            scaled, search_width, dim=-1, sorted=True
+        )
+        top_probabilities = probabilities.gather(1, top_ids)
+        cumulative = top_probabilities.cumsum(dim=-1)
+        if bool((cumulative[:, -1] >= top_p).all()):
+            break
+        if search_width == vocabulary:
+            raise RuntimeError("top-p boundary search failed")
+        search_width = min(2 * search_width, vocabulary)
+
+    boundary_indices = (cumulative < top_p).sum(dim=-1).clamp_max(
+        search_width - 1
     )
-    sorted_probabilities = sorted_logits.softmax(dim=-1)
-    preceding_mass = (
-        sorted_probabilities.cumsum(dim=-1) - sorted_probabilities
+    boundary_logits = top_logits.gather(
+        1, boundary_indices[:, None]
+    ).squeeze(1)
+    strictly_higher = scaled > boundary_logits[:, None]
+    equal_boundary = scaled == boundary_logits[:, None]
+    higher_mass = torch.where(
+        strictly_higher, probabilities, torch.zeros_like(probabilities)
+    ).sum(dim=-1)
+    boundary_probability = top_probabilities.gather(
+        1, boundary_indices[:, None]
+    ).squeeze(1)
+    needed_ties = torch.ceil(
+        (top_p - higher_mass).clamp_min(0.0)
+        / boundary_probability.clamp_min(torch.finfo(torch.float32).tiny)
+    ).long().clamp_min_(1)
+    tie_rank = equal_boundary.long().cumsum(dim=-1)
+    membership = strictly_higher | (
+        equal_boundary & (tie_rank <= needed_ties[:, None])
     )
-    sorted_probabilities.masked_fill_(preceding_mass >= top_p, 0.0)
-    sorted_probabilities.div_(
-        sorted_probabilities.sum(dim=-1, keepdim=True)
-    )
-    probabilities = torch.zeros_like(sorted_probabilities)
-    probabilities.scatter_(1, sorted_ids, sorted_probabilities)
+    probabilities.masked_fill_(~membership, 0.0)
+    probabilities.div_(probabilities.sum(dim=-1, keepdim=True))
     return probabilities
 
 
@@ -578,21 +927,22 @@ def maximal_coupling_verify(
         < (target / draft.clamp_min(1e-30)).clamp_max(1.0)
     ) & active
     rejected = active & ~accepted
-    committed = proposals.clone()
-    if bool(rejected.any()):
-        residual = (
-            target_probabilities[rejected] - draft_probabilities[rejected]
-        ).clamp_min_(0.0)
-        residual_mass = residual.sum(dim=-1, keepdim=True)
-        fallback = residual_mass.squeeze(1) <= 0
-        residual.div_(residual_mass.clamp_min(1e-30))
-        if bool(fallback.any()):
-            residual[fallback] = target_probabilities[rejected][fallback]
-        committed[rejected] = torch.multinomial(
-            residual,
-            1,
-            generator=generator,
-        ).squeeze(1)
+    residual = (
+        target_probabilities - draft_probabilities
+    ).clamp_min_(0.0)
+    residual_mass = residual.sum(dim=-1, keepdim=True)
+    residual.div_(residual_mass.clamp_min(1e-30))
+    residual = torch.where(
+        residual_mass <= 0,
+        target_probabilities,
+        residual,
+    )
+    corrections = torch.multinomial(
+        residual,
+        1,
+        generator=generator,
+    ).squeeze(1)
+    committed = torch.where(rejected, corrections, proposals)
     return committed, accepted
 
 def _precompute_advantages(old_values: Tensor, correct: bool) -> Tensor:
@@ -679,6 +1029,8 @@ class TrajectoryRecord:
         )
 
 
+
+
 def replay_storage_bytes(records: Sequence[TrajectoryRecord]) -> int:
     return sum(record.storage_bytes for record in records)
 
@@ -690,15 +1042,18 @@ def plan_replay_microbatches(
     token_budget: int,
     max_trajectories: int,
 ) -> list[tuple[int, ...]]:
-    """Length-bucket every trajectory exactly once under a padded-token budget."""
+    """First-fit-decreasing packing under a real-token activation budget."""
 
     if token_budget < 1 or max_trajectories < 1:
         raise ValueError("replay limits must be positive")
-    if sorted(order) != list(range(len(records))):
-        raise ValueError("replay order must be a permutation of every trajectory")
+    if not order or len(set(order)) != len(order) or any(
+        index < 0 or index >= len(records) for index in order
+    ):
+        raise ValueError("replay order must contain unique valid trajectory indices")
     oversized = [
-        index for index, record in enumerate(records)
-        if record.input_length > token_budget
+        index
+        for index in order
+        if records[index].input_length > token_budget
     ]
     if oversized:
         largest = max(records[index].input_length for index in oversized)
@@ -706,32 +1061,37 @@ def plan_replay_microbatches(
             f"replay trajectory length {largest} exceeds token budget "
             f"{token_budget}"
         )
-    remaining = sorted(order, key=lambda index: records[index].input_length, reverse=True)
-    plan: list[tuple[int, ...]] = []
-    cursor = 0
-    while cursor < len(remaining):
-        batch = [remaining[cursor]]
-        cursor += 1
-        maximum = records[batch[0]].input_length
-        while cursor < len(remaining) and len(batch) < max_trajectories:
-            candidate = remaining[cursor]
-            candidate_maximum = max(maximum, records[candidate].input_length)
-            if candidate_maximum * (len(batch) + 1) > token_budget:
+    plan: list[list[int]] = []
+    token_counts: list[int] = []
+    for index in sorted(
+        order, key=lambda item: records[item].input_length, reverse=True
+    ):
+        length = records[index].input_length
+        for shard_index, (shard, count) in enumerate(
+            zip(plan, token_counts)
+        ):
+            if len(shard) < max_trajectories and count + length <= token_budget:
+                shard.append(index)
+                token_counts[shard_index] += length
                 break
-            batch.append(candidate)
-            maximum = candidate_maximum
-            cursor += 1
-        plan.append(tuple(batch))
-    flattened = [index for microbatch in plan for index in microbatch]
-    if sorted(flattened) != list(range(len(records))):
+        else:
+            plan.append([index])
+            token_counts.append(length)
+    packed = [tuple(shard) for shard in plan]
+    flattened = [index for microbatch in packed for index in microbatch]
+    if sorted(flattened) != sorted(order):
         raise RuntimeError("replay planner lost or duplicated a trajectory")
-    return plan
+    return packed
 
 
 @dataclass
 class ReplayMicrobatch:
     input_ids: Tensor
     attention_mask: Tensor | None
+    position_ids: Tensor
+    sequence_ids: Tensor
+    cu_seqlens: Tensor
+    max_sequence_length: int
     action_batch_indices: Tensor
     action_positions: Tensor
     response_state_mask: Tensor
@@ -739,7 +1099,6 @@ class ReplayMicrobatch:
     old_logprobs: Tensor
     advantages: Tensor
     value_targets: Tensor
-    positive_weights: Tensor
 
     @property
     def action_count(self) -> int:
@@ -753,43 +1112,40 @@ def collate_replay_microbatch(
     indices: Sequence[int],
     *,
     pad_token_id: int,
-    correct_denominator: int,
     device: torch.device,
 ) -> ReplayMicrobatch:
+    del pad_token_id
     if not indices:
         raise ValueError("cannot collate an empty replay microbatch")
     selected = [records[index] for index in indices]
-    maximum = max(record.input_length for record in selected)
+    lengths = [record.input_length for record in selected]
+    total = sum(lengths)
+    maximum = max(lengths)
     pin = device.type == "cuda"
-    input_ids = torch.full(
-        (len(selected), maximum),
-        pad_token_id,
-        dtype=torch.long,
-        pin_memory=pin,
-    )
-    attention_mask = torch.zeros(
-        (len(selected), maximum), dtype=torch.bool, pin_memory=pin
-    )
+    input_ids = torch.empty((1, total), dtype=torch.long, pin_memory=pin)
+    position_ids = torch.empty_like(input_ids)
+    sequence_ids = torch.empty_like(input_ids)
     response_state_mask = torch.zeros(
-        (len(selected), maximum), dtype=torch.bool, pin_memory=pin
+        (1, total), dtype=torch.bool, pin_memory=pin
     )
-    batch_indices: list[Tensor] = []
     positions: list[Tensor] = []
     targets: list[Tensor] = []
     old_logprobs: list[Tensor] = []
     advantages: list[Tensor] = []
     value_targets: list[Tensor] = []
-    positive_weights: list[Tensor] = []
+    boundaries = [0]
+    offset = 0
 
-    for row, record in enumerate(selected):
+    for sequence, record in enumerate(selected):
         length = record.input_length
-        input_ids[row, :length].copy_(record.token_ids[:-1])
-        attention_mask[row, :length] = True
-        action_start = record.prompt_length - 1
+        stop = offset + length
+        input_ids[0, offset:stop].copy_(record.token_ids[:-1])
+        position_ids[0, offset:stop].copy_(torch.arange(length))
+        sequence_ids[0, offset:stop] = sequence
+        action_start = offset + record.prompt_length - 1
         action_stop = action_start + record.response_length
-        batch_indices.append(torch.full((record.response_length,), row, dtype=torch.long))
         positions.append(torch.arange(action_start, action_stop, dtype=torch.long))
-        response_state_mask[row, action_start:action_stop] = True
+        response_state_mask[0, action_start:action_stop] = True
         targets.append(record.token_ids[record.prompt_length:].long())
         old_logprobs.append(record.old_logprobs)
         advantages.append(record.advantages)
@@ -800,31 +1156,28 @@ def collate_replay_microbatch(
                 dtype=torch.float32,
             )
         )
-        positive_weight = (
-            1.0 / (correct_denominator * record.response_length)
-            if record.correct and correct_denominator
-            else 0.0
-        )
-        positive_weights.append(
-            torch.full((record.response_length,), positive_weight, dtype=torch.float32)
-        )
-
-    all_unpadded = all(record.input_length == maximum for record in selected)
+        offset = stop
+        boundaries.append(offset)
 
     def transfer(tensor: Tensor) -> Tensor:
         return tensor.to(device, non_blocking=pin)
 
     return ReplayMicrobatch(
         input_ids=transfer(input_ids),
-        attention_mask=None if all_unpadded else transfer(attention_mask),
-        action_batch_indices=transfer(torch.cat(batch_indices)),
+        attention_mask=None,
+        position_ids=transfer(position_ids),
+        sequence_ids=transfer(sequence_ids),
+        cu_seqlens=transfer(torch.tensor(boundaries, dtype=torch.int32)),
+        max_sequence_length=maximum,
+        action_batch_indices=transfer(
+            torch.zeros(sum(record.response_length for record in selected), dtype=torch.long)
+        ),
         action_positions=transfer(torch.cat(positions)),
         response_state_mask=transfer(response_state_mask),
         targets=transfer(torch.cat(targets)),
         old_logprobs=transfer(torch.cat(old_logprobs)),
         advantages=transfer(torch.cat(advantages)),
         value_targets=transfer(torch.cat(value_targets)),
-        positive_weights=transfer(torch.cat(positive_weights)),
     )
 
 

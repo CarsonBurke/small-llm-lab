@@ -7,6 +7,7 @@ tensorboard
 transformers>=5.6.2,<6
 huggingface-hub
 kernels
+flash-attn-4==4.0.0b28
 setuptools
 typing-extensions==4.15.0
 datasets
