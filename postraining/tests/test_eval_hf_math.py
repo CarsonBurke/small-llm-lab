@@ -176,14 +176,17 @@ def test_vapo_adapter_evaluation_loads_bf16_policy_weights(tmp_path) -> None:
     torch.save(
         {
             "policy": {
-                "model_id": "model",
-                "revision": "revision",
-                "lora_config": {
-                    "rank": config.rank,
-                    "alpha": config.alpha,
-                    "targets": config.targets,
+                "schema": "minicpm5_vapo_adapter/v6",
+                "actor": {
+                    "model_id": "model",
+                    "revision": "revision",
+                    "lora_config": {
+                        "rank": config.rank,
+                        "alpha": config.alpha,
+                        "targets": config.targets,
+                    },
+                    "adapter": adapter_state_dict(source),
                 },
-                "adapter": adapter_state_dict(source),
             },
             "step": 7,
             "args": {"thinking": True},

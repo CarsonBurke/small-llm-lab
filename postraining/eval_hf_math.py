@@ -1097,7 +1097,12 @@ def load_vapo_adapter_for_evaluation(
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=False
     )
-    policy = checkpoint["policy"]
+    payload = checkpoint["policy"]
+    policy = (
+        payload["actor"]
+        if payload.get("schema") == "minicpm5_vapo_adapter/v6"
+        else payload
+    )
     if policy["model_id"] != model_id or policy["revision"] != revision:
         raise ValueError("adapter base checkpoint differs from evaluation model")
     config = dict(policy["lora_config"])

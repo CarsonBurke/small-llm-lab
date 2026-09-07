@@ -164,11 +164,13 @@ def _preflight_checkpoint(tmp_path):
         seed=7,
         lora_rank=2,
         lora_alpha=4.0,
+        lora_initialization="standard",
     )
     expected_lora = {
         "rank": 2,
         "alpha": 4.0,
         "targets": tuple(DEFAULT_LORA_TARGETS),
+        "initialization": "standard",
     }
     checkpoint["policy"]["actor"]["lora_config"] = expected_lora
     checkpoint["policy"]["critic"]["lora_config"] = expected_lora.copy()
@@ -202,6 +204,28 @@ def test_preflight_resolves_additional_steps_and_builds_queue_command(tmp_path) 
     assert "--name balanced-continuation" in report["queue_command"]
     assert "--temperature 0.8" in report["queue_command"]
     assert "--seed 7" in report["queue_command"]
+
+
+
+
+def test_preflight_accepts_nora_initialization_metadata(tmp_path) -> None:
+    checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
+    checkpoint["args"]["lora_initialization"] = "nora"
+    for side in ("actor", "critic"):
+        checkpoint["policy"][side]["lora_config"]["initialization"] = "nora"
+
+    report = preflight.inspect_continuation(
+        checkpoint,
+        resume_path=resume_path,
+        output_path=tmp_path / "continuation",
+        data_path=data_path,
+        target_steps=None,
+        additional_steps=10,
+        job_name="nora continuation",
+        time_limit="1h",
+    )
+
+    assert report["remaining_actor_updates"] == 10
 
 
 def test_preflight_rejects_noop_target_before_launch(tmp_path) -> None:

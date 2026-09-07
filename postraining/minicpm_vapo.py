@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 import math
 from importlib import import_module
-from typing import Any, cast
+from typing import Any, Literal, cast
 import numpy as np
 from scipy.signal import lfilter
 
@@ -42,12 +42,15 @@ class LoRAConfig:
     rank: int = 16
     alpha: float = 32.0
     targets: tuple[str, ...] = DEFAULT_LORA_TARGETS
+    initialization: Literal["standard", "nora"] = "nora"
 
     def __post_init__(self) -> None:
         if self.rank < 1:
             raise ValueError("LoRA rank must be positive")
         if not math.isfinite(self.alpha) or self.alpha <= 0:
             raise ValueError("LoRA alpha must be finite and positive")
+        if self.initialization not in {"standard", "nora"}:
+            raise ValueError("LoRA initialization must be standard or nora")
         if not self.targets or len(set(self.targets)) != len(self.targets):
             raise ValueError("LoRA targets must be nonempty and unique")
 
@@ -72,6 +75,14 @@ class LoRALinear(nn.Module):
             torch.zeros(base.out_features, config.rank, dtype=torch.float32)
         )
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
+        if config.initialization == "nora":
+            with torch.no_grad():
+                column_norms = torch.linalg.vector_norm(
+                    self.lora_a, dim=0, keepdim=True
+                )
+                self.lora_a.div_(
+                    column_norms.clamp_min(torch.finfo(self.lora_a.dtype).eps)
+                )
         for parameter in self.base.parameters():
             parameter.requires_grad_(False)
 
@@ -468,10 +479,13 @@ class MiniCPMVAPOPolicy(nn.Module):
         *,
         position_ids: Tensor | None = None,
         cu_seqlens: Tensor | None = None,
+        sequence_boundaries: tuple[int, ...] | None = None,
         max_sequence_length: int = 0,
     ) -> Tensor:
         if cu_seqlens is not None:
-            boundaries = tuple(int(item) for item in cu_seqlens.tolist())
+            boundaries = sequence_boundaries
+            if boundaries is None:
+                boundaries = tuple(int(item) for item in cu_seqlens.tolist())
             for layer in self.causal_lm.model.layers:
                 attention = cast(Any, layer.self_attn)
                 attention._packed_cu_seqlens = cu_seqlens
@@ -622,10 +636,13 @@ class MiniCPMVAPOCritic(nn.Module):
         *,
         position_ids: Tensor | None = None,
         cu_seqlens: Tensor | None = None,
+        sequence_boundaries: tuple[int, ...] | None = None,
         max_sequence_length: int = 0,
     ) -> Tensor:
         if cu_seqlens is not None:
-            boundaries = tuple(int(item) for item in cu_seqlens.tolist())
+            boundaries = sequence_boundaries
+            if boundaries is None:
+                boundaries = tuple(int(item) for item in cu_seqlens.tolist())
             for layer in self.causal_lm.model.layers:
                 attention = cast(Any, layer.self_attn)
                 attention._packed_cu_seqlens = cu_seqlens
@@ -1091,6 +1108,7 @@ class ReplayMicrobatch:
     position_ids: Tensor
     sequence_ids: Tensor
     cu_seqlens: Tensor
+    sequence_boundaries: tuple[int, ...]
     max_sequence_length: int
     action_batch_indices: Tensor
     action_positions: Tensor
@@ -1168,6 +1186,7 @@ def collate_replay_microbatch(
         position_ids=transfer(position_ids),
         sequence_ids=transfer(sequence_ids),
         cu_seqlens=transfer(torch.tensor(boundaries, dtype=torch.int32)),
+        sequence_boundaries=tuple(boundaries),
         max_sequence_length=maximum,
         action_batch_indices=transfer(
             torch.zeros(sum(record.response_length for record in selected), dtype=torch.long)

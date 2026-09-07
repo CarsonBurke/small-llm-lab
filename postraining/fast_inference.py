@@ -23,6 +23,67 @@ from postraining.minicpm_vapo import (
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 
+ROLLOUT_WORKSPACE_RESERVE_BYTES = 1 << 30
+
+
+class _FrozenParameterStash:
+    """Keep immutable training weights on the host while rollout KV is resident."""
+
+    def __init__(self, module: nn.Module) -> None:
+        self.parameters = tuple(
+            parameter for parameter in module.parameters() if not parameter.requires_grad
+        )
+        if not self.parameters:
+            raise ValueError("rollout source has no frozen parameters to offload")
+        devices = {parameter.device for parameter in self.parameters}
+        if len(devices) != 1:
+            raise ValueError("rollout source frozen parameters span multiple devices")
+        self.device = devices.pop()
+        self.host_backing: tuple[Tensor, ...] | None = None
+        self.resident = True
+        self.bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in self.parameters
+        )
+
+    def restore(self) -> None:
+        if self.resident:
+            return
+        if self.host_backing is None:
+            raise RuntimeError("frozen rollout source has no host backing")
+        for parameter, host_value in zip(
+            self.parameters, self.host_backing, strict=True
+        ):
+            parameter.data = host_value.to(self.device)
+        self.resident = True
+
+    def offload(self) -> None:
+        if not self.resident:
+            return
+        if self.host_backing is None:
+            self.host_backing = tuple(
+                parameter.detach().to("cpu", copy=True)
+                for parameter in self.parameters
+            )
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
+        for parameter, host_value in zip(
+            self.parameters, self.host_backing, strict=True
+        ):
+            parameter.data = host_value
+        self.resident = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _cuda_allocatable_bytes(device: torch.device) -> int:
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    reclaimable_bytes = max(
+        torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device),
+        0,
+    )
+    return free_bytes + reclaimable_bytes
+
 
 class _FusedFirstProjection(nn.Module):
     fused: nn.Module
@@ -231,7 +292,7 @@ class _CompactStaticLayer(StaticLayer):
         self.batch_size, self.num_heads = key_states.shape[:2]
         self.k_head_dim = key_states.shape[-1]
         self.v_head_dim = value_states.shape[-1]
-        self.key_backing = torch.zeros(
+        self.key_backing = torch.empty(
             (
                 self.batch_size,
                 self.max_cache_len,
@@ -241,7 +302,7 @@ class _CompactStaticLayer(StaticLayer):
             dtype=self.dtype,
             device=self.device,
         )
-        self.value_backing = torch.zeros(
+        self.value_backing = torch.empty(
             (
                 self.batch_size,
                 self.max_cache_len,
@@ -256,6 +317,10 @@ class _CompactStaticLayer(StaticLayer):
         self.cumulative_length = self.cumulative_length.to(self.device)
         self.is_initialized = True
 
+    def reset(self) -> None:
+        """Invalidate by length; stale KV beyond each sequence is never read."""
+        self.cumulative_length.zero_()
+
     def update(
         self,
         key_states: Tensor,
@@ -268,18 +333,18 @@ class _CompactStaticLayer(StaticLayer):
         width = key_states.shape[-2]
         if width > 1:
             valid = self.prefill_mask[:, :width]
-            compact_positions = valid.cumsum(dim=1).sub(1).clamp_min(0)
-            key_source = key_states.transpose(1, 2) * valid[:, :, None, None]
-            value_source = value_states.transpose(1, 2) * valid[:, :, None, None]
-            key_indices = compact_positions[:, :, None, None].expand_as(key_source)
-            value_indices = compact_positions[:, :, None, None].expand_as(
-                value_source
+            compact_positions = valid.cumsum(dim=1).sub(1)
+            rows, source_positions = valid.nonzero(as_tuple=True)
+            destination_positions = compact_positions[rows, source_positions]
+            self.key_backing.index_put_(
+                (rows, destination_positions),
+                key_states.transpose(1, 2)[rows, source_positions],
             )
-            self.key_backing.zero_().scatter_add_(1, key_indices, key_source)
-            self.value_backing.zero_().scatter_add_(
-                1, value_indices, value_source
+            self.value_backing.index_put_(
+                (rows, destination_positions),
+                value_states.transpose(1, 2)[rows, source_positions],
             )
-            self.cumulative_length.fill_(width)
+            self.cumulative_length.copy_(self.sequence_lengths.max())
             return key_states, value_states
 
         safe_lengths = self.sequence_lengths.clamp_max(self.max_cache_len - 1)
@@ -816,7 +881,7 @@ class FastTrainingDecodeStats:
 
 @dataclass(frozen=True)
 class PromptPrefixBank:
-    """Host-resident prompt KV reused when continuous lanes are refilled."""
+    """Prompt KV reused when continuous lanes are refilled."""
 
     lengths: Tensor
     logits: Tensor
@@ -831,7 +896,11 @@ class PromptPrefixBank:
 
 @dataclass(frozen=True)
 class ContinuousTrainingGeneration:
-    """Completed response rows in stable prompt-major/sample-major order."""
+    """Completed rows in stable prompt-major/sample-major order.
+
+    ``logprobs`` contains shape-compatible zeros because training refreshes
+    exact behavior statistics from replay before PPO.
+    """
 
     responses: tuple[Tensor, ...]
     logprobs: tuple[Tensor, ...]
@@ -849,6 +918,13 @@ class ContinuousTrainingGeneration:
             return 0.0
         return self.useful_tokens / self.capacity_row_steps
 
+def _retire_inactive_flash_rows_(
+    flash_sequence_lengths: Tensor,
+    active: Tensor,
+) -> None:
+    """Keep completed static lanes from scanning their now-irrelevant KV history."""
+    flash_sequence_lengths.masked_fill_(~active, 1)
+
 
 def _take_refill_rows(
     free_slots: Sequence[int],
@@ -862,6 +938,9 @@ def _take_refill_rows(
     remaining = max(total_rows - pending_row, 0)
     rows = min(len(free_slots), remaining)
     return list(free_slots[:rows]), rows
+
+
+
 
 def _completion_poll_chunk(
     host_output_positions: Sequence[int],
@@ -882,6 +961,7 @@ def _completion_poll_chunk(
     return min(poll_steps, remaining)
 
 
+
 class CapturedTrainingRolloutEngine:
     """Persistent fused rollout replica with a captured full-batch decode step."""
 
@@ -897,10 +977,18 @@ class CapturedTrainingRolloutEngine:
         top_k: int,
         top_p: float,
         compile_decode: bool,
+        physical_batch_size: int | None = None,
     ) -> None:
 
+        logical_batch_size = prompts_per_rollout * samples_per_prompt
         if prompts_per_rollout < 1 or samples_per_prompt < 1:
             raise ValueError("rollout batch dimensions must be positive")
+        if physical_batch_size is None:
+            physical_batch_size = logical_batch_size
+        if not 1 <= physical_batch_size <= logical_batch_size:
+            raise ValueError(
+                "physical rollout batch must fit the logical rollout batch"
+            )
         if not stop_ids:
             raise ValueError("rollout stop ids cannot be empty")
         if temperature <= 0 or top_k < 1 or not 0 < top_p <= 1:
@@ -912,7 +1000,7 @@ class CapturedTrainingRolloutEngine:
         )
         self.prompts_per_rollout = prompts_per_rollout
         self.samples_per_prompt = samples_per_prompt
-        self.batch_size = prompts_per_rollout * samples_per_prompt
+        self.batch_size = physical_batch_size
         self.cache_length = cache_length
         self.temperature = temperature
         self.top_k = top_k
@@ -936,13 +1024,8 @@ class CapturedTrainingRolloutEngine:
             * int(config.head_dim)
             * torch.empty((), dtype=torch.bfloat16).element_size()
         )
-        free_bytes, _ = torch.cuda.mem_get_info(device)
-        if self.estimated_cache_bytes > int(0.7 * free_bytes):
-            raise MemoryError(
-                "captured rollout cache requires "
-                f"{self.estimated_cache_bytes / 2**30:.2f} GiB with only "
-                f"{free_bytes / 2**30:.2f} GiB free"
-            )
+        self._source_stash = _FrozenParameterStash(source_policy.causal_lm)
+        self.offloaded_source_bytes = self._source_stash.bytes
         self.cache_positions = torch.arange(cache_length, device=device)
         self.cache_position = torch.zeros(1, dtype=torch.long, device=device)
         self.output_position = torch.zeros(
@@ -986,6 +1069,7 @@ class CapturedTrainingRolloutEngine:
             self.batch_size, dtype=torch.float32, device=device
         )
         self._decode_graph: torch.cuda.CUDAGraph | None = None
+        self._continuous_decode_graph: torch.cuda.CUDAGraph | None = None
         self._capture_stream = torch.cuda.Stream(device=device)
         self._compile_decode = compile_decode
         if hasattr(torch, "_dynamo"):
@@ -1007,41 +1091,30 @@ class CapturedTrainingRolloutEngine:
             ):
                 torch._dynamo.mark_static_address(tensor)
 
-        def sample(logits: Tensor) -> tuple[Tensor, Tensor]:
-            token = top_k_top_p_sample(
+        def sample_tokens(logits: Tensor) -> Tensor:
+            return top_k_top_p_sample(
                 logits,
                 temperature=self.temperature,
                 top_k=self.top_k,
                 top_p=self.top_p,
             )
+
+        def sample(logits: Tensor) -> tuple[Tensor, Tensor]:
+            token = sample_tokens(logits)
             selected_logprob = selected_token_logprobs(logits, token)
             return token, selected_logprob
 
-        def decode(
+        def advance(
             token: Tensor,
-            selected_logprob: Tensor,
-            state_value: Tensor,
             cache: Cache,
-        ) -> tuple[Tensor, Tensor]:
+        ) -> Tensor:
             active = self.active
             safe_output = self.output_position.clamp_max(
                 self.generated.size(1) - 1
             )[:, None]
             previous_tokens = self.generated.gather(1, safe_output).squeeze(1)
             actual = torch.where(active, token, previous_tokens)
-            previous_logprobs = self.logprobs.gather(
-                1, safe_output
-            ).squeeze(1)
-            actual_logprobs = torch.where(
-                active, selected_logprob, previous_logprobs
-            )
-            previous_values = self.values.gather(1, safe_output).squeeze(1)
-            actual_values = torch.where(active, state_value, previous_values)
             self.generated.scatter_(1, safe_output, actual[:, None])
-            self.logprobs.scatter_(
-                1, safe_output, actual_logprobs[:, None]
-            )
-            self.values.scatter_(1, safe_output, actual_values[:, None])
             cache_rows = self.sequence_lengths.clamp_max(
                 self.attention_mask.size(1) - 1
             )[:, None]
@@ -1069,13 +1142,60 @@ class CapturedTrainingRolloutEngine:
             )
             exhausted = self.output_position >= self.response_limit
             self.active.logical_and_(~(stopped | exhausted))
+            _retire_inactive_flash_rows_(
+                self.flash_sequence_lengths,
+                self.active,
+            )
+            return hidden
+
+        def decode(
+            token: Tensor,
+            selected_logprob: Tensor,
+            state_value: Tensor,
+            cache: Cache,
+        ) -> tuple[Tensor, Tensor]:
+            safe_output = self.output_position.clamp_max(
+                self.values.size(1) - 1
+            )[:, None]
+            previous_values = self.values.gather(1, safe_output).squeeze(1)
+            actual_values = torch.where(
+                self.active, state_value, previous_values
+            )
+            previous_logprobs = self.logprobs.gather(
+                1, safe_output
+            ).squeeze(1)
+            actual_logprobs = torch.where(
+                self.active, selected_logprob, previous_logprobs
+            )
+            self.logprobs.scatter_(
+                1, safe_output, actual_logprobs[:, None]
+            )
+            self.values.scatter_(1, safe_output, actual_values[:, None])
+            hidden = advance(token, cache)
             return self.policy.logits(hidden), self.policy.rollout_values(hidden)
 
+        def decode_without_statistics(
+            token: Tensor,
+            cache: Cache,
+        ) -> Tensor:
+            hidden = advance(token, cache)
+            return self.policy.logits(hidden)
+
+        self.sample_tokens = (
+            torch.compile(sample_tokens, fullgraph=True)
+            if compile_decode
+            else sample_tokens
+        )
         self.sample = (
             torch.compile(sample, fullgraph=True) if compile_decode else sample
         )
         self.decode = (
             torch.compile(decode, fullgraph=False) if compile_decode else decode
+        )
+        self.decode_without_statistics = (
+            torch.compile(decode_without_statistics, fullgraph=False)
+            if compile_decode
+            else decode_without_statistics
         )
 
 
@@ -1097,9 +1217,27 @@ class CapturedTrainingRolloutEngine:
         self.cache = self._new_cache()
         self._rollout_resident = True
 
+    def _validate_cache_capacity(self) -> None:
+        available_bytes = _cuda_allocatable_bytes(self._runtime_device)
+        required_bytes = (
+            self.estimated_cache_bytes + ROLLOUT_WORKSPACE_RESERVE_BYTES
+        )
+        if required_bytes > available_bytes:
+            raise MemoryError(
+                "captured rollout requires "
+                f"{self.estimated_cache_bytes / 2**30:.2f} GiB of KV plus "
+                f"{ROLLOUT_WORKSPACE_RESERVE_BYTES / 2**30:.2f} GiB workspace, "
+                f"but only {available_bytes / 2**30:.2f} GiB is allocatable "
+                f"after offloading {self.offloaded_source_bytes / 2**30:.2f} GiB "
+                "of frozen training weights"
+            )
+
     def synchronize(self) -> None:
-        self._restore_rollout_cache()
+        self._source_stash.restore()
         synchronize_fused_lora_policy_(self.policy, self.source_policy)
+        self._source_stash.offload()
+        self._restore_rollout_cache()
+        self._validate_cache_capacity()
 
     def prepare_generation(self) -> None:
         self.synchronize()
@@ -1131,16 +1269,17 @@ class CapturedTrainingRolloutEngine:
 
 
     def release_cache(self) -> None:
-        """Release only phase-local KV and graph state; model weights stay resident."""
+        """Swap rollout KV for the frozen training backbone between phases."""
         self._prepared_for_generation = False
-        if not self._rollout_resident:
-            return
-        self._decode_graph = None
-        for decoder_layer in self.policy.causal_lm.model.layers:
-            attention = cast(Any, decoder_layer.self_attn)
-            attention._rollout_sequence_lengths = None
-        self.cache = self._new_cache()
-        self._rollout_resident = False
+        if self._rollout_resident:
+            self._decode_graph = None
+            self._continuous_decode_graph = None
+            for decoder_layer in self.policy.causal_lm.model.layers:
+                attention = cast(Any, decoder_layer.self_attn)
+                attention._rollout_sequence_lengths = None
+            self.cache = self._new_cache()
+            self._rollout_resident = False
+        self._source_stash.restore()
 
     def _prepare_prompts(
         self, prompt_ids_cpu: Sequence[Tensor]
@@ -1207,7 +1346,7 @@ class CapturedTrainingRolloutEngine:
     def _run_decode_schedule(
         self,
         logits: Tensor,
-        values: Tensor,
+        values: Tensor | None,
         calls: int,
         *,
         started: float,
@@ -1216,27 +1355,44 @@ class CapturedTrainingRolloutEngine:
         ),
     ) -> None:
         self._graph_logits.copy_(logits)
-        self._graph_values.copy_(values)
+        collect_statistics = values is not None
+        graph_name = (
+            "_decode_graph"
+            if collect_statistics
+            else "_continuous_decode_graph"
+        )
+        if values is not None:
+            self._graph_values.copy_(values)
         completed = 0
         if calls < 1:
             return
         if not self._compile_decode:
             for completed in range(1, calls + 1):
-                self._split_decode_step()
+                if collect_statistics:
+                    self._split_decode_step()
+                else:
+                    self._continuous_split_decode_step()
                 self._report_progress(completed, started, progress_callback)
             return
-        if self._decode_graph is None:
+        if getattr(self, graph_name) is None:
             if calls == 1:
-                self._split_decode_step()
+                if collect_statistics:
+                    self._split_decode_step()
+                else:
+                    self._continuous_split_decode_step()
                 self._report_progress(1, started, progress_callback)
                 return
-            self._capture_static_decode_schedule()
+            if collect_statistics:
+                self._capture_static_decode_schedule()
+            else:
+                self._capture_continuous_decode_schedule()
             completed = 2
             self._report_progress(completed, started, progress_callback)
-        if self._decode_graph is None:
+        graph = getattr(self, graph_name)
+        if graph is None:
             raise RuntimeError("static decode schedule capture failed")
         for completed in range(completed + 1, calls + 1):
-            self._decode_graph.replay()
+            graph.replay()
             self._report_progress(completed, started, progress_callback)
 
     def _report_progress(
@@ -1271,6 +1427,7 @@ class CapturedTrainingRolloutEngine:
         prompt_ids_cpu: Sequence[Tensor],
         *,
         max_new_tokens: int,
+        collect_statistics: bool = True,
         progress_callback: (
             Callable[[int, dict[str, float | int]], None] | None
         ) = None,
@@ -1304,7 +1461,9 @@ class CapturedTrainingRolloutEngine:
             )[:, -1]
             self._bind_flash_cache()
             logits = self.policy.logits(hidden)
-            state_values = self.policy.rollout_values(hidden)
+            state_values = (
+                self.policy.rollout_values(hidden) if collect_statistics else None
+            )
             prefill_complete.record()
             self._run_decode_schedule(
                 logits,
@@ -1356,6 +1515,21 @@ class CapturedTrainingRolloutEngine:
         prefill_batch_prompts: int = 8,
     ) -> PromptPrefixBank:
         """Prefill every unique prompt once and retain compact KV on the host."""
+        return self._build_prompt_prefix_bank(
+            prompt_ids_cpu,
+            prefill_batch_prompts=prefill_batch_prompts,
+            collect_values=True,
+            storage_device="cpu",
+        )
+
+    def _build_prompt_prefix_bank(
+        self,
+        prompt_ids_cpu: Sequence[Tensor],
+        *,
+        prefill_batch_prompts: int,
+        collect_values: bool,
+        storage_device: torch.device | str,
+    ) -> PromptPrefixBank:
         if not prompt_ids_cpu:
             raise ValueError("prompt prefix bank cannot be empty")
         if prefill_batch_prompts < 1:
@@ -1371,15 +1545,32 @@ class CapturedTrainingRolloutEngine:
             raise ValueError("prompt prefix bank exhausts the rollout cache")
 
         device = self.generated.device
+        bank_device = torch.device(storage_device)
+        if bank_device.type not in {"cpu", "cuda"}:
+            raise ValueError("prompt prefix bank storage must be CPU or CUDA")
+        if bank_device.type == "cuda" and bank_device != device:
+            raise ValueError("CUDA prompt prefix bank must use the rollout device")
+        host_resident = bank_device.type == "cpu"
+
+        def empty_bank(shape: tuple[int, ...], *, dtype: torch.dtype) -> Tensor:
+            if host_resident:
+                return torch.empty(
+                    shape,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            return torch.empty(shape, dtype=dtype, device=bank_device)
+
         pad_token_id = int(self.policy.causal_lm.config.pad_token_id)
         prompt_count = len(prompt_ids_cpu)
-        bank_logits = torch.empty(
+        bank_logits = empty_bank(
             (prompt_count, self._graph_logits.size(1)),
             dtype=self._graph_logits.dtype,
-            device="cpu",
         )
-        bank_values = torch.empty(
-            prompt_count, dtype=self._graph_values.dtype, device="cpu"
+        bank_values = empty_bank(
+            (prompt_count,) if collect_values else (0,),
+            dtype=self._graph_values.dtype,
         )
         bank_keys: Tensor | None = None
         bank_layer_values: Tensor | None = None
@@ -1433,11 +1624,14 @@ class CapturedTrainingRolloutEngine:
                     position_ids=position_ids,
                 )[:, -1]
                 bank_logits[start:stop].copy_(
-                    self.policy.logits(hidden).to("cpu")
+                    self.policy.logits(hidden),
+                    non_blocking=host_resident,
                 )
-                bank_values[start:stop].copy_(
-                    self.policy.rollout_values(hidden).to("cpu")
-                )
+                if collect_values:
+                    bank_values[start:stop].copy_(
+                        self.policy.rollout_values(hidden),
+                        non_blocking=host_resident,
+                    )
 
             compact_layers = [
                 cast(_CompactStaticLayer, layer) for layer in chunk_cache.layers
@@ -1453,7 +1647,7 @@ class CapturedTrainingRolloutEngine:
                     raise ValueError(
                         "continuous prefix bank requires uniform KV dimensions"
                     )
-                bank_keys = torch.empty(
+                bank_keys = empty_bank(
                     (
                         prompt_count,
                         prompt_width,
@@ -1462,9 +1656,8 @@ class CapturedTrainingRolloutEngine:
                         first_layer.k_head_dim,
                     ),
                     dtype=first_layer.key_backing.dtype,
-                    device="cpu",
                 )
-                bank_layer_values = torch.empty(
+                bank_layer_values = empty_bank(
                     (
                         prompt_count,
                         prompt_width,
@@ -1473,16 +1666,18 @@ class CapturedTrainingRolloutEngine:
                         first_layer.v_head_dim,
                     ),
                     dtype=first_layer.value_backing.dtype,
-                    device="cpu",
                 )
             for layer_index, layer in enumerate(compact_layers):
                 bank_keys[start:stop, :, layer_index].copy_(
-                    layer.key_backing.to("cpu")
+                    layer.key_backing,
+                    non_blocking=host_resident,
                 )
                 bank_layer_values[start:stop, :, layer_index].copy_(
-                    layer.value_backing.to("cpu")
+                    layer.value_backing,
+                    non_blocking=host_resident,
                 )
 
+        torch.cuda.current_stream(device).synchronize()
         if bank_keys is None or bank_layer_values is None:
             raise RuntimeError("prompt prefix bank was not initialized")
         return PromptPrefixBank(
@@ -1540,10 +1735,15 @@ class CapturedTrainingRolloutEngine:
         self.attention_mask.index_fill_(0, slot_ids, False)
         self.attention_mask[slot_ids, :length] = True
         self.generated.index_fill_(0, slot_ids, 0)
-        self.logprobs.index_fill_(0, slot_ids, 0)
-        self.values.index_fill_(0, slot_ids, 0)
-        key_sources = bank.layer_keys[prompt_index, :length].to(device)
-        value_sources = bank.layer_values[prompt_index, :length].to(device)
+        if bank.values.numel():
+            self.logprobs.index_fill_(0, slot_ids, 0)
+            self.values.index_fill_(0, slot_ids, 0)
+        key_sources = bank.layer_keys[prompt_index, :length].to(
+            device, non_blocking=True
+        )
+        value_sources = bank.layer_values[prompt_index, :length].to(
+            device, non_blocking=True
+        )
         for layer_index, cache_layer in enumerate(self.cache.layers):
             layer = cast(_CompactStaticLayer, cache_layer)
             layer.key_backing[slot_ids, :length] = key_sources[:, layer_index]
@@ -1553,18 +1753,39 @@ class CapturedTrainingRolloutEngine:
         self.position_ids.index_fill_(0, slot_ids, length)
         self.output_position.index_fill_(0, slot_ids, 0)
         self.response_limit.index_fill_(0, slot_ids, max_new_tokens)
-        self._graph_logits[slot_ids] = bank.logits[prompt_index].to(device)
-        self._graph_values[slot_ids] = bank.values[prompt_index].to(device)
+        self._graph_logits[slot_ids] = bank.logits[prompt_index].to(
+            device, non_blocking=True
+        )
+        if bank.values.numel():
+            self._graph_values[slot_ids] = bank.values[prompt_index].to(
+                device, non_blocking=True
+            )
         self.active.index_fill_(0, slot_ids, True)
+
+    def _continuous_split_decode_step(self) -> None:
+        token = self.sample_tokens(self._graph_logits)
+        next_logits = self.decode_without_statistics(token, self.cache)
+        self._graph_logits.copy_(next_logits)
+
+    def _capture_continuous_decode_schedule(self) -> None:
+        torch.cuda.current_stream().synchronize()
+        with torch.cuda.stream(self._capture_stream):
+            self._continuous_split_decode_step()
+        self._capture_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=self._capture_stream):
+            self._continuous_split_decode_step()
+        torch.cuda.current_stream().wait_stream(self._capture_stream)
+        self._continuous_decode_graph = graph
 
     def _continuous_decode_once(self) -> None:
         if not self._compile_decode:
-            self._split_decode_step()
+            self._continuous_split_decode_step()
             return
-        if self._decode_graph is None:
-            self._capture_static_decode_schedule()
+        if self._continuous_decode_graph is None:
+            self._capture_continuous_decode_schedule()
             return
-        self._decode_graph.replay()
+        self._continuous_decode_graph.replay()
 
     @torch.inference_mode()
     def generate_prompt_pool(
@@ -1578,7 +1799,13 @@ class CapturedTrainingRolloutEngine:
             Callable[[int, dict[str, float | int]], None] | None
         ) = None,
     ) -> ContinuousTrainingGeneration:
-        """Continuously refill every completed physical rollout lane."""
+        """Generate an ordered logical pool over reusable physical lanes.
+
+        Completion polling batches device-to-host synchronization. Completed
+        lanes are refilled immediately after each poll.
+        Responses include their first stop token or reach ``max_new_tokens``;
+        log-probabilities are zero placeholders for replay-time refresh.
+        """
         if not prompt_ids_cpu:
             raise ValueError("continuous prompt pool cannot be empty")
         if max_new_tokens < 1:
@@ -1591,9 +1818,11 @@ class CapturedTrainingRolloutEngine:
 
         started = time.perf_counter()
         self._synchronize_generation()
-        bank = self.build_prompt_prefix_bank(
+        bank = self._build_prompt_prefix_bank(
             prompt_ids_cpu,
             prefill_batch_prompts=prefill_batch_prompts,
+            collect_values=False,
+            storage_device=self.generated.device,
         )
         self._ensure_continuous_cache(bank)
         for cache_layer in self.cache.layers:
@@ -1607,20 +1836,15 @@ class CapturedTrainingRolloutEngine:
         self.flash_sequence_lengths.fill_(1)
         self.attention_mask.zero_()
         self.generated.zero_()
-        self.logprobs.zero_()
-        self.values.zero_()
         self._graph_logits.zero_()
-        self._graph_values.zero_()
-        if self._compile_decode and self._decode_graph is None:
-            self._capture_static_decode_schedule()
+        if self._compile_decode and self._continuous_decode_graph is None:
+            self._capture_continuous_decode_schedule()
             self._graph_logits.zero_()
-            self._graph_values.zero_()
         prefill_complete = time.perf_counter()
 
         prompt_count = len(prompt_ids_cpu)
         total_rows = prompt_count * self.samples_per_prompt
         completed_responses: list[Tensor | None] = [None] * total_rows
-        completed_logprobs: list[Tensor | None] = [None] * total_rows
         slot_prompt = [-1] * self.batch_size
         slot_sample = [-1] * self.batch_size
         free_slots = list(range(self.batch_size))
@@ -1730,18 +1954,13 @@ class CapturedTrainingRolloutEngine:
                 completed_batch = self.generated.index_select(
                     0, completed_slot_ids
                 )[:, :max_completed_length].to("cpu")
-                completed_logprob_batch = self.logprobs.index_select(
-                    0, completed_slot_ids
-                )[:, :max_completed_length].to("cpu")
-                for result_index, row, row_logprobs, length in zip(
+                for result_index, row, length in zip(
                     completed_indices,
                     completed_batch,
-                    completed_logprob_batch,
                     completed_lengths,
                     strict=True,
                 ):
                     completed_responses[result_index] = row[:length].clone()
-                    completed_logprobs[result_index] = row_logprobs[:length].clone()
             if completed_slots:
                 completed_set = set(completed_slots)
                 occupied_slots = [
@@ -1791,19 +2010,18 @@ class CapturedTrainingRolloutEngine:
                     },
                 )
 
-        if any(response is None for response in completed_responses) or any(
-            logprobs is None for logprobs in completed_logprobs
-        ):
+        if any(response is None for response in completed_responses):
             raise RuntimeError("continuous rollout pool lost completed responses")
         responses = tuple(
             cast(Tensor, response) for response in completed_responses
         )
-        logprobs = tuple(
-            cast(Tensor, row_logprobs) for row_logprobs in completed_logprobs
+        placeholder_logprobs = tuple(
+            torch.zeros(response.numel(), dtype=torch.float32)
+            for response in responses
         )
         return ContinuousTrainingGeneration(
             responses=responses,
-            logprobs=logprobs,
+            logprobs=placeholder_logprobs,
             prefill_seconds=prefill_complete - started,
             decode_seconds=time.perf_counter() - prefill_complete,
             decode_steps=decode_steps,

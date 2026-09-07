@@ -970,6 +970,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     lora_config = LoRAConfig(
         rank=int(lora_payload["rank"]),
         alpha=float(lora_payload["alpha"]),
+        initialization=lora_payload.get("initialization", "standard"),
         targets=tuple(lora_payload["targets"]),
     )
     critic_state = critic_payload.get("value_head")

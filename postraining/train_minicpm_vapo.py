@@ -126,6 +126,11 @@ def validate_resume_dataset(resume: dict[str, Any], data_sha256: str) -> None:
     if resume.get("data_sha256") != data_sha256:
         raise ValueError("resume checkpoint was trained from different dataset bytes")
 
+LEGACY_RESUME_DEFAULTS = {
+    "lora_initialization": "standard",
+    "nextlat_trunk_balance": "parameter",
+    "rollout_physical_batch_size": 0,
+}
 
 RESUME_MUTABLE_OPTIONS = frozenset(
     {
@@ -138,10 +143,14 @@ RESUME_MUTABLE_OPTIONS = frozenset(
         "device_power_floor",
         "min_rollout_tokens_per_second",
         "rollout_only",
+        "rollout_physical_batch_size",
         "gate_min_positive_trajectories",
         "gate_min_positive_groups",
         "gate_max_truncation_fraction",
+        "logit_chunk_tokens",
+        "nextlat_kl_chunk_tokens",
         "replay_token_budget",
+        "nextlat_trunk_balance",
         "replay_max_trajectories",
         "replay_checkpoint_interval",
         "replay_attention_backend",
@@ -158,9 +167,13 @@ def validate_resume_configuration(resume: dict[str, Any], args) -> None:
         name
         for name, value in vars(args).items()
         if name not in mutable_options
-        and prior_args.get(name) != value
+        and prior_args.get(name, LEGACY_RESUME_DEFAULTS.get(name)) != value
         and not (
             name == "max_new_tokens"
+            and resume.get("pending_records") is None
+        )
+        and not (
+            name == "optimizer_minibatches"
             and resume.get("pending_records") is None
         )
     ]
@@ -598,10 +611,7 @@ def collect_rollouts(
         )
         for row in rows
     ]
-    if (
-        isinstance(engine, CapturedTrainingRolloutEngine)
-        and len(encoded_rows) > engine.prompts_per_rollout
-    ):
+    if isinstance(engine, CapturedTrainingRolloutEngine):
         continuous = engine.generate_prompt_pool(
             [prompt_ids for _, prompt_ids in encoded_rows],
             max_new_tokens=max_new_tokens,
@@ -632,6 +642,11 @@ def collect_rollouts(
             continuous.minimum_active_rows_with_backlog
         )
     else:
+        generation = engine.generate_prompts(
+            [prompt_ids for _, prompt_ids in encoded_rows],
+            max_new_tokens=max_new_tokens,
+            progress_callback=progress_callback,
+        )
         (
             responses,
             logprobs,
@@ -639,11 +654,7 @@ def collect_rollouts(
             scanned_vocabulary,
             nucleus_mass_lower_bound,
             decoding,
-        ) = engine.generate_prompts(
-            [prompt_ids for _, prompt_ids in encoded_rows],
-            max_new_tokens=max_new_tokens,
-            progress_callback=progress_callback,
-        )
+        ) = generation
         scheduled_tokens = responses.numel()
         admission_events = 1
         minimum_active_rows_with_backlog = engine.batch_size
@@ -945,8 +956,8 @@ def _nextlat_training_loss(
 def _optimizer_minibatches(
     record_count: int, minibatch_count: int
 ) -> list[tuple[int, ...]]:
-    if minibatch_count < 4:
-        raise ValueError("at least four optimizer minibatches are required")
+    if minibatch_count < 1:
+        raise ValueError("optimizer minibatches must be positive")
     if record_count < minibatch_count:
         raise ValueError("optimizer minibatches cannot exceed trajectories")
     order = torch.randperm(record_count).tolist()
@@ -984,6 +995,7 @@ def _replay_hidden(
         batch.attention_mask,
         position_ids=batch.position_ids,
         cu_seqlens=batch.cu_seqlens,
+        sequence_boundaries=batch.sequence_boundaries,
         max_sequence_length=batch.max_sequence_length,
     )
 
@@ -1399,6 +1411,32 @@ def _gradient_list_norm(gradients: list[Tensor | None]) -> Tensor:
 
 
 @torch.no_grad()
+def _combine_balanced_hidden_gradients_(
+    primary: Tensor, auxiliary: Tensor
+) -> Tensor:
+    """Merge two stored-scale hidden VJPs without amplifying the auxiliary."""
+    if primary.shape != auxiliary.shape:
+        raise ValueError("hidden gradients must have matching shapes")
+    primary_norm = torch.linalg.vector_norm(primary, dtype=torch.float64)
+    auxiliary_norm = torch.linalg.vector_norm(auxiliary, dtype=torch.float64)
+    if not torch.isfinite(primary_norm):
+        raise RuntimeError("primary hidden gradient norm is non-finite")
+    if not torch.isfinite(auxiliary_norm):
+        raise RuntimeError("auxiliary hidden gradient norm is non-finite")
+    coefficient = torch.where(
+        auxiliary_norm > 0,
+        torch.minimum(
+            torch.ones((), dtype=torch.float64, device=primary.device),
+            primary_norm / auxiliary_norm,
+        ),
+        torch.zeros((), dtype=torch.float64, device=primary.device),
+    )
+    auxiliary.mul_(coefficient.to(dtype=auxiliary.dtype))
+    primary.add_(auxiliary)
+    return primary
+
+
+@torch.no_grad()
 def _accumulate_balanced_parameter_gradients_(
     accumulator: list[Tensor | None],
     primary_gradients: list[Tensor | None],
@@ -1553,12 +1591,15 @@ def update_step(
     nextlat_kl_chunk_tokens: int,
     train_nextlat: bool,
     grad_clip_norm: float,
+    nextlat_trunk_balance: str = "parameter",
     value_only: bool = False,
 ) -> dict[str, float | int]:
     if not records:
         raise ValueError("cannot update from an empty rollout")
     if not math.isfinite(grad_clip_norm) or grad_clip_norm <= 0:
         raise ValueError("gradient clip norm must be finite and positive")
+    if nextlat_trunk_balance not in {"parameter", "hidden"}:
+        raise ValueError("NextLat trunk balance must be parameter or hidden")
     device = next(policy.parameters()).device
     policy.train()
     critic.train()
@@ -1680,10 +1721,20 @@ def update_step(
                 device=device,
             )
             nextlat_budget = nextlat_budgets[shard_index]
+            hidden_trunk_balance = (
+                nextlat_trunk_balance == "hidden"
+                and train_nextlat
+                and nextlat_budget > 0
+            )
             if not value_only:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     actor_hidden = _replay_hidden(policy, batch)
-                    actor_actions = actor_hidden[
+                    actor_primary_hidden = (
+                        actor_hidden.detach().requires_grad_()
+                        if hidden_trunk_balance
+                        else actor_hidden
+                    )
+                    actor_actions = actor_primary_hidden[
                         batch.action_batch_indices, batch.action_positions
                     ]
                     new_logprobs = chunked_frozen_head_logprobs(
@@ -1727,23 +1778,22 @@ def update_step(
                             actor_nextlat.loss,
                             objective.detach().abs().mean(),
                         )
-                (
-                    policy_loss * _PARAMETER_GRADIENT_STORAGE_SCALE
-                ).backward(retain_graph=actor_nextlat is not None)
-                actor_primary_gradients = _pop_parameter_gradients(
-                    actor_primary_parameters
-                )
                 actor_auxiliary_probe_gradients: list[Tensor | None] = [
                     None
                 ] * len(actor_primary_parameters)
-                if actor_nextlat is not None:
+                if hidden_trunk_balance:
+                    assert actor_nextlat is not None
                     assert actor_nextlat_hidden is not None
                     assert balanced_actor_nextlat is not None
+                    (
+                        policy_loss * _PARAMETER_GRADIENT_STORAGE_SCALE
+                    ).backward()
+                    assert actor_primary_hidden.grad is not None
                     (
                         balanced_actor_nextlat
                         * actor_nextlat.samples
                         / nextlat_selected
-                        * _AUXILIARY_TRUNK_PROBE_SCALE
+                        * _PARAMETER_GRADIENT_STORAGE_SCALE
                     ).backward()
                     actor_nextlat_probe_gradients = _pop_parameter_gradients(
                         actor_nextlat_parameters
@@ -1754,11 +1804,46 @@ def update_step(
                         storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
                     )
                     assert actor_nextlat_hidden.grad is not None
-                    actor_hidden.backward(actor_nextlat_hidden.grad)
+                    actor_hidden.backward(
+                        _combine_balanced_hidden_gradients_(
+                            actor_primary_hidden.grad,
+                            actor_nextlat_hidden.grad,
+                        )
+                    )
                     del actor_nextlat_probe_gradients
-                    actor_auxiliary_probe_gradients = _pop_parameter_gradients(
+                    actor_primary_gradients = _pop_parameter_gradients(
                         actor_primary_parameters
                     )
+                else:
+                    (
+                        policy_loss * _PARAMETER_GRADIENT_STORAGE_SCALE
+                    ).backward(retain_graph=actor_nextlat is not None)
+                    actor_primary_gradients = _pop_parameter_gradients(
+                        actor_primary_parameters
+                    )
+                    if actor_nextlat is not None:
+                        assert actor_nextlat_hidden is not None
+                        assert balanced_actor_nextlat is not None
+                        (
+                            balanced_actor_nextlat
+                            * actor_nextlat.samples
+                            / nextlat_selected
+                            * _AUXILIARY_TRUNK_PROBE_SCALE
+                        ).backward()
+                        actor_nextlat_probe_gradients = _pop_parameter_gradients(
+                            actor_nextlat_parameters
+                        )
+                        _accumulate_rescaled_parameter_gradients_(
+                            actor_nextlat_accumulator,
+                            actor_nextlat_probe_gradients,
+                            storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                        )
+                        assert actor_nextlat_hidden.grad is not None
+                        actor_hidden.backward(actor_nextlat_hidden.grad)
+                        del actor_nextlat_probe_gradients
+                        actor_auxiliary_probe_gradients = (
+                            _pop_parameter_gradients(actor_primary_parameters)
+                        )
                 _accumulate_balanced_parameter_gradients_(
                     actor_primary_accumulator,
                     actor_primary_gradients,
@@ -1821,14 +1906,20 @@ def update_step(
                     totals["actor_nextlat_transitions"] += (
                         actor_nextlat.transitions
                     )
-                del actor_hidden, actor_actions, new_logprobs, log_ratio, ratio
+                del actor_hidden, actor_primary_hidden, actor_actions
+                del new_logprobs, log_ratio, ratio
                 del clipped_ratio, objective, policy_loss
                 del actor_nextlat, actor_nextlat_hidden, balanced_actor_nextlat
                 del actor_primary_gradients, actor_auxiliary_probe_gradients
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 critic_hidden = _replay_hidden(critic, batch)
-                critic_actions = critic_hidden[
+                critic_primary_hidden = (
+                    critic_hidden.detach().requires_grad_()
+                    if hidden_trunk_balance
+                    else critic_hidden
+                )
+                critic_actions = critic_primary_hidden[
                     batch.action_batch_indices, batch.action_positions
                 ]
                 predictions = critic.values(critic_actions).float()
@@ -1866,23 +1957,22 @@ def update_step(
                             reduction="mean",
                         ),
                     )
-            (
-                critic_primary_loss * _PARAMETER_GRADIENT_STORAGE_SCALE
-            ).backward(retain_graph=critic_nextlat is not None)
-            critic_primary_gradients = _pop_parameter_gradients(
-                critic_primary_parameters
-            )
             critic_auxiliary_probe_gradients: list[Tensor | None] = [
                 None
             ] * len(critic_primary_parameters)
-            if critic_nextlat is not None:
+            if hidden_trunk_balance:
+                assert critic_nextlat is not None
                 assert critic_nextlat_hidden is not None
                 assert balanced_critic_nextlat is not None
+                (
+                    critic_primary_loss * _PARAMETER_GRADIENT_STORAGE_SCALE
+                ).backward()
+                assert critic_primary_hidden.grad is not None
                 (
                     balanced_critic_nextlat
                     * critic_nextlat.samples
                     / nextlat_selected
-                    * _AUXILIARY_TRUNK_PROBE_SCALE
+                    * _PARAMETER_GRADIENT_STORAGE_SCALE
                 ).backward()
                 critic_nextlat_probe_gradients = _pop_parameter_gradients(
                     critic_nextlat_parameters
@@ -1893,11 +1983,46 @@ def update_step(
                     storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
                 )
                 assert critic_nextlat_hidden.grad is not None
-                critic_hidden.backward(critic_nextlat_hidden.grad)
+                critic_hidden.backward(
+                    _combine_balanced_hidden_gradients_(
+                        critic_primary_hidden.grad,
+                        critic_nextlat_hidden.grad,
+                    )
+                )
                 del critic_nextlat_probe_gradients
-                critic_auxiliary_probe_gradients = _pop_parameter_gradients(
+                critic_primary_gradients = _pop_parameter_gradients(
                     critic_primary_parameters
                 )
+            else:
+                (
+                    critic_primary_loss * _PARAMETER_GRADIENT_STORAGE_SCALE
+                ).backward(retain_graph=critic_nextlat is not None)
+                critic_primary_gradients = _pop_parameter_gradients(
+                    critic_primary_parameters
+                )
+                if critic_nextlat is not None:
+                    assert critic_nextlat_hidden is not None
+                    assert balanced_critic_nextlat is not None
+                    (
+                        balanced_critic_nextlat
+                        * critic_nextlat.samples
+                        / nextlat_selected
+                        * _AUXILIARY_TRUNK_PROBE_SCALE
+                    ).backward()
+                    critic_nextlat_probe_gradients = _pop_parameter_gradients(
+                        critic_nextlat_parameters
+                    )
+                    _accumulate_rescaled_parameter_gradients_(
+                        critic_nextlat_accumulator,
+                        critic_nextlat_probe_gradients,
+                        storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                    )
+                    assert critic_nextlat_hidden.grad is not None
+                    critic_hidden.backward(critic_nextlat_hidden.grad)
+                    del critic_nextlat_probe_gradients
+                    critic_auxiliary_probe_gradients = _pop_parameter_gradients(
+                        critic_primary_parameters
+                    )
             _accumulate_balanced_parameter_gradients_(
                 critic_primary_accumulator,
                 critic_primary_gradients,
@@ -1935,7 +2060,8 @@ def update_step(
                 totals["critic_nextlat_transitions"] += (
                     critic_nextlat.transitions
                 )
-            del batch, critic_hidden, critic_actions, predictions, residuals
+            del batch, critic_hidden, critic_primary_hidden, critic_actions
+            del predictions, residuals
             del value_loss, critic_primary_loss
             del critic_nextlat, critic_nextlat_hidden, balanced_critic_nextlat
             del critic_primary_gradients, critic_auxiliary_probe_gradients
@@ -1972,6 +2098,8 @@ def update_step(
             )
         )
         critic_optimizer.step()
+    actor_optimizer.zero_grad(set_to_none=True)
+    critic_optimizer.zero_grad(set_to_none=True)
 
     count = float(total_actions)
     target_mean = totals["value_target"] / count
@@ -2132,8 +2260,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-warmup-steps", type=int, default=10)
     parser.add_argument("--prompts-per-rollout", type=int, default=4)
     parser.add_argument("--samples-per-prompt", type=int, default=16)
+    parser.add_argument(
+        "--rollout-physical-batch-size",
+        type=int,
+        default=0,
+        help="physical continuous-decode lanes; zero uses every logical row",
+    )
     parser.add_argument("--prompt-tokens", type=int, default=1_024)
-    parser.add_argument("--max-new-tokens", type=int, default=4_096)
+    parser.add_argument("--max-new-tokens", type=int, default=10_000)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument(
@@ -2145,9 +2279,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(thinking=True)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument(
+        "--lora-initialization",
+        choices=("standard", "nora"),
+        default="nora",
+        help="NoRA column-normalized A or standard Kaiming A",
+    )
     parser.add_argument("--critic-width", type=int, default=256)
     parser.add_argument("--actor-lr", type=float, default=1e-6)
-    parser.add_argument("--critic-lr", type=float, default=2e-6)
+    parser.add_argument("--critic-lr", type=float, default=1e-5)
     parser.add_argument("--nextlat-horizon", type=int, default=2)
     parser.add_argument("--nextlat-projection-factor", type=float, default=1.6)
     parser.add_argument("--nextlat-samples", type=int, default=64)
@@ -2157,6 +2297,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-nextlat", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument(
+        "--nextlat-trunk-balance",
+        choices=("parameter", "hidden"),
+        default="parameter",
+        help="balance auxiliary trunk gradients at parameters or final hidden states",
+    )
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--optimizer-minibatches", type=int, default=4)
     parser.add_argument("--post-update-kl-interval", type=int, default=10)
@@ -2164,7 +2310,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip-low", type=float, default=0.20)
     parser.add_argument("--clip-high", type=float, default=0.28)
     parser.add_argument("--value-coefficient", type=float, default=1.0)
-    parser.add_argument("--replay-token-budget", type=int, default=8_192)
+    parser.add_argument("--replay-token-budget", type=int, default=11_024)
     parser.add_argument("--replay-max-trajectories", type=int, default=16)
     parser.add_argument("--logit-chunk-tokens", type=int, default=128)
     parser.add_argument(
@@ -2173,7 +2319,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--replay-checkpoint-interval",
         type=int,
-        default=2,
+        default=4,
         help="checkpoint every Nth replay layer; zero retains all activations",
     )
     parser.add_argument(
@@ -2248,11 +2394,18 @@ def _validate_args(args) -> None:
         raise ValueError(f"positive integer options required: {', '.join(invalid)}")
     if args.replay_checkpoint_interval < 0:
         raise ValueError("replay checkpoint interval cannot be negative")
-    if args.optimizer_minibatches < 4:
-        raise ValueError("at least four optimizer minibatches are required")
+    if args.rollout_physical_batch_size < 0:
+        raise ValueError("physical rollout batch cannot be negative")
     rollout_trajectories = args.prompts_per_rollout * args.samples_per_prompt
     if args.optimizer_minibatches > rollout_trajectories:
         raise ValueError("optimizer minibatches cannot exceed rollout trajectories")
+    if args.rollout_physical_batch_size > rollout_trajectories:
+        raise ValueError("physical rollout batch cannot exceed trajectories")
+    if (
+        not args.fast_rollout
+        and args.rollout_physical_batch_size not in (0, rollout_trajectories)
+    ):
+        raise ValueError("smaller physical rollout batches require fast rollout")
     if args.steps < 0 or args.value_warmup_steps < 0 or args.ppo_epochs < 1:
         raise ValueError("training step counts must be nonnegative and epochs positive")
     if not 0 < args.top_p <= 1 or args.temperature <= 0:
@@ -2330,7 +2483,11 @@ def main() -> None:
     data_sha256 = file_sha256(args.data)
     rows = load_unique_math_rows(args.data)
     random.shuffle(rows)
-    lora_config = LoRAConfig(rank=args.lora_rank, alpha=args.lora_alpha)
+    lora_config = LoRAConfig(
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        initialization=args.lora_initialization,
+    )
     policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
         model_id=args.model,
         revision=args.revision,
@@ -2419,10 +2576,13 @@ def main() -> None:
                 or side_payload["revision"] != args.revision
             ):
                 raise ValueError("resume base checkpoint differs")
-            if side_payload["lora_config"] != {
+            saved_lora_config = dict(side_payload["lora_config"])
+            saved_lora_config.setdefault("initialization", "standard")
+            if saved_lora_config != {
                 "rank": args.lora_rank,
                 "alpha": args.lora_alpha,
                 "targets": tuple(lora_config.targets),
+                "initialization": args.lora_initialization,
             }:
                 raise ValueError("resume LoRA configuration differs")
             if (
@@ -2505,6 +2665,7 @@ def main() -> None:
             top_k=args.top_k,
             top_p=args.top_p,
             compile_decode=args.compile_rollout,
+            physical_batch_size=args.rollout_physical_batch_size or None,
         )
     else:
         engine = RolloutEngine(
@@ -2549,6 +2710,9 @@ def main() -> None:
             parameter.numel() for parameter in critic_nextlat_parameters
         ),
         "estimated_static_kv_cache_bytes": engine.estimated_cache_bytes,
+        "rollout_offloaded_source_bytes": getattr(
+            engine, "offloaded_source_bytes", 0
+        ),
         "shared_frozen_parameters": sum(
             actor_parameters_by_name[name].numel()
             for name in critic.shared_frozen_parameters
@@ -2743,6 +2907,7 @@ def main() -> None:
             nextlat_kl_coefficient=args.nextlat_kl_coefficient,
             nextlat_kl_chunk_tokens=args.nextlat_kl_chunk_tokens,
             train_nextlat=args.train_nextlat,
+            nextlat_trunk_balance=args.nextlat_trunk_balance,
             grad_clip_norm=args.gradient_clip_norm,
             value_only=True,
         )
@@ -2895,6 +3060,7 @@ def main() -> None:
                 nextlat_kl_coefficient=args.nextlat_kl_coefficient,
                 nextlat_kl_chunk_tokens=args.nextlat_kl_chunk_tokens,
                 train_nextlat=args.train_nextlat,
+                nextlat_trunk_balance=args.nextlat_trunk_balance,
                 grad_clip_norm=args.gradient_clip_norm,
             )
             update_ended = time.perf_counter()

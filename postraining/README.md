@@ -64,11 +64,12 @@ int32 token ids plus fp32 selected-token log-probabilities and advantages,
 never full logits. Replay reconstructs selected-token probabilities in
 128-token output-head chunks under a padded-token budget.
 
-Each rollout collects four distinct prompts with sixteen responses apiece. All
-64 trajectories occupy one physical GPU batch and one KV cache; the trainer
-does not double the logical rollout by running a second wave. With four
-optimizer minibatches, each actor and critic step therefore consumes a
-disjoint 16-trajectory quarter of the rollout.
+Each rollout collects four distinct prompts with sixteen responses apiece. The
+default gives all 64 logical trajectories one physical GPU lane in one KV
+cache. `--rollout-physical-batch-size` can benchmark fewer continuously
+refilled lanes without changing the logical rollout. With four optimizer
+minibatches, each actor and critic step consumes a disjoint 16-trajectory
+quarter of the rollout.
 
 One PPO epoch uses four true optimizer minibatches. Each contains a disjoint
 quarter of the rollout; length-bucketed replay batches are only memory shards
@@ -94,22 +95,25 @@ this training path.
 The default rollout path keeps a fused inference-only actor replica resident on
 the GPU. QKV and gate/up projections stay fused, and one decode step—including
 top-k sampling and replay-buffer writes—is captured as a CUDA graph.
-Left-padded prefill K/V is compacted into per-row contiguous prefixes, then
-fixed-shape FA4 varlen decode reads the persistent sequence-major cache using
-device-resident sequence lengths. No critic model or critic KV cache runs
-during autoregressive decoding. The actor replica weights remain resident
-across rollout and replay, while phase-local KV state is released before
-replay. Replay uses an 8,192-token packed budget, stable segmented SDPA, and
-checkpoints every second actor and critic decoder layer. The
-`--replay-attention-backend fa4` path remains available only for profiling;
-SM120 FA4 varlen backward produced NaNs in production. Retaining the other
-activations cuts recomputation without exceeding 32 GiB.
+Left-padded prefill K/V is compacted into per-row contiguous prefixes. The four
+unique prompt prefixes remain in a device-resident bank and expand into their
+sample lanes without a host round trip. Fixed-shape FA4 varlen decode reads the
+persistent sequence-major cache using device-resident sequence lengths; once a
+lane finishes, its visible KV length drops to one so later captured steps do not
+scan dead history. No critic model or critic KV cache runs during autoregressive
+decoding. The actor replica weights remain resident across rollout and replay,
+while phase-local KV state is released before replay. Replay uses an
+11,024-token packed budget, stable segmented SDPA, and checkpoints every fourth
+actor and critic decoder layer. The `--replay-attention-backend fa4` path
+remains available only for profiling; SM120 FA4 varlen backward produced NaNs
+in production. Retaining the other activations cuts recomputation without
+exceeding 32 GiB.
 
 MiniCPM VAPO uses the checkpoint's native thinking template, temperature 0.9,
-top-k 20, and top-p 0.95. The default 4,096-token response budget keeps the
-64-row static cache inside the 32 GiB device. `--top-k 0 --no-fast-rollout`
-retains the slower exact full-vocabulary nucleus sampler. Production aborts if
-steady scheduled decode throughput falls below
+top-k 20, and top-p 0.95. The default 10,000-token response budget uses the
+64-row static cache after offloading the frozen training backbone.
+`--top-k 0 --no-fast-rollout` retains the slower exact full-vocabulary nucleus
+sampler. Production aborts if steady scheduled decode throughput falls below
 `--min-rollout-tokens-per-second`.
 
 TensorBoard is the only live metric stream. Semantic categories cover rollout

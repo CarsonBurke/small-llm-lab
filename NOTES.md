@@ -5896,3 +5896,164 @@ subsets, exact rollout log-probabilities, shared-storage/disjoint-trainable
 invariants, checkpoint migration, and slow-rollout SDPA switching. Pyright is
 clean on the model, trainer, and migrator. An independent follow-up review
 found no remaining concrete defect.
+
+## 2026-09-04: MiniCPM serving-runtime transfer audit
+
+The measured B64 continuous-rollout smoke exposed two serving-path losses.
+At 4,096 generated positions it spent 7.594 s in prefill and 50.614 s in
+decode. Static prefill took 0.831 s. The continuous prefix-bank builder copied
+logits, values, and every layer's K/V to pageable host storage with dozens of
+synchronizing `.to("cpu")` calls, then copied the same four prompts back to the
+device. Decode productive utilization was 71.63%; active rows fell from 64 to
+48 by position 1,536 and to 36 by position 3,584, but completed rows retained
+their full visible FA4 KV lengths on every later captured step.
+
+Exact serving-runtime changes staged without a model run:
+
+- Continuous generation now retains its unique-prompt prefix bank on the GPU,
+  removing the immediate D2H/H2D round trip. The public reusable host-bank path
+  uses pinned storage, nonblocking copies, and one final synchronization rather
+  than one synchronization per tensor.
+- Completed static lanes set their FA4 `seqused_k` length to one. The fixed B64
+  CUDA graph and all active-row outputs are unchanged, while dead lanes stop
+  scanning stale KV history.
+- The existing 10,000-token, B64, BF16 policy stays unchanged. These are
+  execution-only changes; no sampling, reward, optimizer, or objective setting
+  moved.
+
+Transfer decisions from vLLM/SGLang and local evidence:
+
+- Keep CUDA graphs, continuous refill, fused projections, device-resident
+  sequence metadata, pinned host staging, and weight/KV phase separation.
+- Do not add paged/shared-prefix KV yet: the installed FA4 SM120 path explicitly
+  rejects `page_table`, split-KV, block sparsity, and FP8 KV. A custom paged
+  kernel would be a separate benchmarked project, not a flag change.
+- Do not enable NextLat speculative decoding: measured position-2 acceptance is
+  0.90% at step 370 and 0.55% at step 203, far below break-even.
+- Do not enable W8A16 output-head quantization: its B1 speedup was about 7%, but
+  the categorical quality gate failed (KL 0.00693, top-1 match 0.8846).
+- Keep replay logit chunks at 128 and checkpoint interval 4. The step-370 sweep
+  measured interval 4 at 1,867.87 tok/s versus 1,838.54 for interval 2; larger
+  10,240/12,288-token replay shards were slower and used more VRAM.
+
+Queued evidence gates use a hard maximum of ten actor steps or 30 minutes,
+whichever arrives first. Critic warmup is a separate prerequisite and is not
+charged to either limit.
+
+1. Run matched B64 and B48 10,000-token rollout-only gates from the same
+   step-370 checkpoint. B64 must move prefill toward the static 0.831 s
+   reference without a generated-token or quality regression. Keep B48 only if
+   its end-to-end rollout tok/s beats B64 on the same 64 logical trajectories;
+   high truncation can make delayed admissions lose despite higher occupancy.
+2. Run matched standard-LoRA and NoRA arms for at most ten actor steps after
+   each arm completes ten critic-only warmup steps. Ten steps cannot satisfy
+   the repository's normal 2,000-step/0.005-BPB adoption rule, so this gate may
+   reject NoRA early but cannot promote it to the default.
+3. Branch the warmed standard-LoRA state into four-minibatch and one-minibatch
+   arms for at most ten actor steps. Changing the minibatch count changes AdamW
+   step count, behavior-policy age, and NextLat sampling; this remains a
+   learning experiment rather than a speed refactor.
+
+Every gate, including critic warmup, has an `mlq --time-limit 30m`; all jobs
+use `--max-parallel-runs 1`.
+
+Queue history:
+
+- 4849 and 4850: successful B64/B48 10,000-token rollout gates. B64 took
+  260.04 s for 335,049 tokens (1,288.45 useful tok/s; 2,578.61 scheduled
+  decode tok/s); B48 took 283.94 s for 343,495 tokens (1,209.75 useful tok/s;
+  2,179.69 scheduled decode tok/s). B48 is rejected: it was 9.2% slower
+  end-to-end despite 2.5% more sampled tokens.
+- 4851 and 4852: failed before model loading because the requested 60-second
+  checkpoint interval violated the repository's validated 300–600-second
+  range. Dependent jobs 4853–4855 were skipped.
+- 4859: replacement standard-LoRA critic warmup, 10 warmup steps, 30 minutes.
+- 4860: replacement NoRA critic warmup, 10 warmup steps, 30 minutes.
+- 4861: standard LoRA / four minibatches, after 4859, 10 actor steps or
+  30 minutes.
+- 4862: standard LoRA / one minibatch, after 4859, 10 actor steps or
+  30 minutes.
+- 4863: NoRA / four minibatches, after 4860, 10 actor steps or 30 minutes.
+- 4859 and 4860 reached critic replay but OOMed with the 10,000-token response
+  and 11,024-token replay budgets; dependents 4861–4863 were skipped.
+- 4868 and 4869 are memory-safe replacements using the previously validated
+  4,096-token response and 8,192-token replay budgets. Each critic warmup still
+  has 10 steps and a 30-minute hard limit.
+- 4870 and 4871 are the standard-LoRA four/one-minibatch gates after 4868;
+  4872 is the NoRA four-minibatch gate after 4869. Each has 10 actor steps and
+  a 30-minute hard limit.
+
+## 2026-09-06: Uno / Ψ-Spec (diffusion-augmented LLM) applicability review
+
+Read-only. Paper filed at `papers/uno_diffusion_augmented_2609.04010v1.pdf`
+(arXiv:2609.04010v1). Full record and assessment in
+`docs/uno_diffusion_augmented_assessment.md`. No code changed, nothing queued.
+
+The method adds frozen-base LoRA "diffusion weights" trained by one-step
+blockwise consistency distillation with a total-variation loss against the AR
+verifier, then drafts a whole block in one forward pass and accepts by standard
+rejection sampling. It is lossless because the base AR weights are never
+modified. The paper reports 1.47x system throughput at max batch on 8xH200 and
+up to 40% end-to-end DAPO speedup, with only a 6% TPF loss when SFT-trained
+adapters are reused across full-parameter RL.
+
+Findings specific to this stack:
+
+- The verification half already exists and is unit-tested.
+  `maximal_coupling_verify` (`postraining/minicpm_vapo.py:923-963`) is exactly
+  Algorithm 1 lines 6-12; `RaggedStaticCache`/`ragged_causal_mask`
+  (`postraining/nextlat_speculative.py:37-150`), the accept/commit/rollback
+  loop, the bonus-token path, per-position acceptance telemetry, and the
+  logit-fidelity gate in `scripts/benchmark_minicpm_nextlat.py:197-213` all
+  transfer verbatim. Only the drafter and the block-wide forward are missing.
+- The 2026-09-04 rejection of NextLat speculative decoding does not transfer.
+  It rejected a drafter, not the harness: NextLat is KL/SmoothL1-trained on
+  hidden states, drafts sequentially, and has no always-accepted first token.
+  Uno's total-variation loss optimizes accepted-prefix length directly, drafts
+  the block in one pass, and draws position 1 from the base weights so TPF >= 1
+  by construction.
+- Proportional adapter transplant is rank 48, alpha 3072 (alpha/r = 64), all
+  seven projections. Per-layer LoRA params are 29,184 r; x24 layers = 700,416 r,
+  which reproduces the recorded 11,206,656 at r=16 exactly. r=48 gives 33.6 M,
+  3.11% of the 1,080,632,832 frozen parameters.
+- Calibrating the paper's own Table 17a/18 pairs gives a stable marginal
+  per-position cost delta = 0.081-0.094 at concurrency 64. Roofline for
+  MiniCPM5-1B on the 5090 at 64 rows gives delta ~= 0.11, because our decode
+  step is KV-read dominated (9.4-17.3 GB KV against 2.16 GB of weights). At
+  delta = 0.11 and the paper's tau, B=4 projects to 1.47x rollout and, with
+  rollout at 68-74% of step time, 1.28-1.31x end-to-end.
+- Blockers: `_fixed_varlen_fa4_attention` (`postraining/fast_inference.py:377`)
+  hardcodes `max_seqlen_q=1` and falls back to SDPA whenever `q_len > 1`, so
+  every block-wide pass currently abandons FA4. The installed FA4 varlen
+  entry point does accept `max_seqlen_q` with `seqused_q`/`seqused_k` and
+  `causal=True` and needs no `page_table`, so this is a code choice rather than
+  a kernel limit on SM120. Gated LoRA does not exist
+  (`postraining/minicpm_vapo.py:89-99` applies the update unconditionally), a
+  gated adapter cannot be merged into the fused replica
+  (`postraining/fast_inference.py:196-270`), and `RaggedStaticCache` still has
+  to be unified with the sequence-major `_CompactStaticLayer`. Tree sampling is
+  unavailable because block sparsity is rejected on this FA4 build, so the
+  linear sampler is the only option; that is also the paper's
+  system-throughput-optimal choice at high concurrency.
+- Two unknowns decide it: delta on real hardware, and whether a 1B drafter
+  reaches tau ~= 3.9 at B=4 (the paper measures nothing below 8B).
+
+Proposed gates, all through `mlq --max-parallel-runs 1`, not yet queued:
+
+1. E0, about 10 GPU-minutes, no training: measure `t(n)` for n in {1,2,4,8,16}
+   at 64 rows and the real 11,024-slot cache, comparing FA4 varlen with
+   `max_seqlen_q=n` against the current SDPA fallback. Gate: delta <= 0.15 at
+   n=4. Above delta = 0.25 the ceiling is 1.11x and the idea is dead.
+2. E1, about 15-20 GPU-hours: pilot adapter, r=48/alpha=3072, TV-only, lr 1e-5,
+   L=2048, chunked-vocab loss, OpenThoughts3 retokenized, 100M tokens at B=2
+   then 300M at B=4. Gate: linear-B4 tau >= 3.0 at temp 0.9 / top-p 0.95 /
+   top-k 20 against the zero-acceptance floor of 2.0.
+3. E2: rollout-only gate at 64 rows / 4,096 tokens against the 2,578.61
+   scheduled decode tok/s reference. Gate: >= 1.25x with distributional
+   equivalence confirmed by the existing fidelity gate and id SHA-256.
+
+Distillation should target the pure frozen base, not a checkpoint: `lora_b` is
+zero-initialized, so at RL step 0 the AR weights equal the base exactly, and one
+adapter then serves every run branched off it. RL drift is confined to the
+rank-16 actor subspace, strictly less than the full-parameter DAPO under which
+the paper still measured only a 6% TPF loss.

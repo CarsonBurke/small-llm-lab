@@ -3,7 +3,7 @@ from collections import Counter
 import copy
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -16,6 +16,7 @@ from postraining.fast_inference import (
     CapturedTrainingRolloutEngine,
     ContinuousTrainingGeneration,
     _CompactStaticLayer,
+    _FrozenParameterStash,
     _fixed_varlen_fa4_attention,
     _completion_poll_chunk,
     _take_refill_rows,
@@ -27,6 +28,7 @@ from postraining.fast_inference import (
 )
 from postraining.minicpm_vapo import (
     LoRAConfig,
+    LoRALinear,
     MiniCPMVAPOPolicy,
     NextLatAuxiliaryHead,
     StaticCachePool,
@@ -59,6 +61,7 @@ from postraining.train_minicpm_vapo import (
     _validate_args,
     _ChunkedNextLatKL,
     _accumulate_balanced_parameter_gradients_,
+    _combine_balanced_hidden_gradients_,
     _accumulate_rescaled_parameter_gradients_,
     _clip_finite_grad_norm_,
     _approximate_kl_terms,
@@ -73,6 +76,7 @@ from postraining.train_minicpm_vapo import (
     _TRAIN_TAGS,
     _optimizer_minibatches,
     _nextlat_shard_samples,
+    collect_rollouts,
     configure_replay_checkpointing,
     build_parser,
     device_phase_metrics,
@@ -126,6 +130,37 @@ def test_lora_injection_is_initially_exact_and_freezes_base() -> None:
 
 
 
+
+def test_nora_init_normalizes_lora_a_columns_once() -> None:
+    torch.manual_seed(7)
+    base = nn.Linear(6, 5, bias=False)
+    standard = LoRALinear(
+        copy.deepcopy(base),
+        LoRAConfig(rank=2, alpha=4, initialization="standard"),
+    )
+    torch.manual_seed(7)
+    base = nn.Linear(6, 5, bias=False)
+    nora = LoRALinear(
+        copy.deepcopy(base),
+        LoRAConfig(rank=2, alpha=4, initialization="nora"),
+    )
+
+    standard_norms = torch.linalg.vector_norm(standard.lora_a, dim=0)
+    nora_norms = torch.linalg.vector_norm(nora.lora_a, dim=0)
+    torch.testing.assert_close(nora_norms, torch.ones_like(nora_norms))
+    torch.testing.assert_close(
+        nora.lora_a,
+        standard.lora_a / standard_norms.unsqueeze(0),
+    )
+    assert torch.count_nonzero(nora.lora_b) == 0
+
+
+def test_lora_config_rejects_unknown_initialization() -> None:
+    with pytest.raises(ValueError, match="initialization"):
+        LoRAConfig(initialization="unknown")  # type: ignore[arg-type]
+
+
+
 def test_actor_and_critic_share_only_frozen_parameter_storage() -> None:
     torch.manual_seed(3)
     actor = _TinyLlamaBlock()
@@ -147,6 +182,9 @@ def test_actor_and_critic_share_only_frozen_parameter_storage() -> None:
                 actor_parameters[name].untyped_storage().data_ptr()
                 != critic_parameters[name].untyped_storage().data_ptr()
             )
+
+
+
 
 def test_reference_nextlat_head_matches_one_billion_parameter_configuration() -> None:
     head = NextLatAuxiliaryHead(1536, projection_factor=1.6)
@@ -337,6 +375,69 @@ def test_compact_static_cache_packs_prefill_and_appends_per_row() -> None:
     assert cached_keys is layer.keys
     assert cached_values is layer.values
 
+
+def test_compact_static_cache_reset_invalidates_without_rewriting_storage() -> None:
+    sequence_lengths = torch.tensor([2])
+    prefill_mask = torch.tensor([[True, True]])
+    layer = _CompactStaticLayer(6, sequence_lengths, prefill_mask)
+    keys = torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2)
+    layer.update(keys, keys)
+    stale_tail = torch.full_like(layer.key_backing[:, 2:], 17.0)
+    layer.key_backing[:, 2:].copy_(stale_tail)
+    key_pointer = layer.key_backing.data_ptr()
+
+    layer.reset()
+
+    assert layer.key_backing.data_ptr() == key_pointer
+    assert int(layer.cumulative_length) == 0
+    torch.testing.assert_close(layer.key_backing[:, 2:], stale_tail)
+
+
+def test_frozen_parameter_stash_moves_only_immutable_storage() -> None:
+    module = nn.Sequential(
+        nn.Linear(3, 4, bias=False),
+        nn.Linear(4, 2, bias=False),
+    )
+    first = cast(nn.Linear, module[0])
+    second = cast(nn.Linear, module[1])
+    first.weight.requires_grad_(False)
+    frozen = first.weight
+    trainable = second.weight
+    expected = frozen.detach().clone()
+    stash = _FrozenParameterStash(module)
+
+    stash.offload()
+    assert not stash.resident
+    assert stash.bytes == frozen.numel() * frozen.element_size()
+    assert stash.parameters[0] is frozen
+    assert trainable.requires_grad
+
+    stash.restore()
+    assert stash.resident
+    torch.testing.assert_close(frozen, expected)
+
+
+def test_rollout_capacity_reserves_workspace_after_weight_offload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = cast(Any, object.__new__(CapturedTrainingRolloutEngine))
+    engine._runtime_device = torch.device("cuda")
+    engine.estimated_cache_bytes = 19 << 30
+    engine.offloaded_source_bytes = 2 << 30
+    monkeypatch.setattr(
+        "postraining.fast_inference._cuda_allocatable_bytes",
+        lambda device: 20 << 30,
+    )
+
+    engine._validate_cache_capacity()
+
+    monkeypatch.setattr(
+        "postraining.fast_inference._cuda_allocatable_bytes",
+        lambda device: (20 << 30) - 1,
+    )
+    with pytest.raises(MemoryError, match="KV plus 1.00 GiB workspace"):
+        engine._validate_cache_capacity()
+
 def test_compact_static_cache_safely_replays_completed_max_length_rows() -> None:
     sequence_lengths = torch.tensor([4])
     prefill_mask = torch.ones((1, 2), dtype=torch.bool)
@@ -418,6 +519,37 @@ def test_first_captured_schedule_replays_every_persistent_decode() -> None:
 
     assert graph.replays == 3
 
+
+def test_statistics_free_captured_schedule_uses_continuous_graph() -> None:
+    class Graph:
+        replays = 0
+
+        def replay(self) -> None:
+            self.replays += 1
+
+    graph = Graph()
+    engine = SimpleNamespace(
+        _graph_logits=torch.zeros(1),
+        _graph_values=torch.zeros(1),
+        _compile_decode=True,
+        _continuous_decode_graph=None,
+        _report_progress=lambda *args, **kwargs: None,
+    )
+    engine._capture_continuous_decode_schedule = lambda: setattr(
+        engine, "_continuous_decode_graph", graph
+    )
+
+    CapturedTrainingRolloutEngine._run_decode_schedule(
+        cast(CapturedTrainingRolloutEngine, engine),
+        torch.ones(1),
+        None,
+        5,
+        started=0.0,
+        progress_callback=None,
+    )
+
+    assert graph.replays == 3
+
 def test_continuous_refill_fills_every_available_lane() -> None:
     free = [1, 3, 4, 7, 8, 9, 10]
     selected, rows = _take_refill_rows(
@@ -472,20 +604,24 @@ def test_captured_rollout_release_keeps_replica_resident_and_evicts_only_cache()
             )
         ),
     )
-    engine = object.__new__(CapturedTrainingRolloutEngine)
+    engine = cast(Any, object.__new__(CapturedTrainingRolloutEngine))
     engine.policy = policy
     engine._rollout_resident = True
     engine._decode_graph = object()
+    engine._continuous_decode_graph = object()
     engine._num_hidden_layers = 1
     engine.cache_length = 8
     engine.sequence_lengths = torch.zeros(2, dtype=torch.long)
     engine.attention_mask = torch.zeros(2, 8, dtype=torch.bool)
+    restored: list[bool] = []
+    engine._source_stash = SimpleNamespace(restore=lambda: restored.append(True))
 
     engine.release_cache()
 
     assert engine._decode_graph is None
     assert engine._rollout_resident is False
     assert attention._rollout_sequence_lengths is None
+    assert restored == [True]
 
     engine._restore_rollout_cache()
     assert engine._rollout_resident is True
@@ -504,6 +640,61 @@ def test_continuous_generation_reports_productive_utilization() -> None:
         minimum_active_rows_with_backlog=8,
     )
     assert generation.productive_utilization == 0.5
+
+
+def test_captured_rollouts_reuse_unique_prompt_prefills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = cast(Any, object.__new__(CapturedTrainingRolloutEngine))
+    engine.prompts_per_rollout = 2
+    engine.samples_per_prompt = 1
+    engine.stop_ids = (9,)
+    engine.top_k = 2
+    engine.top_p = 0.9
+    engine.policy = SimpleNamespace(
+        causal_lm=SimpleNamespace(config=SimpleNamespace(vocab_size=10))
+    )
+    called: list[int] = []
+
+    def generate_prompt_pool(prompt_ids, **kwargs):
+        del kwargs
+        called.append(len(prompt_ids))
+        return ContinuousTrainingGeneration(
+            responses=(torch.tensor([9]), torch.tensor([9])),
+            logprobs=(torch.zeros(1), torch.zeros(1)),
+            prefill_seconds=0.1,
+            decode_seconds=0.2,
+            decode_steps=1,
+            useful_tokens=2,
+            capacity_row_steps=2,
+            admission_events=1,
+            minimum_active_rows_with_backlog=2,
+        )
+
+    engine.generate_prompt_pool = generate_prompt_pool
+    engine.generate_prompts = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("captured rollout must not repeat each prompt prefill")
+    )
+    monkeypatch.setattr(
+        "postraining.train_minicpm_vapo.encode_math_prompt",
+        lambda *args, **kwargs: torch.tensor([1]),
+    )
+    monkeypatch.setattr(
+        "postraining.train_minicpm_vapo._build_group_records",
+        lambda *args, **kwargs: ([SimpleNamespace()], 1),
+    )
+
+    result = collect_rollouts(
+        engine,
+        object(),
+        [{}, {}],
+        prompt_tokens=8,
+        max_new_tokens=4,
+        enable_thinking=True,
+    )
+
+    assert called == [2]
+    assert len(result.records) == 2
 
 
 def test_fast_top_k_top_p_sampler_respects_nucleus_boundary() -> None:
@@ -1082,6 +1273,42 @@ def test_auxiliary_parameter_gradient_is_capped_to_primary_norm() -> None:
     torch.testing.assert_close(uncapped[0], torch.tensor([3.0, 6.0]))
 
 
+
+
+def test_hidden_gradient_balancing_caps_auxiliary_before_lora_backward() -> None:
+    torch.testing.assert_close(
+        _combine_balanced_hidden_gradients_(
+            torch.tensor([3.0, 4.0]),
+            torch.tensor([0.0, 10.0]),
+        ),
+        torch.tensor([3.0, 9.0]),
+    )
+    base = nn.Linear(4, 4, bias=False)
+    layer = LoRALinear(base, LoRAConfig(rank=2, alpha=2.0))
+    layer.lora_b.data.fill_(0.1)
+    hidden = layer(torch.ones(3, 4))
+    primary_hidden = hidden.detach().requires_grad_()
+    auxiliary_hidden = hidden.detach().requires_grad_()
+    (primary_hidden.square().sum() * 1e-3).backward()
+    (auxiliary_hidden.sum() * 1e-2).backward()
+    assert primary_hidden.grad is not None
+    assert auxiliary_hidden.grad is not None
+
+    hidden.backward(
+        _combine_balanced_hidden_gradients_(
+            primary_hidden.grad,
+            auxiliary_hidden.grad,
+        )
+    )
+
+    assert layer.lora_a.grad is not None
+    assert layer.lora_b.grad is not None
+    assert torch.isfinite(layer.lora_a.grad).all()
+    assert torch.isfinite(layer.lora_b.grad).all()
+    assert torch.linalg.vector_norm(layer.lora_a.grad) > 0
+    assert torch.linalg.vector_norm(layer.lora_b.grad) > 0
+
+
 def test_scaled_primary_gradient_is_restored_before_balancing() -> None:
     accumulator: list[torch.Tensor | None] = [None]
     _accumulate_balanced_parameter_gradients_(
@@ -1172,6 +1399,7 @@ def test_replay_plan_and_collation_preserve_variable_length_actions() -> None:
     assert batch.input_ids.shape == (1, 13)
     assert batch.attention_mask is None
     assert batch.cu_seqlens.tolist() == [0, 8, 13]
+    assert batch.sequence_boundaries == (0, 8, 13)
     assert batch.position_ids.tolist() == [
         [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4]
     ]
@@ -1375,9 +1603,10 @@ def test_training_config_bounds_parallel_rollout_context() -> None:
     assert args.top_k == 20
     assert args.prompts_per_rollout == 4
     assert args.samples_per_prompt == 16
-    assert args.max_new_tokens == 4_096
-    assert args.replay_checkpoint_interval == 2
-    assert args.replay_token_budget == 8_192
+    assert args.rollout_physical_batch_size == 0
+    assert args.max_new_tokens == 10_000
+    assert args.replay_checkpoint_interval == 4
+    assert args.replay_token_budget == 11_024
     assert args.replay_attention_backend == "sdpa"
     assert args.value_warmup_steps == 10
     assert args.replay_max_trajectories == 16
@@ -1389,17 +1618,31 @@ def test_training_config_bounds_parallel_rollout_context() -> None:
     assert args.nextlat_mse_coefficient == 1.0
     assert args.nextlat_kl_coefficient == 1.0
     assert args.train_nextlat is True
+    assert args.nextlat_trunk_balance == "parameter"
+    assert args.lora_initialization == "nora"
     assert args.gradient_clip_norm == 1.0
     assert args.actor_lr == pytest.approx(1e-6)
-    assert args.critic_lr == pytest.approx(2e-6)
+    assert args.critic_lr == pytest.approx(1e-5)
     assert not hasattr(args, "positive_coefficient")
     assert not hasattr(args, "nextlat_lr")
     assert args.optimizer_minibatches == 4
     args.max_new_tokens = 18_000
     with pytest.raises(ValueError, match="replay token budget"):
         _validate_args(args)
-    args = build_parser().parse_args(["--optimizer-minibatches", "3"])
-    with pytest.raises(ValueError, match="at least four"):
+    args = build_parser().parse_args(["--optimizer-minibatches", "1"])
+    _validate_args(args)
+    args = build_parser().parse_args(["--optimizer-minibatches", "0"])
+    with pytest.raises(ValueError, match="positive integer"):
+        _validate_args(args)
+    args = build_parser().parse_args(
+        ["--rollout-physical-batch-size", "65"]
+    )
+    with pytest.raises(ValueError, match="cannot exceed trajectories"):
+        _validate_args(args)
+    args = build_parser().parse_args(
+        ["--no-fast-rollout", "--rollout-physical-batch-size", "48"]
+    )
+    with pytest.raises(ValueError, match="require fast rollout"):
         _validate_args(args)
 
 
@@ -1428,14 +1671,37 @@ def test_resume_dataset_fingerprint_rejects_changed_bytes(tmp_path) -> None:
         validate_resume_dataset(resume, file_sha256(data))
 
 
+
+
+def test_resume_treats_missing_lora_initialization_as_legacy_standard() -> None:
+    prior_args = vars(build_parser().parse_args([]))
+    prior_args.pop("lora_initialization")
+    resume = {"args": prior_args, "pending_records": None}
+
+    standard_args = build_parser().parse_args(["--lora-initialization", "standard"])
+    validate_resume_configuration(resume, standard_args)
+
+    nora_args = build_parser().parse_args(["--lora-initialization", "nora"])
+    with pytest.raises(ValueError, match="lora_initialization"):
+        validate_resume_configuration(resume, nora_args)
+
+
 def test_resume_changes_runtime_gate_and_rollout_limit_between_batches() -> None:
     prior_args = build_parser().parse_args([])
     resumed_args = build_parser().parse_args(
         [
             "--max-new-tokens",
-            "8192",
+            "12000",
             "--min-rollout-tokens-per-second",
             "2800",
+            "--logit-chunk-tokens",
+            "256",
+            "--nextlat-kl-chunk-tokens",
+            "32",
+            "--nextlat-trunk-balance",
+            "hidden",
+            "--optimizer-minibatches",
+            "1",
         ]
     )
     resume = {"args": vars(prior_args), "pending_records": None}
@@ -1446,6 +1712,13 @@ def test_resume_changes_runtime_gate_and_rollout_limit_between_batches() -> None
     resume["pending_records"] = [object()]
     with pytest.raises(ValueError, match="max_new_tokens"):
         validate_resume_configuration(resume, resumed_args)
+
+    same_limit_args = build_parser().parse_args(
+        ["--optimizer-minibatches", "1"]
+    )
+    with pytest.raises(ValueError, match="optimizer_minibatches"):
+        validate_resume_configuration(resume, same_limit_args)
+
 
 def test_resume_reasserts_cli_learning_rates_on_every_optimizer_group() -> None:
     actor_parameters = [nn.Parameter(torch.zeros(())) for _ in range(2)]
@@ -1565,6 +1838,13 @@ def test_optimizer_minibatches_are_four_real_disjoint_updates() -> None:
     assert sorted(index for indices in minibatches for index in indices) == list(
         range(64)
     )
+
+
+def test_optimizer_minibatches_support_one_full_rollout_update() -> None:
+    torch.manual_seed(11)
+    minibatches = _optimizer_minibatches(64, 1)
+    assert len(minibatches) == 1
+    assert sorted(minibatches[0]) == list(range(64))
 
 
 def test_future_tensorboard_categories_have_at_most_twelve_charts() -> None:

@@ -141,14 +141,18 @@ def inspect_continuation(
         "rank": saved_args.get("lora_rank"),
         "alpha": saved_args.get("lora_alpha"),
         "targets": tuple(saved_args.get("lora_targets", ())),
+        "initialization": saved_args.get("lora_initialization", "standard"),
     }
     if not expected_lora_config["targets"]:
         from postraining.minicpm_vapo import DEFAULT_LORA_TARGETS
 
         expected_lora_config["targets"] = tuple(DEFAULT_LORA_TARGETS)
     for side, label in ((actor, "actor"), (critic, "critic")):
-        lora_config = _required_mapping(side["lora_config"], f"{label} LoRA config")
-        if dict(lora_config) != expected_lora_config:
+        lora_config = dict(
+            _required_mapping(side["lora_config"], f"{label} LoRA config")
+        )
+        lora_config.setdefault("initialization", "standard")
+        if lora_config != expected_lora_config:
             raise ValueError(f"checkpoint {label} LoRA config differs from saved args")
         for field in ("adapter", "nextlat"):
             state = _required_mapping(side[field], f"{label} {field}")
