@@ -99,6 +99,54 @@ class LoRALinear(nn.Module):
         return self.base(inputs) + update * self.scaling
 
 
+@torch.library.custom_op("parameter_golf::replay_silu_backward", mutates_args=())
+def _replay_silu_backward(gradient: Tensor, inputs: Tensor) -> Tensor:
+    # Keep the native fused derivative: decomposition changes bf16 rounding.
+    return torch.ops.aten.silu_backward.default(gradient, inputs)
+
+
+@_replay_silu_backward.register_fake
+def _fake_replay_silu_backward(gradient: Tensor, inputs: Tensor) -> Tensor:
+    return torch.empty_like(inputs)
+
+
+class _ReplaySiLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, inputs: Tensor) -> Tensor:
+        ctx.save_for_backward(inputs)
+        return F.silu(inputs)
+
+    @staticmethod
+    def backward(ctx: Any, gradient: Tensor) -> Tensor:
+        return _replay_silu_backward(gradient, ctx.saved_tensors[0])
+
+
+class _ReplaySiLU(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return _ReplaySiLUFunction.apply(inputs)
+
+
+def enable_replay_mlp_compilation(causal_lm: nn.Module) -> None:
+    """Compile replay MLPs without renaming parameters or changing SiLU backward."""
+    from transformers.activations import SiLUActivation
+    from postraining.invariant_linear import compile_invariant
+
+    layers = cast(Any, causal_lm.get_submodule("model")).layers
+    for layer in layers:
+        if not isinstance(layer.mlp.act_fn, (nn.SiLU, SiLUActivation, _ReplaySiLU)):
+            raise TypeError("compiled replay requires a SiLU MLP")
+    for layer in layers:
+        if (
+            isinstance(layer.mlp.act_fn, _ReplaySiLU)
+            and layer.mlp._compiled_call_impl is not None
+        ):
+            continue
+        layer.mlp.act_fn = _ReplaySiLU()
+        # nn.Module's compilation slot is excluded from deepcopy/serialization.
+        # A forward closure would keep an inference replica bound to the actor.
+        layer.mlp._compiled_call_impl = compile_invariant(layer.mlp._call_impl)
+
+
 def inject_lora(model: nn.Module, config: LoRAConfig) -> tuple[str, ...]:
     """Freeze ``model`` and replace every requested Llama projection exactly once."""
 

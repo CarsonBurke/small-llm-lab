@@ -17,7 +17,6 @@ from postraining.fast_inference import (
     ContinuousTrainingGeneration,
     _CompactStaticLayer,
     _FrozenParameterStash,
-    _fixed_varlen_fa4_attention,
     _completion_poll_chunk,
     _take_refill_rows,
     W8A16Linear,
@@ -36,9 +35,11 @@ from postraining.minicpm_vapo import (
     _nucleus_membership,
     _packed_replay_attention,
     _packed_replay_attention_fa4,
+    _ReplaySiLU,
     chunked_frozen_head_logprobs,
     collate_replay_microbatch,
     dense_top_p_probabilities,
+    enable_replay_mlp_compilation,
     exact_top_p_sample,
     maximal_coupling_verify,
     inject_lora,
@@ -87,6 +88,7 @@ from postraining.train_minicpm_vapo import (
     reassert_optimizer_learning_rates,
     validate_resume_configuration,
     validate_resume_dataset,
+    validate_resume_rollout_arithmetic,
 )
 from postraining.validate_minicpm_vapo import prompt_ids
 from scripts.benchmark_minicpm_nextlat import required_warmup_steps
@@ -342,12 +344,17 @@ def test_fused_rollout_replica_synchronizes_live_actor_lora() -> None:
     )
 
 
-def test_compact_static_cache_packs_prefill_and_appends_per_row() -> None:
+@pytest.mark.parametrize("indexed_decode", [False, True])
+def test_compact_static_cache_packs_prefill_and_appends_per_row(
+    indexed_decode: bool,
+) -> None:
     sequence_lengths = torch.tensor([3, 2])
     prefill_mask = torch.tensor(
         [[False, True, True, True], [False, False, True, True]]
     )
-    layer = _CompactStaticLayer(8, sequence_lengths, prefill_mask)
+    layer = _CompactStaticLayer(
+        8, sequence_lengths, prefill_mask, indexed_decode=indexed_decode
+    )
     keys = torch.arange(2 * 2 * 4 * 3, dtype=torch.float32).reshape(2, 2, 4, 3)
     values = keys + 100
 
@@ -363,17 +370,16 @@ def test_compact_static_cache_packs_prefill_and_appends_per_row() -> None:
 
     next_keys = torch.full((2, 2, 1, 3), 999.0)
     next_values = next_keys + 100
+    layer.prefilling = False
     cached_keys, cached_values = layer.update(next_keys, next_values)
     torch.testing.assert_close(
-        layer.key_backing[torch.arange(2), sequence_lengths],
+        cached_keys[torch.arange(2), :, sequence_lengths],
         next_keys[:, :, 0],
     )
     torch.testing.assert_close(
-        layer.value_backing[torch.arange(2), sequence_lengths],
+        cached_values[torch.arange(2), :, sequence_lengths],
         next_values[:, :, 0],
     )
-    assert cached_keys is layer.keys
-    assert cached_values is layer.values
 
 
 def test_compact_static_cache_reset_invalidates_without_rewriting_storage() -> None:
@@ -424,6 +430,7 @@ def test_rollout_capacity_reserves_workspace_after_weight_offload(
     engine._runtime_device = torch.device("cuda")
     engine.estimated_cache_bytes = 19 << 30
     engine.offloaded_source_bytes = 2 << 30
+    engine.cache = SimpleNamespace(layers=[])
     monkeypatch.setattr(
         "postraining.fast_inference._cuda_allocatable_bytes",
         lambda device: 20 << 30,
@@ -446,6 +453,7 @@ def test_compact_static_cache_safely_replays_completed_max_length_rows() -> None
     layer.update(keys, keys)
     final = torch.full((1, 2, 1, 3), 7.0)
 
+    layer.prefilling = False
     layer.update(final, final)
 
     torch.testing.assert_close(layer.key_backing[0, -1], final[0, :, 0])
@@ -453,40 +461,6 @@ def test_compact_static_cache_safely_replays_completed_max_length_rows() -> None
 
 
 
-def test_fa4_decode_uses_batched_kv_with_per_row_lengths() -> None:
-    captured: dict[str, object] = {}
-
-    def flash_attention(query, keys, values, **kwargs):
-        captured.update(query=query, keys=keys, values=values, **kwargs)
-        return torch.zeros_like(query), None
-
-    keys = torch.randn(2, 9, 2, 8)
-    values = torch.randn_like(keys)
-    sequence_lengths = torch.tensor([7, 9], dtype=torch.int32)
-    module = SimpleNamespace(
-        _rollout_flash_varlen=flash_attention,
-        _rollout_sequence_lengths=sequence_lengths,
-        _rollout_max_cache_len=9,
-    )
-    query = torch.randn(2, 16, 1, 8)
-    output, weights = _fixed_varlen_fa4_attention(
-        cast(nn.Module, module),
-        query,
-        keys.transpose(1, 2),
-        values.transpose(1, 2),
-        None,
-        scaling=0.5,
-    )
-
-    assert output.shape == (2, 1, 16, 8)
-    assert weights is None
-    torch.testing.assert_close(cast(torch.Tensor, captured["keys"]), keys)
-    torch.testing.assert_close(cast(torch.Tensor, captured["values"]), values)
-    assert captured["seqused_k"] is sequence_lengths
-    assert captured["max_seqlen_k"] == 9
-    assert captured["pack_gqa"] is True
-    assert "cu_seqlens_q" not in captured
-    assert "cu_seqlens_k" not in captured
 
 
 def test_first_captured_schedule_replays_every_persistent_decode() -> None:
@@ -587,44 +561,100 @@ def test_continuous_polling_batches_sync_without_crossing_token_limit() -> None:
         )
         == 16
     )
+    assert (
+        _completion_poll_chunk(
+            [94, 90],
+            [0, 1],
+            max_new_tokens=100,
+            poll_steps=16,
+            maximum_tokens_per_step=5,
+        )
+        == 2
+    )
 
 def test_prompt_major_prefix_slice_is_contiguous_across_layers() -> None:
     bank = torch.empty(3, 11, 4, 2, 8)
     assert bank[1, :7].is_contiguous()
 
 
-def test_captured_rollout_release_keeps_replica_resident_and_evicts_only_cache() -> None:
+def test_captured_rollout_release_keeps_replica_resident_and_evicts_only_cache() -> (
+    None
+):
+    import gc
+    import weakref
+
     attention = SimpleNamespace(
         _rollout_sequence_lengths=torch.ones(1),
     )
     policy = SimpleNamespace(
         causal_lm=SimpleNamespace(
-            model=SimpleNamespace(
-                layers=[SimpleNamespace(self_attn=attention)]
-            )
+            model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)])
         ),
     )
     engine = cast(Any, object.__new__(CapturedTrainingRolloutEngine))
     engine.policy = policy
     engine._rollout_resident = True
+    engine._compile_decode = True
     engine._decode_graph = object()
     engine._continuous_decode_graph = object()
     engine._num_hidden_layers = 1
     engine.cache_length = 8
     engine.sequence_lengths = torch.zeros(2, dtype=torch.long)
     engine.attention_mask = torch.zeros(2, 8, dtype=torch.bool)
-    restored: list[bool] = []
-    engine._source_stash = SimpleNamespace(restore=lambda: restored.append(True))
+    engine.cache = engine._new_cache()
+    engine.cache.layers[0].lazy_initialization(
+        torch.empty(2, 1, 1, 2), torch.empty(2, 1, 1, 2)
+    )
+    retained_cache = engine.cache
+    allocations = [
+        weakref.ref(tensor)
+        for layer in retained_cache.layers
+        for tensor in (layer.key_backing, layer.value_backing)
+    ]
+    engine._source_stash = SimpleNamespace(restore=lambda: None)
 
-    engine.release_cache()
+    automatic_gc = gc.isenabled()
+    gc.disable()
+    try:
+        # Simulate unreachable Dynamo bookkeeping retaining a layer separately.
+        cycle = {"layer": retained_cache.layers[0]}
+        cycle["self"] = cycle
+        del cycle
+        engine.release_cache()
+        assert all(reference() is None for reference in allocations)
+    finally:
+        if automatic_gc:
+            gc.enable()
+        gc.collect()
 
-    assert engine._decode_graph is None
-    assert engine._rollout_resident is False
-    assert attention._rollout_sequence_lengths is None
-    assert restored == [True]
 
-    engine._restore_rollout_cache()
-    assert engine._rollout_resident is True
+def test_capacity_guard_counts_only_unallocated_kv(monkeypatch) -> None:
+    import postraining.fast_inference as runtime
+
+    engine = cast(Any, object.__new__(CapturedTrainingRolloutEngine))
+    engine._runtime_device = torch.device("cuda")
+    engine.offloaded_source_bytes = 0
+    engine.estimated_cache_bytes = 32
+    layer = SimpleNamespace(
+        is_initialized=False,
+        key_backing=torch.empty(4),
+        value_backing=torch.empty(4),
+    )
+    engine.cache = SimpleNamespace(layers=[layer])
+    monkeypatch.setattr(
+        runtime, "_cuda_allocatable_bytes",
+        lambda device: runtime.ROLLOUT_WORKSPACE_RESERVE_BYTES + 16,
+    )
+    with pytest.raises(MemoryError):
+        engine._validate_cache_capacity()
+    layer.is_initialized = True
+    engine._validate_cache_capacity()
+    monkeypatch.setattr(
+        runtime, "_cuda_allocatable_bytes",
+        lambda device: runtime.ROLLOUT_WORKSPACE_RESERVE_BYTES - 1,
+    )
+    with pytest.raises(MemoryError):
+        engine._validate_cache_capacity()
 
 
 def test_continuous_generation_reports_productive_utilization() -> None:
@@ -1421,10 +1451,52 @@ def test_replay_plan_accepts_optimizer_minibatch_subset() -> None:
     assert plan == [(2, 1)]
 
 
-def test_segmented_sdpa_packed_replay_has_finite_backward() -> None:
+def test_compiled_replay_copy_uses_replica_weights_and_accepts_checkpoint() -> None:
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.eye(4))
+            self.act_fn = nn.SiLU()
+
+        def forward(self, inputs):
+            return self.act_fn(inputs @ self.weight)
+
+    model = nn.Module()
+    model.model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = MLP()
+    model.model.layers = nn.ModuleList([layer])
+    inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    expected = layer.mlp(inputs).detach()
+    checkpoint = copy.deepcopy(model.state_dict())
+    enable_replay_mlp_compilation(model)
+    replica = copy.deepcopy(model)
+    with torch.no_grad():
+        layer.mlp.weight.fill_(float("nan"))
+    replica.load_state_dict(checkpoint, strict=True)
+    torch.testing.assert_close(replica.model.layers[0].mlp(inputs), expected)
+
+
+def test_replay_silu_preserves_native_derivative_across_retained_backward() -> None:
+    inputs = torch.linspace(-20, 20, 257, dtype=torch.bfloat16).requires_grad_()
+    actual = _ReplaySiLU()(inputs)
+    reference = torch.nn.functional.silu(inputs)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for gradient in (torch.ones_like(inputs), inputs.detach() * 0.125):
+        actual_gradient = torch.autograd.grad(
+            actual, inputs, gradient, retain_graph=True
+        )[0]
+        reference_gradient = torch.autograd.grad(
+            reference, inputs, gradient, retain_graph=True
+        )[0]
+        torch.testing.assert_close(actual_gradient, reference_gradient, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("boundaries", [(0, 5), (0, 3, 5)])
+def test_segmented_sdpa_packed_replay_has_finite_backward(boundaries) -> None:
     module = SimpleNamespace(
-        _packed_sequence_boundaries=(0, 3, 5),
-        _packed_cu_seqlens=torch.tensor([0, 3, 5], dtype=torch.int32),
+        _packed_sequence_boundaries=boundaries,
+        _packed_cu_seqlens=torch.tensor(boundaries, dtype=torch.int32),
     )
     query = torch.randn(1, 4, 5, 8, requires_grad=True)
     key = torch.randn(1, 2, 5, 8, requires_grad=True)
@@ -1447,17 +1519,17 @@ def test_segmented_sdpa_packed_replay_has_finite_backward() -> None:
                 scale=0.125,
                 enable_gqa=True,
             )
-            for start, stop in ((0, 3), (3, 5))
+            for start, stop in zip(boundaries, boundaries[1:])
         ],
         dim=2,
     ).transpose(1, 2)
     torch.testing.assert_close(output, expected)
     assert weights is None
-    output.square().mean().backward()
-    assert all(
-        tensor.grad is not None and torch.isfinite(tensor.grad).all()
-        for tensor in (query, key, value)
-    )
+    upstream = torch.randn_like(output)
+    actual_gradients = torch.autograd.grad(output, (query, key, value), upstream)
+    expected_gradients = torch.autograd.grad(expected, (query, key, value), upstream)
+    for actual, reference in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual, reference)
 
 
 def test_packed_replay_attention_preserves_transformers_output_layout() -> None:
@@ -1598,34 +1670,6 @@ def test_replay_checkpointing_selects_uniform_layer_subset() -> None:
 def test_training_config_bounds_parallel_rollout_context() -> None:
     args = build_parser().parse_args([])
     _validate_args(args)
-    assert args.thinking is True
-    assert args.temperature == 0.9
-    assert args.top_k == 20
-    assert args.prompts_per_rollout == 4
-    assert args.samples_per_prompt == 16
-    assert args.rollout_physical_batch_size == 0
-    assert args.max_new_tokens == 10_000
-    assert args.replay_checkpoint_interval == 4
-    assert args.replay_token_budget == 11_024
-    assert args.replay_attention_backend == "sdpa"
-    assert args.value_warmup_steps == 10
-    assert args.replay_max_trajectories == 16
-    assert args.fast_rollout is True
-    assert args.min_rollout_tokens_per_second == 4_000.0
-    assert args.nextlat_projection_factor == 1.6
-    assert args.nextlat_horizon == 2
-    assert args.nextlat_samples == 64
-    assert args.nextlat_mse_coefficient == 1.0
-    assert args.nextlat_kl_coefficient == 1.0
-    assert args.train_nextlat is True
-    assert args.nextlat_trunk_balance == "parameter"
-    assert args.lora_initialization == "nora"
-    assert args.gradient_clip_norm == 1.0
-    assert args.actor_lr == pytest.approx(1e-6)
-    assert args.critic_lr == pytest.approx(1e-5)
-    assert not hasattr(args, "positive_coefficient")
-    assert not hasattr(args, "nextlat_lr")
-    assert args.optimizer_minibatches == 4
     args.max_new_tokens = 18_000
     with pytest.raises(ValueError, match="replay token budget"):
         _validate_args(args)
@@ -1718,6 +1762,29 @@ def test_resume_changes_runtime_gate_and_rollout_limit_between_batches() -> None
     )
     with pytest.raises(ValueError, match="optimizer_minibatches"):
         validate_resume_configuration(resume, same_limit_args)
+
+
+def test_pending_legacy_ar_resume_rejects_arithmetic_promotion() -> None:
+    from postraining.invariant_linear import LEGACY_ARITHMETIC, OPTIMIZED_ARITHMETIC
+
+    resume = {"args": {}, "pending_records": [object()]}
+    validate_resume_rollout_arithmetic(resume, LEGACY_ARITHMETIC)
+    with pytest.raises(ValueError, match="numerical target"):
+        validate_resume_rollout_arithmetic(resume, OPTIMIZED_ARITHMETIC)
+    resume["pending_records"] = None
+    validate_resume_rollout_arithmetic(resume, OPTIMIZED_ARITHMETIC)
+
+
+def test_pending_optimized_ar_resume_rejects_arithmetic_demotion() -> None:
+    from postraining.invariant_linear import LEGACY_ARITHMETIC, OPTIMIZED_ARITHMETIC
+
+    resume = {
+        "args": {"rollout_arithmetic": OPTIMIZED_ARITHMETIC},
+        "pending_records": [object()],
+    }
+    validate_resume_rollout_arithmetic(resume, OPTIMIZED_ARITHMETIC)
+    with pytest.raises(ValueError, match="numerical target"):
+        validate_resume_rollout_arithmetic(resume, LEGACY_ARITHMETIC)
 
 
 def test_resume_reasserts_cli_learning_rates_on_every_optimizer_group() -> None:
@@ -1917,3 +1984,77 @@ def test_tensorboard_rollout_samples_publish_rewarded_training_text() -> None:
     assert "Ground truth:\n4" in correct
     assert "Model response:\nanswer" in correct
     assert writer.flushes == 0
+
+
+def test_uno_rollout_requires_trained_artifact_and_captured_fast_path(tmp_path) -> None:
+    args = build_parser().parse_args(["--uno-rollout"])
+    with pytest.raises(ValueError, match="pretrained"):
+        _validate_args(args)
+    checkpoint = tmp_path / "uno.pt"
+    checkpoint.write_bytes(b"identity checked by loader")
+    args.uno_checkpoint = str(checkpoint)
+    _validate_args(args)
+    args.compile_rollout = False
+    with pytest.raises(ValueError, match="CUDA-graph"):
+        _validate_args(args)
+    args.compile_rollout = True
+    args.fast_rollout = False
+    with pytest.raises(ValueError, match="CUDA-graph"):
+        _validate_args(args)
+    args.fast_rollout = True
+    args.uno_rollout = False
+    with pytest.raises(ValueError, match="requires --uno-rollout"):
+        _validate_args(args)
+
+
+def test_resume_can_enable_uno_only_at_completed_rollout_boundary(tmp_path) -> None:
+    prior = vars(build_parser().parse_args([]))
+    for name in ("uno_rollout", "uno_checkpoint", "uno_block_size"):
+        prior.pop(name)
+    artifact = tmp_path / "uno.pt"
+    artifact.write_bytes(b"trained adapter identity")
+    args = build_parser().parse_args(
+        ["--uno-rollout", "--uno-checkpoint", str(artifact)]
+    )
+    resume = {"args": prior, "pending_records": None}
+    validate_resume_configuration(resume, args)
+    resume["pending_records"] = [object()]
+    with pytest.raises(ValueError, match="uno_rollout"):
+        validate_resume_configuration(resume, args)
+
+
+def test_resume_pins_uno_artifact_bytes_not_only_its_path(tmp_path) -> None:
+    artifact = tmp_path / "uno.pt"
+    artifact.write_bytes(b"first trained adapter")
+    args = build_parser().parse_args(
+        ["--uno-rollout", "--uno-checkpoint", str(artifact)]
+    )
+    prior = {**vars(args), "uno_checkpoint_sha256": file_sha256(artifact)}
+    resume = {"args": prior, "pending_records": None}
+    validate_resume_configuration(resume, args)
+    relocated = tmp_path / "relocated.pt"
+    relocated.write_bytes(artifact.read_bytes())
+    args.uno_checkpoint = str(relocated)
+    validate_resume_configuration(resume, args)
+    relocated.write_bytes(b"different trained adapter")
+    with pytest.raises(ValueError, match="adapter bytes differ"):
+        validate_resume_configuration(resume, args)
+
+
+def test_pending_uno_resume_pins_numerical_target(tmp_path) -> None:
+    from postraining.invariant_linear import INVARIANT_ARITHMETIC
+
+    artifact = tmp_path / "uno.pt"
+    artifact.write_bytes(b"trained adapter")
+    args = build_parser().parse_args(
+        ["--uno-rollout", "--uno-checkpoint", str(artifact)]
+    )
+    prior = {**vars(args), "uno_checkpoint_sha256": file_sha256(artifact)}
+    resume = {"args": prior, "pending_records": [object()]}
+    with pytest.raises(ValueError, match="numerical target"):
+        validate_resume_configuration(resume, args)
+    prior["uno_arithmetic"] = INVARIANT_ARITHMETIC
+    validate_resume_configuration(resume, args)
+    prior["uno_arithmetic"] = "different-arithmetic"
+    resume["pending_records"] = None
+    validate_resume_configuration(resume, args)

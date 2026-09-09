@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import gc
 
 from collections.abc import Callable, Sequence
 from importlib import import_module
@@ -18,12 +19,22 @@ from postraining.minicpm_vapo import (
     MiniCPMVAPOPolicy,
     merge_lora_for_inference,
 )
+from postraining.invariant_linear import (
+    INVARIANT_ARITHMETIC,
+    LEGACY_ARITHMETIC,
+    OPTIMIZED_ARITHMETIC,
+    InvariantLinear,
+    compile_invariant,
+    install_invariant_linears,
+)
+from postraining.invariant_attention import INVARIANT_ATTENTION, invariant_suffix_attention
 
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 ROLLOUT_WORKSPACE_RESERVE_BYTES = 1 << 30
+DEFAULT_OPTIMIZED_DECODE = True
 
 
 class _FrozenParameterStash:
@@ -278,10 +289,14 @@ class _CompactStaticLayer(StaticLayer):
         max_cache_len: int,
         sequence_lengths: Tensor,
         prefill_mask: Tensor,
+        *,
+        indexed_decode: bool = False,
     ) -> None:
         super().__init__(max_cache_len)
         self.sequence_lengths = sequence_lengths
         self.prefill_mask = prefill_mask
+        self.prefilling = True
+        self.indexed_decode = indexed_decode
         self.key_backing: Tensor
         self.value_backing: Tensor
 
@@ -321,6 +336,16 @@ class _CompactStaticLayer(StaticLayer):
         """Invalidate by length; stale KV beyond each sequence is never read."""
         self.cumulative_length.zero_()
 
+    def _append_suffix(
+        self, key_states: Tensor, value_states: Tensor, positions: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        # index_put is reinplaceable by Inductor; functional scatter is not.
+        # Derive views here instead of capturing aliases of mutated backings.
+        rows = torch.arange(key_states.size(0), device=key_states.device)[:, None]
+        self.key_backing.index_put_((rows, positions), key_states.transpose(1, 2))
+        self.value_backing.index_put_((rows, positions), value_states.transpose(1, 2))
+        return self.key_backing.permute(0, 2, 1, 3), self.value_backing.permute(0, 2, 1, 3)
+
     def update(
         self,
         key_states: Tensor,
@@ -331,7 +356,7 @@ class _CompactStaticLayer(StaticLayer):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
         width = key_states.shape[-2]
-        if width > 1:
+        if self.prefilling:
             valid = self.prefill_mask[:, :width]
             compact_positions = valid.cumsum(dim=1).sub(1)
             rows, source_positions = valid.nonzero(as_tuple=True)
@@ -348,6 +373,14 @@ class _CompactStaticLayer(StaticLayer):
             return key_states, value_states
 
         safe_lengths = self.sequence_lengths.clamp_max(self.max_cache_len - 1)
+        if self.indexed_decode:
+            keys, values = self._append_suffix(
+                key_states, value_states, safe_lengths[:, None]
+            )
+            self.cumulative_length.copy_(
+                self.sequence_lengths.max().add(1).clamp_max(self.max_cache_len)
+            )
+            return keys, values
         key_indices = safe_lengths[:, None, None, None].expand(
             -1, 1, self.num_heads, self.k_head_dim
         )
@@ -385,7 +418,7 @@ def _fixed_varlen_fa4_attention(
     scaling: float | None = None,
     **kwargs,
 ) -> tuple[Tensor, None]:
-    if query.shape[2] > 1:
+    if not getattr(module, "_rollout_cached_append", False):
         from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
         if attention_mask is not None:
@@ -439,6 +472,7 @@ def build_fused_rollout_replica(
     ALL_ATTENTION_FUNCTIONS.register(
         implementation, _fixed_varlen_fa4_attention
     )
+    ALL_ATTENTION_FUNCTIONS.register(INVARIANT_ATTENTION, invariant_suffix_attention)
     ALL_MASK_ATTENTION_FUNCTIONS.register(implementation, _hybrid_fa4_mask)
     replica.causal_lm.config._attn_implementation = implementation
     replica.causal_lm.gradient_checkpointing_disable()
@@ -948,9 +982,10 @@ def _completion_poll_chunk(
     *,
     max_new_tokens: int,
     poll_steps: int,
+    maximum_tokens_per_step: int = 1,
 ) -> int:
-    """Batch host synchronization without crossing any known token limit."""
-    if not occupied_slots or max_new_tokens < 1 or poll_steps < 1:
+    """Poll when a lane can first reach its known output limit."""
+    if not occupied_slots or min(max_new_tokens, poll_steps, maximum_tokens_per_step) < 1:
         raise ValueError("completion polling dimensions must be positive")
     remaining = min(
         max_new_tokens - host_output_positions[slot]
@@ -958,12 +993,17 @@ def _completion_poll_chunk(
     )
     if remaining < 1:
         raise ValueError("occupied rollout lane already exhausted its token limit")
-    return min(poll_steps, remaining)
+    remaining_steps = (remaining + maximum_tokens_per_step - 1) // maximum_tokens_per_step
+    return min(poll_steps, remaining_steps)
 
 
 
 class CapturedTrainingRolloutEngine:
     """Persistent fused rollout replica with a captured full-batch decode step."""
+
+    _invariant_projections: tuple[InvariantLinear, ...] = ()
+    invariant_decode: bool = False
+    optimized_decode: bool = False
 
     def __init__(
         self,
@@ -978,6 +1018,8 @@ class CapturedTrainingRolloutEngine:
         top_p: float,
         compile_decode: bool,
         physical_batch_size: int | None = None,
+        invariant_decode: bool = False,
+        optimized_decode: bool = DEFAULT_OPTIMIZED_DECODE,
     ) -> None:
 
         logical_batch_size = prompts_per_rollout * samples_per_prompt
@@ -993,11 +1035,31 @@ class CapturedTrainingRolloutEngine:
             raise ValueError("rollout stop ids cannot be empty")
         if temperature <= 0 or top_k < 1 or not 0 < top_p <= 1:
             raise ValueError("sampling dimensions are invalid")
+        if invariant_decode and not compile_decode:
+            raise ValueError("invariant rollout requires compiled CUDA decode")
 
         self.source_policy = source_policy
         self.policy, self.fused_projection_groups = build_fused_rollout_replica(
             source_policy
         )
+        self.invariant_decode = invariant_decode
+        # An explicit eager request keeps the ordinary compatibility path.
+        self.optimized_decode = invariant_decode or (optimized_decode and compile_decode)
+        self.arithmetic = (
+            INVARIANT_ARITHMETIC
+            if invariant_decode
+            else OPTIMIZED_ARITHMETIC if self.optimized_decode else LEGACY_ARITHMETIC
+        )
+        if invariant_decode:
+            self._invariant_projections = install_invariant_linears(
+                self.policy.causal_lm
+            )
+            self._pending = torch.zeros(
+                physical_batch_size,
+                dtype=torch.long,
+                device=next(self.policy.parameters()).device,
+            )
+            self._prompt_last_tokens: Tensor | None = None
         self.prompts_per_rollout = prompts_per_rollout
         self.samples_per_prompt = samples_per_prompt
         self.batch_size = physical_batch_size
@@ -1181,6 +1243,9 @@ class CapturedTrainingRolloutEngine:
             hidden = advance(token, cache)
             return self.policy.logits(hidden)
 
+        compile_forward = compile_invariant if self.optimized_decode else (
+            lambda function: torch.compile(function, fullgraph=False)
+        )
         self.sample_tokens = (
             torch.compile(sample_tokens, fullgraph=True)
             if compile_decode
@@ -1190,14 +1255,46 @@ class CapturedTrainingRolloutEngine:
             torch.compile(sample, fullgraph=True) if compile_decode else sample
         )
         self.decode = (
-            torch.compile(decode, fullgraph=False) if compile_decode else decode
+            compile_forward(decode)
+            if compile_decode
+            else decode
         )
         self.decode_without_statistics = (
-            torch.compile(decode_without_statistics, fullgraph=False)
+            compile_forward(decode_without_statistics)
             if compile_decode
             else decode_without_statistics
         )
+        if invariant_decode:
 
+            def predict_pending() -> Tensor:
+                hidden = self.policy.cached_hidden(
+                    self._pending[:, None],
+                    past_key_values=self.cache,
+                    cache_position=self.cache_position,
+                    position_ids=self.sequence_lengths[:, None],
+                )[:, 0]
+                return self.policy.logits(hidden)
+
+            def commit_pending(token: Tensor) -> None:
+                destination = self.output_position.clamp_max(
+                    self.generated.size(1) - 1
+                )[:, None]
+                previous = self.generated.gather(1, destination).squeeze(1)
+                self.generated.scatter_(
+                    1, destination, torch.where(self.active, token, previous)[:, None]
+                )
+                self._pending.copy_(torch.where(self.active, token, self._pending))
+                step = self.active.long()
+                self.sequence_lengths.add_(step)
+                self.output_position.add_(step)
+                self.position_ids[:, 0].copy_(self.sequence_lengths)
+                stopped = (token[:, None] == self.stop_tensor[None]).any(-1)
+                self.active.logical_and_(
+                    ~stopped & (self.output_position < self.response_limit)
+                )
+
+            self._predict_pending = compile_invariant(predict_pending)
+            self._commit_pending = torch.compile(commit_pending, fullgraph=True)
 
     def _new_cache(self) -> Cache:
         return Cache(
@@ -1206,6 +1303,7 @@ class CapturedTrainingRolloutEngine:
                     self.cache_length,
                     self.sequence_lengths,
                     self.attention_mask,
+                    indexed_decode=self.optimized_decode or self.invariant_decode,
                 )
                 for _ in range(self._num_hidden_layers)
             ]
@@ -1219,13 +1317,17 @@ class CapturedTrainingRolloutEngine:
 
     def _validate_cache_capacity(self) -> None:
         available_bytes = _cuda_allocatable_bytes(self._runtime_device)
-        required_bytes = (
-            self.estimated_cache_bytes + ROLLOUT_WORKSPACE_RESERVE_BYTES
+        resident_cache_bytes = sum(
+            layer.key_backing.nbytes + layer.value_backing.nbytes
+            for cache_layer in self.cache.layers
+            if (layer := cast(_CompactStaticLayer, cache_layer)).is_initialized
         )
+        additional_cache_bytes = self.estimated_cache_bytes - resident_cache_bytes
+        required_bytes = additional_cache_bytes + ROLLOUT_WORKSPACE_RESERVE_BYTES
         if required_bytes > available_bytes:
             raise MemoryError(
                 "captured rollout requires "
-                f"{self.estimated_cache_bytes / 2**30:.2f} GiB of KV plus "
+                f"{additional_cache_bytes / 2**30:.2f} GiB of additional KV plus "
                 f"{ROLLOUT_WORKSPACE_RESERVE_BYTES / 2**30:.2f} GiB workspace, "
                 f"but only {available_bytes / 2**30:.2f} GiB is allocatable "
                 f"after offloading {self.offloaded_source_bytes / 2**30:.2f} GiB "
@@ -1252,6 +1354,7 @@ class CapturedTrainingRolloutEngine:
     def _bind_flash_cache(self) -> None:
         import transformers.modeling_flash_attention_utils as flash_utils
 
+        self._set_invariant_decode(True)
         attention_layers = self.policy.causal_lm.model.layers
         if len(attention_layers) != len(self.cache.layers):
             raise RuntimeError("rollout policy and cache layer counts differ")
@@ -1263,6 +1366,8 @@ class CapturedTrainingRolloutEngine:
             if not cache_layer.is_initialized:
                 raise RuntimeError("rollout cache was not initialized by prefill")
             attention = cast(Any, decoder_layer.self_attn)
+            cache_layer.prefilling = False
+            attention._rollout_cached_append = True
             attention._rollout_flash_varlen = flash_utils._flash_varlen_fn
             attention._rollout_sequence_lengths = self.flash_sequence_lengths
             attention._rollout_max_cache_len = self.cache_length
@@ -1277,13 +1382,29 @@ class CapturedTrainingRolloutEngine:
             for decoder_layer in self.policy.causal_lm.model.layers:
                 attention = cast(Any, decoder_layer.self_attn)
                 attention._rollout_sequence_lengths = None
+            # Dynamo's ModelOutput bookkeeping can retain an obsolete Cache
+            # until cyclic GC. Release its GPU payload at this phase boundary.
+            self.cache.layers.clear()
             self.cache = self._new_cache()
             self._rollout_resident = False
+            if self._compile_decode:
+                # Traced layer/tensor aliases can also survive in unreachable
+                # Dynamo cycles. Collect before allocating the restored actor.
+                gc.collect()
         self._source_stash.restore()
+
+    def _set_invariant_decode(self, decoding: bool) -> None:
+        if self.optimized_decode or self.invariant_decode:
+            self.policy.causal_lm.config._attn_implementation = (
+                INVARIANT_ATTENTION if decoding else "parameter_golf_fa4_decode"
+            )
+        for projection in self._invariant_projections:
+            projection.decoding = decoding
 
     def _prepare_prompts(
         self, prompt_ids_cpu: Sequence[Tensor]
     ) -> tuple[Tensor, Tensor, int]:
+        self._set_invariant_decode(False)
         if len(prompt_ids_cpu) != self.prompts_per_rollout:
             raise ValueError("rollout prompt count differs from the configured batch")
         lengths = [prompt.numel() for prompt in prompt_ids_cpu]
@@ -1292,6 +1413,10 @@ class CapturedTrainingRolloutEngine:
         prompt_width = max(lengths)
         if prompt_width >= self.cache_length:
             raise ValueError("prompt exhausts the rollout cache")
+        for layer in self.cache.layers:
+            cast(_CompactStaticLayer, layer).prefilling = True
+        for layer in self.policy.causal_lm.model.layers:
+            cast(Any, layer.self_attn)._rollout_cached_append = False
 
         device = self.generated.device
         pad_token_id = int(self.policy.causal_lm.config.pad_token_id)
@@ -1461,6 +1586,16 @@ class CapturedTrainingRolloutEngine:
             )[:, -1]
             self._bind_flash_cache()
             logits = self.policy.logits(hidden)
+            if self.invariant_decode:
+                # Prefill and decode have different numerical geometry. Recompute
+                # the final prompt token through the same target as every suffix.
+                self._pending.copy_(prompt_batch[:, -1])
+                self.sequence_lengths.sub_(1)
+                self.flash_sequence_lengths.sub_(1)
+                if collect_statistics:
+                    logits = self._predict_pending()
+                    self.sequence_lengths.add_(1)
+                    self.flash_sequence_lengths.add_(1)
             state_values = (
                 self.policy.rollout_values(hidden) if collect_statistics else None
             )
@@ -1530,6 +1665,9 @@ class CapturedTrainingRolloutEngine:
         collect_values: bool,
         storage_device: torch.device | str,
     ) -> PromptPrefixBank:
+        self._set_invariant_decode(False)
+        for layer in self.policy.causal_lm.model.layers:
+            cast(Any, layer.self_attn)._rollout_cached_append = False
         if not prompt_ids_cpu:
             raise ValueError("prompt prefix bank cannot be empty")
         if prefill_batch_prompts < 1:
@@ -1543,6 +1681,10 @@ class CapturedTrainingRolloutEngine:
         prompt_width = int(lengths.max())
         if prompt_width >= self.cache_length:
             raise ValueError("prompt prefix bank exhausts the rollout cache")
+        if self.invariant_decode:
+            self._prompt_last_tokens = torch.stack(
+                [prompt[-1] for prompt in prompt_ids_cpu]
+            ).to(self._runtime_device)
 
         device = self.generated.device
         bank_device = torch.device(storage_device)
@@ -1761,8 +1903,21 @@ class CapturedTrainingRolloutEngine:
                 device, non_blocking=True
             )
         self.active.index_fill_(0, slot_ids, True)
+        if self.invariant_decode:
+            if self._prompt_last_tokens is None:
+                raise RuntimeError("invariant admission requires prompt token identity")
+            self.sequence_lengths.index_fill_(0, slot_ids, length - 1)
+            self.flash_sequence_lengths.index_fill_(0, slot_ids, length)
+            self.position_ids.index_fill_(0, slot_ids, length - 1)
+            self._pending[slot_ids] = self._prompt_last_tokens[prompt_index]
 
     def _continuous_split_decode_step(self) -> None:
+        if self.invariant_decode:
+            self.sequence_lengths.masked_fill_(~self.active, 0)
+            self.flash_sequence_lengths.copy_((self.sequence_lengths + 1).int())
+            logits = self._predict_pending()
+            self._commit_pending(self.sample_tokens(logits))
+            return
         token = self.sample_tokens(self._graph_logits)
         next_logits = self.decode_without_statistics(token, self.cache)
         self._graph_logits.copy_(next_logits)
@@ -1907,6 +2062,7 @@ class CapturedTrainingRolloutEngine:
                 occupied_slots,
                 max_new_tokens=max_new_tokens,
                 poll_steps=completion_poll_steps,
+                maximum_tokens_per_step=getattr(self, "_output_slots_per_cycle", 1),
             )
             for _ in range(decode_chunk):
                 self._continuous_decode_once()
@@ -1997,11 +2153,15 @@ class CapturedTrainingRolloutEngine:
                             - 1
                         )
                         // self.samples_per_prompt,
-                        "scheduled_tokens": decode_steps * self.batch_size,
+                        "scheduled_tokens": (
+                            decode_steps * self.batch_size
+                            * getattr(self, "_output_slots_per_cycle", 1)
+                        ),
                         "useful_completed_tokens": useful_tokens,
                         "wall_seconds": wall_seconds,
                         "scheduled_tokens_per_second": (
                             decode_steps * self.batch_size
+                            * getattr(self, "_output_slots_per_cycle", 1)
                         )
                         / max(wall_seconds, 1e-9),
                         "peak_vram_bytes": torch.cuda.max_memory_allocated(
@@ -2026,7 +2186,10 @@ class CapturedTrainingRolloutEngine:
             decode_seconds=time.perf_counter() - prefill_complete,
             decode_steps=decode_steps,
             useful_tokens=useful_tokens,
-            capacity_row_steps=decode_steps * self.batch_size,
+            capacity_row_steps=(
+                decode_steps * self.batch_size
+                * getattr(self, "_output_slots_per_cycle", 1)
+            ),
             admission_events=admission_events,
             minimum_active_rows_with_backlog=minimum_active_with_backlog,
         )
