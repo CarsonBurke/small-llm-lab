@@ -2,9 +2,45 @@
 
 Paper: *Unlocking Lossless Speedups in LLMs via Discrete Diffusion*, Sahoo et al.,
 arXiv:2609.04010v1 (3 Sep 2026), IFM / UIUC / Cornell Tech / Harvard / Cerebras.
-Filed at `papers/uno_diffusion_augmented_2609.04010v1.pdf`. Code/checkpoints: https://s-sahoo.com/uno
+Filed at `papers/uno_diffusion_augmented_2609.04010v1.pdf`. Paper:
+https://arxiv.org/abs/2609.04010. Code/checkpoints: https://s-sahoo.com/uno
 
-Status: **read-only investigation. No code changed. Nothing queued.**
+Status, **2026-09-08 numerical investigation**: opt-in distillation and captured
+Ψ-Spec rollout are implemented; ordinary AR remains the default. The user selected
+a shared, width-invariant bf16 target for Uno and its matched AR reference, rather
+than requiring the legacy cuBLAS/Inductor rounding schedule. CPU contracts pass
+(96 tests). Full-model CUDA qualification job5646 passed bit-identical serial/block
+logits, clean KV and transformed sampling laws, including after actor-weight refresh.
+Invariant decoding now requires complete compilation; the old eager-fallback probes
+are not qualified runtime evidence. Three-arm fixture benchmark job5647 measured
+0.932× invariant AR and1.493× legacy AR: the ≥1.25× dual gate correctly failed.
+No full adapter-learning or RL campaign has started; trained benefit remains unproven.
+
+**Subsequent decision:** Uno training/qualification is vetoed until better hardware
+and explicit reauthorization. Standalone AR now defaults to optimized compilation
+and KV writes with ordinary cuBLAS GEMMs, not the invariant Uno arithmetic.
+Job 5706 found invariant GEMMs slower; job 5711 measured 3.33× useful rollout
+throughput versus legacy at a 10,000-token cap. Its small quality sample was
+22/64 optimized versus 26/64 legacy: quality neutrality is not established.
+See [current MiniCPM decisions](../postraining/TODO_MINICPM5.md).
+Future Uno adoption must also beat the new optimized production AR baseline,
+not merely the historical legacy and invariant controls below.
+
+Operational workflow: [MiniCPM Uno instructions](../postraining/README.md#opt-in-uno-diffusion-assisted-rollouts).
+Implementation is in `postraining/uno.py`, `postraining/uno_speculative.py`,
+`postraining/invariant_linear.py`, `postraining/invariant_attention.py`,
+`scripts/train_minicpm_uno.py`, and `scripts/benchmark_minicpm_uno.py`.
+Enable only with `--uno-rollout --uno-checkpoint ... --uno-block-size 4` after
+qualification. The verifier uses the current actor's weights with an explicit
+numerical contract; diffusion weights remain separate and frozen. Replay likelihoods
+remain unchanged. Recovery pins both checkpoint bytes and the Uno arithmetic version.
+
+Reference implementation: [`ifm-ai/uno` at
+`46fbdb66f026bae9c68a1e5a3f97a17c7805c778`](https://github.com/ifm-ai/uno/tree/46fbdb66f026bae9c68a1e5a3f97a17c7805c778).
+Its release also advertises a distinct 1B checkpoint; that is not a MiniCPM adapter
+or evidence for this rank48 transfer recipe. The implementation uses the released
+paired-mask/gated-LoRA/TV insights, while retaining this repository's fused actor,
+production sampling law and continuous scheduler.
 
 ---
 
@@ -20,10 +56,17 @@ Define a high-quality **AR** distribution, then learn to draw multiple tokens in
 | AR weights | θ_AR | response quality; the verifier | standard NTP pretrain → SFT → RL |
 | Diffusion weights | θ_Δ | generation speed; the drafter | LoRA adapters, one *Diffusion Distillation* phase, θ_AR frozen |
 
-The draft pathway is `θ_AR + θ_Δ`; the verify pathway is `θ_AR` alone. Because θ_AR is never
-modified, rejection sampling against it is **exactly lossless** — unlike d-LLMs
-(DiffusionGemma, Nemotron-Labs-Diffusion) and self-speculative conversions (TiDAR), which
-mutate base weights and are therefore lossy.
+The draft pathway is `θ_AR + θ_Δ`; the verify pathway is `θ_AR` alone.
+**Losslessness comes from correct rejection sampling against the current target distribution**,
+not from freezing weights alone. Freezing θ_AR during distillation preserves the original
+target; RL may subsequently change it. Correct proposal probabilities, target sampling
+transforms, clean KV state, and verifier numerics are still required. “Lossless” means equality
+in distribution in exact arithmetic, not identical sampled IDs for the same RNG seed.
+
+The paper explicitly acknowledges “sampling randomness and numerical nondeterminism”
+in §5.2.1. Its pinned runtime uses ordinary `F.linear` with separate width-one and
+width-B graphs; it does not provide a shape-invariant GEMM solution. Its mathematical
+guarantee is not evidence of equality to a different native bf16 implementation.
 
 Distinguishing properties vs. speculative decoding: no separate draft model, **one shared KV
 cache** (EAGLE-3 and DFlash each keep two), fewer added parameters, lower peak memory, and
@@ -53,11 +96,12 @@ Objective (Eq. 3): `L(θ_Δ) = α·L_DCD + β·L_TV`.
   so the entire trajectory is distilled into a single step mapping fully corrupt `z_1 ~ π^L`
   to clean `x`, done blockwise over `N` blocks of size `B`.
   `L_DCD = Σ_b Σ_ℓ KL( x_{θ_Δ,θ_AR}^{(N+b,ℓ)}([x,z_1]) ‖ x_{θ_AR}^{(b,ℓ)}([x,z_1]) )`.
-- **Total-variation loss** — the term that actually matters:
-  `L_TV = Σ_b Σ_ℓ | x_{θ_Δ,θ_AR}^{(N+b,ℓ)} − x_{θ_AR}^{(b,ℓ)} |`.
-  Justified by Leviathan et al. Cor. 3.6: minimizing blockwise TV distance between draft and
-  target maximizes the expected accepted-prefix length. This is a *direct* optimization of
-  acceptance, not a proxy.
+- **Total-variation loss:** the paper sums vocabulary L1 distances, equal to twice conventional
+  TV. For a fixed conditioning context, maximal-coupling acceptance is exactly
+  `Σ_v min(p_v,q_v) = 1 − TV(p,q)` ([Leviathan et al., §3.2](https://proceedings.mlr.press/v202/leviathan23a.html)).
+  This directly aligns the local objective with acceptance. It does **not** prove that minimizing
+  an unweighted, teacher-forced block loss globally maximizes on-policy accepted-prefix length.
+  That expectation depends on all preceding accept events and the inference context distribution.
 - **Single forward pass for teacher and student.** Concatenate `[x, z_1]` (hence context
   `2·L`), use a **block-causal mask** (causal within `x`; causal within each noisy block
   `z_1^{(b)}`; `z_1^{(b)}` additionally attends to all preceding clean blocks `x^{(<b)}`), and
@@ -76,17 +120,19 @@ Single-step draft, AR verify. Algorithm 1 (Suppl. B.3), differences vs. Leviatha
 3: x_{L+1} ~ q0                             # [free clean token, drawn from AR weights only]
 4: x̃ ~ q                                    # [B-1 draft tokens sampled in parallel]
 5: p ← x_{θAR}([x_{L+1}, x̃]; x)             # AR verifier pass
-6: r ~ ∏ U[0,1]
-7: n ← min({ i : r_i > min(1, p_i/q_i) } ∪ {B})
+6: r ~ ∏_{i=1}^{B-1} U[0,1]
+7: n ← min({ i ∈ 1..B-1 : r_i > min(1, p_i[x̃_i]/q_i[x̃_i]) } ∪ {B})
 8-12: if n = B: z̃ ~ p_B  else  z̃ ~ Norm([p_n − q_n]_+)
 13: return [x, x_{L+1}, x̃_{1..n-1}, z̃]
 ```
 
 Key structural facts:
-- **Position 1 is drafted with base AR weights only**, so it matches the verifier exactly and
-  is *always accepted*. Combined with the residual resample, even total rejection yields **2**
-  output tokens; full acceptance yields `B+1`. Hence `1 ≤ TPF ≤ (B+1)/2`, and
-  `τ = 2·TPF` tokens per step (a step = 1 draft forward + 1 verify forward).
+- **Position 1 is drawn directly from the current AR target**, with diffusion adapters disabled
+  and only clean causal KV visible. It needs no accept/reject test. In an unterminated cycle,
+  immediate rejection then emits **2** tokens; full acceptance emits `B+1`.
+  Hence `1 ≤ TPF ≤ (B+1)/2`, and `τ = 2·TPF` for two forwards per cycle.
+  EOS, remaining output budget, or context capacity can truncate the emitted block below this
+  floor. TPF counts forwards, not their wall-clock cost; TPF ≥ 1 does not guarantee speedup.
 - The clean/noisy logit split within the draft pass is required to avoid distribution shift
   (θ_Δ is trained only on corrupted positions) and is realized by gated LoRA.
 - **Linear sampler**: one candidate, sampled from the per-position marginals. Best for *system*
@@ -106,7 +152,7 @@ Two settings: from-scratch **Uno** (8B: 36L, d=4096, MLP 12288, 32Q/8KV, head 12
 
 | | Uno (from scratch) | UnoQwen |
 |---|---|---|
-| LoRA rank / α | 128 / 256 (α/r = 64 chosen for Uno) | 128 / 2048 (α/r = 16 chosen) |
+| LoRA rank / α, main text | 128 / 256 (α/r = 2) | 128 / 256 (α/r = 2) |
 | Targets | **every** projection (Q,K,V,O,gate,up,down) | same |
 | Trainable | — | 0.35B (4.4% of 8B) |
 | Tokens | 7B (SFT-distribution) | 14.7B = 3 epochs OpenThoughts3-1.2M |
@@ -116,36 +162,56 @@ Two settings: from-scratch **Uno** (8B: 36L, d=4096, MLP 12288, 32Q/8KV, head 12
 | Loss | α=0.01, β=1 | α=0, β=1 |
 | Wall clock | ~60 h × 64 H200 | ~32 h × 32 H200 |
 
+**V1 recipe inconsistency, with a released reference now available:** §§5.1.2 and
+5.2.2 specify α=256 at r=128, while Appendix C.6.4 selects α/r=64 for Uno and 16 for
+UnoQwen. The pinned release's UnoQwen reproduction uses r128/α2048, TV-only,
+lr1e-5, global batch128 and 562 warmup steps, consistent with the appendix's
+UnoQwen scaling—not the main-text α256. The shorter MiniCPM pilot's r48/α3072,
+effective batch64 and 2% token warmup remain explicit candidate choices.
+
 **Throughput (Table 7, 1K/8K test, H200)** — Uno 5255 sys / 383 per-req vs base AR 3577 / 176.
 So **1.47× system throughput at max batch, 2.18× per-request**. DiffusionGemma-26B-A4B is
 faster at batch 1 (836) but collapses in aggregate (1136) and loses badly on accuracy.
 
 **Batch-size scaling (Table 18, Qwen3-8B, concurrency 64)** — Uno B4 5733 / B8 5600 / B16 4112
-vs AR 3662. Optimum is **small B at high concurrency**: B=4 wins at C=64, B=16 wins at C≤4.
+vs AR 3662 system tok/s. Among these linear settings, B=4 wins at C=64 and B=16 at C≤4.
+Including trees, B16,V32 wins at C=1 and C=2; linear B16 wins at C=4.
+
+These are the paper's **synthetic 1K/8K timing tests**: random inputs and a prescribed average
+acceptance measured separately on benchmarks (§5). They are not end-to-end continuous-refill
+rollouts. Table 18 contains both system and per-user rows despite its per-request caption.
+Table 17's caption calls its values “unfiltered,” whereas §5.2.1/C.1.2 specify top-p=.95,
+top-k=50 at temperature 1; retain that source ambiguity rather than infer a filtering benefit.
 
 **Acceptance (Table 17a, temp = 1, linear sampler)** — τ: B4 3.89, B8 4.94, B16 5.42.
 Tree B16,V32 5.97; B16,V60 6.11. At temp = 0: B4 4.27, B16 7.11, tree B16/V60 8.37.
 Math and coding are the highest-τ domains (MATH500 B16 τ=6.26; MBPP B16 τ=5.20).
 
 **Ablations (§5.2.4, Tables 12–15)** — these are the actionable ones:
-1. **Loss**: TV-only 2.39 > 0.01·KL+TV 2.40 ≈ TV-only, ≫ KL-only 2.22 = KL+TV 2.23. KL is
-   naturally ~10× larger in magnitude and *swamps* TV unless downweighted. **TV is the term
-   that buys acceptance.**
-2. **Curriculum**: ramping B 2→16 gives 2.71 vs 2.65 for fixed B=16. Small effect.
+1. **Loss**: 0.01·KL+TV 2.40 ≈ TV-only 2.39 > KL+TV 2.23 ≈ KL-only 2.22 (Table 12;
+   the body rounds/reports KL-only as 2.23). KL is ~10× larger in magnitude. This supports
+   TV as a promising objective in that experiment, not a proven repair for NextLat.
+2. **Curriculum**: both arms first train ½ epoch at B=2 and ½ epoch at B=4. Ramping the
+   remaining two epochs through B=6,8,12,16 gives 2.71 versus 2.65 for two epochs at B=16.
 3. **LoRA placement**: all projections 2.39 > QKVO 2.38 ≈ O-only 2.38 > QV 2.26 > Q-only 2.14,
    at matched 349M parameters. Spread beats concentration, weakly.
-4. **Rank**: r 128→256 gives 2.39→2.47 for 2× the parameters and 2× the draft cost.
-5. **α/r ratio matters far more than rank**: at 1 epoch, α/r = 2→64 lifts TPF 2.39→2.63
-   (+10%). Optimum shifts with horizon: α/r = 64 at 1 epoch, 16 at 3 epochs.
-6. **1 epoch reaches ~97% of 3-epoch TPF** (2.63 vs 2.71). Nothing below 1 epoch is reported.
+4. **Rank**: r 128→256 gives 2.39→2.47 for 2× adapter parameters and adapter matmul FLOPs,
+   **not** 2× total draft cost.
+5. **α/r**: at 1 epoch, 2→64 lifts TPF 2.39→2.63 (+10%).
+   The optimum differs with horizon: 64 at 1 epoch, 16 at 3 epochs.
+6. **Best one-epoch TPF / best three-epoch TPF ≈ 97%** (2.63/2.71). This compares
+   different scaling and training curricula, not a single run's convergence curve.
+   The shared two-forward floor also inflates this ratio: `(2.63−1)/(2.71−1) ≈ 95%`
+   of the excess TPF. No sub-epoch final-model comparison is reported.
 
 **RL post-training (§5.1.3, Table 8, Suppl. C.2)** — DAPO from the SFT checkpoint, four
 experts (math, code, tool use, browse). θ_Δ trained on the SFT checkpoint, **frozen**, used
 only to accelerate rollouts; only θ_AR updated. Math expert: 2,560 steps, 28.9B response
-tokens, lr 5e-7, 16 groups × 32 prompts = 512 sequences/step. Result: **up to 40% end-to-end
-training speedup** (math and code; smaller for tool use, where tool calls dominate), and the
-SFT-trained adapters retained their speedup after RL with only a **6% TPF drop** (2.25 → 2.10).
-Detailed results deferred to a future revision.
+tokens, lr 5e-7, 16 groups × 32 prompts = 512 sequences/step. The authors report
+**up to 40% end-to-end training speedup**, with detailed timing deferred to a future revision.
+Table 8 compares SFT with the consolidated post-RL model: mean TPF 2.25→2.10
+(6.7% reduction; called 6% in the paper). This is not a maximum drift bound:
+GSM8K drops 2.66→1.95 (26.7%), and every listed math task loses acceptance.
 
 ## 1.6 Honest limitations stated by the authors
 
@@ -175,9 +241,9 @@ max_position 131,072, bf16. 1,091,839,488 total / 1,080,632,832 frozen.
   DAPO-Math-17k. Actor and critic own **disjoint rank-16 / α-32 LoRA** over one shared frozen
   bf16 backbone. Thinking template on by default.
 - Rollout: bespoke CUDA-graph-captured continuous-refill decoder,
-  `CapturedTrainingRolloutEngine.generate_prompt_pool` (`fast_inference.py:1791`), 64 lanes
-  (4 prompts × 16 samples), sequence-major static KV (`_CompactStaticLayer` `:273`), fixed-shape
-  FA4 varlen (`_fixed_varlen_fa4_attention` `:377`), fused QKV + gate/up. No vLLM, no SGLang, no
+  `CapturedTrainingRolloutEngine.generate_prompt_pool` (`postraining/fast_inference.py`),
+  64 lanes (4 prompts × 16 samples), sequence-major static KV (`_CompactStaticLayer`),
+  fixed-shape FA4 varlen (`_fixed_varlen_fa4_attention`), fused QKV + gate/up. No vLLM, no SGLang, no
   HF `generate`. Sampling temp 0.9 / top-p 0.95 / top-k 20.
 - Weight sync: in-process. `build_fused_rollout_replica` (`:418`) holds a LoRA-merged,
   projection-fused replica; `synchronize_fused_lora_policy_` (`:196`) re-merges the live actor
@@ -187,45 +253,43 @@ max_position 131,072, bf16. 1,091,839,488 total / 1,080,632,832 frozen.
   position 1,536 and →36 by 3,584 (`NOTES.md:5902-5910`). Production reference:
   **2,578.61 scheduled decode tok/s** at B64/10,000 tokens (`NOTES.md:5962-5964`).
 
-**The verification half of Ψ-Spec already exists in this repo and is unit-tested.**
-`postraining/nextlat_speculative.py` (680 lines) implements exactly Algorithm 1 lines 5–13:
-`maximal_coupling_verify` (`minicpm_vapo.py:923-963`) is `min(1, p/q)` accept with
-`Norm([p−q]_+)` residual resample; `dense_top_p_probabilities` (`:858-920`) materializes the
-nucleus densely; `RaggedStaticCache` / `ragged_causal_mask` (`nextlat_speculative.py:37-150`)
-gives per-row independent write cursors inside a fixed-shape compiled graph; the accept /
-commit / rollback loop (`:480-610`), bonus token (`:548-598`), and per-position acceptance
-telemetry (`NextLatDecodeStats` `:20-35`) are all there;
-`scripts/benchmark_minicpm_nextlat.py` provides a logit-fidelity gate (cosine ≥ 0.999,
-top-1 ≥ 0.90, top-20 ≥ 0.95, KL ≤ 0.01, `:197-213`) and acceptance reporting (`:364-424`).
+**Reusable primitives exist; the production verifier does not transfer verbatim.**
+`maximal_coupling_verify` (`postraining/minicpm_vapo.py:923-963`) implements per-position
+acceptance and residual correction, not the whole block algorithm or bonus-token transition.
+`postraining/nextlat_speculative.py` supplies `RaggedStaticCache`, `ragged_causal_mask`,
+accept/commit/rollback, bonus-token handling, and `NextLatDecodeStats`. Existing tests cover
+these building blocks; they do not exercise an Uno drafter in the production refill engine.
 
-**What is missing is only the drafter and the block-wide forward.**
+In particular, `dense_top_p_probabilities` accepts temperature and top-p **but no top-k**.
+Production `top_k_top_p_sample` uses top-k=20 before nucleus filtering. Reusing the NextLat
+probability path unchanged would preserve a different target distribution. Both the free
+token and verifier must use the live actor's exact production sampling transform; each draft
+probability must describe the proposal actually sampled. The existing benchmark's approximate
+fusion-logit gate is useful diagnostics, not a distributional-equivalence proof (§2.8).
 
-## 2.2 Why the existing rejection of speculative decoding does not transfer
+## 2.2 What the NextLat rejection does and does not establish
 
-`NOTES.md:5931-5932` — "Do not enable NextLat speculative decoding: measured position-2
-acceptance is 0.90% at step 370 and 0.55% at step 203, far below break-even." Measured
-throughput: B64 d=2 4,032 tok/s and d=6 2,544 tok/s vs AR 8,456 tok/s — 2.10× and 3.32×
-**slower**.
+`NOTES.md:5931-5932` records position-2 acceptance of 0.90% at step 370 and 0.55% at step 203.
+The NextLat benchmark reports B64 d=2 4,032 tok/s and d=6 2,544 tok/s versus its own AR
+8,456 tok/s (2.10× and 3.32× slower). These are not the production 10k-token baseline.
 
-That verdict is about a *drafter*, not the harness, and NextLat's failure mode is precisely
-what Uno's L_TV exists to fix:
+Uno changes several things together: a full-backbone noisy-block drafter, TV distillation,
+parallel rather than sequential drafting, and a first token sampled directly from the target.
+That makes it a distinct hypothesis worth measuring, **not an established fix**:
 
-- NextLat is trained with SmoothL1 on hidden states + categorical KL through a detached LM head
-  (`NOTES.md:5853-5860`). **It was never trained against a total-variation objective, and
-  never on a noisy-block input.** Uno's own ablation shows KL-only gets TPF 2.22 vs TV-only
-  2.39 — and that gap is with a *good* drafter; with a bad one, KL-only training has no reason
-  to produce agreement on the sampled token at all.
-- NextLat drafts **sequentially** (`nextlat_speculative.py:404-421`): `draft_length` iterations
-  of latent-dynamics MLP + full 130,560-way LM head. Uno drafts the **entire block in one
-  forward pass**. Sequential drafting is why d=6 was 3.3× slower even at ~0 acceptance.
-- NextLat has no free always-accepted first token. Uno's position-1-from-θ_AR construction
-  guarantees TPF ≥ 1 and ≥ 2 output tokens per cycle even on total rejection.
+- KL is also an agreement objective: Pinsker's inequality bounds TV by `sqrt(KL/2)`.
+  The paper's 2.22→2.39 TPF ablation cannot attribute NextLat's near-zero acceptance solely
+  to its loss or predict that TV will repair it.
+- Parallel drafting removes sequential latent-MLP/LM-head calls, but adds an entire adapted
+  backbone block pass. The original timing does not isolate which cost dominates.
+- NextLat's first post-prefill proposal uses the target distribution (`nextlat_speculative.py`
+  initial `has_pending=False` branch), but subsequent pending-token cycles use its latent
+  approximation. Uno restores the AR-only first-token property each ordinary cycle.
+  This improves the forward-count floor, not necessarily tokens/second.
 
-Also flagged: the repo-wide "does not land speculative changes" note (`NOTES.md:1030-1031`) and
-`postraining/README.md:92-93`. The other written rejection (`NOTES.md:1795-1799`) is explicitly
-scoped to the **latent** VAPO action space ("no lossless draft/verifier construction for the
-joint discrete gate/token plus continuous latent action") — irrelevant to native MiniCPM tokens,
-where a lossless construction demonstrably exists and is already implemented.
+The latent-action objection (`NOTES.md:1795-1799`) is separate from native token sampling.
+The existing no-speculation production decision remains in force until correctness and
+matched throughput evidence justify revisiting it. This assessment is not an adoption.
 
 ## 2.3 Adapter sizing (exact)
 
@@ -238,7 +302,7 @@ per layer = 29,184 r      × 24 layers = 700,416 r
 ```
 
 Validation: `r=16 → 11,206,656` — exactly the recorded trainable count in
-`postraining/benchmarks/minicpm_lora_vapo_training.json:47`. Formula confirmed.
+`postraining/benchmarks/minicpm_lora_vapo_training.json:39-46`. Formula confirmed.
 
 | r | θ_Δ params | % of 1.0806B frozen |
 |---|---|---|
@@ -247,230 +311,385 @@ Validation: `r=16 → 11,206,656` — exactly the recorded trainable count in
 | 64 | 44.8 M | 4.15% |
 | 128 | 89.7 M | 8.30% |
 
-Uno used `r/hidden = 128/4096 = 1/32`. The **proportional transplant is r = 48**, giving 3.11%
-of base (Uno's own adapter was 4.4% of 8B). With α/r = 64 (Uno's from-scratch choice, and the
-1-epoch optimum in Table 15a) that is **α = 3072**. Using r = 128 here would make the adapter
-8.3% of the model — the draft pass would carry ~8% extra FLOPs and 90M extra resident
-parameters for the +0.08 TPF that Table 12 attributes to doubling rank. Not worth it.
+Scaling `r/hidden = 128/4096 = 1/32` gives **r=48**; α/r=64 gives **α=3072**.
+These are candidate hyperparameters, not an optimal transplant established by data.
+The paper's 0.35B/4.4% count is for **UnoQwen**, not the from-scratch Uno architecture.
+Table 12's r=128→256 gain does not predict a MiniCPM r=48→128 gain. Adapter parameter
+ratios also do not equal wall-time overhead: the frozen input embedding is not a dense
+matmul, the LM head is, and small unmerged GEMMs can be launch- or bandwidth-limited.
 
-## 2.4 The throughput model, calibrated on the paper's own numbers
+## 2.4 Throughput model: useful sensitivity analysis, not a forecast
 
-A Ψ-Spec cycle is `t_draft(B) + t_verify(B)`. Let `t(n)` be one forward with `n` query
-positions per row at 64 rows, and `δ = [t(2) − t(1)] / t(1)` the marginal cost of an extra
-position. Then
+At fixed live-row occupancy and cache lengths, define:
 
 ```
-speedup vs AR  =  τ / ( 2 · [1 + (B−1)·δ] )
+C_B = (t_draft(B) + t_verify(B) + t_sampling/cache(B)) / t_AR
+S_decode = τ / C_B
+S_decode,max = (B+1) / C_B
 ```
 
-Calibrating δ from Table 17a (τ) against Table 18 (throughput at concurrency 64, Qwen3-8B/H200,
-AR = 3662 tok/s):
+Use the full one-token AR step, including sampling/cache overhead, as the denominator.
+Measure the cycle components without double-counting. For a hypothetical equal-cost pair
+of forwards with negligible added overhead and linear query scaling:
 
-| B | τ | measured tok/s | implied speedup | implied δ |
+```
+δ_B = (t(B)/t(1) − 1) / (B−1)
+C_B ≈ 2[1 + (B−1)δ_B]
+```
+
+`δ_2` need not predict `δ_4`, `δ_8`, or `δ_16`. Adapter work, attention arithmetic,
+softmax/top-k, RNG, residual sampling, rollback, refill, and graph scheduling can change `C_B`.
+
+Back-solving this simplified model from Tables 17a/18 at concurrency 64:
+
+| B | τ | paper system tok/s | speedup over 3662 | effective δ_B |
 |---|---|---|---|---|
 | 4 | 3.89 | 5733 | 1.566 | 0.081 |
 | 8 | 4.94 | 5600 | 1.529 | 0.088 |
 | 16 | 5.42 | 4112 | 1.123 | 0.094 |
 
-δ ≈ 0.081–0.094, stable across B. **The model is sound and δ is the single decisive quantity.**
+The arithmetic is correct, but these are **effective fitted costs** from the paper's synthetic
+throughput procedure (§1.5), not independently measured marginal kernel timings. Their
+agreement does not validate an RTX 5090 forecast.
 
-Roofline estimate of δ for MiniCPM5-1B on one 5090 at 64 rows [INFERENCE]:
+**Memory/compute inventory, not a measured roofline:**
 
-- Weights per forward: 1.0806e9 × 2 B = **2.16 GB**.
-- KV per forward: 24 L × 2 kv × 128 × 2 (K,V) × 2 B = 24,576 B per position per row; at an
-  average live cursor of ~6,000 over a 10k-token rollout × 64 rows = **9.4 GB** (17.3 GB at the
-  full 11,024-slot cache). **KV read dominates the base step** — the regime speculation likes.
-- Marginal compute per extra query position: body 679.5M + head 200.6M = 880.1M params
-  ⇒ 2 × 64 × 880.1e6 = **112.7 GFLOP**. At ~84 TFLOPS achieved (40% of ~209 TFLOPS bf16 dense)
-  ⇒ **1.34 ms**.
-- Base step measured: 50.614 s decode / 4,096 positions = **12.35 ms** (`NOTES.md:5904-5906`).
-- ⇒ **δ ≈ 1.34 / 12.35 ≈ 0.11**.
+- Frozen weights occupy ~2.16 GB bf16; not all are streamed by each decode matmul.
+- KV capacity is `24 × 2 KV heads × 128 × 2(K,V) × 2 bytes = 24,576 bytes`
+  per cached token per row. At 64 rows and 6,000 visible tokens this is 9.44 GB;
+  at all 11,024 slots it is **17.34 GB / 16.15 GiB**, not ~6 GiB.
+  A 6,000-token mean cursor is assumed, not measured for the proposed workload.
+  Capacity is not measured HBM traffic: kernels, GQA reuse, tiling, occupancy, and actual
+  per-row lengths determine bytes read and whether KV bandwidth dominates.
+- Body+head linear work is ~112.6 GFLOP per additional query across 64 rows.
+  At 6,000 visible tokens, attention QK/AV adds approximately
+  `4 × 64 × 24 × 2048 × 6000 = 75.5 GFLOP` per query, before adapters and sampling.
+- The original estimate divides **only the linear work** by an assumed, not achieved,
+  84 TFLOP/s to obtain 1.34 ms.
+  Dividing again by the historical `50.614/4096 = 12.36 ms` gives ~0.11, but that old
+  4,096-position run had declining occupancy and predates serving fixes. Combining it with
+  10k-token cache assumptions does not estimate current production `δ_B`.
 
-Projected speedup if the paper's τ transplants to a 1B model:
+Keep δ=.11 only as a labeled **conditional scenario**:
 
-| B | τ (paper, temp 1) | 1 + (B−1)·0.11 | rollout speedup | end-to-end (rollout 68–74%) |
+| B | paper τ | assumed C_B | decode speedup | optimistic whole-step speedup |
 |---|---|---|---|---|
-| 4 | 3.89 | 1.33 | **1.47×** | 1.28–1.31× |
-| 8 | 4.94 | 1.77 | 1.40× | 1.24–1.27× |
-| 16 | 5.42 | 2.65 | 1.03× | ~1.02× |
+| 4 | 3.89 | 2.66 | 1.46× | 1.27–1.31× |
+| 8 | 4.94 | 3.54 | 1.40× | 1.24–1.27× |
+| 16 | 5.42 | 5.30 | 1.02× | ~1.02× |
 
-Optimum at **B = 4**, consistent with the paper's own finding that B=4 maximizes system
-throughput at high concurrency. Projected end-to-end **1.28–1.31×**, bracketing the paper's
-claimed "up to 40%" RL speedup.
+The final column uses Amdahl's law `1/[(1−f)+f/S]`, f=.68–.74, **as if the entire
+rollout sped up by the decode factor**. Prefill, synchronization, scheduling and other
+unaccelerated rollout work make that optimistic. Measure the decode fraction separately.
+Neither τ nor δ has been measured for this 1B setup; B=4 is a starting candidate, not a
+locally established optimum.
 
-Two effects push in opposite directions, and neither is measured:
-- **In our favor:** our sampling is temp 0.9 / top-p 0.95 / **top-k 20**, versus the paper's
-  temp 1 / top-k 50. Harder truncation shrinks the effective support and should *raise* τ
-  materially — Table 17a's temp-0 column is ~10% higher than temp-1 at B=4 and ~31% higher at
-  B=16. Our domain (DAPO-math with thinking traces) is also the paper's highest-τ domain.
-- **Against us:** τ is unmeasured below 8B. A 1B model has higher next-token entropy and a
-  proportionally smaller adapter. **This is the primary risk and there is no evidence either
-  way in the paper or the repo.**
+Stronger top-k/temperature truncation is **not guaranteed to improve acceptance**.
+For example, p=(.51,.49), q=(.49,.51) overlap by .98, but top-1 truncation makes their supports
+disjoint and acceptance zero. Likewise, model size alone does not establish next-token
+entropy or draftability on our prompts. Measure post-transform agreement in the actual domain.
 
-## 2.5 Concrete blockers, in order of engineering weight
+## 2.5 Implementation and performance prerequisites
 
-**1. Multi-position decode is hard-disabled in the production path.** ⚠️ largest item.
-`_fixed_varlen_fa4_attention` (`fast_inference.py:377-416`) hardcodes `max_seqlen_q=1` and
-falls back to `sdpa_attention_forward` with a materialized mask whenever
-`query.shape[2] > 1` (`:388-402`); `_hybrid_fa4_mask` (`:369-374`) returns `None` only at
-`q_length == 1`. Ψ-Spec needs `q_len = B` in **both** passes, so as written every Ψ-Spec
-forward abandons FA4 and runs SDPA against a sequence-major cache laid out for FA4.
+**1. Multi-query cached append is implemented separately from prefill.**
+The original `_CompactStaticLayer.update` classified width>1 as prefill and would
+overwrite the prefix; a `max_seqlen_q` change alone was invalid. Prefill/append
+mode is now explicit, including single-token prefill. `UnoTrainingRolloutEngine`
+uses `_UnoStaticLayer` for per-row suffix append and native bottom-right-causal
+FA4 with a fixed B-query draft/verification schedule and reserved scratch capacity.
 
-*Positive finding:* the installed FA4 build supports this natively. Read from
-`.venv/lib/python3.14/site-packages/flash_attn/cute/interface.py`,
-`flash_attn_varlen_func` accepts `max_seqlen_q`, `seqused_q`, `seqused_k` with
-`(batch, seqlen_q, nheads, hdim)` inputs and `causal=True`; varlen causal aligns the diagonal
-to the end of each row's k-range, which is exactly right when
-`seqused_k[row] = cursor[row] + B`. It needs **no `page_table`**, so it does not touch the
-SM120 rejections recorded at `NOTES.md:5926-5929`. **The `q_len == 1` specialization is a code
-choice, not a kernel limitation.** Unverified on hardware — this is experiment E0 below.
+Installed `flash_attn_varlen_func` accepts fixed-shape query/KV tensors, `max_seqlen_q`,
+`seqused_q`, `seqused_k`, and causal mode without requiring a page table. That establishes an
+API candidate; the queued numerical checks qualify SM120 behavior rather than
+assuming it from the signature. Validate bottom-right causal alignment, per-row
+append positions, active lengths and full-prefix visibility before timing.
+Attention-only support cannot establish full-backbone `C_B`.
 
-**2. Gated LoRA does not exist.** `LoRALinear.forward` (`minicpm_vapo.py:89-99`) applies
-`update * self.scaling` unconditionally. Uno needs a per-position 0/1 gate so θ_AR alone
-produces teacher logits at clean positions while `θ_AR + θ_Δ` produce student logits at noisy
-positions — in one pass, at both training and draft time. This is a one-line change
-(`update * scaling * gate`) that must default to gate ≡ 1 so the actor path is bit-identical.
+**2. Shared KV needs a clean-state invariant, not just a layout conversion.**
+Retain only AR-path KV for committed clean tokens. For Algorithm 1, the draft processes
+`[x_L,z]` over clean `x_<L`; only x_L's KV can become committed. Discard/overwrite the
+noisy suffix before verification. Verify `[x_{L+1},x̃]` over clean x, then retain the
+accepted-prefix KV while leaving the correction/bonus token pending for the next draft.
+No rejected proposal or diffusion-path KV may become visible to the next clean token.
+Per-row cursors, RoPE positions, EOS, near-capacity blocks, inactive rows and lane refill
+must obey this invariant inside graph replay. `RaggedStaticCache` and the NextLat loop are
+references, not drop-in replacements for the production sequence-major cache/scheduler.
 
-**3. The rollout replica merges LoRA; a gated adapter is unmergeable by construction.**
-`synchronize_fused_lora_policy_` (`fast_inference.py:196-270`) folds
-`base.weight + scaling·B@A` into the fused replica weights via `_copy_merged_lora_weight_`
-(`:187-193`), and hard-fails if any actor projection is not a `LoRALinear` (`:224`, `:252`).
-θ_Δ must stay **unmerged**. `_FusedFirstProjection` (`:88-139`) therefore needs an unmerged
-gated path with stacked-A / block-diagonal-B. Concrete shapes at r = 48:
-QKV → A `(144 × 1536)`, B `(2560 × 144)`; gate/up → A `(96 × 1536)`, B `(9216 × 96)`;
-`o_proj` and `down_proj` stay plain gated `LoRALinear`. Those B GEMMs are trivial and
-CUDA-graph friendly; block-diagonal zeros waste 2/3 of a negligible GEMM.
+**3. Add a separate gated diffusion adapter without disabling the actor.**
+During RL, θ_AR means the **current actor**, including its rank-16 update. It can remain
+merged in the fused replica. Only θ_Δ is gated: off on the clean first token and all verifier
+positions; on at noisy draft positions. Training also needs a gate, block mask, aligned
+position IDs and **same-output-position** teacher/student next-token targets.
+Neither an extra teacher shift nor reconstructing the current noisy input is the objective.
+Ensure actor synchronization cannot overwrite or accidentally merge the diffusion adapter.
 
-**4. Two incompatible KV cache classes.** The production path uses sequence-major
-`_CompactStaticLayer` (`fast_inference.py:273`) with CUDA-graph capture of a fixed-shape
-1-position step (`_capture_continuous_decode_schedule` `:1770`). Ψ-Spec commits a
-data-dependent number of tokens per row per cycle. `RaggedStaticCache`
-(`nextlat_speculative.py:37-136`) already solves exactly that with scatter writes at per-row
-cursors and `mark_static_address` annotations — but it is a *different* class with a different
-layout. **Unifying them is the single largest piece of work** and is what currently makes the
-NextLat benchmark numbers non-comparable to the production engine (319 tok/s B1 AR vs the
-production 2,578 scheduled tok/s at B64).
+For fused projections, stacked A factors are a candidate; a dense block-diagonal B is not
+automatically optimal. At r=48, QKV uses A `(144,1536)` and B `(2560,144)`, while gate/up
+uses A `(96,1536)` and B `(9216,96)`. The dense B multiplies structural zeros: 2/3 of QKV
+and 1/2 of gate/up B entries. Compare independent/grouped or fused low-rank updates rather
+than prescribe padded GEMMs as “negligible.” Preserve the base QKV/gate-up fusion and
+avoid diffusion work altogether on the verifier pass; benchmark the complete draft path.
 
-**5. Tree sampler is out of reach; linear only.** Tree attention needs an arbitrary DAG mask.
-FA4 exposes `mask_mod` / `block_sparse_tensors`, but `NOTES.md:5926-5929` records block
-sparsity as rejected on this SM120 build. This forfeits the tree column (τ 5.97–6.11) and caps
-us at linear (τ 3.89–5.42). **Acceptable**: linear B=4 is the paper's own
-system-throughput-optimal configuration, and we run 64 lanes, never batch 1.
+**4. Training uses compiled FlexAttention, not FA4 custom-mask backward.**
+The concatenated teacher/noisy-block mask is not ordinary triangular attention.
+Installed SM120 FA4 backward rejects `mask_mod` and `block_sparse_tensors`.
+The released Uno implementation uses native FlexAttention for this formulation;
+`postraining/uno.py` now constructs a compiled BlockMask and uses HF's compiled
+FlexAttention forward/backward with checkpoint-stable gates. Clean rows are causal;
+noisy rows see earlier clean blocks and causal positions within their own noisy block.
+Full-model numerical/backward qualification and measured throughput remain distinct.
 
-**6. Dense maximal coupling at vocab 130,560.** 64 rows × B positions × 130,560 × 4 B:
-B=4 → 134 MB/tensor, B=8 → 267 MB, B=16 → 535 MB; ×3 tensors (q, p, residual) ⇒ 0.40 / 0.80 /
-1.6 GB on top of the ~6 GiB KV that `release_cache` frees (`fast_inference.py:1271-1282`).
-Fine at B ≤ 8 on 32 GB. Available optimization: the accept test only needs gathered scalars
-`p[x]`, `q[x]`; the dense residual is needed **only for rejected rows**, so it can be
-materialized lazily. `dense_top_p_probabilities` is dense-always today.
+Tree inference is **deferred**, not proven impossible: block-sparsity rejection alone does
+not exclude other mask implementations; the SM120 forward path exposes `mask_mod`.
+Linear B=4 is the paper-supported high-concurrency starting point. No MiniCPM τ ceiling
+can be inferred from the paper's measured linear or tree acceptance.
 
-**7. Distillation memory.** `[x, z_1]` at L = 2048 is 4,096 positions; logits are
-4,096 × 130,560 = 2.14 GB fp32 per tensor, and TV needs both softmaxes. Must be chunked over
-positions — precedent exists: the trainer already computes frozen-head logprobs in 128-token
-chunks (`train_minicpm_vapo.py:1035-1041`), which brings this to 67 MB/chunk. With existing
-non-reentrant checkpointing, 32 GB is sufficient.
+**5. Use exact small-support coupling where possible; preserve graph shapes.**
+Dense fp32 distributions at 64×B×130,560 cost 134/267/535 MB each for B=4/8/16.
+Three such tensors are already 0.40/0.80/1.60 GB; logits, sorting indices and temporary
+softmax/residual buffers add more. The old NextLat helper materializes dense residuals
+and synchronizes during adaptive nucleus search; it is not the captured Uno verifier.
 
-## 2.6 Corpus and teacher — both resolve cleanly
+The new verifier keeps exact bounded top-k/nucleus supports. It looks up p at proposed
+IDs and q at target IDs with sort/searchsorted, then samples `max(p-q,0)` only on
+the target support (at most 20 IDs): outside that support the residual is exactly zero.
+This handles partial/disjoint support without dense full-vocabulary probabilities
+or a padded 40-ID union. Full LM-head/top-k work still remains. Fixed-shape device
+buffers avoid dynamic rejected-row compaction and per-position host synchronization.
+If proposal truncation changes, use its actual normalized support, not this bound.
 
-**Teacher = the pure frozen base, not a checkpoint.** `LoRALinear.lora_b` is zero-initialized
-(`minicpm_vapo.py:74-76`), so at RL step 0 `θ_AR ≡ base` **exactly**. Distill θ_Δ against the
-frozen base once and it is valid for every RL run and every variant branched off that base.
+Keep these transformed behavior probabilities separate from the untempered current-actor
+logprobs stored for RL replay (`selected_token_logprobs`); do not record proposal/residual
+logprobs as the actor likelihood.
 
-**Drift during RL is structurally bounded.** Our θ_AR moves only inside an 11.2M-parameter
-rank-16 subspace of a 1.08B model. The paper's Table 8 lost only 6% TPF across 2,560 steps of
-**full-parameter** DAPO on an 8B model. Rank-confined updates should drift strictly less.
-This is an advantage of our setup, not a risk. [INFERENCE, but the mechanism is clear]
+**6. Distillation peak memory requires an actual backward measurement.**
+At L=2048, `[x,z]` has 4096 positions: full logits occupy 2.139 GB fp32 across both halves;
+each L-position teacher or student distribution is 1.070 GB. A 128-position full-vocabulary
+chunk is 66.85 MB **per tensor**, not the whole loss footprint.
+Chunk over positions while normalizing over the full vocabulary. Independent vocabulary-
+chunk softmaxes would change TV. Merely summing chunk losses before backward can retain
+every chunk's autograd buffers; use a verified recomputation/backward design that bounds
+retained activations. Existing frozen-head logprob chunking is not proof of this TV design.
+Include mask/attention temporaries, optimizer, checkpoint recomputation, teacher/student
+probabilities and other resident models when measuring peak memory. 32 GB fit is unproven.
 
-**Corpus: OpenThoughts3-1.2M, retokenized.** The paper's §5.2 result is precisely that θ_Δ
-trained on a *different* data distribution than θ_AR still yields lossless speedups — the same
-OpenThoughts corpus that *degrades* Qwen3-8B when used for SFT (Table 9) nonetheless trains a
-working adapter. Reasoning traces match our math/thinking domain.
-The alternative — a self-generated on-policy corpus, for which precedent exists in
-`scripts/generate_minicpm_critic_corpus.py` — is **not viable**: at the measured 1,288 useful
-tok/s, generating 500M tokens costs ~108 h, roughly 7× the cost of training on it.
+## 2.6 Teacher, drift, and corpus
 
-## 2.7 Cost to a trained adapter
+**A fresh actor's base is a reasonable candidate teacher, not a universal optimum.**
+`LoRALinear.__init__` initializes B to zero under both standard and current NoRA
+initialization (NoRA normalizes A only). Thus a fresh, unloaded actor equals the frozen base
+mathematically. A resumed actor checkpoint is generally different. If accelerating a resumed
+run is the objective, evaluate or distill against that actual actor checkpoint.
+Pin teacher weights, model revision, tokenizer, chat template, sampling settings, and corpus
+preprocessing. A base-trained adapter can be reused with a new current-actor verifier without
+invalidating rejection sampling; **its speedup is not guaranteed**.
 
-LoRA-only training: forward 2N + backward-through-activations 2N ≈ 4N per position, and 2
-positions per supervised token (the `[x, z_1]` concatenation) ⇒ ~8N = **8.64 GFLOP per
-supervised token** at N = 1.0806e9. At ~84 TFLOPS achieved (40% MFU; likely optimistic for a
-1536-hidden model at seq 4096 on one 5090 — at 30% these become ~1.33× longer):
+**Low rank does not bound distribution drift.** Learned A and B do not define a fixed
+rank-16 linear subspace of output distributions, nor constrain update magnitude or logit KL.
+Even a rank-one update can reverse the dominant token and destroy draft overlap.
+The paper's 6.7% mean TPF decline hides 26.7% loss on GSM8K (§1.5). Measure τ and cycle
+throughput at relevant actor checkpoints and rollout lengths rather than assume less drift
+than full-parameter DAPO.
 
-| Budget | FLOPs | Wall clock, 1× 5090 |
+**OpenThoughts3-1.2M is a candidate offline corpus.** The paper demonstrates successful
+cross-distribution distillation for Qwen3-8B, not for MiniCPM. Check dataset licensing,
+thinking-template alignment, truncation/packing, and held-out prompt separation; retokenize
+and count tokens with MiniCPM's tokenizer. The paper's 4.9B tokens/epoch does not transfer
+unchanged across tokenizers. Existing on-policy rollout traces are another candidate.
+Generating a new 500M-token corpus at the recorded 1,288.45 useful tok/s would cost
+~108 hours; that is expensive, not proof that reusing or generating a smaller corpus is
+nonviable.
+
+## 2.7 Training cost: illustrative arithmetic only
+
+The original `8N` approximation with N=1.0806B gives 8.645 GFLOP per supervised token.
+At an **assumed** sustained 84 TFLOP/s it yields:
+
+| Budget | Nominal FLOPs | Arithmetic time, not a job estimate |
 |---|---|---|
-| 100M tokens (smoke) | 8.6e17 | **~3 h** |
-| 500M tokens (pilot) | 4.3e18 | **~14 h** |
-| 4.9B tokens (= UnoQwen 1 epoch) | 4.2e19 | **~6 days** |
-| 14.7B tokens (= UnoQwen 3 epochs) | 1.3e20 | ~17 days |
+| 100M tokens | 8.645e17 | 2.86 h |
+| 400M tokens (proposed pilot) | 3.458e18 | 11.44 h |
+| 500M tokens | 4.323e18 | 14.29 h |
+| 4.9B tokens (paper's tokenizer) | 4.236e19 | 5.84 days |
+| 14.7B tokens (paper's tokenizer) | 1.271e20 | 17.51 days |
 
-The 1-epoch point is the sensible ceiling: Table 15 shows 1 epoch reaches 2.63 vs 3 epochs 2.71
-(97%). Whether 100–500M tokens suffices for a model 8× smaller — with 10× fewer adapter
-parameters to fit — is **unmeasured in the paper** (nothing below 1 epoch is reported) and is
-the second decisive unknown.
+This is neither a lower nor upper bound. `8N` counts embeddings like dense linear work,
+ignores teacher stop-gradient savings, and omits attention, low-rank backward, checkpoint
+recomputation, loss, optimizer and data overhead. The implementation now selects compiled
+FlexAttention explicitly; this arithmetic still does not measure its full update cost.
+Measure full forward/loss/backward/optimizer throughput and peak memory at the intended
+precision, compiled path, length and batch before setting a time budget. Sub-epoch quality,
+adapter convergence at 1B, and tokens to useful τ remain unmeasured. No “one GPU-day
+go/no-go” or “six-day full adapter” commitment follows from this arithmetic.
 
-## 2.8 Recommended gate sequence
+## 2.8 Evidence gates — implementation available, production adoption unproven
 
-All GPU work goes through `mlq submit --max-parallel-runs 1` per `AGENTS.md`. **Nothing queued;
-this is a proposal.**
+All local model/GPU workloads, including kernel probes, benchmarks and backward checks, must
+use `mlq submit --max-parallel-runs 1`. Do not promote a technique from reduced-run quality
+evidence or bypass the repository's ablation/adoption rules. The following is a conditional
+research plan, not authorization to change production defaults.
 
-**E0 — δ measurement. No training. ~10 GPU-minutes. Kills or greenlights the whole idea.**
-Measure `t(n)` for `n ∈ {1,2,4,8,16}` at 64 rows on the production fused replica at the real
-11,024-slot cache, two arms: (a) FA4 varlen with `max_seqlen_q=n` + per-row `seqused_k` +
-`causal=True`, (b) the current SDPA fallback. This also answers blocker 1 empirically.
-**Gate: δ ≤ 0.15 at n = 4.** If δ > 0.25, the best achievable speedup is
-`3.89 / (2 × 1.75) = 1.11×` and no τ the paper reports can pay for the work — **stop there.**
+**E0a — kernel feasibility and correctness, no training.**
+Probe query widths `{1,2,4,8,16}` with sequence-major KV, 64 rows, homogeneous and ragged
+visible lengths spanning short, middle and near-capacity contexts in an 11,024-slot cache.
+Reserve n writable slots; do not append past capacity. Check multi-query outputs against
+the same-prefix reference and validate causal alignment before timing. Separately evaluate
+the supported training-attention/backward formulation; a fast causal forward is insufficient.
+Record unsupported shapes as failures, not silent fallback measurements. Compilation,
+warmup and integration time are separate from steady-state GPU timing; no ten-minute
+completion guarantee is justified.
 
-**E1 — pilot adapter. ~15–20 GPU-hours.** r = 48, α = 3072 (α/r = 64), all 7 projections,
-TV-only (α_loss = 0, β = 1), lr 1e-5 constant with 2% warmup, gated LoRA, block-causal mask,
-chunked-vocab TV loss, L = 2048, OpenThoughts3 retokenized, block curriculum 100M @ B=2 then
-300M @ B=4. **Gate: linear-B4 τ ≥ 3.0** at temp 0.9 / top-p 0.95 / top-k 20 on held-out
-DAPO-math prompts, against the theoretical floor τ = 2.0 (zero acceptance). τ ≥ 3.0 at δ = 0.11
-already implies a 1.13× rollout win and validates that the recipe transfers to 1B.
+**E0b — full-model cost gate, after append-correct cache plumbing.**
+Measure complete base block forwards against the one-token production path, with matching
+weights, cache lengths, dtype, graph mode, logits and sampling. Compare FA4 and a labeled
+SDPA reference only where both implement the same full-prefix semantics. Then measure an
+actual unmerged gated draft path and sampling/cache cycle overhead before using `C_B` as
+an adoption forecast. A no-adapter measurement only screens backbone cost.
 
-**E2 — production shape.** Rollout-only gate at 64 rows / 4,096 tokens against the recorded
-2,578.61 scheduled decode tok/s reference (`NOTES.md:5962-5964`). **Gate: ≥ 1.25× scheduled
-decode tok/s** with distributional equivalence confirmed by the existing logit-fidelity gate
-(`scripts/benchmark_minicpm_nextlat.py:197-213`) and generated-id SHA-256 comparison.
+For a required speedup R, require `τ ≥ R·C_B`; rule out a measured configuration if even
+`(B+1)/C_B < R`. In the simplified B=4 model:
 
-Total to a go/no-go: **~1 GPU-day**, and E0 alone (10 minutes) can end it.
+- δ=.15 and paper τ=3.89 predict **1.34×**, before omitted overhead.
+- δ=.25 and paper τ predict **1.11×**; the true token-count ceiling is **5/3.5=1.43×**,
+  not 1.11×. This may fail a chosen paper-acceptance business case, not prove impossibility.
+- At δ=.11, τ=3.0 predicts only **1.13×**; **1.25× requires τ≥3.325** before overhead.
+  A bare δ cutoff or τ≥3.0 gate cannot approve a 1.25× rollout claim.
+
+**E1 — distillation only after feasible training and inference paths.**
+Candidate pilot: r=48, α=3072, all seven projections, TV-only, lr=1e-5 with 2% warmup,
+L=2048, position-chunked full-vocabulary loss, 100M tokens at B=2 then 300M at B=4
+(**400M total**, not 500M). Specify diffusion initialization independently of the actor:
+standard random-A/zero-B is a candidate, not the repository's implicit NoRA default.
+This is a hypothesis, not a reproduced paper recipe.
+Resolve the paper's scaling inconsistency (§1.5), memory/backward path and actual token
+budget first. Evaluate held-out DAPO-math at temp=.9/top-p=.95/top-k=20, reporting τ,
+conditional per-position acceptance, completion/truncation and measured `C_B` together.
+Use sufficient learning evidence under the repository protocol; do not equate “97% of
+best paper TPF at one epoch” with a convergence guarantee for this pilot.
+
+**E2 — matched production rollout and correctness gates.**
+The historical reference is **B64 / 10,000 response tokens**, not 4,096:
+2,578.61 scheduled decode tok/s and **1,288.45 useful rollout tok/s** over 260.04 s
+(`NOTES.md:5962-5966`). Rerun AR and candidate on the same pinned actor, prompt pool,
+64 logical trajectories, output cap, cache budget, sampler and refill policy. A 4,096-token
+experiment needs its own matched AR reference. Hold physical/logical concurrency fixed
+and report any resident-capacity penalty.
+
+Require ≥1.25× **useful rollout tok/s** for the proposed performance gate; also report total
+rollout and full RL cycle wall time, prefill/decode timing, productive occupancy, τ, peak
+VRAM and scheduled decode tok/s. Count only emitted in-budget tokens, never rejected or
+post-EOS drafts. Scheduled throughput alone can reward idle/wasted work. Recheck at
+representative later actor checkpoints; do not infer drift tolerance from LoRA rank.
+Also amortize adapter training and setup: a measured S-fold rollout speedup saves
+`T_rollout·(1−1/S)` GPU time over the remaining baseline rollout budget. That must exceed
+the adapter's measured GPU cost for compute payback; engineering cost is additional.
+
+Correctness needs multiple complementary checks:
+
+- Compare serial/current-actor versus block verifier logits on the **same prefixes** across
+  ragged lengths, clean first tokens, accepted/rejected suffixes, rollback, EOS, capacity
+  boundaries, inactive lanes and refill. Check transformed supports/probabilities, not just
+  mean cosine/top-1. Specify tolerances for the chosen bf16/fused implementation and report
+  approximation rather than claim exact arithmetic from loose aggregate thresholds.
+- The selected MiniCPM contract is `bf16-lane64-n128-k32-casts/v1`: fixed token/lane
+  GEMM tiles, fp32 dot-product accumulation with bf16 inputs/outputs, and explicit
+  compiler rounding. Tests require **bit-identical** logits, clean KV and compiled
+  transformed supports/probabilities against this one-token reference. Drift from
+  legacy AR is reported separately, not hidden by a wider numerical tolerance.
+  Prefill is shared; its final token is recomputed through the invariant target
+  before sampling, including on lane admission/refill.
+- Validate the coupling against analytical small-vocabulary distributions (identical and
+  disjoint support, partial overlap, ties, and every rejection position), plus empirical
+  sequence-distribution comparisons with uncertainty. Include bonus/correction-token and
+  output-budget transitions. These supplement, not replace, the algorithm/state invariant.
+- A generated-ID SHA-256 is a replay diagnostic for the **same** algorithm and RNG schedule.
+  AR and speculative decoding consume randomness differently; same-seed IDs need not
+  match despite identical distributions. Hash equality is neither required nor sufficient.
 
 ## 2.9 Verdict
 
-**Technically applicable, and unusually well-matched — but gated on one 10-minute measurement.**
+**Opt-in implementation available; production benefit not established.**
+The code implements TV-only gated distillation before RL and linear B4 Ψ-Spec
+against the changing actor, without enabling speculation by default.
+Independent reviews corrected teacher-adapter device migration, multi-token
+completion polling, cyclic retention of evicted KV and a pending-token prefill
+handoff error. CPU contracts, full-shape training backward and complete-graph
+captured numerical qualification pass. The invariant target forbids silent eager
+fallback; the explicit legacy control remains unchanged, but is no longer the default.
 
-In favor:
-- The **entire verification half already exists and is unit-tested** (`maximal_coupling_verify`
-  is literally Algorithm 1 lines 6–12; ragged per-row KV, accept/commit/rollback, bonus token,
-  per-position telemetry, fidelity gate, benchmark harness).
-- LoRA is hand-rolled on **exactly** the 7 projections Uno's placement ablation prescribes, and
-  merging adapters into the rollout replica is already a first-class operation.
-- **Rollout is 68–74% of RL step time** — the payoff multiplier is real, not hypothetical.
-- Our decode step is **KV-read dominated** (9.4–17.3 GB KV vs 2.16 GB weights), which is
-  precisely the regime where extra query positions are nearly free; roofline δ ≈ 0.11 is close
-  to the paper's own δ ≈ 0.081–0.094 on much larger hardware.
-- Distilling against the **zero-initialized-LoRA base** means one adapter serves every RL run,
-  and RL drift is confined to a rank-16 subspace — strictly less drift than the 6% the paper
-  measured under full-parameter DAPO.
-- Our top-k 20 / temp 0.9 sampling should raise τ above the paper's temp-1 / top-k-50 figures.
+The remaining research unknowns are trained MiniCPM draft acceptance, acceptance
+drift under RL, and amortized payoff. Neither rank confinement,
+narrow top-k, a released 1B model nor fitted paper timings resolves them.
+Losslessness, learning quality and profitability remain separate gates.
+After explicit reauthorization, train/evaluate the real offline-corpus adapter
+and compare against the current production AR before enabling Uno for an RL campaign.
 
-Against:
-- **δ is unverified on hardware**, and the production decode path is hard-specialized to
-  `q_len == 1` with an SDPA fallback that would negate the FA4 win. FA4's signature says the
-  needed path exists; that must be measured, not assumed.
-- **τ is unmeasured below 8B.** No evidence a 1B model's draft adapter reaches τ ≈ 3.9 at B=4.
-- Tree sampling is unavailable on this SM120 FA4 build → linear only, forfeiting the paper's
-  best acceptance numbers.
-- Unifying `RaggedStaticCache` with the sequence-major CUDA-graph-captured
-  `_CompactStaticLayer` is real, non-trivial engineering.
-- ~6 GPU-days for a full-recipe adapter on a single 5090.
+### Numerical experiment record
 
-Expected payoff if both unknowns land where the roofline says: **1.4–1.5× rollout, 1.28–1.31×
-end-to-end RL step.** That clears the repo's adoption bar by a wide margin — but the repo's
-current written policy against speculative decoding must be revisited explicitly, on the
-grounds that it rejected a *drafter* (NextLat, KL-trained, sequential, 0.55–0.90% position-2
-acceptance) and not the harness, and that L_TV is the specific mechanism that addresses that
-failure.
+- Job5517 confirmed local precision-cast emulation makes the gated first token and
+  independent clean-KV rebuild exact at fixed width. Native width-one versus block
+  still reached 0.06131 maximum raw-vocabulary TV. FA4 on identical Q/K/V was exact;
+  changing the output projection from M64 to M256 produced a 0.015625 bf16 difference.
+  Its cache-release regression freed all old backing references; full-model
+  backward peaked at 3,046,521,856 allocated bytes.
+- Job5518 isolated projection geometry: four contiguous M64 GEMMs per block
+  projection, with cast emulation in both paths, gave zero serial/block logit error.
+  This costs four launches per projection and was not the selected implementation.
+- Job5520 tested the fixed-tile Triton implementation on the full MiniCPM model,
+  B64 and ragged prefixes 1/65/513/8192: zero serial/block logit error and zero
+  gated-first-token error. CUDA-graph probe timings were 15.09ms one-token target,
+  15.81ms verifier and 18.19ms draft, versus 14.08ms/16.43ms stock verifier/draft.
+  These timings are **provisional, not qualified performance evidence**: those
+  probes did not enforce complete compilation, and later tests exposed eager
+  fallback. The invariant target differs numerically from stock bf16 arithmetic.
+- Disabling bf16 reduced-precision reduction alone did not solve the discrepancy.
+  cuBLASLt with both reduced-precision reduction and split-K disabled reduced
+  same-backend serial/block maximum TV to 0.01763, but was still not exact.
+  A separate default-compiler probe showed that matching GEMM shapes alone also
+  does not reproduce shape-dependent compiler fusion/rounding.
+- Jobs5630–5634 exposed the compiler failure: graph breaks at the native FA4
+  wrapper specialized `LlamaAttention.forward` by layer index and exhausted
+  Dynamo's eight-variant limit. Layer-qualified hook defaults added another
+  specialization source. Hooks now capture projection modules directly; FA4 is
+  a compiler-visible custom operator with checked mutation/fake-layout contracts.
+  Invariant model forwards require `fullgraph=True`, preserved precision casts,
+  and hard failure on recompilation-limit exhaustion. No limit was raised.
+- Job5646 passed the full CUDA suite, including ragged prefixes1/65/513/8192,
+  B64/B4, refill, EOS/output limits, cache eviction/rebuild, gated first token,
+  exact selected-target sampling laws, and actor refresh. Legacy AR maximum raw
+  TV was0.03000 before and0.04575 after the fixture actor update. Legacy retains
+  its original compiler behavior, including its pre-existing fallback; the matched
+  invariant AR reference does not use that fallback.
+- Generated-code review found a distinct performance defect: functionalized
+  `scatter_` cloned and copied back all48 KV backings each forward. At cache8230,
+  that is48.22GiB of logical read/write traffic per forward, not a measured DRAM
+  counter. Fresh returned views alone did not fix it. Indexed suffix updates use
+  Inductor's registered in-place lowering. Job5646 passed every numerical check;
+  generated-code inspection confirmed all96 full copies per forward disappeared.
+  The identical33-cycle fixture fell from3.00618s (job5641) to0.76872s (job5646):
+  **3.91× faster decoding schedule**, not an AR-relative or trained-adapter speedup.
+- The benchmark now has three separate-process arms: invariant AR, Uno on the
+  same target, and unchanged legacy AR. The ≥1.25× useful-throughput gate must pass
+  against **both** AR arms; slowing the reference cannot manufacture qualification.
 
-**Next concrete action: E0.** It is 10 GPU-minutes, needs no training, no new adapter, and no
-change to the trainer — only a benchmark that calls the existing fused replica with
-`max_seqlen_q > 1`.
+### Three-arm runtime fixture (job5647)
+
+RTX5090;8 prompts×16 responses,64 physical lanes, Uno B4,4096-token output cap;
+three same-seed timing repetitions after warmup in separate processes.
+The adapter received only one2048-token numerical-fixture update.
+
+| Engine | Median useful tokens/s | Median pool seconds | Peak allocated GiB |
+|---|---:|---:|---:|
+| Legacy AR, unchanged | 4812 | 108.58 | 11.82 |
+| Shared invariant AR | 7712 | 67.75 | 11.79 |
+| Uno fixture | 7185 | 72.90 | 11.96 |
+
+Uno reachedτ=2.132 tokens per active row-cycle: **0.932× matched invariant AR**
+and **1.493× legacy AR**. The performance gate correctly **failed** because both
+comparisons must reach1.25×. This establishes runtime mechanics, not the speedup
+of a properly distilled adapter. Between96.9% and99.2% of responses hit the
+output cap; no task-quality conclusion is supported.
+
+Canonical evidence, including raw repetition metrics and source fingerprints:
+`ablation_results/uno_invariant_runtime_20260908/metrics.jsonl` and `result.json`.
+The benchmark fixture checkpoint and throwaway diagnostic scripts were removed.

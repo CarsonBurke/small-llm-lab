@@ -103,18 +103,53 @@ lane finishes, its visible KV length drops to one so later captured steps do not
 scan dead history. No critic model or critic KV cache runs during autoregressive
 decoding. The actor replica weights remain resident across rollout and replay,
 while phase-local KV state is released before replay. Replay uses an
-11,024-token packed budget, stable segmented SDPA, and checkpoints every fourth
-actor and critic decoder layer. The `--replay-attention-backend fa4` path
-remains available only for profiling; SM120 FA4 varlen backward produced NaNs
-in production. Retaining the other activations cuts recomputation without
-exceeding 32 GiB.
+11,024-token packed budget and stable segmented SDPA. Activation checkpointing
+defaults to off (`--replay-checkpoint-interval 0`): retaining activations avoids
+recomputing decoder layers during backward. A 16-trajectory, 160k-response-token
+actor/critic optimizer-minibatch comparison measured 19.07→17.60 seconds (8.4%
+higher throughput), with peak allocation 16.77→20.22 GiB. This benchmark did not
+include a resident rollout replica or an entire RL cycle; reserve additional
+memory for those persistent weights and other workloads. Use
+`--replay-checkpoint-interval 4` when memory is tighter. Commands explicitly
+pinning an interval keep that setting; changing this option is resume-compatible.
+Replay MLP compilation is also enabled by default (`--compile-replay`).
+It preserves bf16 casts and keeps SiLU backward native: ordinary compiler
+decomposition changed replay gradients despite identical forward losses.
+The integrated long-trajectory update fixture measured 17.73→16.87 seconds
+(5.1% higher warm throughput) and 20.22→18.16 GiB peak allocated memory.
+These are isolated update measurements, not cold-start or full-cycle numbers.
+Compilation preserves parameter names and replica ownership, and supports the
+separate retained-graph primary/auxiliary backward passes. Use
+`--no-compile-replay` for an explicit eager comparison; this option is
+resume-compatible. Attention remains segmented SDPA.
+The `--replay-attention-backend fa4` path remains available only for profiling;
+SM120 FA4 varlen backward produced NaNs in production.
 
 MiniCPM VAPO uses the checkpoint's native thinking template, temperature 0.9,
 top-k 20, and top-p 0.95. The default 10,000-token response budget uses the
 64-row static cache after offloading the frozen training backbone.
 `--top-k 0 --no-fast-rollout` retains the slower exact full-vocabulary nucleus
-sampler. Production aborts if steady scheduled decode throughput falls below
-`--min-rollout-tokens-per-second`.
+sampler. Production aborts below `--min-rollout-tokens-per-second`: the AR path
+uses steady scheduled decode tok/s; opt-in Uno uses useful end-to-end rollout tok/s.
+Choose the Uno floor from a matched benchmark, not the AR scheduled-token value.
+
+Compiled MiniCPM AR now defaults to compiler-visible FA4, in-place indexed KV
+writes and fullgraph compilation with preserved bf16 casts. It retains ordinary
+cuBLAS GEMMs and the ordinary AR scheduler; fixed invariant GEMMs are **not**
+enabled. The runtime identity is `bf16-cublas-fa4-fullgraph-casts/v1`.
+Explicit noncompiled ordinary decode retains the legacy path.
+
+Qualification job 5711 used a step-370 actor and the 10,000-token cap: useful
+throughput improved 1,251.95→4,164.31 tokens/s (3.33×), and the 64-response pool
+fell from 253.53→89.78 seconds (2.82×). Peak allocation stayed about 20.48 GiB.
+The whole comparison and cache/actor-refresh checks took 463.89 seconds.
+Quality is **not established as unchanged**: optimized scored 22/64 versus
+legacy 26/64 on only four distinct problems. See
+[MiniCPM TODO and evidence](TODO_MINICPM5.md#standalone-ar-runtime--optimized-default-enabled).
+
+Checkpoint metadata pins `rollout_arithmetic`. Resuming pending legacy records
+under the new runtime is rejected; use a checkpoint at a completed-rollout
+boundary to change arithmetic. Existing running processes do not switch modes.
 
 TensorBoard is the only live metric stream. Semantic categories cover rollout
 quality, rollout performance, refill efficiency, sampling, replay, actor,
@@ -157,6 +192,149 @@ python3 scripts/preflight_minicpm_vapo.py \
   --output postraining/runs/minicpm5_vapo_continuation \
   --additional-steps 200
 ```
+
+### Opt-in Uno diffusion-assisted rollouts
+
+**Deferred by user veto until better hardware and explicit reauthorization.**
+The standalone AR optimization above is independent of this deferred training.
+
+Train the diffusion adapter **before RL**, then freeze it. The current actor—not
+the frozen distillation teacher—remains the verifier at every rollout. Default
+generation stays AR; enabling Uno requires all three explicit settings:
+`--uno-rollout --uno-checkpoint RUN/adapter.pt --uno-block-size 4`.
+Fast rollout and CUDA-graph capture must remain enabled.
+
+Uno uses the explicit `bf16-lane64-n128-k32-casts/v1` numerical target. Fixed-tile
+Triton projections retain bf16 inputs/outputs and fp32 accumulation; compiler casts
+are preserved, and the FA4 custom operator keeps decoding in one complete graph.
+Compilation failure is fatal rather than silently changing arithmetic.
+Its matched AR reference uses the same arithmetic and recomputes
+the last prompt token at the prefill/decode boundary. This is **not** a claim of
+finite-precision equality to legacy AR or the new ordinary-GEMM optimized default.
+Qualification requires exact serial/block logits, clean KV and transformed sampling
+laws on the selected target, with legacy drift reported separately.
+
+Current evidence (2026-09-08): 96 CPU tests and full-model CUDA numerical
+qualification job5646 pass, including exact logits/KV/sampling laws before and
+after actor refresh. Legacy raw-vocabulary maximum TV was0.03000/0.04575 on those
+regression prefixes. Inspect **both stdout and stderr** when qualifying; earlier
+probes hid Dynamo fallback warnings in stderr and are not valid runtime evidence.
+Do not treat the temporary one-update adapter as learning or trained-speedup evidence.
+Replacing functionalized KV scatters with in-place indexed suffix writes reduced
+the identical33-cycle fixture from3.006s to0.769s (3.91×). This is a runtime-code
+optimization, not evidence of a trained adapter beating AR.
+The three-arm benchmark (job5647; B64/B4,4096-token cap,three timing repetitions)
+measured4812/7712/7185 useful tokens/s for legacy AR/invariant AR/Uno respectively.
+The one-update fixture achieved0.932× matched AR and1.493× legacy AR, so the
+≥1.25× dual performance gate **failed**. Between96.9% and99.2% of responses were
+cap-truncated; this is not a task-quality result. Keep production RL on default AR
+until a properly distilled adapter passes the learning, quality and speed gates.
+Canonical metrics and source fingerprints:
+`ablation_results/uno_invariant_runtime_20260908/{metrics.jsonl,result.json}`.
+
+`scripts/train_minicpm_uno.py` implements one paired clean/noisy backbone forward,
+duplicated logical RoPE positions, the Uno block mask with compiled native
+FlexAttention, and detached same-position teacher next-token distributions.
+Noise is uniform over the **entire** vocabulary. The objective is full-vocabulary
+probability L1 (2×TV), position-chunked with recomputation backward. Only independent
+fp32-master diffusion LoRA trains; base/actor weights and the output head are frozen.
+FA4 is used for causal rollout suffixes, **not** unsupported masked training backward.
+
+Candidate MiniCPM defaults are rank48/alpha3072, all seven projections,
+standard random-A/zero-B initialization, bf16 compute, sequence2048,
+microbatch1 × accumulation64, lr1e-5, 2% token warmup, and
+100M supervised tokens at block2 followed by 300M at block4.
+These transfer hyperparameters are not a demonstrated MiniCPM optimum.
+Input is an explicitly supplied offline reasoning corpus: local JSONL
+`messages`, OpenThoughts `conversations`, `text`, or question/response pairs;
+each `.txt` file is one document. DAPO questions alone are not a reasoning corpus.
+The default document-hash heldout split is 1%; explicit heldout documents must
+be disjoint from training. Prepared streams, tokenizer, source bytes, teacher,
+optimizer/RNG/cursor, and curriculum identity are pinned for exact recovery.
+
+```bash
+# Point UNO_DATA at a real offline reasoning JSONL corpus.
+mlq submit --name minicpm-uno-prepare --cwd "$PWD" --max-parallel-runs 1 -- \
+  .venv/bin/python scripts/train_minicpm_uno.py \
+  --data "$UNO_DATA" --output postraining/runs/minicpm_uno --prepare-only
+
+# Start only after numerical/runtime feasibility checks; this is a 400M-token pilot.
+mlq submit --name minicpm-uno-distill --cwd "$PWD" --max-parallel-runs 1 -- \
+  .venv/bin/python scripts/train_minicpm_uno.py \
+  --data "$UNO_DATA" --output postraining/runs/minicpm_uno
+
+# Same immutable arguments plus --resume postraining/runs/minicpm_uno/latest.pt
+# recover training. A completed curriculum also exports adapter.pt.
+```
+
+For an already-trained RL actor, add `--teacher-checkpoint ACTOR_CHECKPOINT`
+to distillation and retain that same teacher on recovery. No teacher checkpoint
+means the pinned native MiniCPM base, which also equals a fresh zero-B actor.
+Recovery checkpoints are atomic at completed optimizer boundaries; SIGINT/SIGTERM
+finish the current accumulated update before saving. Distillation writes
+`metrics.jsonl` and `tensorboard/` beneath its output directory, including heldout
+L1/TV, token throughput and gradient norms.
+
+Before enabling RL, compare Uno against all three AR controls on the same trained adapter and actor:
+
+```bash
+mlq submit --name minicpm-uno-compare --cwd "$PWD" --max-parallel-runs 1 -- \
+  .venv/bin/python scripts/benchmark_minicpm_uno.py \
+  --uno-checkpoint postraining/runs/minicpm_uno/adapter.pt \
+  --output postraining/runs/minicpm_uno/comparison.json
+```
+
+The benchmark defaults to eight prompts × sixteen responses over 64 physical lanes,
+10,000 response tokens, and the production temperature/top-k/top-p. Add
+`--actor-checkpoint` for a resumed actor; use `--prompts 4` for a matched 64-logical-row
+comparison without backlog. The default `--engine all` runs separate-process
+`legacy-ar`, `optimized-ar` (production), `ar` (invariant) and `uno` arms,
+reclaiming graph/compile memory between methods. Warmup is excluded and useful
+emitted tokens are the numerator. Uno must exceed all three AR controls by
+≥1.25×; a slower numerical reference cannot inflate the qualification claim.
+The JSON also records logical-pool wall time, truncation, memory, occupancy,
+per-position acceptance and checkpoint/data/prompt identity. It does **not**
+prove distributional correctness, math quality, full RL-cycle speedup or compute payback.
+For AR-only work use `--engine optimized-ar`, `--engine legacy-ar` or `--engine ar`
+without `--uno-checkpoint`. `--cache-length` specifies the cache capacity separately
+from the output cap. Answer grading uses the trainer's existing non-symbolic grader
+outside the generation timer; `--export-responses` also saves text and token IDs.
+
+Append the Uno settings to the normal VAPO command only after those gates pass:
+Set `UNO_USEFUL_TPS_FLOOR` to a measured useful-token floor; do not copy the default
+4,000 scheduled-token AR floor into an Uno campaign.
+
+```bash
+mlq submit --name minicpm-vapo-uno --cwd "$PWD" --max-parallel-runs 1 -- \
+  .venv/bin/python -m postraining.train_minicpm_vapo \
+  --uno-rollout --uno-checkpoint postraining/runs/minicpm_uno/adapter.pt \
+  --uno-block-size 4 --min-rollout-tokens-per-second "$UNO_USEFUL_TPS_FLOOR" \
+  --output postraining/runs/minicpm_vapo_uno
+```
+
+The inherited continuous scheduler commits only clean verified KV, keeps the final
+correction/bonus token pending, and truncates at the first EOS/output limit.
+Sparse coupling uses the exact production top-k-then-nucleus law; PPO likelihoods
+still come from untempered actor replay, never draft/residual probabilities.
+Uno checkpoints are separately stored and SHA-256-pinned in RL recovery.
+Pending Uno replay also pins the arithmetic version; changing it requires a
+completed rollout boundary. AR↔Uno/block-size changes likewise require a completed
+rollout boundary. Relocating identical adapter bytes at a completed
+rollout boundary is allowed;
+silently replacing them on an Uno resume is not. Acceptance can deteriorate as
+RL changes the actor; rebenchmark later checkpoints instead of assuming rank bounds drift.
+
+Opt-in full-model numerical regression (not a learning or speedup trial):
+
+```bash
+mlq submit --name minicpm-uno-contracts --cwd "$PWD" --max-parallel-runs 1 \
+  --time-limit 45m --env RUN_UNO_CUDA_VALIDATION=1 -- \
+  .venv/bin/python -m pytest postraining/tests/test_uno_cuda.py -x -v -s
+```
+
+See `docs/uno_diffusion_augmented_assessment.md` for paper/release provenance,
+the evidence gates, and measured versus still-unmeasured claims.
+
 
 Run every GPU workload through `mlq`. Before a new training campaign, run the
 frozen-policy learnability gate:
