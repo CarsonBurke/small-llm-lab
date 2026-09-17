@@ -734,3 +734,144 @@ Pin the runtime-only backend, recurrence precision, compiler, and batching
 settings explicitly for a staged continuation. Runtime kernel choices are not
 part of the paper architecture, while schedule, data, batching, optimizer, and
 gate choices are bound into the checkpoint's `paper_v3` training contract.
+
+## FFN-only streaming TD value pretraining
+
+`scripts/train_future_credit_stream.py` trains
+`pretraining/future_credit_stream/` on the non-GPT2 FineWeb
+SentencePiece-1024 corpus. Six width-512 residual FFNs use the nanoGPT-mini
+ReLU-square MLP convention, without attention, token-history buffers, or memory
+slots. Each document carries one detached BF16 vector, injected before the
+first FFN; FP32 master parameters train with fused AdamW.
+
+The actual current hidden produces next-token CE and becomes the detached
+recurrent input. A tiny, training-only scalar critic predicts remaining
+prediction loss, not a vector of synthetic gradients:
+
+```text
+V(h_t) estimates CE_(t+1) + discount * CE_(t+2) + ...
+producer_t = mean(CE_t + discount * V(h_t; frozen critic weights))
+target_(t-1) = stop_gradient(CE_t + discount * V(h_t))
+critic_(t-1) = 0.5 * mean((V(stop_gradient(h_(t-1))) - target_(t-1))^2)
+loss_t = producer_t + critic_(t-1)
+```
+
+This is ordinary teacher-forced pretraining: targets use observed corpus
+tokens, not sampled rollouts or contrastive negatives. The 64-unit squared-ReLU
+critic adds no inference backbone capacity. Its first projection uses BF16;
+the final scalar accumulation uses FP32 so cumulative values can retain small
+TD residuals. It is initialized after the common FFN parameters, with zero
+output weights, preserving same-seed CE initialization.
+
+The producer differentiates through a **frozen critic** into only the current
+FFN. Critic regression sees the **original detached previous carry**, not the
+reset state, and its CE/value teacher is detached. A current BOS target removes
+the current future-value term while retaining CE. A document reset sets the
+previous state's entire TD target to zero, including that terminal row in
+regression.
+
+Each token uses **one compiled forward and one combined backward**. There is
+no incoming-state VJP, lookahead, boundary replay, additional history vector,
+or linked temporal graph/TBPTT. The previous TD feature is the same vector
+already needed for recurrence. A global `has_previous` flag skips fitting only
+the first observation's nonexistent predecessor; it stays true across optimizer
+pages and is restored from the saved optimizer-step count. Every observed
+transition is eligible, including transitions across update boundaries. No
+pending graph survives a token backward or enters a checkpoint. Carry and
+accumulated gradients use external buffers across CUDA-graph replays.
+
+The default `discount=1` targets the undiscounted finite-document continuation;
+values in `[0,1]` are configurable. A calibrated value estimate is not a guarantee
+of useful input gradients: critic exploitation and moving-target instability
+remain algorithmic risks. Only the matched BPB ablation can establish benefit.
+
+The mmap loader maintains 4,096 independent document lanes, preserves
+cross-shard documents, prefetches one bounded page, and checkpoints the consumed
+rather than speculative cursor. A complete document ends at the following real
+BOS target; incomplete corpus edges are excluded. The default 2,000 updates
+consume 65,536,000 token targets, with validation every 20 updates.
+
+```bash
+mlq submit --name ffn_td_value_sp1024_2k --cwd "$PWD" \
+  --max-parallel-runs 1 --max-attempts 1 --time-limit 4h \
+  --env FUTURE_CREDIT_STREAM_RUN_ID=ffn_td_value_sp1024_2k \
+  --env FUTURE_CREDIT_STREAM_OBJECTIVE=td -- \
+  .venv/bin/python scripts/train_future_credit_stream.py
+
+mlq submit --name ffn_td_value_ce_sp1024_2k --cwd "$PWD" \
+  --max-parallel-runs 1 --max-attempts 1 --time-limit 4h \
+  --env FUTURE_CREDIT_STREAM_RUN_ID=ffn_td_value_ce_sp1024_2k \
+  --env FUTURE_CREDIT_STREAM_OBJECTIVE=ce -- \
+  .venv/bin/python scripts/train_future_credit_stream.py
+```
+
+Use fresh run identifiers for new experiments. Configuration overrides use
+`FUTURE_CREDIT_STREAM_<FIELD>`. Resume with
+`--resume ablation_results/<run>/checkpoint.pt` and identical configuration,
+data, tokenizer, and source hashes. An improved validation at the resumed
+starting step also publishes `best.pt`. Generate through `mlq` with
+`--generate ablation_results/<run>/checkpoint.pt --prompt "Some text"`.
+Neither validation nor generation invokes the critic. The architecture tag
+`streaming_ffn_td_value_v1` rejects historical vector-credit and NextLat
+checkpoints. Resume source fingerprints include the baseline utility that
+defines validation byte accounting; that upstream source is not modified.
+
+### Scalar TD acceptance gates
+
+Control-like speed means at most **1.15x** the matched CE update time. The
+throughput-only check uses full 4,096-lane, eight-tick optimizer pages, actual
+prefetched corpus data, one process, 40 warmup updates per arm, and three
+alternating 100-update timing rounds. It checks for unmanaged Python GPU
+workloads and uses median round timings; this is not reduced-run BPB evidence.
+The learning comparison remains 2,000 updates, with an improvement greater than
+0.005 proxy BPB required for promotion. Neither speed nor learning benefit is
+assumed from the implementation.
+
+### Historical vector-credit ablation
+
+The matched CE control, `ffn_future_credit_ce_sp1024_2k`, completed 2,000
+updates and 65,536,000 targets: **2.139481 proxy BPB**, 3.309343 reset-state BPB,
+and 50.107 seconds of timed training. Its source hashes, data/tokenizer
+fingerprints, and configuration match the future-credit arm except objective
+and run identifier.
+
+`ffn_future_credit_sp1024_2k` was externally cancelled by request, not culled
+by the trainer. Its last logged update was 670; its last validation was
+**2.485239 proxy BPB at step 660**. `checkpoint.pt` preserves step 600 and
+`best.pt` preserves step 660. There is no completed 2,000-update future-credit
+score, so this experiment is **not eligible for promotion or a final matched
+BPB comparison**. `result.json` and `comparison.json` explicitly record the
+interruption rather than treating the last validation as a final score.
+
+Future-credit wall-clock timing was contaminated by concurrent, untracked PGQA
+GPU training; it is not an isolated throughput benchmark. The implementation
+passed 26 CPU document-stream tests and 15 CUDA gradient/runtime contracts,
+including compiled optimizer-page parity over three updates. The full-checkpoint
+generation and resumed-best-publication checks were skipped because their
+required training job was cancelled; those end-to-end checks remain unverified.
+
+### Historical 2,000-update references
+
+The previous streaming NextLat implementation used SmoothL1 hidden matching and
+forward-KL self-distillation, conditioned on the correct next token. Those
+auxiliary losses and the old entrypoint have been replaced; historical
+checkpoints, source hashes, metrics, and comparison artifacts remain unchanged.
+
+| Recipe | Parameters | Proxy BPB | Reset-state BPB | Training-loop seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Recurrent CE, actual-hidden carry | 13,652,480 | **2.139849** | 3.306123 | 46.246 |
+| Delayed NextLat, predicted carry | 16,274,944 | 2.597596 | 3.067103 | 60.827 |
+| Delayed NextLat, actual-hidden carry | 16,274,944 | 2.396413 | 3.018147 | 62.462 |
+
+Predicted-carry NextLat was 0.457747 BPB worse than CE. Switching NextLat to
+actual carry improved BPB by 0.201183, but remained 0.256564 worse than CE.
+These are negative ablations, not promoted recipes. Future credit is a separate
+ablation; the historical results do not establish its effectiveness.
+
+Scores cover a fixed 32,768-target partial-document panel (76,307 bytes), not
+full challenge validation or the old nanoGPT baseline window. Reset-state BPB
+is a counterfactual using zero carry at every token, not a separately trained
+model. Canonical metrics, run provenance, results, and checkpoints live under
+`ablation_results/<run>/`; the same metrics stream feeds `tb_logs/<run>/`.
+Current training records CE, scalar TD regression, predecessor values and targets;
+timed training excludes validation and checkpoint writes.
