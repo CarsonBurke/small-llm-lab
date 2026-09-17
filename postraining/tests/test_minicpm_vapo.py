@@ -1,6 +1,8 @@
 from __future__ import annotations
 from collections import Counter
 import copy
+from contextlib import nullcontext
+from dataclasses import replace
 
 from types import SimpleNamespace
 from typing import Any, cast
@@ -36,6 +38,7 @@ from postraining.minicpm_vapo import (
     _packed_replay_attention,
     _packed_replay_attention_fa4,
     _ReplaySiLU,
+    adapter_state_dict,
     chunked_frozen_head_logprobs,
     collate_replay_microbatch,
     dense_top_p_probabilities,
@@ -43,6 +46,7 @@ from postraining.minicpm_vapo import (
     exact_top_p_sample,
     maximal_coupling_verify,
     inject_lora,
+    load_adapter_state_dict,
     merge_lora_for_inference,
     plan_replay_microbatches,
     prepare_text_only_transformers_runtime,
@@ -66,6 +70,8 @@ from postraining.train_minicpm_vapo import (
     _accumulate_rescaled_parameter_gradients_,
     _clip_finite_grad_norm_,
     _approximate_kl_terms,
+    _clipped_policy_objective,
+    _ratio_moments_from_log_sums,
     _scale_auxiliary_loss,
     _build_group_records,
     _nextlat_training_loss,
@@ -82,10 +88,13 @@ from postraining.train_minicpm_vapo import (
     build_parser,
     device_phase_metrics,
     file_sha256,
+    measure_post_update_behavior_kl,
+    refresh_behavior_statistics,
     static_kv_cache_bytes,
     tensorboard_scalars,
     tensorboard_rollout_samples,
     reassert_optimizer_learning_rates,
+    update_step,
     validate_resume_configuration,
     validate_resume_dataset,
     validate_resume_rollout_arithmetic,
@@ -155,6 +164,27 @@ def test_nora_init_normalizes_lora_a_columns_once() -> None:
         standard.lora_a / standard_norms.unsqueeze(0),
     )
     assert torch.count_nonzero(nora.lora_b) == 0
+
+
+def test_nora_adapter_reload_preserves_nonunit_trained_outputs(tmp_path) -> None:
+    torch.manual_seed(19)
+    base = nn.Linear(6, 5, bias=False)
+    trained = LoRALinear(copy.deepcopy(base), LoRAConfig(rank=2, alpha=4))
+    with torch.no_grad():
+        trained.lora_a.mul_(torch.arange(2, 8))
+        trained.lora_b.normal_()
+    inputs = torch.randn(3, 6)
+    expected = base(inputs) + (
+        inputs @ trained.lora_a.T @ trained.lora_b.T
+    ) * trained.scaling
+    checkpoint = tmp_path / "adapter.pt"
+    torch.save(adapter_state_dict(trained), checkpoint)
+
+    restored = LoRALinear(copy.deepcopy(base), LoRAConfig(rank=2, alpha=4))
+    load_adapter_state_dict(
+        restored, torch.load(checkpoint, weights_only=True)
+    )
+    torch.testing.assert_close(restored(inputs), expected)
 
 
 def test_lora_config_rejects_unknown_initialization() -> None:
@@ -681,6 +711,8 @@ def test_captured_rollouts_reuse_unique_prompt_prefills(
     engine.stop_ids = (9,)
     engine.top_k = 2
     engine.top_p = 0.9
+    engine.answer_reserve_tokens = 0
+    engine.thinking_end_token_id = None
     engine.policy = SimpleNamespace(
         causal_lm=SimpleNamespace(config=SimpleNamespace(vocab_size=10))
     )
@@ -897,8 +929,7 @@ def test_nextlat_auxiliary_trains_source_hidden_and_predictor() -> None:
     hidden = torch.randn(1, 5, 128, requires_grad=True)
     batch = SimpleNamespace(
         input_ids=torch.tensor([[0, 1, 2, 3, 4]]),
-        response_state_mask=torch.ones((1, 5), dtype=torch.bool),
-        sequence_ids=torch.zeros((1, 5), dtype=torch.long),
+        nextlat_sequence_ranges=((0, 5),),
     )
     result = _nextlat_training_loss(
         cast(MiniCPMVAPOPolicy, policy),
@@ -1260,10 +1291,76 @@ def test_multi_prompt_preparation_forms_one_left_padded_batch() -> None:
     assert engine.prompt_lengths_buffer.tolist() == [3, 3, 1, 1]
 
 def test_ppo_approximate_kl_is_pointwise_non_negative() -> None:
-    log_ratio = torch.tensor([-2.0, -0.1, 0.0, 0.2, 3.0])
+    log_ratio = torch.tensor([-2.0, -0.1, -1e-8, 0.0, 1e-8, 0.2, 3.0])
     terms = _approximate_kl_terms(log_ratio)
     assert torch.all(terms >= 0)
-    assert terms[2] == 0
+    assert terms[3] == 0
+    torch.testing.assert_close(
+        terms[[2, 4]], 0.5 * log_ratio[[2, 4]].double().square(),
+        rtol=1e-7, atol=1e-25,
+    )
+
+
+def test_ppo_clipped_extreme_branches_have_finite_zero_gradients() -> None:
+    log_ratio = torch.tensor([602.67676, -1000.0, 1000.0], requires_grad=True)
+    advantages = torch.tensor([0.3786605, -2.0, 0.0])
+    objective = _clipped_policy_objective(
+        log_ratio, advantages, clip_low=0.2, clip_high=0.2
+    )
+    objective.sum().backward()
+    torch.testing.assert_close(objective, torch.tensor([0.4543926, -1.6, 0.0]))
+    torch.testing.assert_close(log_ratio.grad, torch.zeros(3), rtol=0, atol=0)
+
+
+def test_ppo_log_domain_clipping_preserves_finite_objectives_and_gradients() -> None:
+    actual_input = torch.tensor(
+        [-1.0, -0.1, 0.1, 0.5, -1.0, 0.5], dtype=torch.float64, requires_grad=True
+    )
+    reference_input = actual_input.detach().clone().requires_grad_()
+    advantages = torch.tensor([1.0, 1.0, 1.0, 1.0, -1.0, -1.0])
+    actual = _clipped_policy_objective(
+        actual_input, advantages, clip_low=0.2, clip_high=0.2
+    )
+    ratio = reference_input.exp()
+    expected = torch.minimum(ratio * advantages, ratio.clamp(0.8, 1.2) * advantages)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(
+        actual_input.grad, reference_input.grad, rtol=1e-12, atol=1e-12
+    )
+
+
+def test_ppo_does_not_cap_unfavorable_positive_ratios() -> None:
+    log_ratio = torch.tensor([600.0], dtype=torch.float64, requires_grad=True)
+    objective = _clipped_policy_objective(
+        log_ratio, torch.tensor([-1.0]), clip_low=0.2, clip_high=0.2
+    )
+    objective.sum().backward()
+    expected = -log_ratio.detach().exp()
+    torch.testing.assert_close(objective, expected)
+    torch.testing.assert_close(log_ratio.grad, expected)
+
+
+def test_ppo_ratio_moments_avoid_overflow_in_representable_statistics() -> None:
+    log_ratio = torch.tensor([600.0, 0.0], dtype=torch.float64)
+    mean, std = _ratio_moments_from_log_sums(
+        torch.logsumexp(log_ratio, 0), torch.logsumexp(2 * log_ratio, 0), 2
+    )
+    expected = log_ratio[0].exp() / 2
+    torch.testing.assert_close(mean, expected, rtol=1e-12, atol=0)
+    torch.testing.assert_close(std, expected, rtol=1e-12, atol=0)
+    torch.testing.assert_close(
+        _approximate_kl_terms(torch.tensor(600.0)), 2 * expected - 601
+    )
+
+
+def test_ppo_ratio_moments_handle_empty_and_zero_probability_samples() -> None:
+    log_zero = torch.tensor(-torch.inf, dtype=torch.float64)
+    for count in (0, 2):
+        mean, std = _ratio_moments_from_log_sums(log_zero, log_zero, count)
+        assert mean.item() == 0.0
+        assert std.item() == 0.0
 
 def test_auxiliary_loss_is_downscaled_without_amplifying_small_losses() -> None:
     large = torch.tensor(20.0, requires_grad=True)
@@ -1433,14 +1530,182 @@ def test_replay_plan_and_collation_preserve_variable_length_actions() -> None:
     assert batch.position_ids.tolist() == [
         [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4]
     ]
-    assert batch.sequence_ids.tolist() == [[0] * 8 + [1] * 5]
     assert batch.action_count == records[0].response_length + records[1].response_length
     assert batch.targets.tolist() == [4, 5, 6, 7, 8, 3, 4, 5]
     assert batch.action_positions.tolist() == [3, 4, 5, 6, 7, 10, 11, 12]
-    assert batch.response_state_mask.tolist() == [
-        [False, False, False, True, True, True, True, True, False, False, True, True, True]
-    ]
     assert replay_storage_bytes(records) == sum(record.storage_bytes for record in records)
+
+
+@pytest.fixture
+def replay_table_sides(monkeypatch):
+    """Independent state tables expose each actor action and critic value gradient."""
+    class Side(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden = nn.Parameter(torch.zeros(6, 7))
+            self.nextlat_head = nn.Linear(7, 7)
+            self.register_buffer("lm_head_weight", torch.eye(7))
+            self.causal_lm = SimpleNamespace(config=SimpleNamespace(pad_token_id=0))
+            self.seen_inputs = None
+
+        def replay_hidden(self, input_ids, attention_mask, **kwargs):
+            self.seen_inputs = input_ids.clone()
+            return self.hidden[input_ids]
+
+        def values(self, hidden):
+            return hidden[..., 0]
+
+    monkeypatch.setattr(torch, "autocast", lambda **kwargs: nullcontext())
+    return Side(), Side()
+
+
+@pytest.mark.parametrize("log_ratio_shift", [0.0, 600.0])
+def test_forced_replay_action_has_no_policy_gradient_but_keeps_context_and_value(
+    replay_table_sides, log_ratio_shift,
+) -> None:
+    actor, critic = replay_table_sides
+    logprobs = torch.full((5,), -torch.log(torch.tensor(7.0)).item() - log_ratio_shift)
+    logprobs[2] = -1e6
+    record = TrajectoryRecord(
+        token_ids=torch.arange(7, dtype=torch.int32),
+        prompt_length=2,
+        old_logprobs=logprobs,
+        advantages=torch.tensor([1.0, 2.0, 1e6, 3.0, 4.0]),
+        correct=True,
+        text="think </think> answer",
+        forced_token_index=2,
+    )
+    batch = collate_replay_microbatch(
+        [record], [0], pad_token_id=0, device=torch.device("cpu")
+    )
+    assert batch.policy_mask.tolist() == [True, True, False, True, True]
+    assert batch.targets.tolist() == [2, 3, 4, 5, 6]
+    assert batch.action_positions.tolist() == [1, 2, 3, 4, 5]
+    torch.testing.assert_close(batch.advantages, record.advantages)
+    metrics = update_step(
+        actor, critic, [record],
+        torch.optim.SGD(actor.parameters(), lr=0.05),
+        torch.optim.SGD(critic.parameters(), lr=0.05),
+        optimizer_minibatches=1,
+        replay_token_budget=6,
+        replay_max_trajectories=1,
+        logit_chunk_tokens=2,
+        clip_low=0.2,
+        clip_high=0.2,
+        value_coefficient=1.0,
+        nextlat_horizon=1,
+        nextlat_samples=1,
+        nextlat_mse_coefficient=1.0,
+        nextlat_kl_coefficient=1.0,
+        nextlat_kl_chunk_tokens=2,
+        train_nextlat=False,
+        grad_clip_norm=100.0,
+    )
+    expected_actor = torch.zeros_like(actor.hidden)
+    if log_ratio_shift == 0:
+        for state, target, advantage in ((1, 2, 1.0), (2, 3, 2.0), (4, 5, 3.0), (5, 6, 4.0)):
+            expected_actor[state] = -0.05 * advantage / (4 * 7)
+            expected_actor[state, target] += 0.05 * advantage / 4
+    torch.testing.assert_close(actor.hidden, expected_actor)
+    expected_critic = torch.zeros_like(critic.hidden)
+    expected_critic[1:, 0] = 0.02
+    torch.testing.assert_close(critic.hidden, expected_critic)
+    assert actor.seen_inputs.tolist() == [[0, 1, 2, 3, 4, 5]]
+    assert critic.seen_inputs.tolist() == [[0, 1, 2, 3, 4, 5]]
+    expected_ratio = torch.tensor(log_ratio_shift, dtype=torch.float64).exp().item()
+    assert metrics["policy_loss"] == pytest.approx(-2.5 * min(expected_ratio, 1.2))
+    assert metrics["ratio_mean"] == pytest.approx(expected_ratio)
+    assert metrics["ratio_std"] == pytest.approx(0.0, abs=1e-10)
+    assert metrics["approximate_kl"] == pytest.approx(
+        expected_ratio - 1 - log_ratio_shift
+    )
+    assert metrics["sampled_forward_kl"] == pytest.approx(-log_ratio_shift)
+    assert metrics["ratio_abs_log_max"] == pytest.approx(log_ratio_shift)
+    assert metrics["clip_fraction"] == pytest.approx(float(log_ratio_shift > 0))
+    assert metrics["advantage_mean"] == pytest.approx(2.5)
+    assert metrics["advantage_max"] == pytest.approx(4.0)
+
+
+def test_behavior_refresh_preserves_forced_transition_and_full_gae(replay_table_sides):
+    actor, critic = replay_table_sides
+    record = TrajectoryRecord.from_device(
+        token_ids=torch.arange(7),
+        prompt_length=2,
+        old_logprobs=torch.zeros(5),
+        old_values=torch.zeros(5),
+        correct=True,
+        text="think </think> answer",
+        forced_token_index=2,
+    )
+    values = torch.tensor([0.1, 0.3, -0.2, 0.4, 0.5])
+    with torch.no_grad():
+        critic.hidden[1:, 0].copy_(values)
+    refreshed, _ = refresh_behavior_statistics(
+        actor, critic, [record],
+        replay_token_budget=6,
+        replay_max_trajectories=1,
+        logit_chunk_tokens=2,
+    )
+    result = refreshed[0]
+    assert result.forced_token_index == 2
+    assert result.response_length == 5
+    torch.testing.assert_close(result.token_ids, record.token_ids)
+    torch.testing.assert_close(
+        result.old_logprobs, torch.full((5,), -torch.log(torch.tensor(7.0)).item())
+    )
+    rewards = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0]])
+    expected, _ = generalized_advantage_estimate(
+        rewards, values[None], torch.ones_like(rewards),
+        length_adaptive_lambda(torch.tensor([5.0])),
+    )
+    torch.testing.assert_close(result.advantages, expected[0])
+
+
+def test_post_update_kl_excludes_forced_action_and_uses_sampled_denominator(
+    replay_table_sides,
+) -> None:
+    actor, _ = replay_table_sides
+    log_ratio = torch.tensor([0.2, -0.1, 1e6, 0.3, -0.4])
+    record = replace(
+        _record(7, 2),
+        old_logprobs=-torch.log(torch.tensor(7.0)) - log_ratio,
+        forced_token_index=2,
+    )
+    metrics = measure_post_update_behavior_kl(
+        actor, [record],
+        replay_token_budget=6,
+        replay_max_trajectories=1,
+        logit_chunk_tokens=2,
+    )
+    sampled = log_ratio[torch.tensor([True, True, False, True, True])]
+    assert metrics["post_update_approximate_kl"] == pytest.approx(
+        _approximate_kl_terms(sampled).mean().item(), abs=1e-7
+    )
+    assert metrics["post_update_sampled_forward_kl"] == pytest.approx(
+        -sampled.mean().item(), abs=1e-7
+    )
+    assert metrics["post_update_ratio_abs_log_max"] == pytest.approx(0.4)
+
+
+def test_pending_replay_roundtrip_preserves_forced_and_legacy_actions(tmp_path):
+    forced = replace(_record(7, 2), forced_token_index=2)
+    legacy = _record(7, 2)
+    del legacy.__dict__["forced_token_index"]
+    path = tmp_path / "pending.pt"
+    torch.save([forced, legacy], path)
+    restored = torch.load(path, weights_only=False)
+    batch = collate_replay_microbatch(
+        restored, [0, 1], pad_token_id=0, device=torch.device("cpu")
+    )
+    assert restored[0].forced_token_index == 2
+    assert restored[1].forced_token_index == -1
+    assert batch.policy_mask.tolist() == [True, True, False, True, True] + [True] * 5
+
+
+@pytest.mark.parametrize("forced_token_index", [-2, 5])
+def test_replay_record_rejects_out_of_range_forced_token(forced_token_index):
+    with pytest.raises(ValueError, match="forced token index"):
+        replace(_record(7, 2), forced_token_index=forced_token_index)
 
 
 def test_replay_plan_accepts_optimizer_minibatch_subset() -> None:
@@ -1787,6 +2052,26 @@ def test_pending_optimized_ar_resume_rejects_arithmetic_demotion() -> None:
         validate_resume_rollout_arithmetic(resume, LEGACY_ARITHMETIC)
 
 
+@pytest.mark.parametrize(
+    "prior_arithmetic",
+    [
+        "bf16-cublas-fa4-fullgraph-casts/v1",
+        "bf16-cublas-fa4-split4-fp32-fullgraph-casts/v2",
+    ],
+)
+def test_pending_prior_ar_resume_rejects_attention_cutover(prior_arithmetic) -> None:
+    from postraining.invariant_linear import OPTIMIZED_ARITHMETIC
+
+    resume = {
+        "args": {"rollout_arithmetic": prior_arithmetic},
+        "pending_records": [object()],
+    }
+    with pytest.raises(ValueError, match="numerical target"):
+        validate_resume_rollout_arithmetic(resume, OPTIMIZED_ARITHMETIC)
+    resume["pending_records"] = None
+    validate_resume_rollout_arithmetic(resume, OPTIMIZED_ARITHMETIC)
+
+
 def test_resume_reasserts_cli_learning_rates_on_every_optimizer_group() -> None:
     actor_parameters = [nn.Parameter(torch.zeros(())) for _ in range(2)]
     critic_parameters = [nn.Parameter(torch.zeros(())) for _ in range(2)]
@@ -2058,3 +2343,77 @@ def test_pending_uno_resume_pins_numerical_target(tmp_path) -> None:
     prior["uno_arithmetic"] = "different-arithmetic"
     resume["pending_records"] = None
     validate_resume_configuration(resume, args)
+
+
+def test_token_carry_rejects_other_reasoning_and_forced_delimiters() -> None:
+    options = ["--token-carry", "--answer-reserve-tokens", "0", "--no-train-nextlat"]
+    _validate_args(build_parser().parse_args(options))
+    for incompatible in (
+        ["--latent-thinking"],
+        ["--uno-rollout"],
+        ["--no-fast-rollout"],
+        ["--no-compile-rollout"],
+        ["--no-compile-replay"],
+        ["--answer-reserve-tokens", "1000"],
+        ["--train-nextlat"],
+    ):
+        with pytest.raises(ValueError, match="token carry"):
+            _validate_args(build_parser().parse_args(options + incompatible))
+
+
+def test_resume_cannot_silently_change_token_carry_mode() -> None:
+    native = vars(build_parser().parse_args([]))
+    native.pop("token_carry")
+    resume = {"args": native, "pending_records": None}
+    validate_resume_configuration(resume, build_parser().parse_args([]))
+    with pytest.raises(ValueError, match="token_carry"):
+        validate_resume_configuration(
+            resume, build_parser().parse_args(["--token-carry"])
+        )
+    carry = build_parser().parse_args(["--token-carry"])
+    resume["args"] = vars(carry).copy()
+    validate_resume_configuration(resume, carry)
+    with pytest.raises(ValueError, match="token_carry"):
+        validate_resume_configuration(resume, build_parser().parse_args([]))
+
+
+def test_pending_carry_replay_requires_persisted_observations_not_fixed_geometry() -> None:
+    args = build_parser().parse_args(["--token-carry"])
+    record = TrajectoryRecord(
+        token_ids=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        prompt_length=1,
+        old_logprobs=torch.zeros(3),
+        advantages=torch.ones(3),
+        correct=True,
+        text="",
+        carry_hiddens=torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),
+    )
+    resume = {"args": vars(args).copy(), "pending_records": [record]}
+    validate_resume_configuration(resume, args)
+    args.replay_max_trajectories += 1
+    args.replay_token_budget += 32
+    validate_resume_configuration(resume, args)
+    resume["pending_records"] = [TrajectoryRecord(
+        token_ids=record.token_ids,
+        prompt_length=record.prompt_length,
+        old_logprobs=record.old_logprobs,
+        advantages=record.advantages,
+        correct=True,
+        text="",
+    )]
+    with pytest.raises(ValueError, match="stored carry hiddens"):
+        validate_resume_configuration(resume, args)
+    resume["pending_records"] = None
+    validate_resume_configuration(resume, args)
+
+
+@pytest.mark.parametrize("schema", ["minicpm5_vapo_token_carry/v1", "minicpm5_vapo_token_carry/v2"])
+def test_token_carry_resume_rejects_ungated_schemas_even_at_completed_boundary(schema) -> None:
+    args = build_parser().parse_args(["--token-carry"])
+    resume = {
+        "args": vars(args).copy(),
+        "pending_records": None,
+        "policy": {"schema": schema},
+    }
+    with pytest.raises(ValueError, match="minicpm5_vapo_token_carry/v3"):
+        validate_resume_configuration(resume, args)

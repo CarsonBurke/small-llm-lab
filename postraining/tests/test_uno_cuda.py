@@ -53,7 +53,10 @@ def test_invariant_projection_handles_strides_partial_tiles_and_ar_head_shape():
     )
 
 
-def test_native_fa4_ragged_suffix_matches_full_precision_causal_reference():
+@pytest.mark.parametrize("optimized_decode", [False, True])
+def test_native_fa4_ragged_suffix_matches_full_precision_causal_reference(
+    optimized_decode,
+):
     from postraining.invariant_attention import invariant_fa4
 
     torch.manual_seed(149)
@@ -67,9 +70,18 @@ def test_native_fa4_ragged_suffix_matches_full_precision_causal_reference():
         values[row, length:] = float("nan")
     for width in (1, 2, 4, 8, 16):
         query = torch.randn(4, width, 16, 128, device=device, dtype=torch.bfloat16)
-        arguments = (query, keys, values, lengths, width, 8192, 128**-0.5)
+        arguments = (
+            query,
+            keys,
+            values,
+            lengths,
+            width,
+            8192,
+            128**-0.5,
+            optimized_decode,
+        )
         actual = invariant_fa4(*arguments)
-        if width == 4:
+        if width in (1, 4):
             torch.library.opcheck(
                 invariant_fa4,
                 arguments,
@@ -95,6 +107,91 @@ def test_native_fa4_ragged_suffix_matches_full_precision_causal_reference():
             width=width,
             maximum_absolute_error=(actual.float() - expected).abs().max().item(),
         )
+
+
+@pytest.mark.parametrize(("batch", "capacity"), [(1, 257), (4, 257), (4, 8192)])
+def test_split_fa4_graph_tracks_retirement_refill_and_empty_partitions(batch, capacity):
+    from postraining.invariant_attention import invariant_fa4
+
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 split-KV qualification")
+    torch.manual_seed(163)
+    # Also exercise noncontiguous head/dimension strides through graph replay.
+    if batch == 4 and capacity == 257:
+        query = torch.randn(batch, 1, 128, 32, device="cuda", dtype=torch.bfloat16)
+        query = query.transpose(2, 3)[:, :, ::2, :]
+    else:
+        query = torch.randn(batch, 1, 16, 128, device="cuda", dtype=torch.bfloat16)
+    keys = torch.randn(batch, capacity, 2, 128, device="cuda", dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    lengths = torch.tensor(
+        [capacity, 65, 2, 1][:batch], device="cuda", dtype=torch.int32
+    )
+    arguments = (query, keys, values, lengths, 1, capacity, 128**-0.5, True)
+    for _ in range(3):
+        invariant_fa4(*arguments)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = invariant_fa4(*arguments)
+
+    # Reuse the captured addresses across shrinking lengths, then refill.
+    # NaNs outside each live prefix catch both stale offsets and empty-split reads.
+    for live_lengths in ([capacity, 65, 2, 1], [1, 64, 1, 1], [129, 1, capacity, 65]):
+        live_lengths = live_lengths[:batch]
+        lengths.copy_(torch.tensor(live_lengths, device="cuda", dtype=torch.int32))
+        query.normal_()
+        keys.normal_()
+        values.normal_()
+        for row, length in enumerate(live_lengths):
+            keys[row, length:] = float("nan")
+            values[row, length:] = float("nan")
+        graph.replay()
+        references = []
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            for row, length in enumerate(live_lengths):
+                references.append(
+                    F.scaled_dot_product_attention(
+                        query[row : row + 1].transpose(1, 2).float(),
+                        keys[row : row + 1, :length].transpose(1, 2).float(),
+                        values[row : row + 1, :length].transpose(1, 2).float(),
+                        enable_gqa=True,
+                    ).transpose(1, 2)
+                )
+        expected = torch.cat(references)
+        torch.testing.assert_close(captured.float(), expected, atol=0.015, rtol=0.015)
+        # A single live token must reproduce V exactly, despite three empty splits.
+        for row, length in enumerate(live_lengths):
+            if length == 1:
+                torch.testing.assert_close(
+                    captured[row, 0],
+                    values[row, 0].repeat_interleave(8, dim=0),
+                    atol=0,
+                    rtol=0,
+                )
+        _report(
+            "split_fa4_graph",
+            capacity=capacity,
+            live_lengths=live_lengths,
+            maximum_absolute_error=(captured.float() - expected).abs().max().item(),
+        )
+
+
+def test_split_fa4_retains_small_residual_across_cancelling_partitions():
+    from postraining.invariant_attention import invariant_fa4
+
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 split-KV qualification")
+    query = torch.zeros(1, 1, 16, 128, device="cuda", dtype=torch.bfloat16)
+    keys = torch.zeros(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16)
+    values = torch.zeros_like(keys)
+    values[:, :16] = 1.0
+    values[:, 16:32] = 1.0078125
+    values[:, 32:64] = -1.0
+    lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+    actual = invariant_fa4(query, keys, values, lengths, 1, 128, 128**-0.5, True)
+    # Uniform attention: (16 + 16*1.0078125 - 32) / 128 == 2**-10.
+    # Rounding the first normalized partial to BF16 would erase this residual.
+    torch.testing.assert_close(actual, torch.full_like(actual, 2**-10), atol=0, rtol=0)
 
 
 @pytest.fixture(scope="module")

@@ -8,6 +8,8 @@ from pretraining.fresh_lejepa.fresh_lejepa_train_v1_probe_shared_rms_pope import
 from postraining.latent_thought import (
     CombinedEmbedding,
     DecodeRangeMask,
+    GaussianTransitionHead,
+    StopThinkingGate,
     LatentThoughtModel,
     PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS,
     RENDERER_FEATURES_SCHEMA,
@@ -826,3 +828,72 @@ def test_vector_sigma_scales_components_by_runtime_width():
     assert torch.equal(factors.sum(-1), wrapper.transition.log_prob(
         deterministic_action, mean, log_sigma
     ))
+
+
+def test_gaussian_sampling_compiles_with_dynamic_batch_and_preserves_fp32_actions():
+    transition = GaussianTransitionHead(4, 1.0)
+    sample = torch.compile(
+        transition.sample_latent, backend="eager", fullgraph=True, dynamic=True
+    )
+    with torch.random.fork_rng(devices=[]):
+        for rows in (2, 5):
+            mean = torch.arange(rows * 4, dtype=torch.bfloat16).reshape(rows, 4) / 8
+            log_sigma = torch.full_like(mean, -0.7, dtype=torch.float32)
+            torch.manual_seed(17)
+            expected = mean.float() + log_sigma.exp() * torch.randn(
+                mean.shape, dtype=torch.float32
+            )
+            torch.manual_seed(17)
+            actual = sample(mean, log_sigma)
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gaussian_sampling_honors_explicit_generator_without_global_rng_changes():
+    transition = GaussianTransitionHead(4, 1.0)
+    mean = torch.zeros(3, 4)
+    log_sigma = torch.zeros_like(mean)
+    generator = torch.Generator().manual_seed(23)
+    global_state = torch.get_rng_state()
+    actual = transition.sample_latent(mean, log_sigma, generator=generator)
+    expected = torch.randn(mean.shape, generator=torch.Generator().manual_seed(23))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), global_state)
+
+
+@pytest.mark.parametrize("method", ["sample", "sample_action"])
+def test_stop_gate_compiles_with_dynamic_batch_and_scores_sampled_actions(method):
+    gate = StopThinkingGate(4, 0.7)
+    sample = torch.compile(
+        getattr(gate, method), backend="eager", fullgraph=True, dynamic=True
+    )
+    with torch.random.fork_rng(devices=[]):
+        for rows in (2, 5):
+            belief = torch.zeros(rows, 4, dtype=torch.bfloat16)
+            torch.manual_seed(17)
+            expected = (torch.rand(rows) < 0.7).long()
+            torch.manual_seed(17)
+            actual = sample(belief)
+            if method == "sample":
+                action, logprob = actual
+                expected_logprob = torch.where(
+                    expected.bool(), torch.tensor(0.7), torch.tensor(0.3)
+                ).log()
+                torch.testing.assert_close(logprob, expected_logprob)
+            else:
+                action = actual
+            torch.testing.assert_close(action, expected, rtol=0, atol=0)
+
+
+def test_stop_gate_honors_explicit_generator_without_global_rng_changes():
+    gate = StopThinkingGate(4, 0.7)
+    belief = torch.zeros(5, 4)
+    generator = torch.Generator().manual_seed(23)
+    global_state = torch.get_rng_state()
+    actual, logprob = gate.sample(belief, generator=generator)
+    expected = (
+        torch.rand(5, generator=torch.Generator().manual_seed(23)) < 0.7
+    ).long()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(logprob, gate.log_prob(expected, belief))
+    assert torch.equal(torch.get_rng_state(), global_state)

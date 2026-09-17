@@ -53,6 +53,7 @@ def _require_fields(
 
 def _saved_trainer_options(saved_args: Mapping[str, Any]) -> list[str]:
     from postraining.train_minicpm_vapo import (
+        LEGACY_RESUME_DEFAULTS,
         RESUME_MUTABLE_OPTIONS,
         build_parser as build_trainer_parser,
     )
@@ -68,6 +69,8 @@ def _saved_trainer_options(saved_args: Mapping[str, Any]) -> list[str]:
             value = defaults[action.dest]
         elif action.dest in saved_args:
             value = saved_args[action.dest]
+        elif action.dest in LEGACY_RESUME_DEFAULTS:
+            value = LEGACY_RESUME_DEFAULTS[action.dest]
         else:
             continue
         long_options = [
@@ -120,12 +123,21 @@ def inspect_continuation(
         "root",
     )
     policy = _required_mapping(checkpoint["policy"], "policy")
-    if policy.get("schema") != POLICY_SCHEMA:
-        raise ValueError(f"resume policy must use {POLICY_SCHEMA}")
+    saved_args = _required_mapping(checkpoint["args"], "args")
+    latent_thinking = bool(saved_args.get("latent_thinking", False))
+    token_carry = bool(saved_args.get("token_carry", False))
+    if latent_thinking and token_carry:
+        raise ValueError("checkpoint cannot combine Gaussian thoughts and token carry")
+    expected_schema = (
+        "minicpm5_vapo_latent/v1" if latent_thinking
+        else "minicpm5_vapo_token_carry/v3" if token_carry
+        else POLICY_SCHEMA
+    )
+    if policy.get("schema") != expected_schema:
+        raise ValueError(f"resume policy must use {expected_schema}")
     _require_fields(policy, ("actor", "critic"), "policy")
     actor = _required_mapping(policy["actor"], "actor")
     critic = _required_mapping(policy["critic"], "critic")
-    saved_args = _required_mapping(checkpoint["args"], "args")
     side_fields = (
         "model_id",
         "revision",
@@ -137,6 +149,57 @@ def inspect_continuation(
     )
     _require_fields(actor, side_fields, "actor")
     _require_fields(critic, (*side_fields, "value_head"), "critic")
+    for side, label in ((actor, "actor"), (critic, "critic")):
+        if bool(side.get("latent_thinking", False)) != latent_thinking:
+            raise ValueError(f"checkpoint {label} reasoning mode differs from saved args")
+        if bool(side.get("token_carry", False)) != token_carry:
+            raise ValueError(f"checkpoint {label} token carry mode differs from saved args")
+        if token_carry:
+            _require_fields(side, ("token_combiner",), label)
+            combiner = _required_mapping(side["token_combiner"], f"{label} token combiner")
+            _require_fields(combiner, ("token_delta.weight", "carry.weight", "gate_logit"), label)
+            if set(combiner) != {"token_delta.weight", "carry.weight", "gate_logit"}:
+                raise ValueError(f"checkpoint {label} token combiner has unexpected parameters")
+            token_weight, carry_weight = combiner["token_delta.weight"], combiner["carry.weight"]
+            if (
+                not isinstance(token_weight, torch.Tensor)
+                or not isinstance(carry_weight, torch.Tensor)
+                or token_weight.ndim != 2
+                or token_weight.shape[0] != token_weight.shape[1]
+                or token_weight.shape != carry_weight.shape
+                or token_weight.numel() == 0
+                or not token_weight.is_floating_point()
+                or not carry_weight.is_floating_point()
+                or not torch.isfinite(token_weight).all()
+                or not torch.isfinite(carry_weight).all()
+            ):
+                raise ValueError(f"checkpoint {label} token combiner dimensions are invalid")
+            gate = combiner["gate_logit"]
+            if (
+                not isinstance(gate, torch.Tensor)
+                or gate.ndim != 0
+                or gate.dtype != torch.float32
+                or not torch.isfinite(gate)
+            ):
+                raise ValueError(f"checkpoint {label} token combiner gate_logit must be a finite FP32 scalar")
+    if latent_thinking:
+        _require_fields(
+            actor,
+            ("thought_sigma", "init_stop_thinking_probability",
+             "transition", "thinking_gate", "thought_adapter"),
+            "latent actor",
+        )
+        _require_fields(critic, ("thought_adapter",), "latent critic")
+        for name in ("thought_sigma", "init_stop_thinking_probability"):
+            if actor[name] != saved_args.get(name):
+                raise ValueError(f"checkpoint latent {name} differs from saved args")
+        for side, fields in (
+            (actor, ("transition", "thinking_gate", "thought_adapter")),
+            (critic, ("thought_adapter",)),
+        ):
+            for field in fields:
+                if not _required_mapping(side[field], field):
+                    raise ValueError(f"checkpoint latent {field} is empty")
     expected_lora_config = {
         "rank": saved_args.get("lora_rank"),
         "alpha": saved_args.get("lora_alpha"),
@@ -222,6 +285,12 @@ def inspect_continuation(
     if pending_records is not None and not 0 <= pending_epoch < ppo_epochs:
         raise ValueError("resume pending PPO epoch is invalid")
     pending_record_count = 0 if pending_records is None else len(pending_records)
+    for record in pending_records or ():
+        if (getattr(record, "action_kinds", None) is not None) != latent_thinking:
+            raise ValueError("pending replay reasoning mode differs from checkpoint")
+        if (getattr(record, "carry_hiddens", None) is not None) != token_carry:
+            raise ValueError("pending replay token-carry mode differs from checkpoint")
+        record.__post_init__()
 
     if (target_steps is None) == (additional_steps is None):
         raise ValueError("choose exactly one of target_steps or additional_steps")
@@ -317,7 +386,7 @@ def inspect_continuation(
         "schema": "minicpm_vapo_preflight/v1",
         "resume": str(resume_path),
         "checkpoint_bytes": resume_path.stat().st_size,
-        "policy_schema": POLICY_SCHEMA,
+        "policy_schema": expected_schema,
         "model_id": actor.get("model_id"),
         "revision": actor.get("revision"),
         "saved_actor_step": step,

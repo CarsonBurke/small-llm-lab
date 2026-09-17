@@ -1098,6 +1098,16 @@ def load_vapo_adapter_for_evaluation(
         checkpoint_path, map_location="cpu", weights_only=False
     )
     payload = checkpoint["policy"]
+    if payload.get("schema") == "minicpm5_vapo_latent/v1":
+        raise ValueError(
+            "latent checkpoints require the MiniCPM latent rollout engine; "
+            "native-token evaluation would discard their thinking policy"
+        )
+    if str(payload.get("schema", "")).startswith("minicpm5_vapo_token_carry/"):
+        raise ValueError(
+            "token-carry checkpoints require CapturedTrainingRolloutEngine; "
+            "stock generate would silently discard the recurrent hidden input"
+        )
     policy = (
         payload["actor"]
         if payload.get("schema") == "minicpm5_vapo_adapter/v6"

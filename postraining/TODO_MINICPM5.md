@@ -41,6 +41,46 @@ ten-minute-capped longer check. Uno training remains vetoed.
 - [x] Pending-record resumes now pin rollout arithmetic. Old checkpoints with
   pending legacy records fail closed rather than silently switching targets;
   checkpoints at completed-rollout boundaries can adopt the new default.
+- [x] Integrated the measured SM120 ordinary-decode FA4 `64x64` tile while
+  preserving packed GQA and leaving invariant AR/Uno unchanged. Jobs5896/5906
+  confirmed exact checked logits, continuation/retirement/refill behavior and
+  identical 373,859 generated tokens; integrated rollout was 57.55s, 6,497
+  useful tokens/s. Earlier matched default-tile control was 92.51s.
+- [x] Tested three FA4 split-KV implementations at fixed 64 physical lanes,
+  including the measured retirement masks. Native FP32 split-16 reduced the
+  20-active-lane/10k-context attention fixture from 0.279ms to 0.139ms.
+  Identical recorded-token replay: unsplit 56.13s, native split-16 48.19s,
+  compact FP32 split-4 49.36s (16.5%/13.7% throughput improvement).
+  Reproduction sources are embedded in
+  [split experiment artifacts](../ablation_results/minicpm_fa4_split_20260909/result.json).
+- [x] Adopt compact FP32 split-4 for ordinary optimized SM120 decode after the
+  user accepted normal mixed-precision drift. Initial runtime identity was
+  `bf16-cublas-fa4-split4-fp32-fullgraph-casts/v2`; pending unsplit-v1 records
+  are rejected rather than silently reinterpreted. Invariant AR/Uno is unchanged.
+  [Integrated qualification](../ablation_results/minicpm_fa4_split_adoption_20260909/result.json).
+  This does not establish statistical quality neutrality: earlier sampling-TV
+  maxima reached 0.14707 for compact split-4 including refill, and the small
+  natural sample scored 21/64 versus unsplit 22/64 on four prompts.
+  Adoption rerun: identical 373,859-token replay improved 56.57→48.52s
+  (16.6% throughput); natural split-4 produced 7,149 useful tokens/s.
+  Five GPU reference/graph cases and 103 CPU tests passed. Cache release,
+  actor refresh and recapture matched a fresh replica exactly in checked logits.
+- [x] Tune split attention scheduling at the same 64 lanes, 11,024-slot cache
+  and 10,000-token cap. Adopt `16x32` single-warp tiles, one stage, split-4 and
+  32-token-aligned partitions; BF16 operands and FP32 partials/merge are unchanged.
+  Integrated identical 373,859-token replay improved 49.14→46.64s,
+  7,608→8,016 useful tokens/s (**5.35% higher throughput**); prototype 46.68s.
+  Split-8 tied while doubling partial scratch. Direct scheduler fork was slower;
+  fused preparation's extra ~0.6% in single runs did not justify another kernel.
+  Q-in-registers candidates failed reference checks and were rejected.
+  Natural generation: 320,124 tokens in 42.05s (7,613 useful tokens/s), not matched
+  workload evidence. Six GPU cases and 104 CPU tests passed; continuation/refill
+  stayed finite (maximum checked sampling TV versus v2: 0.0690). Cache release,
+  actor update and recapture matched a fresh replica exactly in checked logits.
+  Current identity: `bf16-cublas-fa4-split4-m16n32-fp32-fullgraph-casts/v3`;
+  pending v1/v2 records fail closed. No training or full RL cycle was run.
+  All model jobs were exclusive through mlq, capped at 180s with no retries.
+  [Scheduling qualification](../ablation_results/minicpm_attention_scheduling_20260909/result.json).
 - [ ] Establish broader math-quality non-regression. The longer sample scored
   **22/64 optimized versus 26/64 legacy**, with 44 versus 47 completed responses.
   Only four distinct problems were sampled: this neither establishes a systematic

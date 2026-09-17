@@ -43,8 +43,9 @@ use lockstep. CPU parity/integration tests live in
 
 ## MiniCPM5 native-token VAPO
 
-`train_minicpm_vapo` is an additional standard-token VAPO path; it does not change
-the nano, latent-thinking, or OPSD trainers. It defaults to the pinned final
+`train_minicpm_vapo` defaults to standard-token VAPO, with opt-in continuous latent
+thinking described below. It does not change the nano, latent-thinking, or OPSD
+trainers. It defaults to the pinned final
 `openbmb/MiniCPM5-1B` RL+OPD checkpoint because its existing math success rate
 provides useful sparse-reward variation and its post-training reduces overlong
 responses. The checkpoint remains a native `LlamaForCausalLM`: its tokenizer,
@@ -56,6 +57,297 @@ shared immutable MiniCPM embedding and transformer storage. The critic has its
 own 256-wide scalar value head and never consumes actor hidden states. Its
 unused 130,560-way output projection is removed. Only adapters, value head, and
 auxiliary heads are serialized.
+
+Fresh MiniCPM VAPO runs default to NoRA initialization: normalize each column of
+the FP32 LoRA A matrix once at construction, leave B zero, and retain alpha/rank
+scaling. This preserves the initial base-model outputs; trained adapters are never
+renormalized on forward or checkpoint load. Both actor and critic use this
+initialization with independent trainable storage. A **fresh run has no `--resume`**:
+it starts new adapters, optimizers and critic warmup from the pinned native base.
+Continuation preserves its checkpoint's initialization; missing legacy metadata
+means standard LoRA, not NoRA. Use the continuation preflight rather than changing
+that label.
+
+NoRA is the experimental fresh-run default, not a proven quality winner. The
+existing ten-step gate has finite optimization metrics but an incomplete matched
+standard-LoRA control and severe 4K-response truncation; the named 2K comparison
+did not complete. The implementation/resume review and focused tests qualify a
+fresh experiment, not empirical default adoption under the longer-run criteria.
+Review evidence and the fresh 10K, v3-attention run:
+[NoRA readiness and fresh run](../ablation_results/minicpm5_vapo_nora_fresh_20m_20260910/result.json).
+That fresh 20-minute run completed ten critic-warmup cycles and saved actor step
+one (four actor and 44 critic optimizer steps) with finite checkpoint tensors.
+The two actor-phase rollouts measured 8,703 and 9,038 useful tokens/s, but 59.4%
+and 92.2% of responses reached the 10K cap. The second update was interrupted by
+the time limit. This confirms the integrated path runs; it does not establish
+learning improvement or acceptable task-quality/truncation.
+
+Fresh runs reserve **1,000 answer tokens inside the existing 10,000-token response
+cap** (`--answer-reserve-tokens 1000`). If the response has not naturally emitted
+the native `</think>` token, rollout inserts it as response token 9,000, leaving
+up to 1,000 subsequent tokens for the answer. Earlier natural thinking closure
+or EOS is unchanged. The delimiter counts toward the total cap; no additional
+KV capacity is required. Set the reserve to zero to disable budget forcing.
+
+The forced delimiter stays in replay context and value/advantage computation,
+but is excluded from PPO likelihood, policy-KL diagnostics, and sampled-action
+normalization. It is an environment intervention, not a policy action or an
+episode termination. `rollout_quality/forced_thinking_trajectories` reports its
+use; truncation still means the response failed to emit EOS before the total
+cap. Speculative decoders discard the verified suffix after an injected
+delimiter and continue from the corrected context.
+
+Changing the answer reserve on continuation requires a completed rollout
+boundary with no pending replay records. Continuation preflight preserves the
+saved reserve, treating missing legacy metadata as zero; it never silently
+relabels pending unforced generations. Budget forcing is a compute-budget
+contract, not a demonstrated accuracy improvement.
+
+**Opt-in sampled-token hidden carry:** use
+`--token-carry --no-train-nextlat --answer-reserve-tokens 0` on a fresh
+`postraining.train_minicpm_vapo` run. Native token-only remains the default;
+top-k 20, temperature 0.9, top-p 0.95, and the optimized BF16 rollout backend
+are unchanged.
+
+After sampling token `x` from the vocabulary head, the next input is
+`E(x) + sigmoid(g) * (Wd E(x) + Wh stopgrad(h))`, where `h` is the previous
+final normalized hidden state, immediately before the LM head. The two
+bias-free projections are implemented without allocating a concatenation.
+Both matrices start at zero; the learnable scalar gate starts at **0.01**.
+The pretrained embedding bypass remains intact, and the gate attenuates both
+new residual branches (4,718,593 parameters per combiner). The gate initially
+has zero gradient while the residual is zero; it learns once a residual develops.
+Prompts use plain embeddings. Every generated token uses the carry path,
+including ordinary sampled thinking delimiters and EOS. There are no Gaussian
+actions, latent slots, additional noise, or learned stopping gates.
+
+Rollout stores the actor's **behavior-time producer hidden** alongside each
+sampled token as detached BF16 data. Actor and critic consume that identical
+observed stream through **independent gated combiners over their token embeddings**. Detach
+is before each trainable combiner, not after the combined embedding. The critic
+does not generate its own carry trajectory, consume an actor-combined embedding,
+or backpropagate its value loss into the actor. Its state-value objective is
+unchanged; prompt embeddings remain plain.
+
+Behavior refresh, PPO updates, and post-update KL each use the ordinary parallel
+packed forward. Updating either model changes its projections and predictions,
+not the stored observations. There is no sequential teacher-forced reconstruction,
+extra replay KV cache, new attention mask, or special attention backend. This is
+the deterministic-carry contract already established in commit `ac2d67c`.
+
+Fixed-batch and continuous/refilled captured rollout retain exact producer
+histories in logical response order. CPU exports own their storage and survive
+refill/cache release. This mode requires compiled fast rollout and compiled
+replay. Gaussian latent mode, Uno/NextLat proposals, auxiliary NextLat training,
+and forced delimiters remain rejected for this isolated experiment.
+Checkpoints use `minicpm5_vapo_token_carry/v3`; both residual projections and
+scalar gates, optimizers, pending tokens **and stored carries**, and RNG state
+are saved. Old v1/v2 checkpoints are rejected: v1 lacks the stored observations,
+and v2 uses the ungated identity-initialized token projection. Continuation
+preflight supports v3; stock native-only evaluation rejects carry checkpoints
+instead of dropping their inputs.
+
+Bounded correctness verification (not a quality evaluation):
+
+```bash
+.venv/bin/python scripts/diagnose_minicpm_token_carry.py \
+  --output ablation_results/minicpm_token_carry_check/correctness.json
+```
+
+The entrypoint submits through `mlq` with parallel limit 1, normal priority,
+a five-minute cap, and one attempt. It checks identity initialization, stored
+producer persistence/refill, independent critic gradients, fixed replay inputs,
+and checkpoint restoration. Earlier v1 diagnostic artifacts concern the
+superseded reconstruction design, not the stored-carry training contract.
+
+Historical ungated v2 run **7642**, now cancelled, used 64 trajectories per
+rollout with the full 10,000-token response cap, ten critic-warmup cycles, and
+native packed replay with activation checkpointing disabled. The first actor-phase
+rollout produced 534,081 tokens at **8,490 useful tokens/s**; its complete
+actor/critic update took **53.4 s**. A steady critic-warmup update processed
+640,000 actions in **29.9 s**. The real replay profile confirms
+`aten::_scaled_dot_product_flash_attention` rather than masked non-Flash SDPA.
+After actor step one, both token and carry matrices had moved independently
+in the saved actor and critic; all four matrices were finite.
+
+Historical evidence:
+`ablation_results/minicpm_token_carry_stored_train_20260916/result.json`,
+`metrics.jsonl`, `packed_replay_kernels.txt`, and `vapo_adapter_checkpoint.pt`.
+
+That run collapsed: its last five recorded rollout accuracies were zero.
+Finite parameters, improving value loss, and throughput did not establish
+successful learning.
+
+Behavior refresh averaged **24.06 s**, or **15.04%** of rollout + refresh +
+update time across its first nine actor iterations. The continuous rollout
+exports placeholder log-probabilities, so refresh must materialize actor
+likelihoods as well as independent critic values for GAE. The candidate
+refactor retains both passes and transfers the two scalar statistics per
+action to CPU once per rollout rather than twice per trajectory. GPU buffers
+cost eight bytes per response action; likelihood and advantage semantics are
+unchanged. Speedup is pending a paired production-data benchmark.
+
+Fresh gated run **7679** is queued at normal priority, parallel limit one,
+with a two-hour cap and one attempt. It uses the same full response geometry
+and performs an alternating original/candidate refresh benchmark on its first
+real actor rollout, checking bit-identical likelihoods and advantages.
+Evidence is written to
+`ablation_results/minicpm_token_carry_gated_train_20260916/`.
+Gated quality and GPU throughput are not yet established. Host coverage passes
+192 focused tests; the real-tiny-Llama CPU model test was excluded.
+
+When training starts, the linked TensorBoard run is available at
+`http://127.0.0.1:6101/?runFilter=minicpm_token_carry_gated_train_20260916#timeseries`.
+The server on port 6106 lists the same run with `/tensorboard` appended.
+Both servers rescan every 180 seconds. `carry/actor_gate` and
+`carry/critic_gate` report the learned gates. Behavior refresh also reports
+`carry/{actor,critic}_probe_carry_to_token_rms` and
+`carry/{actor,critic}_probe_residual_to_token_rms`, using at most 256 evenly
+spaced carry inputs from the first nonempty packed shard, not the whole rollout.
+
+**Opt-in latent thinking:** add `--latent-thinking` to a fresh MiniCPM run.
+The default is false; `--no-latent-thinking` explicitly retains native token
+generation. This mode uses the existing stochastic latent policy:
+
+```
+native <think> prefix → first latent → continue latents → </think> → answer tokens
+```
+
+The first continuous thought is mandatory. Thereafter a separate Bernoulli
+head chooses continue or stop. Inside the block, a Gaussian transition head
+produces raw fp32 vectors centered on the current hidden state plus a learned
+residual. `--thought-sigma` defaults to 1.0 and is the vector-level noise scale:
+component standard deviation is `thought_sigma / sqrt(hidden_size)`.
+`--init-stop-thinking-probability` defaults to 0.9; this initializes the learned
+gate and cannot bypass the first thought. An identity-initialized combined
+embedding adapter feeds each vector into the shared MiniCPM transformer.
+
+Thought and close steps never execute the vocabulary head. Stopping consumes
+the native close token before ordinary answer generation; answer sampling
+excludes the two thinking delimiters, so the block cannot reopen. The total
+`--max-new-tokens` budget counts latent slots, the close, and answer tokens.
+The answer reserve retains its meaning; with reserve zero, latent mode still
+forces closure early enough to leave one answer slot.
+
+**The critic sees every exact sampled latent vector**, through its own
+independent trainable thought adapter and transformer adapters. It predicts
+values before each action, including states reached after thoughts, and all
+latent transitions participate in advantage computation and value training.
+Replay never redraws noise or substitutes actor hidden states for critic
+states. PPO scores first-thought Gaussian, continue gate plus Gaussian, learned
+stop gate, and answer-token actions; forced stops have no actor likelihood.
+NextLat's lexical auxiliary trains only on answer-to-answer transitions in
+this mode. `latent_thinking/*` TensorBoard metrics separate thought counts,
+answer-token counts, and learned stops from total stream length.
+
+Latent checkpoints use `minicpm5_vapo_latent/v1` and store both thought adapters,
+actor Gaussian/gate heads, exact pending raw actions, optimizer state, and RNG
+state. Native v6 checkpoints remain unchanged; switching reasoning modes on
+resume is rejected. Continuation preflight supports latent checkpoints.
+The standalone native HF evaluator rejects them rather than silently dropping
+latent heads; `--rollout-only --latent-thinking` uses the actual latent runtime.
+Token-only Uno proposals are incompatible with latent mode.
+
+**Latent training is not numerically qualified.** Short-stream execution checks pass.
+CUDA generation runs for host-driven latent, graph-chunk latent, and native
+decoding. Actor and critic replay pass exact raw-action, independent state
+reconstruction, and checkpoint-gradient parity checks under deterministic
+controls. Default nondeterministic backward varies by about 1.4% in relative L2
+even between identical runs. Separately, bf16 rollout and packed replay produce
+different Gaussian means: one measured first-thought state has mean-distance
+4.53 at component sigma 0.0255, or approximately 15,774 nats of Gaussian KL.
+Batch shape and projection fusion affect this difference; toggling replay MLP
+compilation did not. Disabling reduced-precision bf16 GEMM reductions also failed
+to resolve it (approximately 15,700 nats); that setting has not been adopted.
+The 17-position PPO/NextLat update completes with finite trainable parameters,
+but latent ratio mean/std and approximate KL still overflow fp64 after updates.
+At 2,177 stream positions, actor and critic replay retain exact checkpoint parity,
+but the integrated PPO update fails with a non-finite primary gradient.
+The saved-trajectory diagnostic starts with ratios exactly one, then reaches
+unclipped negative-advantage objectives around `exp(995)` after one optimizer
+update. Reordering the existing PPO clipping cannot resolve this divergence.
+Do not treat this mode as validated for training or interpret refreshed age-zero
+PPO ratios as proof of sampling/replay distribution agreement. The benchmark's
+checkpoint-gradient checks use a scoped deterministic CUDA workspace and restore
+the original settings before timing. A passed execution benchmark does not
+establish Gaussian distribution agreement or training validity.
+Evidence and numerical controls are in
+`ablation_results/minicpm_latent_performance_20260911/`.
+
+PPO applies its existing sign-dependent clipping before exponentiation, avoiding
+spurious NaN gradients on already-clipped branches. Unfavorable unclipped ratios
+remain unbounded. Ratio moments are accumulated in log space; KL diagnostics use
+fp64 `expm1` to avoid fp32 overflow and near-zero cancellation.
+
+The latent decoder uses a fused bf16 replica, compiled embedding-only trunk,
+separate phase heads, and continuous physical-lane refill. It requires CUDA/FA4.
+Phase and position state stays on-device inside adaptive chunks of up to eight
+steps. Each graph has fixed thinking/answer membership, so thinking rows never
+enter the vocabulary projection. A stopped row consumes the close token, then
+pauses with its KV prefix intact until answer admission at the next boundary.
+Exact fp32 actions and scores use bounded GPU/pinned-host staging and transfer
+once per chunk, not once per thought. Prefix KV remains host-backed.
+
+The graph cache is bounded; graphs are recaptured for each public rollout
+because KV and source-weight residency changes invalidate their addresses.
+Public-generation benchmark timing includes that capture cost. Replay collation
+precomputes token/gate indices and contiguous NextLat ranges on the CPU; packed
+replay avoids device-side index discovery and a full embedding-buffer copy.
+
+`scripts/benchmark_minicpm_latent.py` compares fixed stream-position workloads
+for optimized latent and native decoding. `--mode all` also measures actor/critic
+replay and warmed rollout → behavior refresh → optimizer cycles, including the
+NextLat auxiliary. These synthetic cycles exclude data loading, math verification,
+logging, and checkpoint I/O; they are not accuracy or learning evidence.
+An optional `--engines host optimized native --host-reference PATH` adds a
+preserved pre-chunking runtime. `--expected-sources PATH` rejects source drift
+while queued. Reports include exact raw-action sidecars, phase counts,
+original-versus-replayed likelihood drift, graph/staging telemetry, wall time,
+CUDA time, and peak memory. Integrated-update and core-cycle failures are retained
+without discarding independent arms; the overall status and exit code remain
+failed. Core cycles are blocked when their update qualification fails.
+Run every benchmark through `mlq`, for example:
+
+```bash
+mlq submit --name minicpm-latent-qualification --max-parallel-runs 1 -- \
+  .venv/bin/python scripts/benchmark_minicpm_latent.py --mode qualify \
+    --prompts 2 --samples-per-prompt 2 --physical-batch-size 3 \
+    --context-tokens 256 --thought-steps 8 --answer-tokens 8 \
+    --output ablation_results/minicpm_latent_qualification.json
+```
+
+CPU regressions establish phase, replay, gradient, and checkpoint contracts;
+they do not establish real CUDA capture compatibility, speedup, or math quality.
+Native AR throughput thresholds are not evidence of latent throughput: qualify
+the configured workload and set its minimum-throughput threshold from that
+measurement. Matched moderate- and long-context workloads are needed to separate
+head-bypass gains from attention/KV bandwidth limits.
+
+**Measured RTX 5090 costs (2026-09-11).** Medians in seconds for 64
+trajectories, 64 physical rollout lanes, and replay batch size 1. Latent rollouts
+add one close token and 128 answer positions; native performs lexical work at
+every matched stream position.
+
+| Workload | Native | Previous host latent | Graph-chunk latent |
+| --- | ---: | ---: | ---: |
+| Rollout: 1,024 context + 2,048 thoughts | 9.68 | 13.74 | 11.49 |
+| Rollout: 8,192 context + 1,024 thoughts | 12.87 | 17.76 | 16.14 |
+| Actor likelihood replay: 2,177 action positions | 8.36 | — | 7.15 |
+| Critic value replay: 2,177 action positions | 6.82 | — | 7.05 |
+| Core cycle: 2,177 action positions | 32.89 | Blocked | Blocked |
+
+The 2k rollout control used four warmups and seven measurements with reversed
+engine order; the other rows used two warmups and three measurements. Replay rows
+isolate forward/backward and include CPU collation/H2D, not optimizer or NextLat
+work. The core row includes actual PPO/NextLat updates and inference-weight
+refresh. Initial engine construction is measured separately and excluded.
+One graph-chunk rollout outlier reached 23.47 seconds (22.31 in decoding) despite
+unchanged work/graph counters. All samples are retained: the 2k median throughput
+gain over host latent
+is 19.6%, but aggregate throughput over all seven measurements improves only 4.0%.
+Native remains faster, and no latent full-cycle throughput is claimed.
+Canonical results, raw records, numerical diagnostics, and source manifests:
+`ablation_results/minicpm_latent_performance_20260911/result.json`.
 
 Rollout remains actor-only. After generation, length-bucketed teacher-forced
 actor and critic passes materialize replay-consistent behavior-policy
@@ -136,8 +428,68 @@ Choose the Uno floor from a matched benchmark, not the AR scheduled-token value.
 Compiled MiniCPM AR now defaults to compiler-visible FA4, in-place indexed KV
 writes and fullgraph compilation with preserved bf16 casts. It retains ordinary
 cuBLAS GEMMs and the ordinary AR scheduler; fixed invariant GEMMs are **not**
-enabled. The runtime identity is `bf16-cublas-fa4-fullgraph-casts/v1`.
+enabled. The runtime identity is `bf16-cublas-fa4-split4-m16n32-fp32-fullgraph-casts/v3`.
 Explicit noncompiled ordinary decode retains the legacy path.
+
+Ordinary optimized decode on SM120 uses packed-GQA FA4 `16x32` single-warp tiles
+with four-way split-KV for single-query BF16 MiniCPM attention (16 query heads,
+2 KV heads, head dimension 128, contiguous sequence-major KV). Invariant AR/Uno,
+prefill and other attention geometries retain their existing paths. The adapter
+reuses the pinned FA4 main loop; its output epilogue preserves FP32 partials
+until FA4's FP32 merge writes the final BF16 output. Partition lengths and offsets
+are recomputed on-device during every graph replay; no KV replication or host
+length synchronization is needed.
+
+Before split-KV, tuning the unsplit tile alone retained arithmetic identity:
+The matched 10,000-token-cap comparison improved 4,041→6,506 useful tokens/s
+(92.51→57.46 seconds), with all 64 response token sequences identical.
+Integrated production qualification reproduced 6,497 useful tokens/s and those
+same responses, plus bit-exact checked logits through continuation and refill.
+
+Compact split-4 adds a measured throughput benefit in the draining tail, at the
+cost of overhead at full occupancy. Earlier identical recorded-token replay
+improved throughput 13.7% (56.13→49.36s). The larger native split-16 prototype
+reached 16.5%, but the compact adapter avoids maintaining a fork of FA4's main
+loop. Sources and original measurements:
+[FA4 split experiments](../ablation_results/minicpm_fa4_split_20260909/result.json).
+
+BF16 probability operands with FP32 accumulation are accepted mixed precision.
+Split-KV changes the reduction order and can change sampled responses; it is
+not bit-identical to unsplit FA4. Acceptance requires FP32-reference accuracy,
+correct masking and cache/graph lifecycle, not old-kernel token identity.
+Statistical math-quality neutrality is **not established** by the small sampled
+comparisons. Integrated adoption evidence:
+[split-4 qualification](../ablation_results/minicpm_fa4_split_adoption_20260909/result.json).
+
+The original `64x64` split-4 adoption replayed identical 373,859 tokens and 640,000
+scheduled lane-positions: tuned unsplit FA64 took 56.57s versus split-4 48.52s,
+or 6,609→7,706 useful tokens/s (**16.6% higher throughput**). Natural split-4
+generation emitted 310,203 tokens in 43.39s (7,149 useful tokens/s); its different
+token workload is not a kernel-only speed comparison.
+Five GPU reference/graph cases and 103 focused CPU tests passed. Full-decoder
+checks covered continuation and retirement/refill; after cache release, an
+actor update and recapture, the reused replica's checked logits matched a fresh
+replica exactly. This does not claim equivalence to unsplit sampled responses.
+
+Further attention scheduling experiments retained `16x32` tiles with 32 threads,
+one pipeline stage and four splits. Smaller tiles reduce padding for eight packed
+GQA query rows; split starts align to the 32-token K tile. On identical recorded
+373,859-token work, integrated production improved 49.14→46.64s, or
+7,608→8,016 useful tokens/s (**5.35% higher throughput**). The prototype rerun
+measured 46.68s. Eight splits tied while doubling partial-output scratch; a direct
+scheduler fork was slower, and fused preparation added only about 0.6% in single
+runs, insufficient to justify another kernel. Existing preparation is retained.
+No physical-lane, context-capacity, sampling or precision reduction was used.
+
+Natural v3 generation emitted 320,124 tokens in 42.05s (7,613 useful tokens/s);
+this different workload is not a matched speed comparison. Six GPU reference/graph
+cases and 104 focused CPU tests passed, including strided queries and an FP32
+partial-output cancellation regression. Full-decoder continuation and retirement/
+refill checks stayed finite; maximum checked transformed-sampling TV versus v2
+was 0.0690. After cache release, actor update and recapture, checked logits matched
+a fresh replica exactly. This is accepted mixed-precision drift, not a statistical
+math-quality guarantee. Sources, bounded jobs and measurements:
+[attention scheduling qualification](../ablation_results/minicpm_attention_scheduling_20260909/result.json).
 
 Qualification job 5711 used a step-370 actor and the 10,000-token cap: useful
 throughput improved 1,251.95→4,164.31 tokens/s (3.33×), and the 64-response pool
@@ -147,8 +499,8 @@ Quality is **not established as unchanged**: optimized scored 22/64 versus
 legacy 26/64 on only four distinct problems. See
 [MiniCPM TODO and evidence](TODO_MINICPM5.md#standalone-ar-runtime--optimized-default-enabled).
 
-Checkpoint metadata pins `rollout_arithmetic`. Resuming pending legacy records
-under the new runtime is rejected; use a checkpoint at a completed-rollout
+Checkpoint metadata pins `rollout_arithmetic`. Pending legacy, unsplit-v1 or
+split-v2 records cannot resume under v3; use a checkpoint at a completed-rollout
 boundary to change arithmetic. Existing running processes do not switch modes.
 
 TensorBoard is the only live metric stream. Semantic categories cover rollout

@@ -20,7 +20,7 @@ import triton.language as tl
 
 INVARIANT_ARITHMETIC = "bf16-lane64-n128-k32-casts/v1"
 LEGACY_ARITHMETIC = "bf16-cublas-inductor-default/v1"
-OPTIMIZED_ARITHMETIC = "bf16-cublas-fa4-fullgraph-casts/v1"
+OPTIMIZED_ARITHMETIC = "bf16-cublas-fa4-split4-m16n32-fp32-fullgraph-casts/v3"
 
 
 def compile_invariant(function: Callable[..., Any]) -> Callable[..., Any]:

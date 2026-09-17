@@ -28,6 +28,7 @@ from postraining.invariant_linear import (
     install_invariant_linears,
 )
 from postraining.invariant_attention import INVARIANT_ATTENTION, invariant_suffix_attention
+from postraining.thinking_budget import force_thinking_end_, validate_thinking_budget
 
 
 FP8_DTYPE = torch.float8_e4m3fn
@@ -211,6 +212,9 @@ def synchronize_fused_lora_policy_(
 ) -> int:
     """Refresh a fused inference replica from the live actor LoRA."""
 
+    if getattr(destination, "token_carry", False) != getattr(source, "token_carry", False):
+        raise ValueError("rollout replica token-carry mode differs from the actor")
+
     source_layers = cast(Any, source.causal_lm.get_submodule("model")).layers
     destination_layers = cast(
         Any, destination.causal_lm.get_submodule("model")
@@ -277,6 +281,12 @@ def synchronize_fused_lora_policy_(
             raise TypeError("MLP output projection layout differs")
         _copy_merged_lora_weight_(destination_down.weight, source_down)
         synchronized += 1
+
+    if getattr(source, "token_carry", False):
+        destination.token_combiner.token_delta.weight.copy_(source.token_combiner.token_delta.weight)
+        destination.token_combiner.carry.weight.copy_(source.token_combiner.carry.weight)
+        destination.token_combiner.gate_logit.copy_(source.token_combiner.gate_logit)
+        synchronized += 3
 
     return synchronized
 
@@ -375,7 +385,8 @@ class _CompactStaticLayer(StaticLayer):
         safe_lengths = self.sequence_lengths.clamp_max(self.max_cache_len - 1)
         if self.indexed_decode:
             keys, values = self._append_suffix(
-                key_states, value_states, safe_lengths[:, None]
+                key_states, value_states,
+                safe_lengths[:, None],
             )
             self.cumulative_length.copy_(
                 self.sequence_lengths.max().add(1).clamp_max(self.max_cache_len)
@@ -476,6 +487,8 @@ def build_fused_rollout_replica(
     ALL_MASK_ATTENTION_FUNCTIONS.register(implementation, _hybrid_fa4_mask)
     replica.causal_lm.config._attn_implementation = implementation
     replica.causal_lm.gradient_checkpointing_disable()
+    # Disabling checkpointing alone can leave the training embedding hook installed.
+    replica.causal_lm.disable_input_require_grads()
     replica.causal_lm.config.use_cache = True
     merge_lora_for_inference(replica.causal_lm)
     fused = fuse_llama_projections_(replica.causal_lm)
@@ -716,6 +729,8 @@ class FixedLengthInferenceEngine:
     ) -> None:
         from transformers import StaticCache
 
+        if getattr(policy, "token_carry", False):
+            raise ValueError("token carry requires CapturedTrainingRolloutEngine")
         if batch_size < 1 or cache_length < 2:
             raise ValueError("batch size and cache length must be positive")
         if temperature <= 0 or top_k < 1 or not 0 < top_p <= 1:
@@ -922,6 +937,7 @@ class PromptPrefixBank:
     values: Tensor
     layer_keys: Tensor
     layer_values: Tensor
+    hidden: Tensor | None = None
 
     @property
     def prompts(self) -> int:
@@ -934,6 +950,8 @@ class ContinuousTrainingGeneration:
 
     ``logprobs`` contains shape-compatible zeros because training refreshes
     exact behavior statistics from replay before PPO.
+    ``carry_hiddens`` owns the CPU BF16 producer of every response token in
+    token-carry mode, including the prompt producer and terminal action.
     """
 
     responses: tuple[Tensor, ...]
@@ -945,6 +963,7 @@ class ContinuousTrainingGeneration:
     capacity_row_steps: int
     admission_events: int
     minimum_active_rows_with_backlog: int
+    carry_hiddens: tuple[Tensor, ...] | None = None
 
     @property
     def productive_utilization(self) -> float:
@@ -1001,6 +1020,8 @@ def _completion_poll_chunk(
 class CapturedTrainingRolloutEngine:
     """Persistent fused rollout replica with a captured full-batch decode step."""
 
+    token_carry = False
+
     _invariant_projections: tuple[InvariantLinear, ...] = ()
     invariant_decode: bool = False
     optimized_decode: bool = False
@@ -1020,8 +1041,13 @@ class CapturedTrainingRolloutEngine:
         physical_batch_size: int | None = None,
         invariant_decode: bool = False,
         optimized_decode: bool = DEFAULT_OPTIMIZED_DECODE,
+        answer_reserve_tokens: int = 0,
+        thinking_end_token_id: int | None = None,
     ) -> None:
 
+        validate_thinking_budget(answer_reserve_tokens, thinking_end_token_id)
+        self.answer_reserve_tokens = answer_reserve_tokens
+        self.thinking_end_token_id = thinking_end_token_id
         logical_batch_size = prompts_per_rollout * samples_per_prompt
         if prompts_per_rollout < 1 or samples_per_prompt < 1:
             raise ValueError("rollout batch dimensions must be positive")
@@ -1037,6 +1063,14 @@ class CapturedTrainingRolloutEngine:
             raise ValueError("sampling dimensions are invalid")
         if invariant_decode and not compile_decode:
             raise ValueError("invariant rollout requires compiled CUDA decode")
+        self.token_carry = bool(getattr(source_policy, "token_carry", False))
+        if self.token_carry and invariant_decode:
+            raise ValueError(
+                "token-carry rollout does not support invariant/Uno decoding; "
+                "use the ordinary optimized native rollout"
+            )
+        if self.token_carry and not compile_decode:
+            raise ValueError("token-carry rollout requires compiled CUDA decode")
 
         self.source_policy = source_policy
         self.policy, self.fused_projection_groups = build_fused_rollout_replica(
@@ -1096,6 +1130,7 @@ class CapturedTrainingRolloutEngine:
         self.active = torch.zeros(
             self.batch_size, dtype=torch.bool, device=device
         )
+        self.thinking_closed = torch.zeros_like(self.active)
         self.response_limit = torch.ones(
             self.batch_size, dtype=torch.long, device=device
         )
@@ -1111,9 +1146,12 @@ class CapturedTrainingRolloutEngine:
         self.sequence_lengths = torch.zeros(
             self.batch_size, dtype=torch.long, device=device
         )
-        self.flash_sequence_lengths = torch.zeros(
-            self.batch_size, dtype=torch.int32, device=device
-        )
+        # This buffer crosses into the nested compiled FA4 metadata operator.
+        # Match its inference-mode warmup copies to avoid recapture-time guards.
+        with torch.inference_mode():
+            self.flash_sequence_lengths = torch.zeros(
+                self.batch_size, dtype=torch.int32, device=device
+            )
         self.cache = self._new_cache()
         self.generated = torch.zeros(
             (self.batch_size, cache_length), dtype=torch.long, device=device
@@ -1130,6 +1168,10 @@ class CapturedTrainingRolloutEngine:
         self._graph_values = torch.empty(
             self.batch_size, dtype=torch.float32, device=device
         )
+        self.carry_hidden: Tensor | None = None
+        self._carry_history: Tensor | None = None
+        self.last_carry_hiddens: Tensor | None = None
+        self._allocate_carry_storage()
         self._decode_graph: torch.cuda.CUDAGraph | None = None
         self._continuous_decode_graph: torch.cuda.CUDAGraph | None = None
         self._capture_stream = torch.cuda.Stream(device=device)
@@ -1139,6 +1181,7 @@ class CapturedTrainingRolloutEngine:
                 self.cache_position,
                 self.output_position,
                 self.active,
+                self.thinking_closed,
                 self.response_limit,
                 self.stop_tensor,
                 self.position_ids,
@@ -1154,12 +1197,22 @@ class CapturedTrainingRolloutEngine:
                 torch._dynamo.mark_static_address(tensor)
 
         def sample_tokens(logits: Tensor) -> Tensor:
-            return top_k_top_p_sample(
+            token = top_k_top_p_sample(
                 logits,
                 temperature=self.temperature,
                 top_k=self.top_k,
                 top_p=self.top_p,
             )
+            if self.answer_reserve_tokens:
+                token, _ = force_thinking_end_(
+                    token,
+                    self.output_position,
+                    self.thinking_closed,
+                    self.active,
+                    self.response_limit - self.answer_reserve_tokens - 1,
+                    cast(int, self.thinking_end_token_id),
+                )
+            return token
 
         def sample(logits: Tensor) -> tuple[Tensor, Tensor]:
             token = sample_tokens(logits)
@@ -1186,13 +1239,42 @@ class CapturedTrainingRolloutEngine:
                 cache_rows,
                 torch.where(active[:, None], True, previous_mask),
             )
-            hidden = self.policy.cached_hidden(
-                actual[:, None],
-                past_key_values=cache,
-                cache_position=self.cache_position,
-                attention_mask=self.attention_mask,
-                position_ids=self.position_ids,
-            )[:, -1]
+            if self.token_carry:
+                # Save the producer of this action, before consuming its token.
+                # Match compact KV's reinplaceable index_put: functional
+                # scatter would copy the entire B x capacity x H bank.
+                # Inactive lanes preserve even their final capacity row.
+                history_rows = torch.arange(
+                    self.batch_size, device=self.generated.device
+                )
+                history_positions = safe_output.squeeze(1)
+                previous_carry = self._carry_history[
+                    history_rows, history_positions
+                ]
+                self._carry_history.index_put_(
+                    (history_rows, history_positions),
+                    torch.where(active[:, None], self.carry_hidden, previous_carry),
+                )
+                hidden = self.policy.cached_hidden(
+                    inputs_embeds=self.policy.carry_embeddings(
+                        actual[:, None], self.carry_hidden[:, None, :]
+                    ),
+                    past_key_values=cache,
+                    cache_position=self.cache_position,
+                    attention_mask=self.attention_mask,
+                    position_ids=self.position_ids,
+                )[:, -1]
+                self.carry_hidden.copy_(
+                    torch.where(active[:, None], hidden, self.carry_hidden)
+                )
+            else:
+                hidden = self.policy.cached_hidden(
+                    actual[:, None],
+                    past_key_values=cache,
+                    cache_position=self.cache_position,
+                    attention_mask=self.attention_mask,
+                    position_ids=self.position_ids,
+                )[:, -1]
             step = active.long()
             self.sequence_lengths.add_(step)
             self.flash_sequence_lengths.add_(step.to(torch.int32))
@@ -1309,10 +1391,29 @@ class CapturedTrainingRolloutEngine:
             ]
         )
 
+    def _allocate_carry_storage(self) -> None:
+        if not self.token_carry:
+            return
+        hidden_size = int(self.policy.causal_lm.config.hidden_size)
+        self.carry_hidden = torch.zeros(
+            (self.batch_size, hidden_size),
+            dtype=torch.bfloat16,
+            device=self._runtime_device,
+        )
+        self._carry_history = torch.zeros(
+            (self.batch_size, self.cache_length, hidden_size),
+            dtype=torch.bfloat16,
+            device=self._runtime_device,
+        )
+        if hasattr(torch, "_dynamo"):
+            torch._dynamo.mark_static_address(self.carry_hidden)
+            torch._dynamo.mark_static_address(self._carry_history)
+
     def _restore_rollout_cache(self) -> None:
         if self._rollout_resident:
             return
         self.cache = self._new_cache()
+        self._allocate_carry_storage()
         self._rollout_resident = True
 
     def _validate_cache_capacity(self) -> None:
@@ -1371,6 +1472,9 @@ class CapturedTrainingRolloutEngine:
             attention._rollout_flash_varlen = flash_utils._flash_varlen_fn
             attention._rollout_sequence_lengths = self.flash_sequence_lengths
             attention._rollout_max_cache_len = self.cache_length
+            attention._rollout_optimized_decode = (
+                self.optimized_decode and not self.invariant_decode
+            )
 
 
     def release_cache(self) -> None:
@@ -1386,6 +1490,8 @@ class CapturedTrainingRolloutEngine:
             # until cyclic GC. Release its GPU payload at this phase boundary.
             self.cache.layers.clear()
             self.cache = self._new_cache()
+            self.carry_hidden = None
+            self._carry_history = None
             self._rollout_resident = False
             if self._compile_decode:
                 # Traced layer/tensor aliases can also survive in unreachable
@@ -1557,6 +1663,9 @@ class CapturedTrainingRolloutEngine:
             Callable[[int, dict[str, float | int]], None] | None
         ) = None,
     ) -> tuple[Tensor, Tensor, Tensor, int, float, FastTrainingDecodeStats]:
+        validate_thinking_budget(
+            self.answer_reserve_tokens, self.thinking_end_token_id, max_new_tokens
+        )
         started_wall = time.perf_counter()
         self._synchronize_generation()
         prompt_batch, prefill_position_ids, prompt_width = self._prepare_prompts(
@@ -1568,10 +1677,14 @@ class CapturedTrainingRolloutEngine:
         self.cache_position.zero_()
         self.output_position.zero_()
         self.active.fill_(True)
+        self.thinking_closed.zero_()
         self.response_limit.fill_(max_new_tokens)
         self.generated.zero_()
         self.logprobs.zero_()
         self.values.zero_()
+        self.last_carry_hiddens = None
+        if self.token_carry:
+            self._carry_history.zero_()
         started = torch.cuda.Event(enable_timing=True)
         prefill_complete = torch.cuda.Event(enable_timing=True)
         decode_complete = torch.cuda.Event(enable_timing=True)
@@ -1584,6 +1697,8 @@ class CapturedTrainingRolloutEngine:
                 attention_mask=self.attention_mask,
                 position_ids=prefill_position_ids,
             )[:, -1]
+            if self.token_carry:
+                self.carry_hidden.copy_(hidden)
             self._bind_flash_cache()
             logits = self.policy.logits(hidden)
             if self.invariant_decode:
@@ -1628,6 +1743,13 @@ class CapturedTrainingRolloutEngine:
                     ),
                 },
             )
+        if self.token_carry:
+            # Replay needs ordinary detached tensors, not inference tensors,
+            # and must own values independently of the next rollout/cache.
+            with torch.inference_mode(False):
+                self.last_carry_hiddens = self._carry_history[
+                    :, :max_new_tokens
+                ].detach().to(device="cpu", copy=True)
         return (
             self.generated[:, :max_new_tokens].cpu(),
             self.logprobs[:, :max_new_tokens].cpu(),
@@ -1714,6 +1836,14 @@ class CapturedTrainingRolloutEngine:
             (prompt_count,) if collect_values else (0,),
             dtype=self._graph_values.dtype,
         )
+        bank_hidden = (
+            empty_bank(
+                (prompt_count, self.carry_hidden.size(1)),
+                dtype=self.carry_hidden.dtype,
+            )
+            if self.token_carry
+            else None
+        )
         bank_keys: Tensor | None = None
         bank_layer_values: Tensor | None = None
 
@@ -1765,6 +1895,10 @@ class CapturedTrainingRolloutEngine:
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                 )[:, -1]
+                if bank_hidden is not None:
+                    bank_hidden[start:stop].copy_(
+                        hidden, non_blocking=host_resident
+                    )
                 bank_logits[start:stop].copy_(
                     self.policy.logits(hidden),
                     non_blocking=host_resident,
@@ -1828,6 +1962,7 @@ class CapturedTrainingRolloutEngine:
             values=bank_values,
             layer_keys=bank_keys,
             layer_values=bank_layer_values,
+            hidden=bank_hidden,
         )
 
     def _ensure_continuous_cache(self, bank: PromptPrefixBank) -> None:
@@ -1871,6 +2006,8 @@ class CapturedTrainingRolloutEngine:
     ) -> None:
         if not slots:
             raise ValueError("admission requires at least one rollout lane")
+        if self.token_carry and bank.hidden is None:
+            raise ValueError("token-carry admission requires prompt final hidden states")
         device = self.generated.device
         slot_ids = torch.tensor(slots, dtype=torch.long, device=device)
         length = int(bank.lengths[prompt_index])
@@ -1894,6 +2031,8 @@ class CapturedTrainingRolloutEngine:
         self.flash_sequence_lengths.index_fill_(0, slot_ids, length + 1)
         self.position_ids.index_fill_(0, slot_ids, length)
         self.output_position.index_fill_(0, slot_ids, 0)
+        # Carry history needs no capacity-sized clear on refill: every valid
+        # action overwrites its producer row, and exports use this new length.
         self.response_limit.index_fill_(0, slot_ids, max_new_tokens)
         self._graph_logits[slot_ids] = bank.logits[prompt_index].to(
             device, non_blocking=True
@@ -1902,7 +2041,12 @@ class CapturedTrainingRolloutEngine:
             self._graph_values[slot_ids] = bank.values[prompt_index].to(
                 device, non_blocking=True
             )
+        if self.token_carry:
+            self.carry_hidden[slot_ids] = cast(Tensor, bank.hidden)[prompt_index].to(
+                device, non_blocking=True
+            )
         self.active.index_fill_(0, slot_ids, True)
+        self.thinking_closed.index_fill_(0, slot_ids, False)
         if self.invariant_decode:
             if self._prompt_last_tokens is None:
                 raise RuntimeError("invariant admission requires prompt token identity")
@@ -1961,6 +2105,9 @@ class CapturedTrainingRolloutEngine:
         Responses include their first stop token or reach ``max_new_tokens``;
         log-probabilities are zero placeholders for replay-time refresh.
         """
+        validate_thinking_budget(
+            self.answer_reserve_tokens, self.thinking_end_token_id, max_new_tokens
+        )
         if not prompt_ids_cpu:
             raise ValueError("continuous prompt pool cannot be empty")
         if max_new_tokens < 1:
@@ -1973,6 +2120,7 @@ class CapturedTrainingRolloutEngine:
 
         started = time.perf_counter()
         self._synchronize_generation()
+        self.last_carry_hiddens = None
         bank = self._build_prompt_prefix_bank(
             prompt_ids_cpu,
             prefill_batch_prompts=prefill_batch_prompts,
@@ -1985,6 +2133,7 @@ class CapturedTrainingRolloutEngine:
         self.cache_position.zero_()
         self.output_position.zero_()
         self.active.zero_()
+        self.thinking_closed.zero_()
         self.response_limit.fill_(max_new_tokens)
         self.position_ids.zero_()
         self.sequence_lengths.zero_()
@@ -1992,6 +2141,8 @@ class CapturedTrainingRolloutEngine:
         self.attention_mask.zero_()
         self.generated.zero_()
         self._graph_logits.zero_()
+        if self.token_carry:
+            self.carry_hidden.zero_()
         if self._compile_decode and self._continuous_decode_graph is None:
             self._capture_continuous_decode_schedule()
             self._graph_logits.zero_()
@@ -2000,6 +2151,9 @@ class CapturedTrainingRolloutEngine:
         prompt_count = len(prompt_ids_cpu)
         total_rows = prompt_count * self.samples_per_prompt
         completed_responses: list[Tensor | None] = [None] * total_rows
+        completed_carries: list[Tensor | None] | None = (
+            [None] * total_rows if self.token_carry else None
+        )
         slot_prompt = [-1] * self.batch_size
         slot_sample = [-1] * self.batch_size
         free_slots = list(range(self.batch_size))
@@ -2117,6 +2271,20 @@ class CapturedTrainingRolloutEngine:
                     strict=True,
                 ):
                     completed_responses[result_index] = row[:length].clone()
+                if completed_carries is not None:
+                    # Slice before gathering so padding up to cache capacity
+                    # is never copied. CPU clones own each logical request.
+                    with torch.inference_mode(False):
+                        carry_batch = self._carry_history[
+                            :, :max_completed_length
+                        ].index_select(0, completed_slot_ids).detach().to("cpu")
+                        for result_index, row, length in zip(
+                            completed_indices,
+                            carry_batch,
+                            completed_lengths,
+                            strict=True,
+                        ):
+                            completed_carries[result_index] = row[:length].clone()
             if completed_slots:
                 completed_set = set(completed_slots)
                 occupied_slots = [
@@ -2172,6 +2340,10 @@ class CapturedTrainingRolloutEngine:
 
         if any(response is None for response in completed_responses):
             raise RuntimeError("continuous rollout pool lost completed responses")
+        if completed_carries is not None and any(
+            carry is None for carry in completed_carries
+        ):
+            raise RuntimeError("continuous rollout pool lost completed carries")
         responses = tuple(
             cast(Tensor, response) for response in completed_responses
         )
@@ -2192,4 +2364,9 @@ class CapturedTrainingRolloutEngine:
             ),
             admission_events=admission_events,
             minimum_active_rows_with_backlog=minimum_active_with_backlog,
+            carry_hiddens=(
+                tuple(cast(Tensor, carry) for carry in completed_carries)
+                if completed_carries is not None
+                else None
+            ),
         )

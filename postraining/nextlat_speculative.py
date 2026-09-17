@@ -14,6 +14,7 @@ from postraining.minicpm_vapo import (
     dense_top_p_probabilities,
     maximal_coupling_verify,
 )
+from postraining.thinking_budget import force_thinking_end_, validate_thinking_budget
 
 
 @dataclass(frozen=True)
@@ -166,7 +167,14 @@ class NextLatSpeculativeEngine:
         temperature: float,
         top_p: float,
         compile_decode: bool,
+        answer_reserve_tokens: int = 0,
+        thinking_end_token_id: int | None = None,
     ) -> None:
+        if getattr(policy, "token_carry", False):
+            raise ValueError("token carry cannot use token-only NextLat proposals")
+        validate_thinking_budget(answer_reserve_tokens, thinking_end_token_id)
+        self.answer_reserve_tokens = answer_reserve_tokens
+        self.thinking_end_token_id = thinking_end_token_id
         if (
             prompts_per_rollout < 1
             or samples_per_prompt < 1
@@ -312,6 +320,10 @@ class NextLatSpeculativeEngine:
         max_new_tokens: int,
         progress_callback: Callable[[int, dict[str, float | int]], None] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, int, float, NextLatDecodeStats]:
+        validate_thinking_budget(
+            self.answer_reserve_tokens, self.thinking_end_token_id, max_new_tokens
+        )
+        thinking_boundary = max_new_tokens - self.answer_reserve_tokens - 1
         if max_new_tokens < 1:
             raise ValueError("generation length must be positive")
         longest_prompt = max(
@@ -360,6 +372,7 @@ class NextLatSpeculativeEngine:
         finished = torch.zeros(
             self.batch_size, dtype=torch.bool, device=device
         )
+        thinking_closed = torch.zeros_like(finished)
         target_calls = 0
         target_positions = 0
         row_cycles = torch.zeros((), dtype=torch.long, device=device)
@@ -495,6 +508,18 @@ class NextLatSpeculativeEngine:
                     drafts[:, offset],
                     active,
                 )
+                if self.answer_reserve_tokens:
+                    committed, forced = force_thinking_end_(
+                        committed,
+                        response_lengths + cycle_count,
+                        thinking_closed,
+                        active,
+                        thinking_boundary,
+                        self.thinking_end_token_id,
+                    )
+                    # The replacement is pending, not cached: all later verified
+                    # states still depend on the original proposal.
+                    accepted_mask = accepted_mask & ~forced
                 proposed_at_position = active.sum()
                 accepted_at_position = accepted_mask.sum()
                 proposed_by_position[offset] += proposed_at_position
@@ -562,6 +587,15 @@ class NextLatSpeculativeEngine:
             )
             bonus = torch.multinomial(bonus_probabilities, 1).squeeze(1)
             output_positions = response_lengths + cycle_count
+            if self.answer_reserve_tokens:
+                bonus, _ = force_thinking_end_(
+                    bonus,
+                    output_positions,
+                    thinking_closed,
+                    bonus_active,
+                    thinking_boundary,
+                    self.thinking_end_token_id,
+                )
             safe_output_positions = output_positions.clamp_max(
                 max_new_tokens - 1
             )[:, None]

@@ -254,12 +254,18 @@ class GaussianTransitionHead(nn.Module):
         noise: Tensor | None = None,
     ) -> Tensor:
         if noise is None:
-            noise = torch.randn(
-                mean.shape,
-                dtype=torch.float32,
-                device=mean.device,
-                generator=generator,
-            )
+            if generator is None:
+                # The generator overload cannot trace symbolic sizes, even for None.
+                noise = torch.randn(
+                    mean.shape, dtype=torch.float32, device=mean.device
+                )
+            else:
+                noise = torch.randn(
+                    mean.shape,
+                    dtype=torch.float32,
+                    device=mean.device,
+                    generator=generator,
+                )
         return mean.float() + log_sigma.float().exp() * noise.float()
 
     def per_dim_log_prob(
@@ -305,15 +311,7 @@ class StopThinkingGate(nn.Module):
     def sample(
         self, belief: Tensor, generator: torch.Generator | None = None
     ) -> tuple[Tensor, Tensor]:
-        logit = self.stop_logit(belief)
-        probability = logit.sigmoid()
-        uniform = torch.rand(
-            probability.shape,
-            device=probability.device,
-            dtype=probability.dtype,
-            generator=generator,
-        )
-        action = (uniform < probability).long()
+        action = self.sample_action(belief, generator=generator)
         return action, self.log_prob(action, belief)
 
     def log_prob(self, action: Tensor, belief: Tensor) -> Tensor:
@@ -325,12 +323,19 @@ class StopThinkingGate(nn.Module):
         self, belief: Tensor, generator: torch.Generator | None = None
     ) -> Tensor:
         probability = self.stop_logit(belief).sigmoid()
-        uniform = torch.rand(
-            probability.shape,
-            device=probability.device,
-            dtype=probability.dtype,
-            generator=generator,
-        )
+        if generator is None:
+            uniform = torch.rand(
+                probability.shape,
+                device=probability.device,
+                dtype=probability.dtype,
+            )
+        else:
+            uniform = torch.rand(
+                probability.shape,
+                device=probability.device,
+                dtype=probability.dtype,
+                generator=generator,
+            )
         return (uniform < probability).long()
 
 

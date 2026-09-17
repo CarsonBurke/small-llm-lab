@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from postraining.fast_inference import (
     CapturedTrainingRolloutEngine,
@@ -202,6 +203,7 @@ def test_refill_restores_prompt_last_token_and_excludes_it_from_cursor() -> None
     engine.response_limit = torch.tensor([3, 3])
     engine._graph_logits = torch.zeros(2, 2)
     engine.active = torch.tensor([False, True])
+    engine.thinking_closed = torch.ones_like(engine.active)
     engine._pending = torch.tensor([99, 12])
     engine._prompt_last_tokens = torch.tensor([8, 9])
     layer = _UnoStaticLayer(13, engine.sequence_lengths, engine.attention_mask)
@@ -228,12 +230,15 @@ def test_refill_restores_prompt_last_token_and_excludes_it_from_cursor() -> None
     torch.testing.assert_close(
         engine.generated[1], torch.full((8,), 77, dtype=torch.long)
     )
+    assert engine.thinking_closed.tolist() == [False, True]
 
 
 def test_continuous_scheduler_refills_variable_width_cycles_without_losing_rows() -> (
     None
 ):
     engine = object.__new__(UnoTrainingRolloutEngine)
+    engine.answer_reserve_tokens = 0
+    engine.thinking_end_token_id = None
     engine.batch_size = 2
     engine.samples_per_prompt = 1
     engine.cache_length = 8
@@ -247,6 +252,7 @@ def test_continuous_scheduler_refills_variable_width_cycles_without_losing_rows(
     engine.position_ids = torch.zeros(2, 1, dtype=torch.long)
     engine.attention_mask = torch.zeros(2, 8, dtype=torch.bool)
     engine.active = torch.zeros(2, dtype=torch.bool)
+    engine.thinking_closed = torch.zeros_like(engine.active)
     engine.response_limit = torch.ones(2, dtype=torch.long)
     engine._pending = torch.zeros(2, dtype=torch.long)
     engine._compile_decode = False
@@ -301,3 +307,64 @@ def test_continuous_scheduler_refills_variable_width_cycles_without_losing_rows(
     assert result.decode_steps == 2
     assert result.useful_tokens == 9
     assert result.capacity_row_steps == 20
+
+
+@pytest.mark.parametrize("boundary_offset", [0, 1, 2, 3, 4])
+def test_forced_delimiter_truncates_uno_cycle_and_remains_pending(boundary_offset) -> None:
+    position = torch.tensor([4 - boundary_offset])
+    start = int(position[0])
+    generated = torch.full((1, 7), -1, dtype=torch.long)
+    cursor = torch.tensor([10])
+    pending = torch.tensor([1])
+    active = torch.tensor([True])
+    closed = torch.tensor([False])
+    emitted, accepted = commit_cycle_(
+        generated, position, cursor, pending, active, torch.tensor([7]),
+        torch.tensor([99]), torch.tensor([10]), torch.tensor([[20, 21, 22]]),
+        torch.ones(1, 3, dtype=torch.long), torch.tensor([90]),
+        thinking_closed=closed, answer_reserve_tokens=2, thinking_end_token_id=9,
+    )
+    assert emitted.tolist() == [boundary_offset + 1]
+    assert generated[0, start:5].tolist() == [10, 20, 21, 22][:boundary_offset] + [9]
+    assert generated[0, 5:].tolist() == [-1, -1]
+    assert pending.tolist() == [9]
+    assert cursor.tolist() == [11 + boundary_offset]
+    assert active.tolist() == [True]
+    assert accepted.sum().item() == min(max(boundary_offset - 1, 0), 3)
+    # The next cycle uses the forced delimiter as its pending context.
+    commit_cycle_(
+        generated, position, cursor, pending, active, torch.tensor([7]),
+        torch.tensor([99]), torch.tensor([2]), torch.tensor([[2, 2, 2]]),
+        torch.ones(1, 3, dtype=torch.long), torch.tensor([2]),
+        thinking_closed=closed, answer_reserve_tokens=2, thinking_end_token_id=9,
+    )
+    assert generated[0, 4:].tolist() == [9, 2, 2]
+    assert position.tolist() == [7]
+    assert active.tolist() == [False]
+
+
+def test_uno_budget_ignores_uncommitted_close_and_preserves_early_eos() -> None:
+    generated = torch.full((5, 7), -1, dtype=torch.long)
+    position = torch.tensor([2, 2, 2, 2, 2])
+    cursor = torch.zeros(5, dtype=torch.long)
+    pending = torch.ones(5, dtype=torch.long)
+    active = torch.tensor([True, True, True, False, True])
+    closed = torch.tensor([False, False, False, False, True])
+    emitted, _ = commit_cycle_(
+        generated, position, cursor, pending, active, torch.full((5,), 7),
+        torch.tensor([99]), torch.tensor([9, 99, 10, 9, 10]),
+        torch.tensor([[20, 21, 22], [20, 21, 22], [20, 9, 22], [20, 21, 22], [20, 21, 22]]),
+        torch.tensor([[1, 1, 1], [1, 1, 1], [0, 0, 0], [1, 1, 1], [1, 1, 1]]),
+        torch.full((5,), 90),
+        thinking_closed=closed, answer_reserve_tokens=2, thinking_end_token_id=9,
+    )
+    assert emitted.tolist() == [5, 1, 2, 0, 5]
+    assert generated.tolist() == [
+        [-1, -1, 9, 20, 21, 22, 90],
+        [-1, -1, 99, -1, -1, -1, -1],
+        [-1, -1, 10, 90, -1, -1, -1],
+        [-1, -1, -1, -1, -1, -1, -1],
+        [-1, -1, 10, 20, 21, 22, 90],
+    ]
+    assert closed.tolist() == [True, False, False, False, True]
+    assert pending.tolist() == [90, 99, 90, 1, 90]

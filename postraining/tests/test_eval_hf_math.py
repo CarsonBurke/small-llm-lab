@@ -219,6 +219,18 @@ def test_vapo_adapter_evaluation_loads_bf16_policy_weights(tmp_path) -> None:
     )
 
 
+def test_stock_evaluation_refuses_to_discard_token_carry(tmp_path) -> None:
+    checkpoint = tmp_path / "carry.pt"
+    torch.save(
+        {"policy": {"schema": "minicpm5_vapo_token_carry/v3"}},
+        checkpoint,
+    )
+    with pytest.raises(ValueError, match="token-carry"):
+        load_vapo_adapter_for_evaluation(
+            nn.Linear(2, 2), checkpoint, model_id="model", revision="revision",
+        )
+
+
 def test_periodic_suite_metrics_append_to_training_tensorboard(tmp_path) -> None:
     write_suite_metrics_to_tensorboard(
         tmp_path,

@@ -19,6 +19,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from postraining.hf_runtime import prepare_text_only_transformers_runtime
+from postraining.latent_thought import (
+    CombinedEmbedding,
+    GaussianTransitionHead,
+    StopThinkingGate,
+)
+from postraining.token_carry import (
+    TokenCarryCombiner,
+    load_token_carry_state_dict,
+    token_carry_replay_hidden,
+)
 
 
 
@@ -26,6 +36,11 @@ from postraining.hf_runtime import prepare_text_only_transformers_runtime
 MINICPM5_MODEL_ID = "openbmb/MiniCPM5-1B"
 MINICPM5_REVISION = "87179e5c1f455ef22e6223592d2d61351b525bfc"
 MINICPM5_VOCAB_SIZE = 130_560
+TOKEN_ACTION = 0
+FIRST_THOUGHT = 1
+CONTINUE_THOUGHT = 2
+STOP_THINKING = 3
+FORCED_STOP_THINKING = 4
 DEFAULT_LORA_TARGETS = (
     "q_proj",
     "k_proj",
@@ -430,6 +445,77 @@ class NextLatAuxiliaryHead(nn.Module):
         return hidden + delta.to(hidden.dtype)
 
 
+def _thought_embeddings(side: Any, raw: Tensor) -> Tensor:
+    if not side.latent_thinking:
+        raise ValueError("thought embeddings require latent thinking")
+    if raw.ndim != 2 or raw.shape[1] != int(side.causal_lm.config.hidden_size):
+        raise ValueError("thought vectors must have shape [thoughts, hidden_size]")
+    raw = raw.detach()
+    dtype = side.causal_lm.get_input_embeddings().weight.dtype
+    return side.thought_adapter(raw.to(dtype=dtype), raw)
+
+
+def _replay_inputs(
+    side: Any,
+    input_ids: Tensor | None,
+    inputs_embeds: Tensor | None,
+    latent_vectors: Tensor | None,
+    latent_input_positions: Tensor | None,
+) -> dict[str, Tensor]:
+    if (latent_vectors is None) != (latent_input_positions is None):
+        raise ValueError("latent replay requires both vectors and input positions")
+    if latent_vectors is not None:
+        if inputs_embeds is not None or input_ids is None:
+            raise ValueError("latent replay substitutes token inputs, not inputs_embeds")
+        if not side.latent_thinking:
+            raise ValueError("latent replay requires a latent-thinking model")
+        assert latent_input_positions is not None
+        if (
+            latent_input_positions.ndim != 1
+            or latent_input_positions.dtype != torch.long
+            or latent_input_positions.numel() != latent_vectors.shape[0]
+        ):
+            raise ValueError("one packed input position is required per thought")
+        # Token weights are frozen; discard the training-only input-gradient leaf
+        # before in-place replacement, without detaching the thought adapter.
+        embeddings = side.token_embeddings(input_ids).detach()
+        thought_embeddings = side.thought_embeddings(latent_vectors)
+        inputs_embeds = embeddings.flatten(0, 1).index_copy_(
+            0, latent_input_positions, thought_embeddings
+        ).view_as(embeddings)
+    if inputs_embeds is not None:
+        return {"inputs_embeds": inputs_embeds}
+    if input_ids is None:
+        raise ValueError("replay requires token ids or input embeddings")
+    return {"input_ids": input_ids}
+
+
+def _load_latent_state(side: Any, payload: dict[str, Any], *, actor: bool) -> None:
+    enabled = payload.get("latent_thinking", False)
+    if type(enabled) is not bool or enabled != side.latent_thinking:
+        raise ValueError("checkpoint latent-thinking mode differs from the model")
+    keys = {
+        "thought_sigma", "init_stop_thinking_probability",
+        "transition", "thinking_gate", "thought_adapter",
+    }
+    if not enabled:
+        if keys.intersection(payload):
+            raise ValueError("native checkpoint contains latent-thinking state")
+        return
+    modules = {"thought_adapter": side.thought_adapter}
+    if actor:
+        for key in ("thought_sigma", "init_stop_thinking_probability"):
+            if payload.get(key) != getattr(side, key):
+                raise ValueError(f"checkpoint {key} differs from the model")
+        modules.update(transition=side.transition, thinking_gate=side.thinking_gate)
+    elif (keys - {"thought_adapter"}).intersection(payload):
+        raise ValueError("critic checkpoint contains actor latent-thinking state")
+    for name, module in modules.items():
+        if name not in payload:
+            raise ValueError(f"checkpoint is missing {name}")
+        module.load_state_dict(payload[name], strict=True)
+
+
 class MiniCPMVAPOPolicy(nn.Module):
     """MiniCPM actor with its own LoRA and NextLat dynamics model."""
 
@@ -439,8 +525,14 @@ class MiniCPMVAPOPolicy(nn.Module):
         lora_config: LoRAConfig,
         *,
         nextlat_projection_factor: float = 1.6,
+        latent_thinking: bool = False,
+        token_carry: bool = False,
+        thought_sigma: float = 1.0,
+        init_stop_thinking_probability: float = 0.9,
     ) -> None:
         super().__init__()
+        if latent_thinking and token_carry:
+            raise ValueError("token carry cannot be combined with latent thinking")
         self.causal_lm = causal_lm
         config: Any = causal_lm.config
         if getattr(config, "model_type", None) != "llama":
@@ -456,6 +548,18 @@ class MiniCPMVAPOPolicy(nn.Module):
         self.nextlat_head = NextLatAuxiliaryHead(
             int(config.hidden_size), nextlat_projection_factor
         )
+        self.latent_thinking = latent_thinking
+        self.token_carry = token_carry
+        if token_carry:
+            self.token_combiner = TokenCarryCombiner(int(config.hidden_size))
+        if latent_thinking:
+            self.thought_sigma = float(thought_sigma)
+            self.init_stop_thinking_probability = float(init_stop_thinking_probability)
+            self.transition = GaussianTransitionHead(int(config.hidden_size), thought_sigma)
+            self.thinking_gate = StopThinkingGate(
+                int(config.hidden_size), init_stop_thinking_probability
+            )
+            self.thought_adapter = CombinedEmbedding(int(config.hidden_size))
         self.model_id = MINICPM5_MODEL_ID
         self.revision = MINICPM5_REVISION
         self.causal_lm.config.use_cache = False
@@ -470,6 +574,10 @@ class MiniCPMVAPOPolicy(nn.Module):
         lora_config: LoRAConfig,
         nextlat_projection_factor: float = 1.6,
         gradient_checkpointing: bool = True,
+        latent_thinking: bool = False,
+        token_carry: bool = False,
+        thought_sigma: float = 1.0,
+        init_stop_thinking_probability: float = 0.9,
     ) -> tuple["MiniCPMVAPOPolicy", Any]:
         prepare_text_only_transformers_runtime()
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -487,6 +595,10 @@ class MiniCPMVAPOPolicy(nn.Module):
             causal_lm,
             lora_config,
             nextlat_projection_factor=nextlat_projection_factor,
+            latent_thinking=latent_thinking,
+            token_carry=token_carry,
+            thought_sigma=thought_sigma,
+            init_stop_thinking_probability=init_stop_thinking_probability,
         ).to(device)
         policy.model_id = model_id
         policy.revision = revision
@@ -508,28 +620,50 @@ class MiniCPMVAPOPolicy(nn.Module):
         return weight
 
     def actor_parameters(self) -> Iterable[nn.Parameter]:
-        return (
-            parameter
-            for name, parameter in self.causal_lm.named_parameters()
-            if name.endswith(("lora_a", "lora_b")) and parameter.requires_grad
-        )
+        for name, parameter in self.causal_lm.named_parameters():
+            if name.endswith(("lora_a", "lora_b")) and parameter.requires_grad:
+                yield parameter
+        if self.token_carry:
+            yield from (
+                parameter for parameter in self.token_combiner.parameters()
+                if parameter.requires_grad
+            )
+        if self.latent_thinking:
+            for module in (self.transition, self.thinking_gate, self.thought_adapter):
+                yield from (parameter for parameter in module.parameters() if parameter.requires_grad)
 
     def token_embeddings(self, token_ids: Tensor) -> Tensor:
         return self.causal_lm.get_input_embeddings()(token_ids)
+
+    def carry_embeddings(self, token_ids: Tensor, previous_hidden: Tensor) -> Tensor:
+        if not self.token_carry:
+            raise ValueError("carry embeddings require token carry")
+        return self.token_combiner(self.token_embeddings(token_ids), previous_hidden)
+
+    def token_carry_replay_hidden(self, batch: "ReplayMicrobatch") -> Tensor:
+        return token_carry_replay_hidden(self, batch)
+
+    def thought_embeddings(self, raw: Tensor) -> Tensor:
+        return _thought_embeddings(self, raw)
 
     def nextlat_hidden(self, hidden: Tensor, token_ids: Tensor) -> Tensor:
         return self.nextlat_head(hidden, self.token_embeddings(token_ids))
 
     def replay_hidden(
         self,
-        input_ids: Tensor,
+        input_ids: Tensor | None,
         attention_mask: Tensor | None,
         *,
         position_ids: Tensor | None = None,
         cu_seqlens: Tensor | None = None,
         sequence_boundaries: tuple[int, ...] | None = None,
         max_sequence_length: int = 0,
+        inputs_embeds: Tensor | None = None,
+        latent_vectors: Tensor | None = None,
+        latent_input_positions: Tensor | None = None,
     ) -> Tensor:
+        if self.token_carry and inputs_embeds is None:
+            raise ValueError("token carry requires token_carry_replay_hidden with stored carries")
         if cu_seqlens is not None:
             boundaries = sequence_boundaries
             if boundaries is None:
@@ -540,7 +674,7 @@ class MiniCPMVAPOPolicy(nn.Module):
                 attention._packed_max_sequence_length = max_sequence_length
                 attention._packed_sequence_boundaries = boundaries
         outputs = self.causal_lm.model(
-            input_ids=input_ids,
+            **_replay_inputs(self, input_ids, inputs_embeds, latent_vectors, latent_input_positions),
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
@@ -550,15 +684,16 @@ class MiniCPMVAPOPolicy(nn.Module):
 
     def cached_hidden(
         self,
-        input_ids: Tensor,
+        input_ids: Tensor | None = None,
         *,
         past_key_values: Any,
         cache_position: Tensor,
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
+        inputs_embeds: Tensor | None = None,
     ) -> Tensor:
         outputs = self.causal_lm.model(
-            input_ids=input_ids,
+            **_replay_inputs(self, input_ids, inputs_embeds, None, None),
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -571,13 +706,59 @@ class MiniCPMVAPOPolicy(nn.Module):
     def logits(self, hidden: Tensor) -> Tensor:
         return self.causal_lm.lm_head(hidden)
 
+    def action_logprobs(
+        self, action_hidden: Tensor, batch: "ReplayMicrobatch", *, chunk_tokens: int = 64
+    ) -> Tensor:
+        """Score each action using only its phase's distribution."""
+        if action_hidden.ndim != 2 or action_hidden.shape[0] != batch.action_count:
+            raise ValueError("one hidden state is required per replay action")
+        if batch.action_kinds is None:
+            if self.latent_thinking:
+                raise ValueError("latent policy cannot replay native-token records")
+            return chunked_frozen_head_logprobs(
+                action_hidden, batch.targets, self.lm_head_weight, chunk_tokens=chunk_tokens
+            )
+        if not self.latent_thinking:
+            raise ValueError("native policy cannot replay latent records")
+        if (
+            batch.latent_vectors is None or batch.latent_action_indices is None
+            or batch.token_action_indices is None or batch.gate_action_indices is None
+            or batch.gate_stop_actions is None
+        ):
+            raise ValueError("latent likelihood requires stored actions and phase indices")
+        result = action_hidden.new_zeros(batch.action_count, dtype=torch.float32)
+        token_indices = batch.token_action_indices
+        if token_indices.numel():
+            result = result.index_copy(
+                0, token_indices,
+                chunked_frozen_head_logprobs(
+                    action_hidden[token_indices], batch.targets[token_indices],
+                    self.lm_head_weight, chunk_tokens=chunk_tokens,
+                ),
+            )
+        thought_indices = batch.latent_action_indices
+        thought_hidden = action_hidden[thought_indices]
+        mean = self.transition.predict_mean(thought_hidden)
+        thought_logprobs = self.transition.log_prob(
+            batch.latent_vectors.detach(), mean,
+            self.transition.predict_log_sigma(thought_hidden),
+        )
+        result = result.index_copy(0, thought_indices, thought_logprobs)
+        gate_indices = batch.gate_action_indices
+        if gate_indices.numel():
+            gate_logprobs = self.thinking_gate.log_prob(
+                batch.gate_stop_actions, action_hidden[gate_indices]
+            )
+            result = result.index_add(0, gate_indices, gate_logprobs)
+        return result
+
     def rollout_values(self, hidden: Tensor) -> Tensor:
         """Value placeholder; the independent critic refreshes returns post-rollout."""
         return torch.zeros(hidden.shape[:-1], dtype=torch.float32, device=hidden.device)
 
 
     def checkpoint_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model_id": self.model_id,
             "revision": self.revision,
             "lora_config": asdict(self.lora_config),
@@ -589,6 +770,30 @@ class MiniCPMVAPOPolicy(nn.Module):
                 for name, tensor in self.nextlat_head.state_dict().items()
             },
         }
+        if self.token_carry:
+            payload.update(
+                token_carry=True,
+                token_combiner={
+                    name: tensor.detach().cpu()
+                    for name, tensor in self.token_combiner.state_dict().items()
+                },
+            )
+        if self.latent_thinking:
+            payload.update(
+                latent_thinking=True,
+                thought_sigma=self.thought_sigma,
+                init_stop_thinking_probability=self.init_stop_thinking_probability,
+                transition={name: tensor.detach().cpu() for name, tensor in self.transition.state_dict().items()},
+                thinking_gate={name: tensor.detach().cpu() for name, tensor in self.thinking_gate.state_dict().items()},
+                thought_adapter={name: tensor.detach().cpu() for name, tensor in self.thought_adapter.state_dict().items()},
+            )
+        return payload
+
+    def load_latent_state_dict(self, payload: dict[str, Any]) -> None:
+        _load_latent_state(self, payload, actor=True)
+
+    def load_token_carry_state_dict(self, payload: dict[str, Any]) -> None:
+        load_token_carry_state_dict(self, payload)
 
 
 class MiniCPMVAPOCritic(nn.Module):
@@ -601,8 +806,12 @@ class MiniCPMVAPOCritic(nn.Module):
         *,
         critic_width: int = 256,
         nextlat_projection_factor: float = 1.6,
+        latent_thinking: bool = False,
+        token_carry: bool = False,
     ) -> None:
         super().__init__()
+        if latent_thinking and token_carry:
+            raise ValueError("token carry cannot be combined with latent thinking")
         self.causal_lm = causal_lm
         config: Any = causal_lm.config
         if getattr(config, "model_type", None) != "llama":
@@ -616,6 +825,12 @@ class MiniCPMVAPOCritic(nn.Module):
         self.nextlat_head = NextLatAuxiliaryHead(
             int(config.hidden_size), nextlat_projection_factor
         )
+        self.latent_thinking = latent_thinking
+        self.token_carry = token_carry
+        if token_carry:
+            self.token_combiner = TokenCarryCombiner(int(config.hidden_size))
+        if latent_thinking:
+            self.thought_adapter = CombinedEmbedding(int(config.hidden_size))
         self.shared_frozen_parameters: tuple[str, ...] = ()
         self.model_id = MINICPM5_MODEL_ID
         self.revision = MINICPM5_REVISION
@@ -633,6 +848,8 @@ class MiniCPMVAPOCritic(nn.Module):
         nextlat_projection_factor: float = 1.6,
         gradient_checkpointing: bool = True,
         shared_frozen_source: nn.Module | None = None,
+        latent_thinking: bool = False,
+        token_carry: bool = False,
     ) -> "MiniCPMVAPOCritic":
         prepare_text_only_transformers_runtime()
         from transformers import AutoModelForCausalLM
@@ -649,6 +866,8 @@ class MiniCPMVAPOCritic(nn.Module):
             lora_config,
             critic_width=critic_width,
             nextlat_projection_factor=nextlat_projection_factor,
+            latent_thinking=latent_thinking,
+            token_carry=token_carry,
         )
         if shared_frozen_source is not None:
             critic.shared_frozen_parameters = share_frozen_parameters_(
@@ -664,11 +883,19 @@ class MiniCPMVAPOCritic(nn.Module):
         return critic
 
     def backbone_parameters(self) -> Iterable[nn.Parameter]:
-        return (
-            parameter
-            for name, parameter in self.causal_lm.named_parameters()
-            if name.endswith(("lora_a", "lora_b")) and parameter.requires_grad
-        )
+        for name, parameter in self.causal_lm.named_parameters():
+            if name.endswith(("lora_a", "lora_b")) and parameter.requires_grad:
+                yield parameter
+        if self.token_carry:
+            yield from (
+                parameter for parameter in self.token_combiner.parameters()
+                if parameter.requires_grad
+            )
+        if self.latent_thinking:
+            yield from (
+                parameter for parameter in self.thought_adapter.parameters()
+                if parameter.requires_grad
+            )
 
     @property
     def lm_head_weight(self) -> Tensor:
@@ -679,14 +906,19 @@ class MiniCPMVAPOCritic(nn.Module):
 
     def replay_hidden(
         self,
-        input_ids: Tensor,
+        input_ids: Tensor | None,
         attention_mask: Tensor | None,
         *,
         position_ids: Tensor | None = None,
         cu_seqlens: Tensor | None = None,
         sequence_boundaries: tuple[int, ...] | None = None,
         max_sequence_length: int = 0,
+        inputs_embeds: Tensor | None = None,
+        latent_vectors: Tensor | None = None,
+        latent_input_positions: Tensor | None = None,
     ) -> Tensor:
+        if self.token_carry and inputs_embeds is None:
+            raise ValueError("token carry requires token_carry_replay_hidden with stored carries")
         if cu_seqlens is not None:
             boundaries = sequence_boundaries
             if boundaries is None:
@@ -697,7 +929,7 @@ class MiniCPMVAPOCritic(nn.Module):
                 attention._packed_max_sequence_length = max_sequence_length
                 attention._packed_sequence_boundaries = boundaries
         outputs = self.causal_lm.model(
-            input_ids=input_ids,
+            **_replay_inputs(self, input_ids, inputs_embeds, latent_vectors, latent_input_positions),
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
@@ -708,11 +940,22 @@ class MiniCPMVAPOCritic(nn.Module):
     def token_embeddings(self, token_ids: Tensor) -> Tensor:
         return self.causal_lm.get_input_embeddings()(token_ids)
 
+    def carry_embeddings(self, token_ids: Tensor, previous_hidden: Tensor) -> Tensor:
+        if not self.token_carry:
+            raise ValueError("carry embeddings require token carry")
+        return self.token_combiner(self.token_embeddings(token_ids), previous_hidden)
+
+    def token_carry_replay_hidden(self, batch: "ReplayMicrobatch") -> Tensor:
+        return token_carry_replay_hidden(self, batch)
+
+    def thought_embeddings(self, raw: Tensor) -> Tensor:
+        return _thought_embeddings(self, raw)
+
     def values(self, hidden: Tensor) -> Tensor:
         return self.value_head(hidden)
 
     def checkpoint_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model_id": self.model_id,
             "revision": self.revision,
             "lora_config": asdict(self.lora_config),
@@ -728,6 +971,26 @@ class MiniCPMVAPOCritic(nn.Module):
                 for name, tensor in self.nextlat_head.state_dict().items()
             },
         }
+        if self.token_carry:
+            payload.update(
+                token_carry=True,
+                token_combiner={
+                    name: tensor.detach().cpu()
+                    for name, tensor in self.token_combiner.state_dict().items()
+                },
+            )
+        if self.latent_thinking:
+            payload.update(
+                latent_thinking=True,
+                thought_adapter={name: tensor.detach().cpu() for name, tensor in self.thought_adapter.state_dict().items()},
+            )
+        return payload
+
+    def load_latent_state_dict(self, payload: dict[str, Any]) -> None:
+        _load_latent_state(self, payload, actor=False)
+
+    def load_token_carry_state_dict(self, payload: dict[str, Any]) -> None:
+        load_token_carry_state_dict(self, payload)
 
 
 class _ChunkedFrozenHeadLogProbs(torch.autograd.Function):
@@ -1040,6 +1303,11 @@ class TrajectoryRecord:
     advantages: Tensor
     correct: bool
     text: str
+    forced_token_index: int = -1
+    action_kinds: Tensor | None = None
+    latent_vectors: Tensor | None = None
+    controller_observations: Tensor | None = None
+    carry_hiddens: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.token_ids.device.type != "cpu" or self.token_ids.dtype != torch.int32:
@@ -1048,6 +1316,8 @@ class TrajectoryRecord:
             raise ValueError("replay log-probabilities must be CPU fp32")
         if self.advantages.device.type != "cpu" or self.advantages.dtype != torch.float32:
             raise ValueError("replay advantages must be CPU fp32")
+        if any(tensor.ndim != 1 for tensor in (self.token_ids, self.old_logprobs, self.advantages)):
+            raise ValueError("replay token ids, log-probabilities, and advantages must be vectors")
         response_length = self.token_ids.numel() - self.prompt_length
         if self.prompt_length < 1 or response_length < 1:
             raise ValueError("trajectory must contain prompt and response tokens")
@@ -1055,6 +1325,72 @@ class TrajectoryRecord:
             raise ValueError("one old log-probability is required per response token")
         if self.advantages.numel() != response_length:
             raise ValueError("one advantage is required per response token")
+        if not -1 <= self.forced_token_index < response_length:
+            raise ValueError("forced token index must be -1 or a response token index")
+        if (self.action_kinds is None) != (self.latent_vectors is None):
+            raise ValueError("latent replay requires both action kinds and vectors")
+        carries = self.carry_hiddens
+        if carries is not None:
+            if self.action_kinds is not None:
+                raise ValueError("token carry cannot be combined with latent trajectories")
+            if (
+                carries.device.type != "cpu" or carries.dtype != torch.bfloat16
+                or carries.ndim != 2 or carries.shape[0] != response_length
+                or carries.shape[1] < 1 or carries.requires_grad or carries.is_inference()
+                or not bool(torch.isfinite(carries).all())
+            ):
+                raise ValueError("carry hiddens must be ordinary detached finite CPU BF16 [response_length, hidden_size]")
+        observations = self.controller_observations
+        if observations is not None:
+            if (
+                observations.device.type != "cpu"
+                or not observations.is_floating_point()
+                or observations.ndim != 2
+                or observations.shape[0] != response_length
+                or observations.shape[1] < 1
+                or observations.requires_grad
+            ):
+                raise ValueError(
+                    "controller observations must be detached CPU floating "
+                    "[response_length, hidden_size]"
+                )
+            if self.latent_vectors is None:
+                raise ValueError("controller observations require a latent trajectory")
+        if self.action_kinds is None:
+            return
+        kinds = self.action_kinds
+        vectors = self.latent_vectors
+        assert vectors is not None
+        if (
+            kinds.device.type != "cpu" or kinds.dtype != torch.int8
+            or kinds.ndim != 1 or kinds.numel() != response_length
+        ):
+            raise ValueError("action kinds must be CPU int8 with one entry per response slot")
+        if (
+            vectors.device.type != "cpu" or vectors.dtype != torch.float32
+            or vectors.ndim != 2 or vectors.shape[1] < 1 or vectors.requires_grad
+            or not bool(torch.isfinite(vectors).all())
+        ):
+            raise ValueError("latent vectors must be detached finite CPU fp32 [thoughts, hidden_size]")
+        if observations is not None and observations.shape[1] != vectors.shape[1]:
+            raise ValueError("controller observations must match the latent hidden size")
+        thought_count = vectors.shape[0]
+        if thought_count < 1 or response_length < thought_count + 2:
+            raise ValueError("latent response requires thoughts, a close slot, and answer tokens")
+        if (
+            int(kinds[0]) != FIRST_THOUGHT
+            or not bool((kinds[1:thought_count] == CONTINUE_THOUGHT).all())
+            or int(kinds[thought_count]) not in (STOP_THINKING, FORCED_STOP_THINKING)
+            or not bool((kinds[thought_count + 1:] == TOKEN_ACTION).all())
+        ):
+            raise ValueError("latent action kinds must be first, continue*, close, answer+")
+        expected_forced = (
+            thought_count if int(kinds[thought_count]) == FORCED_STOP_THINKING else -1
+        )
+        if self.forced_token_index != expected_forced:
+            raise ValueError("forced token index must identify exactly the forced latent close")
+        if expected_forced >= 0 and float(self.old_logprobs[expected_forced]) != 0.0:
+            raise ValueError("forced latent close must have zero policy log-probability")
 
     @property
     def response_length(self) -> int:
@@ -1066,8 +1402,14 @@ class TrajectoryRecord:
 
     @property
     def storage_bytes(self) -> int:
-        tensors = (self.token_ids, self.old_logprobs, self.advantages)
-        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+        tensors = (
+            self.token_ids, self.old_logprobs, self.advantages,
+            self.action_kinds, self.latent_vectors, self.controller_observations,
+            self.carry_hiddens,
+        )
+        return sum(
+            tensor.numel() * tensor.element_size() for tensor in tensors if tensor is not None
+        )
 
     @classmethod
     def from_device(
@@ -1079,11 +1421,31 @@ class TrajectoryRecord:
         old_values: Tensor,
         correct: bool,
         text: str,
+        forced_token_index: int = -1,
+        action_kinds: Tensor | None = None,
+        latent_vectors: Tensor | None = None,
+        controller_observations: Tensor | None = None,
+        carry_hiddens: Tensor | None = None,
     ) -> "TrajectoryRecord":
+        if action_kinds is not None:
+            action_kinds = action_kinds.detach().to(device="cpu")
+            if (
+                action_kinds.dtype not in (
+                    torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8
+                )
+                or action_kinds.ndim != 1
+                or not bool(((action_kinds >= TOKEN_ACTION) & (action_kinds <= FORCED_STOP_THINKING)).all())
+            ):
+                raise ValueError("action kinds must contain integer latent action codes")
         token_ids_cpu = token_ids.detach().to(device="cpu", dtype=torch.int32)
         response_length = token_ids_cpu.numel() - prompt_length
         if old_values.numel() != response_length:
             raise ValueError("one old value is required per response token")
+        if carry_hiddens is not None:
+            if carry_hiddens.dtype != torch.bfloat16:
+                raise ValueError("rollout carry hiddens must already be BF16")
+            with torch.inference_mode(False):
+                carry_hiddens = carry_hiddens.detach().to(device="cpu", copy=True)
         return cls(
             token_ids=token_ids_cpu,
             prompt_length=prompt_length,
@@ -1091,6 +1453,20 @@ class TrajectoryRecord:
             advantages=_precompute_advantages(old_values, correct),
             correct=correct,
             text=text,
+            forced_token_index=forced_token_index,
+            action_kinds=(
+                None if action_kinds is None
+                else action_kinds.detach().to(device="cpu", dtype=torch.int8)
+            ),
+            latent_vectors=(
+                None if latent_vectors is None
+                else latent_vectors.detach().to(device="cpu", dtype=torch.float32)
+            ),
+            controller_observations=(
+                None if controller_observations is None
+                else controller_observations.detach().to(device="cpu")
+            ),
+            carry_hiddens=carry_hiddens,
         )
 
 
@@ -1154,17 +1530,26 @@ class ReplayMicrobatch:
     input_ids: Tensor
     attention_mask: Tensor | None
     position_ids: Tensor
-    sequence_ids: Tensor
     cu_seqlens: Tensor
     sequence_boundaries: tuple[int, ...]
     max_sequence_length: int
     action_batch_indices: Tensor
     action_positions: Tensor
-    response_state_mask: Tensor
     targets: Tensor
+    policy_mask: Tensor
     old_logprobs: Tensor
     advantages: Tensor
     value_targets: Tensor
+    nextlat_sequence_ranges: tuple[tuple[int, int], ...]
+    action_kinds: Tensor | None = None
+    latent_vectors: Tensor | None = None
+    latent_input_positions: Tensor | None = None
+    latent_action_indices: Tensor | None = None
+    token_action_indices: Tensor | None = None
+    gate_action_indices: Tensor | None = None
+    gate_stop_actions: Tensor | None = None
+    carry_hiddens: Tensor | None = None
+    carry_input_positions: Tensor | None = None
 
     @property
     def action_count(self) -> int:
@@ -1184,35 +1569,90 @@ def collate_replay_microbatch(
     if not indices:
         raise ValueError("cannot collate an empty replay microbatch")
     selected = [records[index] for index in indices]
+    latent = selected[0].action_kinds is not None
+    if any((record.action_kinds is not None) != latent for record in selected):
+        raise ValueError("cannot mix native and latent trajectories in one replay microbatch")
+    if latent and len({record.latent_vectors.shape[1] for record in selected if record.latent_vectors is not None}) != 1:
+        raise ValueError("latent trajectories must share a hidden size")
+    carry = selected[0].carry_hiddens is not None
+    if any((record.carry_hiddens is not None) != carry for record in selected):
+        raise ValueError("cannot mix native, Gaussian, and token-carry trajectories")
+    if carry:
+        if latent:
+            raise ValueError("token carry cannot be combined with latent trajectories")
+        if len({record.carry_hiddens.shape[1] for record in selected}) != 1:
+            raise ValueError("carry trajectories must share a hidden size")
     lengths = [record.input_length for record in selected]
     total = sum(lengths)
     maximum = max(lengths)
     pin = device.type == "cuda"
     input_ids = torch.empty((1, total), dtype=torch.long, pin_memory=pin)
     position_ids = torch.empty_like(input_ids)
-    sequence_ids = torch.empty_like(input_ids)
-    response_state_mask = torch.zeros(
-        (1, total), dtype=torch.bool, pin_memory=pin
-    )
     positions: list[Tensor] = []
     targets: list[Tensor] = []
+    policy_masks: list[Tensor] = []
     old_logprobs: list[Tensor] = []
     advantages: list[Tensor] = []
     value_targets: list[Tensor] = []
+    action_kinds: list[Tensor] = []
+    latent_vectors: list[Tensor] = []
+    latent_input_positions: list[Tensor] = []
+    latent_action_indices: list[Tensor] = []
+    token_action_indices: list[Tensor] = []
+    gate_action_indices: list[Tensor] = []
+    gate_stop_actions: list[Tensor] = []
+    carry_hiddens: list[Tensor] = []
+    carry_input_positions: list[Tensor] = []
+    nextlat_sequence_ranges: list[tuple[int, int]] = []
+    action_offset = 0
     boundaries = [0]
     offset = 0
 
-    for sequence, record in enumerate(selected):
+    for record in selected:
         length = record.input_length
         stop = offset + length
         input_ids[0, offset:stop].copy_(record.token_ids[:-1])
         position_ids[0, offset:stop].copy_(torch.arange(length))
-        sequence_ids[0, offset:stop] = sequence
         action_start = offset + record.prompt_length - 1
         action_stop = action_start + record.response_length
         positions.append(torch.arange(action_start, action_stop, dtype=torch.long))
-        response_state_mask[0, action_start:action_stop] = True
         targets.append(record.token_ids[record.prompt_length:].long())
+        policy_mask = torch.ones(record.response_length, dtype=torch.bool)
+        if record.forced_token_index >= 0:
+            policy_mask[record.forced_token_index] = False
+        policy_masks.append(policy_mask)
+        if carry:
+            assert record.carry_hiddens is not None
+            carry_hiddens.append(record.carry_hiddens[:-1])
+            carry_input_positions.append(torch.arange(action_start + 1, action_stop))
+        if latent:
+            assert record.action_kinds is not None and record.latent_vectors is not None
+            thought_count = record.latent_vectors.shape[0]
+            action_kinds.append(record.action_kinds)
+            latent_vectors.append(record.latent_vectors)
+            # Action state precedes the sampled input by one stream position.
+            latent_input_positions.append(
+                torch.arange(action_start + 1, action_start + 1 + thought_count)
+            )
+            latent_action_indices.append(
+                torch.arange(action_offset, action_offset + thought_count)
+            )
+            token_action_indices.append(torch.arange(
+                action_offset + thought_count + 1, action_offset + record.response_length,
+            ))
+            learned_stop = record.forced_token_index < 0
+            gate_count = thought_count - 1 + int(learned_stop)
+            gate_action_indices.append(torch.arange(
+                action_offset + 1, action_offset + 1 + gate_count,
+            ))
+            gate_actions = torch.zeros(gate_count, dtype=torch.long)
+            if learned_stop:
+                gate_actions[-1] = 1
+            gate_stop_actions.append(gate_actions)
+            nextlat_sequence_ranges.append((action_start + thought_count + 1, action_stop))
+        else:
+            nextlat_sequence_ranges.append((action_start, action_stop))
+        action_offset += record.response_length
         old_logprobs.append(record.old_logprobs)
         advantages.append(record.advantages)
         value_targets.append(
@@ -1232,7 +1672,6 @@ def collate_replay_microbatch(
         input_ids=transfer(input_ids),
         attention_mask=None,
         position_ids=transfer(position_ids),
-        sequence_ids=transfer(sequence_ids),
         cu_seqlens=transfer(torch.tensor(boundaries, dtype=torch.int32)),
         sequence_boundaries=tuple(boundaries),
         max_sequence_length=maximum,
@@ -1240,11 +1679,21 @@ def collate_replay_microbatch(
             torch.zeros(sum(record.response_length for record in selected), dtype=torch.long)
         ),
         action_positions=transfer(torch.cat(positions)),
-        response_state_mask=transfer(response_state_mask),
         targets=transfer(torch.cat(targets)),
+        policy_mask=transfer(torch.cat(policy_masks)),
         old_logprobs=transfer(torch.cat(old_logprobs)),
         advantages=transfer(torch.cat(advantages)),
         value_targets=transfer(torch.cat(value_targets)),
+        action_kinds=transfer(torch.cat(action_kinds)) if latent else None,
+        latent_vectors=transfer(torch.cat(latent_vectors)) if latent else None,
+        latent_input_positions=transfer(torch.cat(latent_input_positions)) if latent else None,
+        latent_action_indices=transfer(torch.cat(latent_action_indices)) if latent else None,
+        token_action_indices=transfer(torch.cat(token_action_indices)) if latent else None,
+        gate_action_indices=transfer(torch.cat(gate_action_indices)) if latent else None,
+        gate_stop_actions=transfer(torch.cat(gate_stop_actions)) if latent else None,
+        carry_hiddens=transfer(torch.cat(carry_hiddens)) if carry else None,
+        carry_input_positions=transfer(torch.cat(carry_input_positions)) if carry else None,
+        nextlat_sequence_ranges=tuple(nextlat_sequence_ranges),
     )
 
 

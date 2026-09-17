@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import cast
 
-import pytest
 import torch
 
 from postraining.fast_inference import (
@@ -11,6 +10,57 @@ from postraining.fast_inference import (
     PromptPrefixBank,
     _retire_inactive_flash_rows_,
 )
+
+
+def test_fused_replica_removes_training_input_hook_without_changing_source(monkeypatch):
+    from torch import nn
+    from postraining.hf_runtime import prepare_text_only_transformers_runtime
+
+    prepare_text_only_transformers_runtime()
+    from transformers import PretrainedConfig, PreTrainedModel
+    import transformers.masking_utils as masking
+    import transformers.modeling_utils as modeling
+    import postraining.fast_inference as inference
+
+    class ToyLM(PreTrainedModel):
+        def __init__(self):
+            super().__init__(PretrainedConfig())
+            self.embedding = nn.Embedding(7, 4)
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+    class ToyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.causal_lm = ToyLM()
+            self.nextlat_head = nn.Identity()
+
+        def token_embeddings(self, ids):
+            return self.causal_lm.get_input_embeddings()(ids)
+
+    source = ToyPolicy()
+    source.requires_grad_(False)
+    source.causal_lm.enable_input_require_grads()
+    monkeypatch.setattr(
+        inference, "import_module",
+        lambda name: SimpleNamespace(flash_attn_varlen_func=None),
+    )
+    monkeypatch.setattr(inference, "merge_lora_for_inference", lambda model: None)
+    monkeypatch.setattr(inference, "fuse_llama_projections_", lambda model: ())
+    monkeypatch.setattr(inference, "synchronize_fused_lora_policy_", lambda *args: 0)
+    monkeypatch.setattr(modeling.ALL_ATTENTION_FUNCTIONS, "register", lambda *args: None)
+    monkeypatch.setattr(masking.ALL_MASK_ATTENTION_FUNCTIONS, "register", lambda *args: None)
+    replica, _ = inference.build_fused_rollout_replica(source)
+    ids = torch.tensor([1, 2])
+    compiled_embedding = torch.compile(
+        replica.token_embeddings, backend="eager", fullgraph=True, dynamic=True
+    )
+    with torch.inference_mode():
+        actual = compiled_embedding(ids)
+    torch.testing.assert_close(actual, source.token_embeddings(ids).detach())
+    assert not actual.requires_grad
+    assert source.token_embeddings(ids).requires_grad
 
 
 def _scheduler_harness(
@@ -22,6 +72,8 @@ def _scheduler_harness(
     cache_length = 8
     prompt_count = len(responses) // samples_per_prompt
     engine = object.__new__(CapturedTrainingRolloutEngine)
+    engine.answer_reserve_tokens = 0
+    engine.thinking_end_token_id = None
     engine.batch_size = batch_size
     engine.samples_per_prompt = samples_per_prompt
     engine.cache_length = cache_length
@@ -39,6 +91,7 @@ def _scheduler_harness(
     engine.cache_position = torch.zeros(1, dtype=torch.long)
     engine.output_position = torch.zeros(batch_size, dtype=torch.long)
     engine.active = torch.zeros(batch_size, dtype=torch.bool)
+    engine.thinking_closed = torch.zeros_like(engine.active)
     engine.response_limit = torch.ones(batch_size, dtype=torch.long)
     engine.position_ids = torch.zeros((batch_size, 1), dtype=torch.long)
     engine.sequence_lengths = torch.zeros(batch_size, dtype=torch.long)
@@ -225,6 +278,7 @@ def test_continuous_admission_leaves_legacy_statistic_buffers_untouched() -> Non
     engine.output_position = torch.ones(2, dtype=torch.long)
     engine.response_limit = torch.ones(2, dtype=torch.long)
     engine.active = torch.zeros(2, dtype=torch.bool)
+    engine.thinking_closed = torch.ones_like(engine.active)
     engine.cache = SimpleNamespace(layers=[])
     bank = PromptPrefixBank(
         lengths=torch.tensor([2]),
@@ -239,6 +293,7 @@ def test_continuous_admission_leaves_legacy_statistic_buffers_untouched() -> Non
     torch.testing.assert_close(engine.values, torch.full((2, 5), 7.0))
     torch.testing.assert_close(engine._graph_values, torch.full((2,), 11.0))
     assert engine.active.tolist() == [False, True]
+    assert engine.thinking_closed.tolist() == [True, False]
 
 
 def test_public_prefix_bank_keeps_value_collection_contract() -> None:

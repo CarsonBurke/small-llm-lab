@@ -100,6 +100,10 @@ def commit_cycle_(
     proposals: Tensor,
     accepted_prefix: Tensor,
     correction: Tensor,
+    *,
+    thinking_closed: Tensor | None = None,
+    answer_reserve_tokens: int = 0,
+    thinking_end_token_id: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Commit a clean emitted prefix, leaving its final token pending.
 
@@ -114,10 +118,31 @@ def commit_cycle_(
     eligible = offsets[None] < (count + 2)[:, None]
     eligible &= offsets[None] < (response_limit - output_position)[:, None]
     eligible &= active[:, None]
+    if answer_reserve_tokens:
+        if thinking_closed is None or thinking_end_token_id is None:
+            raise ValueError("thinking budget requires per-lane state and token id")
+        closes = (candidates == thinking_end_token_id) & eligible
+        prior_close = closes.long().cumsum(-1) - closes.long()
+        boundary = response_limit - answer_reserve_tokens - 1
+        forced = (
+            eligible
+            & ~thinking_closed[:, None]
+            & (prior_close == 0)
+            & (output_position[:, None] + offsets[None] == boundary[:, None])
+        )
+        candidates.masked_fill_(forced, thinking_end_token_id)
+        # Verification after a replacement used the wrong prefix. Retain only
+        # the clean prefix and leave the delimiter pending for the next cycle.
+        prior_forced = forced.long().cumsum(-1) - forced.long()
+        eligible &= prior_forced == 0
     stop = (candidates[..., None] == stop_ids).any(-1) & eligible
     # Keep the first EOS, but no position after it.
     before_stop = stop.long().cumsum(-1) - stop.long()
     emit = eligible & (before_stop == 0)
+    if answer_reserve_tokens:
+        thinking_closed.logical_or_(
+            ((candidates == thinking_end_token_id) & emit).any(-1)
+        )
     emitted = emit.sum(-1)
     for offset in range(candidates.size(1)):
         destination = (output_position + offset).clamp_max(generated.size(1) - 1)[
@@ -133,7 +158,10 @@ def commit_cycle_(
     sequence_lengths.add_(emitted)
     output_position.add_(emitted)
     active.logical_and_(~stop.any(-1) & (output_position < response_limit))
-    return emitted, emit[:, 1:-1] & accepted_prefix.bool()
+    accepted = emit[:, 1:-1] & accepted_prefix.bool()
+    if answer_reserve_tokens:
+        accepted &= ~forced[:, 1:-1]
+    return emitted, accepted
 
 
 class _UnoStaticLayer(_CompactStaticLayer):
@@ -324,6 +352,9 @@ class UnoTrainingRolloutEngine(CapturedTrainingRolloutEngine):
             proposals,
             prefix,
             correction,
+            thinking_closed=self.thinking_closed,
+            answer_reserve_tokens=self.answer_reserve_tokens,
+            thinking_end_token_id=self.thinking_end_token_id,
         )
         self.position_ids[:, 0].copy_(self.sequence_lengths)
         self._cycle_metrics[0].add_(active_before.sum())
@@ -348,6 +379,7 @@ class UnoTrainingRolloutEngine(CapturedTrainingRolloutEngine):
             self.flash_sequence_lengths,
             self.position_ids,
             self.active,
+            self.thinking_closed,
             self.generated,
             self._pending,
             self._cycle_metrics,

@@ -181,8 +181,15 @@ def _preflight_checkpoint(tmp_path):
     return checkpoint, resume_path, data_path
 
 
-def test_preflight_resolves_additional_steps_and_builds_queue_command(tmp_path) -> None:
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+def test_preflight_resolves_additional_steps_and_builds_queue_command(
+    tmp_path, legacy_metadata
+) -> None:
     checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
+    if legacy_metadata:
+        checkpoint["args"].pop("lora_initialization")
+        for side in ("actor", "critic"):
+            checkpoint["policy"][side]["lora_config"].pop("initialization")
     output_path = tmp_path / "continuation"
     report = preflight.inspect_continuation(
         checkpoint,
@@ -326,3 +333,59 @@ def test_preflight_rejects_empty_pending_replay(tmp_path) -> None:
             job_name=None,
             time_limit="10h",
         )
+
+
+def test_token_carry_continuation_preserves_mode_and_requires_gated_projections(tmp_path):
+    checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
+    checkpoint["args"].update(
+        token_carry=True, train_nextlat=False, answer_reserve_tokens=0,
+    )
+    checkpoint["policy"]["schema"] = "minicpm5_vapo_token_carry/v3"
+    for side in ("actor", "critic"):
+        checkpoint["policy"][side].update(
+            token_carry=True,
+            token_combiner={
+                "token_delta.weight": torch.zeros(6, 6),
+                "carry.weight": torch.zeros(6, 6),
+                "gate_logit": torch.tensor(-4.0),
+            },
+        )
+    options = dict(
+        resume_path=resume_path, output_path=tmp_path / "continuation",
+        data_path=data_path, target_steps=None, additional_steps=1,
+        job_name=None, time_limit="10h",
+    )
+    report = preflight.inspect_continuation(checkpoint, **options)
+    assert "--token-carry" in report["queue_command"]
+    assert "--no-train-nextlat" in report["queue_command"]
+    assert "--answer-reserve-tokens 0" in report["queue_command"]
+    checkpoint["pending_records"] = [object()]
+    with pytest.raises(ValueError, match="token-carry mode"):
+        preflight.inspect_continuation(checkpoint, **options)
+    checkpoint["pending_records"] = None
+    for schema in ("minicpm5_vapo_token_carry/v1", "minicpm5_vapo_token_carry/v2"):
+        checkpoint["policy"]["schema"] = schema
+        with pytest.raises(ValueError, match="must use"):
+            preflight.inspect_continuation(checkpoint, **options)
+    checkpoint["policy"]["schema"] = "minicpm5_vapo_token_carry/v3"
+    combiner = checkpoint["policy"]["critic"]["token_combiner"]
+    for name in ("token_delta.weight", "carry.weight", "gate_logit"):
+        saved = combiner.pop(name)
+        with pytest.raises(ValueError, match=name):
+            preflight.inspect_continuation(checkpoint, **options)
+        combiner[name] = saved
+    for invalid in (torch.tensor(float("nan")), torch.tensor(float("inf")), torch.zeros(1),
+                    torch.tensor(0.0, dtype=torch.bfloat16), 0.0):
+        combiner["gate_logit"] = invalid
+        with pytest.raises(ValueError, match="gate_logit"):
+            preflight.inspect_continuation(checkpoint, **options)
+    combiner["gate_logit"] = torch.tensor(-4.0)
+    for invalid in (torch.zeros(6, 5), torch.zeros(6, 6, dtype=torch.long),
+                    torch.full((6, 6), float("nan"))):
+        combiner["carry.weight"] = invalid
+        with pytest.raises(ValueError, match="token combiner"):
+            preflight.inspect_continuation(checkpoint, **options)
+    combiner["carry.weight"] = torch.zeros(6, 6)
+    combiner["token.weight"] = torch.eye(6)
+    with pytest.raises(ValueError, match="unexpected parameters"):
+        preflight.inspect_continuation(checkpoint, **options)
