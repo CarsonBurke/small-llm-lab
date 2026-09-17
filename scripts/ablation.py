@@ -565,6 +565,7 @@ def run_config(
     script: str = "train_gpt.py",
     script_args: list[str] | None = None,
     futility_gates: tuple[tuple[int, str, float], ...] = (),
+    stop_at: int | None = None,
 ) -> dict:
     """Run a single training config and return parsed results."""
     # Create result subfolder, clean stale data
@@ -595,12 +596,23 @@ def run_config(
     gates_by_step = {
         step: (metric, threshold) for step, metric, threshold in futility_gates
     }
+    # --stop-at: the schedule (warmdown etc.) is that of the full run; the
+    # process is terminated after the validation at this step and the result
+    # is the metric at that step. Must land on a validation step.
+    if stop_at is not None and (
+        stop_at <= 0 or stop_at > effective_steps or stop_at % effective_val_every
+    ):
+        raise ValueError(
+            f"--stop-at {stop_at} must be a validation step within the run "
+            f"(val_every={effective_val_every}, steps={effective_steps})"
+        )
 
     print(f"\n{'='*60}")
     print(f"  ABLATION: {name}")
     print(
         f"  steps={effective_steps}, val_every={effective_val_every}, "
         f"warmdown_iters_env={warmdown_iters_env}"
+        + (f", stop_at={stop_at}" if stop_at is not None else "")
     )
     script_args = list(script_args or ())
     print(f"  script: {script}")
@@ -615,6 +627,7 @@ def run_config(
     metrics_writer = MetricsWriter(metrics_path, name)
     proc = None
     early_stop: dict[str, object] | None = None
+    stopped_at: int | None = None
     try:
         proc = subprocess.Popen(
             [sys.executable, "-u", script, *script_args],
@@ -665,6 +678,15 @@ def run_config(
                                 proc
                             )
                             break
+                    if (
+                        entry.get("type") == "val"
+                        and stop_at is not None
+                        and int(entry.get("step", -1)) == stop_at
+                    ):
+                        stopped_at = stop_at
+                        print(f"  STOP AT: step {stop_at} (schedule of {effective_steps})", flush=True)
+                        terminate_process_group(proc)
+                        break
         proc.wait()
     except BaseException:
         if proc is not None and proc.poll() is None:
@@ -679,7 +701,9 @@ def run_config(
 
     val_entries = [e for e in entries if e["type"] == "val"]
     completed_steps = (
-        int(early_stop["step"]) if early_stop is not None else effective_steps
+        int(early_stop["step"]) if early_stop is not None
+        else stopped_at if stopped_at is not None
+        else effective_steps
     )
     integrity_errors = metric_integrity_errors(entries, completed_steps)
     # A script that reports a codelength reports it under this key, and it is
@@ -755,7 +779,8 @@ def run_config(
     training_returncode = int(proc.returncode)
     expected_stop_returncodes = {0, -signal.SIGTERM, -signal.SIGKILL}
     expected_early_stop = (
-        early_stop is not None and training_returncode in expected_stop_returncodes
+        (early_stop is not None or stopped_at is not None)
+        and training_returncode in expected_stop_returncodes
     )
     effective_returncode = 0 if expected_early_stop else training_returncode
     if effective_returncode == 0 and integrity_errors:
@@ -797,13 +822,16 @@ def run_config(
             for step, metric, threshold in futility_gates
         ],
         "early_stop": early_stop,
+        "stop_at": stopped_at,
     }
 
-    if expected_early_stop:
+    if early_stop is not None and expected_early_stop:
         print(
             "  Rejected by predeclared futility gate at "
             f"step {completed_steps}; training process rc={training_returncode}"
         )
+    elif stopped_at is not None and expected_early_stop:
+        print(f"  Stopped at step {completed_steps} of {effective_steps}; BPB: {final_bpb}")
     elif training_returncode != 0:
         result["error"] = output_text[-2000:] if output_text else "unknown error"
         print(f"  ERROR (rc={training_returncode})")
@@ -861,7 +889,7 @@ def compare_results(results_dir: Path) -> None:
             unique.append(r)
 
     print(
-        f"\n{'Name':<40} {'Steps':>6} {'WD env':>7} "
+        f"\n{'Name':<40} {'Steps':>9} {'WD env':>7} "
         f"{'Scope':>9} {'BPB':>8} {'Probe':>8} {'Loss':>8} {'Time':>8}"
     )
     print("-" * 101)
@@ -918,8 +946,12 @@ def compare_results(results_dir: Path) -> None:
         probe = f"{r['final_probe_val_bpb']:.4f}" if r.get("final_probe_val_bpb") else "-"
         loss = f"{r['final_val_loss']:.4f}" if r.get("final_val_loss") else "-"
         time_s = f"{r['elapsed_seconds']:.0f}s" if r.get("elapsed_seconds") else "-"
+        steps_text = (
+            f"{r['completed_steps']}/{r['steps']}"
+            if r.get("stop_at") is not None else str(r["steps"])
+        )
         print(
-            f"{r['name']:<40} {r['steps']:>6} {warmdown_text:>7} "
+            f"{r['name']:<40} {steps_text:>9} {warmdown_text:>7} "
             f"{scope:>9} {bpb:>8} {probe:>8} {loss:>8} {time_s:>8}"
         )
 
@@ -972,6 +1004,13 @@ def main() -> int:
             "greater than or equal to MAX at STEP; repeat for multiple gates"
         ),
     )
+    parser.add_argument(
+        "--stop-at", type=int, default=None, metavar="STEP",
+        help=(
+            "terminate after the validation at STEP while keeping the full "
+            "--steps schedule; the result is the metric at STEP"
+        ),
+    )
     # action="extend" so repeated --env flags accumulate instead of the last
     # silently overwriting the rest (which drops e.g. DATA_PATH).
     parser.add_argument(
@@ -1004,6 +1043,7 @@ def main() -> int:
                 args.script,
                 args.script_arg,
                 futility_gates,
+                args.stop_at,
             )
             returncode = returncode or int(result["returncode"])
         print("\n\nSWEEP SUMMARY:")
@@ -1019,6 +1059,7 @@ def main() -> int:
             args.script,
             args.script_arg,
             futility_gates,
+            args.stop_at,
         )
         return int(result["returncode"])
 
