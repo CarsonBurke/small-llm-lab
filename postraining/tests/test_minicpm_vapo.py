@@ -3,17 +3,24 @@ from collections import Counter
 import copy
 from contextlib import nullcontext
 from dataclasses import replace
+import random
 
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-from postraining.core import generalized_advantage_estimate, length_adaptive_lambda
+from postraining.core import (
+    generalized_advantage_estimate,
+    length_adaptive_lambda,
+    math_corpus_identity,
+)
 from postraining.fast_inference import (
     CapturedTrainingRolloutEngine,
     ContinuousTrainingGeneration,
@@ -65,8 +72,10 @@ from postraining.train_minicpm_vapo import (
     RolloutEngine,
     _validate_args,
     _ChunkedNextLatKL,
+    _GradientHealth,
     _accumulate_balanced_parameter_gradients_,
     _combine_balanced_hidden_gradients_,
+    _packed_action_rows,
     _accumulate_rescaled_parameter_gradients_,
     _clip_finite_grad_norm_,
     _approximate_kl_terms,
@@ -88,6 +97,7 @@ from postraining.train_minicpm_vapo import (
     build_parser,
     device_phase_metrics,
     file_sha256,
+    load_training_math_corpus,
     measure_post_update_behavior_kl,
     refresh_behavior_statistics,
     static_kv_cache_bytes,
@@ -140,6 +150,48 @@ def test_lora_injection_is_initially_exact_and_freezes_base() -> None:
     assert all(name.endswith(("lora_a", "lora_b")) for name in trainable)
 
 
+
+
+def _unfolded_lora_reference(layer: LoRALinear, inputs: torch.Tensor) -> torch.Tensor:
+    update = torch.nn.functional.linear(
+        torch.nn.functional.linear(inputs, layer.lora_a), layer.lora_b
+    )
+    return layer.base(inputs) + update * layer.scaling
+
+
+@pytest.mark.parametrize("alpha", [4.0, 1.0, 0.5, 16.0])
+def test_power_of_two_lora_scaling_fold_is_bit_exact(alpha: float) -> None:
+    torch.manual_seed(23)
+    base = nn.Linear(6, 5, bias=False)
+    layer = LoRALinear(copy.deepcopy(base), LoRAConfig(rank=2, alpha=alpha))
+    assert layer._fold_scaling
+    with torch.no_grad():
+        layer.lora_b.normal_()
+    inputs = torch.randn(7, 6, requires_grad=True)
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    actual = layer(inputs)
+    expected = _unfolded_lora_reference(layer, reference_inputs)
+    assert torch.equal(actual, expected)
+    upstream = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(
+        actual, (inputs, layer.lora_a, layer.lora_b), upstream
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (reference_inputs, layer.lora_a, layer.lora_b), upstream
+    )
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        assert torch.equal(actual_grad, expected_grad)
+
+
+def test_non_power_of_two_lora_scaling_keeps_the_unfolded_update() -> None:
+    torch.manual_seed(29)
+    base = nn.Linear(6, 5, bias=False)
+    layer = LoRALinear(copy.deepcopy(base), LoRAConfig(rank=2, alpha=3.0))
+    assert not layer._fold_scaling
+    with torch.no_grad():
+        layer.lora_b.normal_()
+    inputs = torch.randn(4, 6)
+    torch.testing.assert_close(layer(inputs), _unfolded_lora_reference(layer, inputs))
 
 
 def test_nora_init_normalizes_lora_a_columns_once() -> None:
@@ -772,6 +824,38 @@ def test_fast_top_k_top_p_sampler_respects_nucleus_boundary() -> None:
     assert sampled.tolist() == [0, 3]
 
 
+def test_unrestricted_carry_sampling_matches_full_softmax() -> None:
+    args = build_parser().parse_args([
+        "--token-carry", "--no-train-nextlat",
+        "--top-k", "-1", "--top-p", "1", "--temperature", "1",
+    ])
+    _validate_args(args)
+    logits = torch.linspace(1.5, -1.5, 32)
+    expected = logits.softmax(dim=-1)
+    draws = 32_768
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        sampled = top_k_top_p_sample(
+            logits.expand(draws, -1),
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+        )
+    frequencies = torch.bincount(sampled, minlength=logits.numel()).float() / draws
+    tolerance = 6 * (expected * (1 - expected) / draws).sqrt() + 1 / draws
+    assert torch.all((frequencies - expected).abs() <= tolerance)
+
+
+def test_unrestricted_sampling_rejects_nucleus_filtering() -> None:
+    args = build_parser().parse_args(["--top-k", "-1", "--top-p", "0.95"])
+    with pytest.raises(ValueError):
+        _validate_args(args)
+    with pytest.raises(ValueError):
+        top_k_top_p_sample(
+            torch.zeros(2, 32), temperature=1.0, top_k=-1, top_p=0.95,
+        )
+
+
 def test_chunked_frozen_head_logprobs_match_dense_values_and_gradients() -> None:
     torch.manual_seed(2)
     hidden = torch.randn(11, 5, requires_grad=True)
@@ -1402,6 +1486,24 @@ def test_auxiliary_parameter_gradient_is_capped_to_primary_norm() -> None:
 
 
 
+def test_hidden_gradient_balancing_defers_finiteness_to_device_flags() -> None:
+    health = _GradientHealth()
+    combined = _combine_balanced_hidden_gradients_(
+        torch.tensor([3.0, 4.0]), torch.tensor([0.0, 10.0]), health=health
+    )
+    torch.testing.assert_close(combined, torch.tensor([3.0, 9.0]))
+    health.check()
+    _combine_balanced_hidden_gradients_(
+        torch.tensor([1.0, float("nan")]), torch.tensor([1.0, 1.0]), health=health
+    )
+    with pytest.raises(RuntimeError, match="hidden gradient norm is non-finite"):
+        health.check()
+    with pytest.raises(RuntimeError, match="primary hidden gradient norm"):
+        _combine_balanced_hidden_gradients_(
+            torch.tensor([1.0, float("inf")]), torch.tensor([1.0, 1.0])
+        )
+
+
 def test_hidden_gradient_balancing_caps_auxiliary_before_lora_backward() -> None:
     torch.testing.assert_close(
         _combine_balanced_hidden_gradients_(
@@ -1788,13 +1890,35 @@ def test_segmented_sdpa_packed_replay_has_finite_backward(boundaries) -> None:
         ],
         dim=2,
     ).transpose(1, 2)
-    torch.testing.assert_close(output, expected)
+    assert torch.equal(output, expected)
+    # Token-major contiguity lets the caller's head merge stay a view.
+    assert output.is_contiguous()
     assert weights is None
     upstream = torch.randn_like(output)
     actual_gradients = torch.autograd.grad(output, (query, key, value), upstream)
     expected_gradients = torch.autograd.grad(expected, (query, key, value), upstream)
     for actual, reference in zip(actual_gradients, expected_gradients):
-        torch.testing.assert_close(actual, reference)
+        assert torch.equal(actual, reference)
+
+
+def test_packed_action_rows_match_advanced_indexing_exactly() -> None:
+    torch.manual_seed(31)
+    hidden = torch.randn(1, 9, 4, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    positions = torch.tensor([7, 0, 3, 5])
+    batch = SimpleNamespace(
+        action_batch_indices=torch.zeros_like(positions),
+        action_positions=positions,
+    )
+    actual = _packed_action_rows(hidden, cast(Any, batch))
+    expected = reference_hidden[batch.action_batch_indices, batch.action_positions]
+    assert torch.equal(actual, expected)
+    upstream = torch.randn_like(actual)
+    (actual_grad,) = torch.autograd.grad(actual, hidden, upstream)
+    (expected_grad,) = torch.autograd.grad(expected, reference_hidden, upstream)
+    assert torch.equal(actual_grad, expected_grad)
+    with pytest.raises(ValueError, match="single row"):
+        _packed_action_rows(torch.zeros(2, 9, 4), cast(Any, batch))
 
 
 def test_packed_replay_attention_preserves_transformers_output_layout() -> None:
@@ -1932,6 +2056,35 @@ def test_replay_checkpointing_selects_uniform_layer_subset() -> None:
         configure_replay_checkpointing(causal_lm, -1)
 
 
+@pytest.mark.parametrize("destination", ["tb_logs/run", "ablation_results/run", "postraining/runs"])
+def test_training_rejects_outputs_outside_posttraining_runs(
+    tmp_path, monkeypatch, destination
+) -> None:
+    import postraining.train_minicpm_vapo as training
+
+    monkeypatch.setattr(training, "__file__", str(tmp_path / "postraining/train_minicpm_vapo.py"))
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--output", destination])
+    with pytest.raises(ValueError):
+        _validate_args(args)
+    assert not (tmp_path / destination).exists()
+
+
+def test_training_output_cannot_escape_dashboard_through_symlink(tmp_path, monkeypatch) -> None:
+    import postraining.train_minicpm_vapo as training
+
+    monkeypatch.setattr(training, "__file__", str(tmp_path / "postraining/train_minicpm_vapo.py"))
+    runs = tmp_path / "postraining/runs"
+    runs.mkdir(parents=True)
+    pretraining = tmp_path / "tb_logs"
+    pretraining.mkdir()
+    (runs / "escape").symlink_to(pretraining, target_is_directory=True)
+    args = build_parser().parse_args(["--output", str(runs / "escape/run")])
+    with pytest.raises(ValueError):
+        _validate_args(args)
+    assert not (pretraining / "run").exists()
+
+
 def test_training_config_bounds_parallel_rollout_context() -> None:
     args = build_parser().parse_args([])
     _validate_args(args)
@@ -1973,11 +2126,80 @@ def test_training_config_rejects_nonfinite_floats(option: str, value: str) -> No
 def test_resume_dataset_fingerprint_rejects_changed_bytes(tmp_path) -> None:
     data = tmp_path / "dapo.parquet"
     data.write_bytes(b"first")
-    resume = {"data_sha256": file_sha256(data)}
-    validate_resume_dataset(resume, file_sha256(data))
+    resume = {
+        "data_sha256": file_sha256(data),
+        "math_corpus_identity": "effective-corpus",
+    }
+    validate_resume_dataset(resume, file_sha256(data), "effective-corpus")
     data.write_bytes(b"second")
     with pytest.raises(ValueError, match="different dataset bytes"):
-        validate_resume_dataset(resume, file_sha256(data))
+        validate_resume_dataset(resume, file_sha256(data), "effective-corpus")
+
+
+def test_training_corpus_seeded_order_deduplicates_source_ids(tmp_path) -> None:
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": f"What is {n} + 1?"}],
+            "reward_model": {"style": "rule", "ground_truth": str(n + 1)},
+            "extra_info": {"index": str(n)},
+        }
+        for n in range(5)
+    ]
+    duplicate = copy.deepcopy(rows[0])
+    duplicate["extra_info"]["index"] = "another-source-id"
+    path = tmp_path / "math.parquet"
+    pq.write_table(pa.Table.from_pylist(rows + [duplicate]), path)
+    expected = copy.deepcopy(rows)
+    random.Random(7).shuffle(expected)
+
+    ordered, _, identity = load_training_math_corpus(path, seed=7)
+    assert [row["prompt"] for row in ordered] == [row["prompt"] for row in expected]
+    assert identity == math_corpus_identity(ordered)
+    validate_resume_dataset(
+        {"data_sha256": file_sha256(path), "math_corpus_identity": identity},
+        file_sha256(path),
+        load_training_math_corpus(path, seed=7)[2],
+    )
+
+
+@pytest.mark.parametrize("change", ("target", "order", "missing"))
+def test_resume_rejects_stale_corpus_before_model_or_cuda_work(
+    tmp_path, monkeypatch, change
+) -> None:
+    import postraining.train_minicpm_vapo as trainer
+
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": f"What is {n} + 1?"}],
+            "reward_model": {"style": "rule", "ground_truth": str(n + 1)},
+            "extra_info": {"index": str(n)},
+        }
+        for n in range(3)
+    ]
+    data = tmp_path / "math.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), data)
+    args = build_parser().parse_args(["--data", str(data), "--resume", "old.pt"])
+    ordered, _, identity = load_training_math_corpus(data, seed=args.seed)
+    resume = {"data_sha256": file_sha256(data), "math_corpus_identity": identity}
+    if change == "missing":
+        del resume["math_corpus_identity"]
+    else:
+        changed = copy.deepcopy(ordered)
+        if change == "target":
+            changed[0]["reward_model"]["ground_truth"] = "999"
+        else:
+            changed.reverse()
+        resume["math_corpus_identity"] = math_corpus_identity(changed)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("model or CUDA setup ran before corpus validation")
+
+    monkeypatch.setattr(trainer.argparse.ArgumentParser, "parse_args", lambda self: args)
+    monkeypatch.setattr(trainer.torch, "load", lambda *a, **kw: resume)
+    monkeypatch.setattr(trainer.torch, "manual_seed", forbidden)
+    monkeypatch.setattr(trainer.MiniCPMVAPOPolicy, "from_pretrained", forbidden)
+    with pytest.raises(ValueError, match="math_corpus_identity|different effective math corpus"):
+        trainer.main()
 
 
 
@@ -1996,7 +2218,7 @@ def test_resume_treats_missing_lora_initialization_as_legacy_standard() -> None:
 
 
 def test_resume_changes_runtime_gate_and_rollout_limit_between_batches() -> None:
-    prior_args = build_parser().parse_args([])
+    prior_args = build_parser().parse_args(["--optimizer-minibatches", "4"])
     resumed_args = build_parser().parse_args(
         [
             "--max-new-tokens",
@@ -2345,20 +2567,33 @@ def test_pending_uno_resume_pins_numerical_target(tmp_path) -> None:
     validate_resume_configuration(resume, args)
 
 
-def test_token_carry_rejects_other_reasoning_and_forced_delimiters() -> None:
-    options = ["--token-carry", "--answer-reserve-tokens", "0", "--no-train-nextlat"]
-    _validate_args(build_parser().parse_args(options))
+def test_token_carry_supports_answer_reserve_but_rejects_other_reasoning_modes() -> None:
+    options = ["--token-carry", "--no-train-nextlat"]
+    _validate_args(build_parser().parse_args(options + ["--answer-reserve-tokens", "1000"]))
+    _validate_args(build_parser().parse_args(options + ["--answer-reserve-tokens", "0"]))
     for incompatible in (
         ["--latent-thinking"],
         ["--uno-rollout"],
         ["--no-fast-rollout"],
         ["--no-compile-rollout"],
         ["--no-compile-replay"],
-        ["--answer-reserve-tokens", "1000"],
         ["--train-nextlat"],
     ):
         with pytest.raises(ValueError, match="token carry"):
             _validate_args(build_parser().parse_args(options + incompatible))
+
+
+def test_prompt_suffix_can_change_only_at_a_completed_rollout_boundary() -> None:
+    args = build_parser().parse_args([])
+    prior = vars(args).copy()
+    prior.pop("prompt_suffix")
+    resume = {"args": prior, "pending_records": [_record(7, 2)]}
+    validate_resume_configuration(resume, args)
+    args.prompt_suffix = "Use a bounded reasoning budget."
+    with pytest.raises(ValueError, match="prompt_suffix"):
+        validate_resume_configuration(resume, args)
+    resume["pending_records"] = None
+    validate_resume_configuration(resume, args)
 
 
 def test_resume_cannot_silently_change_token_carry_mode() -> None:
@@ -2407,13 +2642,53 @@ def test_pending_carry_replay_requires_persisted_observations_not_fixed_geometry
     validate_resume_configuration(resume, args)
 
 
-@pytest.mark.parametrize("schema", ["minicpm5_vapo_token_carry/v1", "minicpm5_vapo_token_carry/v2"])
-def test_token_carry_resume_rejects_ungated_schemas_even_at_completed_boundary(schema) -> None:
+@pytest.mark.parametrize("schema", [
+    "minicpm5_vapo_token_carry/v1",
+    "minicpm5_vapo_token_carry/v2",
+    "minicpm5_vapo_token_carry/v3",
+])
+def test_token_carry_resume_rejects_pre_layerscale_schemas_even_at_completed_boundary(schema) -> None:
     args = build_parser().parse_args(["--token-carry"])
     resume = {
         "args": vars(args).copy(),
         "pending_records": None,
         "policy": {"schema": schema},
     }
-    with pytest.raises(ValueError, match="minicpm5_vapo_token_carry/v3"):
+    with pytest.raises(ValueError, match="minicpm5_vapo_token_carry/v4"):
         validate_resume_configuration(resume, args)
+
+
+@torch.no_grad()
+def test_carry_probe_reports_signed_scales_and_bf16_rounded_residual() -> None:
+    from postraining.token_carry import TokenCarryCombiner
+    from postraining.train_minicpm_vapo import _carry_input_probe
+
+    combiner = TokenCarryCombiner(3)
+    combiner.token_delta.weight.copy_(torch.eye(3))
+    combiner.carry.weight.copy_(torch.eye(3) / 256)
+    combiner.scale.copy_(torch.tensor([-0.5, 0.25, 1.5]))
+    embeddings = torch.ones(1, 3, dtype=torch.bfloat16)
+    side = SimpleNamespace(
+        token_carry=True,
+        token_combiner=combiner,
+        token_embeddings=lambda token_ids: embeddings[token_ids],
+    )
+    batch = SimpleNamespace(
+        input_ids=torch.zeros(1, 1, dtype=torch.long),
+        carry_input_positions=torch.tensor([0]),
+        carry_hiddens=torch.ones(1, 3, dtype=torch.bfloat16),
+    )
+
+    # BF16 rounds 1 + 1/256 back to 1 before the signed channel scales apply.
+    scale_rms = (41 / 48) ** 0.5
+    assert _carry_input_probe(side, batch) == pytest.approx({
+        "scale_mean": 5 / 12,
+        "scale_min": -0.5,
+        "scale_max": 1.5,
+        "scale_rms": scale_rms,
+        "probe_token_rms": 1.0,
+        "probe_hidden_rms": 1.0,
+        "probe_scaled_carry_rms": scale_rms / 256,
+        "probe_carry_to_token_rms": scale_rms / 256,
+        "probe_residual_to_token_rms": scale_rms,
+    })

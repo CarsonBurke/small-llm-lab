@@ -12,7 +12,7 @@ exec .venv/bin/python -u -m postraining.train_minicpm_vapo \
   --model openbmb/MiniCPM5-1B \
   --revision 87179e5c1f455ef22e6223592d2d61351b525bfc \
   --data postraining/data/dapo-math-17k.parquet \
-  --output ablation_results/minicpm_gate10_nora_mb4_v3_10k \
+  --output postraining/runs/minicpm_gate10_nora_mb4_v3_10k \
   --steps 10 \
   --value-warmup-steps 10 \
   --prompts-per-rollout 4 \

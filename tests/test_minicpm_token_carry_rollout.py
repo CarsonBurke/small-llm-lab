@@ -96,6 +96,51 @@ def test_decode_carries_every_token_but_freezes_finished_lanes(carry_engine, sta
     ]
 
 
+@pytest.mark.parametrize("statistics", [False, True])
+@torch.inference_mode()
+def test_forced_delimiter_consumes_actual_token_and_preserves_carry_producers(
+    carry_engine, monkeypatch, statistics,
+):
+    engine = carry_engine
+    engine.answer_reserve_tokens = 1
+    engine.thinking_end_token_id = 2
+    engine.response_limit.fill_(4)
+    # Put the inactive lane at the forcing boundary as well.
+    engine.output_position[2] = 2
+    monkeypatch.setattr(
+        fast_inference, "top_k_top_p_sample",
+        lambda logits, **kwargs: logits.argmax(-1),
+    )
+    for proposals in ([4, 2, 2], [4, 4, 2], [4, 6, 2], [6, 6, 2]):
+        logits = torch.zeros(3, 10)
+        logits.scatter_(1, torch.tensor(proposals)[:, None], 10.0)
+        if statistics:
+            token, logprob = engine.sample(logits)
+            engine.decode(
+                token, logprob, engine.carry_hidden[:, 0].float(), engine.cache,
+            )
+        else:
+            engine.decode_without_statistics(engine.sample_tokens(logits), engine.cache)
+
+    assert engine.generated[:, :4].tolist() == [
+        [4, 4, 2, 6], [2, 4, 6, 6], [0, 0, 0, 0],
+    ]
+    assert engine._carry_history[:, :4, 0].tolist() == [
+        [1, 5, 9, 11], [5, 7, 11, 17], [0, 0, 0, 0],
+    ]
+    assert engine.carry_hidden[:, 0].tolist() == [17, 23, 8]
+    assert engine.thinking_closed.tolist() == [True, True, False]
+    assert engine.output_position.tolist() == [4, 4, 2]
+    if statistics:
+        assert engine.values[:, :4].tolist() == [
+            [1, 5, 9, 11], [5, 7, 11, 17], [0, 0, 0, 0],
+        ]
+        forced_logits = torch.zeros(10)
+        forced_logits[4] = 10
+        torch.testing.assert_close(
+            engine.logprobs[0, 2], forced_logits.log_softmax(-1)[2],
+        )
+
 @torch.inference_mode()
 def test_inactive_lane_at_history_capacity_preserves_final_producer(carry_engine):
     engine = carry_engine
@@ -144,15 +189,93 @@ def host_generation(carry_engine, monkeypatch):
     monkeypatch.setattr(engine, "_bind_flash_cache", lambda: None)
     engine.cache = SimpleNamespace(layers=[], reset=lambda: None)
 
-    def sample_tokens(logits):
+    def sample_tokens(logits, **kwargs):
         hidden = logits[:, 0]
         return torch.where(
             (hidden == 1) | (hidden == 30), 2,
             torch.where(hidden == 20, 4, torch.where(hidden == 24, 6, 9)),
         ).long()
 
-    monkeypatch.setattr(engine, "sample_tokens", sample_tokens)
+    monkeypatch.setattr(fast_inference, "top_k_top_p_sample", sample_tokens)
     return engine
+
+
+@pytest.fixture
+def budget_host_generation(host_generation, monkeypatch):
+    engine = host_generation
+    engine.answer_reserve_tokens = 1
+    engine.thinking_end_token_id = 2
+
+    def sample_tokens(logits, **kwargs):
+        hidden = logits[:, 0]
+        return torch.where(
+            (hidden == 1) | (hidden == 60), 2,
+            torch.where(
+                (hidden == 11) | (hidden == 62), 9,
+                torch.where((hidden == 30) | (hidden == 50), 6, 4),
+            ),
+        ).long()
+
+    monkeypatch.setattr(fast_inference, "top_k_top_p_sample", sample_tokens)
+    return engine
+
+
+def test_continuous_budget_exports_delimiter_and_answer_producers_across_refill(
+    budget_host_generation, monkeypatch,
+):
+    engine = budget_host_generation
+    hidden = torch.tensor([[1], [60], [20], [40]], dtype=torch.bfloat16)
+    bank = PromptPrefixBank(
+        lengths=torch.ones(4, dtype=torch.long),
+        logits=hidden.expand(-1, 10), hidden=hidden,
+        values=torch.empty(0), layer_keys=torch.empty(4, 1, 0, 0, 0),
+        layer_values=torch.empty(4, 1, 0, 0, 0),
+    )
+    monkeypatch.setattr(engine, "_build_prompt_prefix_bank", lambda *args, **kwargs: bank)
+    result = engine.generate_prompt_pool(
+        [torch.tensor([value]) for value in (1, 60, 20, 40)],
+        max_new_tokens=4, completion_poll_steps=1,
+    )
+    # Prompt 60 closes naturally and finishes while prompt 1 is still answering.
+    # Its replacement must reopen only that lane, then force its own delimiter.
+    assert [row.tolist() for row in result.responses] == [
+        [2, 4, 4, 9], [2, 9], [4, 4, 2, 6], [4, 4, 2, 6],
+    ]
+    assert [row[:, 0].tolist() for row in result.carry_hiddens] == [
+        [1, 3, 7, 11], [60, 62], [20, 24, 28, 30], [40, 44, 48, 50],
+    ]
+
+
+def test_fixed_budget_exports_answer_producers_and_resets_closure(
+    budget_host_generation, monkeypatch,
+):
+    engine = budget_host_generation
+    event = SimpleNamespace(
+        record=lambda: None, synchronize=lambda: None, elapsed_time=lambda other: 0.0,
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: event)
+    monkeypatch.setattr(torch, "autocast", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(
+        engine, "_prepare_prompts",
+        lambda rows: (torch.stack(rows), torch.zeros(3, 1, dtype=torch.long), 1),
+    )
+    response, *_ = engine.generate_prompts(
+        [torch.tensor([value]) for value in (1, 60, 20)],
+        max_new_tokens=4, collect_statistics=False,
+    )
+    assert response.tolist() == [[2, 4, 4, 9], [2, 9, 0, 0], [4, 4, 2, 6]]
+    saved = engine.last_carry_hiddens
+    assert saved[:, :, 0].tolist() == [
+        [1, 3, 7, 11], [60, 62, 0, 0], [20, 24, 28, 30],
+    ]
+    response, *_ = engine.generate_prompts(
+        [torch.tensor([20])] * 3, max_new_tokens=4, collect_statistics=False,
+    )
+    assert response.tolist() == [[4, 4, 2, 6]] * 3
+    assert engine.last_carry_hiddens[:, :, 0].tolist() == [[20, 24, 28, 30]] * 3
+    assert saved[:, :, 0].tolist() == [
+        [1, 3, 7, 11], [60, 62, 0, 0], [20, 24, 28, 30],
+    ]
 
 
 def test_continuous_exports_exact_logical_histories_across_refills(
@@ -251,27 +374,32 @@ def _synchronization_side():
     backbone = nn.Module()
     backbone.model = nn.Module()
     backbone.model.layers = nn.ModuleList()
-    combiner = TokenCarryCombiner(1)
+    combiner = TokenCarryCombiner(3)
     return SimpleNamespace(causal_lm=backbone, token_carry=True, token_combiner=combiner)
 
 
 @torch.no_grad()
-def test_sync_refreshes_gated_residual_without_replacing_graph_storage():
+def test_sync_refreshes_scaled_residual_without_replacing_graph_storage():
     source, destination = _synchronization_side(), _synchronization_side()
     token_address = destination.token_combiner.token_delta.weight.data_ptr()
     carry_address = destination.token_combiner.carry.weight.data_ptr()
-    gate_address = destination.token_combiner.gate_logit.data_ptr()
-    for token_weight, carry_weight, gate_logit in ((2.0, 3.0, -4.0), (4.0, -1.0, 0.0)):
-        source.token_combiner.token_delta.weight.fill_(token_weight)
-        source.token_combiner.carry.weight.fill_(carry_weight)
-        source.token_combiner.gate_logit.fill_(gate_logit)
+    scale_address = destination.token_combiner.scale.data_ptr()
+    token = torch.tensor([[5.0, 2.0, -1.0]])
+    carry = torch.tensor([[7.0, -3.0, 4.0]])
+    for token_weight, carry_weight, scale in (
+        (2.0, 3.0, [-0.5, 0.0, 0.25]),
+        (4.0, -1.0, [0.125, -0.75, 1.5]),
+    ):
+        source.token_combiner.token_delta.weight.copy_(torch.eye(3) * token_weight)
+        source.token_combiner.carry.weight.copy_(torch.eye(3) * carry_weight)
+        source.token_combiner.scale.copy_(torch.tensor(scale))
         synchronize_fused_lora_policy_(destination, source)
-        result = destination.token_combiner(torch.tensor([[5.0]]), torch.tensor([[7.0]]))
-        expected = 5 + torch.tensor(gate_logit).sigmoid() * (token_weight * 5 + carry_weight * 7)
-        torch.testing.assert_close(result.squeeze(), expected)
+        result = destination.token_combiner(token, carry)
+        expected = token + torch.tensor(scale) * (token_weight * token + carry_weight * carry)
+        torch.testing.assert_close(result, expected)
         assert destination.token_combiner.token_delta.weight.data_ptr() == token_address
         assert destination.token_combiner.carry.weight.data_ptr() == carry_address
-        assert destination.token_combiner.gate_logit.data_ptr() == gate_address
+        assert destination.token_combiner.scale.data_ptr() == scale_address
 
 
 def test_sync_rejects_a_token_only_replica():

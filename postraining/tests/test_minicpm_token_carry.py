@@ -96,46 +96,66 @@ def _oracle(side, records):
     return torch.cat(outputs, dim=1)
 
 
-def test_combiner_starts_identity_then_learns_gate_without_training_carry_producer():
+def test_combiner_starts_identity_then_learns_scale_without_training_carry_producer():
     combiner = TokenCarryCombiner(4)
     embedding = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4).requires_grad_()
     producer = torch.full((2, 4), 2.0, requires_grad=True)
     previous = producer.square()
     saved = previous.detach().clone()
     optimizer = torch.optim.SGD(combiner.parameters(), lr=0.01)
-    initial_gate = combiner.gate_logit.detach().clone()
-    torch.testing.assert_close(initial_gate.sigmoid(), torch.tensor(0.01))
+    initial_scale = combiner.scale.detach().clone()
     torch.testing.assert_close(combiner(embedding, previous), embedding, rtol=0, atol=0)
     combiner(embedding, previous).square().sum().backward()
     assert producer.grad is None
     assert embedding.grad.abs().sum() > 0
     assert combiner.token_delta.weight.grad.abs().sum() > 0
     assert combiner.carry.weight.grad.abs().sum() > 0
-    assert combiner.gate_logit.grad.item() == 0
+    assert torch.count_nonzero(combiner.scale.grad) == 0
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     assert not torch.allclose(combiner(embedding, previous), embedding)
     combiner(embedding, previous).square().sum().backward()
-    assert combiner.gate_logit.grad.abs().item() > 0
+    assert combiner.scale.grad.abs().sum() > 0
     optimizer.step()
-    assert combiner.gate_logit.item() != initial_gate.item()
+    assert not torch.equal(combiner.scale, initial_scale)
     assert producer.grad is None
     torch.testing.assert_close(previous, saved, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("gate_logit,gate", [(-100.0, 0.0), (None, 0.01), (100.0, 1.0)])
-def test_gate_scales_entire_residual_not_pretrained_embedding(gate_logit, gate):
+def test_scale_controls_each_residual_channel_not_pretrained_embedding():
+    combiner = TokenCarryCombiner(4)
+    with torch.no_grad():
+        combiner.token_delta.weight.copy_(2 * torch.eye(4))
+        combiner.carry.weight.copy_(3 * torch.eye(4))
+        combiner.scale.copy_(torch.tensor([0.0, 0.01, -0.5, 2.0]))
+    embedding = torch.tensor([[1.0, -2.0, 3.0, 4.0]])
+    previous = torch.tensor([[4.0, 5.0, -6.0, 7.0]], requires_grad=True)
+    result = combiner(embedding, previous)
+    residual = 2 * embedding + 3 * previous.detach()
+    torch.testing.assert_close(result, embedding + torch.tensor([0.0, 0.01, -0.5, 2.0]) * residual)
+    result.sum().backward()
+    torch.testing.assert_close(combiner.scale.grad, residual.squeeze(0))
+    assert previous.grad is None
+
+
+def test_bf16_forward_preserves_fp32_scale_until_after_multiplication():
     combiner = TokenCarryCombiner(2)
     with torch.no_grad():
-        combiner.token_delta.weight.copy_(2 * torch.eye(2))
-        combiner.carry.weight.copy_(3 * torch.eye(2))
-        if gate_logit is not None:
-            combiner.gate_logit.fill_(gate_logit)
-    embedding = torch.tensor([[1.0, -2.0]])
-    previous = torch.tensor([[4.0, 5.0]])
-    torch.testing.assert_close(
-        combiner(embedding, previous), embedding + gate * (2 * embedding + 3 * previous),
-    )
+        combiner.carry.weight.copy_(torch.eye(2))
+        # Both round to the same BF16 scale, but their scaled outputs differ.
+        combiner.scale.copy_(torch.tensor([0.009985, 0.010035]))
+    embedding = torch.zeros(1, 2, dtype=torch.bfloat16)
+    previous = torch.full((1, 2), 1.5, dtype=torch.bfloat16, requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result = combiner(embedding, previous)
+    expected = (previous.detach().float() * combiner.scale.detach()).bfloat16()
+    rounded_first = previous.detach() * combiner.scale.detach().bfloat16()
+    assert result.dtype == torch.bfloat16
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert not torch.equal(result, rounded_first)
+    result.float().sum().backward()
+    torch.testing.assert_close(combiner.scale.grad, torch.full((2,), 1.5))
+    assert previous.grad is None
 
 
 @pytest.mark.parametrize("side_index", [0, 1])
@@ -163,7 +183,7 @@ def test_parallel_fixed_carry_matches_independent_streams_and_gradients(models, 
     assert batch.carry_hiddens.grad is None
     assert side.token_combiner.token_delta.weight.grad.abs().sum() > 0
     assert side.token_combiner.carry.weight.grad.abs().sum() > 0
-    assert side.token_combiner.gate_logit.grad.abs().item() > 0
+    assert side.token_combiner.scale.grad.abs().sum() > 0
     assert side.causal_lm.model.q_proj.lora_b.grad.abs().sum() > 0
     assert all(parameter.grad is None for parameter in models[1 - side_index].parameters())
 
@@ -183,7 +203,7 @@ def test_actor_update_changes_predictions_not_shared_history_or_critic(models):
     torch.testing.assert_close(critic.token_carry_replay_hidden(batch), critic_before, rtol=0, atol=0)
     assert actor.token_combiner.token_delta.weight.data_ptr() != critic.token_combiner.token_delta.weight.data_ptr()
     assert actor.token_combiner.carry.weight.data_ptr() != critic.token_combiner.carry.weight.data_ptr()
-    assert actor.token_combiner.gate_logit.data_ptr() != critic.token_combiner.gate_logit.data_ptr()
+    assert actor.token_combiner.scale.data_ptr() != critic.token_combiner.scale.data_ptr()
 
 
 def test_prompt_boundary_and_single_response_use_plain_embeddings(models):
@@ -256,7 +276,7 @@ def test_checkpoint_restores_carry_behavior_and_rejects_mode_mismatch(models, si
     with torch.no_grad():
         side.token_combiner.token_delta.weight.normal_()
         side.token_combiner.carry.weight.normal_()
-        side.token_combiner.gate_logit.fill_(-0.7)
+        side.token_combiner.scale.copy_(torch.tensor([-0.7, 0.0, 0.01, 1.2]))
     payload = side.checkpoint_payload()
     restored.load_token_carry_state_dict(payload)
     batch = _batch(_record([1, 2, 3, 4], 1))

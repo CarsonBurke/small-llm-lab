@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -113,3 +115,84 @@ def test_optimizer_epochs_learn_from_fixed_carries_without_changing_history(side
     assert torch.equal(actor.token_combiner.carry.weight, actor_before) == value_only
     for record, original in zip(records, saved):
         torch.testing.assert_close(record.carry_hiddens, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("value_only", [False, True])
+@pytest.mark.parametrize("token_budget,max_trajectories", [(5, 16), (64, 2)])
+def test_full_rollout_accumulation_matches_packed_adamw(
+    sides, value_only, token_budget, max_trajectories,
+):
+    """VRAM partitions must not change sparse-reward carry optimizer updates."""
+    actor, critic = sides
+    records = [
+        replace(record, correct=index == 0, forced_token_index=0 if index % 2 else -1)
+        for index, record in enumerate(_records(7))
+    ]
+    records, _ = trainer.refresh_behavior_statistics(
+        actor, critic, records, **{**_REPLAY_OPTIONS, "replay_token_budget": 64},
+    )
+    saved_carries = [record.carry_hiddens.clone() for record in records]
+    packed_actor, packed_critic = deepcopy(actor), deepcopy(critic)
+    sharded_optimizers = [
+        torch.optim.AdamW(side.parameters(), lr=0.005)
+        for side in (actor, critic)
+    ]
+    packed_optimizers = [
+        torch.optim.AdamW(side.parameters(), lr=0.005)
+        for side in (packed_actor, packed_critic)
+    ]
+    options = dict(
+        optimizer_minibatches=trainer.build_parser().parse_args([]).optimizer_minibatches,
+        logit_chunk_tokens=3, clip_low=0.2, clip_high=0.2,
+        value_coefficient=1.0, nextlat_horizon=1, nextlat_samples=1,
+        nextlat_mse_coefficient=1.0, nextlat_kl_coefficient=1.0,
+        nextlat_kl_chunk_tokens=3, train_nextlat=False,
+        grad_clip_norm=0.1, value_only=value_only,
+    )
+    assert options["optimizer_minibatches"] == 1
+    # A second epoch tests fixed behavior statistics and non-unit PPO ratios.
+    for epoch in range(2):
+        sharded = trainer.update_step(
+            actor, critic, records, *sharded_optimizers,
+            replay_token_budget=token_budget, replay_max_trajectories=max_trajectories,
+            **options,
+        )
+        packed = trainer.update_step(
+            packed_actor, packed_critic, records, *packed_optimizers,
+            replay_token_budget=64, replay_max_trajectories=16, **options,
+        )
+        assert sharded["replay_microbatches"] > 1
+        assert packed["replay_microbatches"] == 1
+        assert sharded["optimizer_minibatches"] == packed["optimizer_minibatches"] == 1
+        expected_policy_actions = sum(
+            r.response_length - (r.forced_token_index >= 0) for r in records
+        )
+        assert sharded["replay_policy_actions"] == expected_policy_actions
+        assert sharded["critic_grad_norm"] > options["grad_clip_norm"]
+        metric_names = ["value_loss", "critic_grad_norm"]
+        if not value_only:
+            metric_names.extend(("policy_loss", "actor_grad_norm"))
+        for name in metric_names:
+            assert sharded[name] == pytest.approx(packed[name], rel=2e-5, abs=1e-6)
+        for small, large in zip((actor, critic), (packed_actor, packed_critic)):
+            for small_parameter, large_parameter in zip(
+                small.parameters(), large.parameters(),
+            ):
+                torch.testing.assert_close(
+                    small_parameter, large_parameter, rtol=2e-5, atol=1e-6,
+                )
+        # Adam's moments expose incorrect loss scaling that its parameter update
+        # alone can hide; step counters expose accidental per-shard stepping.
+        for small, large in zip(sharded_optimizers, packed_optimizers):
+            small_state = small.state_dict()["state"]
+            large_state = large.state_dict()["state"]
+            assert small_state.keys() == large_state.keys()
+            for index in small_state:
+                assert small_state[index]["step"].item() == epoch + 1
+                for name in ("step", "exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(
+                        small_state[index][name], large_state[index][name],
+                        rtol=2e-5, atol=1e-8,
+                    )
+    for record, saved in zip(records, saved_carries):
+        torch.testing.assert_close(record.carry_hiddens, saved, rtol=0, atol=0)

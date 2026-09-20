@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import random
+from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
 from postraining.minicpm_vapo import DEFAULT_LORA_TARGETS, NextLatAuxiliaryHead
-from postraining.train_minicpm_vapo import build_parser as build_trainer_parser
+from postraining.train_minicpm_vapo import (
+    build_parser as build_trainer_parser,
+    load_training_math_corpus,
+    save_checkpoint,
+)
 from scripts import preflight_minicpm_vapo as preflight
 from scripts.migrate_minicpm_vapo_v6 import migrate_checkpoint
 
@@ -144,7 +151,19 @@ def test_v6_migration_requires_completed_rollout_boundary() -> None:
 
 def _preflight_checkpoint(tmp_path):
     data_path = tmp_path / "data.parquet"
-    data_path.write_bytes(b"fixed dataset bytes")
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "prompt": [{"role": "user", "content": f"What is {n} + 1?"}],
+                    "reward_model": {"style": "rule", "ground_truth": str(n + 1)},
+                    "extra_info": {"index": str(n)},
+                }
+                for n in range(5)
+            ]
+        ),
+        data_path,
+    )
     checkpoint = migrate_checkpoint(_v4_checkpoint(), seed=7)
     checkpoint["data_sha256"] = hashlib.sha256(data_path.read_bytes()).hexdigest()
     checkpoint["cpu_rng"] = torch.get_rng_state()
@@ -175,6 +194,9 @@ def _preflight_checkpoint(tmp_path):
     checkpoint["policy"]["actor"]["lora_config"] = expected_lora
     checkpoint["policy"]["critic"]["lora_config"] = expected_lora.copy()
     checkpoint["args"] = saved_args
+    _, _, checkpoint["math_corpus_identity"] = load_training_math_corpus(
+        data_path, seed=saved_args["seed"]
+    )
     resume_path = tmp_path / "source" / "vapo_adapter_checkpoint.pt"
     resume_path.parent.mkdir()
     torch.save(checkpoint, resume_path)
@@ -205,6 +227,11 @@ def test_preflight_resolves_additional_steps_and_builds_queue_command(
     assert report["target_actor_step"] == 403
     assert report["remaining_actor_updates"] == 200
     assert report["rollout_trajectories"] == 64
+    assert report["math_corpus_questions"] == 5
+    assert report["corpus_pass"] == 202
+    assert report["next_question_offset"] == 2
+    assert report["cursor"] == checkpoint["cursor"]
+    assert report["warmup_step"] == checkpoint["warmup_step"]
     assert report["output_state"] == "new"
     assert "--max-parallel-runs 1" in report["queue_command"]
     assert "--steps 403" in report["queue_command"]
@@ -335,19 +362,22 @@ def test_preflight_rejects_empty_pending_replay(tmp_path) -> None:
         )
 
 
-def test_token_carry_continuation_preserves_mode_and_requires_gated_projections(tmp_path):
+@pytest.mark.parametrize("invalid_side", ("actor", "critic"))
+def test_token_carry_continuation_preserves_mode_and_requires_layerscale_projections(
+    tmp_path, invalid_side,
+):
     checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
     checkpoint["args"].update(
         token_carry=True, train_nextlat=False, answer_reserve_tokens=0,
     )
-    checkpoint["policy"]["schema"] = "minicpm5_vapo_token_carry/v3"
+    checkpoint["policy"]["schema"] = "minicpm5_vapo_token_carry/v4"
     for side in ("actor", "critic"):
         checkpoint["policy"][side].update(
             token_carry=True,
             token_combiner={
                 "token_delta.weight": torch.zeros(6, 6),
                 "carry.weight": torch.zeros(6, 6),
-                "gate_logit": torch.tensor(-4.0),
+                "scale": torch.tensor([-2.0, -0.01, 0.0, 0.01, 1.0, 2.0]),
             },
         )
     options = dict(
@@ -363,29 +393,137 @@ def test_token_carry_continuation_preserves_mode_and_requires_gated_projections(
     with pytest.raises(ValueError, match="token-carry mode"):
         preflight.inspect_continuation(checkpoint, **options)
     checkpoint["pending_records"] = None
-    for schema in ("minicpm5_vapo_token_carry/v1", "minicpm5_vapo_token_carry/v2"):
+    for schema in (
+        "minicpm5_vapo_token_carry/v1",
+        "minicpm5_vapo_token_carry/v2",
+        "minicpm5_vapo_token_carry/v3",
+    ):
         checkpoint["policy"]["schema"] = schema
         with pytest.raises(ValueError, match="must use"):
             preflight.inspect_continuation(checkpoint, **options)
-    checkpoint["policy"]["schema"] = "minicpm5_vapo_token_carry/v3"
-    combiner = checkpoint["policy"]["critic"]["token_combiner"]
-    for name in ("token_delta.weight", "carry.weight", "gate_logit"):
+    checkpoint["policy"]["schema"] = "minicpm5_vapo_token_carry/v4"
+    combiner = checkpoint["policy"][invalid_side]["token_combiner"]
+    for name in ("token_delta.weight", "carry.weight", "scale"):
         saved = combiner.pop(name)
         with pytest.raises(ValueError, match=name):
             preflight.inspect_continuation(checkpoint, **options)
         combiner[name] = saved
-    for invalid in (torch.tensor(float("nan")), torch.tensor(float("inf")), torch.zeros(1),
-                    torch.tensor(0.0, dtype=torch.bfloat16), 0.0):
-        combiner["gate_logit"] = invalid
-        with pytest.raises(ValueError, match="gate_logit"):
+    for invalid in (
+        torch.tensor(0.01),
+        torch.zeros(5),
+        torch.zeros(1, 6),
+        torch.full((6,), float("nan")),
+        torch.full((6,), float("inf")),
+        torch.zeros(6, dtype=torch.bfloat16),
+        torch.zeros(6, dtype=torch.float64),
+        torch.zeros(6, dtype=torch.long),
+        0.01,
+    ):
+        combiner["scale"] = invalid
+        with pytest.raises(ValueError, match="scale"):
             preflight.inspect_continuation(checkpoint, **options)
+    combiner["scale"] = torch.full((6,), 0.01)
+    for name in ("token_delta.weight", "carry.weight"):
+        for invalid in (
+            torch.zeros(6, 5),
+            torch.zeros(5, 5),
+            torch.zeros(6, 6, dtype=torch.long),
+            torch.full((6, 6), float("nan")),
+        ):
+            combiner[name] = invalid
+            with pytest.raises(ValueError, match="token combiner"):
+                preflight.inspect_continuation(checkpoint, **options)
+        combiner[name] = torch.zeros(6, 6)
     combiner["gate_logit"] = torch.tensor(-4.0)
-    for invalid in (torch.zeros(6, 5), torch.zeros(6, 6, dtype=torch.long),
-                    torch.full((6, 6), float("nan"))):
-        combiner["carry.weight"] = invalid
-        with pytest.raises(ValueError, match="token combiner"):
-            preflight.inspect_continuation(checkpoint, **options)
-    combiner["carry.weight"] = torch.zeros(6, 6)
-    combiner["token.weight"] = torch.eye(6)
     with pytest.raises(ValueError, match="unexpected parameters"):
         preflight.inspect_continuation(checkpoint, **options)
+
+
+def test_preflight_rejects_legacy_corpus_cursor(tmp_path) -> None:
+    checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
+    del checkpoint["math_corpus_identity"]
+    with pytest.raises(ValueError, match="math_corpus_identity"):
+        preflight.inspect_continuation(
+            checkpoint,
+            resume_path=resume_path,
+            output_path=tmp_path / "continuation",
+            data_path=data_path,
+            target_steps=None,
+            additional_steps=1,
+            job_name=None,
+            time_limit="10h",
+        )
+
+
+@pytest.mark.parametrize("change", ("target", "order"))
+def test_preflight_rejects_changed_effective_corpus_with_unchanged_bytes(
+    tmp_path, monkeypatch, change
+) -> None:
+    import postraining.train_minicpm_vapo as trainer
+
+    checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
+    original_loader = trainer.load_unique_math_rows
+
+    def changed_loader(path, *, audit=None):
+        rows = original_loader(path, audit=audit)
+        if change == "target":
+            rows[0]["reward_model"]["ground_truth"] = "999"
+        else:
+            rows.reverse()
+        return rows
+
+    monkeypatch.setattr(trainer, "load_unique_math_rows", changed_loader)
+    assert preflight.file_sha256(data_path) == checkpoint["data_sha256"]
+    with pytest.raises(ValueError, match="different effective math corpus"):
+        preflight.inspect_continuation(
+            checkpoint,
+            resume_path=resume_path,
+            output_path=tmp_path / "continuation",
+            data_path=data_path,
+            target_steps=None,
+            additional_steps=1,
+            job_name=None,
+            time_limit="10h",
+        )
+
+
+@pytest.mark.parametrize(
+    ("step", "warmup_step", "cursor"),
+    ((0, 3, 12), (203, 10, 1012)),
+)
+def test_checkpoint_roundtrip_preserves_warmup_and_wrapped_corpus_cursor(
+    tmp_path, monkeypatch, step, warmup_step, cursor
+) -> None:
+    checkpoint, resume_path, data_path = _preflight_checkpoint(tmp_path)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", torch.get_rng_state)
+    save_checkpoint(
+        resume_path,
+        SimpleNamespace(checkpoint_payload=lambda: checkpoint["policy"]["actor"]),
+        SimpleNamespace(checkpoint_payload=lambda: checkpoint["policy"]["critic"]),
+        SimpleNamespace(state_dict=lambda: checkpoint["actor_optimizer"]),
+        SimpleNamespace(state_dict=lambda: checkpoint["critic_optimizer"]),
+        step=step,
+        cursor=cursor,
+        warmup_step=warmup_step,
+        pending_records=None,
+        pending_epoch=0,
+        args=SimpleNamespace(**checkpoint["args"]),
+        data_sha256=checkpoint["data_sha256"],
+        corpus_identity=checkpoint["math_corpus_identity"],
+    )
+    restored = torch.load(resume_path, map_location="cpu", weights_only=False)
+    report = preflight.inspect_continuation(
+        restored,
+        resume_path=resume_path,
+        output_path=tmp_path / "continuation",
+        data_path=data_path,
+        target_steps=None,
+        additional_steps=1,
+        job_name=None,
+        time_limit="10h",
+    )
+    assert report["saved_actor_step"] == step
+    assert report["warmup_step"] == warmup_step
+    assert report["cursor"] == cursor
+    assert report["next_question_offset"] == cursor % 5
+    assert report["corpus_pass"] == cursor // 5

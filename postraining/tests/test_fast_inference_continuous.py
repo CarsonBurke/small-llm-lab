@@ -3,12 +3,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 import torch
 
 from postraining.fast_inference import (
     CapturedTrainingRolloutEngine,
     PromptPrefixBank,
     _retire_inactive_flash_rows_,
+    response_token_limits,
 )
 
 
@@ -101,6 +103,7 @@ def _scheduler_harness(
     )
     engine._compile_decode = False
     engine._continuous_decode_graph = None
+    engine.capture_logprobs = False
     engine._synchronize_generation = lambda: None
     engine._ensure_continuous_cache = lambda bank: None
 
@@ -201,13 +204,134 @@ def test_continuous_pool_refills_next_step_and_preserves_logical_order() -> None
     assert [row.tolist() for row in result.logprobs] == [
         [0.0] * len(row) for row in expected
     ]
+    # The pool clears the log-probability buffer up front so lanes that do not
+    # capture behavior log-probabilities never export stale values.
     torch.testing.assert_close(
         engine.logprobs,
-        torch.full((engine.batch_size, engine.cache_length), -5.0),
+        torch.zeros((engine.batch_size, engine.cache_length)),
     )
     assert active_rows_by_step[:2] == [(0, 1), (2, 1)]
     assert result.minimum_active_rows_with_backlog == engine.batch_size
     assert engine._prefix_calls == [(False, "cpu")]
+
+
+def test_mixed_prompt_lengths_use_each_remaining_budget_after_lane_reuse() -> None:
+    expected = ((10,) * 6, (20,) * 4, (30,) * 5, (40,) * 3)
+    engine, active_rows = _scheduler_harness(expected, samples_per_prompt=1)
+    prompts = [torch.ones(length, dtype=torch.long) for length in (2, 4, 3, 5)]
+    result = engine.generate_prompt_pool(
+        prompts, max_new_tokens=8, context_tokens=8, completion_poll_steps=16,
+    )
+    assert tuple(tuple(row.tolist()) for row in result.responses) == expected
+    assert result.response_limits == (6, 4, 5, 3)
+    assert all(
+        prompt.numel() + response.numel() == 8
+        for prompt, response in zip(prompts, result.responses, strict=True)
+    )
+    # The short-budget lane is polled/refilled at four, not the batch max eight.
+    assert active_rows[4] == (0, 2)
+
+
+@pytest.mark.parametrize("prompt_length,reserve", [(8, 0), (9, 0), (5, 2)])
+def test_context_boundary_rejects_before_prefix_or_decode(prompt_length, reserve) -> None:
+    engine, active_rows = _scheduler_harness(((10,) * 8,), samples_per_prompt=1)
+    engine.answer_reserve_tokens = reserve
+    engine.thinking_end_token_id = 9 if reserve else None
+    with pytest.raises(ValueError):
+        engine.generate_prompt_pool(
+            [torch.ones(prompt_length, dtype=torch.long)],
+            max_new_tokens=8, context_tokens=8,
+        )
+    assert engine._prefix_calls == []
+    assert active_rows == []
+
+
+def test_remaining_budget_preserves_response_cap_and_legacy_omission() -> None:
+    assert response_token_limits([2, 5], max_new_tokens=4, context_tokens=8) == (4, 3)
+    assert response_token_limits([2, 5], max_new_tokens=4) == (4, 4)
+    assert response_token_limits(
+        [4], max_new_tokens=8, context_tokens=8,
+        answer_reserve_tokens=2, thinking_end_token_id=9,
+    ) == (4,)
+
+def test_collection_does_not_mistake_short_budget_padding_for_generated_eos(monkeypatch):
+    import postraining.train_minicpm_vapo as trainer
+
+    engine, _ = _scheduler_harness(((20,) * 6, (30,) * 4), samples_per_prompt=1)
+    engine.policy = SimpleNamespace(
+        token_carry=False, causal_lm=SimpleNamespace(config=SimpleNamespace(vocab_size=130560)),
+    )
+    engine.top_k = -1
+    engine.top_p = 1.0
+    rows = [
+        {"ids": torch.ones(length, dtype=torch.long),
+         "reward_model": {"ground_truth": "42", "style": "rule"}}
+        for length in (2, 4)
+    ]
+    monkeypatch.setattr(trainer, "encode_math_prompt", lambda tokenizer, row, **kwargs: row["ids"])
+    tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: "Answer: 42")
+    result = trainer.collect_rollouts(
+        engine, tokenizer, rows, prompt_tokens=4, max_new_tokens=8,
+        context_tokens=8, enable_thinking=False,
+    )
+    assert [record.response_length for record in result.records] == [6, 4]
+    assert [record.token_ids.numel() for record in result.records] == [8, 8]
+    assert [int(record.token_ids[-1]) for record in result.records] == [20, 30]
+    metrics = trainer.rollout_diagnostics(result, samples_per_prompt=1, stop_ids=(99,))
+    assert metrics["truncation_fraction"] == 1.0
+    assert metrics["domain/legacy_math/capped_trajectories"] == 2
+
+
+
+def test_carry_history_disabled_keeps_only_live_state_after_cache_restore() -> None:
+    engine = object.__new__(CapturedTrainingRolloutEngine)
+    engine.token_carry = True
+    engine.record_carry_history = False
+    engine.batch_size = 2
+    engine.cache_length = 8
+    engine._runtime_device = torch.device("cpu")
+    engine.policy = SimpleNamespace(
+        causal_lm=SimpleNamespace(config=SimpleNamespace(hidden_size=4))
+    )
+    engine.carry_hidden = None
+    engine._carry_history = None
+    engine._new_cache = lambda: SimpleNamespace(layers=[])
+
+    engine._allocate_carry_storage()
+
+    torch.testing.assert_close(
+        engine.carry_hidden, torch.zeros((2, 4), dtype=torch.bfloat16)
+    )
+    assert engine._carry_history is None
+    engine.carry_hidden = None
+    engine._rollout_resident = False
+
+    engine._restore_rollout_cache()
+
+    torch.testing.assert_close(
+        engine.carry_hidden, torch.zeros((2, 4), dtype=torch.bfloat16)
+    )
+    assert engine._carry_history is None
+
+
+def test_continuous_pool_does_not_export_disabled_carry_history() -> None:
+    engine, _ = _scheduler_harness(
+        ((99,), (20, 99), (30, 99), (99,)),
+        samples_per_prompt=2,
+    )
+    engine.token_carry = True
+    engine.record_carry_history = False
+    engine.carry_hidden = torch.zeros((2, 4), dtype=torch.bfloat16)
+    engine._carry_history = None
+
+    result = engine.generate_prompt_pool(
+        [torch.tensor([1]), torch.tensor([2])],
+        max_new_tokens=4,
+        completion_poll_steps=1,
+    )
+
+    assert result.carry_hiddens is None
+    assert engine.last_carry_hiddens is None
 
 
 def test_continuous_decode_omits_discarded_rollout_statistics() -> None:
@@ -215,6 +339,7 @@ def test_continuous_decode_omits_discarded_rollout_statistics() -> None:
     engine._graph_logits = torch.tensor([[1.0, 2.0]])
     engine._graph_values = torch.tensor([13.0])
     engine.cache = object()
+    engine.capture_logprobs = False
     engine.sample_tokens = lambda logits: torch.tensor([1])
     engine.sample = lambda *args: (_ for _ in ()).throw(
         AssertionError("log-probability-producing sampler must not run")
@@ -264,8 +389,12 @@ def test_completed_lanes_stop_scanning_stale_kv_history() -> None:
     assert lengths.tolist() == [18, 1, 27, 1]
 
 
-def test_continuous_admission_leaves_legacy_statistic_buffers_untouched() -> None:
+def test_continuous_admission_preserves_inactive_state_without_replay_buffers() -> None:
     engine = object.__new__(CapturedTrainingRolloutEngine)
+    engine.token_carry = True
+    engine.record_carry_history = False
+    engine.carry_hidden = torch.full((2, 4), -3.0, dtype=torch.bfloat16)
+    engine._carry_history = None
     engine.generated = torch.ones((2, 5), dtype=torch.long)
     engine.logprobs = torch.ones((2, 5))
     engine.values = torch.full((2, 5), 7.0)
@@ -286,6 +415,7 @@ def test_continuous_admission_leaves_legacy_statistic_buffers_untouched() -> Non
         values=torch.empty(0),
         layer_keys=torch.empty((1, 2, 0, 0, 0)),
         layer_values=torch.empty((1, 2, 0, 0, 0)),
+        hidden=torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.bfloat16),
     )
 
     engine._admit_prompt_rows(bank, 0, [1], max_new_tokens=3)
@@ -294,6 +424,14 @@ def test_continuous_admission_leaves_legacy_statistic_buffers_untouched() -> Non
     torch.testing.assert_close(engine._graph_values, torch.full((2,), 11.0))
     assert engine.active.tolist() == [False, True]
     assert engine.thinking_closed.tolist() == [True, False]
+    torch.testing.assert_close(
+        engine.carry_hidden,
+        torch.tensor(
+            [[-3.0, -3.0, -3.0, -3.0], [1.0, 2.0, 3.0, 4.0]],
+            dtype=torch.bfloat16,
+        ),
+    )
+    assert engine._carry_history is None
 
 
 def test_public_prefix_bank_keeps_value_collection_contract() -> None:

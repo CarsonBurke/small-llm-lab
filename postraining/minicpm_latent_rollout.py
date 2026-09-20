@@ -213,6 +213,9 @@ class _LatentStateDecoder:
             attention._rollout_sequence_lengths = self.flash_lengths
             attention._rollout_max_cache_len = self.cache_length
             attention._rollout_optimized_decode = self.compile_decode
+            # The latent decoder launches per layer; no shared split-KV plan.
+            attention._rollout_split_kv_offsets = None
+            attention._rollout_split_kv_live = None
 
     def admit(self, lanes: Sequence[int], prompt_indices: Sequence[int]) -> Tensor:
         if self.cache is None or self.prefix_hidden is None:

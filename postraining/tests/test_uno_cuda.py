@@ -79,6 +79,8 @@ def test_native_fa4_ragged_suffix_matches_full_precision_causal_reference(
             8192,
             128**-0.5,
             optimized_decode,
+            None,
+            None,
         )
         actual = invariant_fa4(*arguments)
         if width in (1, 4):
@@ -112,6 +114,7 @@ def test_native_fa4_ragged_suffix_matches_full_precision_causal_reference(
 @pytest.mark.parametrize(("batch", "capacity"), [(1, 257), (4, 257), (4, 8192)])
 def test_split_fa4_graph_tracks_retirement_refill_and_empty_partitions(batch, capacity):
     from postraining.invariant_attention import invariant_fa4
+    from postraining.split_kv_plan import SPLITS, plan_split_kv, split_kv_metadata
 
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 split-KV qualification")
@@ -127,12 +130,26 @@ def test_split_fa4_graph_tracks_retirement_refill_and_empty_partitions(batch, ca
     lengths = torch.tensor(
         [capacity, 65, 2, 1][:batch], device="cuda", dtype=torch.int32
     )
-    arguments = (query, keys, values, lengths, 1, capacity, 128**-0.5, True)
+    arguments = (query, keys, values, lengths, 1, capacity, 128**-0.5, True, None, None)
+    # The rollout engine plans partitions once per step and shares the plan
+    # across layers; that path must replay bitwise-identically to per-launch planning.
+    metadata = split_kv_metadata(batch, capacity, "cuda")
+    plan_offsets = torch.zeros(batch * SPLITS + 1, device="cuda", dtype=torch.int32)
+    plan_live = torch.zeros(batch * SPLITS, device="cuda", dtype=torch.int32)
+
+    def shared_plan_launch():
+        offsets, live = plan_split_kv(lengths, *metadata)
+        plan_offsets.copy_(offsets)
+        plan_live.copy_(live)
+        return invariant_fa4(*arguments[:-2], plan_offsets, plan_live)
+
     for _ in range(3):
         invariant_fa4(*arguments)
+        shared_plan_launch()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = invariant_fa4(*arguments)
+        captured_shared = shared_plan_launch()
 
     # Reuse the captured addresses across shrinking lengths, then refill.
     # NaNs outside each live prefix catch both stale offsets and empty-split reads.
@@ -146,6 +163,7 @@ def test_split_fa4_graph_tracks_retirement_refill_and_empty_partitions(batch, ca
             keys[row, length:] = float("nan")
             values[row, length:] = float("nan")
         graph.replay()
+        torch.testing.assert_close(captured_shared, captured, atol=0, rtol=0)
         references = []
         with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
             for row, length in enumerate(live_lengths):
@@ -188,7 +206,9 @@ def test_split_fa4_retains_small_residual_across_cancelling_partitions():
     values[:, 16:32] = 1.0078125
     values[:, 32:64] = -1.0
     lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
-    actual = invariant_fa4(query, keys, values, lengths, 1, 128, 128**-0.5, True)
+    actual = invariant_fa4(
+        query, keys, values, lengths, 1, 128, 128**-0.5, True, None, None
+    )
     # Uniform attention: (16 + 16*1.0078125 - 32) / 128 == 2**-10.
     # Rounding the first normalized partial to BF16 would erase this residual.
     torch.testing.assert_close(actual, torch.full_like(actual, 2**-10), atol=0, rtol=0)

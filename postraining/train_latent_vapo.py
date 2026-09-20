@@ -96,6 +96,7 @@ from postraining.core import (
     length_adaptive_lambda,
     load_posttraining_tokenizer,
     load_unique_math_rows,
+    math_corpus_identity,
     modal_answer_baseline,
     module_answer_baselines,
     nearby_numeric_reward,
@@ -385,12 +386,16 @@ tilelang_compile_counter = _TileLangCompileCounter()
 logging.getLogger("tilelang.jit.kernel").addHandler(tilelang_compile_counter)
 
 
-def math_dataset_identity(path: str | Path, exclude_modules: str) -> str:
+def math_dataset_identity(
+    path: str | Path, exclude_modules: str, rows: list[dict]
+) -> str:
     """Content identity that makes a sequential cursor safe to resume."""
     digest = hashlib.sha256()
     digest.update(PROMPT_ORDER_SCHEMA.encode())
     digest.update(b"\0")
     digest.update(exclude_modules.encode())
+    digest.update(b"\0")
+    digest.update(math_corpus_identity(rows).encode())
     digest.update(b"\0")
     with Path(path).open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
@@ -3502,6 +3507,7 @@ def main() -> None:
     mixture_manifest = None
     mixture_sources = None
     mixture_rollout_source_quotas = None
+    corpus_audit = {}
     if args.rl_mixture_manifest:
         math_rows, mixture_sources, mixture_manifest = load_mixture_manifest(
             args.rl_mixture_manifest
@@ -3528,7 +3534,7 @@ def main() -> None:
                 "Python rewards require --think-tokens and --answer-fence"
             )
     else:
-        math_rows = load_unique_math_rows(args.math_data)
+        math_rows = load_unique_math_rows(args.math_data, audit=corpus_audit)
     if args.answer_fence:
         math_rows = rewrite_prompts_for_answer_fence(math_rows)
         if mixture_sources is not None:
@@ -3592,7 +3598,9 @@ def main() -> None:
         else 0.0
     )
     if mixture_manifest is None:
-        data_identity = math_dataset_identity(args.math_data, args.exclude_modules)
+        data_identity = math_dataset_identity(
+            args.math_data, args.exclude_modules, math_rows
+        )
         sampler = MathPromptSampler(
             math_rows, args.seed, dataset_identity=data_identity
         )
@@ -3618,7 +3626,8 @@ def main() -> None:
             if actor_init_payload.get("math_data_identity") != data_identity:
                 raise ValueError(
                     "initialization checkpoint's prompt cursor belongs to different "
-                    "dataset bytes, exclusions, or ordering"
+                    "dataset bytes, effective corpus policy/targets, exclusions, or ordering; "
+                    "start a new run instead of reusing the cursor"
                 )
             source_args = actor_init_payload.get("args", {})
             if hasattr(source_args, "__dict__"):
@@ -3824,7 +3833,8 @@ def main() -> None:
         if payload.get("math_data_identity") != data_identity:
             raise ValueError(
                 "resume checkpoint's prompt cursor belongs to different dataset "
-                "bytes, exclusions, or ordering"
+                "bytes, effective corpus policy/targets, exclusions, or ordering; "
+                "start a new run instead of reusing the cursor"
             )
         if bool(resume_args.get("think_tokens")) != bool(args.think_tokens):
             raise ValueError(
@@ -4514,6 +4524,8 @@ def main() -> None:
                     ANSWER_FENCE_PROMPT_SCHEMA if args.answer_fence else None
                 ),
                 "math_data_identity": data_identity,
+                "math_corpus_identity": math_corpus_identity(math_rows),
+                "math_corpus_audit": corpus_audit,
                 "rl_mixture_manifest": mixture_manifest,
                 "rl_source_ids": source_ids,
                 "python_reward_schema": (

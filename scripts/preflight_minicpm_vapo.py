@@ -119,6 +119,7 @@ def inspect_continuation(
             "cuda_rng",
             "python_rng",
             "data_sha256",
+            "math_corpus_identity",
         ),
         "root",
     )
@@ -126,11 +127,15 @@ def inspect_continuation(
     saved_args = _required_mapping(checkpoint["args"], "args")
     latent_thinking = bool(saved_args.get("latent_thinking", False))
     token_carry = bool(saved_args.get("token_carry", False))
+    slot_memory = bool(saved_args.get("slot_memory", False))
     if latent_thinking and token_carry:
         raise ValueError("checkpoint cannot combine Gaussian thoughts and token carry")
+    if slot_memory and not token_carry:
+        raise ValueError("checkpoint slot memory requires token carry")
     expected_schema = (
-        "minicpm5_vapo_latent/v1" if latent_thinking
-        else "minicpm5_vapo_token_carry/v3" if token_carry
+        "minicpm5_vapo_slot_memory/v1" if slot_memory
+        else "minicpm5_vapo_latent/v1" if latent_thinking
+        else "minicpm5_vapo_token_carry/v4" if token_carry
         else POLICY_SCHEMA
     )
     if policy.get("schema") != expected_schema:
@@ -154,19 +159,44 @@ def inspect_continuation(
             raise ValueError(f"checkpoint {label} reasoning mode differs from saved args")
         if bool(side.get("token_carry", False)) != token_carry:
             raise ValueError(f"checkpoint {label} token carry mode differs from saved args")
+        if (side.get("slot_memory") is not None) != slot_memory:
+            raise ValueError(f"checkpoint {label} slot-memory mode differs from saved args")
+        if slot_memory:
+            from postraining.slot_memory import SlotMemoryConfig
+
+            geometry = SlotMemoryConfig.from_payload(side["slot_memory"])
+            if geometry != SlotMemoryConfig(
+                slots=int(saved_args.get("slot_memory_slots", 64)),
+                heads=int(saved_args.get("slot_memory_heads", 1)),
+                head_dim=int(saved_args.get("slot_memory_head_dim", 128)),
+            ):
+                raise ValueError(f"checkpoint {label} slot-memory geometry differs from saved args")
+            if (label == "actor") != ("slot_head" in side):
+                raise ValueError("only the actor carries the slot choice head")
         if token_carry:
             _require_fields(side, ("token_combiner",), label)
             combiner = _required_mapping(side["token_combiner"], f"{label} token combiner")
-            _require_fields(combiner, ("token_delta.weight", "carry.weight", "gate_logit"), label)
-            if set(combiner) != {"token_delta.weight", "carry.weight", "gate_logit"}:
+            expected_combiner = (
+                {
+                    "token_delta.weight", "query_token.weight", "query_carry.weight",
+                    "key.weight", "value.weight", "output.weight", "null_key", "scale",
+                }
+                if slot_memory
+                else {"token_delta.weight", "carry.weight", "scale"}
+            )
+            _require_fields(combiner, tuple(sorted(expected_combiner)), label)
+            if set(combiner) != expected_combiner:
                 raise ValueError(f"checkpoint {label} token combiner has unexpected parameters")
-            token_weight, carry_weight = combiner["token_delta.weight"], combiner["carry.weight"]
+            token_weight = combiner["token_delta.weight"]
+            carry_weight = combiner["output.weight" if slot_memory else "carry.weight"]
             if (
                 not isinstance(token_weight, torch.Tensor)
                 or not isinstance(carry_weight, torch.Tensor)
                 or token_weight.ndim != 2
                 or token_weight.shape[0] != token_weight.shape[1]
-                or token_weight.shape != carry_weight.shape
+                or carry_weight.ndim != 2
+                or carry_weight.shape[0] != token_weight.shape[0]
+                or (not slot_memory and token_weight.shape != carry_weight.shape)
                 or token_weight.numel() == 0
                 or not token_weight.is_floating_point()
                 or not carry_weight.is_floating_point()
@@ -174,14 +204,17 @@ def inspect_continuation(
                 or not torch.isfinite(carry_weight).all()
             ):
                 raise ValueError(f"checkpoint {label} token combiner dimensions are invalid")
-            gate = combiner["gate_logit"]
+            scale = combiner["scale"]
             if (
-                not isinstance(gate, torch.Tensor)
-                or gate.ndim != 0
-                or gate.dtype != torch.float32
-                or not torch.isfinite(gate)
+                not isinstance(scale, torch.Tensor)
+                or scale.shape != (token_weight.shape[0],)
+                or scale.dtype != torch.float32
+                or not torch.isfinite(scale).all()
             ):
-                raise ValueError(f"checkpoint {label} token combiner gate_logit must be a finite FP32 scalar")
+                raise ValueError(
+                    f"checkpoint {label} token combiner scale must be a finite FP32 vector "
+                    "matching the projection width"
+                )
     if latent_thinking:
         _require_fields(
             actor,
@@ -290,6 +323,8 @@ def inspect_continuation(
             raise ValueError("pending replay reasoning mode differs from checkpoint")
         if (getattr(record, "carry_hiddens", None) is not None) != token_carry:
             raise ValueError("pending replay token-carry mode differs from checkpoint")
+        if (getattr(record, "slot_choices", None) is not None) != slot_memory:
+            raise ValueError("pending replay slot-memory mode differs from checkpoint")
         record.__post_init__()
 
     if (target_steps is None) == (additional_steps is None):
@@ -314,6 +349,16 @@ def inspect_continuation(
     actual_data_sha256 = file_sha256(data_path)
     if actual_data_sha256 != expected_data_sha256:
         raise ValueError("dataset bytes differ from the resume checkpoint")
+    from postraining.train_minicpm_vapo import (
+        load_training_math_corpus,
+        validate_resume_dataset,
+    )
+
+    _require_fields(saved_args, ("seed",), "args")
+    rows, corpus_audit, corpus_identity = load_training_math_corpus(
+        data_path, seed=int(saved_args["seed"])
+    )
+    validate_resume_dataset(dict(checkpoint), actual_data_sha256, corpus_identity)
 
     if output_path.exists() and not output_path.is_dir():
         raise ValueError(f"output path is not a directory: {output_path}")
@@ -398,6 +443,11 @@ def inspect_continuation(
         "pending_records": pending_record_count,
         "dataset": str(data_path),
         "data_sha256": actual_data_sha256,
+        "math_corpus_identity": corpus_identity,
+        "math_corpus_audit": corpus_audit,
+        "math_corpus_questions": len(rows),
+        "corpus_pass": cursor // len(rows),
+        "next_question_offset": cursor % len(rows),
         "output": str(output_path),
         "output_state": output_state,
         "rollout_trajectories": prompts * samples,
@@ -419,9 +469,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    from postraining.train_minicpm_vapo import validate_output_directory
+
     args = build_parser().parse_args()
     resume_path = _resolve_repo_path(args.resume)
     output_path = _resolve_repo_path(args.output)
+    validate_output_directory(output_path)
     if not resume_path.is_file():
         raise ValueError(f"resume checkpoint does not exist: {resume_path}")
     checkpoint = torch.load(

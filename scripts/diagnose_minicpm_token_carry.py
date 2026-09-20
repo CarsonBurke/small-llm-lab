@@ -250,9 +250,10 @@ def worker(args):
             checkpoint_path, policy, critic, actor_optimizer, critic_optimizer,
             step=1, cursor=2, warmup_step=0, pending_records=refreshed,
             pending_epoch=0, args=training_args, data_sha256="diagnostic-no-dataset",
+            corpus_identity="diagnostic-only-not-resumable",
         )
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        assert state["policy"]["schema"] == "minicpm5_vapo_token_carry/v3"
+        assert state["policy"]["schema"] == "minicpm5_vapo_token_carry/v4"
         for original, loaded in zip(refreshed, state["pending_records"], strict=True):
             torch.testing.assert_close(original.carry_hiddens, loaded.carry_hiddens, rtol=0, atol=0)
         with torch.no_grad():

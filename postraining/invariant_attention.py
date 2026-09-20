@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any, cast
+from typing import Any, Optional, cast
 import torch
 from torch import Tensor, nn
 
@@ -23,7 +23,15 @@ def invariant_fa4(
     max_key: int,
     scale: float,
     optimized_decode: bool,
+    split_offsets: Optional[Tensor],
+    split_live: Optional[Tensor],
 ) -> Tensor:
+    """Ragged-suffix FA4 for one decode step.
+
+    ``split_offsets`` and ``split_live`` carry a split-KV partition plan the
+    caller computed once for this step (see ``split_kv_plan``); pass ``None``
+    to derive it per launch. Both give identical attention output.
+    """
     interface = cast(Any, import_module("flash_attn.cute.interface"))
     # Keep Uno's serial/block numerical target unchanged. This tile was
     # qualified for ordinary MiniCPM decode, not other FA4 architectures.
@@ -42,7 +50,9 @@ def invariant_fa4(
     ):
         from postraining.split_kv_attention import split_kv_attention
 
-        return split_kv_attention(query, key, value, sequence_lengths, scale)
+        return split_kv_attention(
+            query, key, value, sequence_lengths, scale, split_offsets, split_live
+        )
     forward = (
         interface._flash_attn_fwd if tune_tile else interface.flash_attn_varlen_func
     )
@@ -65,7 +75,16 @@ def invariant_fa4(
 
 @invariant_fa4.register_fake
 def _fake_invariant_fa4(
-    query, key, value, sequence_lengths, max_query, max_key, scale, optimized_decode
+    query,
+    key,
+    value,
+    sequence_lengths,
+    max_query,
+    max_key,
+    scale,
+    optimized_decode,
+    split_offsets,
+    split_live,
 ):
     return torch.empty(
         (*query.shape[:-1], value.shape[-1]), dtype=query.dtype, device=query.device
@@ -93,5 +112,7 @@ def invariant_suffix_attention(
         attention._rollout_max_cache_len,
         scale,
         attention._rollout_optimized_decode,
+        attention._rollout_split_kv_offsets,
+        attention._rollout_split_kv_live,
     )
     return output, None

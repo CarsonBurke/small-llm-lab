@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
@@ -11,13 +10,13 @@ from torch import Tensor, nn
 
 
 class TokenCarryCombiner(nn.Module):
-    """Gate a learned residual while keeping the pretrained embedding intact."""
+    """Scale each residual channel while preserving the token embedding path."""
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.token_delta = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.float32)
         self.carry = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.float32)
-        self.gate_logit = nn.Parameter(torch.tensor(math.log(0.01 / 0.99), dtype=torch.float32))
+        self.scale = nn.Parameter(torch.full((hidden_size,), 0.01, dtype=torch.float32))
         nn.init.zeros_(self.token_delta.weight)
         nn.init.zeros_(self.carry.weight)
 
@@ -26,18 +25,31 @@ class TokenCarryCombiner(nn.Module):
         residual = F.linear(token_embedding, self.token_delta.weight.to(dtype)) + F.linear(
             previous_hidden.detach().to(dtype), self.carry.weight.to(dtype)
         )
-        return token_embedding + self.gate_logit.sigmoid().to(dtype) * residual
+        # Do not quantize the learned scale to BF16 before multiplication.
+        return token_embedding + (residual.float() * self.scale).to(dtype)
 
 
 def load_token_carry_state_dict(side: Any, payload: dict[str, Any]) -> None:
     enabled = payload.get("token_carry", False)
     if type(enabled) is not bool or enabled != side.token_carry:
         raise ValueError("checkpoint token-carry mode differs from the model")
+    slot_memory = getattr(side, "slot_memory", None)
+    if (payload.get("slot_memory") is None) != (slot_memory is None):
+        raise ValueError("checkpoint slot-memory mode differs from the model")
     if enabled:
         if payload.get("latent_thinking", False):
             raise ValueError("token carry cannot be combined with latent thinking")
         if "token_combiner" not in payload:
             raise ValueError("checkpoint is missing token_combiner")
+        if slot_memory is not None:
+            from postraining.slot_memory import SlotMemoryConfig
+
+            if SlotMemoryConfig.from_payload(payload["slot_memory"]) != slot_memory:
+                raise ValueError("checkpoint slot-memory geometry differs from the model")
+            if hasattr(side, "slot_head") != ("slot_head" in payload):
+                raise ValueError("checkpoint slot head presence differs from the model side")
+            if "slot_head" in payload:
+                side.slot_head.load_state_dict(payload["slot_head"], strict=True)
         side.token_combiner.load_state_dict(payload["token_combiner"], strict=True)
     elif "token_combiner" in payload:
         raise ValueError("native checkpoint contains token-carry state")
@@ -49,6 +61,8 @@ def token_carry_replay_hidden(side: Any, batch: Any) -> Tensor:
         raise ValueError("stored-carry replay requires token carry")
     if batch.action_kinds is not None or batch.latent_vectors is not None:
         raise ValueError("token-carry replay cannot consume Gaussian latent actions")
+    if getattr(batch, "slot_alive_table", None) is not None:
+        raise ValueError("plain token-carry replay cannot consume slot-memory records")
     carries = batch.carry_hiddens
     positions = batch.carry_input_positions
     if carries is None or positions is None:

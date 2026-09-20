@@ -24,6 +24,14 @@ from postraining.latent_thought import (
     GaussianTransitionHead,
     StopThinkingGate,
 )
+from postraining.slot_memory import (
+    NO_WRITE,
+    SlotChoiceHead,
+    SlotMemoryCombiner,
+    SlotMemoryConfig,
+    build_alive_table,
+    slot_memory_replay_hidden,
+)
 from postraining.token_carry import (
     TokenCarryCombiner,
     load_token_carry_state_dict,
@@ -83,6 +91,11 @@ class LoRALinear(nn.Module):
         self.base = base
         self.rank = config.rank
         self.scaling = config.alpha / config.rank
+        # Scaling by a power of two commutes with every rounding step, so
+        # folding it into the small ``lora_b`` operand before the GEMM gives
+        # bit-identical forward values and gradients while dropping one
+        # token-sized multiply per projection in each direction.
+        self._fold_scaling = math.frexp(self.scaling)[0] == 0.5
         self.lora_a = nn.Parameter(
             torch.empty(config.rank, base.in_features, dtype=torch.float32)
         )
@@ -110,6 +123,11 @@ class LoRALinear(nn.Module):
                 "mixed-dtype LoRA requires autocast so fp32 masters are cast "
                 "only inside the adapter GEMMs"
             )
+        if self._fold_scaling:
+            update = F.linear(
+                F.linear(inputs, self.lora_a), self.lora_b * self.scaling
+            )
+            return self.base(inputs).add_(update)
         update = F.linear(F.linear(inputs, self.lora_a), self.lora_b)
         return self.base(inputs) + update * self.scaling
 
@@ -258,7 +276,10 @@ def _packed_replay_attention(
                 enable_gqa=query_slice.shape[1] != key_slice.shape[1],
             )
         )
-    return torch.cat(outputs, dim=2).transpose(1, 2), None
+    # Concatenate token-major views so the [1, tokens, heads, dim] result is
+    # already contiguous: the caller's head merge becomes a view instead of a
+    # second full copy of the activations.
+    return torch.cat([output.transpose(1, 2) for output in outputs], dim=1), None
 
 
 @torch.compiler.disable
@@ -527,12 +548,15 @@ class MiniCPMVAPOPolicy(nn.Module):
         nextlat_projection_factor: float = 1.6,
         latent_thinking: bool = False,
         token_carry: bool = False,
+        slot_memory: SlotMemoryConfig | None = None,
         thought_sigma: float = 1.0,
         init_stop_thinking_probability: float = 0.9,
     ) -> None:
         super().__init__()
         if latent_thinking and token_carry:
             raise ValueError("token carry cannot be combined with latent thinking")
+        if slot_memory is not None and not token_carry:
+            raise ValueError("slot memory extends token carry; enable both")
         self.causal_lm = causal_lm
         config: Any = causal_lm.config
         if getattr(config, "model_type", None) != "llama":
@@ -550,7 +574,12 @@ class MiniCPMVAPOPolicy(nn.Module):
         )
         self.latent_thinking = latent_thinking
         self.token_carry = token_carry
-        if token_carry:
+        self.slot_memory = slot_memory
+        self.slot_replay_backend = "flex"
+        if slot_memory is not None:
+            self.token_combiner = SlotMemoryCombiner(int(config.hidden_size), slot_memory)
+            self.slot_head = SlotChoiceHead(int(config.hidden_size), slot_memory.slots)
+        elif token_carry:
             self.token_combiner = TokenCarryCombiner(int(config.hidden_size))
         if latent_thinking:
             self.thought_sigma = float(thought_sigma)
@@ -576,6 +605,7 @@ class MiniCPMVAPOPolicy(nn.Module):
         gradient_checkpointing: bool = True,
         latent_thinking: bool = False,
         token_carry: bool = False,
+        slot_memory: SlotMemoryConfig | None = None,
         thought_sigma: float = 1.0,
         init_stop_thinking_probability: float = 0.9,
     ) -> tuple["MiniCPMVAPOPolicy", Any]:
@@ -597,6 +627,7 @@ class MiniCPMVAPOPolicy(nn.Module):
             nextlat_projection_factor=nextlat_projection_factor,
             latent_thinking=latent_thinking,
             token_carry=token_carry,
+            slot_memory=slot_memory,
             thought_sigma=thought_sigma,
             init_stop_thinking_probability=init_stop_thinking_probability,
         ).to(device)
@@ -628,6 +659,11 @@ class MiniCPMVAPOPolicy(nn.Module):
                 parameter for parameter in self.token_combiner.parameters()
                 if parameter.requires_grad
             )
+        if self.slot_memory is not None:
+            yield from (
+                parameter for parameter in self.slot_head.parameters()
+                if parameter.requires_grad
+            )
         if self.latent_thinking:
             for module in (self.transition, self.thinking_gate, self.thought_adapter):
                 yield from (parameter for parameter in module.parameters() if parameter.requires_grad)
@@ -638,9 +674,13 @@ class MiniCPMVAPOPolicy(nn.Module):
     def carry_embeddings(self, token_ids: Tensor, previous_hidden: Tensor) -> Tensor:
         if not self.token_carry:
             raise ValueError("carry embeddings require token carry")
+        if self.slot_memory is not None:
+            raise ValueError("slot memory embeddings come from the rollout slot state")
         return self.token_combiner(self.token_embeddings(token_ids), previous_hidden)
 
     def token_carry_replay_hidden(self, batch: "ReplayMicrobatch") -> Tensor:
+        if self.slot_memory is not None:
+            return slot_memory_replay_hidden(self, batch, backend=self.slot_replay_backend)
         return token_carry_replay_hidden(self, batch)
 
     def thought_embeddings(self, raw: Tensor) -> Tensor:
@@ -778,6 +818,14 @@ class MiniCPMVAPOPolicy(nn.Module):
                     for name, tensor in self.token_combiner.state_dict().items()
                 },
             )
+        if self.slot_memory is not None:
+            payload.update(
+                slot_memory=self.slot_memory.payload(),
+                slot_head={
+                    name: tensor.detach().cpu()
+                    for name, tensor in self.slot_head.state_dict().items()
+                },
+            )
         if self.latent_thinking:
             payload.update(
                 latent_thinking=True,
@@ -808,10 +856,13 @@ class MiniCPMVAPOCritic(nn.Module):
         nextlat_projection_factor: float = 1.6,
         latent_thinking: bool = False,
         token_carry: bool = False,
+        slot_memory: SlotMemoryConfig | None = None,
     ) -> None:
         super().__init__()
         if latent_thinking and token_carry:
             raise ValueError("token carry cannot be combined with latent thinking")
+        if slot_memory is not None and not token_carry:
+            raise ValueError("slot memory extends token carry; enable both")
         self.causal_lm = causal_lm
         config: Any = causal_lm.config
         if getattr(config, "model_type", None) != "llama":
@@ -827,7 +878,11 @@ class MiniCPMVAPOCritic(nn.Module):
         )
         self.latent_thinking = latent_thinking
         self.token_carry = token_carry
-        if token_carry:
+        self.slot_memory = slot_memory
+        self.slot_replay_backend = "flex"
+        if slot_memory is not None:
+            self.token_combiner = SlotMemoryCombiner(int(config.hidden_size), slot_memory)
+        elif token_carry:
             self.token_combiner = TokenCarryCombiner(int(config.hidden_size))
         if latent_thinking:
             self.thought_adapter = CombinedEmbedding(int(config.hidden_size))
@@ -850,6 +905,7 @@ class MiniCPMVAPOCritic(nn.Module):
         shared_frozen_source: nn.Module | None = None,
         latent_thinking: bool = False,
         token_carry: bool = False,
+        slot_memory: SlotMemoryConfig | None = None,
     ) -> "MiniCPMVAPOCritic":
         prepare_text_only_transformers_runtime()
         from transformers import AutoModelForCausalLM
@@ -868,6 +924,7 @@ class MiniCPMVAPOCritic(nn.Module):
             nextlat_projection_factor=nextlat_projection_factor,
             latent_thinking=latent_thinking,
             token_carry=token_carry,
+            slot_memory=slot_memory,
         )
         if shared_frozen_source is not None:
             critic.shared_frozen_parameters = share_frozen_parameters_(
@@ -943,9 +1000,13 @@ class MiniCPMVAPOCritic(nn.Module):
     def carry_embeddings(self, token_ids: Tensor, previous_hidden: Tensor) -> Tensor:
         if not self.token_carry:
             raise ValueError("carry embeddings require token carry")
+        if self.slot_memory is not None:
+            raise ValueError("slot memory embeddings come from the rollout slot state")
         return self.token_combiner(self.token_embeddings(token_ids), previous_hidden)
 
     def token_carry_replay_hidden(self, batch: "ReplayMicrobatch") -> Tensor:
+        if self.slot_memory is not None:
+            return slot_memory_replay_hidden(self, batch, backend=self.slot_replay_backend)
         return token_carry_replay_hidden(self, batch)
 
     def thought_embeddings(self, raw: Tensor) -> Tensor:
@@ -979,6 +1040,8 @@ class MiniCPMVAPOCritic(nn.Module):
                     for name, tensor in self.token_combiner.state_dict().items()
                 },
             )
+        if self.slot_memory is not None:
+            payload.update(slot_memory=self.slot_memory.payload())
         if self.latent_thinking:
             payload.update(
                 latent_thinking=True,
@@ -1038,15 +1101,15 @@ class _ChunkedFrozenHeadLogProbs(torch.autograd.Function):
         grad_output = grad_outputs[0]
         hidden, targets, weight = ctx.saved_tensors
         grad_hidden = torch.empty_like(hidden)
+        rows = torch.arange(
+            min(ctx.chunk_tokens, hidden.shape[0]), device=hidden.device
+        )
         for start in range(0, hidden.shape[0], ctx.chunk_tokens):
             stop = min(start + ctx.chunk_tokens, hidden.shape[0])
             logits = F.linear(hidden[start:stop], weight).float()
             probabilities = -logits.softmax(dim=1)
             del logits
-            probabilities[
-                torch.arange(stop - start, device=hidden.device),
-                targets[start:stop],
-            ] += 1.0
+            probabilities[rows[: stop - start], targets[start:stop]] += 1.0
             probabilities.mul_(grad_output[start:stop, None].float())
             grad_hidden[start:stop] = F.linear(
                 probabilities.to(weight.dtype), weight.transpose(0, 1)
@@ -1308,6 +1371,8 @@ class TrajectoryRecord:
     latent_vectors: Tensor | None = None
     controller_observations: Tensor | None = None
     carry_hiddens: Tensor | None = None
+    slot_choices: Tensor | None = None
+    slot_count: int = 0
 
     def __post_init__(self) -> None:
         if self.token_ids.device.type != "cpu" or self.token_ids.dtype != torch.int32:
@@ -1340,6 +1405,22 @@ class TrajectoryRecord:
                 or not bool(torch.isfinite(carries).all())
             ):
                 raise ValueError("carry hiddens must be ordinary detached finite CPU BF16 [response_length, hidden_size]")
+        choices = self.slot_choices
+        if (choices is None) != (self.slot_count == 0):
+            raise ValueError("slot choices and a positive slot count travel together")
+        if choices is not None:
+            if carries is None:
+                raise ValueError("slot choices require stored carry hiddens")
+            if type(self.slot_count) is not int or self.slot_count < 1:
+                raise ValueError("slot count must be a positive integer")
+            if (
+                choices.device.type != "cpu" or choices.dtype != torch.int16
+                or choices.ndim != 1 or choices.numel() != response_length
+                or bool((choices < NO_WRITE).any()) or bool((choices >= self.slot_count).any())
+            ):
+                raise ValueError("slot choices must be CPU int16 [response_length] in [-1, slot_count)")
+            if self.forced_token_index >= 0 and int(choices[self.forced_token_index]) != NO_WRITE:
+                raise ValueError("a forced token never writes a memory slot")
         observations = self.controller_observations
         if observations is not None:
             if (
@@ -1405,7 +1486,7 @@ class TrajectoryRecord:
         tensors = (
             self.token_ids, self.old_logprobs, self.advantages,
             self.action_kinds, self.latent_vectors, self.controller_observations,
-            self.carry_hiddens,
+            self.carry_hiddens, self.slot_choices,
         )
         return sum(
             tensor.numel() * tensor.element_size() for tensor in tensors if tensor is not None
@@ -1426,6 +1507,8 @@ class TrajectoryRecord:
         latent_vectors: Tensor | None = None,
         controller_observations: Tensor | None = None,
         carry_hiddens: Tensor | None = None,
+        slot_choices: Tensor | None = None,
+        slot_count: int = 0,
     ) -> "TrajectoryRecord":
         if action_kinds is not None:
             action_kinds = action_kinds.detach().to(device="cpu")
@@ -1446,6 +1529,9 @@ class TrajectoryRecord:
                 raise ValueError("rollout carry hiddens must already be BF16")
             with torch.inference_mode(False):
                 carry_hiddens = carry_hiddens.detach().to(device="cpu", copy=True)
+        if slot_choices is not None:
+            with torch.inference_mode(False):
+                slot_choices = slot_choices.detach().to(device="cpu", dtype=torch.int16, copy=True)
         return cls(
             token_ids=token_ids_cpu,
             prompt_length=prompt_length,
@@ -1467,6 +1553,8 @@ class TrajectoryRecord:
                 else controller_observations.detach().to(device="cpu")
             ),
             carry_hiddens=carry_hiddens,
+            slot_choices=slot_choices,
+            slot_count=slot_count,
         )
 
 
@@ -1550,6 +1638,11 @@ class ReplayMicrobatch:
     gate_stop_actions: Tensor | None = None
     carry_hiddens: Tensor | None = None
     carry_input_positions: Tensor | None = None
+    slot_alive_table: Tensor | None = None
+    slot_key_choices: Tensor | None = None
+    slot_positions: Tensor | None = None
+    slot_actions: Tensor | None = None
+    slot_action_mask: Tensor | None = None
 
     @property
     def action_count(self) -> int:
@@ -1582,6 +1675,11 @@ def collate_replay_microbatch(
             raise ValueError("token carry cannot be combined with latent trajectories")
         if len({record.carry_hiddens.shape[1] for record in selected}) != 1:
             raise ValueError("carry trajectories must share a hidden size")
+    slot = selected[0].slot_choices is not None
+    if any((record.slot_choices is not None) != slot for record in selected):
+        raise ValueError("cannot mix slot-memory and plain token-carry trajectories")
+    if slot and len({record.slot_count for record in selected}) != 1:
+        raise ValueError("slot-memory trajectories must share a slot count")
     lengths = [record.input_length for record in selected]
     total = sum(lengths)
     maximum = max(lengths)
@@ -1603,6 +1701,12 @@ def collate_replay_microbatch(
     gate_stop_actions: list[Tensor] = []
     carry_hiddens: list[Tensor] = []
     carry_input_positions: list[Tensor] = []
+    slot_alive_tables: list[Tensor] = []
+    slot_key_choices: list[Tensor] = []
+    slot_positions: list[Tensor] = []
+    slot_actions: list[Tensor] = []
+    slot_action_masks: list[Tensor] = []
+    key_offset = 0
     nextlat_sequence_ranges: list[tuple[int, int]] = []
     action_offset = 0
     boundaries = [0]
@@ -1625,6 +1729,23 @@ def collate_replay_microbatch(
             assert record.carry_hiddens is not None
             carry_hiddens.append(record.carry_hiddens[:-1])
             carry_input_positions.append(torch.arange(action_start + 1, action_stop))
+        if slot:
+            assert record.slot_choices is not None
+            # Query t consumes response token t after write t; the terminal
+            # producer is never consumed, so keys and queries share the [:-1] rows.
+            key_choices = record.slot_choices[:-1].long()
+            slot_alive_tables.append(
+                build_alive_table(key_choices, record.slot_count, offset=key_offset)
+            )
+            slot_key_choices.append(key_choices)
+            slot_positions.append(torch.arange(key_choices.numel(), dtype=torch.long))
+            slot_actions.append(record.slot_choices.long())
+            # The terminal write is never read, so its slot choice has no
+            # causal effect and receives no policy credit.
+            slot_action_mask = torch.ones(record.response_length, dtype=torch.bool)
+            slot_action_mask[-1] = False
+            slot_action_masks.append(slot_action_mask)
+            key_offset += key_choices.numel()
         if latent:
             assert record.action_kinds is not None and record.latent_vectors is not None
             thought_count = record.latent_vectors.shape[0]
@@ -1693,6 +1814,11 @@ def collate_replay_microbatch(
         gate_stop_actions=transfer(torch.cat(gate_stop_actions)) if latent else None,
         carry_hiddens=transfer(torch.cat(carry_hiddens)) if carry else None,
         carry_input_positions=transfer(torch.cat(carry_input_positions)) if carry else None,
+        slot_alive_table=transfer(torch.cat(slot_alive_tables)) if slot else None,
+        slot_key_choices=transfer(torch.cat(slot_key_choices)) if slot else None,
+        slot_positions=transfer(torch.cat(slot_positions)) if slot else None,
+        slot_actions=transfer(torch.cat(slot_actions)) if slot else None,
+        slot_action_mask=transfer(torch.cat(slot_action_masks)) if slot else None,
         nextlat_sequence_ranges=tuple(nextlat_sequence_ranges),
     )
 

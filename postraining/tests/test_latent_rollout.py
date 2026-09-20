@@ -1572,6 +1572,9 @@ def test_answer_fence_prompt_rewrite_covers_real_datasets():
             data_dir / "dapo-math-17k.parquet",
             data_dir / "gsm8k_rl_prompts.parquet",
             data_dir / "aime-2024.parquet",
+            data_dir / "aime-2025.parquet",
+            data_dir / "aime-2025-i.parquet",
+            data_dir / "aime-2025-ii.parquet",
             data_dir / "aime-2026.parquet",
             data_dir / "aime-2026-i.parquet",
             data_dir / "aime-2026-ii.parquet",
@@ -3457,11 +3460,20 @@ def test_math_prompt_sampler_wraps_epochs_with_deterministic_reshuffles():
 def test_math_dataset_identity_binds_bytes_exclusions_and_order(tmp_path):
     dataset = tmp_path / "math.parquet"
     dataset.write_bytes(b"first")
-    original = math_dataset_identity(dataset, "")
-    assert math_dataset_identity(dataset, "") == original
-    assert math_dataset_identity(dataset, "algebra") != original
+    rows = [
+        {"prompt": [{"role": "user", "content": f"Compute {i}."}],
+         "reward_model": {"ground_truth": str(i), "style": "rule"}}
+        for i in range(2)
+    ]
+    original = math_dataset_identity(dataset, "", rows)
+    assert math_dataset_identity(dataset, "", rows) == original
+    assert math_dataset_identity(dataset, "algebra", rows) != original
+    assert math_dataset_identity(dataset, "", rows[::-1]) != original
+    rows[0]["reward_model"]["ground_truth"] = "corrected"
+    assert math_dataset_identity(dataset, "", rows) != original
+    rows[0]["reward_model"]["ground_truth"] = "0"
     dataset.write_bytes(b"second")
-    assert math_dataset_identity(dataset, "") != original
+    assert math_dataset_identity(dataset, "", rows) != original
 
 
 def test_checkpoint_records_partial_value_warmup_for_exact_resume(tmp_path):

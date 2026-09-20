@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import hashlib
@@ -29,12 +30,13 @@ from torch import Tensor
 from torch._functorch import config as aot_config
 from torch.utils.tensorboard import SummaryWriter
 
-from checkpointing import RecoveryCheckpointPolicy, atomic_torch_save
-from postraining.core import answer_style, load_unique_math_rows, verify_answer
+from checkpointing import RecoveryCheckpointPolicy, atomic_link_or_copy, atomic_torch_save
+from postraining.core import JsonlLogger, answer_style, load_unique_math_rows, math_corpus_identity, verify_answer
 from postraining.eval_hf_math import prepare_prompt_ids, resolved_eos_ids
 from postraining.fast_inference import (
     CapturedTrainingRolloutEngine,
     FastTrainingDecodeStats,
+    response_token_limits,
     top_k_top_p_sample,
 )
 from postraining.minicpm_vapo import (
@@ -61,8 +63,21 @@ from postraining.minicpm_vapo import (
 )
 from postraining.minicpm_latent_rollout import MiniCPMLatentRolloutEngine
 from postraining.runtime.profiling import DEVICE_SAMPLE_FIELDS, DeviceSampler
+from postraining.slot_memory import (
+    SLOT_MEMORY_SCHEMA,
+    SlotMemoryConfig,
+    slot_choice_statistics,
+    visibility_reference,
+)
+from postraining.repetition import repetition_metrics
 from postraining.train_vapo import prompt_text
 from postraining.thinking_budget import force_thinking_end_, validate_thinking_budget
+from postraining.verifiable_tasks import (
+    is_verifiable_task,
+    score_verifiable_response,
+    verifiable_reward_identity,
+    validate_verifiable_task,
+)
 
 from postraining.nextlat_speculative import (
     NextLatDecodeStats,
@@ -98,7 +113,11 @@ class RolloutResult:
     admission_events: int
     minimum_active_rows_with_backlog: int
     decoding: DecodeStats | FastTrainingDecodeStats | NextLatDecodeStats
+    scoring_seconds: float = 0.0
     uno_metrics: dict[str, float | int] | None = None
+    group_domains: tuple[str, ...] = ()
+    outcome_reasons: tuple[str, ...] = ()
+    response_limits: tuple[int, ...] = ()
 
 def static_kv_cache_bytes(
     model_config: Any,
@@ -129,10 +148,74 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def validate_resume_dataset(resume: dict[str, Any], data_sha256: str) -> None:
+def load_training_math_corpus(
+    path: str | Path, *, seed: int
+) -> tuple[list[dict], dict[str, Any], str]:
+    """Load a unique global corpus; preserve the historical math-only API."""
+    audit: dict[str, Any] = {}
+    rows = load_unique_math_rows(path, audit=audit)
+    if not rows:
+        raise ValueError("effective math corpus contains no trainable questions")
+    for row in rows:
+        if is_verifiable_task(row):
+            validate_verifiable_task(row)
+    random.Random(seed).shuffle(rows)
+    counts = Counter(training_row_domain(row) for row in rows)
+    audit["domain_counts"] = dict(sorted(counts.items()))
+    audit["domain_proportions"] = {
+        domain: count / len(rows) for domain, count in sorted(counts.items())
+    }
+    identity = math_corpus_identity(rows)
+    if any(is_verifiable_task(row) for row in rows):
+        reward_identity = verifiable_reward_identity()
+        audit["verifiable_reward_identity"] = reward_identity
+        identity = hashlib.sha256(json.dumps({
+            "corpus": identity,
+            "reward": reward_identity,
+            "response_boundary": "native_special_tokens_prefilled_thinking/v1",
+            "domains": [training_row_domain(row) for row in rows],
+        }, sort_keys=True).encode("utf-8")).hexdigest()
+    return rows, audit, identity
+
+
+def training_row_domain(row: dict) -> str:
+    return row["extra_info"]["domain"] if is_verifiable_task(row) else "legacy_math"
+
+
+def select_corpus_rows(rows: list[dict], *, cursor: int, count: int) -> list[dict]:
+    """Advance one global permutation, without replacement within each full pass."""
+    if not rows or cursor < 0 or not 1 <= count <= len(rows):
+        raise ValueError("rollout requires a nonempty corpus and no repeated prompt per batch")
+    return [rows[(cursor + index) % len(rows)] for index in range(count)]
+
+
+def corpus_progress(cursor: int, size: int) -> dict[str, float | int]:
+    return {
+        "corpus_questions_seen": cursor,
+        "corpus_completed_epochs": cursor // size,
+        "corpus_cursor": cursor % size,
+        "corpus_epoch_progress": (cursor % size) / size,
+    }
+
+
+def validate_resume_dataset(
+    resume: dict[str, Any], data_sha256: str, corpus_identity: str
+) -> None:
     if resume.get("data_sha256") != data_sha256:
         raise ValueError("resume checkpoint was trained from different dataset bytes")
+    if not resume.get("math_corpus_identity"):
+        raise ValueError(
+            "resume checkpoint is missing math_corpus_identity; its old corpus cursor "
+            "cannot be reused for exact resume (actor-only evaluation is unaffected)"
+        )
+    if resume["math_corpus_identity"] != corpus_identity:
+        raise ValueError(
+            "resume checkpoint has a different effective math corpus or question order"
+        )
 
+DEFAULT_ANSWER_RESERVE_TOKENS = 1_000
+
+# Missing metadata in pre-reserve checkpoints must preserve their unforced behavior.
 LEGACY_RESUME_DEFAULTS = {
     "top_k": 20,
     "lora_initialization": "standard",
@@ -142,10 +225,16 @@ LEGACY_RESUME_DEFAULTS = {
     "uno_checkpoint": None,
     "uno_block_size": 4,
     "answer_reserve_tokens": 0,
+    "prompt_suffix": "",
     "latent_thinking": False,
     "token_carry": False,
+    "slot_memory": False,
+    "slot_memory_slots": 64,
+    "slot_memory_heads": 1,
+    "slot_memory_head_dim": 128,
     "thought_sigma": 1.0,
     "init_stop_thinking_probability": 0.9,
+    "behavior_logprobs": "replay",
 }
 
 RESUME_MUTABLE_OPTIONS = frozenset(
@@ -180,14 +269,38 @@ RESUME_MUTABLE_OPTIONS = frozenset(
 )
 
 
+def policy_checkpoint_schema(
+    *, latent_thinking: bool, token_carry: bool, slot_memory: bool
+) -> str:
+    if slot_memory:
+        if not token_carry or latent_thinking:
+            raise ValueError("slot memory requires token carry without latent thinking")
+        return SLOT_MEMORY_SCHEMA
+    if latent_thinking:
+        return "minicpm5_vapo_latent/v1"
+    if token_carry:
+        return "minicpm5_vapo_token_carry/v4"
+    return "minicpm5_vapo_adapter/v6"
+
+
+def slot_memory_config_from_args(args) -> SlotMemoryConfig | None:
+    if not getattr(args, "slot_memory", False):
+        return None
+    return SlotMemoryConfig(
+        slots=int(args.slot_memory_slots),
+        heads=int(args.slot_memory_heads),
+        head_dim=int(args.slot_memory_head_dim),
+    )
+
+
 def validate_resume_configuration(resume: dict[str, Any], args) -> None:
     mutable_options = RESUME_MUTABLE_OPTIONS
     prior_args = resume["args"]
     if "policy" in resume:
-        expected_schema = (
-            "minicpm5_vapo_latent/v1" if args.latent_thinking
-            else "minicpm5_vapo_token_carry/v3" if args.token_carry
-            else "minicpm5_vapo_adapter/v6"
+        expected_schema = policy_checkpoint_schema(
+            latent_thinking=args.latent_thinking,
+            token_carry=args.token_carry,
+            slot_memory=getattr(args, "slot_memory", False),
         )
         if resume["policy"].get("schema") != expected_schema:
             raise ValueError(f"resume checkpoint requires {expected_schema}")
@@ -203,11 +316,13 @@ def validate_resume_configuration(resume: dict[str, Any], args) -> None:
         if name not in mutable_options
         and prior_args.get(name, LEGACY_RESUME_DEFAULTS.get(name)) != value
         and not (
-            name in {"max_new_tokens", "answer_reserve_tokens"}
+            name in {"max_new_tokens", "answer_reserve_tokens", "prompt_suffix"}
             and resume.get("pending_records") is None
+            and prior_args.get("context_tokens") is None
+            and getattr(args, "context_tokens", None) is None
         )
         and not (
-            name == "optimizer_minibatches"
+            name in {"optimizer_minibatches", "behavior_logprobs"}
             and resume.get("pending_records") is None
         )
         and not (
@@ -220,9 +335,14 @@ def validate_resume_configuration(resume: dict[str, Any], args) -> None:
             "resume configuration differs for: " + ", ".join(mismatches)
         )
     if getattr(args, "token_carry", False) and resume.get("pending_records") is not None:
+        slot_config = slot_memory_config_from_args(args)
         for record in resume["pending_records"]:
             if not isinstance(record, TrajectoryRecord) or getattr(record, "carry_hiddens", None) is None:
                 raise ValueError("pending token-carry replay requires stored carry hiddens")
+            if (getattr(record, "slot_choices", None) is None) != (slot_config is None):
+                raise ValueError("pending replay slot-memory mode differs from the run")
+            if slot_config is not None and record.slot_count != slot_config.slots:
+                raise ValueError("pending replay slot count differs from the run")
             record.__post_init__()
     if prior_args.get("uno_rollout", False) and args.uno_rollout:
         expected = prior_args.get("uno_checkpoint_sha256")
@@ -287,16 +407,45 @@ def resolve_thinking_start_token(tokenizer, *, stop_ids: tuple[int, ...]) -> int
     return token_id
 
 
+def _math_prompt_text(row: dict, prompt_suffix: str) -> str:
+    text = prompt_text(row)
+    if is_verifiable_task(row):
+        return text
+    return f"{text}\n\n{prompt_suffix}" if prompt_suffix else text
+
+
 def encode_math_prompt(
     tokenizer,
     row: dict,
     *,
     prompt_tokens: int,
     enable_thinking: bool,
+    prompt_suffix: str = "",
+    truncate_prompt: bool = True,
 ) -> Tensor:
+    if is_verifiable_task(row) and "prompt_token_cap" in row["extra_info"]:
+        row_cap = row["extra_info"]["prompt_token_cap"]
+        if type(row_cap) is not int or row_cap < 1:
+            raise ValueError("prompt_token_cap must be a positive integer")
+        prompt_tokens = min(prompt_tokens, row_cap)
+    if is_verifiable_task(row) or not truncate_prompt:
+        messages = row["prompt"] if is_verifiable_task(row) else [
+            {"role": "user", "content": _math_prompt_text(row, prompt_suffix)}
+        ]
+        encoded = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        ids = list(encoded["input_ids"] if isinstance(encoded, Mapping) else encoded)
+        if not ids or len(ids) > prompt_tokens:
+            raise ValueError(
+                f"Full chat prompt has {len(ids)} tokens, exceeding "
+                f"the configured bound {prompt_tokens}; reprepare instead of truncating"
+            )
+        return torch.tensor(ids, dtype=torch.long)
     ids = prepare_prompt_ids(
         tokenizer,
-        prompt_text(row),
+        _math_prompt_text(row, prompt_suffix),
         prompt_mode="chat",
         prompt_tokens=prompt_tokens,
         enable_thinking=enable_thinking,
@@ -314,6 +463,29 @@ def _first_stop_length(tokens: Tensor, stop_ids: tuple[int, ...]) -> int:
 
 def _decode_text(tokenizer, token_ids: Tensor) -> str:
     return tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+
+
+def score_training_response(
+    tokenizer, row: dict, prompt_ids: Tensor, response: Tensor,
+    *, prefilled_thinking: bool | None = None,
+) -> tuple[str, bool, str]:
+    """Keep native answer boundaries for verifiable tasks and prefilled thinking."""
+    if not is_verifiable_task(row):
+        text = _decode_text(tokenizer, response)
+        correct, _ = verify_answer(
+            text, row["reward_model"]["ground_truth"], answer_style(row),
+        )
+        return text, correct, "correct" if correct else "incorrect"
+    text = tokenizer.decode(response.tolist(), skip_special_tokens=False)
+    # Chat templates can supply <think> outside the generated response. Carry it
+    # into grading so a capped scratchpad cannot masquerade as a final answer.
+    if prefilled_thinking is None:
+        prefix = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
+        prefilled_thinking = prefix.rstrip().endswith("<think>")
+    if prefilled_thinking:
+        text = "<think>" + text
+    correct, reason = score_verifiable_response(row, text)
+    return text, correct, reason
 
 
 
@@ -356,8 +528,10 @@ class RolloutEngine:
         self.answer_reserve_tokens = answer_reserve_tokens
         self.thinking_end_token_id = thinking_end_token_id
         model_config: Any = getattr(policy.causal_lm, "config")
-        if not 0 <= top_k <= int(model_config.vocab_size):
-            raise ValueError("top-k must be zero or fit the model vocabulary")
+        if not -1 <= top_k <= int(model_config.vocab_size):
+            raise ValueError("top-k must be -1, zero, or fit the model vocabulary")
+        if top_k == -1 and top_p != 1.0:
+            raise ValueError("unrestricted top-k sampling requires top-p=1")
         device = next(policy.parameters()).device
         self.estimated_cache_bytes = static_kv_cache_bytes(
             model_config,
@@ -671,12 +845,17 @@ def _build_group_records(
     thinking_end_token_id: int | None = None,
     forced_thinking_position: int = -1,
     carry_hiddens: Sequence[Tensor] | Tensor | None = None,
+    slot_choices: Sequence[Tensor] | Tensor | None = None,
+    slot_count: int = 0,
+    outcome_reasons: list[str] | None = None,
 ) -> tuple[list[TrajectoryRecord], int]:
     """Decode, score, and compact one host-resident prompt group."""
-    truth = row["reward_model"]["ground_truth"]
-    style = answer_style(row)
     records = []
     generated_tokens = 0
+    prefilled_thinking = (
+        tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False).rstrip().endswith("<think>")
+        if is_verifiable_task(row) else False
+    )
     for sample in range(samples_per_prompt):
         response_length = _first_stop_length(responses[sample], stop_ids)
         response = responses[sample, :response_length]
@@ -687,8 +866,11 @@ def _build_group_records(
                 raise RuntimeError("rollout exceeded its thinking budget without closing")
             if int(closed[0, 0]) == forced_thinking_position:
                 forced_token_index = forced_thinking_position
-        text = _decode_text(tokenizer, response)
-        correct, _ = verify_answer(text, truth, style)
+        text, correct, reason = score_training_response(
+            tokenizer, row, prompt_ids, response, prefilled_thinking=prefilled_thinking,
+        )
+        if outcome_reasons is not None:
+            outcome_reasons.append(reason)
         records.append(
             TrajectoryRecord.from_device(
                 token_ids=torch.cat((prompt_ids, response)),
@@ -701,6 +883,10 @@ def _build_group_records(
                 carry_hiddens=(
                     None if carry_hiddens is None else carry_hiddens[sample][:response_length]
                 ),
+                slot_choices=(
+                    None if slot_choices is None else slot_choices[sample][:response_length]
+                ),
+                slot_count=slot_count,
             )
         )
         generated_tokens += response_length
@@ -715,6 +901,8 @@ def collect_rollouts(
     prompt_tokens: int,
     max_new_tokens: int,
     enable_thinking: bool,
+    prompt_suffix: str = "",
+    context_tokens: int | None = None,
     progress_callback: (
         Callable[[int, dict[str, float | int]], None] | None
     ) = None,
@@ -722,9 +910,8 @@ def collect_rollouts(
     answer_reserve = int(getattr(engine, "answer_reserve_tokens", 0))
     if answer_reserve and not enable_thinking:
         raise ValueError("answer reserve requires a thinking-mode rollout")
-    forced_thinking_position = (
-        max_new_tokens - answer_reserve - 1 if answer_reserve else -1
-    )
+    if context_tokens is not None and type(engine) is not CapturedTrainingRolloutEngine:
+        raise ValueError("context_tokens requires the native continuous rollout engine")
     started = time.perf_counter()
     encoded_rows = [
         (
@@ -734,10 +921,18 @@ def collect_rollouts(
                 row,
                 prompt_tokens=prompt_tokens,
                 enable_thinking=enable_thinking,
+                prompt_suffix=prompt_suffix,
+                truncate_prompt=context_tokens is None,
             ),
         )
         for row in rows
     ]
+    prompt_limits = response_token_limits(
+        [int(prompt.numel()) for _, prompt in encoded_rows],
+        max_new_tokens=max_new_tokens, context_tokens=context_tokens,
+        answer_reserve_tokens=answer_reserve,
+        thinking_end_token_id=getattr(engine, "thinking_end_token_id", None),
+    )
     if isinstance(engine, MiniCPMLatentRolloutEngine):
         return collect_latent_rollouts(
             engine, tokenizer, encoded_rows,
@@ -747,9 +942,11 @@ def collect_rollouts(
         continuous = engine.generate_prompt_pool(
             [prompt_ids for _, prompt_ids in encoded_rows],
             max_new_tokens=max_new_tokens,
+            context_tokens=context_tokens,
             progress_callback=progress_callback,
         )
         carry_hiddens = continuous.carry_hiddens
+        slot_choices = continuous.slot_choices
         responses = torch.nn.utils.rnn.pad_sequence(
             list(continuous.responses),
             batch_first=True,
@@ -796,11 +993,15 @@ def collect_rollouts(
             decoding,
         ) = generation
         carry_hiddens = getattr(engine, "last_carry_hiddens", None)
+        slot_choices = getattr(engine, "last_slot_choices", None)
         scheduled_tokens = responses.numel()
         admission_events = 1
         minimum_active_rows_with_backlog = engine.batch_size
     if bool(getattr(engine.policy, "token_carry", False)) != (carry_hiddens is not None):
         raise ValueError("rollout token-carry mode differs from stored carry hiddens")
+    slot_config = getattr(engine.policy, "slot_memory", None)
+    if (slot_config is not None) != (slot_choices is not None):
+        raise ValueError("rollout slot-memory mode differs from stored slot choices")
     invalid_tokens = (responses < 0) | (responses >= MINICPM5_VOCAB_SIZE)
     if invalid_tokens.any():
         coordinates = invalid_tokens.nonzero()[:8].tolist()
@@ -814,6 +1015,8 @@ def collect_rollouts(
 
     records: list[TrajectoryRecord] = []
     generated_tokens = 0
+    group_outcomes: list[list[str]] = [[] for _ in encoded_rows]
+    scoring_started = time.perf_counter()
     with ThreadPoolExecutor(
         max_workers=len(encoded_rows),
         thread_name_prefix="minicpm-vapo-score",
@@ -828,20 +1031,26 @@ def collect_rollouts(
                     tokenizer,
                     row,
                     prompt_ids,
-                    responses[start:stop],
-                    logprobs[start:stop],
-                    values[start:stop],
+                    responses[start:stop, :prompt_limits[group]],
+                    logprobs[start:stop, :prompt_limits[group]],
+                    values[start:stop, :prompt_limits[group]],
                     samples_per_prompt=engine.samples_per_prompt,
                     stop_ids=engine.stop_ids,
                     thinking_end_token_id=getattr(engine, "thinking_end_token_id", None),
-                    forced_thinking_position=forced_thinking_position,
+                    forced_thinking_position=(
+                        prompt_limits[group] - answer_reserve - 1 if answer_reserve else -1
+                    ),
                     carry_hiddens=None if carry_hiddens is None else carry_hiddens[start:stop],
+                    slot_choices=None if slot_choices is None else slot_choices[start:stop],
+                    slot_count=0 if slot_config is None else slot_config.slots,
+                    outcome_reasons=group_outcomes[group],
                 )
             )
         for future in pending:
             group_records, group_tokens = future.result()
             records.extend(group_records)
             generated_tokens += group_tokens
+    scoring_seconds = time.perf_counter() - scoring_started
     top_k = int(getattr(engine, "top_k", 0))
     conditional_mass_lower_bound = nucleus_mass_lower_bound
     return RolloutResult(
@@ -849,16 +1058,22 @@ def collect_rollouts(
         generated_tokens=generated_tokens,
         scheduled_tokens=scheduled_tokens,
         elapsed_seconds=time.perf_counter() - started,
+        scoring_seconds=scoring_seconds,
         sampling_scanned_vocabulary=scanned_vocabulary,
-        sampling_candidate_support=top_k or scanned_vocabulary,
+        sampling_candidate_support=top_k if top_k > 0 else scanned_vocabulary,
         sampling_full_policy_mass_lower_bound=(
-            0.0 if top_k else nucleus_mass_lower_bound
+            0.0 if top_k > 0 else nucleus_mass_lower_bound
         ),
         sampling_conditional_mass_lower_bound=conditional_mass_lower_bound,
         admission_events=admission_events,
         minimum_active_rows_with_backlog=minimum_active_rows_with_backlog,
         decoding=decoding,
         uno_metrics=getattr(engine, "last_uno_metrics", None),
+        group_domains=tuple(training_row_domain(row) for row in rows),
+        outcome_reasons=tuple(reason for group in group_outcomes for reason in group),
+        response_limits=tuple(
+            limit for limit in prompt_limits for _ in range(engine.samples_per_prompt)
+        ),
     )
 
 
@@ -889,16 +1104,18 @@ def collect_latent_rollouts(
         progress_callback=progress_callback,
     )
     records = []
+    outcome_reasons = []
     for index, (response, kinds, vectors, logprobs) in enumerate(zip(
         result.responses, result.action_kinds, result.latent_vectors,
         result.logprobs, strict=True,
     )):
         row, prompt = encoded_rows[index // engine.samples_per_prompt]
         lexical = (kinds != FIRST_THOUGHT) & (kinds != CONTINUE_THOUGHT)
-        text = _decode_text(tokenizer, response[lexical])
-        correct, _ = verify_answer(
-            text, row["reward_model"]["ground_truth"], answer_style(row),
+        text, correct, reason = score_training_response(
+            tokenizer, row, prompt, response[lexical],
+            prefilled_thinking=True,
         )
+        outcome_reasons.append(reason)
         forced = (kinds == FORCED_STOP_THINKING).nonzero().flatten()
         records.append(TrajectoryRecord.from_device(
             token_ids=torch.cat((prompt, response)),
@@ -929,6 +1146,8 @@ def collect_latent_rollouts(
             target_decode_calls=result.decode_steps,
             target_decode_positions=result.capacity_row_steps,
         ),
+        group_domains=tuple(training_row_domain(row) for row, _ in encoded_rows),
+        outcome_reasons=tuple(outcome_reasons),
     )
 
 
@@ -947,6 +1166,14 @@ def rollout_diagnostics(
     terminated = torch.tensor(
         [int(record.token_ids[-1]) in stop_ids for record in records], dtype=torch.float32
     )
+    capped = 1 - terminated
+    if result.response_limits:
+        if len(result.response_limits) != len(records):
+            raise ValueError("response limits must follow every trajectory")
+        limits = torch.tensor(result.response_limits)
+        if bool((lengths > limits).any()) or bool(((capped > 0) & (lengths != limits)).any()):
+            raise ValueError("nonterminal rollout must end at its own response limit")
+    repetition = [repetition_metrics(record.text) for record in records]
     metrics: dict[str, float | int] = {
         "trajectories": len(records),
         "prompt_groups": grouped.shape[0],
@@ -954,7 +1181,7 @@ def rollout_diagnostics(
         "positive_groups": int(grouped.any(dim=1).sum()),
         "mixed_groups": int((grouped.any(dim=1) & ~grouped.all(dim=1)).sum()),
         "accuracy": float(correct.float().mean()),
-        "truncation_fraction": float(1.0 - terminated.mean()),
+        "truncation_fraction": float(capped.mean()),
         "forced_thinking_trajectories": sum(
             record.forced_token_index >= 0 for record in records
         ),
@@ -963,6 +1190,7 @@ def rollout_diagnostics(
         "response_length_max": int(lengths.max()),
         "generated_tokens": result.generated_tokens,
         "rollout_seconds": result.elapsed_seconds,
+        "rollout_scoring_seconds": result.scoring_seconds,
         "rollout_tokens_per_second": result.generated_tokens
         / max(result.elapsed_seconds, 1e-9),
         "scheduled_rollout_tokens_per_second": result.scheduled_tokens
@@ -999,6 +1227,66 @@ def rollout_diagnostics(
             / max(result.decoding.target_decode_calls, 1)
         ),
     }
+    for name in repetition[0]:
+        metrics[f"{name}_mean"] = sum(item[name] for item in repetition) / len(repetition)
+        metrics[f"{name}_max"] = max(item[name] for item in repetition)
+    if result.response_limits:
+        metrics["response_limit_mean"] = float(limits.float().mean())
+        metrics["response_limit_min"] = int(limits.min())
+        metrics["response_limit_max"] = int(limits.max())
+    if result.group_domains:
+        if len(result.group_domains) != grouped.shape[0]:
+            raise ValueError("domain metadata must follow complete prompt-major groups")
+        if len(result.outcome_reasons) != len(records):
+            raise ValueError("outcome metadata must follow every prompt-major trajectory")
+        for domain in sorted(set(result.group_domains)):
+            groups = [
+                index for index, value in enumerate(result.group_domains) if value == domain
+            ]
+            indices = [
+                group * samples_per_prompt + sample
+                for group in groups for sample in range(samples_per_prompt)
+            ]
+            domain_correct = correct[indices]
+            domain_grouped = grouped[groups]
+            domain_lengths = lengths[indices].float()
+            domain_metrics = {
+                "attempts": len(indices),
+                "correct": int(domain_correct.sum()),
+                "accuracy": float(domain_correct.float().mean()),
+                "prompt_groups": len(groups),
+                "positive_groups": int(domain_grouped.any(dim=1).sum()),
+                "mixed_groups": int((
+                    domain_grouped.any(dim=1) & ~domain_grouped.all(dim=1)
+                ).sum()),
+                "response_length_mean": float(domain_lengths.mean()),
+                "response_length_p95": float(torch.quantile(domain_lengths, 0.95)),
+                "response_length_max": int(domain_lengths.max()),
+                "capped_trajectories": int(capped[indices].sum()),
+                "truncation_fraction": float(capped[indices].mean()),
+                "forced_thinking_trajectories": sum(
+                    records[index].forced_token_index >= 0 for index in indices
+                ),
+            }
+            for name in repetition[0]:
+                domain_metrics[f"{name}_mean"] = (
+                    sum(repetition[index][name] for index in indices) / len(indices)
+                )
+                domain_metrics[f"{name}_max"] = max(
+                    repetition[index][name] for index in indices
+                )
+            if result.response_limits:
+                domain_metrics["response_limit_mean"] = float(limits[indices].float().mean())
+                domain_metrics["response_limit_min"] = int(limits[indices].min())
+                domain_metrics["response_limit_max"] = int(limits[indices].max())
+            domain_metrics.update({
+                f"outcome/{reason}": count for reason, count in Counter(
+                    result.outcome_reasons[index] for index in indices
+                ).items()
+            })
+            metrics.update({
+                f"domain/{domain}/{name}": value for name, value in domain_metrics.items()
+            })
     latent_records = [record for record in records if record.action_kinds is not None]
     if latent_records:
         from postraining.minicpm_vapo import TOKEN_ACTION, STOP_THINKING
@@ -1240,6 +1528,8 @@ def _replay_hidden(
         raise ValueError("replay reasoning mode differs from actor or critic")
     if bool(getattr(side, "token_carry", False)) != (batch.carry_hiddens is not None):
         raise ValueError("replay token-carry mode differs from stored carry hiddens")
+    if (getattr(side, "slot_memory", None) is not None) != (batch.slot_alive_table is not None):
+        raise ValueError("replay slot-memory mode differs from stored slot choices")
     if getattr(side, "token_carry", False):
         return side.token_carry_replay_hidden(batch)
     latent_inputs = {}
@@ -1259,12 +1549,81 @@ def _replay_hidden(
     )
 
 
+def _packed_action_rows(hidden: Tensor, batch: ReplayMicrobatch) -> Tensor:
+    """Gather action-position rows from the single packed replay row.
+
+    Values match advanced indexing exactly; the backward is one ``index_add``
+    over unique positions (also exact) instead of the sort-based accumulate
+    path that advanced indexing schedules.
+    """
+    if hidden.size(0) != 1:
+        raise ValueError("packed replay hidden states must be a single row")
+    return hidden[0].index_select(0, batch.action_positions)
+
+
 def _action_logprobs(policy, hidden: Tensor, batch, *, chunk_tokens: int) -> Tensor:
     if getattr(batch, "action_kinds", None) is not None:
         return policy.action_logprobs(hidden, batch, chunk_tokens=chunk_tokens)
-    return chunked_frozen_head_logprobs(
+    logprobs = chunked_frozen_head_logprobs(
         hidden, batch.targets, policy.lm_head_weight, chunk_tokens=chunk_tokens,
     )
+    slot_actions = getattr(batch, "slot_actions", None)
+    if (getattr(policy, "slot_memory", None) is not None) != (slot_actions is not None):
+        raise ValueError("slot-memory likelihood requires recorded slot choices")
+    if slot_actions is not None:
+        # Joint action: log pi(x_t, sigma_t | m_t) = log pi_tok + log pi_slot.
+        # The terminal slot choice is never read and carries no credit.
+        slot_logprobs = policy.slot_head.log_prob(hidden, slot_actions)
+        logprobs = logprobs + torch.where(
+            batch.slot_action_mask, slot_logprobs, torch.zeros_like(slot_logprobs)
+        )
+    return logprobs
+
+
+@torch.no_grad()
+def _carry_scale_statistics(scale: Tensor) -> dict[str, Tensor]:
+    return {
+        "scale_mean": scale.mean(),
+        "scale_min": scale.amin(),
+        "scale_max": scale.amax(),
+        "scale_rms": scale.square().mean().sqrt(),
+    }
+
+
+@torch.no_grad()
+def _slot_read_probe(side, batch: ReplayMicrobatch, indices: Tensor, embeddings: Tensor) -> dict[str, float]:
+    """Dense-read probe of sampled query rows against their full recorded key set."""
+    combiner = side.token_combiner
+    carries = batch.carry_hiddens
+    with torch.autocast(device_type=embeddings.device.type, dtype=torch.bfloat16):
+        queries = combiner.queries(embeddings, carries[indices], batch.slot_positions[indices])
+        keys, values = combiner.keys_values(carries, batch.slot_positions)
+        visible = visibility_reference(batch.slot_alive_table[indices], batch.slot_key_choices)
+        read = combiner.read_dense(queries, keys, values, visible)
+        scores = torch.einsum("nhd,khd->nhk", queries.float(), keys.float()) * combiner.score_scale
+        scores = scores.masked_fill(~visible[:, None, :], float("-inf"))
+        full = torch.cat((combiner.null_logits(queries)[..., None], scores), dim=-1).softmax(dim=-1)
+        token_delta = combiner.token_delta(embeddings)
+        read_delta = F.linear(read.to(embeddings.dtype), combiner.output.weight.to(embeddings.dtype))
+        residual = token_delta + read_delta
+    scale = combiner.scale
+    ages = (batch.slot_positions[indices][:, None] - batch.slot_positions[None]).float().clamp_min(0)
+    key_mass = full[..., 1:]
+    token_rms = embeddings.float().square().mean().sqrt()
+    scaled_read = (read_delta.float() * scale).to(embeddings.dtype).float()
+    scaled_residual = (residual.float() * scale).to(embeddings.dtype).float()
+    statistics = _carry_scale_statistics(scale) | {
+        "probe_token_rms": token_rms,
+        "probe_hidden_rms": carries[indices].float().square().mean().sqrt(),
+        "probe_scaled_read_rms": scaled_read.square().mean().sqrt(),
+        "probe_read_to_token_rms": scaled_read.square().mean().sqrt() / token_rms.clamp_min(1e-12),
+        "probe_residual_to_token_rms": scaled_residual.square().mean().sqrt() / token_rms.clamp_min(1e-12),
+        "probe_null_mass": full[..., 0].mean(),
+        "probe_visible_keys_mean": visible.sum(dim=1).float().mean(),
+        "probe_read_age_mean": (key_mass * ages[:, None, :]).sum(dim=-1).mean(),
+    }
+    values_list = torch.stack(tuple(statistics.values())).cpu().tolist()
+    return dict(zip(statistics, values_list, strict=True))
 
 
 @torch.no_grad()
@@ -1280,22 +1639,27 @@ def _carry_input_probe(side, batch: ReplayMicrobatch) -> dict[str, float]:
     embeddings = side.token_embeddings(batch.input_ids[0, positions[indices]])
     carries = batch.carry_hiddens[indices]
     combiner = side.token_combiner
+    if getattr(side, "slot_memory", None) is not None:
+        return _slot_read_probe(side, batch, indices, embeddings)
     with torch.autocast(device_type=embeddings.device.type, dtype=torch.bfloat16):
-        token_delta = combiner.token_delta(embeddings).float()
-        carry_delta = combiner.carry(carries.to(embeddings.dtype)).float()
-    gate = combiner.gate_logit.sigmoid()
+        token_delta = combiner.token_delta(embeddings)
+        carry_delta = combiner.carry(carries.to(embeddings.dtype))
+        residual = token_delta + carry_delta
+    scale = combiner.scale
     token_rms = embeddings.float().square().mean().sqrt()
-    carry_rms = (gate * carry_delta).square().mean().sqrt()
-    residual_rms = (gate * (token_delta + carry_delta)).square().mean().sqrt()
-    values = torch.stack((
-        gate, token_rms, carries.float().square().mean().sqrt(),
-        carry_rms, carry_rms / token_rms.clamp_min(1e-12),
-        residual_rms / token_rms.clamp_min(1e-12),
-    )).cpu().tolist()
-    return dict(zip((
-        "gate", "probe_token_rms", "probe_hidden_rms", "probe_gated_carry_rms",
-        "probe_carry_to_token_rms", "probe_residual_to_token_rms",
-    ), values, strict=True))
+    scaled_carry = (carry_delta.float() * scale).to(embeddings.dtype).float()
+    scaled_residual = (residual.float() * scale).to(embeddings.dtype).float()
+    carry_rms = scaled_carry.square().mean().sqrt()
+    residual_rms = scaled_residual.square().mean().sqrt()
+    statistics = _carry_scale_statistics(scale) | {
+        "probe_token_rms": token_rms,
+        "probe_hidden_rms": carries.float().square().mean().sqrt(),
+        "probe_scaled_carry_rms": carry_rms,
+        "probe_carry_to_token_rms": carry_rms / token_rms.clamp_min(1e-12),
+        "probe_residual_to_token_rms": residual_rms / token_rms.clamp_min(1e-12),
+    }
+    values = torch.stack(tuple(statistics.values())).cpu().tolist()
+    return dict(zip(statistics, values, strict=True))
 
 
 @torch.no_grad()
@@ -1307,8 +1671,16 @@ def refresh_behavior_statistics(
     replay_token_budget: int,
     replay_max_trajectories: int,
     logit_chunk_tokens: int,
+    behavior_logprobs: str = "replay",
 ) -> tuple[list[TrajectoryRecord], dict[str, float | int]]:
-    """Materialize replay-consistent behavior log-probabilities and values."""
+    """Materialize replay-consistent behavior log-probabilities and values.
+
+    ``behavior_logprobs="rollout"`` keeps the exact log-probabilities the
+    rollout engine captured and replays only the independent critic.
+    """
+    if behavior_logprobs not in {"replay", "rollout"}:
+        raise ValueError("behavior_logprobs must be replay or rollout")
+    replay_actor = behavior_logprobs == "replay"
     if not records:
         raise ValueError("cannot refresh an empty rollout")
     started = time.perf_counter()
@@ -1333,20 +1705,21 @@ def refresh_behavior_statistics(
         batch = collate_replay_microbatch(
             records, indices, pad_token_id=pad_token_id, device=device,
         )
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            actor_hidden = _replay_hidden(policy, batch)
-            actor_actions = actor_hidden[
-                batch.action_batch_indices, batch.action_positions
-            ]
-            old_logprobs = _action_logprobs(
-                policy, actor_actions, batch, chunk_tokens=logit_chunk_tokens,
-            )
-        del actor_hidden, actor_actions
+        if replay_actor:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                actor_hidden = _replay_hidden(policy, batch)
+                actor_actions = _packed_action_rows(actor_hidden, batch)
+                old_logprobs = _action_logprobs(
+                    policy, actor_actions, batch, chunk_tokens=logit_chunk_tokens,
+                )
+            del actor_hidden, actor_actions
+        else:
+            old_logprobs = torch.cat(
+                [records[record_index].old_logprobs for record_index in indices]
+            ).to(device, non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             critic_hidden = _replay_hidden(critic, batch)
-            critic_actions = critic_hidden[
-                batch.action_batch_indices, batch.action_positions
-            ]
+            critic_actions = _packed_action_rows(critic_hidden, batch)
             old_values = critic.values(critic_actions).float()
         cursor = 0
         for record_index in indices:
@@ -1374,6 +1747,14 @@ def refresh_behavior_statistics(
                 advantages=_precompute_advantages(old_values, record.correct),
             )
         )
+    if getattr(policy, "slot_memory", None) is not None:
+        carry_metrics.update({
+            f"slot_{key}": value
+            for key, value in slot_choice_statistics(
+                [record.slot_choices for record in records if record.slot_choices is not None],
+                policy.slot_memory.slots,
+            ).items()
+        })
     return refreshed, {
         "behavior_refresh_seconds": time.perf_counter() - started,
         "behavior_refresh_microbatches": len(plan),
@@ -1410,9 +1791,7 @@ def measure_post_update_behavior_kl(
         )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             hidden = _replay_hidden(policy, batch)
-            action_hidden = hidden[
-                batch.action_batch_indices, batch.action_positions
-            ]
+            action_hidden = _packed_action_rows(hidden, batch)
             logprobs = _action_logprobs(
                 policy, action_hidden, batch, chunk_tokens=logit_chunk_tokens,
             )
@@ -1473,6 +1852,7 @@ _ROLLOUT_PERFORMANCE_TAGS = {
     for name in (
         "generated_tokens",
         "rollout_seconds",
+        "rollout_scoring_seconds",
         "rollout_tokens_per_second",
         "scheduled_rollout_tokens_per_second",
         "prefill_seconds",
@@ -1564,6 +1944,20 @@ _LIVE_TAGS = {
 
 
 def _organized_tensorboard_tag(namespace: str, name: str) -> str | None:
+    if name.startswith(("repetition_", "response_limit_")) and namespace in {
+        "rollout", "rollout_gate", "value_warmup",
+    }:
+        phase = "_warmup" if namespace == "value_warmup" else ""
+        return f"rollout_quality{phase}/{name}"
+    if name.startswith("corpus_"):
+        return f"corpus/{name.removeprefix('corpus_')}"
+    if name.startswith("domain/") and namespace in {
+        "rollout", "rollout_gate", "value_warmup",
+    }:
+        phase = "_warmup" if namespace == "value_warmup" else ""
+        return f"rollout_domains{phase}/{name.removeprefix('domain/')}"
+    if namespace == "corpus":
+        return f"corpus/{name}"
     if name.startswith("uno_") and namespace in {
         "rollout", "rollout_gate", "value_warmup", "rollout_live", "value_warmup_live"
     }:
@@ -1655,10 +2049,14 @@ def tensorboard_rollout_samples(
     *,
     samples_per_prompt: int,
     step: int,
+    prompt_suffix: str = "",
+    response_limits: Sequence[int] = (),
 ) -> None:
     """Publish one correct and one incorrect training response as text."""
     if len(records) != len(rows) * samples_per_prompt:
         raise ValueError("rollout samples do not match their prompt groups")
+    if response_limits and len(response_limits) != len(records):
+        raise ValueError("sample response limits do not match their trajectories")
     selected: dict[str, int] = {}
     for index, record in enumerate(records):
         label = "correct" if record.correct else "incorrect"
@@ -1670,7 +2068,12 @@ def tensorboard_rollout_samples(
             (
                 f"Reward: {1 if record.correct else -1}",
                 f"Response tokens: {record.response_length}",
-                f"Prompt:\n{prompt_text(row)}",
+                *((
+                    f"Response limit: {response_limits[index]}",
+                    f"Prompt tokens: {record.prompt_length}",
+                ) if response_limits else ()),
+                f"Repetition: {json.dumps(repetition_metrics(record.text), sort_keys=True)}",
+                f"Prompt:\n{_math_prompt_text(row, prompt_suffix)}",
                 f"Ground truth:\n{row['reward_model']['ground_truth']}",
                 f"Model response:\n{record.text}",
             )
@@ -1734,6 +2137,41 @@ _PARAMETER_GRADIENT_STORAGE_SCALE = 1e-20
 _AUXILIARY_TRUNK_PROBE_SCALE = 1e-20
 
 
+class _GradientHealth:
+    """Device-side finiteness flags resolved once per optimizer step.
+
+    Per-shard ``bool(torch.isfinite(...))`` checks drained the launch queue
+    hundreds of times per update; the flags accumulate on the device instead
+    and ``check`` raises the same errors at the clip boundary.
+    """
+
+    _NAMES = (
+        "primary parameter gradient norm",
+        "auxiliary parameter gradient norm",
+        "stored auxiliary-head gradient",
+        "hidden gradient norm",
+    )
+
+    def __init__(self, device: torch.device | str | None = None) -> None:
+        self.flags = torch.zeros(len(self._NAMES), dtype=torch.bool, device=device)
+
+    def record(self, index: int, finite: Tensor) -> None:
+        self.flags[index] |= ~finite.to(self.flags.device)
+
+    def check(self) -> None:
+        for name, failed in zip(self._NAMES, self.flags.tolist(), strict=True):
+            if failed:
+                raise RuntimeError(f"{name} is non-finite")
+
+
+def _gradient_device(*gradient_lists: Sequence[Tensor | None]) -> torch.device | None:
+    for gradients in gradient_lists:
+        for gradient in gradients:
+            if gradient is not None:
+                return gradient.device
+    return None
+
+
 @torch.no_grad()
 def _pop_parameter_gradients(
     parameters: Sequence[Tensor],
@@ -1746,30 +2184,35 @@ def _pop_parameter_gradients(
 
 
 @torch.no_grad()
-def _gradient_list_norm(gradients: list[Tensor | None]) -> Tensor:
-    component_norms = [
-        torch.linalg.vector_norm(gradient, dtype=torch.float64)
-        for gradient in gradients
-        if gradient is not None
-    ]
-    if not component_norms:
+def _gradient_list_norm(gradients: Sequence[Tensor | None]) -> Tensor:
+    present = [gradient for gradient in gradients if gradient is not None]
+    if not present:
         return torch.zeros((), dtype=torch.float64)
-    return torch.linalg.vector_norm(torch.stack(component_norms))
+    return torch.linalg.vector_norm(
+        torch.stack(torch._foreach_norm(present, dtype=torch.float64))
+    )
 
 
 @torch.no_grad()
 def _combine_balanced_hidden_gradients_(
-    primary: Tensor, auxiliary: Tensor
+    primary: Tensor, auxiliary: Tensor, *, health: _GradientHealth | None = None
 ) -> Tensor:
-    """Merge two stored-scale hidden VJPs without amplifying the auxiliary."""
+    """Merge two stored-scale hidden VJPs without amplifying the auxiliary.
+
+    With ``health`` the finiteness guard is a deferred device flag (no host
+    sync per shard); without it the guard raises immediately.
+    """
     if primary.shape != auxiliary.shape:
         raise ValueError("hidden gradients must have matching shapes")
     primary_norm = torch.linalg.vector_norm(primary, dtype=torch.float64)
     auxiliary_norm = torch.linalg.vector_norm(auxiliary, dtype=torch.float64)
-    if not torch.isfinite(primary_norm):
-        raise RuntimeError("primary hidden gradient norm is non-finite")
-    if not torch.isfinite(auxiliary_norm):
-        raise RuntimeError("auxiliary hidden gradient norm is non-finite")
+    if health is not None:
+        health.record(3, primary_norm.isfinite() & auxiliary_norm.isfinite())
+    else:
+        if not torch.isfinite(primary_norm):
+            raise RuntimeError("primary hidden gradient norm is non-finite")
+        if not torch.isfinite(auxiliary_norm):
+            raise RuntimeError("auxiliary hidden gradient norm is non-finite")
     coefficient = torch.where(
         auxiliary_norm > 0,
         torch.minimum(
@@ -1792,49 +2235,70 @@ def _accumulate_balanced_parameter_gradients_(
     primary_scale: float = 1.0,
     probe_scale: float = _AUXILIARY_TRUNK_PROBE_SCALE,
     storage_scale: float = 1.0,
+    health: _GradientHealth | None = None,
 ) -> None:
-    """Accumulate balanced gradients at a common finite storage scale."""
+    """Accumulate balanced gradients at a common finite storage scale.
+
+    Without ``health`` the finiteness guard resolves immediately; with it the
+    caller resolves the deferred device flags later.
+    """
     if not 0.0 < primary_scale <= 1.0:
         raise ValueError("primary_scale must be in (0, 1]")
     if not 0.0 < probe_scale <= 1.0:
         raise ValueError("probe_scale must be in (0, 1]")
     if not 0.0 < storage_scale <= 1.0:
         raise ValueError("storage_scale must be in (0, 1]")
-    primary_norm = _gradient_list_norm(primary_gradients) / primary_scale
-    auxiliary_probe_norm = _gradient_list_norm(auxiliary_probe_gradients)
-    if not torch.isfinite(primary_norm):
-        raise RuntimeError("primary parameter gradient norm is non-finite")
-    if not torch.isfinite(auxiliary_probe_norm):
-        raise RuntimeError("auxiliary parameter gradient norm is non-finite")
-    if auxiliary_probe_norm == 0:
-        auxiliary_coefficient = torch.zeros((), dtype=torch.float64)
-    else:
-        auxiliary_coefficient = torch.minimum(
-            torch.tensor(1.0 / probe_scale, dtype=torch.float64),
-            primary_norm / auxiliary_probe_norm,
+    resolve_now = health is None
+    if health is None:
+        health = _GradientHealth(
+            _gradient_device(primary_gradients, auxiliary_probe_gradients)
         )
+    primary_norm = _gradient_list_norm(primary_gradients) / primary_scale
+    health.record(0, primary_norm.isfinite())
     primary_storage_coefficient = storage_scale / primary_scale
-    auxiliary_storage_coefficient = auxiliary_coefficient * storage_scale
-    for index, (primary, auxiliary) in enumerate(
-        zip(primary_gradients, auxiliary_probe_gradients, strict=True)
-    ):
-        if primary is None and auxiliary is None:
-            continue
-        if accumulator[index] is None:
-            source = primary if primary is not None else auxiliary
-            assert source is not None
-            accumulator[index] = torch.zeros_like(source)
-        accumulated = accumulator[index]
-        assert accumulated is not None
-        if primary is not None:
-            accumulated.add_(primary, alpha=primary_storage_coefficient)
-        if auxiliary is not None:
-            accumulated.add_(
-                auxiliary
-                * auxiliary_storage_coefficient.to(
-                    device=auxiliary.device, dtype=auxiliary.dtype
-                )
-            )
+    for index, primary in enumerate(primary_gradients):
+        if primary is not None and accumulator[index] is None:
+            accumulator[index] = torch.zeros_like(primary)
+    primary_pairs = [
+        (accumulator[index], primary)
+        for index, primary in enumerate(primary_gradients)
+        if primary is not None
+    ]
+    if primary_pairs:
+        torch._foreach_add_(
+            [accumulated for accumulated, _ in primary_pairs],
+            [primary for _, primary in primary_pairs],
+            alpha=primary_storage_coefficient,
+        )
+    auxiliary_present = [
+        (index, auxiliary)
+        for index, auxiliary in enumerate(auxiliary_probe_gradients)
+        if auxiliary is not None
+    ]
+    if auxiliary_present:
+        auxiliary_probe_norm = _gradient_list_norm(auxiliary_probe_gradients)
+        health.record(1, auxiliary_probe_norm.isfinite())
+        # Zero probes contribute nothing; the unselected division is discarded.
+        auxiliary_coefficient = torch.where(
+            auxiliary_probe_norm > 0,
+            torch.minimum(
+                torch.full_like(auxiliary_probe_norm, 1.0 / probe_scale),
+                primary_norm.to(auxiliary_probe_norm.device) / auxiliary_probe_norm,
+            ),
+            torch.zeros_like(auxiliary_probe_norm),
+        )
+        for index, auxiliary in auxiliary_present:
+            if accumulator[index] is None:
+                accumulator[index] = torch.zeros_like(auxiliary)
+        torch._foreach_add_(
+            [accumulator[index] for index, _ in auxiliary_present],
+            torch._foreach_mul(
+                [auxiliary for _, auxiliary in auxiliary_present],
+                auxiliary_coefficient * storage_scale,
+            ),
+        )
+    if resolve_now:
+        health.check()
 
 @torch.no_grad()
 def _accumulate_rescaled_parameter_gradients_(
@@ -1843,22 +2307,44 @@ def _accumulate_rescaled_parameter_gradients_(
     *,
     probe_scale: float = _AUXILIARY_TRUNK_PROBE_SCALE,
     storage_scale: float = 1.0,
+    health: _GradientHealth | None = None,
 ) -> None:
     """Accumulate a loss-scaled gradient at the requested storage scale."""
     if not 0.0 < storage_scale <= 1.0:
         raise ValueError("storage_scale must be in (0, 1]")
-    restore_to_storage = storage_scale / probe_scale
-    for index, gradient in enumerate(probe_gradients):
-        if gradient is None:
-            continue
-        stored = gradient * restore_to_storage
-        if not torch.isfinite(stored).all():
-            raise RuntimeError("stored auxiliary-head gradient is non-finite")
-        accumulated = accumulator[index]
-        if accumulated is None:
-            accumulator[index] = stored
-        else:
-            accumulated.add_(stored)
+    present = [
+        (index, gradient)
+        for index, gradient in enumerate(probe_gradients)
+        if gradient is not None
+    ]
+    if not present:
+        return
+    resolve_now = health is None
+    if health is None:
+        health = _GradientHealth(present[0][1].device)
+    stored = torch._foreach_mul(
+        [gradient for _, gradient in present], storage_scale / probe_scale
+    )
+    # A finite fp64 norm certifies every fp32 element is finite.
+    health.record(
+        2,
+        torch.stack(torch._foreach_norm(stored, dtype=torch.float64)).isfinite().all(),
+    )
+    existing = [
+        (accumulator[index], value)
+        for (index, _), value in zip(present, stored, strict=True)
+        if accumulator[index] is not None
+    ]
+    if existing:
+        torch._foreach_add_(
+            [accumulated for accumulated, _ in existing],
+            [value for _, value in existing],
+        )
+    for (index, _), value in zip(present, stored, strict=True):
+        if accumulator[index] is None:
+            accumulator[index] = value
+    if resolve_now:
+        health.check()
 
 
 @torch.no_grad()
@@ -1884,11 +2370,9 @@ def _clip_finite_grad_norm_(
     ]
     if not gradients:
         return torch.zeros((), dtype=torch.float64)
-    component_norms = [
-        torch.linalg.vector_norm(gradient, dtype=torch.float64)
-        for gradient in gradients
-    ]
-    stored_norm = torch.linalg.vector_norm(torch.stack(component_norms))
+    stored_norm = torch.linalg.vector_norm(
+        torch.stack(torch._foreach_norm(gradients, dtype=torch.float64))
+    )
     total_norm = stored_norm / gradient_scale
     if not torch.isfinite(total_norm):
         failure_indices = [
@@ -1908,8 +2392,7 @@ def _clip_finite_grad_norm_(
     coefficient = (
         (max_norm / (total_norm + 1e-6)).clamp(max=1.0) / gradient_scale
     )
-    for gradient in gradients:
-        gradient.mul_(coefficient.to(dtype=gradient.dtype))
+    torch._foreach_mul_(gradients, coefficient)
     return total_norm
 
 
@@ -2027,6 +2510,8 @@ def update_step(
 
     for optimizer_indices in minibatches:
         minibatch_records = [records[index] for index in optimizer_indices]
+        # Normalize every memory shard by the entire optimizer batch. Never
+        # average shard means: unequal lengths and forced actions change weights.
         minibatch_actions = sum(
             record.response_length for record in minibatch_records
         )
@@ -2055,6 +2540,8 @@ def update_step(
         critic_nextlat_accumulator: list[Tensor | None] = [
             None
         ] * len(critic_nextlat_parameters)
+        actor_health = _GradientHealth(device)
+        critic_health = _GradientHealth(device)
         nextlat_budgets = _nextlat_shard_samples(
             [
                 sum(
@@ -2092,9 +2579,7 @@ def update_step(
                         if hidden_trunk_balance
                         else actor_hidden
                     )
-                    actor_actions = actor_primary_hidden[
-                        batch.action_batch_indices, batch.action_positions
-                    ]
+                    actor_actions = _packed_action_rows(actor_primary_hidden, batch)
                     new_logprobs = _action_logprobs(
                         policy, actor_actions, batch, chunk_tokens=logit_chunk_tokens,
                     )
@@ -2158,12 +2643,14 @@ def update_step(
                         actor_nextlat_accumulator,
                         actor_nextlat_probe_gradients,
                         storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                        health=actor_health,
                     )
                     assert actor_nextlat_hidden.grad is not None
                     actor_hidden.backward(
                         _combine_balanced_hidden_gradients_(
                             actor_primary_hidden.grad,
                             actor_nextlat_hidden.grad,
+                            health=actor_health,
                         )
                     )
                     del actor_nextlat_probe_gradients
@@ -2193,6 +2680,7 @@ def update_step(
                             actor_nextlat_accumulator,
                             actor_nextlat_probe_gradients,
                             storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                            health=actor_health,
                         )
                         assert actor_nextlat_hidden.grad is not None
                         actor_hidden.backward(actor_nextlat_hidden.grad)
@@ -2206,6 +2694,7 @@ def update_step(
                     actor_auxiliary_probe_gradients,
                     primary_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
                     storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                    health=actor_health,
                 )
                 totals["policy_numerator"] += (
                     -objective.detach().double().sum()
@@ -2284,9 +2773,7 @@ def update_step(
                     if hidden_trunk_balance
                     else critic_hidden
                 )
-                critic_actions = critic_primary_hidden[
-                    batch.action_batch_indices, batch.action_positions
-                ]
+                critic_actions = _packed_action_rows(critic_primary_hidden, batch)
                 predictions = critic.values(critic_actions).float()
                 value_loss = F.mse_loss(
                     predictions, batch.value_targets, reduction="sum"
@@ -2346,12 +2833,14 @@ def update_step(
                     critic_nextlat_accumulator,
                     critic_nextlat_probe_gradients,
                     storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                    health=critic_health,
                 )
                 assert critic_nextlat_hidden.grad is not None
                 critic_hidden.backward(
                     _combine_balanced_hidden_gradients_(
                         critic_primary_hidden.grad,
                         critic_nextlat_hidden.grad,
+                        health=critic_health,
                     )
                 )
                 del critic_nextlat_probe_gradients
@@ -2381,6 +2870,7 @@ def update_step(
                         critic_nextlat_accumulator,
                         critic_nextlat_probe_gradients,
                         storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                        health=critic_health,
                     )
                     assert critic_nextlat_hidden.grad is not None
                     critic_hidden.backward(critic_nextlat_hidden.grad)
@@ -2394,6 +2884,7 @@ def update_step(
                 critic_auxiliary_probe_gradients,
                 primary_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
                 storage_scale=_PARAMETER_GRADIENT_STORAGE_SCALE,
+                health=critic_health,
             )
             residuals = predictions.detach() - batch.value_targets
             totals["value_numerator"] += residuals.double().square().sum()
@@ -2445,6 +2936,7 @@ def update_step(
             critic_nextlat_parameters, critic_nextlat_accumulator
         )
         if not value_only and minibatch_policy_actions:
+            actor_health.check()
             actor_grad_norms.append(
                 _clip_finite_grad_norm_(
                     actor_parameters,
@@ -2454,6 +2946,7 @@ def update_step(
                 )
             )
             actor_optimizer.step()
+        critic_health.check()
         critic_grad_norms.append(
             _clip_finite_grad_norm_(
                 critic_parameters,
@@ -2540,8 +3033,13 @@ def update_step(
     policy.eval()
     critic.eval()
     if getattr(policy, "token_carry", False):
-        metrics["carry_actor_gate"] = float(policy.token_combiner.gate_logit.detach().sigmoid())
-        metrics["carry_critic_gate"] = float(critic.token_combiner.gate_logit.detach().sigmoid())
+        scale_statistics = {
+            f"carry_{name}_{key}": value
+            for name, side in (("actor", policy), ("critic", critic))
+            for key, value in _carry_scale_statistics(side.token_combiner.scale).items()
+        }
+        scale_values = torch.stack(tuple(scale_statistics.values())).cpu().tolist()
+        metrics.update(zip(scale_statistics, scale_values, strict=True))
     if value_only:
         return metrics
     policy_count = float(max(total_policy_actions, 1))
@@ -2596,16 +3094,15 @@ def save_checkpoint(
     pending_epoch: int,
     args,
     data_sha256: str,
+    corpus_identity: str,
 ) -> None:
     atomic_torch_save(
         {
             "policy": {
-                "schema": (
-                    "minicpm5_vapo_latent/v1"
-                    if getattr(policy, "latent_thinking", False)
-                    else "minicpm5_vapo_token_carry/v3"
-                    if getattr(policy, "token_carry", False)
-                    else "minicpm5_vapo_adapter/v6"
+                "schema": policy_checkpoint_schema(
+                    latent_thinking=bool(getattr(policy, "latent_thinking", False)),
+                    token_carry=bool(getattr(policy, "token_carry", False)),
+                    slot_memory=getattr(policy, "slot_memory", None) is not None,
                 ),
                 "actor": policy.checkpoint_payload(),
                 "critic": critic.checkpoint_payload(),
@@ -2619,6 +3116,7 @@ def save_checkpoint(
             "pending_epoch": pending_epoch,
             "args": vars(args).copy(),
             "data_sha256": data_sha256,
+            "math_corpus_identity": corpus_identity,
             "cpu_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state(),
             "python_rng": random.getstate(),
@@ -2632,7 +3130,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=MINICPM5_MODEL_ID)
     parser.add_argument("--revision", default=MINICPM5_REVISION)
     parser.add_argument("--data", default="postraining/data/dapo-math-17k.parquet")
-    parser.add_argument("--output", default="postraining/runs/minicpm5_vapo")
+    parser.add_argument(
+        "--output",
+        default="postraining/runs/minicpm5_vapo",
+        help="run directory beneath postraining/runs/ (parameter-golf-postraining dashboard)",
+    )
     parser.add_argument("--steps", type=int, default=1_000)
     parser.add_argument("--value-warmup-steps", type=int, default=10)
     parser.add_argument("--prompts-per-rollout", type=int, default=4)
@@ -2644,12 +3146,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="physical continuous-decode lanes; zero uses every logical row",
     )
     parser.add_argument("--prompt-tokens", type=int, default=1_024)
+    parser.add_argument(
+        "--prompt-suffix", default="",
+        help="append to legacy math prompts; canonical task prompts own their instructions",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=10_000)
+    parser.add_argument(
+        "--context-tokens", type=int, default=None,
+        help="total full-chat prompt plus response budget; omitted preserves legacy response-only limits",
+    )
     parser.add_argument(
         "--answer-reserve-tokens",
         type=int,
-        default=1_000,
-        help="reserve this many tokens after forced </think> inside --max-new-tokens; zero disables",
+        default=DEFAULT_ANSWER_RESERVE_TOKENS,
+        help="reserve tokens after forced </think> inside each prompt's response allowance; zero disables",
     )
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -2657,7 +3167,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=20,
-        help="sample inside this top-k set; zero enables exact full-vocabulary top-p",
+        help="positive: bounded top-k; -1: full categorical (requires top-p=1); zero: slow exact top-p",
     )
     parser.set_defaults(thinking=True)
     parser.add_argument(
@@ -2668,6 +3178,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-carry", action=argparse.BooleanOptionalAction, default=False,
         help="sample tokens with a gated residual over token embeddings and detached carry",
     )
+    parser.add_argument(
+        "--slot-memory", action=argparse.BooleanOptionalAction, default=False,
+        help="with --token-carry: joint (token, slot) actions over M overwrite slots read by softmax",
+    )
+    parser.add_argument("--slot-memory-slots", type=int, default=64)
+    parser.add_argument("--slot-memory-heads", type=int, default=1)
+    parser.add_argument("--slot-memory-head-dim", type=int, default=128)
     parser.add_argument("--thought-sigma", type=float, default=1.0)
     parser.add_argument("--init-stop-thinking-probability", type=float, default=0.9)
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -2697,7 +3214,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="balance auxiliary trunk gradients at parameters or final hidden states",
     )
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
-    parser.add_argument("--optimizer-minibatches", type=int, default=4)
+    parser.add_argument(
+        "--optimizer-minibatches", type=int, default=1,
+        help=(
+            "optimizer updates per PPO epoch: 1 accumulates the whole rollout "
+            "before clipping and stepping; larger values split it into disjoint "
+            "updates. Control VRAM with --replay-token-budget and "
+            "--replay-max-trajectories, not this option"
+        ),
+    )
     parser.add_argument("--post-update-kl-interval", type=int, default=10)
     parser.add_argument("--ppo-epochs", type=int, default=1)
     parser.add_argument("--clip-low", type=float, default=0.20)
@@ -2705,7 +3230,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-coefficient", type=float, default=1.0)
     parser.add_argument("--replay-token-budget", type=int, default=11_024)
     parser.add_argument("--replay-max-trajectories", type=int, default=16)
-    parser.add_argument("--logit-chunk-tokens", type=int, default=128)
+    parser.add_argument("--logit-chunk-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--behavior-logprobs",
+        choices=("replay", "rollout"),
+        default="replay",
+        help=(
+            "replay: teacher-force the actor after rollout for replay-consistent "
+            "behavior log-probabilities; rollout: keep the exact log-probabilities "
+            "captured in the rollout graph and refresh only the critic"
+        ),
+    )
     parser.add_argument(
         "--compile-rollout", action=argparse.BooleanOptionalAction, default=True
     )
@@ -2760,7 +3295,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_output_directory(output: str | Path) -> None:
+    runs_root = (Path(__file__).resolve().parent / "runs").resolve()
+    output = Path(output).resolve()
+    if output == runs_root or not output.is_relative_to(runs_root):
+        raise ValueError(
+            f"--output must be a run directory beneath {runs_root}; "
+            "post-training belongs in parameter-golf-postraining, not parameter-golf"
+        )
+
+
 def _validate_args(args) -> None:
+    validate_output_directory(args.output)
     positive_integer_names = (
         "prompts_per_rollout",
         "samples_per_prompt",
@@ -2803,6 +3349,17 @@ def _validate_args(args) -> None:
     invalid = [name for name in positive_integer_names if getattr(args, name) < 1]
     if invalid:
         raise ValueError(f"positive integer options required: {', '.join(invalid)}")
+    if args.context_tokens is not None:
+        if args.context_tokens < 1:
+            raise ValueError("context_tokens must be positive")
+        if not args.fast_rollout or not args.compile_rollout or args.latent_thinking or args.uno_rollout:
+            raise ValueError("context_tokens requires native compiled fast rollout; latent/Uno/eager paths are unsupported")
+        response_token_limits(
+            [1], max_new_tokens=args.max_new_tokens,
+            context_tokens=args.context_tokens,
+            answer_reserve_tokens=args.answer_reserve_tokens,
+            thinking_end_token_id=0 if args.answer_reserve_tokens else None,
+        )
     if not math.isfinite(args.thought_sigma) or args.thought_sigma <= 0:
         raise ValueError("thought sigma must be finite and positive")
     if not 0 < args.init_stop_thinking_probability < 1:
@@ -2812,10 +3369,12 @@ def _validate_args(args) -> None:
             raise ValueError("token carry cannot use Gaussian thoughts or Uno proposals")
         if not args.fast_rollout or not args.compile_rollout or not args.compile_replay:
             raise ValueError("token carry requires compiled fast rollout and replay")
-        if args.answer_reserve_tokens:
-            raise ValueError("token carry uses sampled delimiters; set --answer-reserve-tokens 0")
         if args.train_nextlat:
             raise ValueError("token carry requires --no-train-nextlat for an isolated recurrence experiment")
+    if args.slot_memory:
+        if not args.token_carry:
+            raise ValueError("slot memory extends token carry; pass --token-carry --slot-memory")
+        slot_memory_config_from_args(args)
     if args.latent_thinking:
         if args.uno_rollout:
             raise ValueError("latent thinking cannot use token-only Uno proposals")
@@ -2844,10 +3403,15 @@ def _validate_args(args) -> None:
         raise ValueError("training step counts must be nonnegative and epochs positive")
     if not 0 < args.top_p <= 1 or args.temperature <= 0:
         raise ValueError("sampling temperature/top-p are invalid")
-    if not 0 <= args.top_k <= MINICPM5_VOCAB_SIZE:
-        raise ValueError("top-k must be zero or fit the model vocabulary")
+    if not -1 <= args.top_k <= MINICPM5_VOCAB_SIZE:
+        raise ValueError("top-k must be -1, zero, or fit the model vocabulary")
+    if args.top_k == -1:
+        if args.top_p != 1.0:
+            raise ValueError("unrestricted top-k sampling requires top-p=1")
+        if args.latent_thinking or args.uno_rollout:
+            raise ValueError("unrestricted sampling is supported only by native token rollouts")
     if (args.fast_rollout or args.latent_thinking) and args.top_k == 0:
-        raise ValueError("captured and latent rollouts require bounded top-k sampling")
+        raise ValueError("captured rollouts require top-k=-1 or positive bounded top-k")
     if not 2 <= args.uno_block_size <= 16:
         raise ValueError("Uno block size must lie in [2, 16]")
     if args.uno_rollout:
@@ -2859,6 +3423,12 @@ def _validate_args(args) -> None:
         raise ValueError("--uno-checkpoint requires --uno-rollout")
     if args.ppo_epochs != 1:
         raise ValueError("fixed behavior statistics currently require one PPO epoch")
+    if args.behavior_logprobs == "rollout" and (
+        args.latent_thinking or args.token_carry or args.uno_rollout
+    ):
+        raise ValueError(
+            "rollout behavior log-probabilities require a native token rollout"
+        )
     if not 0 < args.clip_low < 1 or args.clip_high <= 0:
         raise ValueError("VAPO clipping bounds are invalid")
     if args.actor_lr <= 0 or args.critic_lr <= 0:
@@ -2875,11 +3445,14 @@ def _validate_args(args) -> None:
         raise ValueError("NextLat dimensions and gradient clip must be positive")
     if args.min_rollout_tokens_per_second <= 0:
         raise ValueError("minimum rollout throughput must be positive")
-    if args.prompt_tokens + args.max_new_tokens > 20_480:
+    maximum_sequence_length = args.prompt_tokens + args.max_new_tokens
+    if args.context_tokens is not None:
+        maximum_sequence_length = min(maximum_sequence_length, args.context_tokens)
+    if maximum_sequence_length > 20_480:
         raise ValueError(
             "configured context exceeds the validated single-GPU VAPO envelope"
         )
-    maximum_replay_length = args.prompt_tokens + args.max_new_tokens - 1
+    maximum_replay_length = maximum_sequence_length - 1
     if not args.rollout_only and maximum_replay_length > args.replay_token_budget:
         raise ValueError(
             "replay token budget must fit one maximum-length trajectory"
@@ -2919,6 +3492,17 @@ def main() -> None:
     )
     from postraining.invariant_linear import INVARIANT_ARITHMETIC
     args.uno_arithmetic = INVARIANT_ARITHMETIC if args.uno_rollout else None
+    data_sha256 = file_sha256(args.data)
+    rows, corpus_audit, corpus_identity = load_training_math_corpus(
+        args.data, seed=args.seed
+    )
+    resume = None
+    if args.resume:
+        resume = torch.load(args.resume, map_location="cpu", weights_only=False)
+        validate_resume_dataset(resume, data_sha256, corpus_identity)
+        validate_resume_configuration(resume, args)
+    if len(rows) < args.prompts_per_rollout:
+        raise ValueError("effective corpus must contain at least prompts_per_rollout unique rows")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -2927,10 +3511,16 @@ def main() -> None:
     device = torch.device("cuda")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    logger = JsonlLogger(output / "metrics.jsonl")
+    corpus_metadata = {
+        "data_sha256": data_sha256,
+        "math_corpus_identity": corpus_identity,
+        "math_corpus_audit": corpus_audit,
+    }
+    logger.log(type="corpus", **corpus_metadata)
+    print(json.dumps({"type": "corpus", **corpus_metadata}, sort_keys=True), flush=True)
     checkpoint_policy = RecoveryCheckpointPolicy(args.checkpoint_interval_seconds)
-    data_sha256 = file_sha256(args.data)
-    rows = load_unique_math_rows(args.data)
-    random.shuffle(rows)
+    # Corpus validation above must finish before model construction or CUDA work.
     lora_config = LoRAConfig(
         rank=args.lora_rank,
         alpha=args.lora_alpha,
@@ -2945,6 +3535,7 @@ def main() -> None:
         gradient_checkpointing=args.replay_checkpoint_interval > 0,
         latent_thinking=args.latent_thinking,
         token_carry=args.token_carry,
+        slot_memory=slot_memory_config_from_args(args),
         thought_sigma=args.thought_sigma,
         init_stop_thinking_probability=args.init_stop_thinking_probability,
     )
@@ -2959,6 +3550,7 @@ def main() -> None:
         shared_frozen_source=policy.causal_lm,
         latent_thinking=args.latent_thinking,
         token_carry=args.token_carry,
+        slot_memory=slot_memory_config_from_args(args),
     )
     actor_checkpointed_layers = configure_replay_checkpointing(
         policy.causal_lm, args.replay_checkpoint_interval
@@ -3018,10 +3610,7 @@ def main() -> None:
     completed_warmup = 0
     pending_records: list[TrajectoryRecord] | None = None
     pending_epoch = 0
-    if args.resume:
-        resume = torch.load(args.resume, map_location="cpu", weights_only=False)
-        validate_resume_dataset(resume, data_sha256)
-        validate_resume_configuration(resume, args)
+    if resume is not None:
         payload = resume["policy"]
         actor_payload = payload["actor"]
         critic_payload = payload["critic"]
@@ -3145,21 +3734,25 @@ def main() -> None:
             resolve_thinking_end_token(tokenizer, stop_ids=_stop_ids(policy, tokenizer))
             if args.answer_reserve_tokens else None
         )
-        uno_options = {}
+        engine_options: dict[str, Any]
         if args.uno_rollout:
             from postraining.uno_speculative import UnoTrainingRolloutEngine
 
             engine_class = UnoTrainingRolloutEngine
-            uno_options = {
+            engine_options = {
                 "uno_checkpoint": args.uno_checkpoint,
                 "uno_block_size": args.uno_block_size,
+            }
+        else:
+            engine_options = {
+                "capture_logprobs": args.behavior_logprobs == "rollout"
             }
         engine = engine_class(
             policy,
             stop_ids=_stop_ids(policy, tokenizer),
             prompts_per_rollout=args.prompts_per_rollout,
             samples_per_prompt=args.samples_per_prompt,
-            cache_length=args.prompt_tokens + args.max_new_tokens,
+            cache_length=args.context_tokens or (args.prompt_tokens + args.max_new_tokens),
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
@@ -3167,7 +3760,7 @@ def main() -> None:
             physical_batch_size=args.rollout_physical_batch_size or None,
             answer_reserve_tokens=args.answer_reserve_tokens,
             thinking_end_token_id=thinking_end_token_id,
-            **uno_options,
+            **engine_options,
         )
         if args.uno_rollout and file_sha256(args.uno_checkpoint) != args.uno_checkpoint_sha256:
             raise ValueError("Uno checkpoint changed while loading the rollout engine")
@@ -3257,12 +3850,22 @@ def main() -> None:
     tensorboard_scalars(
         tensorboard, "config", {**parameter_metrics, **vars(args)}, 0
     )
+    tensorboard_scalars(tensorboard, "corpus", {
+        f"{domain}/{statistic}": value
+        for statistic, values in (
+            ("count", corpus_audit["domain_counts"]),
+            ("proportion", corpus_audit["domain_proportions"]),
+        )
+        for domain, value in values.items()
+    }, 0)
     tensorboard.add_text(
         "samples/configuration",
         json.dumps(
             {
                 **vars(args),
                 "data_sha256": data_sha256,
+                "math_corpus_identity": corpus_identity,
+                "math_corpus_audit": corpus_audit,
                 **({"uno": getattr(engine, "uno_metadata")} if args.uno_rollout else {}),
             },
             sort_keys=True,
@@ -3313,7 +3916,9 @@ def main() -> None:
             selected,
             prompt_tokens=args.prompt_tokens,
             max_new_tokens=args.max_new_tokens,
+            context_tokens=args.context_tokens,
             enable_thinking=args.thinking,
+            prompt_suffix=args.prompt_suffix,
             progress_callback=live_rollout_metrics,
         )
         rollout_ended = time.perf_counter()
@@ -3322,6 +3927,7 @@ def main() -> None:
             samples_per_prompt=args.samples_per_prompt,
             stop_ids=engine.stop_ids,
         )
+        metrics.update(corpus_progress(args.prompts_per_rollout, len(rows)))
         metrics.update(
             device_phase_metrics(
                 device_sampler,
@@ -3345,6 +3951,8 @@ def main() -> None:
             result.records,
             samples_per_prompt=args.samples_per_prompt,
             step=0,
+            prompt_suffix=args.prompt_suffix,
+            response_limits=result.response_limits,
         )
         tensorboard_scalars(
             tensorboard,
@@ -3352,15 +3960,13 @@ def main() -> None:
             {"passed": int(passed), **metrics},
             0,
         )
+        logger.log(type="rollout_gate", step=0, passed=passed, **metrics)
         print(json.dumps({"passed": passed, **metrics}, sort_keys=True), flush=True)
         tensorboard.close()
         raise SystemExit(0 if passed else 2)
 
     for warmup in range(completed_warmup, args.value_warmup_steps):
-        selected = [
-            rows[(cursor + index) % len(rows)]
-            for index in range(args.prompts_per_rollout)
-        ]
+        selected = select_corpus_rows(rows, cursor=cursor, count=args.prompts_per_rollout)
         cursor += args.prompts_per_rollout
         torch.cuda.reset_peak_memory_stats(device)
         if not (args.fast_rollout or args.latent_thinking):
@@ -3372,7 +3978,9 @@ def main() -> None:
             selected,
             prompt_tokens=args.prompt_tokens,
             max_new_tokens=args.max_new_tokens,
+            context_tokens=args.context_tokens,
             enable_thinking=args.thinking,
+            prompt_suffix=args.prompt_suffix,
             progress_callback=lambda progress_step, live_metrics: live_rollout_metrics(
                 warmup * args.max_new_tokens + progress_step,
                 live_metrics,
@@ -3385,6 +3993,7 @@ def main() -> None:
             samples_per_prompt=args.samples_per_prompt,
             stop_ids=engine.stop_ids,
         )
+        metrics.update(corpus_progress(cursor, len(rows)))
         metrics.update(
             device_phase_metrics(
                 device_sampler,
@@ -3408,6 +4017,8 @@ def main() -> None:
             result.records,
             samples_per_prompt=args.samples_per_prompt,
             step=warmup + 1,
+            prompt_suffix=args.prompt_suffix,
+            response_limits=result.response_limits,
         )
         engine.release_cache()
         if not (args.fast_rollout or args.latent_thinking):
@@ -3459,9 +4070,15 @@ def main() -> None:
         tensorboard_scalars(
             tensorboard, "value_warmup", metrics, completed_warmup
         )
-        if checkpoint_policy.due():
+        logger.log(type="value_warmup", step=completed_warmup, **metrics)
+        warmup_complete = completed_warmup == args.value_warmup_steps
+        if warmup_complete or checkpoint_policy.due():
+            checkpoint_path = output / (
+                "critic_warmup_checkpoint.pt" if warmup_complete
+                else "vapo_adapter_checkpoint.pt"
+            )
             save_checkpoint(
-                output / "vapo_adapter_checkpoint.pt",
+                checkpoint_path,
                 policy,
                 critic,
                 actor_optimizer,
@@ -3473,17 +4090,17 @@ def main() -> None:
                 pending_epoch=pending_epoch,
                 args=args,
                 data_sha256=data_sha256,
+                corpus_identity=corpus_identity,
             )
+            if warmup_complete:
+                atomic_link_or_copy(checkpoint_path, output / "vapo_adapter_checkpoint.pt")
             checkpoint_policy.committed(
                 (start_step, cursor, completed_warmup, pending_epoch)
             )
     step = start_step
     while step < args.steps:
         if pending_records is None:
-            selected = [
-                rows[(cursor + index) % len(rows)]
-                for index in range(args.prompts_per_rollout)
-            ]
+            selected = select_corpus_rows(rows, cursor=cursor, count=args.prompts_per_rollout)
             cursor += args.prompts_per_rollout
             torch.cuda.reset_peak_memory_stats(device)
             if not (args.fast_rollout or args.latent_thinking):
@@ -3495,7 +4112,9 @@ def main() -> None:
                 selected,
                 prompt_tokens=args.prompt_tokens,
                 max_new_tokens=args.max_new_tokens,
+                context_tokens=args.context_tokens,
                 enable_thinking=args.thinking,
+                prompt_suffix=args.prompt_suffix,
                 progress_callback=lambda progress_step, live_metrics: live_rollout_metrics(
                     step
                     * args.prompts_per_rollout
@@ -3510,6 +4129,7 @@ def main() -> None:
                 samples_per_prompt=args.samples_per_prompt,
                 stop_ids=engine.stop_ids,
             )
+            rollout_metrics.update(corpus_progress(cursor, len(rows)))
             rollout_metrics.update(
                 device_phase_metrics(
                     device_sampler,
@@ -3532,10 +4152,13 @@ def main() -> None:
                 result.records,
                 samples_per_prompt=args.samples_per_prompt,
                 step=step,
+                prompt_suffix=args.prompt_suffix,
+                response_limits=result.response_limits,
             )
             tensorboard_scalars(
                 tensorboard, "rollout", rollout_metrics, step
             )
+            logger.log(type="rollout", step=step, **rollout_metrics)
             engine.release_cache()
             if not (args.fast_rollout or args.latent_thinking):
                 use_packed_replay_attention(policy.causal_lm, enabled=True)
@@ -3547,6 +4170,7 @@ def main() -> None:
                 replay_token_budget=args.replay_token_budget,
                 replay_max_trajectories=args.replay_max_trajectories,
                 logit_chunk_tokens=args.logit_chunk_tokens,
+                behavior_logprobs=args.behavior_logprobs,
             )
             refresh_metrics["cache_release_allocated_bytes"] = (
                 cache_release_allocated_bytes
@@ -3613,8 +4237,10 @@ def main() -> None:
                     )
                 )
             metrics["peak_vram_bytes"] = torch.cuda.max_memory_allocated(device)
+            metrics.update(corpus_progress(cursor, len(rows)))
 
             tensorboard_scalars(tensorboard, "train", metrics, step)
+            logger.log(type="train", step=step, **metrics)
         if checkpoint_policy.due():
             save_checkpoint(
                 output / "vapo_adapter_checkpoint.pt",
@@ -3629,6 +4255,7 @@ def main() -> None:
                 pending_epoch=pending_epoch,
                 args=args,
                 data_sha256=data_sha256,
+                corpus_identity=corpus_identity,
             )
             checkpoint_policy.committed(
                 (step, cursor, completed_warmup, pending_epoch)
@@ -3647,6 +4274,7 @@ def main() -> None:
         pending_epoch=pending_epoch,
         args=args,
         data_sha256=data_sha256,
+        corpus_identity=corpus_identity,
     )
     tensorboard.close()
 

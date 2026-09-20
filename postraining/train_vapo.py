@@ -23,6 +23,7 @@ from postraining.core import (
     generalized_advantage_estimate,
     length_adaptive_lambda,
     load_unique_math_rows,
+    math_corpus_identity,
     top_p_sample,
     verify_answer,
 )
@@ -600,11 +601,15 @@ def update_step(
     )
 
 
-def save_checkpoint(path: Path, model, actor_optimizer, critic_optimizer, step: int, cursor: int, args) -> None:
+def save_checkpoint(
+    path: Path, model, actor_optimizer, critic_optimizer, step: int, cursor: int,
+    args, corpus_identity: str,
+) -> None:
     atomic_torch_save(
         {
             "step": step,
             "cursor": cursor,
+            "math_corpus_identity": corpus_identity,
             "model": model.state_dict(),
             "model_config": getattr(model, "model_config", DEFAULT_MODEL_CONFIG),
             "architecture": getattr(model, "architecture", None),
@@ -666,9 +671,19 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda")
     tokenizer = spm.SentencePieceProcessor(model_file=args.tokenizer)
-    rows = load_unique_math_rows(args.data)
+    corpus_audit = {}
+    rows = load_unique_math_rows(args.data, audit=corpus_audit)
     aime_rows = load_unique_math_rows(args.aime_data) if args.aime_every > 0 and not args.rollout_only else []
     random.shuffle(rows)
+    corpus_identity = math_corpus_identity(rows)
+    resume = None
+    if args.resume:
+        resume = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if resume.get("math_corpus_identity") != corpus_identity:
+            raise ValueError(
+                "resume checkpoint lacks the current ordered effective math corpus "
+                "identity; old targets/order cannot reuse this cursor. Start a new run."
+            )
     model = load_model(args.resume or args.checkpoint, device)
     model.eval()
     if hasattr(model, "fold_input_projector_for_inference"):
@@ -677,6 +692,10 @@ def main() -> None:
     critic = torch.optim.AdamW(model.critic_probe.parameters(), lr=args.critic_lr, fused=True)
     output = Path(args.output)
     logger = JsonlLogger(output / "metrics.jsonl")
+    logger.log(
+        type="math_corpus", math_corpus_identity=corpus_identity,
+        math_corpus_audit=corpus_audit,
+    )
     tensorboard = SummaryWriter(output / "tensorboard")
 
     if args.prompts_per_rollout < 1:
@@ -724,9 +743,7 @@ def main() -> None:
 
     cursor = 0
     start_step = 0
-    resume = None
-    if args.resume:
-        resume = torch.load(args.resume, map_location="cpu", weights_only=False)
+    if resume is not None:
         prior_args = resume["args"]
         immutable = (
             "data", "tokenizer", "prompts_per_rollout", "rollout_prompt_chunk",
@@ -770,7 +787,7 @@ def main() -> None:
     if not args.resume:
         value_checkpoint = output / "checkpoints/value_pretrained.pt"
         save_checkpoint(
-            value_checkpoint, model, actor, critic, 0, cursor, args
+            value_checkpoint, model, actor, critic, 0, cursor, args, corpus_identity
         )
         atomic_link_or_copy(value_checkpoint, output / "vapo_checkpoint.pt")
         checkpoint_policy.committed((0, cursor))
@@ -849,6 +866,7 @@ def main() -> None:
                 step,
                 cursor,
                 args,
+                corpus_identity,
             )
             checkpoint_policy.committed(checkpoint_state)
     terminal_checkpoint_state = (step, cursor)
@@ -861,6 +879,7 @@ def main() -> None:
             step,
             cursor,
             args,
+            corpus_identity,
         )
         checkpoint_policy.committed(terminal_checkpoint_state)
     tensorboard.close()

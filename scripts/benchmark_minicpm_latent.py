@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--compile-replay", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--replay-batch-size", type=int, default=1)
-    parser.add_argument("--optimizer-minibatches", type=int, default=4)
+    parser.add_argument("--optimizer-minibatches", type=int, default=1)
     parser.add_argument("--replay-checkpoint-interval", type=int, default=0)
     parser.add_argument("--logit-chunk-tokens", type=int, default=128)
     parser.add_argument("--nextlat-samples", type=int, default=64)

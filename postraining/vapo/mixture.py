@@ -10,7 +10,11 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from postraining.core import load_unique_math_rows
+from postraining.core import (
+    load_unique_math_rows,
+    math_corpus_identity,
+    math_corpus_policy_sha256,
+)
 
 
 VAPO_MIXTURE_SCHEMA = "vapo_verifiable_mixture/v1"
@@ -67,7 +71,15 @@ def load_mixture_manifest(
     manifest_path = Path(path)
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("schema") != VAPO_MIXTURE_SCHEMA:
-        raise ValueError(f"unsupported VAPO mixture schema in {manifest_path}")
+        raise ValueError(
+            f"unsupported VAPO mixture schema in {manifest_path}; "
+            "prepare a new immutable mixture manifest"
+        )
+    if manifest.get("math_corpus_policy_sha256") != math_corpus_policy_sha256():
+        raise ValueError(
+            "mixture manifest lacks the current math corpus policy; "
+            "prepare a new immutable mixture manifest, do not reuse its cursor"
+        )
     entries = manifest.get("sources")
     if not isinstance(entries, list) or not entries:
         raise ValueError("VAPO mixture manifest needs nonempty sources")
@@ -87,9 +99,19 @@ def load_mixture_manifest(
             raise ValueError(f"source {name!r} has a nonpositive quota")
         if verifier not in VERIFIER_KINDS:
             raise ValueError(f"source {name!r} has unknown verifier {verifier!r}")
+        if not entry.get("math_corpus_identity"):
+            raise ValueError(
+                f"source {name!r} lacks an effective corpus identity; "
+                "prepare a new immutable mixture manifest"
+            )
         if file_sha256(source_path) != entry.get("sha256"):
             raise ValueError(f"source {name!r} bytes differ from its manifest")
         rows = load_unique_math_rows(source_path)
+        if math_corpus_identity(rows) != entry["math_corpus_identity"]:
+            raise ValueError(
+                f"source {name!r} effective corpus changed; prepare a new "
+                "immutable mixture manifest, do not reuse its cursor"
+            )
         if len(rows) != int(entry.get("rows", -1)):
             raise ValueError(f"source {name!r} logical row count changed")
         stamped = []
@@ -132,11 +154,15 @@ def mixture_identity(path: str | Path, manifest: dict) -> str:
     digest.update(VAPO_MIXTURE_SCHEMA.encode())
     digest.update(b"\0")
     digest.update(file_sha256(path).encode())
+    digest.update(b"\0")
+    digest.update(math_corpus_policy_sha256().encode())
     for entry in manifest["sources"]:
         digest.update(b"\0")
         digest.update(str(entry["name"]).encode())
         digest.update(b"\0")
         digest.update(str(entry["sha256"]).encode())
+        digest.update(b"\0")
+        digest.update(str(entry["math_corpus_identity"]).encode())
     return "sha256:" + digest.hexdigest()
 
 

@@ -99,10 +99,10 @@ def test_captured_steps_force_before_model_forward_and_reset_on_refill(monkeypat
         compile_decode=mode == "invariant", invariant_decode=mode == "invariant",
         answer_reserve_tokens=2, thinking_end_token_id=9,
     )
-    prompt_tokens = torch.tensor([0, 3, 4])
+    prompt_tokens = torch.tensor([0, 0, 4])
     engine._graph_logits.copy_(policy.logits(policy.cached_hidden(prompt_tokens)))
     engine._graph_values.copy_(prompt_tokens.float())
-    engine.response_limit.fill_(6)
+    engine.response_limit.copy_(torch.tensor([6, 5, 4]))
     engine.active.fill_(True)
     if mode == "invariant":
         engine._pending.copy_(prompt_tokens)
@@ -112,9 +112,9 @@ def test_captured_steps_force_before_model_forward_and_reset_on_refill(monkeypat
         else:
             engine._continuous_split_decode_step()
     assert engine.generated[:, :6].tolist() == [
-        [1, 1, 1, 9, 2, 2], [9, 2, 2, 2, 2, 2], [8, 0, 0, 0, 0, 0],
+        [1, 1, 1, 9, 2, 2], [1, 1, 9, 2, 2, 0], [8, 0, 0, 0, 0, 0],
     ]
-    assert engine.output_position.tolist() == [6, 6, 1]
+    assert engine.output_position.tolist() == [6, 5, 1]
     if mode == "statistics":
         # The forced token remains a real context/value step, not a terminal.
         assert engine.values[0, 4:6].tolist() == [9.0, 2.0]
@@ -131,8 +131,9 @@ def test_captured_steps_force_before_model_forward_and_reset_on_refill(monkeypat
     )
     if mode == "invariant":
         engine._prompt_last_tokens = torch.tensor([0])
-    engine._admit_prompt_rows(bank, 0, [0], max_new_tokens=6)
+    engine._admit_prompt_rows(bank, 0, [0], max_new_tokens=4)
     assert engine.thinking_closed.tolist() == [False, True, False]
     for _ in range(6):
         engine._continuous_split_decode_step()
-    assert engine.generated[0, :6].tolist() == [1, 1, 1, 9, 2, 2]
+    assert engine.generated[0, :6].tolist() == [1, 9, 2, 2, 0, 0]
+    assert engine.output_position.tolist() == [4, 5, 1]

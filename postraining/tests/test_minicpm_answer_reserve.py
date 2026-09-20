@@ -66,6 +66,10 @@ def test_missing_budget_close_is_rejected_before_training():
         )
 
 
+def test_fresh_training_defaults_to_a_thousand_token_answer_reserve():
+    assert build_parser().parse_args([]).answer_reserve_tokens == 1000
+
+
 def test_answer_reserve_changes_require_completed_rollout_boundary():
     args = build_parser().parse_args([])
     prior = vars(args).copy()
@@ -102,3 +106,46 @@ def test_thinking_end_uses_native_single_token_and_cannot_be_eos():
     multi = SimpleNamespace(encode=lambda *args, **kwargs: [10, 11])
     with pytest.raises(ValueError, match="single"):
         resolve_thinking_end_token(multi, stop_ids=(2,))
+
+
+@pytest.mark.parametrize("pending", [None, [object()]])
+def test_context_budget_is_immutable_even_at_completed_rollout_boundary(pending):
+    args = build_parser().parse_args(["--context-tokens", "10000"])
+    prior = vars(args).copy()
+    for saved_budget in (None, 12000):
+        prior["context_tokens"] = saved_budget
+        with pytest.raises(ValueError, match="context_tokens"):
+            validate_resume_configuration({"args": prior, "pending_records": pending}, args)
+    prior["context_tokens"] = 10000
+    validate_resume_configuration({"args": prior, "pending_records": None}, args)
+    prior["max_new_tokens"] = 8000
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        validate_resume_configuration({"args": prior, "pending_records": None}, args)
+
+
+def test_missing_historical_context_budget_remains_response_only():
+    args = build_parser().parse_args([])
+    prior = vars(args).copy()
+    prior.pop("context_tokens")
+    validate_resume_configuration({"args": prior, "pending_records": None}, args)
+    args.context_tokens = 10000
+    with pytest.raises(ValueError, match="context_tokens"):
+        validate_resume_configuration({"args": prior, "pending_records": None}, args)
+
+
+@pytest.mark.parametrize("mode", [
+    "--no-fast-rollout", "--no-compile-rollout", "--uno-rollout", "--latent-thinking",
+])
+def test_unsupported_context_budget_modes_fail_argument_validation(mode):
+    args = build_parser().parse_args(["--context-tokens", "10000", mode])
+    with pytest.raises(ValueError, match="context_tokens requires"):
+        _validate_args(args)
+
+def test_context_budget_reserves_answer_after_a_nonempty_prompt():
+    args = build_parser().parse_args([
+        "--context-tokens", "10000", "--prompt-tokens", "6144",
+    ])
+    _validate_args(args)
+    args.context_tokens = 1002
+    with pytest.raises(ValueError, match="answer_reserve_tokens"):
+        _validate_args(args)
