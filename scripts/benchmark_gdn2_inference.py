@@ -11,6 +11,7 @@ import argparse
 import gc
 import hashlib
 import json
+import math
 from pathlib import Path
 import statistics
 import sys
@@ -263,7 +264,7 @@ def benchmark_case(architecture, batch, prefix, repeats, checkpoint_path=None):
     decode_call = (lambda: adapter.decode(next_tokens, adapter.cache(states))) if architecture == "gdn2" else (lambda: adapter.decode(next_tokens, states))
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
         reset()
-        decoded = decode_call()
+        decoded = decode_call().clone()
         decode_error = parity(decoded, expected, "cached versus full sequence")
         for state in states:
             state.zero_()
@@ -277,10 +278,16 @@ def benchmark_case(architecture, batch, prefix, repeats, checkpoint_path=None):
     decode_graph = InferenceGraph(decode_call, reset)
     for _ in range(3):
         parity(decode_graph.replay(), expected, "captured reset-and-replay", tolerance=.02)
+    captured_normal = decode_graph.replay().clone()
     for state in states:
         state.zero_()
     decode_graph.graph.replay()
     parity(decode_graph.output, zero_cache_logits, "captured cache mutation", tolerance=.005)
+    reference_delta = zero_cache_logits.double() - decoded.double()
+    captured_delta = decode_graph.output.double() - captured_normal.double()
+    mutation_error = float((captured_delta - reference_delta).norm() / reference_delta.norm().clamp_min(1e-12))
+    if not math.isfinite(mutation_error) or mutation_error > .1:
+        raise AssertionError(f"Captured cache-effect mismatch: relative difference error {mutation_error}")
     prefill_output = prefill_graph.replay()[0]
     parity(prefill_output, prefill_logits, "captured prefill", tolerance=.005)
     breaks = audit_breaks()
@@ -297,6 +304,7 @@ def benchmark_case(architecture, batch, prefix, repeats, checkpoint_path=None):
                   decode_parity_relative_error=decode_error, graph_breaks=breaks,
                   zero_cache_logit_relative_change=cache_effect,
                   cache_effect_exceeds_twice_parity_error=True,
+                  captured_cache_effect_relative_error=mutation_error,
                   prefill=prefill_graph.measure(repeats, batch * prefix),
                   cached_next_token=decode_graph.measure(repeats, batch),
                   cache_tensor_bytes=sum(t.numel() * t.element_size() for t in states),
