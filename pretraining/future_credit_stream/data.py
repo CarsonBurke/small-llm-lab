@@ -263,9 +263,21 @@ class StreamingDocuments:
             written += take
         return result
 
-    def next_chunk(self, steps: int) -> dict[str, np.ndarray]:
+    def next_chunk(self, steps: int, horizon: int = 0) -> dict[str, np.ndarray]:
+        """Return ``steps`` ticks of inputs, targets, and resets for every lane.
+
+        With ``horizon`` > 0 the page also carries ``future`` [steps, horizon,
+        batch]: the ``horizon`` tokens after each target. They are targets
+        only; they are never inputs. Beyond a document's closing BOS target
+        they belong to whatever follows in the shard, and a consumer must mask
+        them by that BOS, exactly as the objective does. The read is clamped at
+        the corpus end, where such tokens are always masked because the final
+        closed document ends in a BOS target.
+        """
         if not isinstance(steps, (int, np.integer)) or steps <= 0:
             raise ValueError("steps must be a positive integer")
+        if not isinstance(horizon, (int, np.integer)) or horizon < 0:
+            raise ValueError("horizon must be a nonnegative integer")
         positions = np.empty((steps, self.batch_size), dtype=np.int64)
         resets = np.empty((steps, self.batch_size), dtype=np.bool_)
         # One vectorized operation per time tick, not Python loops over tokens/lanes.
@@ -279,8 +291,13 @@ class StreamingDocuments:
                 self._ends[refill] = self.index._boundaries[documents + 1]
             positions[tick] = self._positions
             self._positions += 1
-        return {"inputs": self.index._read_positions(positions),
+        page = {"inputs": self.index._read_positions(positions),
                 "targets": self.index._read_positions(positions + 1), "resets": resets}
+        if horizon:
+            offsets = np.arange(2, 2 + horizon, dtype=np.int64)
+            ahead = positions[:, None, :] + offsets[None, :, None]
+            page["future"] = self.index._read_positions(np.minimum(ahead, self.index.total_tokens - 1))
+        return page
 
     def state_dict(self) -> dict[str, Any]:
         return {

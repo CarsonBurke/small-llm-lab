@@ -217,3 +217,31 @@ def test_rejected_checkpoint_leaves_stream_unchanged(tmp_path: Path) -> None:
     assert_pages_equal(stream.next_chunk(8), reference.next_chunk(8))
 
 
+
+
+def test_future_targets_follow_each_target_and_clamp_at_the_corpus_end(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [[9, 1, 2, 3, 1, 4, 5, 1, 6]])
+    stream = StreamingDocuments(index, batch_size=1, seed=0, shuffle=False)
+    page = stream.next_chunk(6, horizon=2)
+    np.testing.assert_array_equal(page["inputs"][:, 0], [1, 2, 3, 1, 4, 5])
+    np.testing.assert_array_equal(page["targets"][:, 0], [2, 3, 1, 4, 5, 1])
+    # future[tick, j] is the token j + 2 positions after the input: shard
+    # order, crossing into the next document, clamped at the last token.
+    assert page["future"].shape == (6, 2, 1) and page["future"].dtype == np.int64
+    np.testing.assert_array_equal(page["future"][:, :, 0], [
+        [3, 1], [1, 4], [4, 5], [5, 1], [1, 6], [6, 6],
+    ])
+    assert "future" not in stream.next_chunk(1)
+    assert "future" not in stream.next_chunk(1, horizon=0)
+    with pytest.raises(ValueError):
+        stream.next_chunk(1, horizon=-1)
+    # The horizon never moves the lane cursor.
+    plain = StreamingDocuments(index, batch_size=1, seed=0, shuffle=False)
+    plain.next_chunk(6)
+    with_horizon = StreamingDocuments(index, batch_size=1, seed=0, shuffle=False)
+    with_horizon.next_chunk(6, horizon=4)
+    assert_pages_equal(with_horizon.next_chunk(3, horizon=1), plain.next_chunk(3))
+    assert with_horizon.state_dict() == plain.state_dict() or all(
+        np.array_equal(with_horizon.state_dict()[key], plain.state_dict()[key])
+        if isinstance(plain.state_dict()[key], np.ndarray) else with_horizon.state_dict()[key] == plain.state_dict()[key]
+        for key in plain.state_dict())

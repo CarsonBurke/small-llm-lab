@@ -1,8 +1,11 @@
-"""Teacher-forced streaming FFNs with an online scalar TD value critic.
+"""Teacher-forced streaming FFNs with a future-bag carry.
 
-One combined backward trains current CE, differentiates the frozen critic into
-the current producer, and fits the previous carried state's value to the newly
-observed transition. No temporal graph, incoming-state VJP, or lookahead is used.
+One combined backward per token trains current CE and differentiates the
+carry's cross-entropy to the discounted bag of upcoming tokens, read through
+the frozen head, into the carry writer. Future tokens serve only as targets,
+never as inputs. No temporal graph or incoming-state VJP is used, except in
+the explicit TBPTT reference objective, which exists only to bound what local
+methods can gain.
 """
 
 from __future__ import annotations
@@ -23,22 +26,27 @@ import torch.nn.functional as F
 from pretraining.future_credit_stream.config import ARCHITECTURE, Config, REPO_ROOT
 from pretraining.future_credit_stream.data import DocumentIndex, StreamingDocuments
 from pretraining.future_credit_stream.model import StreamingFFNModel
-from pretraining.future_credit_stream.objective import StreamingObjective
+from pretraining.future_credit_stream.objective import (
+    FutureBagObjective,
+    StreamingObjective,
+    TemporalReferenceObjective,
+)
 from train_gpt import build_sentencepiece_luts
 
 
 class PrefetchedDocuments:
     """One CPU page ahead; checkpoints record the consumed, not speculative, cursor."""
 
-    def __init__(self, stream: StreamingDocuments, steps: int):
+    def __init__(self, stream: StreamingDocuments, steps: int, horizon: int):
         self.stream = stream
         self.steps = steps
+        self.horizon = horizon
         self.committed_state = stream.state_dict()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ffn-documents")
         self.future: Future = self.executor.submit(self._read)
 
     def _read(self):
-        page = self.stream.next_chunk(self.steps)
+        page = self.stream.next_chunk(self.steps, self.horizon)
         return page, self.stream.state_dict()
 
     def next(self, device: torch.device):
@@ -103,37 +111,78 @@ def setup_device(config: Config) -> torch.device:
     return torch.device("cuda", 0)
 
 
+def build_optimizer(model: StreamingFFNModel, config: Config) -> torch.optim.AdamW:
+    """Fused AdamW over the whole model, writer included, one base rate.
+
+    Each group records ``base_lr`` so one schedule multiplier drives both.
+    """
+    parameters = list(model.parameters())
+    groups = [
+        {"params": [p for p in parameters if p.ndim >= 2],
+         "weight_decay": config.weight_decay, "base_lr": config.learning_rate},
+        {"params": [p for p in parameters if p.ndim < 2],
+         "weight_decay": 0.0, "base_lr": config.learning_rate},
+    ]
+    for group in groups:
+        group["lr"] = group["base_lr"]
+    return torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8, fused=True)
+
+
 class Engine:
     def __init__(self, model: StreamingFFNModel, config: Config, bos_id: int):
         self.model, self.config, self.bos_id = model, config, bos_id
-        self.has_previous = False
         compile_options = dict(fullgraph=True, dynamic=False, mode=config.compile_mode)
-        self.forward = torch.compile(model.forward, **compile_options)
-        objective = StreamingObjective(model, config.discount, bos_id)
+        self.step = torch.compile(model.step, **compile_options)
+        self.temporal = config.objective == "tbptt"
+        self.future_bag = config.objective == "future_bag"
+        if self.temporal:
+            objective = TemporalReferenceObjective(model)
+        elif self.future_bag:
+            objective = FutureBagObjective(
+                model, bos_id, config.discount, config.backbone_future_weight
+            )
+        else:
+            objective = StreamingObjective(model)
+        self.statistics = objective.statistics
         self.training_forward = torch.compile(objective.forward, **compile_options)
 
     def backward_page(self, page: dict, carry: torch.Tensor) -> torch.Tensor:
-        """Train observed transitions with one forward/backward per token.
+        """Train observed transitions; return statistics summed over ticks.
 
-        Carry is an external, detached buffer. The previous TD feature is that
-        same buffer before document resets, not another state or saved graph.
-        The first observation has no predecessor; page boundaries do not reset
-        this fact. Resume derives it from the completed optimizer-step count.
+        Carry is an external, detached buffer. The local objectives consume
+        one tick at a time and never keep a graph between ticks; the future-bag
+        objective also reads the tick's future targets. The temporal
+        reference consumes the page as one graph and truncates at its edge.
         """
         steps = page["inputs"].shape[0]
-        statistics = torch.zeros(4, device=carry.device)
+        statistics = torch.zeros(len(self.statistics), device=carry.device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            if self.temporal:
+                torch.compiler.cudagraph_mark_step_begin()
+                loss, final_carry, stats = self.training_forward(
+                    page["inputs"], carry, page["targets"], page["resets"]
+                )
+                loss.backward()
+                statistics.add_(stats * steps)
+                carry.copy_(final_carry)
+                del loss, final_carry, stats
+                return statistics
             for offset in range(steps):
                 torch.compiler.cudagraph_mark_step_begin()
-                loss, hidden, stats = self.training_forward(
-                    page["inputs"][offset], carry, page["targets"][offset],
-                    page["resets"][offset], self.has_previous,
-                )
+                if self.future_bag:
+                    loss, next_carry, stats = self.training_forward(
+                        page["inputs"][offset], carry, page["targets"][offset],
+                        page["future"][offset], page["resets"][offset],
+                    )
+                else:
+                    loss, next_carry, stats = self.training_forward(
+                        page["inputs"][offset], carry, page["targets"][offset],
+                        page["resets"][offset],
+                    )
                 (loss / steps).backward()
                 statistics.add_(stats)
-                carry.copy_(hidden.detach())
-                self.has_previous = True
-                del loss, hidden, stats
+                carry.copy_(next_carry)
+                del loss, next_carry, stats
         return statistics
 
 
@@ -153,14 +202,14 @@ def evaluate(engine: Engine, page: dict, byte_luts: tuple) -> dict:
             observed, target = page["inputs"][offset], page["targets"][offset]
             carry.masked_fill_(page["resets"][offset, :, None], 0)
             torch.compiler.cudagraph_mark_step_begin()
-            logits, hidden = engine.forward(observed, carry)
+            logits, _, next_carry = engine.step(observed, carry)
             totals[0].add_(F.cross_entropy(logits, target, reduction="sum"))
-            carry.copy_(hidden)
-            del logits, hidden
+            carry.copy_(next_carry)
+            del logits, next_carry
             torch.compiler.cudagraph_mark_step_begin()
-            logits, hidden = engine.forward(observed, empty_carry)
+            logits, _, _ = engine.step(observed, empty_carry)
             totals[1].add_(F.cross_entropy(logits, target, reduction="sum"))
-            del logits, hidden
+            del logits
             byte_count = base_bytes[target] + (leading_space[target] & ~boundary[observed]).to(torch.int16)
             totals[2].add_(byte_count.sum())
     loss_sum, reset_sum, byte_count = totals.tolist()
@@ -197,7 +246,7 @@ def checkpoint(path: Path, *, engine: Engine, optimizer, carry, stream_state,
 def load_checkpoint(path: Path, config: Config) -> dict:
     value = torch.load(path, map_location="cpu", weights_only=False)
     if value.get("architecture") != ARCHITECTURE:
-        raise ValueError("checkpoint is not a streaming future-credit FFN model")
+        raise ValueError("checkpoint is not a streaming future-bag-carry FFN model")
     previous, current = dict(value["config"]), asdict(config)
     previous.pop("run_id")
     current.pop("run_id")
@@ -206,6 +255,36 @@ def load_checkpoint(path: Path, config: Config) -> dict:
     if value["metadata"]["sources"] != source_hashes():
         raise ValueError("source code changed since checkpoint; exact resume refused")
     return value
+
+
+def contracts(config: Config) -> dict:
+    """Human-readable statements of what each objective differentiates."""
+    if config.objective == "ce":
+        return {
+            "prediction_contract": "teacher-forced next-token CE from the final FFN hidden; the detached actual hidden is the recurrent input",
+            "objective": "ordinary next-token CE with detached actual carry",
+            "target_contract": "ground-truth next token",
+            "page_boundary_contract": "all local CE graphs consumed before update; no boundary lookahead",
+        }
+    if config.objective == "tbptt":
+        return {
+            "prediction_contract": "teacher-forced next-token CE from the final FFN hidden; the actual hidden is the recurrent input and keeps its graph inside a page",
+            "objective": "REFERENCE ONLY: page-mean CE with true temporal gradients through the carried hidden; truncated at optimizer-page boundaries",
+            "target_contract": "ground-truth next token",
+            "page_boundary_contract": "one graph per page; the incoming page carry is detached; not a promotable local recipe",
+        }
+    return {
+        "prediction_contract": "teacher-forced next-token CE from the final FFN hidden; the gated writer's detached output is the recurrent input",
+        "objective": ("current CE plus the written carry's cross-entropy, read through the frozen final norm and head, "
+                      f"to the discounted bag of the current target and the next {config.horizon} tokens "
+                      f"(discount {config.discount}); one combined backward per token; two extra head matmuls per token "
+                      "(one gradient-free, for the hidden's reference bag loss)"),
+        "target_contract": ("bag over x_{t+1}..x_{t+1+horizon} with weights discount^j, truncated at the document's closing BOS "
+                            "(the BOS itself included), normalized per row; future tokens are never inputs"),
+        "writer_contract": (f"trained through the frozen head's input gradient; backbone_future_weight={config.backbone_future_weight} "
+                            "of that gradient reaches the final norm gains and head weights"),
+        "page_boundary_contract": "every tick is its own graph; future targets are read with the page; no lookahead graph or pending graph",
+    }
 
 
 def train(config: Config, resume: Path | None = None):
@@ -232,11 +311,7 @@ def train(config: Config, resume: Path | None = None):
     byte_luts = build_sentencepiece_luts(tokenizer, config.vocab_size, device)
     model = StreamingFFNModel(**config.model_config).to(device)
     engine = Engine(model, config, tokenizer.bos_id())
-    optimizer = torch.optim.AdamW(
-        [{"params": [p for p in model.parameters() if p.ndim >= 2], "weight_decay": config.weight_decay},
-         {"params": [p for p in model.parameters() if p.ndim < 2], "weight_decay": 0.0}],
-        lr=config.learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=True,
-    )
+    optimizer = build_optimizer(model, config)
     # Keep accumulated gradients outside the CUDA-graph pool across replays.
     for parameter in model.parameters():
         parameter.grad = torch.zeros_like(parameter)
@@ -248,22 +323,12 @@ def train(config: Config, resume: Path | None = None):
         "train_fingerprint": training_index.fingerprint, "val_fingerprint": validation_index.fingerprint,
         "parameters": sum(p.numel() for p in model.parameters()),
         "torch": torch.__version__, "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(device),
-        "prediction_contract": "teacher-forced next-token CE; actual detached recurrent hidden; scalar TD critic is training-only and never sees future tokens",
         "evaluation_scope": "deterministic partial-document panel; not full challenge BPB or old nanoGPT validation window",
-        "state_contract": "one vector/document injected before first FFN; detach every token; BOS resets; no attention/history/slots/noise",
-        "objective": (
-            "current CE plus discounted frozen-critic value into producer, plus previous-carry scalar TD regression; one combined backward per token"
-            if model.critic is not None else "ordinary next-token CE with detached actual carry"
-        ),
-        "target_contract": (
-            "previous carry predicts current per-example CE + discount * current scalar value, detached; document-reset targets zero, current-terminal future value zero"
-            if model.critic is not None else "ground-truth next token"
-        ),
-        "page_boundary_contract": (
-            "online TD continues across optimizer pages using the existing detached carry; first observation has no predecessor; no lookahead or pending graph"
-            if model.critic is not None else "all local CE graphs consumed before update; no boundary lookahead"
-        ),
-        "optimizer": "fused AdamW beta=(0.9,0.95), not nanoGPT baseline Muon",
+        "state_contract": ("one vector/document injected before first FFN; detach every token; BOS resets; "
+                           "no attention/history/slots/noise"
+                           + ("; gated writer mixes write(hidden) with the incoming carry" if config.uses_writer else "")),
+        **contracts(config),
+        "optimizer": "fused AdamW beta=(0.9,0.95), one base rate for backbone and writer, not nanoGPT baseline Muon",
         "autocull": "disabled for first matched reference; mlq owns hard wall-clock limit",
     }
     start_step, train_seconds, best_bpb = 0, 0.0, math.inf
@@ -279,17 +344,17 @@ def train(config: Config, resume: Path | None = None):
         torch.set_rng_state(saved["torch_rng_state"])
         torch.cuda.set_rng_state(saved["cuda_rng_state"])
         start_step, train_seconds, best_bpb = saved["step"], saved["train_seconds"], saved["best_bpb"]
-        engine.has_previous = saved["step"] > 0
         del saved
     atomic_json(output / "run_config.json", metadata)
-    print(json.dumps({"parameters": metadata["parameters"], "document_batch": config.document_batch,
+    print(json.dumps({"parameters": metadata["parameters"],
+                      "document_batch": config.document_batch,
                       "tokens_per_step": config.tokens_per_step, "state_updates_per_token": 1,
                       "state_mib": carry.numel() * carry.element_size() / 2**20,
                       "train_documents": training_index.document_count,
                       "compile_mode": config.compile_mode, "objective": config.objective}), flush=True)
     log = MetricLog(config)
-    prefetch = PrefetchedDocuments(stream, config.stream_steps)
-    accumulation = torch.zeros(4, device=device)
+    prefetch = PrefetchedDocuments(stream, config.stream_steps, config.page_horizon)
+    accumulation = torch.zeros(len(engine.statistics), device=device)
     interval_steps, interval_seconds, interval_wait = 0, 0.0, 0.0
     last_validation = None
     completed_step = start_step
@@ -321,8 +386,9 @@ def train(config: Config, resume: Path | None = None):
             started = time.perf_counter()
             page, wait_seconds = prefetch.next(device)
             optimizer.zero_grad(set_to_none=False)
+            multiplier = config.schedule_at(step)
             for group in optimizer.param_groups:
-                group["lr"] = config.learning_rate_at(step)
+                group["lr"] = group["base_lr"] * multiplier
             accumulation.add_(engine.backward_page(page, carry))
             optimizer.step()
             torch.cuda.synchronize()
@@ -333,17 +399,16 @@ def train(config: Config, resume: Path | None = None):
             interval_steps += 1
             completed_step = step + 1
             if completed_step % config.log_every == 0 or completed_step == config.iterations:
-                values = accumulation.tolist()
                 calls = interval_steps * config.stream_steps
-                ce, td_loss, value_mean, target_mean = [value / calls for value in values]
-                if not all(math.isfinite(value) for value in (ce, td_loss, value_mean, target_mean)):
-                    raise FloatingPointError("non-finite streaming TD value")
+                values = dict(zip(engine.statistics, (value / calls for value in accumulation.tolist())))
+                if not all(math.isfinite(value) for value in values.values()):
+                    raise FloatingPointError("non-finite streaming statistic")
+                diagnostics = " ".join(f"{key}:{value:.10g}" for key, value in values.items() if key != "ce")
                 token_count = interval_steps * config.tokens_per_step
-                log.emit(f"step:{completed_step}/{config.iterations} train_loss:{ce:.8f} "
+                log.emit(f"step:{completed_step}/{config.iterations} train_loss:{values['ce']:.8f} "
                          f"train_time:{train_seconds * 1000:.3f}ms "
-                         f"td_loss:{td_loss:.10g} td_value:{value_mean:.10g} "
-                         f"td_target:{target_mean:.10g} "
-                         f"tokens_per_second:{token_count / interval_seconds:.2f} "
+                         + (diagnostics + " " if diagnostics else "")
+                         + f"tokens_per_second:{token_count / interval_seconds:.2f} "
                          f"step_avg_ms:{interval_seconds * 1000 / interval_steps:.3f} "
                          f"data_wait_ms:{interval_wait * 1000 / interval_steps:.3f} "
                          f"tokens_seen:{completed_step * config.tokens_per_step} "
@@ -361,6 +426,7 @@ def train(config: Config, resume: Path | None = None):
                    train_seconds=train_seconds, best_bpb=best_bpb, metadata=metadata)
         atomic_json(output / "result.json", {
             "name": config.run_id, "status": "completed", "returncode": 0,
+            "objective": config.objective,
             "steps": completed_step, "tokens_seen": completed_step * config.tokens_per_step,
             "training_seconds": train_seconds, "best_val_bpb": best_bpb,
             "final_val_bpb": None, "final_proxy_val_bpb": last_validation["val_bpb"],
@@ -376,7 +442,7 @@ def train(config: Config, resume: Path | None = None):
 def generate(checkpoint_path: Path, prompt: str, max_new_tokens: int):
     saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if saved.get("architecture") != ARCHITECTURE:
-        raise ValueError("not a streaming future-credit FFN checkpoint")
+        raise ValueError("not a streaming future-bag-carry FFN checkpoint")
     config = Config(**saved["config"])
     device = setup_device(config)
     tokenizer = spm.SentencePieceProcessor(model_file=str(config.path(config.tokenizer_path)))
@@ -394,24 +460,24 @@ def generate(checkpoint_path: Path, prompt: str, max_new_tokens: int):
     with torch.autocast("cuda", dtype=torch.bfloat16):
         for value in prompt_tokens:
             torch.compiler.cudagraph_mark_step_begin()
-            _, hidden = engine.forward(token, carry)
-            carry.copy_(hidden)
+            _, _, next_carry = engine.step(token, carry)
+            carry.copy_(next_carry)
             token.fill_(value)
         for _ in range(max_new_tokens):
             torch.compiler.cudagraph_mark_step_begin()
-            logits, hidden = engine.forward(token, carry)
+            logits, _, next_carry = engine.step(token, carry)
             target = torch.multinomial(logits.softmax(-1), 1, generator=sampling_rng).squeeze(1)
             value = int(target.item())
             if value in (tokenizer.bos_id(), tokenizer.eos_id()):
                 break
-            carry.copy_(hidden)
+            carry.copy_(next_carry)
             token.copy_(target)
             output.append(value)
     print(tokenizer.decode(prompt_tokens + output), flush=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Streaming future-credit FFN pretraining (run through mlq)")
+    parser = argparse.ArgumentParser(description="Streaming future-bag-carry FFN pretraining (run through mlq)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--resume", type=Path)
     group.add_argument("--generate", type=Path, metavar="CHECKPOINT")

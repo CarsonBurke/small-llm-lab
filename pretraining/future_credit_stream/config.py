@@ -1,4 +1,4 @@
-"""Scalar TD future-loss learning over independent document streams."""
+"""Streaming FFN recurrence with a future-bag carry over document streams."""
 
 from __future__ import annotations
 
@@ -9,7 +9,14 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ARCHITECTURE = "streaming_ffn_td_value_v1"
+ARCHITECTURE = "streaming_ffn_future_bag_carry_v1"
+
+OBJECTIVES = ("ce", "future_bag", "tbptt")
+"""``ce``: carry the hidden verbatim (the recurrent-CE control).
+``future_bag``: gated carry writer trained so the carry's readout through the
+frozen head is the discounted bag of the next ``horizon`` future tokens.
+``tbptt``: CE recursion with true temporal gradients inside each optimizer
+page; an upper reference, never a promotable recipe."""
 
 
 @dataclass(frozen=True)
@@ -20,11 +27,12 @@ class Config:
     model_dim: int = 512
     num_layers: int = 6
     mlp_hidden: int = 2048
-    critic_hidden: int = 64
     document_batch: int = 4096
     stream_steps: int = 8
-    objective: str = "td"
-    discount: float = 1.0
+    objective: str = "future_bag"
+    horizon: int = 32
+    discount: float = 0.9
+    backbone_future_weight: float = 0.0
     iterations: int = 2000
     val_every: int = 20
     log_every: int = 10
@@ -37,7 +45,7 @@ class Config:
     warmup_steps: int = 100
     compile_mode: str = "reduce-overhead"
     cpu_threads: int = 8
-    run_id: str = "ffn_td_value_sp1024_2k"
+    run_id: str = "ffn_bag_carry_sp1024_2k"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -55,14 +63,19 @@ class Config:
 
     def validate(self) -> None:
         for key in ("vocab_size", "model_dim", "num_layers", "mlp_hidden", "document_batch",
-                    "stream_steps", "iterations", "val_every", "log_every", "val_documents",
-                    "val_stream_steps", "checkpoint_every", "cpu_threads", "critic_hidden"):
+                    "stream_steps", "horizon", "iterations", "val_every", "log_every",
+                    "val_documents", "val_stream_steps", "checkpoint_every", "cpu_threads"):
             if getattr(self, key) <= 0:
                 raise ValueError(f"{key} must be positive")
-        if self.objective not in ("td", "ce"):
-            raise ValueError("objective must be td or ce")
+        if self.objective not in OBJECTIVES:
+            raise ValueError(f"objective must be one of {OBJECTIVES}")
         if not math.isfinite(self.discount) or not 0.0 <= self.discount <= 1.0:
             raise ValueError("discount must be finite and in [0, 1]")
+        weight = self.backbone_future_weight
+        if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+            raise ValueError("backbone_future_weight must be finite and in [0, 1]")
+        if weight > 0.0 and self.objective != "future_bag":
+            raise ValueError("backbone_future_weight applies only to the future_bag objective")
         if not 0 <= self.warmup_steps < self.iterations:
             raise ValueError("warmup_steps must be in [0, iterations)")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
@@ -75,10 +88,19 @@ class Config:
             raise ValueError("run_id must be a single directory name")
 
     @property
+    def uses_writer(self) -> bool:
+        return self.objective == "future_bag"
+
+    @property
+    def page_horizon(self) -> int:
+        """Future tokens each training page must provide per position."""
+        return self.horizon if self.uses_writer else 0
+
+    @property
     def model_config(self) -> dict:
         values = {key: getattr(self, key) for key in
-                  ("vocab_size", "model_dim", "num_layers", "mlp_hidden", "critic_hidden")}
-        return {**values, "use_td_critic": self.objective == "td"}
+                  ("vocab_size", "model_dim", "num_layers", "mlp_hidden")}
+        return {**values, "use_writer": self.uses_writer}
 
     @property
     def tokens_per_step(self) -> int:
@@ -88,13 +110,16 @@ class Config:
     def output_dir(self) -> Path:
         return REPO_ROOT / "ablation_results" / self.run_id
 
-
     def path(self, value: str) -> Path:
         path = Path(value)
         return path if path.is_absolute() else REPO_ROOT / path
 
-    def learning_rate_at(self, step: int) -> float:
+    def schedule_at(self, step: int) -> float:
+        """Warmup then cosine to 10%, as a multiplier on the base rate."""
         if step < self.warmup_steps:
-            return self.learning_rate * (step + 1) / self.warmup_steps
+            return (step + 1) / self.warmup_steps
         progress = (step - self.warmup_steps) / max(1, self.iterations - self.warmup_steps - 1)
-        return self.learning_rate * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress)))
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    def learning_rate_at(self, step: int) -> float:
+        return self.learning_rate * self.schedule_at(step)
