@@ -122,6 +122,44 @@ ten-minute-capped longer check. Uno training remains vetoed.
 - [ ] Measure the resulting complete RL-cycle time in a later authorized run.
   The isolated update comparison excludes resident rollout-replica weights;
   reserve memory for them. No full-step or learning-quality improvement claimed.
+- [x] 2026-09-18 exact replay paths adopted (LoRA power-of-two scale fold with
+  in-place add, token-major packed attention concatenation, `index_select`
+  action gathers, deferred hidden-balance finiteness flags). Parity job 8090
+  (about 110s): the same 16-trajectory/160k-action optimizer minibatch took
+  17.85/18.13s on the legacy paths and 16.62/16.63s on the exact paths, an
+  8.2% update speedup at identical 20.22 GiB peak allocation. Maximum
+  parameter difference 7.45e-9 equals the unchanged-path repeat control
+  (7.45e-9; exact-path repeat 6.68e-9). Isolated warm update measurement,
+  not a full-cycle or learning claim. The token-major layout revisits job
+  5784's rejected candidate as a two-line change bundled with the fold.
+- [x] Per-step split-KV planning adopted. Microbenchmark job 8089 at 64 lanes,
+  11,264-slot cache, 24 layers: kernels per decode step 312→76, bitwise
+  identical output across full, mixed, half-retired and short length
+  patterns; graph replay 11.69→11.78ms at full length (KV-bandwidth bound,
+  within noise), 6.50→6.14ms mixed, 0.44→0.15ms at short lengths. The gain
+  concentrates in prompt-length and draining phases, not in the long tail.
+- [x] Logit chunk 1024 versus 128: behavior refresh log-probs and advantages are
+  bitwise identical (maximum difference 0.0) and refresh took 6.54→6.31s for
+  160k actions. Forward-qualified only; the update path's new-log-prob
+  gradients at chunk 1024 were not compared against 128.
+- [ ] SDPA backend audit for packed GQA replay on SM120: flash serves GQA causal
+  (no hard fail under `sdpa_kernel(FLASH_ATTENTION)`), efficient attention is
+  unavailable, cuDNN is available. On a 4096-token forward/backward probe the
+  default dispatch took 1.50ms, cuDNN 1.90ms and forced flash 3.52ms, so the
+  default is not flash on this build. Confirm with the profiler which kernel
+  production replay runs; forcing a backend changes rounding and needs parity.
+- [ ] `--behavior-logprobs rollout` (captured merged-bf16 replica log-probs
+  replacing the replay actor pass, about 10s of the 15–21s refresh): needs a
+  learning ablation gated on `ratio_abs_log_max` and explicit sign-off; the
+  ratio reference changes from replay bf16 to merged bf16 arithmetic.
+- [ ] `--nextlat-trunk-balance hidden` (drops the retained-graph second trunk
+  backward, measured 2.6% faster update): needs the 2000-step learning
+  ablation before becoming the default.
+- Not exact, not implemented: compiled RMSNorm/RoPE regions, saved log-sum-exp
+  in the chunked head backward, larger refresh shard budgets, KL-probe
+  subsampling, tail/refresh overlap on a second stream, FP8 KV, and a shared
+  frozen bottom stack for the critic. Each changes rounding or learning and
+  needs its own gradient-parity or learning ablation.
 - Physical-lane-count sweep (64/48/32): **rejected by user**; do not queue it.
 - Async rollout/update overlap: discussion only, not an implementation plan.
   Requires a frozen behavior snapshot, policy-lag handling, and simultaneous
@@ -144,3 +182,5 @@ Evidence:
 - [Accepted checkpoint-recomputation tradeoff](../ablation_results/minicpm_replay_checkpoint_20260908/result.json)
 - [Rejected compiler backward and all-layer diagnosis](../ablation_results/minicpm_replay_compile_20260908/result.json)
 - [Integrated compiled replay qualification](../ablation_results/minicpm_replay_compile_integrated_20260908/result.json)
+- [Exact replay paths parity, job 8090](../ablation_results/minicpm_exact_replay_paths_20260918/result.json)
+- [Split-KV per-step plan microbenchmark, job 8089](../ablation_results/minicpm_split_kv_plan_20260918/result.json)

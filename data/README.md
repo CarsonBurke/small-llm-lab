@@ -79,3 +79,36 @@ MATCHED_FINEWEB_GPT2_DECODE_BATCH_SIZE=512
 ```
 
 These control batched tokenizer encoding during shard export, tokenizer thread count, tiktoken thread count, and batched GPT-2 decode for the blobstore docs-cache path.
+
+## MiniCPM5 English Source Pool
+
+`data/pretraining_sources/minicpm5_refresh/` contains a pinned, verified
+39.81 GB compressed Parquet source pool: 24 Ultra-FineWeb English shards
+(31.19 GB), four Ultra-FineWeb-L3 English Q&A shards (4.31 GB), and four
+English multi-style shards (4.31 GB). Together they contain 18,402,960 rows.
+Shard selection is deterministic across each pinned English subset, not a
+contiguous prefix. These are acquisition proportions, not validated training
+mixture weights.
+
+- `source_manifest.json`: repository revisions, file lists, byte sizes,
+  upstream SHA-256 hashes, and selection policy; uses the existing source
+  downloader format and the `content` text column.
+- `verification.json`: full-file checksum results, Parquet schemas, row
+  counts, and allocated storage accounting.
+- `cleanup.json`: retired payload inventory and the measured 40.25 GB
+  replacement budget. The final pool, retained provenance, and metadata
+  occupy 39.92 GB, below that budget.
+- `retired_provenance/`: K3 v7 preprocessing-cache metadata and validation
+  snapshots; the completed K3 v7 training corpus remains in place.
+
+Obsolete mathmix v1–v3, dense-v4 diffusion, Bolmo byte1024, MathGLM v1–v5,
+and drill v2/v3 training payloads were retired. Their retained manifests,
+validation, and probe files are historical records, not complete training
+datasets. Failed builds and the completed K3 v7 intermediate cache were
+removed; current trainer defaults and canonical source datasets were retained.
+
+The new pool is **source data only**. Apply challenge-heldout decontamination
+and existing mixture ablations before materializing or using it for training.
+No training configuration was switched to these sources. Check upstream
+source licenses; the L3 dataset card also prohibits unauthorized unchanged
+redistribution.

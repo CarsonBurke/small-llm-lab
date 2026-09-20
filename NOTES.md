@@ -6229,3 +6229,1538 @@ Canonical evidence: `ablation_results/minicpm_ar_gemm_choice_20260908/` and
 `ablation_results/minicpm_ar_production_20260908/`. No full RL training run or Uno
 adapter training was launched. Remaining quality and end-to-end training checks
 are tracked in `postraining/TODO_MINICPM5.md`.
+
+## 2026-09-16: Future-bag carry for the streaming FFN recurrence (pre-registration)
+
+Lineage: the streaming FFN line in `pretraining/future_credit_stream/`. The
+best result there is plain recurrent CE with the actual hidden as the detached
+carry (2.139849 / 2.139481 / 2.139952 proxy BPB across three matched CE runs,
+memory gain ~1.165 BPB). Every attempt to shape the carry with a future proxy
+lost: delayed NextLat predicted carry +0.458, NextLat actual carry +0.257,
+vector synthetic credit worse at step 660 (cancelled), scalar TD value into
+the hidden +0.586 with memory gain falling to 0.884. The TD arm's logs show the
+critic never fit (prediction ~0.2 vs target ~4.7).
+
+Two designs were built and dropped before any arm ran. (1) A hindsight
+advantage critic: a scalar head over the carry direction fitted by a Bellman
+regression to `ce(zero carry) - ce(actual carry)` and differentiated into a
+gated writer. Dropped by request: a learned value is an indirect, hard-to-fit
+stand-in, and it needed a second zero-carry forward per token. (2) An
+imagined rollout: run the reader on the actor's own belief-weighted embedding
+plus the proposed carry for k future steps, score each on the real future
+token, and differentiate into the writer. Dropped for cost: k extra reader
+passes per token exceed TBPTT itself, which is off the table.
+
+Hypothesis. The carry must be chosen without gradients from the future,
+without future tokens as inputs, without a critic, and without running the
+model again. CE recursion carries `h_t`, the vector whose readout through the
+head is the belief about `x_{t+1}`. The next reader will know `x_{t+1}`; what
+it needs from the carry is what the past says about the tokens after it. So a
+gated writer (`c = g * unit(write(h)) + (1-g) * unit(c_prev)`, initialized
+to CE recursion) is trained so that the carry's readout through the *same
+frozen final norm and head* is the discounted bag of the target and the
+upcoming tokens: `q_t ~ sum_{j<=32} 0.9^j onehot(x_{t+1+j})`, truncated at
+the document's closing BOS (included), soft-target cross-entropy. The target
+is the exact discounted return of future one-hots from the corpus, so the
+horizon comes without a bootstrap, a learned value, or a vector residual to
+regress. The backbone stays pure CE by default (`backbone_future_weight=0`).
+
+Two amendments from the pre-run review, before any arm started. (a) The bag
+begins at `x_{t+1}` rather than `x_{t+2}`: with a full-rank head the bag pins
+the carry's whole direction, and a bag that skipped the current target left
+nothing anchoring the carry to what the hidden already encodes (recent-token
+identity the next reader needs). Starting at `x_{t+1}` makes `discount=0`
+exactly the hidden's own job, so the identity-initialized writer starts near
+its optimum and every larger discount adds the horizon on top; it also
+leaves no empty rows. (b) Both mixed terms are RMS-normalized inside the
+writer: otherwise retention could be expressed through the relative norms of
+`write(h)` and `c_prev` instead of the gate, and `gate_mean` would not
+measure retention. Only the carry's direction reaches the reader and the
+judge, so the normalization costs nothing.
+
+Cost and parameters. Per token: two head matmuls (one gradient-free for the
+hidden's reference bag loss), a scatter, two softmaxes, and the writer's three
+`512 x 512` matmuls; expected 10 to 15% of step time. The writer's 787,456
+parameters (about 5.8% of the 13.65 M backbone) run at inference too, so the
+arm is not parameter-matched to `ce`; the results table reports parameter
+counts and the step-time ratio. The head is zero-initialized, so the writer's
+gradient is zero at step 0 and small during warmup; Adam normalizes it, and
+the 100-step warmup from lr 1e-6 is what bounds the early writer steps.
+
+Verifier: matched 2,000-update proxy BPB on the fixed 256-document validation
+panel, plus `val_memory_gain_bpb`, plus training diagnostics `bag_loss`
+against `hidden_bag_loss` (the same bag cross-entropy for the hidden itself,
+what CE recursion would carry: the matched reference the writer must beat;
+`bag_entropy` is not a floor, the bag is a sample of an unseen future),
+`gate_mean`, `carry_cosine`, and the second-half median `step_avg_ms` ratio
+to CE. Same seed, data order,
+tokenizer, and backbone initialization across arms.
+
+Success criterion: `future_bag` (discount 0.9) beats the matched `ce` control
+by more than 0.005 proxy BPB. Interpretation: `discount=0` (carry judged on
+`x_{t+1}` only, the hidden's own job) versus 0.5 versus 0.9 shows whether the
+horizon, rather than the writer, matters; `tbptt` (true temporal gradients inside each 8-tick page,
+reference only) bounds what any local method could gain; the
+`backbone_future_weight=1` arm tests whether letting the bag gradient shape
+the backbone helps or, as with every earlier future-proxy gradient into the
+backbone, hurts.
+
+Likely failure modes: (1) the reader cannot exploit a bag-shaped carry:
+`bag_loss` falls clearly below `hidden_bag_loss` while proxy BPB and memory
+gain do not move or worsen (the carry drifts away from the hidden the reader
+was trained to read; watch `carry_cosine` fall with no BPB gain); (2) a linear-gated writer
+over a CE-shaped hidden is too weak to change anything (`carry_cosine` ~1,
+`gate_mean` ~0.95, `bag_loss` flat); (3) with discount 0.9 the bag is diffuse
+(entropy several nats) and the gradient mostly asks for a topic direction the
+head already exposes; (4) TBPTT-8 itself not beating CE, which would say the
+FFN reader cannot exploit a better carry at this scale.
+
+Arms (all `--after-success` on the GPU contract tests, job 7747):
+7748 `ffn_bag_ce_sp1024_2k` (ce control), 7749 `ffn_bag_g90_sp1024_2k`
+(future_bag, discount 0.9), 7750 `ffn_bag_g50_sp1024_2k` (discount 0.5),
+7751 `ffn_bag_g0_sp1024_2k` (discount 0), 7752 `ffn_bag_g90_bb1_sp1024_2k`
+(discount 0.9, `backbone_future_weight=1.0`), 7753
+`ffn_bag_tbptt8_sp1024_2k` (tbptt reference). Horizon 32 everywhere.
+Results are appended below when the runs complete.
+
+Results (2026-09-17, all six arms complete). Same seed, data, and backbone
+init; 2,000 updates;
+`bag_loss` / `hidden_bag_loss` / `gate_mean` / `carry_cosine` are the last
+training log (step 2000); step ms is the second-half median.
+
+| arm | params | proxy BPB | vs ce | memory gain | bag_loss / hidden_bag_loss | gate_mean | carry_cosine | step ms | ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ce` | 13,652,480 | 2.139688 | - | 1.1667 | - | - | - | 21.37 | 1.00x |
+| `g0` | 14,439,936 | 2.141280 | +0.001591 | 1.1369 | 3.448 / 3.450 | 0.992 | 0.997 | 26.63 | 1.25x |
+| `g50` | 14,439,936 | 2.146800 | +0.007111 | 1.1546 | 5.010 / 5.813 | 0.927 | 0.660 | 26.25 | 1.23x |
+| `g90` | 14,439,936 | 2.168735 | +0.029047 | 1.1119 | 5.842 / 7.848 | 0.784 | 0.365 | 26.30 | 1.23x |
+| `g90_bb1` | 14,439,936 | 2.183606 | +0.043918 | 1.0931 | 5.802 / 7.656 | 0.795 | 0.411 | 27.37 | 1.28x |
+| `tbptt8` | 13,652,480 | 2.175066 | +0.035378 | 1.2650 | - | - | - | 20.46 | 0.96x |
+
+Reading. This is pre-registered failure mode 1, and it is monotone in the
+discount. The writer wins its own judge decisively (the carry's bag
+cross-entropy ends 0.8 nats below the hidden's at discount 0.5 and 2.0 nats
+below at 0.9), so failure mode 2, a writer too weak to move, is ruled out.
+Proxy BPB and memory gain worsen in proportion to how far the carry leaves
+the hidden: cosine 0.998 -> 0.66 -> 0.37 maps to +0.002 -> +0.007 -> +0.029
+BPB. The horizon is not what failed; the judge is. The head reads one
+direction of the carry, while the reader is six FFN blocks that consume
+everything, including whatever the head ignores. The writer is free to
+discard what the head cannot see and is rewarded for doing so whenever that
+buys bag mass. `hidden_bag_loss` rising through training (7.15 at step 510
+to 7.85 at step 2000, discount 0.9) shows the CE-shaped hidden sharpening
+away from the bag direction as it learns; the writer follows the bag instead.
+Letting the bag gradient shape the backbone (`backbone_future_weight=1`) is
+worse again (+0.044), the fifth future-proxy gradient into the backbone to
+lose. The discount-0 arm is within 0.002 of CE, so the 787,456 writer
+parameters and the normalized gate mixing are harmless on their own but earn
+nothing. The step-time ratio is 1.23x, above the 10 to 15% estimate: the
+two `[4096, 1024]` softmaxes and the scatter are not small at this model size.
+
+Lesson. Four reader-free judges of the carry have now lost in this line
+(NextLat regression, synthetic vector credit, scalar TD value, head-readout
+bag). A judge the writer can satisfy without the reader gets satisfied
+without the reader. The one judge that cannot be gamed is the reader's own
+loss: `dCE_{t+1}/dc_t`, which the next tick already computes down to
+`latent_norm`'s input and currently discards. But the `tbptt8` reference
+answers whether a better carry can help at all here, and the answer is no at
+this budget (failure mode 4): true temporal gradients through the backbone
+over every 8-tick page end at 2.175066, +0.035 worse than detached CE, with
+a larger memory gain (1.265 vs 1.167) bought by a worse reset-state BPB
+(3.440 vs 3.306). The gap to CE closes over training (+0.072 at step 800,
++0.035 at step 2000), so this is a 2,000-update statement, not a limit; at
+this budget the model learns faster with each tick as its own graph. TBPTT's
+one backward per page also makes it the fastest arm (0.96x). Since the
+upper reference for temporal credit loses, no local carry objective, reader-
+judged or otherwise, should be expected to gain at this scale, and the
+reader-gradient writer is not built. The line stops here: nothing is
+promotable; CE recursion stands.
+
+## 2026-09-17: Stationary buffer read for the streaming FFN (pre-registration)
+
+Lineage: the streaming FFN line in `pretraining/future_credit_stream/`. CE
+recursion with the detached actual hidden as the carry stands at 2.139688
+proxy BPB (`ffn_bag_ce_sp1024_2k`, memory gain 1.167). Every attempt to
+choose that carry by a reader-free proxy lost, and the TBPTT-8 reference
+(true temporal gradients through the backbone inside each 8-tick page) lost
+too, at 2.175066. The recursive carry is one vector rewritten every step;
+information from `K` steps back reaches the reader only by surviving `K`
+rewrites, none of which is asked to keep it, and gradient pressure through
+that chain does not fix it at this budget.
+
+Hypothesis. Make the recurrence stationary: keep the last `K` post-final-norm
+hiddens of the document verbatim and detached, each written once and never
+rewritten while readable, and let every step read all of them directly. This
+is causal attention's structural trick (each position's representation is
+built once and consumed by many later positions) and Transformer-XL's
+stop-gradient memory at a segment length of one token. Information from
+`x_{t-k}`, `k <= K`, then reaches step `t` in one hop, produced by a network
+that actually had `x_{t-k}` as input. The producer of a slot is still trained
+only by its own CE; long-horizon utility reaches it only through the reader
+adapting. What is new is that far less has to be carried on purpose, because
+the reader reaches back directly and can choose *which* past step to read
+from the current token (content addressing), which a recursive carry cannot
+do at all.
+
+Design (`pretraining/stationary_stream/`). Backbone, data pipeline, seed,
+optimizer, schedule, validation panel, and checkpoint contract are those of
+`future_credit_stream`; the backbone initialization is bitwise identical to
+the CE-recursion control (tested), so `ffn_bag_ce_sp1024_2k` is the matched
+control and no new control arm is run. State per lane: a buffer of the last
+`K` detached BF16 hiddens `[K, B, D]` and a validity mask `[K, B]`, kept as
+a ring: each tick the host overwrites the oldest slot in place with the
+tick's hidden (one `[B, D]` write, no shifting), and a per-tick age vector
+(one row of a precomputed `[K, K]` table indexed by the newest slot) tells
+the read how many steps old each slot is. The mask is cleared on the lane's
+BOS, so slots written before the document are never read. The read, over
+ages `a = 1..K`:
+
+```text
+q      = W_q norm(embed x_t)                       (H heads x d_k)
+k_a    = rotate(age a)( W_k h_{t-a} )              the query is not rotated
+w      = softmax_a ( [ b_null , q . k_a / sqrt(d_k) ] )   masked slots -> -inf; a null slot is always available
+read   = W_v ( concat_h sum_a w_{h,a} slice_h(h_{t-a}) )   value projection after mixing: exact by linearity
+h_t    = FFN stack( norm(embed x_t) + read )
+```
+
+RoPE on the keys carries time: the rotation for every age `1..K` is
+precomputed and gathered by the slot's current age, so every score depends
+on relative age only and the ring layout is invisible to the read (tested:
+permuting slots together with their ages leaves the output unchanged).
+`W_v` starts at zero, so the untrained model is the context-free FFN and
+grows the read from the CE gradient. No gradient crosses a tick; nothing
+judges the buffer.
+
+Cost. `H=4`, `d_k=32`, `K=10`: read parameters 393,988 (2.9% of the
+13.65 M backbone; the model has 14,045,956 parameters, the control
+13,652,480), per-token MACs about 0.98 M against the backbone's 13.1 M
+(7.5%), buffer 40 MiB over 4096 lanes. `K=32`: 2.4 M MACs (18%), 128 MiB.
+The user's requirement is that this stays cheap; the results table reports
+the second-half median step-time ratio to the control (21.37 ms).
+
+Verifier: matched 2,000-update proxy BPB on the fixed 256-document panel,
+`val_memory_gain_bpb` (against an always-empty buffer, realized as an
+all-true reset mask over the same ring), and the read diagnostics
+`null_mass` (attention on the null slot) and `read_age` (mean age of the
+non-null attention), both over lanes with a readable slot, and `read_rms`
+(RMS of the read without the value bias, against the unit-RMS observation;
+exactly zero while the value map is still zero), plus the step-time ratio.
+
+Success criterion: `K=10` beats the CE-recursion control by more than 0.005
+proxy BPB at no more than about 1.1x its step time. Interpretation: `K=1`
+isolates the read from the depth (it can only reach `h_{t-1}`, what CE
+recursion adds directly), though it is not literally CE recursion: the
+control's carry enters live from step 0 at unit RMS through `latent_norm`,
+while here the zero-initialized value map starts context-free and must grow
+the read; `K=32` shows whether more reachable history keeps paying at this
+budget.
+
+Likely failure modes: (1) the reader ignores the buffer (`null_mass` -> 1,
+`read_rms` -> 0, memory gain near zero) because the zero-initialized value
+map never grows; (2) `K=1 ~ K=10 ~ ce`: an FFN reader cannot exploit reachable
+depth at this scale, which would also explain TBPTT's loss; (3) `K=10` below
+`ce`: a convex mixture of past hiddens entering at learned scale is worse than
+one hidden entering at unit RMS through `latent_norm`, in which case the fix
+is the entry path, not the buffer; (4) step time above 1.15x at `K=10`, which
+fails the performance requirement regardless of BPB.
+
+Arms (all `--after-success` on the GPU contract tests): `stat_k1_sp1024_2k`,
+`stat_k10_sp1024_2k`, `stat_k32_sp1024_2k`. First submission 2026-09-17
+(mlq 7777-7780) was skipped: the GPU contract tests passed 9 of 10, the one
+miss being the two-element null-bias gradient at 2.4% against a 2% bound
+after two *independent* optimizer steps of the compiled model and the eager
+reference (Adam on BF16 sign noise); the test now resyncs the reference to
+the compiled parameters after each step. Resubmitted at priority 2: mlq 7783
+(`stat_gpu_tests`), 7784 (`stat_k10_sp1024_2k`), 7785 (`stat_k1_sp1024_2k`),
+7786 (`stat_k32_sp1024_2k`).
+
+Results (value_map entry; control `ffn_bag_ce_sp1024_2k` 2.139688, memory
+gain 1.1667, 21.37 ms):
+
+| arm | proxy BPB | vs control | reset-latent BPB | memory gain | null_mass | read_age | read_rms | step ms (ratio) |
+|---|---|---|---|---|---|---|---|---|
+| `stat_k1_sp1024_2k` (7785) | 2.203452 | -0.0638 | 2.9751 | 0.7716 | 0.346 | 1.00 | 0.285 | 23.31 (1.09x) |
+| `stat_k10_sp1024_2k` (7784) | 2.228332 | -0.0886 | 2.9345 | 0.7061 | 0.086 | 3.16 | 0.227 | 25.75 (1.20x) |
+| `stat_k32_sp1024_2k` (7786) | cancelled by request after K=1 and K=10 | | | | | | | |
+
+`scripts/compare_stationary_stream.py --candidate stat_k10_sp1024_2k
+--control ffn_bag_ce_sp1024_2k --reference stat_k1_sp1024_2k`:
+improvement -0.0886, memory-gain delta -0.4606, gate not met.
+
+Reading. The buffer contents are the control's carry and more (the age-1
+slot is exactly the previous post-final-norm hidden; the ring tests pin
+it), and the reader used it: at `K=10` the null mass fell to 0.09 and the
+attention's mean age was 3.2 steps, so it reached well past `h_{t-1}`. Yet
+both arms recovered far less from context than the control (memory gain
+0.71-0.77 against 1.17) and both were *better than the control with
+context removed* (reset-latent 2.93-2.98 against the control's 3.306). That
+is failure mode (3), the entry path, and `K=1` settles it against the
+history: the read enters through a zero-initialized value map with no
+normalization, so the backbone first learns the context-free solution and
+the read then has to grow against it. Its RMS ended at 0.23-0.29 against
+the unit-RMS observation, roughly a fifth of the control's carry, which
+enters through `latent_norm` at unit RMS from step 0. More history cannot
+fix a weak entry: `K=10` was 0.025 *worse* than `K=1`, and at 1.20x the
+control's step time it also failed the performance requirement, while
+`K=1` at 1.09x met it. Two smaller contributors: a convex mixture cannot
+give two slots full weight at once, and with `W_v = 0` the query, key, and
+null bias receive no gradient until the value map has grown.
+
+Follow-up, pre-registered 2026-09-18: the `latent_norm` read entry. Same
+ring and RoPE-by-age keys, but no null slot and no value map: the softmax
+runs over the readable slots only (a lane with none reads zero, exactly the
+control's zeroed carry), the mixed vector passes through the control's own
+`latent_norm` (RMSNorm with learned gains) and enters at unit RMS from step
+0, the query is zero-initialized so content addressing starts neutral, and
+a learned per-head recency bias `-(age - 1)` makes the newest slot take
+most of the mass at init (63% at `K=10`). With `K=1` this *is* the control's
+forward (tested bitwise against `StreamingFFNModel(use_writer=False)` over
+a page with resets), so `K=1` should reproduce 2.1397 up to run-to-run
+noise and `K=10` can only add reachable slots. Read parameters drop to
+131,368 (query, key, recency bias); the model has 13,783,848 parameters.
+Success criterion unchanged: `K=10` beats the control by more than 0.005 at
+no more than about 1.1x step time; `K=1` must land within 0.01 of the
+control or the parity claim is wrong somewhere in the compiled path.
+Likely failure modes: (1) `K=10 ~ K=1 ~ ce`: the FFN reader gains nothing
+from selectable history at this scale even with the control's entry path;
+(2) `K=10` below `K=1`: the recency-biased mixture blurs `h_{t-1}` at init
+and the query never sharpens it back (would show as read_age well above 1
+with no BPB gain); (3) step time above 1.15x at `K=10`, given the value
+map's 262k MACs are gone but the `K` key projections remain. The weight
+decay rule was restated as "weight matrices only" so the 2-D recency bias
+table is not decayed toward zero; for the control and the value_map arms
+the partition is unchanged. First submission at priority 2 (mlq 7789-7791)
+was skipped: the GPU contract tests passed 15 of 16, with the K=1 bitwise
+parity against the control confirmed, and the one miss was the 16-element
+key-bias gradient on the first page at 2.02% against the 2% bound. That
+gradient is cancellation-dominated by construction (softmax logit gradients
+sum to zero across slots, so the shared bias keeps only the rotation
+differences), so the bound now carries an absolute BF16-accumulation floor
+of 2e-5. Resubmitted: mlq 7794 (`stat_norm_gpu_tests`), 7795
+(`stat_norm_k1_sp1024_2k`), 7796 (`stat_norm_k10_sp1024_2k`); `K=32` is not run (the user cancelled the
+value_map `K=32` arm and the `K=1` vs `K=10` comparison carries the
+question).
+
+Results (latent_norm entry, recency slope 1):
+
+| arm | proxy BPB | vs control | reset-latent BPB | memory gain | read_age | read_rms (pre-norm) | step ms (ratio) |
+|---|---|---|---|---|---|---|---|
+| `stat_norm_k1_sp1024_2k` (7795) | 2.138618 | -0.0011 | 3.2898 | 1.1511 | 1.00 | 1.104 | 21.72 (1.02x) |
+| `stat_norm_k10_sp1024_2k` (7796) | 2.151391 | +0.0117 | 3.2725 | 1.1211 | 1.53 | 0.984 | 23.29 (1.09x) |
+
+`K=1` reproduces the control (0.001 better, run noise), so the whole
+value_map loss was the entry path, and the compiled ring, age rotation, and
+norm placement are validated end to end at run scale. `K=10` is failure
+mode (2): its read age stayed at 1.53-1.59 from step 100 to step 2000,
+which is the recency prior's own expectation (`softmax(-(a-1))` over ten
+ages gives 1.58), so the query never sharpened the mixture back onto
+`h_{t-1}` and never learned to address anything else. The blurred read
+cost 0.099 BPB at step 200 against the control and the gap closed
+monotonically to 0.012 by step 2000 without crossing. The pre-norm mixed
+RMS of 0.98 says consecutive hiddens are nearly parallel, so the mixture
+loses little magnitude, just precision. Speed is met: 1.09x at `K=10`.
+
+Next arm (pre-registered): the same `K=10` with a steep recency prior
+(slope 4: the newest slot takes 98% of the mass at init), so the model
+starts as the control and the extra slots can only add. Outcomes: worse
+than `K=1` means the slots hurt through the query path; equal means the
+reader never finds a use for them at this budget (failure mode 1 for this
+entry); better than the control by more than 0.005 is the first positive
+result of the line.
+Jobs: 7801 (GPU tests after adding `read_recency_slope`, 16 passed; the slope only
+scales the `age_bias` init, so slope 1 is unchanged and the compare script
+treats it as a read knob), 7802 (skipped: its `--after-success` was bound to the wrong
+job id by a shell parse), 7803 (`stat_norm_k10_s4_sp1024_2k`).
+
+Result (`stat_norm_k10_s4_sp1024_2k`, K=10, slope 4):
+
+| proxy BPB | vs control | reset-latent BPB | memory gain | read_age (step 20 -> 2000) | read_rms | step ms (ratio) |
+|---|---|---|---|---|---|---|
+| 2.139679 | -0.00001 | 3.3031 | 1.1634 | 1.019 -> 1.033 | 1.085 | 23.31 (1.09x) |
+
+Outcome "equal": the arm is the control to five decimals along the whole
+trajectory (largest gap either way 0.009 BPB, at step 200), and the read
+age moved from the prior's expectation 1.019 to 1.033 in 2,000 updates,
+i.e. the query put 1.4% more of the mass on older slots than it started
+with. The reader had ten exact copies of `h_{t-1}..h_{t-10}` at 1.09x
+step time and never found a use for any of them. Combined with the
+slope-1 arm this is a clean pair: mass off `h_{t-1}` costs (0.012 BPB at
+63% newest), mass on `h_{t-1}` reproduces the control, and the query's
+gradient does not move it in either direction. `comparison.json` in the
+arm's directory carries the control and both slope-1 arms as references;
+`K=1` at slope 1 is numerically the same model as `K=1` at any slope.
+
+Review of the slope knob (review-diff subagent, after the run): five
+findings, all applied. (1) The compare script refused same-line references
+whose stationary source hashes differ, which every pre-knob arm now does;
+references are now matched on the shared backbone and data sources like
+the control, a missing knob compares at its default, and stationary hash
+drift is reported under `config_differences[<arm>]["sources"]`. (2) The
+`BufferRead` guard accepted `inf` (NaN bias) and skipped `value_map`; it
+now matches the config contract on both entries. (3) A non-default slope
+on `value_map` was inert but recorded; `validate` rejects it. (4) The
+`-1e4` softmax fill was coupled to the slope's range; it is `-1e30` (fp32
+logits, identical softmax for any reachable logit, uniform on a fully
+masked lane). (5) Tests: `inf`/`nan`/`0.0` slopes, the model-side guard,
+the `value_map` rejection, and a new `test_compare_stationary_stream.py`
+over fabricated artifacts. The steep arm ran before (2)-(4); none changes
+its arithmetic (its slope is finite, its entry is latent_norm, and every
+masked logit underflows to zero mass under either fill). GPU tests
+rerun as job 7806.
+
+Reading. At this width, depth, and budget, direct access to
+`h_{t-2}..h_{t-10}` adds nothing over the recursion through `h_{t-1}`,
+which already carries what the backbone can use of them. This is the
+third result of the same shape on this backbone (TBPTT through the carry
+did not help, value_map and latent_norm reads did not help), and it is
+the pretraining counterpart of the MiniCPM token-carry finding: the carry
+is learnable and cheap, but the model does not extract a loss reduction
+from it. The stationary line as specified (single read at the model
+input, CE only, 2k updates) is closed as a negative result. The remaining
+untested directions, none of which this line's budget justifies without a
+new hypothesis: a read inside each block rather than at the input, a
+larger recursion-free context (attention over the observations
+themselves, i.e. a transformer), or an objective that rewards using the
+history (the future-credit line, which also lost at 2k).
+
+## 2026-09-17: Slot memory over token carry (pre-registration, no run yet)
+
+An alternative to the direct hidden carry: the actor decides *where* its
+belief is stored and *what* it reads back. Implemented as an opt-in extension
+of MiniCPM `--token-carry` (`--token-carry --slot-memory`, schema
+`minicpm5_vapo_slot_memory/v1`; `postraining/slot_memory.py`). Nothing in
+the existing native, latent, or plain token-carry paths changes; slot
+checkpoints and pending records are rejected by every non-slot loader,
+by continuation preflight when the mode or geometry differs, and by stock
+native-only evaluation.
+
+**Hypothesis.** With `M=64` addressable slots the model can keep a small,
+persistent working set of producer beliefs alive across thousands of tokens
+instead of only the previous step's, and the joint (token, slot) policy
+gradient can learn a write discipline (overwrite the least useful slot,
+skip writes) that the fixed `h_{t-1}` carry cannot express. **Verifier.**
+The same verifiable-math reward as the token-carry campaign, on
+`verifiable_mixed_10k_20260917` with the sealed held-out panels; matched
+starting checkpoint and identical rollout settings to `minicpm_carry_verifiable_10k_20260917`
+(mlq 7792) except the two slot flags. **Success criterion.** Held-out
+accuracy at the matched step count at or above the token-carry control with
+non-overlapping bootstrap intervals, together with a read that is actually
+used: `carry_actor_probe_null_mass` below 0.5 and `carry_actor_probe_read_age_mean`
+above 1 (a memory that only reads the previous step reproduces the control).
+**Likely failure modes.** (1) Null collapse: `slot_null_fraction` near 1 and
+null mass near 1, the read is switched off and the run is the control with
+extra RNG consumption; (2) write entropy collapse to one slot
+(`slot_distinct_slots_per_trajectory` near 1), a one-slot ring identical to
+the carry; (3) the joint log-prob adds `log(M+1)`-scale variance to the
+ratio at init because the slot prior is uniform, so PPO clipping engages
+on slot choices that have no effect on the read yet; (4) fused decode versus
+packed replay drift larger than in plain carry because the read is an
+attention over stored BF16 hiddens.
+
+**Contract.** Step `t` consumes an input embedding, produces the post-final-norm
+hidden `m_t` (same producer as token carry), samples `x_t` from the LM head and
+`σ_t ∈ {0..M-1, ∅}` from `SlotChoiceHead(m_t)` (zero-init `Linear(H, M+1)`,
+uniform prior, temperature 1, independent of `x_t` given `m_t`), then writes
+`m_t` into slot `σ_t` (pure overwrite; `∅` writes nothing). The next input is
+`E(x_t) + scale * (Wd E(x_t) + Wo read_t)` where `read_t` is a softmax over the
+alive entries after write `t` plus a learned null key with zero value; the
+query is `rope(Wq_tok E(x_t) + Wq_car m_t, t)`, keys are `rope(Wk m_i, i)`
+applied at write time so age `t - i` is native, values are `Wv m_i`. There is
+no direct `Wh m_t` term: the read is the only latent channel. `log π = log π_tok
++ log π_σ` with one shared advantage; the rollout engine stores the sum as the
+behavior log-prob and behavior refresh recomputes both from replay.
+Per-token records: `carry_hiddens` (BF16 `[T, H]`, unchanged) and
+`slot_choices` (int16 `[T]`, `-1` = `∅`), `slot_count`. `alive[t, s] =
+max{i ≤ t : σ_i = s}`; key `i` is visible to query `t` iff
+`alive[t, σ_i] == i`, so at most `M` keys per query. Replay builds that
+`(Q, M)` table per trajectory with global key offsets, packs it, and runs
+compiled FlexAttention with a block mask derived from the table (no dense
+`(Q, K)` scan); a dense reference backend exists for tests and the probe only.
+Forced `</think>` never writes (`σ = ∅`, slot log-prob 0) and stays
+excluded by `policy_mask`. The terminal slot choice `σ_{T-1}` is never read
+(a cap-ended lane does not even sample it and records `∅`), so replay drops
+its log-prob term (`slot_action_mask`): it has no causal effect and must not
+collect the trajectory advantage. Rollout stores the full joint sum; behavior refresh
+(unconditional after every rollout) makes the replay likelihood
+authoritative. Episode boundaries clear the lane's alive table,
+history, and pending-forced flag at admission; a whole rollout clears every
+lane. At init `Wd = Wo = 0`, so step 0 and every later step reproduce the
+base model exactly; the null key is zero so an empty memory reads a
+well-defined zero vector rather than a NaN softmax.
+
+**Null read.** Judged necessary, not optional: without it the read over an
+empty memory is undefined at step 0 and after any prefix of `∅` writes, and
+the policy has no way to express "read nothing" except by writing garbage.
+The learned null key (zero-init, one per head) costs `heads * head_dim`
+parameters. The alternative of reading zero when no slot is alive and
+forcing a read otherwise was rejected because it makes the read
+non-differentiable in the empty/non-empty boundary.
+
+Verification so far: 24 CPU tests in `postraining/tests/test_slot_memory.py`
+(alive table and mask against loop references, rollout-vs-replay visibility
+and read agreement across an episode boundary, joint log-prob composition,
+`∅` handling, forced tokens, packed replay against a per-trajectory oracle
+with gradients, checkpoint/schema refusals); GPU numerical checks in
+`postraining/tests/test_slot_memory_cuda.py`: mlq 7793 ran the pre-review
+file; the compiled FlexAttention replay matched the dense reference (read
+max abs 0.0039, gradient relative errors below 0.007) and the rollout-vs-replay
+check failed only at the two terminal positions (the un-sampled terminal `∅`
+under a peaked slot head), which is exactly the credit the review removed.
+Resubmitted after the fixes as mlq 7798.
+`scripts/evaluate_minicpm_vapo.py` accepts the slot schema (the actor's
+slot geometry, head, and combiner keys are validated against saved args);
+stock generate in `eval_hf_math` refuses it. A subagent review found and I
+fixed: an unconditional forced-flag reset that broke the non-slot continuous
+engine tests, the missing evaluation path, BF16 quantization of the null
+mixing factor in the FlexAttention read, an unbounded slot count versus the
+int16 record storage, stale joint log-probs on lane re-admission, and the
+terminal-slot credit above. No training run has been launched; results are
+appended below when one completes.
+
+## 2026-09-17: Latent feedback ("temporal residual") on the nanogpt-mini transformer (pre-registration)
+
+Context. The full-bandwidth transformer (arXiv:2608.08888) feeds the previous
+position's top-layer state back into the input through a gated linear unit
+and trains the recurrence with Jacobi passes (pass k carries pass k-1's
+shifted top states; every pass is scored with next-token loss; no detach).
+It reports validation-loss and downstream gains equivalent to roughly 1.5x
+the tokens at 1B scale. Our MiniCPM token carry (additive, detached,
+LayerScale 0.01, trained only by 1,000 RL steps) showed no benefit, and the
+FFN-only streaming lines showed a huge memory gain (1.17 BPB) because the
+carry was the model's only memory. The question here is what in the paper's
+result is confounded and what is necessary, on a transformer that has
+attention to compete with the carry, and whether a linear-attention memory
+over the fully processed past makes more of the channel than a single
+vector.
+
+Confounds in the paper, each with an arm that isolates it:
+
+1. Compute: feedback passes cost k forwards per step; the paper compares at
+   equal tokens (1.28-1.5x compute). Arms: the baseline at 2,000 steps
+   (matched tokens) and at 4,000 steps (matched compute for two-pass arms).
+2. Auxiliary-objective effect: the pass-2 loss backpropagates into pass-1
+   top states, shaping them to be useful inputs regardless of decoding. The
+   paper reports gains with standard decoding too. Arm: `glu` with the
+   carried state detached (`FB_DETACH=1`), which keeps the runtime channel
+   and removes the representation-shaping gradient. Every arm also reports
+   pass-1 loss (standard decoding of the same weights).
+3. Fusion form: the paper asserts the gated fusion is necessary because an
+   additive path lets the model ignore the state (shortcut). No ablation
+   is shown. Arm: `add` (additive, zero-initialised map, RMS-normed).
+4. Evaluation regime: the paper's validation losses use k parallel feedback
+   passes; only generation runs the true recurrence. Every arm here reports
+   Jacobi passes 1, 2, 3, 8 on the full panel and the true sequential
+   recurrence (`val_bpb_seq`, KV cache, token by token) on the first
+   262,144 validation tokens alongside pass 1 on the same subset.
+5. Training signal: dense next-token supervision over many tokens versus
+   our RL-only carry. Not a separate arm; the comparison with the MiniCPM
+   line is the whole design.
+
+New hypothesis (the "more use" design). The channel's worth should scale
+with what attention cannot reach: every layer of every position already
+sees the layer-matched past through the KV cache, so a fully processed
+summary of the previous position adds little unless attention is limited.
+Arms with a sliding attention window of the 64 previous tokens plus the
+current one (`FB_WINDOW=65`, exactly the sibling slot line's `fifo` arm
+with 64 slots, which is the windowed control) for the `glu` fusion and
+the memory below test this. If the feedback gain is
+larger under the window than at full attention, the temporal residual is
+a substitute for attention reach, which is what a slot-limited KV cache
+(the sibling line) would need.
+
+`lam`: linear-attention memory over all earlier top states, read at every
+layer. Keys and values are projections of the (jittered) carried top
+states; each layer queries with its own projection of its attention input;
+weights are `phi(q_t).phi(k_i) * lambda_h^(t-i)` for `i < t`, `phi = elu+1`
+with a learned per-head temperature, normalised by their sum; the per-head
+decays are learned from `(0.5, 0.9, 0.98, 0.999)` (half-lives 1, 7, 34, 700
+tokens), so a head can be the paper's `h_{t-1}` or a long summary. At
+decode time the memory is a fixed-size fast-weight state per head; in
+training it is a masked matmul. The read enters through zero-initialised
+projections, so the arm starts as the baseline. Compared with the paper's
+channel, one Jacobi pass already gives every layer of position t the fully
+processed states of all earlier positions rather than the previous one.
+Extra parameters: 3.7M (18%) over the 20.0M baseline; reported, not
+matched.
+
+Common protocol. nanogpt-mini (6L/512d, 4 heads, seq 1024, 524,288-token
+steps, Muon), `DATA_PATH=data/datasets/fineweb10B_sp1024`,
+`VAL_TOKENS=1048576`, 2,000 steps, seed 1337, two passes every step from
+step 0 (the paper introduces passes late and mixes 75/22/3; at 2k steps a
+fixed two-pass schedule is the cleaner comparison), jitter 0.02, no prefix
+mixin, loss = pass-1 + pass-2. Headline `val_bpb` is pass 2 (pass 1 for the
+baseline). Trainer `pretraining/nanogpt_mini/nanogpt_mini_feedback_train.py`,
+model `nanogpt_mini_feedback_model.py`, tests
+`pretraining/tests/test_nanogpt_mini_feedback{,_gpu}.py`.
+
+Arms (run names):
+`nanomini_base_2k`, `nanomini_fb_glu_2k`, `nanomini_fb_lam_2k`,
+`nanomini_base_w64_2k`, `nanomini_fb_glu_w64_2k`, `nanomini_fb_lam_w64_2k`,
+`nanomini_fb_add_2k`, `nanomini_fb_glu_detach_2k`, `nanomini_base_4k`.
+
+Success criteria and readings, fixed before the runs:
+- The temporal residual "works" in an arm iff `val_bpb_seq` beats the
+  baseline's `val_bpb_seq` (same subset) by more than 0.005 AND is within
+  0.01 of that arm's pass-8 number (the recurrence reaches what the Jacobi
+  passes promise). Pass-2 gains that vanish under the sequential eval are
+  Jacobi artefacts.
+- Necessary-ingredient readings: `glu` vs `add` (gating), `glu` vs
+  `glu_detach` (gradient through the state), `glu` at 2k vs `base_4k`
+  (compute), pass-1 of `glu` vs `base` (representation-shaping alone).
+- Window readings: gain(glu_w64 over base_w64) vs gain(glu over base), same
+  for `lam`. A larger windowed gain supports the substitute-for-reach
+  hypothesis.
+- `lam` vs `glu`: the memory earns its parameters if it beats `glu` by
+  more than 0.005 on `val_bpb_seq`; the learned decays and temperatures are
+  logged (`mem_decay{h}`, `mem_temp{h}`) to read what horizon it uses.
+
+Review fixes before the runs (subagent review of the model/trainer): the
+memory read is computed in fp32 with the [B,H,T,T] scores recomputed in
+backward (checkpointed) so the training path matches the fp32 fast-weight
+state of sequential decoding; the sequential recurrence is scored at step 0
+as well as at the end; the checkpoint is written before the final
+validation; the GPU tests hold the trainer's own gate tolerance (0.005 nats
+per token) at T=1024 and pin the memory kernel over 1024 positions with the
+production decays; a two-step trainer exercise covers every validation
+branch (a path test, not evidence). Validation runs the model eagerly in
+every arm (the baseline trainer validates through the compiled forward;
+same math, so cross-arm comparisons are unaffected but a val line will not
+reproduce an older nanogpt-mini log bitwise).
+
+Failure modes: (a) Jacobi non-contraction: pass 8 or the sequential loss
+worse than pass 2 (the paper's 3-pass mixin exists for this); (b) the
+sequential evaluator disagreeing with pass 1 in `none` mode (a runtime
+check raises); (c) `lam` decays drifting to 1 with reads averaging the
+whole past (no addressing; `mem_temp` stuck at 1); (d) the 2x step time of
+two passes making the compute-matched control the real winner.
+
+Queue (2026-09-17): GPU contracts job 7814 (13 passed on the pre-review
+files: lam two-pass step 250 ms per microbatch, peak 22.2 GiB). The first
+chain (7815-7823) was cancelled at the baseline by request: the sibling
+slot line's `full` arm is the base trainer bitwise and its `fifo` arm with
+64 slots is the 64-token window, so `nanomini_slot_full_2k` and
+`nanomini_slot_fifo_2k` serve as `base` and `base_w64` here; `base_4k`
+(compute-matched control) is deferred. Post-review GPU contracts and the six
+feedback arms (glu, lam, glu_w64, lam_w64, add, glu_detach) were requeued
+chained at priority 2: tests 7825, then 7826, 7827, 7833-7836 (the two
+windowed arms use `FB_WINDOW=65` = 64 past tokens + self, the slot fifo
+visibility; their `_w64` names refer to the 64 slots). Job 7825 failed
+(15 passed, 4 failed): the trainer path test could not get the device
+because the test process still held the compiled models from the
+training-step tests (now runs first), and the glu sequential-vs-prefix
+check at real width failed the 0.005-nats gate bound in bf16 by 0.018-0.023
+nats per token on random weights (add, lam and none passed). That is the
+bf16 noise floor of a multiplicative recurrent path, not an algorithmic
+difference (the fp32 CPU checks agree to 1e-4 and the test now pins the
+identity in fp32 at real width too); it means `val_bpb_seq` versus the
+Jacobi passes for `glu` carries a floor of roughly 0.005 bpb, which the
+0.01-bpb criterion must be read against. Requeued: tests 7838, arms
+7839-7844 in the same order. Job 7838: 25 passed, the lam trainer path
+test failed with an out-of-memory in the compiled backward on the fp32
+[64, 4, 1024, 1024] score buffer (the isolated step fit; with the val
+cache and optimizer resident it did not). The memory read is now the
+chunkwise form of decayed linear attention (chunk 128: intra-chunk [C, C]
+decay mask, earlier chunks through the fast-weight state carried across
+chunks), O(T C) memory in fp32 with no checkpointing; the dense form stays
+as the test reference (`linear_memory_read_dense`) and the CPU tests pin
+chunked = dense = recurrent state including padding of a non-multiple T.
+Requeued: tests 7846, arms 7847-7852. Job 7846: 26 passed. Per-microbatch
+(64 x 1024) compiled step and peak memory: none 71 ms / 7.3 GiB; glu 129 ms
+/ 14.6 GiB (two passes); add 126 ms / 14.6 GiB; lam 179 ms / 19.5 GiB (was
+250 ms / 22.2 GiB with the dense bf16 read); lam with the 65-token window
+247 ms (the explicit-mask SDPA path is slower than the causal kernel).
+bf16 sequential-vs-prefix gaps on random weights (nats per token): none
+0.003, add 0.0007, lam 0.0005-0.002, glu 0.018-0.023; all modes exact in
+fp32.
+
+## 2026-09-17: Slot-limited KV cache with a learned write policy (nanogpt-mini)
+
+Pretraining experiment on the nanogpt-mini testbed (6L/512d, sp1024
+FineWeb, 2,000 updates of 524,288 tokens). Code:
+`pretraining/nanogpt_mini/nanogpt_mini_slot_model.py` (alive table, mask_mod
+and table-derived FlexAttention block mask, slot attention, slot head,
+advantage, Jacobi passes, sequential evaluator) and
+`pretraining/nanogpt_mini/nanogpt_mini_slot_train.py` (fork of the base
+trainer; env knobs `SLOT_MODE`, `SLOT_M`, `SLOT_PASSES`, `SLOT_GAMMA`,
+`SLOT_HORIZON`, `SLOT_ENTROPY`, `SLOT_DETACH`, `SLOT_BASELINE_DECAY`,
+`SLOT_SEQ_TOKENS`, `SLOT_BACKEND`, all documented in its docstring).
+
+**Hypothesis.** A transformer whose attention at every layer sees only the
+token itself plus `M = 64` memory entries can learn *which* entries to keep
+through a sampled per-token write action, and that learned write discipline
+recovers a useful part of what a fixed 64-token sliding window loses
+against full causal attention, at the same parameter count (plus a
+`512 x 65` head) and the same data.
+
+**Mechanism.** The memory entry of token `t` is its per-layer rotary'd
+key/value pair (6 layers x (k, v) x 512 bf16 = 12 KB; 64 slots x 64 lanes
+is about 50 MB). After the post-final-norm state of position `t` is
+computed, a zero-initialised fp32 head samples `σ_t ∈ {0..63, ∅}`
+(uniform at init); slot `σ_t` is overwritten with the entry of `t` (`∅`
+writes nothing). The replay rule is `alive[t, s] = max{i < t : σ_i = s}`
+(or -1) and key `i` is visible to query `t` iff `i == t` or
+`alive[t, σ_i] == i`, so at most 65 keys per query; position 0 attends
+to itself only. RoPE is the ordinary one (keys at their own position,
+queries at theirs), so age is native to the score. The `(T, M)` table is
+built per sequence by a cummax; the FlexAttention `BlockMask` is derived
+from the table (`O(T M)` scatter into a `[B, QB, KB]` presence grid plus
+the diagonal, `BlockMask.from_kv_blocks`, `mask_mod` inside every kept
+block) rather than by scanning `T x T`; the compiled kernel runs outside
+the outer compiled graph as the pointer lines do. A dense `[B, T, T]` SDPA
+backend exists for tests only (`SLOT_BACKEND=dense`).
+
+**Training.** Jacobi passes with shared parameters (the full-bandwidth
+transformer's schedule, arXiv:2608.08888): pass 1 is a plain full-causal
+forward (the reference, `CE^(1)`), its head samples `σ^(1)`; pass 2 attends
+under the alive table of `σ^(1)` and yields `CE^(2)`; with `SLOT_PASSES>2`,
+pass `k` uses `σ^(k-1)`. The token term is teacher-forced CE. The slot
+term is a policy gradient with a discounted future-credit advantage:
+
+```text
+A_t   = sum_{u=t+1}^{t+H} γ^(u-t) (CE_u^(1) − CE_u^(k)) − b       γ = 0.9, H = 32
+loss  = CE^(1) + mean_{k≥2} CE^(k)
+        − sum_t stopgrad(A_t) · log π_σ(σ_t^(k-1) | s_t^(k-1))
+        − SLOT_ENTROPY · sum_t H(π_σ(· | s_t^(k-1)))                    (default 0)
+```
+
+Sum-CE convention throughout (Muon/Adam are scale-invariant). `b` is an
+EMA (decay 0.99 per microbatch, seeded by the first microbatch mean) of
+the raw credit, one per later pass. `σ_{T-1}` is never consumed and gets
+no policy gradient. `SLOT_DETACH=1` cuts the slot term's gradient at the
+head; the default lets it reach the trunk through the top state.
+`slot_head.weight` is a Muon parameter (matrix), its bias AdamW. All
+passes share `x0 = norm(embed)`; the trunk math of pass 1 is bitwise the
+base model.
+
+**Three modes of the same trainer.** `SLOT_MODE=policy` (above, two
+passes); `SLOT_MODE=fifo` (`σ_t = t mod 64`, no head, one restricted
+pass: a 64-token sliding window in slot form, no `∅`); `SLOT_MODE=full`
+(no restriction, one pass; tested bitwise against the base `GPT` forward
+and state dict, so it is the line's own base control). Init reproduces the
+baseline trunk draws under the seed (the head is registered last and
+zeroed).
+
+**Evaluation.** Every validation reports `val_bpb` (headline: the last
+slot-restricted pass; the only pass in fifo/full), `val_bpb_full` (pass 1),
+`val_slot_null` (fraction of `∅`), `val_slot_entropy`, `val_slot_age`
+(softmax-mass-weighted mean age of attended non-self entries, over layers;
+computed with a value-channel flex pass). At the final step the true
+sequential regime is run token by token with per-layer slot banks on the
+first 262,144 validation tokens with `σ_t` sampled from the sequential top
+state (`val_bpb_seq`) and argmax (`val_bpb_seq_greedy`), plus
+`val_seq_null`. Full mode skips it (causal SDPA is its own sequential
+regime).
+
+**Success criterion.** At 2,000 updates, policy beats fifo by more than
+0.01 proxy BPB on `val_bpb`, and closes at least half of fifo's gap to
+full (`val_bpb_full` of the full arm), i.e.
+`(fifo − policy) ≥ 0.5 · (fifo − full)`. The sequential number must
+track the parallel one (`val_bpb_seq − val_bpb` small compared with the
+policy–fifo margin) for the parallel headline to count.
+
+**Failure modes to watch.** (1) `∅` collapse: `val_slot_null → 1`, the
+memory empties and the arm degrades toward a context-free model; (2) a
+uniform policy that never sharpens (`val_slot_entropy` stays at
+`log 65 = 4.17`), in which case the arm is a random-eviction cache and any
+margin over fifo is the random-vs-window difference, not a learned
+discipline; (3) advantage variance: `train_adv_std` large relative to the
+signal, with Muon turning a noisy head gradient into a fixed-size
+orthogonalised step (a known risk of putting a policy head under Muon;
+the detach and entropy knobs are the levers); (4) Jacobi non-contraction:
+`val_bpb_seq` far above pass-2 `val_bpb` because the slots the policy picks
+from full-context states differ from what it picks from restricted states.
+
+**Cost.** Policy mode runs two trunk passes plus the block-mask build and
+a slot-restricted flex attention per layer: about 2x the base step
+(base is about 580 ms/step at MBS 64 on the 5090). Fifo runs one
+restricted pass; full runs the base. The measured numbers are in the GPU
+test output and the run logs (`step_avg`).
+
+**Verification.** 18 CPU tests in `pretraining/tests/test_nanogpt_mini_slot.py`
+(alive table and visibility against loops with overwrite and `∅`; mask_mod
+and table-derived block presence against the dense reference; fifo as a
+sliding window; full mode bitwise the base; advantage against a loop;
+policy-gradient reach with and without detach; entropy and baseline knobs;
+no gradient for the terminal slot; sequential vs parallel and prefix
+recompute with injected slots; three passes). GPU tests in
+`pretraining/tests/test_nanogpt_mini_slot_gpu.py`: compiled flex vs dense
+forward and every gradient at real dims, flex vs dense age statistic,
+sequential vs parallel/prefix recompute at real dims, one compiled MBS 64 x
+1024 policy step with peak memory asserted under 28 GB, and (added after
+the first run) the compiled policy graph against the eager one on an
+injected slot trajectory (loss, telemetry, EMA baseline buffer, every
+gradient).
+
+GPU test job mlq 7824 (first version): flex vs dense at 6L/512d, B=2,
+T=1024, M=64 with 20% null writes agreed to fp32 per-token CE max abs
+1.4e-6 (worst parameter-gradient relative error 1.9e-6) and bf16 CE max abs
+1.9e-2 (worst gradient rel 2.5e-2, flex accumulates dK/dV in bf16);
+sequential vs parallel per-token CE max abs 1.4e-6 (fp32) and 1.5e-2 (bf16,
+mean 3.2e-3); prefix recompute agreed at every tested prefix; the
+table-derived block mask builds in 0.63 ms (31 ms on the first call) and
+skips 57.8% of the 128-blocks at that null rate. The MBS 64 training step
+OOMed: the earlier tests had exercised more than Dynamo's default 8
+distinct flex shapes, the compiled `flex_attention` silently fell back to
+eager flex (the dense math reference, a 1 GB score matrix per layer), and
+the backward ran out of memory. Fix: `compiled_flex_attention` raises
+`recompile_limit` to 64 and sets `fail_on_recompile_limit_hit`, so a
+fallback is an error and never a silent slow path. Resubmitted with the
+parity test as mlq 7832; its numbers and the run job ids are recorded
+below.
+
+Chunkwise read review (subagent, after 7846): algebra, padding, broadcasts,
+strict causality and the backward all verified against the dense form and
+the recurrent state at production shapes (forward 8e-7, gradients 6e-7
+relative); fp32 denormals at lambda 0.5, C 128 provably immaterial
+(bitwise identical under simulated flush-to-zero); one compiled graph, no
+breaks. Items applied: T = 0 and chunk <= 0 guards, the positivity
+precondition and the 1e-6 * (1 - lambda) normaliser asymmetry documented,
+a CPU test at the default chunk with T = 260 and the production decays
+against both references. Follow-ups, not applied under the live chain
+(math-neutral but the arms must share one source): saved-for-backward
+memory is about 1.6 GiB per layer call rather than 128 MiB because the
+[B, H, n, C, C] scores are kept twice (the decay mask is differentiable);
+a custom autograd function saving only the masked scores would recover
+it; a step-0 runtime gate binding the chunked read to the state in lam
+mode (currently pinned by the GPU test only).
+
+2026-09-18: `nanomini_fb_glu_2k` (job 7847) was killed by the user at step
+900 for poor performance. Against the July baseline `nanogpt_mini_fullval_2k`
+(identical training data for the first 1,000 steps, same schedule, 62M-token
+validation set instead of the 1M-token subset): step 800 base 1.3948 vs
+glu pass-2 1.3920 and pass-1 1.4092; step 900 glu 1.3735 / 1.3908 (base not
+logged at 900; 1.3692 at 1,000). Reading: two-pass gated feedback is level
+with the baseline at twice the step time (1,160 ms vs 535 ms per step) and
+standard decoding of the same weights is 0.014 bpb worse; the pass-2 minus
+pass-1 gap of 0.017 shows the channel is used, but only to recover what
+feedback training cost. The remaining arms were not requeued; only
+`nanomini_fb_lam_2k` was resubmitted (cull rule: pass-2 not ahead of glu's
+1.4402 at step 500 kills it).
+
+Speed follow-up (during the lam run): the memory read now dispatches to the
+fused chunked kernel `fla.ops.simple_gla.chunk_simple_gla` on CUDA
+(`FB_MEMORY_KERNEL=0` restores the fp32 chunked torch form, which stays the
+CPU reference). The kernel is inclusive, so keys and values are shifted
+right by one position and the numerator is multiplied by lambda to give
+exactly the strict `lambda^(t-i)` read; the per-head decay enters as a
+per-token gate because the kernel returns no gradient for its
+data-independent `g_gamma`; the normaliser is a separate fp32 decayed key
+sum (`decayed_key_sum`, chunked, no d x d state). Operands are bf16 with the
+kernel's fp32 state, so the read carries bf16 rounding like the rest of
+the network (the sequential evaluator keeps its fp32 state; the GPU test
+prints the kernel-vs-chunked gap). GPU contracts queued as job 7860 behind
+the lam run; the lam run itself (job 7854) uses the torch chunked form.
+Baseline job 7856 was queued behind lam and cancelled at the user's
+request ("don't waste time on base").
+
+`nanomini_fb_lam_2k` (job 7854) was killed by the user at step 300 for
+speed (1,655 ms/step, 2.8x the base). Its record: step 100 pass-2 1.7259 /
+pass-1 1.7327 (same-subset base `nanomini_base_100`: 1.7922); step 200
+1.5679 / 1.5779; step 300 1.4955 / 1.5060 (old 1k baseline, larger val set:
+1.7458 / 1.5856 / 1.5159; glu: 1.7897 / 1.5920 / 1.5118). Decays stayed at
+their inits (0.52, 0.91, 0.99, 0.999), head-0 temperature rose to 1.27.
+Reading: the runtime read was worth 0.007-0.010 bpb (pass 2 minus pass 1)
+for 1.45x glu's step; nearly the whole lead over glu and the base sits in
+pass-1 decoding, i.e. in the trunk, and came through the second pass's
+gradient into the earlier top states.
+
+Kernel path (job 7860): kernel vs fp32 chunked at production geometry,
+relative gaps out 0.4%, dq 1.5%, dk 0.6%, dv 0.4%, d(decay) 0.6%; 24
+passed, three failures from the environment and a stale assert (the
+trainer path tests collided on the default rendezvous port with another
+process, now a free port per test; the dispatch-vs-dense 1e-4 assert was
+left from the fp32 era and now compares the chunked form). Timings in that
+job ran alongside another process and are not usable; a dedicated
+read-timing test was added.
+
+**Single-pass design (`FB_MODE=top`, pre-registered before its run).**
+The killed two-pass arms showed the gain lives in the trunk and arrives
+through the gradient the future positions send into the head-facing top
+state via the memory keys and values. That signal does not need a second
+pass: a strictly causal decayed linear-attention read over earlier
+positions' *final* states is computable inside the ordinary parallel
+forward (it needs only earlier positions, which the pass has), so the
+memory is read once at the top, `s_t = norm2(x_t + W_o r_t)` with `W_o`
+zero-initialised, keys and values from `h_t = norm2(x_t)`. Cost: one pass
+plus one read and four 512 x 512 projections (about 3% over the base,
+inference too). Arms: `nanomini_fb_top_2k` and `nanomini_fb_top_detach_2k`
+(keys and values from `h.detach()`: the read stays, the gradient into the
+earlier top states is cut). Every validation logs `val_bpb` (with the
+read), `val_bpb_noread` (same weights, read removed), and at the deep
+evals `val_bpb_seq` (true recurrence; the trainer gates it against the
+parallel loss at 0.005 bpb since there is no Jacobi gap in this mode).
+Readings: `val_bpb_noread` of `top` against the base curve isolates the
+trunk-shaping effect; `top` minus `top_detach` isolates the gradient
+ingredient; `val_bpb` minus `val_bpb_noread` is the read's inference value
+at its true cost. Success: `top` beats the old 1k baseline curve by more
+than the 0.02 lam showed at steps 100-300, and holds a lead at 2,000
+against `nanogpt_mini_fullval_2k`'s 1.2856 (different validation subset;
+the 1M-token subset read about 0.046 harder at step 100). Queue: GPU
+contracts and the two arms chained at priority 1 (the user's cap).
+
+`nanomini_fb_top_2k` (job 7870) was killed by the user at step 300 as
+unimpressive; the detach arm (7871) was skipped with it. Record (val_bpb
+with the read / `val_bpb_noread`): step 100 1.7638 / 1.7862, step 200
+1.5912 / 1.6137, step 300 1.5120 / 1.5340, at 600-670 ms/step (1.05-1.15x
+the base). Decays drifted to (0.45, 0.89, 0.98, 0.999); temperatures rose
+to (1.44, 1.43, 1.26, 1.10), i.e. the short-horizon heads were addressing.
+Same-step comparison (old 1k baseline, larger val set: 1.7458 / 1.5856 /
+1.5159; same-subset base at step 100: 1.7922): top with the read is 0.028
+better than the same-subset base at step 100 and level with glu and the
+old baseline at 300 (-0.004), where lam pass 2 was 0.020 better and lam
+pass 1 0.010 better. `noread` is not a baseline for this mode (the head is
+trained only with the read present), so the trunk-shaping hypothesis is
+not tested by it; what the arm shows is that a single read at the top,
+feeding the head, is worth about what the paper's input fusion is worth
+per token (nothing beyond noise at step 300) while lam's every-layer reads
+of fully processed states were worth 0.02.
+
+Reading across the line (all arms killed between steps 300 and 900; no
+2,000-step number and no matched 1M-subset baseline beyond step 100):
+- Confounded in the paper: compute. The gated input feedback (`glu`) with
+  two Jacobi passes is level with the baseline per token at 2x the step
+  time and 0.014 worse under standard decoding (step 800).
+- Necessary for a per-token gain here: reads of the fully processed earlier
+  states at every layer (`lam`), which is the Feedback-Transformer
+  mechanism; that is exactly what needs the second pass, since in one
+  parallel pass no layer can see earlier positions' final states. The
+  paper's mechanism (one vector, fused at the input) and the cheap
+  single-pass read at the top (`top`) do not carry it.
+- The runtime read in `lam` was worth 0.007-0.010 (pass 2 minus pass 1);
+  the rest of its 0.02-0.06 lead was in the trunk (pass 1), which only the
+  two-pass training produced. `top` has the gradient into earlier top
+  states and did not reproduce that, so the trunk gain is tied to the
+  every-layer reads in pass 2, not to the gradient alone.
+- Compute-matched, none of the arms beats the baseline given more steps
+  at this scale: the base gains about 0.045 per 100 steps at step 300 and
+  about 0.02 for 30% more steps at 2,000, against lam's 0.02 (other
+  subset) per-token lead at 2.8x.
+Not run: the paper's 75/22/3 pass mix (1.28x) on lam, the partial second
+pass (re-run only the top k layers with reads, 1 + k/6), and the chunked
+single-pass form (exact cross-chunk reads through the fast-weight state,
+no within-chunk reads). The last is the only one at 1x FLOPs and loses the
+short horizons the run was using.
+
+## 2026-09-18: MiniCPM RL cycle — exact replay paths, per-step split-KV plan, open decisions
+
+Cycle model at production shape (4×16 rollouts, 10k cap, 64 lanes): rollout
+decode about 47s, cache release about 1s, behavior refresh 15–21s, update
+40–57s, KL probe about 1.2s, checkpoint 1–2s. Decode is KV-bandwidth bound at
+long contexts (64 lanes × 5k mean length × 24 layers ≈ 8 GB of KV per step),
+so kernel-count trims in decode are worth a few percent at most; the large
+levers (FP8 KV, rollout-replica behavior log-probs, hidden trunk balance,
+tail/refresh overlap) all change numerics or learning and need ablations.
+
+Implemented now, exact by construction (queued parity job 8088 must confirm
+candidate parameter error at the unchanged-path repeat control, about 7e-9):
+
+- LoRA power-of-two scale fold: scaling alpha/rank = 2.0 multiplies `lora_b`
+  (1536×16 fp32) before the GEMM and the update is added in place. Scaling by
+  2 commutes with bf16/fp32 rounding, FMA accumulation and the autocast cast,
+  so forward values and all gradients are bit-identical (CPU test asserts
+  `torch.equal` on values and the three gradients). Non-power-of-two scales
+  keep the unfolded path.
+- Packed SDPA concatenates token-major views; the HF head merge becomes a view
+  instead of a second [tokens, 2048] copy per layer. Job 5784 rejected a
+  layout candidate for 0.3–0.4%; this is that gain as a two-line change and is
+  re-measured inside the bundled job, not claimed beyond it.
+- Action-row gathers use `index_select` on the single packed row; backward is
+  one `index_add` over unique positions instead of sorted `index_put_`.
+- `_FrozenParameterStash.restore` copies from pinned backing non-blocking.
+- Hidden-space trunk balancing records finiteness on the deferred device flags
+  (two host syncs per shard removed on that opt-in path).
+- Rollout scoring time is now telemetry (`rollout_performance/rollout_scoring_seconds`).
+- Split-KV decode plans partitions once per captured step from
+  `flash_sequence_lengths` (`postraining/split_kv_plan.py`), and the FA4
+  custom op takes the shared plan as optional tensors; per-launch planning
+  remains the fallback and the CUDA qualification test asserts bitwise
+  equality of both paths across retirement/refill lengths. Expected saving:
+  roughly 50–70 tiny kernels per step, on the order of 1–2s per 47s rollout.
+  Microbenchmark job 8089 reports kernels per step and replay time.
+
+Deferred, needing sign-off or ablation (documented in `postraining/TODO_MINICPM5.md`):
+behavior log-probs from the merged-bf16 rollout replica (about 10s per refresh,
+changes the ratio reference; opt-in flag exists), hidden trunk balance (2.6%
+faster update, 2000-step ablation required), logit chunk 1024 (bitwise
+qualification against 128 queued), compiled RMSNorm/RoPE regions and saved
+log-sum-exp in the head backward (rounding changes; the compiled-SiLU backward
+rejection at 5.5e-7 shows Adam amplifies any rounding change to lr-scale
+parameter differences), refresh shard budget, KL-probe subsampling,
+tail/refresh overlap on a second stream (design project; same-GPU memory
+conflict with released KV), FP8 KV (kernel project), shared frozen bottom
+stack for the critic (learning-affecting design change).
+
+Results (jobs 8089 and 8090, both under two minutes):
+
+- Parity: candidate parameter maximum error 7.45e-9 equals the legacy repeat
+  control 7.45e-9 (exact-path repeat 6.68e-9). Update 17.85/18.13s → 16.62/16.63s
+  (8.2% warm update speedup), peak allocation unchanged at 20.22 GiB. This is
+  an isolated update measurement on the compile-experiment fixture; the full
+  cycle gain is roughly 3–4s of the 40–57s update phase.
+- Logit chunk 1024 vs 128: behavior log-probs and advantages bitwise
+  identical; refresh 6.54s → 6.31s for 160k actions. Update-path gradients at
+  1024 not compared.
+- SDPA backends for GQA causal replay: flash available (no hard fail under
+  `sdpa_kernel(FLASH_ATTENTION)`), efficient unavailable, cuDNN available.
+  4096-token forward+backward probe: default 1.50ms, cuDNN 1.90ms, forced
+  flash 3.52ms. The default dispatch is therefore not flash on this torch
+  build; which kernel production replay runs needs a profiler confirmation
+  before any backend pin (a pin changes rounding and needs parity).
+- Split-KV plan hoist: 312 → 76 kernels per decode step, bitwise identical
+  across full/mixed/half-retired/short length patterns. Replay time 11.69 →
+  11.78ms at full 11,264-token length (KV-bandwidth bound, within noise),
+  6.50 → 6.14ms mixed, 0.44 → 0.15ms short. The saving lives in the
+  prompt-length and draining phases, consistent with the bandwidth model.
+
+Not changed: the remaining per-layer `cumulative_length` reduction in the
+compact cache (about 24 tiny kernels per step) could share one buffer across
+layers; it touches the transformers cache contract and was left for a
+separate measured change.
+
+## 2026-09-18: CELF — CE-anchored latent flow over byte patches (pre-registration)
+
+**Context.** The Cola controls (`pretraining/cola`) reproduce the Cola-DLM
+structure at 120M: a VAE (separate causal encoder and decoder, per-position
+16-dim Gaussian posterior, LayerNormed mean) plus a block-causal DiT flow
+prior. Measured facts from the completed BPE controls (2k steps, 32 x 2560
+positions per update):
+- `cola_bpe_120m_v3_joint_2k` final validation: reconstruction 0.317 bpb,
+  masked accuracy 0.144, flow MSE 1.36 per coordinate on unit-power latents,
+  reference-KL 1.57 nats/pos, arithmetic-mean variance 0.133 (geometric
+  0.038 from the entropy term), effective log-SNR 2.0.
+- Fixed-anchor NELBO (job 8079, v3): 4.77 bpb at 16 and 32 Heun steps; v2:
+  4.72 = reconstruction 0.33 + prior NLL 3.40 + posterior log q 0.99. The
+  latent channel alone costs about 4.4 bpb. The 25M nanomini AR control
+  reads 1.52 bpb at 400 steps on a different validation subset (not matched;
+  order-of-magnitude context only).
+- The variational terms are decorative at the used coefficients: beta x KL is
+  0.027 nats/pos (stage 1), beta x negative entropy 0.003, reference-KL
+  0.157, against reconstruction 1.0 and flow 1.36. The stage-1 variance
+  (0.30) is a drift under lr 1e-4 (the first byte VAE saturated its clamp);
+  stage 2 pulled it to 0.13 in 200 updates while the reference-KL spiked to
+  13, then everything flatlined. The rate is the cost of an unoptimized noise
+  level, not a learned tradeoff.
+- Attachment: the flow gradient reaches the encoder through the noisy block
+  and the velocity target; only the history stream is detached
+  (`objective.py`, `model.py::_forward`). The frozen-encoder KL exists to hold
+  the resulting predictability pressure back.
+- Masked CE with a causal decoder and independent masking is next-token CE at
+  15% of positions (the masked position decodes from a clean prefix); it does
+  not force contextual content into the latent. Latents are token lookups.
+- The byte Cola joint control (job 8081) was cancelled by request; there is no
+  byte Cola NELBO. The BPE v3 figure (4.77) is the Cola reference.
+
+**Hypothesis.** A deterministic encoder whose only anti-collapse term is the
+cross-entropy of a decoder that reads latents at one fixed noise level, with
+the flow loss attached on every side (history, noisy block, target) and no
+KL / entropy / reference / EMA / isotropy term, learns latents whose
+innovation is only what the context cannot predict. Concretely: its
+fixed-anchor NELBO on the same literal byte stream is well below the Cola
+reference at matched parameters and bytes per update, its rate term is the
+majority of the gap, and its latent effective rank stays far from collapse.
+
+**Design (`pretraining/celf`, architecture `celf_byte_v1`, 125.9M params vs
+119.6M for byte Cola; parameter-matched, not FLOP-matched — patching makes
+the step cheaper).**
+- Bytes are patched 4 per latent; 32-dim latent per patch; blocks of 8
+  patches (32 bytes); 2560-byte contexts = 640 latents = 80 blocks.
+- Encoder: byte embeddings concatenated per patch, 4 pre-norm SwiGLU layers
+  at 512, attention bidirectional inside a block and causal across blocks;
+  output normalized to unit RMS per position (the only geometric constraint;
+  it pins scale so MSE means something — CE cannot pin scale).
+- The latent every consumer reads is the flow-path state at
+  `decode_time` = 0.25: w = 0.75 z + 0.25 eps. The decoder (same body,
+  head to 4 x 256 logits, reads only w, block-bidirectional) is trained at
+  that noise level; the prior's history stream is w; the evaluation posterior
+  is N(0.75 z, 0.0625 I) by construction. Gaussian capacity of one anchored
+  latent: 53 bits per 4-byte patch (a rate ceiling, chosen above the 32-bit
+  identity so context can be carried).
+- Prior: 13-layer 640-wide AdaLN DiT (same as the byte Cola prior), two-stream
+  training (history stream at time 0.25, flow stream at sampled t), mask:
+  history queries see history in blocks <= own; flow queries see history in
+  blocks < own and flow keys in their own block. Times are logit-normal
+  rescaled to [0.25, 1]; the path below 0.25 is never used.
+- Losses: reconstruction CE per byte (clean branch) + masked CE per masked
+  byte (15% patch-level mask-token corruption of the encoder input; the
+  masked branch feeds only the codec) + flow MSE per latent (coordinate
+  mean). Weights 1/1/1 — a stated choice, not a tuned one.
+- Optimizer: source Muon on attention/FFN matrices (lr 0.02, wd 0.05),
+  AdamW elsewhere (3e-4; byte embedding 3e-3; scalars no decay), 40-update
+  warmup, hold to 30%, linear cooldown to 5%. 2,000 updates of 32 x 2560
+  bytes (81,920 bytes/update, as byte Cola), microbatch 8.
+
+**Verifier and metrics.** Every 20 updates on 40 validation contexts:
+objective terms, reconstruction bpb/accuracy at the anchor noise, masked
+accuracy, flow MSE, `latent_effective_rank` (covariance-entropy rank of the
+32 coordinates). Every 100: teacher-forced sampled blocks (8 Heun steps from
+noise to 0.25 under true anchored history, 16 contexts): greedy byte accuracy
+and decoder NLL at the sampled latents, plus decoder NLL at the posterior
+sample. Every 200: `val_nelbo_bpb` = reconstruction + (log q - log p) with
+the conditional flow marginal at 0.25 by Hutchinson divergence (8 Heun
+steps, 1 probe, 16 contexts). Final evaluation: 16 and 32 Heun steps, 2
+probes, over the 48 complete 2560-byte validation contexts (122,880 of
+124,766 bytes), plus two 256-byte generations from 64-byte validation
+prompts.
+
+**Success criterion.** Final `nelbo_bpb` (32 steps) below 3.0 bpb — i.e.
+more than 1.7 bpb under the Cola BPE reference — with reconstruction bpb
+under 0.2 and effective rank above 16 of 32 at the end. Anything between 3.0
+and 4.77 is "cheaper than Cola, still not competitive with AR" and does not
+justify a second arm before an AR byte control exists. Above 4.77 is a
+negative result for the CE-only anchor at this budget.
+
+**Failure modes and their signatures.**
+1. Token-lookup latents (semantic collapse): reconstruction bpb near zero
+   early, flow MSE flat near its init (about 1.0 per coordinate), rate term
+   dominating the NELBO, masked accuracy stuck near the unigram rate.
+2. Predictability pressure eroding decodability (the both-sides-attached
+   risk): `posterior_decode_nats_per_byte` rising over training while flow
+   MSE falls; sampled byte accuracy not tracking reconstruction accuracy.
+   This is the trigger for the second arm (identical, target detached).
+3. Dimensional collapse under unit power: effective rank falling toward the
+   32-bit identity floor (about 4-8) — the only case where an isotropy term
+   would be justified.
+4. Anchor too noisy for the identity: reconstruction accuracy plateauing well
+   below 1 at 0.25 with capacity 53 bits — would call for `decode_time` 0.15.
+5. Divergence-estimate noise: the 16-vs-32-step and probe deltas in the final
+   evaluation bound the numerical part; they are not an error bar.
+
+**Cull rule.** At update 600, kill if `val_nelbo_bpb` > 6 or
+`latent_effective_rank` < 4 or reconstruction accuracy < 0.5.
+
+**Queue.** GPU contracts 8108 -> full-shape qualification 8109 -> run 8110
+(`celf_byte_126m_v1_2k`) -> evaluation 8111, chained on success, priority 0,
+max-parallel 1, one attempt each, time limits 45m/45m/4h/2h.
+
+### Amendment 1 (2026-09-18): v1 collapsed to a constant latent; staged arms v2
+
+**Result of `celf_byte_126m_v1_2k` (job 8110, cancelled by request at
+update ~580; no final evaluation, 8111 skipped).** Failure mode 3 in its
+most extreme form, and much earlier than the cull point. Validation, 40
+contexts:
+
+| update | recon bpb | recon acc | masked acc | flow MSE | eff. rank | nelbo bpb (rate) |
+|---|---|---|---|---|---|---|
+| 0 | 8.00 | 0.000 | 0.000 | 1.995 | 15.2 | 21.85 (13.85) |
+| 20 | 6.32 | 0.161 | 0.157 | 0.991 | 14.3 | |
+| 40 | 4.83 | 0.161 | 0.157 | 0.795 | 18.2 | |
+| 60 | 4.73 | 0.161 | 0.157 | 0.102 | 16.8 | |
+| 100 | 4.70 | 0.161 | 0.157 | 0.051 | 23.2 | |
+| 200 | 4.70 | 0.161 | 0.157 | 0.013 | 19.6 | 4.92 (0.17) |
+| 400 | 4.70 | 0.161 | 0.157 | 0.004 | 17.1 | 4.75 (-0.00) |
+| 500 | 4.70 | 0.161 | 0.157 | 0.003 | 14.5 | |
+| 580 | 4.70 | 0.161 | 0.157 | 0.003 | 13.9 | |
+
+Reconstruction accuracy froze at 0.1609 from update 20 onward — the
+validation unigram rate (the decoder learned the byte marginal and nothing
+else); 4.70 bpb is the unigram entropy. Sampled-block accuracy 0.1615 at
+every diagnostic. Train flow MSE: 1.83 (10) -> 1.01 (20) -> 0.84 (40) ->
+0.28 (50) -> 0.11 (60) -> 0.044 (100) -> 0.005 (500). The reported
+effective rank stays 14-23 because per-patch unit power keeps the
+covariance non-degenerate even when the latents carry no byte information;
+the rank canary is therefore *not* a collapse detector for this mode and the
+reconstruction-accuracy plateau is.
+
+**Mechanism.** The encoder found the latent that is trivially predictable:
+a constant (or byte-independent) z makes the flow target u = eps - z a
+function of the noise alone, so the prior fits it exactly and the flow loss
+goes to zero. The decoder head is zero-initialised, so at update 0 the CE
+terms put no gradient into z at all, while the attached-target flow loss
+(both-sides-attached) pulled on z at unit scale from the first update. By
+update ~50 the encoder had collapsed and the CE gradient into z at that
+point — through a decoder that had only learned the marginal — was too weak
+to pull it back against the flow restoring force. The global optimum of the
+objective is unchanged (a decodable latent saves ~13 nats per patch of CE
+against at most ~2 units of flow penalty), so this is a race at
+initialisation, not a statement about the objective. It is exactly the
+"CE must be useful early enough" condition the pre-registration assumed
+and did not enforce.
+
+**What v2 changes (implementation, same package, same 125.9M model).**
+- `TrainConfig.codec_steps`: a codec-only stage in which the prior is not
+  executed (`Objective(..., flow=False)`) and only the encoder/decoder
+  optimizers step. The prior joins at update `codec_steps` with fresh
+  optimizer state. Optimizers are partitioned per component
+  (`make_optimizers(model, config, component)`); the schedule is
+  stage-relative (codec stage: 40-update warmup then hold; joint stage:
+  warmup, hold to 30%, cooldown to 5%; Muon momentum ramp per stage).
+  `stage_id` is logged on every metrics entry; sample/NELBO diagnostics run
+  only in the joint stage. Resume invariants cover `codec_steps`.
+- `LossConfig.attachment`: `all` (as v1: flow gradient reaches the encoder
+  through history, noisy block, and target) or `history` (noisy block and
+  target built from `z.detach()`; the encoder is attached only through the
+  conditioning stream). Recorded in provenance `gradient_contract`.
+- CPU contracts for the stage schedule and config validation; GPU contracts
+  that the codec stage never touches the prior, that `history` changes only
+  the encoder gradient, and that the component optimizers partition every
+  parameter. Qualification now exercises both stages.
+
+**Arms (pre-registered).**
+- Arm A `celf_byte_126m_v2_staged_2k`: 300 codec-only updates + 2000 joint
+  updates, `attachment=all`. Tests the user's claim on its intended terms:
+  both sides attached, CE the only anti-collapse anchor, but from a latent
+  that CE has already made informative.
+- Arm B `celf_byte_126m_v2_staged_history_2k`: identical, `attachment=history`.
+  Removes the endpoint/target gradient so the flow loss cannot pull the
+  encoder toward predictability at all; the encoder still shapes the
+  latents through the conditioning stream and CE. This is the control that
+  separates "staging suffices" from "target attachment is the problem".
+- Prediction: Arm A holds reconstruction accuracy above 0.9 through the
+  joint stage if CE is a sufficient anchor; if it decays toward the unigram
+  rate after update 300 while flow MSE falls, failure mode 2/3 is confirmed
+  for both-sides attachment at this scale and Arm B is the surviving design.
+  Arm B's flow MSE should stay higher than Arm A's for the same recon
+  (nothing simplifies the target), so the NELBO comparison at 2300 is the
+  decision.
+
+**Cull rules.** At update 300 (end of codec stage): reconstruction
+accuracy < 0.5 kills the arm (the codec alone cannot be at fault of the
+prior). At update 900 (600 joint updates): reconstruction accuracy < 0.5,
+or `val_nelbo_bpb` > 6, or flow MSE < 0.05 with reconstruction accuracy
+falling, kills the arm. Success criterion as pre-registered (final
+`nelbo_bpb` < 3.0 with recon < 0.2 bpb and effective rank > 16), now at
+update 2300.
+
+**Queue (v2).** GPU contracts 8126 -> qualification 8127 -> Arm A train 8128
+-> Arm A evaluation 8129; Arm B train 8132 -> evaluation 8133 chained on the
+qualification only, so a culled Arm A does not skip its control. Priority 0,
+max-parallel 1, one attempt each, time limits 45m/45m/4h/2h. Jobs 8130/8131
+were the same Arm B mis-chained behind Arm A's evaluation and were cancelled
+before starting. Job 8111 (v1 evaluation) was skipped by mlq when 8110 was
+cancelled.
+
+### Amendment 2 (2026-09-18): Arm A result — staging fixes the collapse, the rate does not close
+
+**`celf_byte_126m_v2_staged_2k` (job 8128), cancelled by request at update
+~1970 of 2300; final evaluation 8129 skipped.** Validation, 40 contexts
+(NELBO: 16 contexts, 8 Heun steps, 1 probe):
+
+| update | stage | recon bpb | recon acc | masked acc | flow MSE | eff. rank | nelbo bpb (rate) | sampled acc |
+|---|---|---|---|---|---|---|---|---|
+| 100 | codec | 4.54 | 0.159 | 0.162 | - | 1.7 | | |
+| 200 | codec | 3.06 | 0.401 | 0.162 | - | 8.3 | | |
+| 300 | boundary | 1.22 | 0.812 | 0.236 | 2.00 | 16.1 | 15.10 (13.84) | 0.075 |
+| 340 | joint | 1.25 | 0.785 | 0.245 | 0.99 | 9.9 | | |
+| 400 | joint | 1.04 | 0.805 | 0.275 | 0.46 | 15.3 | 5.64 (4.56) | 0.068 |
+| 600 | joint | 0.47 | 0.910 | 0.324 | 0.47 | 17.9 | 4.68 (4.19) | 0.065 |
+| 800 | joint | 0.34 | 0.931 | 0.362 | 0.44 | 19.0 | 4.15 (3.79) | 0.066 |
+| 1000 | joint | 0.27 | 0.945 | 0.389 | 0.44 | 19.6 | 3.96 (3.67) | 0.066 |
+| 1200 | joint | 0.24 | 0.950 | 0.413 | 0.42 | 20.3 | 3.74 (3.48) | 0.066 |
+| 1400 | joint | 0.20 | 0.957 | 0.434 | 0.42 | 20.9 | 3.61 (3.39) | 0.066 |
+| 1600 | joint | 0.19 | 0.959 | 0.447 | 0.40 | 21.4 | 3.47 (3.26) | 0.069 |
+| 1800 | joint | 0.17 | 0.966 | 0.458 | 0.41 | 21.6 | 3.34 (3.16) | 0.069 |
+| 1960 | joint | 0.16 | 0.966 | 0.471 | 0.40 | 21.7 | | |
+
+Train at 1970: recon 0.136 bpb, masked accuracy 0.50, flow MSE 0.375.
+Recovery checkpoint at update 1516; diagnostic scoring of it at 16/32
+steps and 2 probes over the full 48-context panel queued as job 8172
+(`scripts/diagnose_celf_checkpoint.py`, outside the hash contract, output
+`diagnostic_step1516.json`).
+
+**What it shows.**
+- The v1 collapse was an initialisation race, as diagnosed: with 300
+  codec-only updates first, both-sides-attached joint training never
+  collapsed. The transient dip at updates 320-360 (recon acc 0.834 -> 0.748,
+  rank 14.5 -> 9.9) reversed by 400 and every CE term improved monotonically
+  thereafter. CE as the sole anti-collapse anchor holds at this scale once
+  the latent is informative before the flow gradient arrives. Both cull
+  rules passed.
+- The codec stage itself sat on the unigram plateau through update 100
+  (rank 1.7) before escaping; the decoder's zero-init head plus unit-power
+  latents make the first ~100 CE updates slow. Not a problem for staging,
+  but it is the same plateau the flow exploited in v1.
+- The result is nonetheless poor: NELBO 3.34 bpb at 1800 and still falling
+  ~0.13 bpb per 200 updates. The 25M nanomini AR control reached 1.52 bpb at
+  400 updates on the same bytes. Reconstruction is 0.17 bpb; the rate term
+  is 3.16 bpb — 95% of the total. The latents are decodable and not
+  predictable enough, i.e. failure mode 1 in a mild form: not token-lookup
+  (masked accuracy rose to 0.47, so the encoder does carry context), but the
+  prior cannot place enough density on the anchored code of the true patch.
+- Teacher-forced sampled-block accuracy stayed at 0.065-0.069 throughout,
+  which is the byte unigram collision probability. This diagnostic is the
+  collision rate of the sampler with the data; a sampler whose 32-byte block
+  conditionals were sharp would exceed the Renyi-2 floor (>= 2^-H, about
+  0.35 for 1.5 bits/byte) on at least the first bytes of each block. Flat at
+  the unigram collision rate means the prior's samples are marginal-like,
+  so the high rate is a weak prior, not (only) a loose density estimator.
+  Sampled NLL per byte rose 4.8 -> 9.9 as the decoder sharpened, consistent
+  with samples landing on other patches' codes.
+- Flow MSE plateaued at 0.40 per coordinate from update 400 while the rate
+  kept falling; coordinate MSE is a poor proxy for the rate, which is what
+  the encoder is implicitly trading against reconstruction. The objective
+  the encoder optimises (CE + coordinate MSE) is not the bound we report.
+
+**Candidate causes for the rate, to be separated before any redesign.**
+1. Joint modelling of 8 patches (32 bytes) per flow block: one velocity
+   field must resolve a 256-dimensional mixture with ~2^48 plausible modes
+   per block. Isolated by `block_patches=1` (patch-causal prior; the codec
+   becomes strictly causal), no other change.
+2. Estimator resolution: 8 Heun steps and 1 probe on a flow that must be
+   sharp near t=0.25. Job 8172 (16/32 steps, 2 probes) bounds this for Arm A;
+   Arm B's final evaluation 8133 does the same for B.
+3. Attachment: Arm B (`attachment=history`) separates whether the encoder's
+   target-side gradient helped or hurt predictability.
+4. Inherent continuous-density cost of scoring discrete bytes through a
+   Gaussian posterior at fixed sigma (the dequantisation-style gap). Not
+   testable by ablation here; it is the ceiling on this family if 1-3 come
+   back negative.
+
+**Arm C (pre-registered, queued after 8133 and 8172 complete because the
+CLI change touches hashed sources): `celf_byte_126m_v2_staged_p1_2k`,
+identical to Arm A with `block_patches=1`.** Prediction: if joint-block
+modelling is the bottleneck, rate at update 1800 falls by at least 1 bpb
+against Arm A's 3.16; if it stays within 0.3 bpb, the block size is not the
+cause and cause 4 dominates. Cull as Arm A. Lesson recorded: no edit to any
+file under the CELF hash contract while a CELF job is queued or running;
+diagnostics that must land mid-flight go in unhashed scripts.
+
+### Amendment 3 (2026-09-18): Arm B result — target attachment buys rate, not recon
+
+**`celf_byte_126m_v2_staged_history_2k` (job 8132), cancelled by request at
+update ~2100 of 2300; evaluation 8133 skipped.** Matched-update comparison
+with Arm A (same validation subsets, seeds, and estimator settings):
+
+| update | A recon | A rate | A nelbo | A flow MSE | B recon | B rate | B nelbo | B flow MSE |
+|---|---|---|---|---|---|---|---|---|
+| 300 | 1.22 | 13.84 | 15.10 | 2.00 | 0.86 | 13.85 | 14.74 | 2.00 |
+| 400 | 1.04 | 4.56 | 5.64 | 0.46 | 0.36 | 7.40 | 7.79 | 1.37 |
+| 600 | 0.47 | 4.19 | 4.68 | 0.47 | 0.13 | 5.62 | 5.76 | 1.32 |
+| 800 | 0.34 | 3.79 | 4.15 | 0.44 | 0.07 | 5.00 | 5.08 | 1.27 |
+| 1000 | 0.27 | 3.67 | 3.96 | 0.44 | 0.05 | 4.88 | 4.95 | 1.26 |
+| 1200 | 0.24 | 3.48 | 3.74 | 0.42 | 0.04 | 4.44 | 4.48 | 1.23 |
+| 1400 | 0.20 | 3.39 | 3.61 | 0.42 | 0.03 | 4.32 | 4.36 | 1.22 |
+| 1600 | 0.19 | 3.26 | 3.47 | 0.40 | 0.03 | 4.03 | 4.06 | 1.21 |
+| 1800 | 0.17 | 3.16 | 3.34 | 0.41 | 0.02 | 3.84 | 3.87 | 1.20 |
+| 2000 | | | | | 0.02 | 3.58 | 3.60 | 1.17 |
+
+(bpb; flow MSE per coordinate; effective rank A 21.6 / B 25.1 at 1800;
+masked accuracy A 0.458 / B 0.476; sampled-block accuracy A 0.069 / B 0.076.)
+
+**Reading.**
+- Both-sides attachment (A) beats history-only (B) on the bound at every
+  matched update after the prior joins: 0.53 bpb better at 1800. The
+  target-side gradient made the latents about three times more predictable
+  in coordinate MSE (0.41 vs 1.20) and cut the rate by 0.68 bpb, at a cost
+  of 0.15 bpb reconstruction. The user's claim — attach both sides, let CE
+  anchor — is supported as a rate/distortion trade at this scale, and the
+  predictability pressure did not erode decodability (failure mode 2 did
+  not occur in either arm).
+- With the target detached, the encoder converges to an almost lossless
+  code (0.018 bpb) that the prior cannot predict (rate 3.58 at 2000 and
+  falling more slowly than A's). So the rate is not a matter of decoder
+  noise or codec capacity; the prior fails to model the code either way,
+  and attachment only shifts where on the rate/distortion curve the model
+  sits. Neither arm approaches the 1.52 bpb AR control.
+- Both runs' codec stages are configured identically yet diverged from
+  update 100 (recon at 200: A 3.06, B 2.55; at 300: 1.22 vs 0.86). The
+  codec-stage plateau escape is sensitive to GPU nondeterminism, so single
+  runs of this family carry at least a few tenths of a bpb of run-to-run
+  spread at the boundary; the joint-stage comparison above is nevertheless
+  consistent in sign at every point.
+- Cancelled by the user before completion; no final panel evaluation
+  exists for either arm. Diagnostic job 8172 (Arm A recovery checkpoint,
+  update 1516, 16/32 steps, 2 probes) remains queued at priority 0 behind
+  other users' priority-1 work; Arm C was not queued.
+
+**Status of the CELF hypothesis.** Confirmed: CE alone prevents collapse
+once the latent is informative before the flow gradient arrives, and
+target-side attachment improves the bound. Not confirmed: that a
+CE-anchored latent flow is competitive with byte AR at 126M/2k updates —
+it is about 2.2x worse in bpb, with the entire gap in the prior's rate
+term. The open causes are the 8-patch joint block (Arm C, `block_patches=1`,
+ready to queue), estimator resolution (job 8172), and the inherent
+continuous-density cost of scoring bytes through a fixed-sigma Gaussian
+posterior.
+
+## Compiled LAM: performance-first 1,000-update ablation
+
+Retain the ordinary nanoGPT-mini backbone (1024 vocabulary, 6 layers, width
+512) and two-pass LAM. Parameter counts remain 19,958,784 for `none` and
+23,635,976 for LAM. No detach, window change, backbone replacement, or loss
+change was bundled into the optimization.
+
+**Performance diagnosis and retained change.** The installed
+`fla.ops.simple_gla.chunk_simple_gla` is decorated with
+`torch.compiler.disable`, breaking the graph at each memory read. The retained
+`torch.library.custom_op` adapter calls the pinned FLA forward/backward kernels
+with their original gate scans and gradient conventions. FLA's forward chunk
+states use bf16 storage and backward recomputes states in fp32; the normaliser
+remains fp32. The adapter does not change these precision choices. The trainer
+now requires `fullgraph=True`, and missing FLA on CUDA raises rather than
+silently selecting Torch.
+
+Exclusive RTX 5090 benchmark: B64/T1024/H4/d128, full 6L/512 model, five
+warmups and twenty measurements of eight accumulated forward/backward
+microbatches. Median per-microbatch times (optimizer excluded):
+
+| Path | ms/microbatch | Peak allocated GiB |
+|---|---:|---:|
+| Baseline, first comparison | 61.00 | 7.40 |
+| Torch chunked memory | 176.56 | 19.65 |
+| Legacy FLA with graph breaks | 172.90 | 20.20 |
+| Full-graph FLA, retained final source | 159.49 | 18.28 |
+
+The final source benchmark agrees with the initial full-graph measurement
+(159.36 ms). This is approximately 9.7% lower latency than Torch and 7.8%
+lower than legacy FLA, not removal of the two-pass cost. Canonical artifacts:
+`ablation_results/nanomini_lam_performance/{benchmark,final_benchmark}.json`.
+
+Rejected candidates:
+- Sharing query-independent memory preparation across six layers reached
+  154.95 ms, but whole-model temperature-gradient relative maximum error was
+  0.07057 against a predeclared 0.05 tolerance. Removed the candidate from the
+  model rather than loosening tolerance.
+- CUDA graphs initially failed gradient accumulation because graph-owned
+  gradient buffers were overwritten. External stable buffers fixed correctness,
+  but timing was 159.43 ms versus 159.33 ms without CUDA graphs: no win.
+  Graph-private allocations also make its allocated-memory counter unsuitable
+  for comparison; reserved memory remained about 18.4 GiB.
+- Candidate implementations are archived in `candidates.zip` under the same
+  result directory. The retained benchmark excludes these rejected candidates.
+
+**Verification.** Final numerical-contract job 8432: 53 passed, 8 deselected
+(short trainer runs and redundant real-shape timing cases not selected).
+The retained regression compares the compiled adapter's outputs and all
+q/k/v/gate gradients directly with FLA, including a non-chunk-aligned sequence.
+Final benchmark job 8434 passed. Removed the old single-sample timing assertion;
+performance evidence now comes from the isolated repeated benchmark.
+
+**Matched quality result.** Jobs 8435 (LAM) and 8436 (baseline) both completed
+1,000 optimizer updates and 51 validations, one every 20 updates including
+step zero. Both used seed 1337, FineWeb10B-SP1024, 524,288 training tokens per
+update, microbatch 64, sequence length 1024, the same 1,048,576-token validation
+subset, and the same 70% cooldown schedule scaled to 1,000 updates.
+
+| Run | Final BPB | Mean training ms/update | Whole-run seconds |
+|---|---:|---:|---:|
+| `nanomini_fb_base_perf_1k` | 1.3433 | 529.495 | 577.32 |
+| `nanomini_fb_lam_compiled_1k` | 1.3243 | 1343.868 | 1525.58 |
+
+Mean training time includes compilation but excludes validation/checkpoint
+time. LAM's steady median is 1349.14 ms versus 528.48 ms for baseline.
+Compared with the killed historical run's approximately 1655 ms/update, the
+new mean is about 19% lower; that historical comparison is not a fresh paired
+kernel benchmark.
+
+**Keep decision:** LAM clears the >0.005 BPB threshold with a 0.0190 improvement
+at matched updates/tokens, but costs 2.538x the training time. This does not
+establish a matched-compute advantage. At 1,000 updates, pass one is 1.3426
+(only 0.0007 better than baseline), and the second pass buys 0.0183 BPB. The
+early hypothesis that most gain lives in the plain trunk is not supported at
+the final budget. Passes 3 and 8 both score 1.3236, with no degradation through
+eight passes. Sequential BPB 1.3028 is on a smaller 262,144-token subset and
+must not be compared directly against the 1M-token headline.
+
+Metrics/results remain in the two canonical run directories; checkpoints:
+`logs/nanomini_fb_{base_perf,lam_compiled}_1k_final_model.pt`.
+`ablation_results/nanomini_lam_performance/comparison.json` verifies completion,
+validation cadence, matching environment, quality margin, and timing.
+
+**Paper-inspired next hypothesis, not run:** arXiv:2608.08888v1 uses aggregate
+75% one-pass / 22% two-pass / 3% three-pass training for its larger runs,
+equivalent to 1.28x pass compute, not a cheap two-pass update. Its input-only
+GLU is also cheaper than LAM's layerwise reads. An isolated 1,000-update LAM
+schedule ablation could reuse `PassSchedule` from the separate full-bandwidth
+trainer: 750/220/30 updates, progressively introducing feedback. Stage boundaries
+in that utility are a local interpretation, not specified by the paper.
+Using the measured roughly 2.6x two-pass cost gives an estimated 1.45x average
+forward/backward cost for that mixture; this is a cost model, not a measured
+LAM result. Do not alter the completed always-two-pass reference.
+
+## LAM iteration: precision control and dropping layerwise memory reads
+
+The user reported worse intermediate BPB for the optimized path and asked for
+the speed/quality cost of removing each-layer insertion. Kept all training
+runs at 1,000 updates with validation every 20 and reused the preceding matched
+baseline and all-layer FLA run. Added `FB_MEMORY_LAYERS` to select zero-based
+LAM insertion sites without removing any transformer blocks. Only selected
+query/output projections are instantiated; parallel and sequential evaluation
+use the same fixed mapping, serialized in checkpoint config. Default `all`
+preserves existing full-layer checkpoints.
+
+### Precision diagnosis
+
+Original `nanomini_fb_lam_2k` and the optimized 1k run have real intermediate
+differences, e.g. 1.5346 vs 1.5432 BPB at step 240. They are not a matched
+end-budget comparison: the original schedule starts cooling at 600, the new
+one at 300, and the original has no completed 1,000-step result. The schedule
+difference cannot explain gaps before 300.
+
+Matched reference job 8450, `nanomini_fb_lam_torch_1k`, completed all 1,000
+updates using the fp32 Torch memory, with the same data/seed/batch/1k schedule:
+**1.3248 BPB**, versus optimized FLA **1.3243**. The 0.0005 difference is below
+the 0.005 material-improvement threshold; no sustained quality penalty was
+demonstrated. The new fp32 control also scores 1.5432 at step 240, so that
+historical gap is not unique to the FLA memory math. Exact transient causes
+are not established by these single-seed controls; do not attribute all
+historical differences to either precision or the schedule.
+
+Same-checkpoint job 8454 evaluated the entire canonical 1,048,576-token window:
+
+| FLA-trained checkpoint evaluator | Pass-one BPB | Pass-two BPB |
+|---|---:|---:|
+| Torch fp32 memory | 1.3426302185 | 1.3242711448 |
+| Compiled FLA memory | 1.3426302185 | 1.3242790014 |
+
+Identical weights/window/bytes; p2 difference is just **0.0000078566 BPB**.
+This rules out a meaningful scoring discrepancy on that checkpoint, not
+arbitrary training-trajectory effects. The fresh matched training timing is
+1,465.981 ms/update for fp32 versus 1,343.868 for FLA: **8.33% lower latency**,
+more reliable than the earlier historical ~1,655 ms comparison.
+Queued reciprocal-checkpoint evaluator 8455 was cancelled by Main before
+starting as redundant; no reciprocal measurement is claimed.
+
+### Insertion ablation
+
+Exclusive benchmark 8449, B64/T1024/6L/512d, five warmups and twenty samples
+of eight accumulated microbatches, excluding optimizer:
+
+| Variant | Parameters | ms/microbatch | Reduction vs six reads |
+|---|---:|---:|---:|
+| Plain mini | 19,958,784 | 60.95 | — |
+| LAM, all six sites | 23,635,976 | 159.22 | — |
+| LAM, sites 0/2/4 | 22,060,040 | 141.22 | 11.3% |
+| LAM, site 0 only | 21,009,416 | 128.91 | 19.0% |
+| Input-only GLU | 20,484,096 | 124.44 | 21.8% |
+
+First-only quality job 8452, `nanomini_fb_lam_first_1k`, completed all
+1,000 updates and 51 validations:
+
+| Variant | Final headline BPB | Mean training ms/update |
+|---|---:|---:|
+| Plain mini (existing matched control) | 1.3433 | 529.495 |
+| Six-site LAM, compiled FLA | 1.3243 | 1343.868 |
+| First-site LAM, compiled FLA | 1.3265 | 1096.485 |
+
+**Retain first-layer-only as the next control.** It costs just **0.0022 BPB**
+versus six reads while saving **18.4% training latency** and **2,626,560
+parameters**. It beats the plain backbone by **0.0168 BPB**, clearing the
+>0.005 keep rule, but still costs **2.071x** baseline training time because
+both transformer passes remain. Do not claim a matched-compute advantage.
+First-only p1/p2/p3/p8: 1.3426 / 1.3265 / 1.3258 / 1.3257.
+Sequential BPB 1.3058 uses a smaller 262,144-token window and is not directly
+comparable to those full-panel values.
+
+GLU job 8451 was cancelled by request; do not restart it or claim a 1k quality
+result. Three-site LAM was benchmarked but not trained: first-only's small
+quality cost made a middle-site run unnecessary for this iteration.
+
+Verification job 8448: **70 passed, 8 deselected**. Added behavior coverage
+for sparse causality, sequential/prefix agreement with live projections,
+strict checkpoint roundtrip, and unchanged default/full-layer behavior.
+Production compiled benchmark and both completed 1k training runs passed.
+Artifacts: `ablation_results/nanomini_lam_iteration/`; checkpoint:
+`logs/nanomini_fb_lam_first_1k_final_model.pt`; metrics/TensorBoard retain
+their canonical run names.
+
+### AdaRMSNorm proposal — not implemented or launched
+
+The user suggested adaptive normalization at every layer instead of repeated
+memory reads. The proposed controlled next arm keeps first-layer LAM, reuses
+its strictly causal read as conditioning, and adds rank-32 scale-only
+modulation to each block's attention/MLP RMSNorm inputs. Estimated additional
+projection weights: roughly 0.21M, versus ~9.4M for dense six-output DiT-style
+modulation across six width-512 blocks. No BPB improvement is presumed.
+Initialize modulation to identity; zero residual gates combined with the
+backbone's zero output projections can block learning. Both-pass training
+cost remains; this idea is separate from progressive pass scheduling.

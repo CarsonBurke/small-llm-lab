@@ -1,5 +1,145 @@
 # Post-training
 
+## Reviewed math corpus and prompt traversal
+
+`core.load_unique_math_rows()` deduplicates by the **exact full ordered chat
+messages**, not `extra_info.index`. Roles, case, whitespace, and message order
+remain significant. Identical prompts with identical effective reward/test
+contracts keep their first occurrence; conflicting contracts quarantine the
+whole prompt group. Source indices remain provenance, not question identity.
+An empty effective corpus is an error.
+
+The 2026-09-17 DAPO audit found 1,791,700 physical rows, 17,917 source indices,
+and 17,398 exact distinct prompts: 519 extra copies across 495 duplicate
+groups. Seven prompt groups had conflicting targets. Together with one
+reviewed invalid-target quarantine, future loads yield **17,390 questions**.
+Audit evidence is in `runs/math_corpus_audit_20260917/{before,after}.json`.
+
+`data/math_target_reviews.json` records exact prompt fingerprints, expected
+source targets, and mathematical evidence:
+
+- Nested divisor count: **12 → 6**; the outer divisor-count operation was missed.
+- Count of `n ∈ [1, 2015]` with `5 | n³ + 3ⁿ`: **403 → 404**; verified by
+  modular and direct integer enumeration.
+- Subset-sum tolerance target **d=10 quarantined**: nineteen copies of 96 total
+  1824, but no subset lies in `[1800, 1820]`. No replacement optimum is asserted.
+
+Reviews apply to matching source copies at load time without rewriting parquet
+bytes. Unexpected targets on a reviewed prompt quarantine it rather than
+silently overwrite a new label. Correction receipts certify only the terminal
+answer, **not any retained source solution trace**. This is a targeted repair,
+not certification of every remaining answer.
+
+MiniCPM's seeded sequential cursor now traverses the content-unique corpus
+before wrapping. Generating 16 attempts together for one prompt is intentional;
+it does not select that prompt again later in the same corpus pass. Warmup
+consumes the same cursor, and exact resume preserves it. Existing weighted
+mixture samplers retain their independent per-source passes and quotas; they
+do not promise a single global corpus epoch.
+
+New training checkpoints bind the ordered effective prompts, grading contracts,
+and review-policy identity in addition to their existing dataset guards.
+Missing or changed identities reject exact resume: **do not reuse an old cursor
+against a deduplicated/relabelled corpus**. Start a new run instead. Actor-only
+evaluation of existing checkpoints remains supported; live processes and saved
+artifacts are not retroactively changed.
+
+VAPO mixture and OPSD preparation use the same reviewed loader and record corpus
+provenance. Existing prepared manifests without the current policy/effective
+source identities must be rebuilt into **new immutable outputs** before future
+training; never overwrite them beneath an existing run.
+
+## Run locations and dashboards
+
+Post-training runs belong in `postraining/runs/<run_name>/`, with TensorBoard
+events in its `tensorboard/` subdirectory. The **parameter-golf-postraining**
+dashboard at `http://127.0.0.1:6106/` watches this tree directly; no dashboard
+symlink is needed for new runs. Put metrics, summaries, and checkpoints in the
+same run directory.
+
+The **parameter-golf** dashboard at `http://127.0.0.1:6101/` watches `tb_logs/`
+and is for **pretraining only**. Never link post-training runs there.
+MiniCPM training (including `scripts/run_minicpm_vapo.py`) and its resume
+preflight reject output directories outside `postraining/runs/`, including
+symlinks that escape the tree, before loading a model or writing run artifacts.
+Historical external runs remain accessible through existing post-training
+dashboard links; active run files are not moved. Resume historical checkpoints
+into a new canonical run directory rather than an external legacy destination.
+
+**Carry-RL final benchmarks:** AIME 2025 and AIME 2026 are optional evaluations
+after training, not training rewards or automatic per-update evaluations.
+Each local `postraining/data/aime-<year>.parquet` contains all 30 problems,
+with 15-problem `aime-<year>-i.parquet` and `aime-<year>-ii.parquet` splits.
+The user-selected published reference is MiniCPM5-1B's **40.42% Avg@16** on
+both years on its [model card](https://huggingface.co/openbmb/MiniCPM5-1B):
+30 problems × 16 independent attempts, averaged per attempt, not pass@16.
+Before claiming a matched comparison, establish the publisher's prompt,
+thinking/token budget, sampling, and grading protocol; also evaluate the
+untouched pretrained checkpoint with the same local protocol as the carry
+checkpoint. Per-year dataset manifests record provenance and transcription
+limitations. AIME 2026 has three reviewed source corrections; AIME 2025 uses
+pinned OpenCompass transcriptions with an integer answer-key cross-check
+against Math-AI. The publisher's exact dataset revision remains unverified.
+
+`scripts/evaluate_minicpm_vapo.py` evaluates carry-v4 or native-v6 checkpoints
+through `CapturedTrainingRolloutEngine`, restoring the actor adapter and trained
+carry combiner rather than using stock `generate`. It does not construct a
+critic or optimizer, and disables replay-history storage without disabling
+recurrence. The ordinary `eval_hf_math.py` entry point still refuses carry
+checkpoints and points to this evaluator; it also accepts optional
+`--suite aime_2025` or `aime_2026`, plus their `_i` and `_ii` splits, for stock
+HF models. These optional HF suites default to Avg@16; the carry evaluator
+continues to inherit its checkpoint's sample count.
+
+The checkpoint owns evaluation defaults: thinking mode, prompt suffix,
+prompt/response budgets, answer reserve, sampling, samples per problem,
+batch geometry, and seed. For the current full-softmax carry run this means
+30 problems × 16 attempts, 10,000 response tokens, a 1,000-token answer reserve,
+the 9K-budget suffix, and temperature 1 / top-k -1 / top-p 1.
+Use explicit overrides for a different comparison protocol;
+`--prompt-suffix "" --answer-reserve-tokens 0` removes both budget interventions.
+These local defaults are **not** claimed to reproduce the publisher's protocol.
+
+```bash
+# Set CHECKPOINT to the selected trained checkpoint; metadata inspection runs
+# directly because --dry-run never loads a model or writes run artifacts.
+.venv/bin/python scripts/evaluate_minicpm_vapo.py \
+  --checkpoint "$CHECKPOINT" --output postraining/runs/minicpm_carry_aime26 \
+  --dry-run
+
+# Run only when evaluation is wanted; neither command is part of training.
+mlq submit --name minicpm-carry-aime26 --cwd "$PWD" \
+  --max-parallel-runs 1 --time-limit 4h --max-attempts 1 -- \
+  .venv/bin/python scripts/evaluate_minicpm_vapo.py \
+  --checkpoint "$CHECKPOINT" --output postraining/runs/minicpm_carry_aime26
+
+# Same saved protocol, untouched base checkpoint, no learned adapter or carry.
+mlq submit --name minicpm-stock-aime26 --cwd "$PWD" \
+  --max-parallel-runs 1 --time-limit 4h --max-attempts 1 -- \
+  .venv/bin/python scripts/evaluate_minicpm_vapo.py \
+  --checkpoint "$CHECKPOINT" --stock --output postraining/runs/minicpm_stock_aime26
+```
+Select AIME25 by adding `--suite aime_2025` to the carry or stock command and
+choosing a separate output, such as `postraining/runs/minicpm_carry_aime25`.
+AIME26 remains the default. Both full suites record the 40.42% Avg@16 reference;
+individual sittings do not inherit that combined-benchmark score.
+Acquire/rebuild the pinned AIME25 text files with
+`.venv/bin/python scripts/build_aime_2025_eval_set.py` (no model/GPU execution).
+AIME25 is declared eval-only in `problem_sources.json` and included in the SFT
+decontamination targets. Existing immutable registry snapshots and previously
+prepared training corpora are not retroactively rewritten.
+
+
+Outputs are `result.json` (resolved protocol, hashes, provenance and metrics),
+`attempts.jsonl` (every generated response), `metrics.jsonl` (cumulative batch
+metrics), and `tensorboard/` on **parameter-golf-postraining** only. Output
+directories must be new or empty. The primary `contract_content_accuracy` is
+mean per-attempt correctness, not pass@k, and accepts correct capped answers
+like training. EOS-required and relaxed/boxed-answer metrics are also reported
+separately so grading differences remain visible. All problems are evaluated,
+including the incomplete final prompt batch. Gaussian-latent and Uno
+checkpoints are rejected rather than silently evaluated as native tokens.
+
 The historical round-5 base is
 `postraining/runs/sft_v3_answer_hfonly/sft_final_model.pt` (the three-epoch
 round-5 trace-SFT run selected by its sampling gate in `NOTES.md`). The
@@ -82,12 +222,13 @@ and 92.2% of responses reached the 10K cap. The second update was interrupted by
 the time limit. This confirms the integrated path runs; it does not establish
 learning improvement or acceptable task-quality/truncation.
 
-Fresh runs reserve **1,000 answer tokens inside the existing 10,000-token response
-cap** (`--answer-reserve-tokens 1000`). If the response has not naturally emitted
-the native `</think>` token, rollout inserts it as response token 9,000, leaving
-up to 1,000 subsequent tokens for the answer. Earlier natural thinking closure
-or EOS is unchanged. The delimiter counts toward the total cap; no additional
-KV capacity is required. Set the reserve to zero to disable budget forcing.
+Fresh trainer runs default to reserving **1,000 answer tokens inside the existing
+10,000-token response cap** (`--answer-reserve-tokens 1000`). If the response has
+not naturally emitted the native `</think>` token, rollout inserts it as response
+token 9,000, leaving up to 1,000 subsequent tokens for the answer. Earlier natural
+thinking closure or EOS is unchanged. The delimiter counts toward the total cap;
+no additional KV capacity is required. Set the reserve to zero to disable budget
+forcing.
 
 The forced delimiter stays in replay context and value/advantage computation,
 but is excluded from PPO likelihood, policy-KL diagnostics, and sampled-action
@@ -104,26 +245,30 @@ relabels pending unforced generations. Budget forcing is a compute-budget
 contract, not a demonstrated accuracy improvement.
 
 **Opt-in sampled-token hidden carry:** use
-`--token-carry --no-train-nextlat --answer-reserve-tokens 0` on a fresh
+`--token-carry --no-train-nextlat --answer-reserve-tokens 1000` on a fresh
 `postraining.train_minicpm_vapo` run. Native token-only remains the default;
 top-k 20, temperature 0.9, top-p 0.95, and the optimized BF16 rollout backend
 are unchanged.
 
 After sampling token `x` from the vocabulary head, the next input is
-`E(x) + sigmoid(g) * (Wd E(x) + Wh stopgrad(h))`, where `h` is the previous
+`E(x) + scale * (Wd E(x) + Wh stopgrad(h))`, where `h` is the previous
 final normalized hidden state, immediately before the LM head. The two
 bias-free projections are implemented without allocating a concatenation.
-Both matrices start at zero; the learnable scalar gate starts at **0.01**.
-The pretrained embedding bypass remains intact, and the gate attenuates both
-new residual branches (4,718,593 parameters per combiner). The gate initially
-has zero gradient while the residual is zero; it learns once a residual develops.
+Both matrices start at zero; each channel of the independent FP32 LayerScale
+vectors starts at **0.01**, without a sigmoid or tanh. Multiplication of the
+residual by the scale is FP32, then the scaled residual is cast to the token
+embedding dtype before addition. Scales may be negative or exceed one.
+The pretrained embedding bypass remains intact (4,720,128 parameters per
+combiner). Scale gradients are initially zero while the residual is zero;
+the matrices learn first, then the scales. This parameterization is an
+optimization hypothesis, not a demonstrated quality improvement.
 Prompts use plain embeddings. Every generated token uses the carry path,
-including ordinary sampled thinking delimiters and EOS. There are no Gaussian
+including sampled or imposed native thinking delimiters and EOS. There are no Gaussian
 actions, latent slots, additional noise, or learned stopping gates.
 
 Rollout stores the actor's **behavior-time producer hidden** alongside each
 sampled token as detached BF16 data. Actor and critic consume that identical
-observed stream through **independent gated combiners over their token embeddings**. Detach
+observed stream through **independent LayerScale combiners over their token embeddings**. Detach
 is before each trainable combiner, not after the combined embedding. The critic
 does not generate its own carry trajectory, consume an actor-combined embedding,
 or backpropagate its value loss into the actor. Its state-value objective is
@@ -138,14 +283,47 @@ the deterministic-carry contract already established in commit `ac2d67c`.
 Fixed-batch and continuous/refilled captured rollout retain exact producer
 histories in logical response order. CPU exports own their storage and survive
 refill/cache release. This mode requires compiled fast rollout and compiled
-replay. Gaussian latent mode, Uno/NextLat proposals, auxiliary NextLat training,
-and forced delimiters remain rejected for this isolated experiment.
-Checkpoints use `minicpm5_vapo_token_carry/v3`; both residual projections and
-scalar gates, optimizers, pending tokens **and stored carries**, and RNG state
-are saved. Old v1/v2 checkpoints are rejected: v1 lacks the stored observations,
-and v2 uses the ungated identity-initialized token projection. Continuation
-preflight supports v3; stock native-only evaluation rejects carry checkpoints
-instead of dropping their inputs.
+replay. Gaussian latent mode, Uno/NextLat proposals, and auxiliary NextLat
+training remain incompatible with this experiment. The normal answer reserve
+applies: with a 10,000-token response cap and 1,000-token reserve, force
+`</think>` at response position 8,999 (zero-based) if thinking is still open.
+The following 1,000 slots remain available for the answer; early natural closure
+is untouched. An imposed delimiter stays in the carry/context and critic targets,
+but is excluded from the sampled policy objective and KL. This reserves space,
+not a guarantee of a complete or correct answer.
+Checkpoints use `minicpm5_vapo_token_carry/v4`; both residual projections and
+per-channel scales, optimizers, pending tokens **and stored carries**, and RNG
+state are saved. Old v1/v2/v3 checkpoints are rejected: v1 lacks the stored
+observations, v2 uses the ungated identity-initialized token projection, and v3
+uses a scalar sigmoid gate. Continuation preflight requires a finite FP32 scale
+vector matching the projection width; stock native-only evaluation rejects
+carry checkpoints instead of dropping their inputs.
+
+**Opt-in slot memory (extension of token carry):** add `--slot-memory`
+(`--slot-memory-slots 64 --slot-memory-heads 1 --slot-memory-head-dim 128`)
+to a fresh `--token-carry --no-train-nextlat` run. The direct `Wh h` term is
+replaced by an attention read over up to `M` stored producer hiddens: every
+generated step also samples a slot action `σ ∈ {0..M-1, ∅}` from a
+zero-initialized head over the producer hidden, writes that hidden into the
+slot (pure overwrite; `∅` writes nothing), and the next input is
+`E(x) + scale * (Wd E(x) + Wo read)` with RoPE-by-position keys applied at
+write time plus a learned null key. `log π = log π_tok + log π_σ` shares one
+advantage; forced `</think>` never writes and stays excluded from the policy
+objective; the terminal slot choice is never read and carries no credit;
+admission clears the lane. Records carry `slot_choices` beside
+`carry_hiddens`; replay rebuilds the alive table per trajectory and runs
+compiled FlexAttention with a block-sparse mask (at most `M` keys per query).
+Checkpoints use `minicpm5_vapo_slot_memory/v1`; plain token-carry loaders,
+continuation with a different mode or geometry, and stock generate reject
+them; `scripts/evaluate_minicpm_vapo.py` evaluates them through the
+slot-aware rollout engine. Design note: `NOTES.md` 2026-09-17 "Slot memory over token carry".
+CPU contracts: `postraining/tests/test_slot_memory.py`; GPU checks:
+
+```bash
+mlq submit --name slot-memory-cuda-validation --cwd "$PWD" --max-parallel-runs 1 \
+  --time-limit 45m --env RUN_SLOT_MEMORY_CUDA_VALIDATION=1 -- \
+  .venv/bin/python -m pytest postraining/tests/test_slot_memory_cuda.py -x -v -s
+```
 
 Bounded correctness verification (not a quality evaluation):
 
@@ -181,29 +359,64 @@ successful learning.
 Behavior refresh averaged **24.06 s**, or **15.04%** of rollout + refresh +
 update time across its first nine actor iterations. The continuous rollout
 exports placeholder log-probabilities, so refresh must materialize actor
-likelihoods as well as independent critic values for GAE. The candidate
+likelihoods as well as independent critic values for GAE. The
 refactor retains both passes and transfers the two scalar statistics per
 action to CPU once per rollout rather than twice per trajectory. GPU buffers
 cost eight bytes per response action; likelihood and advantage semantics are
-unchanged. Speedup is pending a paired production-data benchmark.
+unchanged. A paired benchmark on 64 trajectories / 534,081 actions produced
+bit-identical likelihoods and advantages. Median refresh times were 26.49 s
+original versus 24.92 s batched transfer (6.3% speedup), but trial timings varied
+substantially; this is not a stable general throughput estimate.
 
-Fresh gated run **7679** is queued at normal priority, parallel limit one,
-with a two-hour cap and one attempt. It uses the same full response geometry
-and performs an alternating original/candidate refresh benchmark on its first
-real actor rollout, checking bit-identical likelihoods and advantages.
-Evidence is written to
+Gated run **7679** was stopped after the user reported 100% truncation with
+the answer reserve disabled. Its rolling checkpoint did not retain the critic
+warmup boundary; training/benchmark evidence remains in
 `ablation_results/minicpm_token_carry_gated_train_20260916/`.
-Gated quality and GPU throughput are not yet established. Host coverage passes
-192 focused tests; the real-tiny-Llama CPU model test was excluded.
 
-When training starts, the linked TensorBoard run is available at
-`http://127.0.0.1:6101/?runFilter=minicpm_token_carry_gated_train_20260916#timeseries`.
-The server on port 6106 lists the same run with `/tensorboard` appended.
-Both servers rescan every 180 seconds. `carry/actor_gate` and
-`carry/critic_gate` report the learned gates. Behavior refresh also reports
+Replacement job **7718** restored the 1,000-token answer reserve, then was
+externally cancelled during warmup. It retained actor step zero / critic warmup
+step three with no pending replay. Historical job **7746** resumed that checkpoint and
+added `--prompt-suffix "You have a budget of 9k tokens"` without changing the
+10,000-token response cap, reserve, or reward. Normal priority, parallel limit
+one, two-hour cap, one attempt remain in force.
+The warmup boundary is now saved separately as `critic_warmup_checkpoint.pt`
+before actor updates, using the existing immutable checkpoint publication helper.
+The suffix is appended to each task before native chat templating, is reflected
+in TensorBoard sample text, and is saved in checkpoint arguments. It may change
+on continuation only when no replay records are pending. It survives the
+1,024-token prompt truncation with the pinned MiniCPM tokenizer. 135 focused
+prompt/checkpoint/evaluator host tests pass; the earlier carry/forcing checks
+passed separately. This prompt communicates a ceiling, not an exact counter.
+
+Evidence is written to
+`ablation_results/minicpm_token_carry_gated_budget9k_20260916/`.
+Its linked TensorBoard run remains available at
+`http://127.0.0.1:6106/?runFilter=minicpm_token_carry_gated_budget9k_20260916#timeseries`.
+The run name has `/tensorboard` appended. The server rescans every 180 seconds.
+The historical sigmoid run's
+`carry/actor_gate` and `carry/critic_gate` report its scalar gates. Behavior refresh reports
 `carry/{actor,critic}_probe_carry_to_token_rms` and
 `carry/{actor,critic}_probe_residual_to_token_rms`, using at most 256 evenly
 spaced carry inputs from the first nonempty packed shard, not the whole rollout.
+
+On user request, **7746 was cancelled and replaced by LayerScale job 7758**.
+The replacement is queued at normal priority with parallel limit one, a
+two-hour cap, one attempt, and no additional autocull policy. It starts fresh
+with ten critic-warmup cycles rather than converting the v3 optimizer state.
+The 1,000-step target, 64 trajectories per rollout, budget prompt, response cap,
+answer reserve, and replay configuration are unchanged. This is not an exactly
+matched warmup comparison: 7746 resumed three earlier warmup cycles without
+the budget prompt, whereas 7758 uses that prompt from the start.
+
+LayerScale reports `carry/{actor,critic}_scale_{mean,min,max,rms}`, retaining
+the carry/token and residual/token RMS probes above. The focused host suite
+passed 172 tests; a separate BF16 boundary check confirmed that FP32 scaling
+produces distinct outputs where rounding the scales first would erase their
+difference, with scale gradients preserved and carry-producer gradients absent.
+GPU/compiled execution is pending queue admission; no learning benefit is
+claimed. Artifacts: `ablation_results/minicpm_token_carry_layerscale_budget9k_20260916/`.
+TensorBoard:
+`http://127.0.0.1:6106/?runFilter=minicpm_token_carry_layerscale_budget9k_20260916#timeseries`.
 
 **Opt-in latent thinking:** add `--latent-thinking` to a fresh MiniCPM run.
 The default is false; `--no-latent-thinking` explicitly retains native token
@@ -359,17 +572,32 @@ never full logits. Replay reconstructs selected-token probabilities in
 Each rollout collects four distinct prompts with sixteen responses apiece. The
 default gives all 64 logical trajectories one physical GPU lane in one KV
 cache. `--rollout-physical-batch-size` can benchmark fewer continuously
-refilled lanes without changing the logical rollout. With four optimizer
-minibatches, each actor and critic step consumes a disjoint 16-trajectory
-quarter of the rollout.
+refilled lanes without changing the logical rollout.
 
-One PPO epoch uses four true optimizer minibatches. Each contains a disjoint
-quarter of the rollout; length-bucketed replay batches are only memory shards
-whose gradients accumulate inside that optimizer minibatch. Actor and critic
-therefore each take four AdamW steps per rollout. Their default learning rates
-are 1e-6 and 2e-6 respectively, matching VAPO's actor/critic scale. Fixed
-behavior log-probabilities make KL, ratios, and clipping meaningful after the
-first minibatch. Exact post-update behavior KL is measured every ten rollouts.
+One PPO epoch now defaults to one actor and one critic optimizer update over
+all 64 trajectories (`--optimizer-minibatches 1`). Length-bucketed replay
+microbatches only bound activation memory: their loss sums use the full
+optimizer batch's action counts, gradients accumulate, and clipping and AdamW
+run once after all shards. Forced actions are excluded from the policy count.
+Use `--replay-token-budget` and `--replay-max-trajectories` to control VRAM.
+This lets sparse successful trajectories contribute to the same update as
+failures instead of making several sequential, potentially all-failure updates.
+It cannot supply positive reward to an entirely unsuccessful rollout.
+
+`--optimizer-minibatches 4` retains the old four disjoint 16-trajectory updates
+for comparisons. One full-rollout update is not equivalent to those four AdamW
+steps; learning rates are unchanged, not multiplied by four. Fixed behavior
+log-probabilities and advantages are retained across replay. Exact post-update
+behavior KL is measured every ten PPO epochs. Existing checkpoints can change
+optimizer minibatch count only between rollouts, with no pending records;
+historical launch scripts that explicitly pin four retain that setting.
+
+Token-carry training disables NextLat, so its primary objective is invariant
+to memory partitioning apart from numerical roundoff. Native/Gaussian runs
+with NextLat still sample and balance auxiliary gradients per memory shard;
+that auxiliary objective is not partition-invariant. With one optimizer batch,
+its sample budget is 64 per PPO epoch rather than four budgets of 64. These
+are implementation semantics, not evidence of improved training accuracy.
 
 Actor and critic each own a canonical residual NextLat dynamics MLP. It consumes
 the current hidden state and next-token embedding, predicts the next hidden
@@ -417,6 +645,38 @@ resume-compatible. Attention remains segmented SDPA.
 The `--replay-attention-backend fa4` path remains available only for profiling;
 SM120 FA4 varlen backward produced NaNs in production.
 
+Three replay execution paths changed on 2026-09-18 without a numerical
+qualification flag because each is exact by construction: a power-of-two LoRA
+scale (alpha/rank, 2.0 in production) is folded into the rank-16 `lora_b`
+operand before its GEMM and added in place, so the token-sized multiply
+disappears in both directions; segmented SDPA concatenates token-major views
+so the head merge is a view instead of a second activation copy; action-row
+gathers use `index_select` on the single packed row, whose backward is one
+`index_add` over unique positions instead of the sorted accumulate path.
+Hidden-space trunk balancing records finiteness on the deferred device flags
+like the parameter-space path. The parity job
+(`scripts/ablate_minicpm_exact_replay_paths.py`, job 8090) measured the same
+16-trajectory/160k-action optimizer minibatch at 17.85/18.13s on the legacy
+paths and 16.62/16.63s on the exact paths (8.2% higher warm update throughput,
+identical peak allocation) with a maximum parameter difference of 7.45e-9,
+equal to the unchanged-path repeat control. Behavior refresh with logit chunk
+1024 is bitwise identical to chunk 128 and 3.6% faster; the update path at
+1024 has not been compared. Flash SDPA serves GQA causal replay on SM120, but a
+4096-token probe showed the default dispatch (1.50ms) beating forced flash
+(3.52ms), so which kernel production replay runs still needs a profiler check.
+
+Rollout decode plans the split-KV partitions once per captured step
+(`postraining/split_kv_plan.py`) from the same device lengths every layer
+consumes; the attention operator accepts that shared plan or derives its own,
+with identical output. The microbenchmark (`scripts/benchmark_split_kv_plan.py`,
+job 8089) cut kernels per decode step from 312 to 76 with bitwise-identical
+output; replay time is unchanged at full 11,264-token length (KV-bandwidth
+bound) and drops 6.50→6.14ms at mixed lengths and 0.44→0.15ms at short
+lengths. `--behavior-logprobs rollout` reuses the captured merged-bf16
+replica log-probabilities instead of the replay actor pass; it changes the
+importance ratio's reference distribution and stays opt-in until a learning
+ablation and explicit sign-off.
+
 MiniCPM VAPO uses the checkpoint's native thinking template, temperature 0.9,
 top-k 20, and top-p 0.95. The default 10,000-token response budget uses the
 64-row static cache after offloading the frozen training backbone.
@@ -424,6 +684,18 @@ top-k 20, and top-p 0.95. The default 10,000-token response budget uses the
 sampler. Production aborts below `--min-rollout-tokens-per-second`: the AR path
 uses steady scheduled decode tok/s; opt-in Uno uses useful end-to-end rollout tok/s.
 Choose the Uno floor from a matched benchmark, not the AR scheduled-token value.
+
+Native token rollouts, including token carry, also support
+`--top-k -1 --top-p 1 --temperature 1` for full-vocabulary categorical sampling
+without leaving the compiled fast decoder. This setting matches the untempered
+full-softmax PPO scorer. `top-k=-1` requires `top-p=1` and is not supported by
+Gaussian latent or Uno rollouts; a non-unit temperature still differs from the
+current PPO scorer. Existing sampling defaults are unchanged.
+
+`scripts/run_minicpm_vapo.py` accepts the trainer's arguments and preserves the
+carry experiments' phase timings and canonical `<output>/metrics.jsonl` stream
+alongside TensorBoard. Use `--output postraining/runs/<run_name>` and submit this
+entry point through `mlq`, as with the trainer.
 
 Compiled MiniCPM AR now defaults to compiler-visible FA4, in-place indexed KV
 writes and fullgraph compilation with preserved bf16 casts. It retains ordinary
@@ -503,13 +775,198 @@ Checkpoint metadata pins `rollout_arithmetic`. Pending legacy, unsplit-v1 or
 split-v2 records cannot resume under v3; use a checkpoint at a completed-rollout
 boundary to change arithmetic. Existing running processes do not switch modes.
 
-TensorBoard is the only live metric stream. Semantic categories cover rollout
-quality, rollout performance, refill efficiency, sampling, replay, actor,
+TensorBoard and run-local `metrics.jsonl` record training metrics. Semantic
+categories cover rollout quality, rollout performance, refill efficiency, sampling, replay, actor,
 critic, advantages, KL, ratios, clipping, gradients, auxiliary NextLat,
 optimization time, and system telemetry. Every category is capped at twelve
 charts. Configuration and correct/incorrect response samples are text
 summaries. Scalar writers rely on TensorBoard's asynchronous flush interval
 instead of synchronously flushing every progress callback.
+
+Render saved rollout responses as a standalone HTML transcript:
+
+```bash
+.venv/bin/python scripts/render_minicpm_responses.py \
+  --run postraining/runs/<run_name> --last 4 --compare-steps 44,64-84
+```
+
+The default destination is `<run>/responses.html`; `--output <path>.html`
+selects another destination. Re-run the command to atomically refresh the
+latest saved steps. Omit `--compare-steps` for only the latest examples.
+Questions and reference answers accompany the original correct/incorrect
+response text; different questions are not paired as if they were the same
+problem. Original TensorBoard text omissions remain marked. These are selected
+examples, not a random sample, and a live writer may not have flushed its
+latest text yet. This command reads event files only: no model, checkpoint,
+or GPU workload, so it can run directly without `mlq`.
+
+### Generic verifiable tasks
+
+`verifiable_tasks.py` owns the dataset-independent `verifiable_task/v1` contract.
+Rows contain a complete `prompt` chat, `reward_model.style` and
+`verification_info.schema` set to that version, a string ground truth, and an
+arbitrary nonempty `extra_info.domain` for reporting. Verification dispatches on
+`verification_info.kind`, **not** the dataset name or reporting domain:
+
+- `math`: exact numeric equivalence, otherwise existing normalized final-answer
+  comparison.
+- `text`: case-sensitive, whitespace-normalized final-answer equality.
+- `python_stdio`: `call_type="std"`, `fn_name=null`, and nonempty, equal-length
+  string `inputs`/`outputs` lists. Every hidden case must pass.
+
+Only the final response after closed thinking is scored. `Answer:` owns its
+entire remaining tail; one enclosing `\boxed{...}` is accepted. Without an
+answer field, the final balanced box is used. Unfinished thinking cannot earn
+reward. Python code executes in fresh bubblewrap namespaces with a minimal
+read-only system Python runtime, seccomp process/network restrictions, bounded
+CPU/memory/output/wall time, and no host credentials. Expected outputs stay
+outside the candidate process. Missing isolation infrastructure raises rather
+than silently assigning incorrect rewards.
+
+MiniCPM uses one seeded content-unique corpus pass without replacement; grouped
+attempts remain intentional. Canonical prompts already own their instructions:
+the trainer does not append `--prompt-suffix` again and rejects overlong prompts
+instead of truncating them. Checkpoints bind grading implementation, ordered
+effective corpus and reporting domains. JSONL/TensorBoard record per-domain
+accuracy, mixed groups, token lengths, caps and verifier outcomes.
+
+With `--context-tokens 10000`, **prompt plus response** must fit within 10,000
+tokens. Each rollout lane gets at most `min(max_new_tokens, context_tokens -
+actual_chat_prompt_tokens)` response tokens; final-answer reservation applies
+inside that allowance. No prompt is truncated. This explicit-context mode uses
+the native compiled rollout path, not latent/Uno/eager rollout modes.
+Changing the context or generation policy is rejected on exact resume.
+
+Rollout/evaluation logs also include duplicate overlapping word 3-gram and
+16-gram fractions and the longest identical-word run. These are observational:
+they neither change reward nor stop generation. The duplicate n-gram statistic
+follows common [Open-R1](https://github.com/huggingface/open-r1/blob/main/src/open_r1/rewards.py)
+and [TRL](https://huggingface.co/docs/trl/main/en/rewards#get_repetition_penalty_reward)
+practice, but this campaign does **not** apply their repetition penalty.
+Calibration on saved outputs is in
+`runs/minicpm_carry_analysis_20260917/repetition_calibration.json`; even passing
+code can be highly repetitive, so a universal cutoff is not justified.
+
+`scripts/evaluate_minicpm_tasks.py` evaluates the same contract and reward path
+with the compiled BF16 actor. Supply `--data`, a preserved `--checkpoint` and a
+new `--output`; `--stock` uses only checkpoint configuration, not trained adapter
+weights. Defaults are up to 32 questions per represented domain and eight
+attempts each. `--require-domain-success` fails if a domain has no successful
+attempt after the complete evaluation. These local adaptation holdouts are
+**not claimed pretraining-clean**. Queue model evaluation through `mlq`.
+
+### Bounded multi-source preparation
+
+`task_data.py` owns prompt construction, global uniqueness, conflict quarantine,
+uncapped splitting, and immutable publication. Dataset adapters emit explicit
+verification kinds; neither the trainer nor the verifier depends on UltraData.
+
+- `ultradata_data.py` pins `openbmb/UltraData-RL-2609` at
+  `e6ecfa733708a4c54b5a98c3ca0fd16fc6923790`. Math/STEM and supplementary code
+  reuse bounded raw windows. QA reads all eight indexed Parquet files at
+  conversion revision `a9fcbd481b7f80a884c3727102be394329b1f4cc`: 18,045 source
+  rows, one fewer than the advertised 18,046. Missing data is not fabricated.
+- `codecontests_data.py` pins `deepmind/code_contests` at
+  `802411c3010cb00d1b05bad57ca77365a3c699d6`. The default reads all 39 **training**
+  shards (13,328 source rows), projecting questions, metadata and complete
+  public/private/generated test arrays. Reference/incorrect solutions and the
+  upstream validation/test splits are not fetched. The source is CC-BY-4.0.
+
+Those are source inventories, **not** promises of retained counts. Unsupported
+test formats, interactive/file-I/O/custom-checker tasks, incomplete or oversized
+test suites, and over-budget prompts are rejected, never shortened. UltraData
+also excludes source-specific multiple-choice/proof/multipart tasks, reviewed
+bad math labels and free-form targets that cannot be safely scored by exact
+answer comparison. QA structure checks target the actual question, not lists
+inside its supplied context.
+
+```bash
+mlq submit --name prepare-verifiable-mixed --cwd "$PWD" \
+  --max-parallel-runs 1 --priority 1 --max-attempts 1 --time-limit 45m -- \
+  .venv/bin/python -u scripts/prepare_verifiable_tasks.py \
+    --output postraining/data/<new_corpus> --context-tokens 10000 \
+    --code-shards 39 --validation-fraction 0.10 --seed 1337 \
+    --acquisition-bytes 4294967296
+```
+
+Preparation is CPU/network work, not model training; negligible GPU utilization
+is expected. It still goes through the repository's exclusive `mlq` policy.
+The **4 GiB lifetime response-body cap** includes prior cache acquisitions and
+conservatively charged failed/interrupted requests. `data_acquisition.py`
+verifies cached digests and response ranges, reads bounded Parquet metadata,
+and batches adjacent selected columns without crossing unused-column gaps.
+No server-side whole-file fallback is accepted.
+
+All usable unique examples are retained: there is no example-count cap,
+downsampling, oversampling or raw-population weighting. Actual training
+proportions follow retained unique counts after a seeded 10% per-domain holdout.
+Raw-window code coverage remains prefix/source-order biased; context, record
+and verifier bounds also affect the mix. This is not uniform full-release
+sampling.
+
+Current full-chat prompt caps are Math 2,048, Knowledge 2,048, Code 4,096 and
+Long_Context 6,144 tokens. Prompts contain no fixed “9k thinking” instruction.
+Use the following shared flags for training and base evaluation:
+
+```text
+--context-tokens 10000 --prompt-tokens 6144 --max-new-tokens 10000
+--answer-reserve-tokens 1000 --prompt-suffix ''
+```
+
+Training additionally needs a replay budget covering the total sequence:
+`--replay-token-budget 10000`. Evaluate the untouched base with
+`scripts/evaluate_minicpm_tasks.py --stock --require-domain-success` before
+launching a fresh run; do not resume the collapsed carry checkpoint.
+
+Preparation publishes a new immutable directory with `train.parquet`,
+`validation.parquet` and `manifest.json`. The manifest records source ranges,
+byte charges, filter reasons, actual domain counts/proportions,
+source/tokenizer/template/reward identities, split hashes and globally
+content-disjoint membership. Local holdouts are not claimed pretraining-clean.
+Format checks do not certify every upstream label or hidden-test suite.
+UltraData's upstream licensing/redistribution restrictions and CodeContests'
+CC-BY-4.0 terms still apply; this workflow does not rehost either release.
+
+Evaluate the untouched MiniCPM5-1B base on a reproducible KodCode coding sample:
+
+```bash
+mlq submit --name minicpm-base-kodcode --cwd "$PWD" \
+  --max-parallel-runs 1 --priority 1 --max-attempts 1 --time-limit 4h -- \
+  .venv/bin/python -u scripts/evaluate_minicpm_kodcode.py \
+    --checkpoint postraining/runs/<preserved_run>/vapo_adapter_checkpoint.pt \
+    --dataset-revision dcf78a8bbba9a613b596ce993c4921a38687dfcc \
+    --output postraining/runs/<new_coding_eval>
+```
+
+The checkpoint supplies validated base identity/configuration only: `stock=True`
+does not load its trained adapter, carry, or NextLat weights. Defaults select
+256 reference-verified, sandbox-compatible KodCode-Light-RL-10K problems with
+seed 42, then generate eight attempts each using compiled BF16, full-softmax
+sampling (`temperature=1`, `top_p=1`, `top_k=-1`), a 10,000-token response cap,
+and a 1,000-token final-answer reserve. Coding prompts contain the question and
+required signature, never reference solutions or hidden tests. Prompts exceeding
+2,048 tokens are explicitly excluded rather than truncated or replaced.
+
+The adapter retains plain zero-argument assertion tests and excludes unsupported
+pytest features, fixtures, imports, and reference failures with recorded counts.
+Selection never consults base-model success. This evaluates the supported subset,
+not all 10K problems; reference execution does not certify test completeness or
+specification correctness. KodCode is **CC BY-NC 4.0**.
+
+`--dry-run` checks local metadata without model work or output files.
+`--prepare-only` materializes the selection and reference preflights without a
+model; queue this dataset-preparation workload too. `--prepared-dir <directory>`
+reuses a digest-verified prepared selection. Outputs include `manifest.json`,
+`prepared_rows.jsonl`, per-attempt evidence, `metrics.jsonl`, `result.json`,
+TensorBoard events, and an automatically refreshed `responses.html`.
+
+For training suitability, inspect per-attempt correctness alongside complete
+all-fail/mixed/all-pass problem fractions, difficulty/subset breakdowns, truncation,
+and format/policy rejections. Any-success across eight attempts is not Avg@8;
+partial groups and missing problems are reported separately. No automatic
+training launch or quality threshold is imposed. Preserve sampled IDs as a held-out
+set when constructing a later training mixture; a useful base success distribution
+justifies an ablation, not a claim of improved learning or generalization.
 
 Establish the pinned native checkpoint baseline before running the integrated
 learnability gate:
