@@ -1,0 +1,16 @@
+{
+  "package": "flash-linear-attention",
+  "version": "0.5.2",
+  "upstream": "https://github.com/fla-org/flash-linear-attention",
+  "upstream_file": "fla/layers/gated_deltanet.py",
+  "source": "installed wheel verified against RECORD by parent",
+  "source_sha256": "d9c8dbfbcded554a1a1bfe58efe7c8181f32957d7565beea5625836f6371e00b",
+  "local_sha256": "9f9052643ab57bc4ea2f6a6cce42a1540bca4dadb0ed18d3eeaff1f84ed4d37f",
+  "license": "MIT; this subdirectory is independent of the sibling NVIDIA Source Code License-NC code",
+  "license_sha256": "41a83c8187efc1e3ccc21909e806a9e52338e69448554d9754706c3d1cd610e7",
+  "modifications": [
+    "Add _project_inputs hook returning combined QKV, scalar decay, scalar beta and output gate.",
+    "Evaluate projections after unpadding; reuse projected tensors in existing fused convolution, cache, recurrence and output paths.",
+    "No kernel, initialization, parameter definition, recurrence or cache API changes."
+  ]
+}

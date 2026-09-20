@@ -1,0 +1,5 @@
+# Install into the existing supported CUDA/PyTorch environment; do not replace Torch.
+fla-core==0.5.2
+flash-linear-attention==0.5.2
+# Match the existing Torch 2.13 environment for FLA frontend optional imports.
+torchvision==0.28.0

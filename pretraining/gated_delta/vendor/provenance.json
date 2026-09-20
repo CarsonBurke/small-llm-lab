@@ -1,0 +1,52 @@
+{
+  "repository": "https://github.com/NVlabs/GatedDeltaNet-2",
+  "commit": "a5552fe3c67e0ebc7ef1220df68ae8896ec62d56",
+  "license": "NVIDIA Source Code License-NC",
+  "license_file": "LICENSE",
+  "use_scope": "research and evaluation; not an unrestricted commercial license",
+  "files": {
+    "gdn2.py": {
+      "upstream_path": "lit_gpt/gdn2.py",
+      "sha256": "33f7b0e2e91f0c0035bf6dfef11d1a3beba44ab42e882543bb79f8ef3e807254",
+      "modifications": [
+        "Add _project_inputs hook for the seven independent first projections after optional unpadding; forward consumes its outputs while second f/g linears remain at their original stages. No recurrence, convolution, cache, initialization, or parameter-key changes.",
+        "Add _chunk_recurrence and _recurrent_recurrence dispatch hooks; forward calls the hooks with unchanged arguments. The model execution subclass can select installed FLA kernels, state layout and backward recomputation schedule without copying the frontend or modifying any kernel."
+      ],
+      "upstream_sha256": "5d93765adcb4e9bf755e7d4160a01d4e2ee8438ec55759d17903223dd18b0324"
+    },
+    "gdn2_ops/chunk_gdn2.py": {
+      "upstream_path": "lit_gpt/gdn2_ops/chunk_gdn2.py",
+      "sha256": "e2bea27b4077c7449f548913866aa08c5fa8d4617a6855f829f6fdb2cb1e6bff",
+      "modifications": [
+        "Relocate imports of three common-delta/GLA helpers to .fla_compat; Triton kernels and recurrence arithmetic unchanged."
+      ],
+      "upstream_sha256": "164a0e8a80b766332d80dbe80e1939b25c31310fa55d1894157e412a467ec939"
+    },
+    "gdn2_ops/fused_recurrent_gdn2.py": {
+      "upstream_path": "lit_gpt/gdn2_ops/fused_recurrent_gdn2.py",
+      "sha256": "aee06a5fe471a194680a5762cbb733118d0e52ad816732a4e1742cb7485a2db1",
+      "modifications": []
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "sha256": "eaff393a7abc4ea7cb05795423b531a212b6d2189bcbe30410587d52d70988bb",
+      "modifications": []
+    },
+    "gdn2_ops/fla_compat.py": {
+      "upstream_path": null,
+      "sha256": "91b3f821e4084c9aaeab7ee96f0e3616fc142553a9f525db604877e6aab1d1d1",
+      "modifications": [
+        "Local API adapter: transpose_state_layout -> state_v_first; require and remove use_exp2=True because installed fla-core helpers already use exp2. No tensor transformations."
+      ]
+    }
+  },
+  "dependencies": {
+    "fla-core": "0.5.2",
+    "flash-linear-attention": "0.5.2"
+  },
+  "integration": "Official fused-recurrent kernel copied byte-for-byte. Mixer has a documented input-projection hook; chunk kernel has two helper-import relocations to the fla-core 0.5.2 compatibility adapter. The optional fused model subclass packs existing independent Parameters each forward; no persistent packed weights.",
+  "runtime_requirements": {
+    "convolution_backend": "triton",
+    "FLA_CONV_BACKEND": "unset or triton; model wrapper rejects other effective backends"
+  }
+}
