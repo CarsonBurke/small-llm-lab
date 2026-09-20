@@ -214,7 +214,7 @@ def apply_authorized_corrections(source_rows: list[dict]) -> list[dict]:
     return rows
 
 
-def convert(source_rows: list[dict]) -> list[dict]:
+def convert(source_rows: list[dict], *, year: int = 2026) -> list[dict]:
     converted = []
     for source in source_rows:
         source_id = int(source["id"])
@@ -223,7 +223,7 @@ def convert(source_rows: list[dict]) -> list[dict]:
         problem = source["problem"].strip()
         converted.append(
             {
-                "data_source": "aime_2026",
+                "data_source": f"aime_{year}",
                 "prompt": [
                     {
                         "content": (
@@ -238,10 +238,10 @@ def convert(source_rows: list[dict]) -> list[dict]:
                     "style": "rule-lighteval/MATH_v2",
                 },
                 "extra_info": {
-                    "index": f"aime_2026_{form.lower()}/{problem_number}",
+                    "index": f"aime_{year}_{form.lower()}/{problem_number}",
                     "raw_problem": problem,
                     "split": "test",
-                    "year": 2026,
+                    "year": year,
                     "form": form,
                     "problem_number": problem_number,
                     "source_id": source_id,
