@@ -105,7 +105,7 @@ def test_canonicalization_assigns_explicit_sources_and_reward_contracts():
     )
 
 
-def test_physical_deduplication_rejects_conflicting_rows(tmp_path: Path):
+def test_physical_deduplication_quarantines_conflicting_rows(tmp_path: Path):
     duplicate_path = tmp_path / "duplicate.parquet"
     row = _deepmind(0)
     _write_rows(duplicate_path, [row, row])
@@ -113,41 +113,42 @@ def test_physical_deduplication_rejects_conflicting_rows(tmp_path: Path):
         duplicate_path, mixture.DEEPMIND_SOURCE_ID
     )
     assert physical == 2
-    assert unique == [row]
+    assert [record["reward_model"] for record in unique] == [row["reward_model"]]
 
     conflict_path = tmp_path / "conflict.parquet"
-    _write_rows(conflict_path, [row, _deepmind(0, answer="different")])
-    with pytest.raises(ValueError, match="conflicting physical rows"):
+    survivor = _deepmind(1)
+    _write_rows(conflict_path, [row, _deepmind(0, answer="different"), survivor])
+    unique, physical = mixture.deduplicate_source(
+        conflict_path, mixture.DEEPMIND_SOURCE_ID
+    )
+    assert unique == [survivor]
+    assert physical == 3
+
+    _write_rows(conflict_path, [row, _deepmind(0, problem="Different prompt")])
+    with pytest.raises(ValueError, match="ambiguous"):
         mixture.deduplicate_source(conflict_path, mixture.DEEPMIND_SOURCE_ID)
 
 
-def test_normalized_problem_deduplication_quarantines_conflicting_truths():
-    deepmind = {
-        "example_id": "deepmind_math:a",
-        "source": "deepmind_math",
-        "problem": "How many?",
-        "solution": "5",
-        "reward_style": "rule",
-    }
-    gsm_equivalent = {
-        "example_id": "gsm8k:b",
-        "source": "gsm8k",
-        "problem": "  how   MANY? ",
-        "solution": "5.0",
-        "reward_style": "rule-lighteval/MATH_v2",
-    }
+def test_exact_chat_deduplication_preserves_case_and_quarantines_contract_conflicts():
+    first = mixture.canonical_source_record(
+        _deepmind(0, answer="5", problem="Find X."), mixture.SOURCE_SPECS[0]
+    )
+    duplicate = {**first, "example_id": "deepmind_math:duplicate"}
+    case_distinct = mixture.canonical_source_record(
+        _deepmind(1, answer="5", problem="Find x."), mixture.SOURCE_SPECS[0]
+    )
     unique, duplicates, conflicts = mixture.deduplicate_canonical_records(
-        [deepmind, gsm_equivalent]
+        [first, duplicate, case_distinct]
     )
-    assert unique == [deepmind]
-    assert duplicates == {"gsm8k": 1}
+    assert unique == [first, case_distinct]
+    assert duplicates == {"deepmind_math": 1}
     assert conflicts == {}
-
+    conflicting = {**duplicate, "reward_style": "rule-lighteval/MATH_v2"}
     quarantined, _, conflicts = mixture.deduplicate_canonical_records(
-        [{**deepmind, "solution": "6"}, gsm_equivalent]
+        [first, conflicting, case_distinct]
     )
-    assert quarantined == []
-    assert conflicts == Counter({"deepmind_math": 1, "gsm8k": 1})
+    assert quarantined == [case_distinct]
+    assert conflicts == Counter({"deepmind_math": 2})
 
 
 def test_derangement_is_position_matched_and_handles_exact_text_answers():
@@ -235,6 +236,19 @@ def test_builder_makes_exact_clean_gate_and_immutable_outputs(
     }
     with pytest.raises(ValueError, match="answer-fence prompt schema"):
         validate_final_answer_manifest(wrong_prompt_schema)
+    old_policy = {**manifest, "math_corpus_policy_sha256": "old"}
+    with pytest.raises(ValueError, match="reviewed math corpus policy"):
+        validate_final_answer_manifest(old_policy)
+    missing_identity = {
+        **manifest,
+        "sources": {
+            source: {key: value for key, value in metadata.items()
+                     if key != "math_corpus_identity"}
+            for source, metadata in manifest["sources"].items()
+        },
+    }
+    with pytest.raises(ValueError, match="effective source corpus identities"):
+        validate_final_answer_manifest(missing_identity)
     train_path, gate_path, manifest_path = mixture.output_paths(prefix)
     train = pq.read_table(train_path).to_pylist()
     gate = pq.read_table(gate_path).to_pylist()
@@ -259,7 +273,7 @@ def test_builder_makes_exact_clean_gate_and_immutable_outputs(
         mixture.normalized_text(row["problem"]) for row in train
     }.isdisjoint(mixture.normalized_text(row["problem"]) for row in gate)
     assert contaminated.isdisjoint(row["problem"] for row in gate)
-    assert manifest["sources"]["gsm8k"]["normalized_problem_duplicates"] == 1
+    assert manifest["sources"]["gsm8k"]["exact_prompt_duplicates"] == 0
     assert all(row["permuted_donor_id"] in train_ids for row in train)
     assert all(row["permuted_donor_id"] in gate_ids for row in gate)
     assert all(

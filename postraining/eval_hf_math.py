@@ -110,6 +110,25 @@ DEFAULT_SUITES = (
     ),
 )
 
+OPTIONAL_AIME_SUITES = tuple(
+    Suite(
+        name=name,
+        path=f"postraining/data/{filename}.parquet",
+        samples=16,
+        max_rows=0,
+        answer_style_override="aime",
+    )
+    for name, filename in (
+        ("aime_2025", "aime-2025"),
+        ("aime_2025_i", "aime-2025-i"),
+        ("aime_2025_ii", "aime-2025-ii"),
+        ("aime_2026", "aime-2026"),
+        ("aime_2026_i", "aime-2026-i"),
+        ("aime_2026_ii", "aime-2026-ii"),
+    )
+)
+AVAILABLE_SUITES = DEFAULT_SUITES + OPTIONAL_AIME_SUITES
+
 
 def _atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1066,8 +1085,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--suite",
         action="append",
-        choices=tuple(suite.name for suite in DEFAULT_SUITES),
-        help="suite(s) to run; repeat the flag, or omit it for all",
+        choices=tuple(suite.name for suite in AVAILABLE_SUITES),
+        help="suite(s) to run; repeat the flag; AIME 2025/2026 are opt-in (Avg@16)",
     )
     parser.add_argument(
         "--tensorboard-log-dir",
@@ -1105,8 +1124,13 @@ def load_vapo_adapter_for_evaluation(
         )
     if str(payload.get("schema", "")).startswith("minicpm5_vapo_token_carry/"):
         raise ValueError(
-            "token-carry checkpoints require CapturedTrainingRolloutEngine; "
+            "token-carry checkpoints require scripts/evaluate_minicpm_vapo.py; "
             "stock generate would silently discard the recurrent hidden input"
+        )
+    if str(payload.get("schema", "")).startswith("minicpm5_vapo_slot_memory/"):
+        raise ValueError(
+            "slot-memory checkpoints require scripts/evaluate_minicpm_vapo.py; "
+            "stock generate would silently discard the memory reads and slot actions"
         )
     policy = (
         payload["actor"]
@@ -1154,7 +1178,7 @@ def main() -> None:
         raise ValueError("sample and problem overrides must be nonnegative")
     selected = set(args.suite or ())
     suites = []
-    for suite in DEFAULT_SUITES:
+    for suite in AVAILABLE_SUITES if selected else DEFAULT_SUITES:
         if selected and suite.name not in selected:
             continue
         samples = args.samples_per_problem or suite.samples

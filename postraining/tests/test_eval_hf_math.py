@@ -23,6 +23,36 @@ from postraining.eval_hf_math import (
     truncate_prompt,
     write_suite_metrics_to_tensorboard,
 )
+from scripts.evaluate_minicpm_vapo import score_response_batch
+
+
+def test_carry_evaluation_scores_partial_batch_without_dropping_capped_answers() -> None:
+    class Tokenizer:
+        def decode(self, tokens, *, skip_special_tokens):
+            return "".join({0: "", 7: "Answer: 7", 8: "Answer: 8"}[token] for token in tokens)
+
+    rows = [
+        {"prompt": [{"role": "user", "content": f"problem {truth}"}],
+         "reward_model": {"ground_truth": str(truth)}}
+        for truth in (7, 8)
+    ]
+    responses = tuple(torch.tensor(tokens) for tokens in ([7, 0], [7], [7, 0], [8, 0]))
+    attempts = score_response_batch(
+        Tokenizer(), rows, responses, begin=0, samples=2, stop_ids=(0,), style="aime",
+    )
+    assert [(a["problem_index"], a["sample_index"]) for a in attempts] == [
+        (0, 0), (0, 1), (1, 0), (1, 1),
+    ]
+    metrics = summarize_attempts(
+        attempts, problem_count=2, samples_per_problem=2, elapsed_seconds=1,
+        peak_allocated_bytes=0, peak_reserved_bytes=0,
+    )
+    assert metrics["contract_content_accuracy"] == 0.75
+    assert metrics["contract_accuracy"] == 0.5
+    with pytest.raises(ValueError):
+        score_response_batch(
+            Tokenizer(), rows, responses[:-1], begin=0, samples=2, stop_ids=(0,), style="aime",
+        )
 
 
 def test_last_boxed_answer_handles_nested_latex_and_uses_last_box() -> None:
@@ -222,7 +252,7 @@ def test_vapo_adapter_evaluation_loads_bf16_policy_weights(tmp_path) -> None:
 def test_stock_evaluation_refuses_to_discard_token_carry(tmp_path) -> None:
     checkpoint = tmp_path / "carry.pt"
     torch.save(
-        {"policy": {"schema": "minicpm5_vapo_token_carry/v3"}},
+        {"policy": {"schema": "minicpm5_vapo_token_carry/v4"}},
         checkpoint,
     )
     with pytest.raises(ValueError, match="token-carry"):

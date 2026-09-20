@@ -279,8 +279,100 @@ def modal_answer_baseline(rows: list[dict]) -> dict[str, str | float]:
     }
 
 
-def load_unique_math_rows(path: str | Path) -> list[dict]:
-    """Load and deduplicate verifier rows, including optional test metadata."""
+MATH_CORPUS_SCHEMA = "exact_prompt_reviewed_contract/v1"
+_MATH_TARGET_REVIEWS_PATH = Path(__file__).with_name("data") / "math_target_reviews.json"
+
+
+def _corpus_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _math_prompt_json(prompt: object) -> str:
+    if not isinstance(prompt, list) or not prompt or any(
+        not isinstance(message, dict)
+        or ("role" in message and not isinstance(message["role"], str))
+        or not isinstance(message.get("content"), str)
+        for message in prompt
+    ):
+        raise ValueError("math corpus requires nonempty ordered text chat messages")
+    return _corpus_json(prompt)
+
+
+def _math_corpus_policy() -> tuple[dict[str, dict], str]:
+    """Validate reviews before any row can be relabeled, including file copies."""
+    registry = json.loads(_MATH_TARGET_REVIEWS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(registry, dict) or registry.get("schema") != "math_target_reviews/v1":
+        raise ValueError("incompatible math target review registry")
+    entries = registry.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("math target review registry requires an entries list")
+    reviews: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid math target review entry")
+        prompt = _math_prompt_json(entry.get("prompt"))
+        fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if entry.get("prompt_sha256") != fingerprint or fingerprint in reviews:
+            raise ValueError("math target review fingerprint mismatch or duplicate")
+        expected = entry.get("expected_targets")
+        if (
+            entry.get("action") not in {"correct", "quarantine"}
+            or not isinstance(expected, list)
+            or not expected
+            or any(not isinstance(target, str) for target in expected)
+            or not entry.get("reason")
+            or not entry.get("evidence")
+            or (
+                entry["action"] == "correct"
+                and not isinstance(entry.get("corrected_target"), str)
+            )
+        ):
+            raise ValueError(f"invalid math target review contract: {fingerprint}")
+        reviews[fingerprint] = entry
+    policy = {"schema": MATH_CORPUS_SCHEMA, "reviews": registry}
+    return reviews, hashlib.sha256(_corpus_json(policy).encode("utf-8")).hexdigest()
+
+
+def math_corpus_policy_sha256() -> str:
+    """Bind corpus semantics to the loader version and validated review registry."""
+    return _math_corpus_policy()[1]
+
+
+def _math_reward_contract(row: dict) -> dict:
+    # Keep styles and all test metadata strict: normalization of a label or a
+    # code test here could merge tasks with different reward semantics.
+    reward = row.get("reward_model")
+    if not isinstance(reward, dict) or not isinstance(reward.get("ground_truth"), str):
+        raise ValueError("math corpus row requires a string reward_model.ground_truth")
+    return {
+        "reward_model": reward,
+        "verification_info": row.get("verification_info"),
+    }
+
+
+def math_corpus_identity(rows: list[dict]) -> str:
+    """Hash ordered effective prompts/contracts, not incidental source indices."""
+    digest = hashlib.sha256()
+    digest.update(_corpus_json({
+        "policy_sha256": math_corpus_policy_sha256(),
+        "rows": len(rows),
+    }).encode("utf-8"))
+    for row in rows:
+        digest.update(b"\n")
+        digest.update(_math_prompt_json(row["prompt"]).encode("utf-8"))
+        digest.update(b"\n")
+        digest.update(_corpus_json(_math_reward_contract(row)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def load_unique_math_rows(path: str | Path, *, audit: dict | None = None) -> list[dict]:
+    """Load one row per exact full chat prompt, quarantining ambiguous rewards.
+
+    Source IDs only accelerate physical-repeat recognition; equality of the
+    entire prompt and raw grading contract is still checked on every cache hit.
+    Thus a reused ID cannot hide different content, labels, styles, or tests.
+    """
+    reviews, policy_sha256 = _math_corpus_policy()
     available = set(pq.read_schema(path).names)
     required = {"prompt", "reward_model", "extra_info"}
     if not required <= available:
@@ -297,14 +389,185 @@ def load_unique_math_rows(path: str | Path) -> list[dict]:
         )
         if name in available
     ]
-    unique: dict[str, dict] = {}
+    groups: dict[str, dict] = {}
+    source_cache: dict[tuple, list[dict]] = {}
+    physical_rows = 0
+    input_rows = 0
     parquet = pq.ParquetFile(path)
     for batch in parquet.iter_batches(batch_size=8192, columns=columns):
         for row in batch.to_pylist():
+            physical_rows += 1
             info = row.get("extra_info") or {}
-            key = str(info.get("index", row["prompt"][0]["content"]))
-            unique.setdefault(key, row)
-    return list(unique.values())
+            source_index = info.get("index")
+            prompt = _math_prompt_json(row["prompt"]) if source_index is None else None
+            # Most DAPO rows repeat 100 times. Compare to a retained source
+            # variant instead of reserializing/hashing these long prompts.
+            source_key = (
+                row.get("data_source"), type(source_index).__name__,
+                prompt if source_index is None else str(source_index),
+            )
+            variants = source_cache.get(source_key)
+            if variants is None:
+                variants = []
+                source_cache[source_key] = variants
+            repeated = None
+            for variant in variants:
+                raw = variant["raw"]
+                if (
+                    raw["prompt"] == row["prompt"]
+                    and raw["reward_model"] == row["reward_model"]
+                    and raw.get("verification_info") == row.get("verification_info")
+                ):
+                    repeated = variant
+                    break
+            if repeated is not None:
+                repeated["physical_rows"] += 1
+                groups[repeated["prompt_key"]]["physical_rows"] += 1
+                continue
+            input_rows += 1
+            if prompt is None:
+                prompt = _math_prompt_json(row["prompt"])
+            raw_contract = _math_reward_contract(row)
+            group = groups.get(prompt)
+            if group is None:
+                fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                group = {
+                    "prompt_sha256": fingerprint,
+                    "row": row,
+                    "contracts": {},
+                    "variants": [],
+                    "physical_rows": 0,
+                    "quarantine_reasons": set(),
+                }
+                groups[prompt] = group
+            fingerprint = group["prompt_sha256"]
+            review = reviews.get(fingerprint)
+            receipt = None
+            effective_row = row
+            if review is not None:
+                # Match full messages too: a digest alone is not permission to
+                # apply a reviewed correction to different prompt content.
+                if row["prompt"] != review["prompt"]:
+                    raise ValueError(f"math target review prompt mismatch: {fingerprint}")
+                target = raw_contract["reward_model"]["ground_truth"]
+                allowed = target in review["expected_targets"] or (
+                    review["action"] == "correct" and target == review["corrected_target"]
+                )
+                receipt = {
+                    "schema": "math_target_reviews/v1",
+                    "policy_sha256": policy_sha256,
+                    "prompt_sha256": fingerprint,
+                    "action": review["action"],
+                    "original_target": target,
+                    "reason": review["reason"],
+                    "evidence": review["evidence"],
+                    "scope": "terminal_answer_only",
+                    "source_solution_reviewed": False,
+                }
+                if not allowed:
+                    group["quarantine_reasons"].add("unexpected_review_target")
+                    receipt["status"] = "unexpected_target"
+                elif review["action"] == "quarantine":
+                    group["quarantine_reasons"].add("reviewed_quarantine")
+                    receipt["status"] = "quarantined"
+                else:
+                    corrected = review["corrected_target"]
+                    receipt["corrected_target"] = corrected
+                    receipt["status"] = "already_correct" if target == corrected else "corrected"
+                    effective_row = {
+                        **row,
+                        "reward_model": {**row["reward_model"], "ground_truth": corrected},
+                        "extra_info": {**info, "math_target_review": receipt},
+                    }
+            effective_contract = _math_reward_contract(effective_row)
+            contract = _corpus_json(effective_contract)
+            group["contracts"].setdefault(contract, effective_contract)
+            if not group["variants"]:
+                group["row"] = effective_row
+            variant = {
+                "raw": row,
+                "prompt_key": prompt,
+                "source": {"index": source_index, "data_source": row.get("data_source")},
+                "physical_rows": 1,
+                "review": receipt,
+            }
+            variants.append(variant)
+            group["variants"].append(variant)
+            group["physical_rows"] += 1
+
+    result = []
+    duplicates = []
+    conflicts = []
+    quarantines = []
+    corrections = []
+    for group in groups.values():
+        if len(group["contracts"]) > 1:
+            group["quarantine_reasons"].add("conflicting_effective_contracts")
+        reasons = sorted(group["quarantine_reasons"])
+        if not reasons:
+            result.append(group["row"])
+        if audit is None:
+            continue
+        detail = {
+            "prompt_sha256": group["prompt_sha256"],
+            "input_rows": len(group["variants"]),
+            "physical_rows": group["physical_rows"],
+            "sources": [variant["source"] for variant in group["variants"]],
+            "effective_contracts": list(group["contracts"].values()),
+        }
+        if len(group["variants"]) > 1:
+            duplicates.append(detail)
+        if len(group["contracts"]) > 1:
+            conflicts.append(detail)
+        if reasons:
+            quarantines.append({
+                **detail,
+                "reasons": reasons,
+                "reviews": [
+                    variant["review"] for variant in group["variants"]
+                    if variant["review"] is not None
+                ],
+            })
+        for variant in group["variants"]:
+            receipt = variant["review"]
+            if receipt is not None and receipt["status"] in {"corrected", "already_correct"}:
+                corrections.append({
+                    **receipt,
+                    "source": variant["source"],
+                    "physical_rows": variant["physical_rows"],
+                    "retained": not reasons,
+                })
+    if audit is not None:
+        collisions = [
+            {
+                "source": variants[0]["source"],
+                "prompt_sha256": list(dict.fromkeys(
+                    groups[variant["prompt_key"]]["prompt_sha256"] for variant in variants
+                )),
+            }
+            for variants in source_cache.values()
+            if len({variant["prompt_key"] for variant in variants}) > 1
+        ]
+        audit.clear()
+        audit.update({
+            "schema": MATH_CORPUS_SCHEMA,
+            "policy_sha256": policy_sha256,
+            "physical_rows": physical_rows,
+            "input_rows": input_rows,
+            "input_source_ids": len(source_cache),
+            "unique_prompt_rows": len(groups),
+            "output_rows": len(result),
+            "physical_repeat_rows": physical_rows - input_rows,
+            "duplicate_prompt_rows": input_rows - len(groups),
+            "duplicate_prompt_groups": duplicates,
+            "conflicting_prompt_groups": conflicts,
+            "quarantined_prompt_groups": quarantines,
+            "corrections": corrections,
+            "source_id_collisions": collisions,
+        })
+    if not result:
+        raise ValueError(f"{path} has no effective math corpus rows after review/quarantine")
+    return result
 
 
 def deterministic_math_subset(rows: list[dict], max_rows: int) -> list[dict]:

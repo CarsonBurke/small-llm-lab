@@ -10,6 +10,25 @@
       "note": "held-out competition benchmark"
     },
     {
+      "name": "aime_2025",
+      "path": "postraining/data/aime-2025.parquet",
+      "split": "eval",
+      "columns": ["prompt"],
+      "note": "held-out competition benchmark; union of the I and II sittings"
+    },
+    {
+      "name": "aime_2025_i",
+      "path": "postraining/data/aime-2025-i.parquet",
+      "split": "eval",
+      "columns": ["prompt"]
+    },
+    {
+      "name": "aime_2025_ii",
+      "path": "postraining/data/aime-2025-ii.parquet",
+      "split": "eval",
+      "columns": ["prompt"]
+    },
+    {
       "name": "aime_2026",
       "path": "postraining/data/aime-2026.parquet",
       "split": "eval",

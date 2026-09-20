@@ -17,6 +17,9 @@ import pyarrow.parquet as pq
 from postraining.core import (
     GPT2BPETokenizer,
     encode_prompt,
+    load_unique_math_rows,
+    math_corpus_identity,
+    math_corpus_policy_sha256,
     normalize_final_answer,
     parse_numeric_answer,
     verify_answer,
@@ -33,6 +36,7 @@ from postraining.opsd.manifest import (
     MATH_MIXTURE_SOURCE_QUOTAS,
     MATH_MIXTURE_SPLIT_SCHEMA,
 )
+from postraining.opsd.prepare_dapo import deduplicate_dapo
 from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
 from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX_ANSWER, word_ngrams
 
@@ -98,10 +102,6 @@ def normalized_text(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def row_fingerprint(row: dict) -> str:
-    return json.dumps(row, sort_keys=True, separators=(",", ":"))
-
-
 def raw_example_id(row: dict, source_id: str) -> str:
     info = row.get("extra_info") or {}
     value = info.get("index")
@@ -110,32 +110,33 @@ def raw_example_id(row: dict, source_id: str) -> str:
     return str(value)
 
 
-def deduplicate_source(path: str | Path, source_id: str) -> tuple[list[dict], int]:
-    """Drop byte-equivalent curriculum repeats and reject ID conflicts."""
-    unique: dict[str, dict] = {}
-    fingerprints: dict[str, str] = {}
+def deduplicate_source(
+    path: str | Path, source_id: str, *, audit: dict | None = None
+) -> tuple[list[dict], int]:
+    """Apply the reviewed corpus policy, rejecting ambiguous source IDs."""
+    if source_id == DAPO_SOURCE_ID:
+        return deduplicate_dapo(Path(path), audit=audit)
+    prompts_by_id: dict[str, str] = {}
     physical_rows = 0
     parquet = pq.ParquetFile(path)
     required = {"prompt", "reward_model", "extra_info"}
     missing = required - set(parquet.schema_arrow.names)
     if missing:
         raise ValueError(f"{path} lacks source columns {sorted(missing)}")
-    for batch in parquet.iter_batches(batch_size=8192):
+    for batch in parquet.iter_batches(batch_size=8192, columns=["prompt", "extra_info"]):
         for row in batch.to_pylist():
             physical_rows += 1
             example_id = raw_example_id(row, source_id)
-            fingerprint = row_fingerprint(row)
-            previous = fingerprints.get(example_id)
-            if previous is not None:
-                if previous != fingerprint:
-                    raise ValueError(
-                        f"conflicting physical rows for {source_id} id "
-                        f"{example_id}"
-                    )
-                continue
-            fingerprints[example_id] = fingerprint
-            unique[example_id] = row
-    return [unique[key] for key in sorted(unique)], physical_rows
+            prompt = json.dumps(
+                row["prompt"], sort_keys=True, ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            previous = prompts_by_id.setdefault(example_id, prompt)
+            if previous != prompt:
+                raise ValueError(
+                    f"ambiguous {source_id} source id {example_id!r} has different prompts"
+                )
+    return load_unique_math_rows(path, audit=audit), physical_rows
 
 
 def _prompt_content(row: dict, source_id: str) -> str:
@@ -193,6 +194,8 @@ def canonical_source_record(row: dict, spec: SourceSpec) -> dict:
         "ground_truth": truth,
         "reward_style": spec.reward_style,
         "verified": True,
+        "source_prompt": row["prompt"],
+        "source_extra_info": row.get("extra_info") or {},
     }
 
 
@@ -218,16 +221,20 @@ def answer_key(record: dict) -> str:
 def deduplicate_canonical_records(
     records: list[dict],
 ) -> tuple[list[dict], Counter[str], Counter[str]]:
-    """Deduplicate equal truths and quarantine every conflicting problem."""
+    """Merge exact source chats and quarantine conflicting grading contracts."""
     by_problem: dict[str, list[dict]] = defaultdict(list)
     for record in records:
-        by_problem[normalized_text(str(record["problem"]))].append(record)
+        prompt = json.dumps(
+            record["source_prompt"], sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        by_problem[prompt].append(record)
 
     unique: list[dict] = []
     duplicate_counts: Counter[str] = Counter()
     conflict_counts: Counter[str] = Counter()
     for group in by_problem.values():
-        if len({answer_key(record) for record in group}) > 1:
+        if len({(record["reward_style"], record["ground_truth"]) for record in group}) > 1:
             conflict_counts.update(str(record["source"]) for record in group)
             continue
         unique.append(group[0])
@@ -555,7 +562,10 @@ def _build_reserved(
     for spec in SOURCE_SPECS:
         path = Path(getattr(args, spec.path_argument))
         source_sha256 = file_sha256(path)
-        source_rows, physical_rows = deduplicate_source(path, spec.source_id)
+        corpus_audit = {}
+        source_rows, physical_rows = deduplicate_source(
+            path, spec.source_id, audit=corpus_audit
+        )
         canonical = [canonical_source_record(row, spec) for row in source_rows]
         if file_sha256(path) != source_sha256:
             raise ValueError(f"{spec.source_id} source changed while being read")
@@ -566,23 +576,23 @@ def _build_reserved(
             "physical_rows": physical_rows,
             "unique_rows": len(canonical),
             "reward_style": spec.reward_style,
+            "math_corpus_identity": math_corpus_identity(source_rows),
+            "math_corpus_audit": corpus_audit,
         }
 
     (
         canonical_records,
-        normalized_duplicates,
-        normalized_conflicts,
+        prompt_duplicates,
+        prompt_conflicts,
     ) = deduplicate_canonical_records(all_canonical)
     canonical_source_rows = Counter(
         record["source"] for record in canonical_records
     )
     for source, metadata in source_metadata.items():
         metadata["canonical_rows"] = canonical_source_rows[source]
-        metadata["normalized_problem_duplicates"] = normalized_duplicates[source]
-        metadata["normalized_problem_conflicts"] = normalized_conflicts[source]
-        rejections[f"{source}/normalized_problem_conflict"] = (
-            normalized_conflicts[source]
-        )
+        metadata["exact_prompt_duplicates"] = prompt_duplicates[source]
+        metadata["exact_prompt_conflicts"] = prompt_conflicts[source]
+        rejections[f"{source}/exact_prompt_conflict"] = prompt_conflicts[source]
         metadata["eligible_rows"] = 0
         metadata["clean_gate_candidates"] = 0
 
@@ -651,9 +661,17 @@ def _build_reserved(
         for record in clean_gate_candidates
     )
     gate_ids = {record["example_id"] for record in gate_base}
+    # Training identity is exact chat content; held-out decontamination remains
+    # deliberately broader and must not admit case/whitespace variants.
+    gate_problems = {normalized_text(record["problem"]) for record in gate_base}
     train_candidates = [
-        record for record in eligible if record["example_id"] not in gate_ids
+        record for record in eligible
+        if record["example_id"] not in gate_ids
+        and normalized_text(record["problem"]) not in gate_problems
     ]
+    rejections["train_gate_problem_overlap"] = (
+        len(eligible) - len(gate_base) - len(train_candidates)
+    )
     bad_train_positions = nonderangeable_bucket_keys(
         train_candidates, lambda record: record["answer_slot_tokens"]
     )
@@ -697,6 +715,7 @@ def _build_reserved(
         raise ValueError("SFT corpus changed during the build")
     manifest_without_hashes = {
         "schema": MATH_MIXTURE_DATA_SCHEMA,
+        "math_corpus_policy_sha256": math_corpus_policy_sha256(),
         "split_schema": MATH_MIXTURE_SPLIT_SCHEMA,
         "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
         "teacher_prompt_schema": TEACHER_PROMPT_SCHEMA,

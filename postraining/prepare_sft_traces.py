@@ -126,6 +126,7 @@ DECONTAMINATION_TARGETS = (
     RELAXED_BAR / "gsm8k_test_questions.parquet",
     DATA / "deepmind-interpolate-easy.parquet",
     DATA / "aime-2024.parquet",
+    DATA / "aime-2025.parquet",
     DATA / "aime-2026.parquet",
 )
 NGRAM = 8

@@ -439,18 +439,28 @@ def _dapo_row(example_id: str, problem: str, truth: str) -> dict:
     }
 
 
-def test_dapo_deduplication_rejects_conflicting_physical_copies(tmp_path):
+def test_dapo_deduplication_merges_content_and_quarantines_conflicts(tmp_path):
     path = tmp_path / "dapo.parquet"
     row = _dapo_row("a", "What is 1+2?", "3")
-    pq.write_table(pa.Table.from_pylist([row, row]), path)
+    duplicate_id = _dapo_row("b", "What is 1+2?", "3")
+    pq.write_table(pa.Table.from_pylist([row, row, duplicate_id]), path)
     unique, physical = deduplicate_dapo(path)
-    assert physical == 2
-    assert unique == [row]
+    assert physical == 3
+    assert [record["extra_info"]["index"] for record in unique] == ["a"]
+    assert unique[0]["reward_model"]["ground_truth"] == "3"
 
     conflicting = copy.deepcopy(row)
     conflicting["reward_model"]["ground_truth"] = "4"
-    pq.write_table(pa.Table.from_pylist([row, conflicting]), path)
-    with pytest.raises(ValueError, match="conflicting physical rows"):
+    survivor = _dapo_row("c", "What is 2+3?", "5")
+    pq.write_table(pa.Table.from_pylist([row, conflicting, survivor]), path)
+    unique, physical = deduplicate_dapo(path)
+    assert unique == [survivor]
+    assert physical == 3
+
+    pq.write_table(
+        pa.Table.from_pylist([row, _dapo_row("a", "Different problem?", "3")]), path
+    )
+    with pytest.raises(ValueError, match="ambiguous DAPO source id"):
         deduplicate_dapo(path)
 
 
@@ -503,6 +513,7 @@ def test_dapo_outputs_are_immutable(tmp_path):
 
 
 def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
+    from postraining.core import math_corpus_policy_sha256
     train = tmp_path / "train.parquet"
     gate = tmp_path / "gate.parquet"
     train.write_bytes(b"train")
@@ -516,6 +527,8 @@ def test_dapo_manifest_binds_train_gate_and_sft_bytes(tmp_path):
         json.dumps(
             {
                 "schema": "dapo_opsd_final_answer_privilege/v2",
+                "math_corpus_policy_sha256": math_corpus_policy_sha256(),
+                "math_corpus_identity": "effective-source-fixture",
                 "split_schema": (
                     "sha256_clean_gate_then_split_local_token_length_"
                     "answer_derangement/v3"

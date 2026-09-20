@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from postraining.core import math_corpus_policy_sha256
 from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
 from postraining.opsd.data import TEACHER_PROMPT_SCHEMA
 from postraining.opsd.schemas import OPSD_PROMPT_SCHEMA
@@ -33,6 +34,24 @@ def validate_final_answer_manifest(manifest: dict) -> None:
     schema = manifest.get("schema")
     if schema not in _SPLIT_SCHEMA_BY_DATA_SCHEMA:
         raise ValueError(f"unsupported OPSD final-answer manifest schema {schema!r}")
+    if manifest.get("math_corpus_policy_sha256") != math_corpus_policy_sha256():
+        raise ValueError(
+            "OPSD manifest lacks the current reviewed math corpus policy; "
+            "prepare new immutable data and start a new run"
+        )
+    if schema == DAPO_OPSD_DATA_SCHEMA:
+        identities = [manifest.get("math_corpus_identity")]
+    else:
+        sources = manifest.get("sources") or {}
+        identities = [
+            (sources.get(source) or {}).get("math_corpus_identity")
+            for source in MATH_MIXTURE_SOURCE_QUOTAS
+        ]
+    if any(not isinstance(identity, str) or not identity for identity in identities):
+        raise ValueError(
+            "OPSD manifest lacks effective source corpus identities; "
+            "prepare new immutable data and start a new run"
+        )
     expected_split = _SPLIT_SCHEMA_BY_DATA_SCHEMA[schema]
     if manifest.get("split_schema") != expected_split:
         raise ValueError(

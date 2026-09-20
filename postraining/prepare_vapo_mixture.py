@@ -11,7 +11,11 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from postraining.core import load_unique_math_rows
+from postraining.core import (
+    load_unique_math_rows,
+    math_corpus_identity,
+    math_corpus_policy_sha256,
+)
 from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
 from postraining.vapo.code_reward import PYTHON_REWARD_SCHEMA, python_tests_pass
 from postraining.vapo.mixture import VAPO_MIXTURE_SCHEMA, file_sha256
@@ -157,7 +161,8 @@ def main() -> None:
     sources = []
     for name, configured_path, quota, verifier in SOURCE_SPECS:
         path = mbpp_path if configured_path is None else configured_path
-        rows = load_unique_math_rows(path)
+        corpus_audit = {}
+        rows = load_unique_math_rows(path, audit=corpus_audit)
         sources.append(
             {
                 "name": name,
@@ -166,11 +171,14 @@ def main() -> None:
                 "verifier": verifier,
                 "rows": len(rows),
                 "sha256": file_sha256(path),
+                "math_corpus_identity": math_corpus_identity(rows),
+                "math_corpus_audit": corpus_audit,
             }
         )
     sft_path = Path(args.sft_corpus)
     manifest = {
         "schema": VAPO_MIXTURE_SCHEMA,
+        "math_corpus_policy_sha256": math_corpus_policy_sha256(),
         "groups_per_cycle": sum(source["quota"] for source in sources),
         "sources": sources,
         "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,

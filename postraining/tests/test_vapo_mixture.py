@@ -10,6 +10,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from postraining.core import (
+    load_unique_math_rows,
+    math_corpus_identity,
+    math_corpus_policy_sha256,
+)
 from postraining.vapo.code_reward import (
     PYTHON_REWARD_SCHEMA,
     batch_python_test_results,
@@ -62,6 +67,7 @@ def test_mixture_manifest_binds_bytes_and_sampler_is_exact_and_resumable(
                 "verifier": "math",
                 "rows": count,
                 "sha256": file_sha256(path),
+                "math_corpus_identity": math_corpus_identity(load_unique_math_rows(path)),
             }
         )
     manifest_path = tmp_path / "mixture.json"
@@ -69,6 +75,7 @@ def test_mixture_manifest_binds_bytes_and_sampler_is_exact_and_resumable(
         json.dumps(
             {
                 "schema": VAPO_MIXTURE_SCHEMA,
+                "math_corpus_policy_sha256": math_corpus_policy_sha256(),
                 "groups_per_cycle": 4,
                 "sources": entries,
             }
@@ -92,12 +99,28 @@ def test_mixture_manifest_binds_bytes_and_sampler_is_exact_and_resumable(
         json.dumps(
             {
                 "schema": VAPO_MIXTURE_SCHEMA,
+                "math_corpus_policy_sha256": math_corpus_policy_sha256(),
                 "groups_per_cycle": 4,
                 "sources": entries,
             }
         )
     )
     with pytest.raises(ValueError, match="bytes differ"):
+        load_mixture_manifest(manifest_path)
+
+    entries[0]["sha256"] = file_sha256(entries[0]["path"])
+    for missing in (True, False):
+        if missing:
+            entries[0].pop("math_corpus_identity")
+        else:
+            entries[0]["math_corpus_identity"] = "stale-effective-corpus"
+        manifest["sources"] = entries
+        manifest_path.write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="effective corpus"):
+            load_mixture_manifest(manifest_path)
+    manifest.pop("math_corpus_policy_sha256")
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="corpus policy"):
         load_mixture_manifest(manifest_path)
 
 

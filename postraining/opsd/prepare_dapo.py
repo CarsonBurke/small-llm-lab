@@ -15,6 +15,9 @@ import pyarrow.parquet as pq
 from postraining.core import (
     GPT2BPETokenizer,
     encode_prompt,
+    load_unique_math_rows,
+    math_corpus_identity,
+    math_corpus_policy_sha256,
     parse_numeric_answer,
     verify_answer,
 )
@@ -51,34 +54,33 @@ def normalized_text(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def row_fingerprint(row: dict) -> str:
-    return json.dumps(row, sort_keys=True, separators=(",", ":"))
-
-
-def deduplicate_dapo(path: Path) -> tuple[list[dict], int]:
-    """Deduplicate physical curriculum repeats and reject conflicting copies."""
-    rows_by_id: dict[str, dict] = {}
-    fingerprints: dict[str, str] = {}
+def deduplicate_dapo(
+    path: Path, *, audit: dict | None = None
+) -> tuple[list[dict], int]:
+    """Use the reviewed corpus while retaining DAPO's required source IDs."""
+    # Validate physical IDs before content dedup can hide malformed copies.
+    # OPSD donor and split identities cannot represent one ID for two prompts.
+    prompts_by_id: dict[str, str] = {}
     physical_rows = 0
     parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=8192):
+    for batch in parquet.iter_batches(batch_size=8192, columns=["extra_info", "prompt"]):
         for row in batch.to_pylist():
             physical_rows += 1
-            info = row.get("extra_info") or {}
-            example_id = str(info.get("index") or "")
-            if not example_id:
+            index = (row.get("extra_info") or {}).get("index")
+            if index is None or not str(index).strip():
                 raise ValueError("DAPO row lacks extra_info.index")
-            fingerprint = row_fingerprint(row)
-            previous = fingerprints.get(example_id)
-            if previous is not None:
-                if previous != fingerprint:
-                    raise ValueError(
-                        f"conflicting physical rows for DAPO id {example_id}"
-                    )
-                continue
-            fingerprints[example_id] = fingerprint
-            rows_by_id[example_id] = row
-    return [rows_by_id[key] for key in sorted(rows_by_id)], physical_rows
+            example_id = str(index)
+            prompt = json.dumps(
+                row["prompt"], sort_keys=True, ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            previous = prompts_by_id.setdefault(example_id, prompt)
+            if previous != prompt:
+                raise ValueError(
+                    f"ambiguous DAPO source id {example_id!r} has different prompts"
+                )
+    rows = load_unique_math_rows(path, audit=audit)
+    return rows, physical_rows
 
 
 def canonical_dapo_record(row: dict) -> dict:
@@ -108,6 +110,7 @@ def canonical_dapo_record(row: dict) -> dict:
         "ground_truth": truth,
         "reward_style": style,
         "verified": True,
+        "source_extra_info": row.get("extra_info") or {},
     }
 
 
@@ -234,7 +237,8 @@ def build(args: argparse.Namespace) -> dict:
     require_fresh_outputs((train_path, gate_path, manifest_path))
     train_path.parent.mkdir(parents=True, exist_ok=True)
 
-    physical_rows_data, physical_rows = deduplicate_dapo(source)
+    corpus_audit = {}
+    physical_rows_data, physical_rows = deduplicate_dapo(source, audit=corpus_audit)
     records = [canonical_dapo_record(row) for row in physical_rows_data]
     exact, sft_ngrams = sft_decontamination_index(sft_corpus)
     tokenizer = GPT2BPETokenizer(think_tokens=True, answer_tokens=True)
@@ -411,6 +415,9 @@ def build(args: argparse.Namespace) -> dict:
         "opsd_prompt_schema": OPSD_PROMPT_SCHEMA,
         "source": str(source),
         "source_sha256": file_sha256(source),
+        "math_corpus_policy_sha256": math_corpus_policy_sha256(),
+        "math_corpus_identity": math_corpus_identity(physical_rows_data),
+        "math_corpus_audit": corpus_audit,
         "sft_corpus": str(sft_corpus),
         "sft_corpus_sha256": file_sha256(sft_corpus),
         "physical_rows": physical_rows,
