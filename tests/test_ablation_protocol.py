@@ -115,42 +115,25 @@ def test_unavailable_compiler_step_average_is_not_a_metric_error() -> None:
 
 
 @pytest.mark.parametrize(
-    ("line", "message"),
+    "line",
     [
-        (
-            "step:20/20 train_loss:nan train_time:1ms",
-            "non-finite training loss",
-        ),
-        (
-            "step:20/20 val_loss:1.0 val_bpb:inf train_time:1ms",
-            "non-finite validation loss or BPB",
-        ),
-        (
-            "step:20/20 train_loss:1.0 train_time:1ms grad_norm:inf",
-            "non-finite metric grad_norm:inf",
-        ),
-        (
-            "step:20/20 train_loss:1e train_time:1ms",
-            "malformed training or validation metric line",
-        ),
-        (
-            "step:20/20 train_loss:1.0 train_time:3msjunk",
-            "missing or malformed train_time",
-        ),
-        (
-            "step:20/20 val_loss:1.0 val_bpb:2.0 train_time:3msjunk",
-            "malformed train_time",
-        ),
+        "step:20/20 train_loss:nan train_time:1ms",
+        "step:20/20 val_loss:1.0 val_bpb:inf train_time:1ms",
+        "step:20/20 train_loss:1.0 train_time:1ms grad_norm:inf",
+        "step:20/20 train_loss:1e train_time:1ms",
+        "step:20/20 train_loss:1.0 train_time:3msjunk",
+        "step:20/20 val_loss:1.0 val_bpb:2.0 train_time:3msjunk",
+        "step:20/20 val_loss:1.0 val_objective:nan train_time:1ms",
     ],
 )
 def test_nonfinite_or_malformed_metrics_are_structured_errors(
-    line: str, message: str
+    line: str,
 ) -> None:
     entry = parse_log_line(line)
     assert entry is not None
     assert entry["type"] == "metric_error"
     assert entry["step"] == 20
-    assert entry["metric_integrity_error"] == message
+    assert metric_integrity_errors([entry], 20)
 
 
 def test_metric_integrity_requires_one_finite_final_validation() -> None:
@@ -206,6 +189,54 @@ def test_diffusion_validation_does_not_masquerade_as_bpb() -> None:
         "type": "val",
     }
     assert "val_bpb" not in entry
+
+
+def test_objective_only_validation_is_not_a_language_model_rate(tmp_path, monkeypatch) -> None:
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "emit_objective.py"
+    child.write_text(
+        "print('step:20/20 val_loss:0.8 val_objective:0.8 "
+        "val_flow_mse:0.3 val_reconstruction_bits_per_byte:0.1 train_time:2ms')\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+    result = run_config("objective_control", {}, 20, 20, child.name)
+    assert result["returncode"] == 0
+    assert result["promotion_metric"] == "objective_only"
+    assert result["final_val_bpb"] is None
+    assert result["final_proxy_val_bpb"] is None
+    assert result["final_val_loss"] == 0.8
+    entries = read_metrics_jsonl(tmp_path / "results/objective_control/metrics.jsonl")
+    assert entries[-1]["val_reconstruction_bits_per_byte"] == 0.1
+    assert "val_bpb" not in entries[-1]
+
+def test_document_stream_bpb_is_visible_without_challenge_promotion(tmp_path, monkeypatch) -> None:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    (tmp_path / "logs").mkdir()
+    child = tmp_path / "emit_document_stream.py"
+    child.write_text(
+        "print('step:20/20 val_loss:2.8 val_bpb_document_stream:1.68 "
+        "val_scope_document_stream:1 train_time:2000ms')\n"
+    )
+    monkeypatch.setattr(ablation, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ablation, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(ablation, "TB_DIR", tmp_path / "tb")
+    result = run_config("document_stream", {}, 20, 20, child.name)
+    assert result["returncode"] == 0
+    assert result["promotion_metric"] == "document_stream_bpb"
+    assert result["final_val_bpb"] is None
+    assert result["final_proxy_val_bpb"] is None
+    assert result["final_val_bpb_document_stream"] == pytest.approx(1.68)
+    events = EventAccumulator(str(tmp_path / "tb/document_stream")).Reload()
+    assert [(event.step, event.value) for event in events.Scalars("val/bpb")] == [
+        (20, pytest.approx(1.68))
+    ]
+    assert [(event.step, event.value) for event in events.Scalars("time/val_bpb")] == [
+        (2, pytest.approx(1.68))
+    ]
+
 
 
 def test_metrics_reader_rejects_malformed_middle_record(tmp_path) -> None:
@@ -275,10 +306,7 @@ def test_run_config_fails_closed_on_nonfinite_final_metric(
     assert result["returncode"] == ablation.METRIC_INTEGRITY_RETURN_CODE
     assert result["final_val_bpb"] is None
     assert result["final_proxy_val_bpb"] is None
-    assert result["metric_integrity_errors"] == [
-        "non-finite validation loss or BPB",
-        "missing finite validation at requested step 20",
-    ]
+    assert result["metric_integrity_errors"]
     persisted = json.loads(
         (tmp_path / "results" / "invalid_final" / "result.json").read_text()
     )

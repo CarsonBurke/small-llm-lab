@@ -197,53 +197,19 @@ def parse_log_line(line: str) -> dict | None:
             entry.update(metrics)
         return entry
 
-    diffusion_val_match = re.match(
-        rf"(?:step:)?(\d+)/\d+\s+val_loss:\s*({SCALAR_PATTERN})(?=\s|$)\s+val_diffusion_nelbo_bits_per_atom:\s*({SCALAR_PATTERN})(?=\s|$)\s*(.*)",
-        line,
-        flags=re.IGNORECASE,
-    )
-    if diffusion_val_match:
-        step = int(diffusion_val_match.group(1))
-        val_loss = float(diffusion_val_match.group(2))
-        nelbo_bits = float(diffusion_val_match.group(3))
-        if not math.isfinite(val_loss) or not math.isfinite(nelbo_bits):
-            return _metric_error(line, "non-finite validation NELBO", step=step)
-        extras = diffusion_val_match.group(4).strip()
-        train_time_ms = parse_time_ms(extras)
-        if train_time_ms is None:
-            if re.search(r"(?:^|\s)train_time:", extras):
-                return _metric_error(line, "malformed train_time", step=step)
-            train_time_ms = 0.0
-        entry = {
-            "step": step,
-            "val_loss": val_loss,
-            "val_diffusion_nelbo_bits_per_atom": nelbo_bits,
-            "train_time_ms": train_time_ms,
-            "type": "val",
-        }
-        if extras:
-            metrics, errors = _parse_extra_metrics(extras)
-            if errors:
-                return _metric_error(line, "; ".join(errors), step=step)
-            entry.update(metrics)
-        return entry
-
     val_match = re.match(
-        rf"(?:step:)?(\d+)/\d+\s+val_loss:\s*({SCALAR_PATTERN})(?=\s|$)\s+val_bpb:\s*({SCALAR_PATTERN})(?=\s|$)\s*(.*)",
+        rf"(?:step:)?(\d+)/\d+\s+val_loss:\s*({SCALAR_PATTERN})(?=\s|$)\s+(val_bpb|val_bpb_document_stream|val_diffusion_nelbo_bits_per_atom|val_objective):\s*({SCALAR_PATTERN})(?=\s|$)\s*(.*)",
         line,
         flags=re.IGNORECASE,
     )
     if val_match:
         step = int(val_match.group(1))
         val_loss = float(val_match.group(2))
-        val_bpb = float(val_match.group(3))
-        if not math.isfinite(val_loss) or not math.isfinite(val_bpb):
-            return _metric_error(
-                line,
-                "non-finite validation loss or BPB",
-                step=step,
-            )
-        extras = val_match.group(4).strip()
+        primary_key = val_match.group(3).lower()
+        primary = float(val_match.group(4))
+        if not math.isfinite(val_loss) or not math.isfinite(primary):
+            return _metric_error(line, "non-finite validation loss or primary metric", step=step)
+        extras = val_match.group(5).strip()
         train_time_ms = parse_time_ms(extras)
         if train_time_ms is None:
             if re.search(r"(?:^|\s)train_time:", extras):
@@ -252,7 +218,7 @@ def parse_log_line(line: str) -> dict | None:
         entry = {
             "step": step,
             "val_loss": val_loss,
-            "val_bpb": val_bpb,
+            primary_key: primary,
             "train_time_ms": train_time_ms,
             "type": "val",
         }
@@ -298,6 +264,17 @@ def parse_log_line(line: str) -> dict | None:
     return None
 
 
+def validation_primary(entry: dict) -> tuple[str, float]:
+    """Select an explicitly named metric without relabeling objectives as rates."""
+    for key in ("val_bpb_document_stream", "val_bpb", "val_diffusion_nelbo_bits_per_atom", "val_objective"):
+        if key in entry:
+            value = entry[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"validation entry has non-finite {key}")
+            return key, value
+    raise ValueError("validation entry has no primary metric")
+
+
 class MetricsWriter:
     """Streams parsed metrics to JSONL and tensorboard."""
 
@@ -309,6 +286,14 @@ class MetricsWriter:
         self._last_train_time_ms = None
         self._pending_churn: dict | None = None
         self._pending_graph: dict | None = None
+
+    @staticmethod
+    def primary_scalar_tags(key: str) -> tuple[str, str]:
+        # Keep BPB discoverable in the usual chart, without changing the
+        # canonical metric's explicit evaluation scope or challenge eligibility.
+        if key == "val_bpb_document_stream":
+            return "val/bpb", "time/val_bpb"
+        return MetricsWriter._extra_scalar_tag(key), f"time/{key}"
 
     @staticmethod
     def _extra_scalar_tag(key: str) -> str:
@@ -402,11 +387,8 @@ class MetricsWriter:
         self.metrics_file.flush()
         if entry["type"] == "val":
             time_s = int(entry["train_time_ms"] / 1000)
-            primary = entry.get("val_bpb", entry.get("val_diffusion_nelbo_bits_per_atom"))
-            if primary is None:
-                raise ValueError("validation entry has no primary metric")
-            primary_tag = "val/bpb" if "val_bpb" in entry else "val/diffusion_nelbo_bits_per_atom"
-            time_tag = "time/val_bpb" if "val_bpb" in entry else "time/val_diffusion_nelbo_bits_per_atom"
+            primary_key, primary = validation_primary(entry)
+            primary_tag, time_tag = self.primary_scalar_tags(primary_key)
             self.writer.add_scalar(primary_tag, primary, entry["step"])
             self.writer.add_scalar("val/loss", entry["val_loss"], entry["step"])
             self.writer.add_scalar(time_tag, primary, time_s)
@@ -504,9 +486,10 @@ def metric_integrity_errors(entries: list[dict], effective_steps: int) -> list[s
                 errors.append(
                     f"final validation has non-finite or missing {key}"
                 )
-        primary = entry.get("val_bpb", entry.get("val_diffusion_nelbo_bits_per_atom"))
-        if isinstance(primary, bool) or not isinstance(primary, (int, float)) or not math.isfinite(primary):
-            errors.append("final validation has no finite BPB or diffusion NELBO")
+        try:
+            validation_primary(entry)
+        except ValueError as error:
+            errors.append(str(error))
     if not final_validations:
         errors.append(f"missing finite validation at requested step {effective_steps}")
     elif len(final_validations) != 1:
@@ -769,9 +752,20 @@ def run_config(
         if final_entry
         else None
     )
+    final_document_stream_bpb = (
+        final_entry.get("val_bpb_document_stream") if final_entry else None
+    )
+    objective_primary = (
+        final_entry is not None
+        and validation_primary(final_entry)[0] == "val_objective"
+    )
     promotion_metric = (
         "gsm8k_exact_match_generation_accuracy"
         if generation_primary
+        else "document_stream_bpb"
+        if final_document_stream_bpb is not None
+        else "objective_only"
+        if objective_primary
         else "diffusion_elbo_proxy_bpb"
         if final_diffusion_elbo_proxy_bpb is not None
         else "challenge_bpb" if final_bpb is not None else "proxy_bpb"
@@ -799,6 +793,7 @@ def run_config(
         "warmdown_iters_env": warmdown_iters_env,
         "elapsed_seconds": elapsed,
         "final_val_bpb": final_bpb,
+        "final_val_bpb_document_stream": final_document_stream_bpb,
         # Kept so the paper-comparable marginalized number stays recoverable
         # without re-reading metrics.jsonl. None for runs that never emit it.
         "final_val_marginalized_bpb": final_marginalized_bpb,
@@ -831,7 +826,12 @@ def run_config(
             f"step {completed_steps}; training process rc={training_returncode}"
         )
     elif stopped_at is not None and expected_early_stop:
-        print(f"  Stopped at step {completed_steps} of {effective_steps}; BPB: {final_bpb}")
+        metric = (
+            "{}: {:.6g}".format(*validation_primary(final_entry))
+            if final_entry is not None
+            else "no validation result"
+        )
+        print(f"  Stopped at step {completed_steps} of {effective_steps}; {metric}")
     elif training_returncode != 0:
         result["error"] = output_text[-2000:] if output_text else "unknown error"
         print(f"  ERROR (rc={training_returncode})")
@@ -844,8 +844,12 @@ def run_config(
     else:
         if final_bpb is not None:
             print(f"  Final BPB: {final_bpb:.4f}")
+        elif final_document_stream_bpb is not None:
+            print(f"  Final document-stream BPB (not packed challenge): {final_document_stream_bpb:.4f}")
         elif final_proxy_bpb is not None:
             print(f"  Final proxy BPB: {final_proxy_bpb:.4f}")
+        elif objective_primary:
+            print(f"  Final objective (not BPB): {final_loss:.6g}")
         else:
             print("  No val results found")
         print(f"  Elapsed: {elapsed:.1f}s")
@@ -897,9 +901,13 @@ def compare_results(results_dir: Path) -> None:
     def comparison_bpb(result: dict) -> float | None:
         if result.get("returncode", 0) != 0 or result.get("early_stop") is not None:
             return None
-        if result.get("promotion_metric") == "gsm8k_exact_match_generation_accuracy":
+        if result.get("promotion_metric") in {"gsm8k_exact_match_generation_accuracy", "objective_only"}:
             return None
-        return result.get("final_val_bpb") or result.get("final_proxy_val_bpb")
+        return (
+            result.get("final_val_bpb_document_stream")
+            or result.get("final_val_bpb")
+            or result.get("final_proxy_val_bpb")
+        )
 
     def comparison_order(result: dict) -> tuple[int, float]:
         value = comparison_bpb(result)
@@ -927,6 +935,10 @@ def compare_results(results_dir: Path) -> None:
             and r.get("promotion_metric")
             == "gsm8k_exact_match_generation_accuracy"
         )
+        objective_primary = (
+            r.get("returncode", 0) == 0
+            and r.get("promotion_metric") == "objective_only"
+        )
         bpb = (
             f"{value:.4f}"
             if value is not None
@@ -934,13 +946,19 @@ def compare_results(results_dir: Path) -> None:
             if r.get("early_stop") is not None
             else "GEN"
             if generation_primary
+            else "OBJ"
+            if objective_primary
             else "FAIL"
         )
         scope = "challenge" if r.get("final_val_bpb") is not None else "proxy"
+        if r.get("final_val_bpb_document_stream") is not None:
+            scope = "docstream"
         if r.get("early_stop") is not None:
             scope = "futility"
         elif generation_primary:
             scope = "gsm8k"
+        elif objective_primary:
+            scope = "objective"
         elif value is None:
             scope = "-"
         probe = f"{r['final_probe_val_bpb']:.4f}" if r.get("final_probe_val_bpb") else "-"
