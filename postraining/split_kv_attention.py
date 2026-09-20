@@ -23,9 +23,13 @@ from flash_attn.cute.utils import AuxData
 from quack import layout_utils
 import torch
 
-
-_SPLITS = 4
-_TILE_N = 32
+from postraining.split_kv_plan import (
+    SPLITS as _SPLITS,
+    TILE_N as _TILE_N,
+    plan_split_kv,
+    split_kv_metadata,
+    split_kv_plan_shapes,
+)
 
 
 class _PartialFA4(FlashAttentionForwardSm120):
@@ -97,47 +101,38 @@ class _PartialFA4(FlashAttentionForwardSm120):
 
 @lru_cache(maxsize=None)
 def _metadata(batch, capacity, device):
-    return (
-        torch.arange(_SPLITS, device=device, dtype=torch.int32)[None, :],
-        torch.arange(batch, device=device, dtype=torch.int32)[:, None] * capacity,
-    )
-
-
-@torch.compile(fullgraph=True)
-def _prepare(query, lengths, split_ids, batch_offsets, capacity):
-    batch = query.shape[0]
-    # Align starts to K tiles; empty partitions remain truly empty.
-    span = ((lengths + _TILE_N * _SPLITS - 1) // (_TILE_N * _SPLITS)) * _TILE_N
-    starts = torch.minimum(span[:, None] * split_ids, lengths[:, None])
-    live = torch.minimum(span[:, None], lengths[:, None] - starts).reshape(-1)
-    offsets = torch.cat(
-        (
-            (batch_offsets + starts).reshape(-1),
-            torch.full((1,), batch * capacity, device=query.device, dtype=torch.int32),
-        )
-    )
-    queries = (
-        query[:, None]
-        .expand(batch, _SPLITS, 1, 16, 128)
-        .reshape(batch * _SPLITS, 1, 16, 128)
-    )
-    return queries, offsets, live
+    return split_kv_metadata(batch, capacity, device)
 
 
 _kernels = {}
 
 
-def split_kv_attention(query, key, value, lengths, scale):
+def split_kv_attention(query, key, value, lengths, scale, offsets=None, live=None):
     """Decode BF16 [B,1,16,128] against contiguous [B,C,2,128] KV.
 
     Caller supplies CUDA int32 lengths in [1,C]; retired lanes use length one.
-    Offsets and live lengths are recomputed on-device on every graph replay,
-    including retirement and refill. KV is viewed, never replicated or copied.
+    The partition plan (``offsets``, ``live``) depends only on ``lengths``:
+    a caller that shares one plan across layers passes it in, otherwise it is
+    derived here. Either way it is recomputed on-device on every graph
+    replay, including retirement and refill. KV is viewed, never copied.
     """
     batch, capacity = key.shape[:2]
-    split_ids, batch_offsets = _metadata(batch, capacity, query.device)
-    queries, offsets, live = _prepare(
-        query, lengths, split_ids, batch_offsets, capacity
+    if (offsets is None) != (live is None):
+        raise ValueError("split-KV plan needs both offsets and live lengths")
+    if offsets is None:
+        offsets, live = plan_split_kv(lengths, *_metadata(batch, capacity, query.device))
+    expected_shapes = split_kv_plan_shapes(batch)
+    if (
+        offsets.shape != (expected_shapes[0],)
+        or live.shape != (expected_shapes[1],)
+        or offsets.dtype != torch.int32
+        or live.dtype != torch.int32
+    ):
+        raise ValueError("split-KV plan shape or dtype differs from the KV batch")
+    queries = (
+        query[:, None]
+        .expand(batch, _SPLITS, 1, 16, 128)
+        .reshape(batch * _SPLITS, 1, 16, 128)
     )
     keys = key.view(batch * capacity, 2, 128)
     values = value.view(batch * capacity, 2, 128)
