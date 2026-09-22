@@ -484,6 +484,15 @@ compression, forgetting, source depth or write quality as the cause of the
 gap. Missing within-window temporal gradients are not the explanation.
 A bank of rich final-layer latents remains a separate, untested hypothesis.
 
+The subsequent [final-to-first GDN2 feedback experiment](FEEDBACK.md) retained
+the transformer and replaced first-layer LAM's carry with attached GDN2
+memory. It reached 1.3228 BPB at 1,000 updates, improving first-layer LAM by
+0.0037 at 9.66% more training time. This missed the >0.005 retention rule;
+source and checkpoint are archived, and the active integration was removed.
+A three-pass follow-up was subsequently stopped at the user's update-400
+gate: 1.4566 BPB versus two-pass training's 1.4510, with 48.33% more training
+time. It is archived with its checkpoint and has no 1,000-update result.
+
 Profile 8653 completed. Its paired complete-update medians were 549.09ms
 for mini and 1038.91ms for GDN2 (954,837 versus 504,652 tokens/sec). This
 separate timing sample is not substituted for the training admission
@@ -505,3 +514,14 @@ CPU-launch starvation problem. Fusion/copy cleanup can offer modest gains,
 but these measurements do not support treating such cleanup as a credible
 standalone remedy for the near-twofold throughput gap. The quality failure
 is independent. See [profile evidence](../../ablation_results/gdn2_fullwidth_fla_kfirst_saved_profile/profile.json).
+
+Follow-up evidence is in [inference and learning diagnostics](DIAGNOSTICS.md)
+and [execution optimization](EXECUTION_OPTIMIZATION.md), whose whole-graph
+custom operators under a pinned kernel profile now train the production
+configuration at 972 ms per update (from 1,097) with final BPB 1.35857 against
+1.36051 over the matched 1,000 updates, with the
+[4K context protocol](CONTEXT_ABLATION.md) recorded separately. These separate
+measured outcomes from unresolved learning and hardware hypotheses. The
+[shared pool of routed state banks](STATE_POOL.md) adds twelve GDN2 banks per
+sequence that all six layers write to and read from through top-1 routers,
+in two Jacobi passes alongside the unchanged private recurrences.

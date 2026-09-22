@@ -29,7 +29,8 @@ from scripts.benchmark_chunk_memory import PlainMini, optimizers
 from scripts.train_recurrent_slots import atomic_json
 from pretraining.nanogpt_mini.chunk_memory_runtime import CompiledFullLoss
 from pretraining.nanogpt_mini.gated_delta_runtime import (
-    CompiledGatedDeltaLoss, build_gated_delta_optimizers, runtime_dependency_versions,
+    CompiledGatedDeltaLoss, ForeignGpuSampler, build_gated_delta_optimizers, runtime_dependency_versions,
+    runtime_autotuning_policy, wait_for_exclusive_gpu,
     gdn2_dependency_provenance,
 )
 from pretraining.nanogpt_mini.recurrent_slots_runtime import CUDAGraphMicrobatch, CUDAGraphValidation
@@ -230,6 +231,9 @@ def main(argv=None):
     parser.add_argument("--state-v-first", action="store_true")
     parser.add_argument("--disable-recompute", action="store_true")
     parser.add_argument("--fused-projections", action="store_true")
+    parser.add_argument("--custom-ops", action="store_true")
+    parser.add_argument("--gate-in-kernel", action="store_true",
+                        help="custom-ops GDN2: FLA's chunk kernels compute the decay gate from the raw projection")
     parser.add_argument("--architecture", choices=("both", "gdn2", "plain_mini"), default="both")
     parser.add_argument("--reaggregate-existing", action="store_true",
                         help="repair preserved v1 report using existing traces, without CUDA execution")
@@ -239,16 +243,20 @@ def main(argv=None):
         return
     if args.repeats < 5:
         parser.error("at least five complete timed updates are required")
+    if args.gate_in_kernel and not args.custom_ops:
+        parser.error("--gate-in-kernel is a custom-operator kernel path; pass --custom-ops")
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("Profiling requires CUDA bf16")
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / "profile.json").exists() or (args.output / "source").exists():
         raise FileExistsError("Choose a fresh profile output directory")
     model_options = dict(gdn_backend=args.gdn_backend, state_v_first=args.state_v_first,
-                         disable_recompute=args.disable_recompute, fused_projections=args.fused_projections)
+                         disable_recompute=args.disable_recompute, fused_projections=args.fused_projections,
+                         custom_ops=args.custom_ops, gate_in_kernel=args.gate_in_kernel)
     sources = [ROOT / p for p in (
         "scripts/profile_gated_delta.py", "scripts/benchmark_chunk_memory.py",
         "scripts/train_recurrent_slots.py", "pretraining/nanogpt_mini/gated_delta_model.py",
+        "pretraining/nanogpt_mini/gated_delta_ops.py",
         "pretraining/nanogpt_mini/gated_delta_runtime.py", "pretraining/nanogpt_mini/chunk_memory_runtime.py",
         "pretraining/nanogpt_mini/nanogpt_mini_model.py", "pretraining/nanogpt_mini/recurrent_slots_runtime.py")]
     sources.extend(p for p in (ROOT / "pretraining/gated_delta/vendor").rglob("*")
@@ -258,7 +266,7 @@ def main(argv=None):
                   model_options=model_options, warmup_optimizer_updates=5,
                   validation_training_graphs_co_resident=True,
                   gpu=torch.cuda.get_device_name(), torch=str(torch.__version__),
-                  dependency_versions=runtime_dependency_versions(),
+                  dependency_versions=runtime_dependency_versions(), autotuning_policy=runtime_autotuning_policy(),
                   gdn2_dependency_provenance=gdn2_dependency_provenance(),
                   host_data_transfer_included=False, optimizer_included=True,
                   source_sha256={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -279,15 +287,19 @@ def main(argv=None):
     path = args.output / "profile.json"
     atomic_json(path, report)
     try:
+        report["gpu_exclusivity"] = wait_for_exclusive_gpu()
         torch.manual_seed(1337)
         inputs = torch.randint(1024, (512, 1024), device="cuda", dtype=torch.int32)
         targets = inputs.roll(-1, 1).long()
         arms = ("plain_mini", "gdn2") if args.architecture == "both" else (args.architecture,)
         for label in arms:
             print(f"profiling {label} full optimizer updates and CUDA kernels", flush=True)
-            report[label] = profile_arm(label, inputs, targets, args.output, args.repeats,
-                                        microbatch=64 if label == "plain_mini" else args.microbatch,
-                                        model_options=model_options)
+            with ForeignGpuSampler() as sampler:
+                report[label] = profile_arm(label, inputs, targets, args.output, args.repeats,
+                                            microbatch=64 if label == "plain_mini" else args.microbatch,
+                                            model_options=model_options)
+            report[label]["gpu_exclusivity"] = sampler.summary()
+            sampler.require_exclusive()
             atomic_json(path, report)
             print(json.dumps({"architecture": label, "tokens_per_second": report[label]["tokens_per_second"],
                               "stages": report[label]["stages"]}), flush=True)

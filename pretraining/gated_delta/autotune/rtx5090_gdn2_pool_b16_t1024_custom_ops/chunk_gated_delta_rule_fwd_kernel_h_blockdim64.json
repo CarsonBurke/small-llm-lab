@@ -1,0 +1,58 @@
+{
+  "autotune_entries": {
+    "8d769fe7d42772de9bcea6628d66328b": {
+      "autotune_key": [
+        4,
+        4,
+        128,
+        128,
+        64,
+        false,
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.bfloat16"
+      ],
+      "config": {
+        "kwargs": {
+          "BV": 32
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 2
+      }
+    },
+    "adfbf70ed82f930f210df78ab06bc780": {
+      "autotune_key": [
+        4,
+        4,
+        128,
+        128,
+        64,
+        false,
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.bfloat16",
+        "torch.int32",
+        "torch.int64"
+      ],
+      "config": {
+        "kwargs": {
+          "BV": 32
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 2
+      }
+    }
+  },
+  "kernel_name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+  "triton_version": "3.7.1"
+}

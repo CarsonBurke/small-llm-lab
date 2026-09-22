@@ -313,6 +313,88 @@ class KimiDeltaAttention(nn.Module):
         )
         return gate.view(*x.shape[:-1], self.num_heads, self.head_dim)
 
+    @torch.compiler.disable
+    def _delta_rule(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        decay_logits: Tensor,
+        beta_logits: Tensor,
+        initial_state: Tensor | None,
+        output_final_state: bool,
+    ) -> tuple[Tensor, Tensor | None]:
+        """The chunked delta-rule recurrence over ``[B, T, H, D]`` inputs.
+
+        This is the only part of the mixer Dynamo must not trace -- FLA's
+        chunk kernel graph-breaks by design -- so it alone is fenced off, and
+        a compiled caller still fuses the projections, short convolutions and
+        gated norm around it.
+        """
+        B, T = q.shape[:2]
+        if q.is_cuda:
+            from fla.ops.kda import chunk_kda
+
+            # Varlen call with uniform row lengths. Flattening [B, T] to
+            # [1, B*T] under cu_seqlens boundaries is the same per-row math
+            # (chunking and state resets are per sequence, and batching is
+            # the same independence), but the TileLang kernels bake the
+            # batch size into their JIT cache key while T and the sequence
+            # count stay dynamic: batched calls paid a fresh ~12 s kernel
+            # compile per distinct replay-shard row count (85 compiles /
+            # 999 s in k3_latent_10h's first 40 min), the varlen form has
+            # exactly one key per kernel, ever. Both cu_seqlens tensors are
+            # built locally — device-side arange plus a CPU twin — so the
+            # call adds no host-device copy.
+            row_bounds_cpu = torch.arange(B + 1, dtype=torch.long) * T
+            row_bounds = (
+                torch.arange(B + 1, device=q.device, dtype=torch.long) * T
+            )
+            heads, width = self.num_heads, self.head_dim
+            y, final_state = chunk_kda(
+                q=q.reshape(1, B * T, heads, width),
+                k=k.reshape(1, B * T, heads, width),
+                v=v.reshape(1, B * T, heads, width),
+                g=decay_logits.reshape(1, B * T, heads, width),
+                beta=beta_logits.reshape(1, B * T, heads),
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=row_bounds,
+                cu_seqlens_cpu=row_bounds_cpu,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                safe_gate=True,
+                lower_bound=KDA_SAFE_GATE_LOWER_BOUND,
+                state_v_first=True,
+                # Pretraining ships disable_recompute=1 for backward speed on
+                # 8xH100; here the grad-enabled replay/critic passes would
+                # retain w/u/qg/kg/v_new/h per KDA layer at replay-shard width,
+                # which does not fit the 32 GiB card at the raised shard
+                # budgets. Recompute-in-backward trades that memory for time;
+                # forward values are identical either way. Teacher-forced SFT
+                # at 8x5120 measured no gain from disabling it either
+                # (scripts/benchmark_sft_step.py, jobs 9152/9155).
+                disable_recompute=False,
+            )
+            y = y.reshape(B, T, heads, width)
+        else:
+            y, final_state = reference_kda_recurrence(
+                q,
+                k,
+                v,
+                decay_logits,
+                beta_logits,
+                self.A_log,
+                self.dt_bias,
+                initial_state=initial_state,
+            )
+            if not output_final_state:
+                final_state = None
+        return y, final_state
+
     def forward(
         self,
         x: Tensor,
@@ -346,66 +428,10 @@ class KimiDeltaAttention(nn.Module):
             B, T, self.num_heads, self.head_dim
         )
         beta_logits = self.b_proj(x).float()
-
-        if x.is_cuda:
-            from fla.ops.kda import chunk_kda
-
-            # Varlen call with uniform row lengths. Flattening [B, T] to
-            # [1, B*T] under cu_seqlens boundaries is the same per-row math
-            # (chunking and state resets are per sequence, and batching is
-            # the same independence), but the TileLang kernels bake the
-            # batch size into their JIT cache key while T and the sequence
-            # count stay dynamic: batched calls paid a fresh ~12 s kernel
-            # compile per distinct replay-shard row count (85 compiles /
-            # 999 s in k3_latent_10h's first 40 min), the varlen form has
-            # exactly one key per kernel, ever. Both cu_seqlens tensors are
-            # built locally — device-side arange plus a CPU twin — so the
-            # call adds no host-device copy.
-            row_bounds_cpu = torch.arange(B + 1, dtype=torch.long) * T
-            row_bounds = (
-                torch.arange(B + 1, device=x.device, dtype=torch.long) * T
-            )
-            heads, width = self.num_heads, self.head_dim
-            y, final_state = chunk_kda(
-                q=q.reshape(1, B * T, heads, width),
-                k=k.reshape(1, B * T, heads, width),
-                v=v.reshape(1, B * T, heads, width),
-                g=decay_logits.reshape(1, B * T, heads, width),
-                beta=beta_logits.reshape(1, B * T, heads),
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=row_bounds,
-                cu_seqlens_cpu=row_bounds_cpu,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                safe_gate=True,
-                lower_bound=KDA_SAFE_GATE_LOWER_BOUND,
-                state_v_first=True,
-                # Pretraining ships disable_recompute=1 for backward speed on
-                # 8xH100; here the grad-enabled replay/critic passes would
-                # retain w/u/qg/kg/v_new/h per KDA layer at replay-shard width,
-                # which does not fit the 32 GiB card at the raised shard
-                # budgets. Recompute-in-backward trades that memory for time;
-                # forward values are identical either way.
-                disable_recompute=False,
-            )
-            y = y.reshape(B, T, heads, width)
-        else:
-            y, final_state = reference_kda_recurrence(
-                q,
-                k,
-                v,
-                decay_logits,
-                beta_logits,
-                self.A_log,
-                self.dt_bias,
-                initial_state=initial_state,
-            )
-            if not output_final_state:
-                final_state = None
+        y, final_state = self._delta_rule(
+            q, k, v, decay_logits, beta_logits, initial_state,
+            output_final_state,
+        )
 
         y = self.o_norm(y, self._output_gate(x)).reshape(B, T, self.projection_size)
         out = self.o_proj(y)
@@ -446,13 +472,6 @@ class KimiDeltaAttention(nn.Module):
         return self.o_proj(y.reshape(-1, 1, self.projection_size))
 
 
-# FLA's chunk kernel deliberately graph-breaks under torch.compile. Treating
-# the whole full-sequence mixer as one eager region avoids repeatedly leaving
-# and re-entering compiled code around its convolutions, recurrence, and gated
-# norm — the same choice the pretraining campaign shipped (DELTA_EAGER_MODULE=1).
-# ``step`` stays compilable on purpose: the decode recurrence is pure PyTorch
-# so the rollout step_core remains one fullgraph-compiled artifact.
-KimiDeltaAttention.forward = torch.compiler.disable(KimiDeltaAttention.forward)
 
 
 class MLP(nn.Module):

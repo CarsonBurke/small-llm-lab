@@ -227,6 +227,18 @@ class GatedDeltaNet2(nn.Module):
                 nn.init.zeros_(module.bias)
         module._is_hf_initialized = True
 
+    def _log_decay(self, f_input: torch.Tensor, mode: str) -> torch.Tensor:
+        """Integration hook: the channel-wise log-decay handed to the selected kernel.
+
+        Computed in fp32 for numerical stability of the downstream cumulative
+        sum. A_log is per-head and broadcast over the head's key channels;
+        dt_bias is per-channel.
+        """
+        return (
+            -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
+            * F.softplus(self.f_proj[1](f_input).float() + self.dt_bias)
+        )
+
     def _chunk_recurrence(self, **kwargs):
         """Integration hook for execution backend/layout/recomputation only."""
         return chunk_gdn2(**kwargs)
@@ -329,13 +341,7 @@ class GatedDeltaNet2(nn.Module):
             k = F.silu(raw_k)
             v = F.silu(raw_v)
 
-        # Channel-wise log-decay, computed in fp32 for numerical stability of
-        # the downstream cumulative sum. A_log is per-head and broadcast over
-        # the head's key channels; dt_bias is per-channel.
-        g = (
-            -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
-            * F.softplus(self.f_proj[1](f_input).float() + self.dt_bias)
-        )
+        g = self._log_decay(f_input, mode)
 
         # GDN-2 gates, both squashed to [0, 1] by a sigmoid. b is the
         # channel-wise erase gate (key axis); w is the channel-wise write

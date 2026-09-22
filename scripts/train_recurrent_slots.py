@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 import glob
 import hashlib
 import json
@@ -36,6 +37,9 @@ from train_gpt import build_sentencepiece_luts
 from pretraining.nanogpt_mini.recurrent_slots_runtime import (
     CUDAGraphMicrobatch, CUDAGraphValidation, RecurrentLoss,
 )
+
+GATE_STEP = 400
+MINIMUM_IMPROVEMENT = Decimal("0.005")
 
 
 @torch.compile(fullgraph=True, dynamic=False)
@@ -182,7 +186,7 @@ def matched_reference(args, data_path: Path, tokenizer_path: Path, reference_pat
         "seed": args.seed == int(overrides["SEED"]),
         "microbatch": args.microbatch == int(overrides["MBS"]),
         "vocab_size": int(overrides["VOCAB_SIZE"]) == 1024,
-        "seq_len": int(overrides["SEQ_LEN"]) == 1024,
+        "seq_len": int(overrides["SEQ_LEN"]) == getattr(args, "seq_len", 1024),
         "val_tokens": int(overrides["VAL_TOKENS"]) == 1048576,
     }
     matched_control = all(matched_fields.values())
@@ -190,7 +194,11 @@ def matched_reference(args, data_path: Path, tokenizer_path: Path, reference_pat
                           "sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
                           "final_val_bpb": reference_bpb, "matched_fields": matched_fields,
                           "overrides": overrides,
-                          "comparison_scope": "matched_update_token_and_validation_budget",
+                          "comparison_scope": ("matched_update_token_and_validation_budget"
+                                               if getattr(args, "seq_len", 1024) == int(overrides["SEQ_LEN"])
+                                               else "same_token_panel_different_context"),
+                          "run_train_seq_len": getattr(args, "seq_len", 1024),
+                          "run_val_seq_len": getattr(args, "seq_len", 1024),
                           "reference_microbatch": int(overrides["MBS"]),
                           "run_microbatch": args.microbatch,
                           "same_execution_microbatch": args.microbatch == int(overrides["MBS"])}
@@ -208,6 +216,7 @@ def parse_args(argv=None):
     parser.add_argument("--data-path", default="data/datasets/fineweb10B_sp1024")
     parser.add_argument("--tokenizer", default="data/tokenizers/fineweb_1024_bpe.model")
     parser.add_argument("--microbatch", type=int, default=64)
+    parser.add_argument("--seq-len", type=int, choices=(1024, 4096), default=1024)
     parser.add_argument("--segment-size", type=int, default=16)
     parser.add_argument("--slots", type=int, default=32)
     parser.add_argument("--memory-head-dim", type=int, choices=(32, 64, 128), default=128)
@@ -217,6 +226,20 @@ def parse_args(argv=None):
     parser.add_argument("--gdn-backend", choices=("vendor", "fla"), default="vendor")
     parser.add_argument("--state-v-first", action="store_true")
     parser.add_argument("--disable-recompute", action="store_true")
+    parser.add_argument("--custom-ops", action="store_true",
+                        help="compile GDN2 as one graph around custom-operator FLA kernels")
+    parser.add_argument("--gate-in-kernel", action="store_true",
+                        help="custom-ops GDN2: FLA's chunk kernels compute the decay gate from the raw projection")
+    parser.add_argument("--shared-pool", action="store_true",
+                        help="custom-ops GDN2 with the two-pass shared pool of latent state banks")
+    parser.add_argument("--pool-banks", type=int, default=None,
+                        help="shared-pool banks: default 12 for the routed writer, one per layer for the layer writer")
+    parser.add_argument("--pool-writer", choices=("routed", "layer"), default="routed",
+                        help="shared-pool writer: each layer writes its top-1 bank, or only its own bank")
+    parser.add_argument("--pool-heads", type=int, default=2, help="shared-pool bank heads of the private head size")
+    parser.add_argument("--decision-gate-reference",
+                        help=f"completed ablation_results run whose update-{GATE_STEP} BPB this run must beat by "
+                             f"{MINIMUM_IMPROVEMENT} at update {GATE_STEP}, else it is pruned with exit 75")
     parser.add_argument("--allow-slow-diagnostic", action="store_true",
                         help="Allow a GDN2 quality diagnostic with completed slower timing evidence; never waive promotion gates")
     parser.add_argument("--seed", type=int, default=1337)
@@ -225,10 +248,12 @@ def parse_args(argv=None):
         parser.error("--name must be one directory component")
     if args.steps != 1000 or args.val_every != 20:
         parser.error("This matched ablation requires --steps 1000 --val-every 20")
-    if args.microbatch <= 0 or 512 % args.microbatch:
-        parser.error("--microbatch must divide 512 packed training rows")
-    if args.segment_size <= 0 or 1024 % args.segment_size:
-        parser.error("--segment-size must divide the 1024-token context")
+    if args.seq_len != 1024 and args.architecture != "gdn2":
+        parser.error("4K contexts currently require --architecture gdn2")
+    if args.microbatch <= 0 or (524288 // args.seq_len) % args.microbatch:
+        parser.error("--microbatch must divide the packed training rows")
+    if args.segment_size <= 0 or args.seq_len % args.segment_size:
+        parser.error("--segment-size must divide the context")
     if args.slots <= 0:
         parser.error("--slots must be positive")
     if args.architecture in {"gdn1", "gdn2"} and args.segment_size != 64:
@@ -239,11 +264,86 @@ def parse_args(argv=None):
         parser.error("--fused-projections is specific to Gated Delta models")
     if args.architecture not in {"gdn1", "gdn2"} and args.value_expansion != 1.0:
         parser.error("--value-expansion is specific to Gated Delta models")
-    if args.architecture != "gdn2" and (args.gdn_backend != "vendor" or args.state_v_first or args.disable_recompute):
+    if args.architecture != "gdn2" and (args.gdn_backend != "vendor" or args.state_v_first
+                                        or args.disable_recompute or args.custom_ops
+                                        or args.gate_in_kernel):
         parser.error("GDN2 execution options require --architecture gdn2")
+    if args.gate_in_kernel and not args.custom_ops:
+        parser.error("--gate-in-kernel is a custom-operator kernel path; pass --custom-ops")
     if args.allow_slow_diagnostic and args.architecture != "gdn2":
         parser.error("--allow-slow-diagnostic is specific to GDN2")
+    validate_shared_pool_options(parser, args)
+    if args.decision_gate_reference is not None and (Path(args.decision_gate_reference).name != args.decision_gate_reference
+                                                     or args.decision_gate_reference == args.name):
+        parser.error("--decision-gate-reference names a different completed ablation_results run")
     return args
+
+
+def validate_shared_pool_options(parser, args):
+    """Shared-pool flags belong to the custom-operator, packed GDN2 execution."""
+    if not args.shared_pool:
+        if args.pool_banks is not None or args.pool_writer != "routed" or args.pool_heads != 2:
+            parser.error("--pool-banks, --pool-writer and --pool-heads describe --shared-pool")
+        return
+    if args.architecture != "gdn2" or not args.custom_ops or not args.fused_projections or args.gate_in_kernel:
+        parser.error("--shared-pool requires --architecture gdn2 --custom-ops --fused-projections "
+                     "and computes the decay gate outside the kernels")
+    from pretraining.nanogpt_mini.gated_delta_pool import pool_policy
+    try:
+        pool_policy(args)
+    except ValueError as error:
+        parser.error(str(error))
+
+
+def gate_decision(step: int, candidate_bpb: float, reference_bpb: float) -> dict | None:
+    """Pure decision policy for the update-400 gate against a completed control's panel."""
+    if step != GATE_STEP:
+        return None
+    if not math.isfinite(candidate_bpb) or not math.isfinite(reference_bpb):
+        raise ValueError("Gate BPBs must be finite")
+    # Compare at the published precision of the metrics stream.
+    candidate = Decimal(f"{candidate_bpb:.4f}")
+    reference = Decimal(f"{reference_bpb:.4f}")
+    improvement = reference - candidate
+    return dict(step=step, metric="val_bpb", candidate_bpb=float(candidate), reference_bpb=float(reference),
+                improvement_bpb=float(improvement), minimum_improvement_bpb=float(MINIMUM_IMPROVEMENT),
+                maximum_candidate_bpb=float(reference - MINIMUM_IMPROVEMENT),
+                passed=improvement >= MINIMUM_IMPROVEMENT)
+
+
+def load_gate_reference(name: str, args, data_path: Path, tokenizer_path: Path) -> dict:
+    """The control's update-400 validation BPB from its immutable metrics stream.
+
+    The control must be a completed run of the same data, tokenizer, seed,
+    context, budget and validation cadence, so the gate compares matched
+    training histories rather than merely two numbers.
+    """
+    run = ROOT / "ablation_results" / name
+    result = json.loads((run / "result.json").read_text())
+    config = json.loads((run / "config.json").read_text())
+    matched = dict(
+        completed=result.get("status") == "completed" and result.get("completed_steps") == result.get("steps"),
+        steps=config.get("steps") == args.steps and config.get("steps", 0) > GATE_STEP,
+        val_every=config.get("val_every") == result.get("val_every") == args.val_every,
+        data_path=(ROOT / config.get("data_path", "")).resolve() == data_path.resolve(),
+        tokenizer=(ROOT / config.get("tokenizer", "")).resolve() == tokenizer_path.resolve(),
+        seed=config.get("seed") == args.seed,
+        seq_len=config.get("seq_len") == args.seq_len,
+        batch_tokens=config.get("batch_tokens") == 524288,
+        val_tokens=config.get("val_tokens") == 1048576,
+    )
+    if not all(matched.values()):
+        mismatched = sorted(field for field, ok in matched.items() if not ok)
+        raise ValueError(f"Decision gate reference {name} is not a matched completed run: {mismatched}")
+    metrics = run / "metrics.jsonl"
+    entries = [json.loads(line) for line in metrics.read_text().splitlines() if line.strip()]
+    gate = [entry for entry in entries if entry.get("type") == "val" and entry.get("step") == GATE_STEP]
+    if len(gate) != 1 or not math.isfinite(gate[0]["val_bpb"]):
+        raise ValueError(f"Decision gate reference {name} lacks one finite update-{GATE_STEP} validation")
+    return dict(name=name, step=GATE_STEP, val_bpb=gate[0]["val_bpb"], matched_fields=sorted(matched),
+                metrics_sha256=hashlib.sha256(metrics.read_bytes()).hexdigest(),
+                config_sha256=hashlib.sha256((run / "config.json").read_bytes()).hexdigest(),
+                final_val_bpb=result.get("final_val_bpb"))
 
 
 def verify_throughput_gate(args):
@@ -296,6 +396,10 @@ def main(argv=None):
         raise ValueError("Throughput benchmark was measured on different hardware")
     import sentencepiece as spm
 
+    # Work launched outside the queue can hold the device; wait for it before creating
+    # the immutable run directory or reserving the graphs, and sample it through the run.
+    from pretraining.nanogpt_mini.gated_delta_runtime import ForeignGpuSampler, wait_for_exclusive_gpu
+    gpu_exclusivity = dict(before=wait_for_exclusive_gpu())
     out = ROOT / "ablation_results" / args.name
     out.mkdir(parents=True, exist_ok=False)
     if (ROOT / "tb_logs" / args.name).exists():
@@ -311,12 +415,21 @@ def main(argv=None):
         architecture = "nanogpt_mini_scalar_delta_v1"
     elif args.architecture == "gdn2":
         from pretraining.nanogpt_mini.gated_delta_model import GatedDeltaGPT
-        model = GatedDeltaGPT(head_dim=args.memory_head_dim, mixer_dim=args.memory_width,
-                             fused_projections=args.fused_projections, expand_v=args.value_expansion,
-                             gdn_backend=args.gdn_backend, state_v_first=args.state_v_first,
-                             disable_recompute=args.disable_recompute).cuda()
-        model_source = ROOT / "pretraining/nanogpt_mini/gated_delta_model.py"
-        architecture = "nanogpt_mini_gated_delta_v2"
+        options = dict(head_dim=args.memory_head_dim, mixer_dim=args.memory_width,
+                       fused_projections=args.fused_projections, expand_v=args.value_expansion,
+                       gdn_backend=args.gdn_backend, state_v_first=args.state_v_first,
+                       disable_recompute=args.disable_recompute, custom_ops=args.custom_ops,
+                       gate_in_kernel=args.gate_in_kernel)
+        if args.shared_pool:
+            from pretraining.nanogpt_mini.gated_delta_pool import SharedPoolGatedDeltaGPT
+            model = SharedPoolGatedDeltaGPT(pool_banks=args.pool_banks, pool_writer=args.pool_writer,
+                                            pool_heads=args.pool_heads, **options).cuda()
+            model_source = ROOT / "pretraining/nanogpt_mini/gated_delta_pool.py"
+            architecture = "nanogpt_mini_gated_delta_v2_shared_pool"
+        else:
+            model = GatedDeltaGPT(**options).cuda()
+            model_source = ROOT / "pretraining/nanogpt_mini/gated_delta_model.py"
+            architecture = "nanogpt_mini_gated_delta_v2"
     elif args.architecture == "chunk":
         from pretraining.nanogpt_mini.chunk_memory import ChunkMemory
         model = ChunkMemory(slots=args.slots, chunk_size=args.segment_size).cuda()
@@ -353,8 +466,8 @@ def main(argv=None):
             group["initial_lr"] = group["lr"]
 
     if args.architecture in {"gdn1", "gdn2"}:
-        from pretraining.nanogpt_mini.gated_delta_runtime import CompiledGatedDeltaLoss
-        loss_fn = CompiledGatedDeltaLoss(model, segment_size=args.segment_size)
+        from pretraining.nanogpt_mini.gated_delta_runtime import compiled_gated_delta_loss
+        loss_fn = compiled_gated_delta_loss(model, segment_size=args.segment_size)
     elif args.architecture == "chunk":
         from pretraining.nanogpt_mini.chunk_memory_runtime import CompiledFullLoss
         loss_fn = CompiledFullLoss(model, segment_size=args.segment_size)
@@ -366,8 +479,8 @@ def main(argv=None):
     data_path = Path(args.data_path)
     if not data_path.is_absolute():
         data_path = ROOT / data_path
-    train_loader = PackedBatches(str(data_path / "fineweb_train_*.bin"), 524288, 1024)
-    val_loader = PackedBatches(str(data_path / "fineweb_val_*.bin"), 1048576, 1024)
+    train_loader = PackedBatches(str(data_path / "fineweb_train_*.bin"), 524288, args.seq_len)
+    val_loader = PackedBatches(str(data_path / "fineweb_val_*.bin"), 1048576, args.seq_len)
     val_inputs, val_targets = val_loader.next()
     del val_loader
     tokenizer_path = Path(args.tokenizer)
@@ -386,11 +499,20 @@ def main(argv=None):
 
     reference_bpb, matched_control, reference_metadata = matched_reference(
         args, data_path, tokenizer_path)
+    gate_reference = (load_gate_reference(args.decision_gate_reference, args, data_path, tokenizer_path)
+                      if args.decision_gate_reference else None)
 
     config = {**vars(args), "architecture": architecture, "throughput_gate": throughput_gate,
-              "model_config": model.config, "batch_tokens": 524288, "seq_len": 1024,
+              "decision_gate": None if gate_reference is None else dict(
+                  gate_reference, minimum_improvement_bpb=float(MINIMUM_IMPROVEMENT),
+                  maximum_candidate_bpb=float(Decimal(f"{gate_reference['val_bpb']:.4f}") - MINIMUM_IMPROVEMENT),
+                  metric="val_bpb", exit_code=75),
+              "model_config": model.config, "batch_tokens": 524288, "seq_len": args.seq_len,
+              "train_seq_len": args.seq_len, "val_seq_len": args.seq_len,
+              "train_rows": 524288 // args.seq_len, "val_rows": 1048576 // args.seq_len,
+              "microsteps_per_update": 524288 // (args.seq_len * args.microbatch),
               "val_tokens": 1048576, "val_bytes": val_bytes,
-              "loss_reduction": "sum", "bptt": "full_1024_without_detach",
+              "loss_reduction": "sum", "bptt": f"full_{args.seq_len}_without_detach",
               "precision": "bf16_compute_and_embedding_fp32_other_parameters", "compiled": True,
               "execution": "compiled_regions_triton_cuda_graphs" if args.architecture in {"gdn1", "gdn2"} else "serial_microbatch_cuda_graphs",
               "reference": "nanomini_fb_lam_first_1k", "reference_bpb": reference_bpb,
@@ -399,6 +521,9 @@ def main(argv=None):
               "optimizer": "control_muon_adam_gdn_conv_decay_groups" if args.architecture in {"gdn1", "gdn2"} else "control_12_step_cubic_muon_adamw",
               "gpu": torch.cuda.get_device_name(), "torch": str(torch.__version__),
               "tokenizer_sha256": hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()}
+    if args.architecture in {"gdn1", "gdn2"}:
+        # verify_throughput_report already rejected a report whose policy differs from this process.
+        config["autotuning_policy"] = throughput_gate["autotuning_policy"]
     atomic_json(out / "config.json", config)
     for source in (Path(__file__), model_source,
                    ROOT / "pretraining/nanogpt_mini/recurrent_slots_runtime.py",
@@ -413,6 +538,8 @@ def main(argv=None):
         (out / source.name).write_text(source.read_text())
         source = ROOT / "pretraining/nanogpt_mini/gated_delta_model.py"
         (out / source.name).write_text(source.read_text())
+        source = ROOT / "pretraining/nanogpt_mini/gated_delta_ops.py"
+        (out / source.name).write_text(source.read_text())
         shutil.copytree(ROOT / "pretraining/gated_delta/vendor", out / "vendor",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     writer = MetricsWriter(out / "metrics.jsonl", args.name)
@@ -423,14 +550,16 @@ def main(argv=None):
     checkpoint_completed_steps = None
     last_val = None
     status = "running"
+    decision = None
     model_path = out / "model.pt"
     torch.cuda.reset_peak_memory_stats()
+    gpu_sampler = ForeignGpuSampler().start()
 
     def save_checkpoint():
         nonlocal checkpoint_completed_steps
         atomic_save(model_path, {"architecture": config["architecture"],
                     "model": model.state_dict(), "model_config": model.config,
-                    "train_seq_len": 1024, "completed_steps": step})
+                    "train_seq_len": args.seq_len, "val_seq_len": args.seq_len, "completed_steps": step})
         atomic_save(out / "training_state.pt", {
             "completed_steps": step, "optimizers": [o.state_dict() for o in optimizers],
             "autocull": asdict(cull), "data": train_loader.state_dict(),
@@ -454,8 +583,10 @@ def main(argv=None):
                   "peak_vram_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
                   "peak_vram_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
                   "autocull": asdict(cull), "promotion_metric": "challenge_bpb",
+                  "gate_decision": decision, "pruned": status == "pruned",
                   "matched_control": matched_control, "reference_bpb": reference_bpb,
                   "speed_passed": throughput_gate.get("speed_passed", True) if throughput_gate else None,
+                  "gpu_exclusivity": dict(gpu_exclusivity, during=gpu_sampler.summary()),
                   "retained": bool(status == "completed" and matched_control and last_val and
                                    (not throughput_gate or throughput_gate.get("speed_passed", True)) and
                                    reference_bpb - last_val["val_bpb"] > 0.005),
@@ -472,12 +603,13 @@ def main(argv=None):
                 validation_start = time.perf_counter()
                 model.eval()
                 if validation_graph is None:
-                    validation_graph = CUDAGraphValidation(loss_fn, batch_size=args.microbatch)
+                    validation_graph = CUDAGraphValidation(loss_fn, batch_size=args.microbatch, seq_len=args.seq_len)
                     if args.architecture in {"gdn1", "gdn2"}:
                         config["compile_graph_breaks"] = loss_fn.audit_graph_breaks()
                         atomic_json(out / "config.json", config)
                 val_sum = torch.zeros((), device="cuda", dtype=torch.float64)
                 memory_stats = torch.zeros(2, device="cuda", dtype=torch.float64)
+                pool_stats = torch.zeros(4, device="cuda", dtype=torch.float64)
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     for row in range(0, len(val_inputs), args.microbatch):
                         outputs = validation_graph.replay(
@@ -486,8 +618,11 @@ def main(argv=None):
                         val_sum += outputs[0].double()
                         if args.architecture not in {"gdn1", "gdn2"}:
                             memory_stats += torch.stack(outputs[1:]).double()
+                        elif args.shared_pool:
+                            pool_stats += torch.stack(outputs[1:]).double()
                 total_nll = float(val_sum)
-                memory_rms, slot_std = (memory_stats / (len(val_inputs) // args.microbatch)).sqrt().tolist()
+                validation_microbatches = len(val_inputs) // args.microbatch
+                memory_rms, slot_std = (memory_stats / validation_microbatches).sqrt().tolist()
                 if not math.isfinite(total_nll):
                     raise FloatingPointError(f"Non-finite validation loss at update {step}")
                 last_val = {"type": "val", "step": step,
@@ -500,16 +635,35 @@ def main(argv=None):
                 if args.architecture in {"gdn1", "gdn2"}:
                     last_val.pop("val_memory_rms")
                     last_val.pop("val_memory_slot_std")
+                if args.shared_pool:
+                    first_nll, balance, z, load_max = pool_stats.tolist()
+                    if not math.isfinite(first_nll):
+                        raise FloatingPointError(f"Non-finite first-pass validation loss at update {step}")
+                    # Headline val_bpb is the second (pool-reading) pass; the first pass is the private model.
+                    last_val.update(val_bpb_pass1=first_nll / (math.log(2) * val_bytes),
+                                    val_loss_pass1=first_nll / val_targets.numel(),
+                                    val_pool_balance=balance / validation_microbatches,
+                                    val_pool_z=z / validation_microbatches,
+                                    val_pool_load_max=load_max / validation_microbatches)
                 writer.write_entry(last_val)
                 print(json.dumps(last_val), flush=True)
                 pruned = cull.update(step, last_val["val_bpb"])
+                reason = "raw_and_ema_validation_stagnation"
+                if gate_reference is not None:
+                    observed = gate_decision(step, last_val["val_bpb"], gate_reference["val_bpb"])
+                    if observed is not None:
+                        decision = dict(observed, reference=gate_reference["name"])
+                        atomic_json(out / "gate_decision.json", decision)
+                        print(json.dumps({"type": "gate_decision", **decision}), flush=True)
+                        if not decision["passed"]:
+                            pruned, reason = True, "decision_gate_below_reference_improvement"
                 save_checkpoint()
                 status = "completed" if step == args.steps else "pruned" if pruned else "running"
                 save_result()
                 if status != "running":
                     if status == "pruned":
-                        record = {"type": "AUTOCULL", "step": step,
-                                  "reason": "raw_and_ema_validation_stagnation", **asdict(cull)}
+                        record = {"type": "AUTOCULL", "step": step, "reason": reason, **asdict(cull),
+                                  "gate_decision": decision}
                         writer.write_entry(record)
                         print(json.dumps(record), flush=True)
                     break
@@ -519,7 +673,7 @@ def main(argv=None):
             update_start = time.perf_counter()
             inputs, targets = train_loader.next()
             if training_graph is None:
-                training_graph = CUDAGraphMicrobatch(loss_fn, batch_size=args.microbatch)
+                training_graph = CUDAGraphMicrobatch(loss_fn, batch_size=args.microbatch, seq_len=args.seq_len)
                 if args.architecture in {"gdn1", "gdn2"}:
                     config["compile_graph_breaks"] = loss_fn.audit_graph_breaks()
                     atomic_json(out / "config.json", config)
@@ -563,6 +717,7 @@ def main(argv=None):
         save_result(f"{type(error).__name__}: {error}")
         raise
     finally:
+        gpu_sampler.stop()
         writer.close()
     return 75 if status == "pruned" else 0
 

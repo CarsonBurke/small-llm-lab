@@ -85,13 +85,15 @@ def test_fla_layout_and_retention_match_literal_outputs_and_all_input_gradients(
         assert reference_leaf.grad.norm() > 0, name
 
 
-def model(*, production=False, fused=True, backend="fla", state_v_first=True, disable_recompute=True):
+def model(*, production=False, fused=True, backend="fla", state_v_first=True, disable_recompute=True,
+          custom_ops=False, gate_in_kernel=False):
     torch.manual_seed(733)
     geometry = dict(vocab_size=1024, num_layers=6, model_dim=512, head_dim=128, mixer_dim=512) if production else dict(
         vocab_size=32, num_layers=2, model_dim=128, head_dim=128, mixer_dim=128)
     net = GatedDeltaGPT(**geometry, expand_v=1., fused_projections=fused,
                        gdn_backend=backend, state_v_first=state_v_first,
-                       disable_recompute=disable_recompute).cuda()
+                       disable_recompute=disable_recompute, custom_ops=custom_ops,
+                       gate_in_kernel=gate_in_kernel).cuda()
     with torch.no_grad():
         for name, parameter in net.named_parameters():
             if name == "proj.weight" or name.endswith(("mlp.proj.weight", "o_proj.weight")):
@@ -99,9 +101,18 @@ def model(*, production=False, fused=True, backend="fla", state_v_first=True, di
     return net
 
 
-@pytest.mark.parametrize("state_v_first", [False, True])
-def test_optimized_model_causality_row_isolation_and_cached_continuation(state_v_first):
-    net = model(state_v_first=state_v_first).eval()
+@pytest.mark.parametrize("state_v_first,custom_ops,gate_in_kernel",
+                         [(False, False, False), (True, False, False), (False, True, False),
+                          (True, True, False), (False, True, True), (True, True, True)])
+def test_optimized_model_causality_row_isolation_and_cached_continuation(state_v_first, custom_ops, gate_in_kernel):
+    """Evaluation paths agree with the training-shaped forward.
+
+    Prefixes and continuations longer than one chunk exercise the released
+    chunk operator with an initial or final state, the path the custom
+    operators hand back to the library; with gate_in_kernel it must take the
+    raw decay projection there too.
+    """
+    net = model(state_v_first=state_v_first, custom_ops=custom_ops, gate_in_kernel=gate_in_kernel).eval()
     tokens = torch.randint(32, (2, 128), device="cuda", dtype=torch.int32)
     altered = tokens.clone()
     altered[0, 73:] = (altered[0, 73:] + 1) % 32
@@ -113,7 +124,11 @@ def test_optimized_model_causality_row_isolation_and_cached_continuation(state_v
         assert (other[0, 73:] - whole[0, 73:]).norm() > .01
         prefix, cache = net.forward_hidden(tokens[:, :64], use_cache=True)
         resumed, _ = net.forward_hidden(tokens[:, 64:], state=cache, use_cache=True)
-        relative(torch.cat((prefix, resumed), 1), whole, .02, "chunk continuation")
+        relative(torch.cat((prefix, resumed), 1), whole, .02, "recurrent continuation")
+        for split in (96, 32):  # chunked prefix with a final state; chunked continuation from a state
+            long_prefix, long_cache = net.forward_hidden(tokens[:, :split], use_cache=True)
+            long_resumed, _ = net.forward_hidden(tokens[:, split:], state=long_cache, use_cache=True)
+            relative(torch.cat((long_prefix, long_resumed), 1), whole, .02, f"chunk continuation at {split}")
         reset, cache = net.forward_hidden(tokens[:, :64], use_cache=True)
         relative(reset, prefix, .001, "fresh cache")
         logits = []
@@ -150,11 +165,13 @@ def test_optimized_model_outputs_and_parameter_gradients_match_reference(referen
         relative(parameter.grad, references[name].grad, .03, reference_kind + " " + name)
 
 
-def test_production_b64_full_context_graph_observes_inputs_and_packed_parameter_updates():
+@pytest.mark.parametrize("custom_ops", [False, True])
+def test_production_b64_full_context_graph_observes_inputs_and_packed_parameter_updates(custom_ops):
     import gc
 
-    net = model(production=True, state_v_first=False).train()
+    net = model(production=True, state_v_first=False, custom_ops=custom_ops).train()
     loss = CompiledGatedDeltaLoss(net, 64)
+    assert loss.fullgraph is custom_ops
     tokens = torch.randint(1024, (64, 1024), device="cuda", dtype=torch.int32)
     targets = torch.randint(1024, tokens.shape, device="cuda")
     changed_tokens = (tokens + 7) % 1024
@@ -227,3 +244,148 @@ def test_production_b64_full_context_graph_observes_inputs_and_packed_parameter_
             parameter.copy_(saved)
     compare(changed_tokens, changed_targets, changed_weights)
     loss.audit_graph_breaks()
+
+
+def custom_operator_inputs(gate_in_kernel=False):
+    """Kernel inputs; with ``gate_in_kernel`` ``g`` is the raw bf16 decay projection plus decay parameters."""
+    torch.manual_seed(977)
+    batch, time, heads, key_dim, value_dim = 2, 128, 2, 128, 128
+    tensors = dict(
+        q=torch.randn(batch, time, heads, key_dim, device="cuda", dtype=torch.bfloat16),
+        k=torch.randn(batch, time, heads, key_dim, device="cuda", dtype=torch.bfloat16),
+        v=torch.randn(batch, time, heads, value_dim, device="cuda", dtype=torch.bfloat16) * .2,
+        g=-torch.rand(batch, time, heads, key_dim, device="cuda") * .1,
+        b=torch.rand(batch, time, heads, key_dim, device="cuda", dtype=torch.bfloat16),
+        w=torch.rand(batch, time, heads, value_dim, device="cuda", dtype=torch.bfloat16))
+    decay = dict(A_log=None, dt_bias=None)
+    if gate_in_kernel:
+        tensors["g"] = torch.randn(batch, time, heads, key_dim, device="cuda", dtype=torch.bfloat16)
+        decay = dict(A_log=torch.empty(heads, device="cuda").uniform_(1, 16).log(),
+                     dt_bias=torch.empty(heads * key_dim, device="cuda").uniform_(-6, -2))
+    return tensors, key_dim ** -.5, decay
+
+
+def frontend_log_decay(raw, A_log, dt_bias):
+    """The vendored frontend's fp32 decay from the raw projection (what the kernels compute in-kernel)."""
+    heads, key_dim = raw.shape[2], raw.shape[3]
+    rate = A_log.float().exp().repeat_interleave(key_dim).view(heads, key_dim)
+    return -rate * F.softplus(raw.float() + dt_bias.view(heads, key_dim))
+
+
+KERNEL_OPTIONS = [(False, False), (True, False), (False, True), (True, True)]
+
+
+@pytest.mark.parametrize("state_v_first,gate_in_kernel", KERNEL_OPTIONS)
+def test_custom_operators_satisfy_library_contracts(state_v_first, gate_in_kernel):
+    """torch.library.opcheck: schemas, fake kernels, autograd registration and AOT dispatch."""
+    from pretraining.nanogpt_mini import gated_delta_ops as ops
+    tensors, scale, decay = custom_operator_inputs(gate_in_kernel)
+    leaves = {name: tensor.clone().requires_grad_() for name, tensor in tensors.items()}
+    parameters = {name: None if value is None else value.clone().requires_grad_() for name, value in decay.items()}
+    forward_args = (leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["b"], leaves["w"],
+                    parameters["A_log"], parameters["dt_bias"], None, None, scale, state_v_first)
+    # FLA leaves the masked triangle of the intra-chunk Aqk/Akk intermediates
+    # uninitialized by design, so the dispatcher's elementwise output
+    # comparison is not meaningful for the forward; whole-graph parity is
+    # covered by test_whole_graph_custom_ops_model_matches_graph_break_model.
+    torch.library.opcheck(ops.chunk_fwd, forward_args,
+                          test_utils=("test_schema", "test_autograd_registration", "test_faketensor"))
+    with torch.no_grad():
+        outputs = ops.chunk_fwd(*(tensors[n] for n in "qkvgbw"), decay["A_log"], decay["dt_bias"], None, None,
+                                scale, state_v_first)
+    do = torch.randn_like(outputs[0])
+    bwd_args = (do, *outputs[1:5], tensors["v"], outputs[5], tensors["b"], tensors["w"], *outputs[6:],
+                tensors["g"] if gate_in_kernel else None, decay["A_log"], decay["dt_bias"], None, None, scale,
+                state_v_first)
+    torch.library.opcheck(ops.chunk_bwd, bwd_args,
+                          test_utils=("test_schema", "test_autograd_registration", "test_faketensor"))
+    # The backward kernels reduce with atomics, so compare its compiled
+    # execution against eager within kernel-order tolerance instead.
+    compiled_bwd = torch.compile(ops.chunk_bwd, fullgraph=True, dynamic=False)
+    for eager, traced in zip(ops.chunk_bwd(*bwd_args), compiled_bwd(*bwd_args)):
+        if eager.numel():
+            relative(traced, eager, 1e-3, "compiled chunk_bwd")
+    packed = torch.randn(2, 128, 3 * 128, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(128, 4, device="cuda") * .3).requires_grad_()
+    x = packed[..., 128:256]
+    assert not x.is_contiguous() and x.stride(-1) == 1
+    torch.library.opcheck(ops.conv_fwd, (x.detach().requires_grad_(), weight))
+    torch.library.opcheck(ops.conv_bwd, (x.detach(), torch.randn_like(x), weight.detach()))
+    gate = torch.randn_like(tensors["v"])
+    norm_weight = torch.rand(128, device="cuda").requires_grad_()
+    torch.library.opcheck(ops.norm_fwd, (tensors["v"].clone().requires_grad_(), gate.clone().requires_grad_(),
+                                         norm_weight, 1e-5))
+    with torch.no_grad():
+        y, rstd = ops.norm_fwd(tensors["v"], gate, norm_weight, 1e-5)
+    torch.library.opcheck(ops.norm_bwd, (torch.randn_like(y), tensors["v"], gate, norm_weight.detach(), rstd, 1e-5))
+
+
+@pytest.mark.parametrize("state_v_first,gate_in_kernel", KERNEL_OPTIONS)
+def test_custom_operator_gradients_match_released_operator(state_v_first, gate_in_kernel):
+    """The reference is the released operator on the frontend's fp32 decay.
+
+    With the gate computed in-kernel the operator must reproduce the frontend
+    decay arithmetic and return its A_log/dt_bias derivatives.
+    """
+    from pretraining.nanogpt_mini import gated_delta_ops as ops
+    tensors, scale, decay = custom_operator_inputs(gate_in_kernel)
+    expected_leaves = {name: tensor.clone().requires_grad_() for name, tensor in tensors.items()}
+    expected_decay = {name: None if value is None else value.clone().requires_grad_() for name, value in decay.items()}
+    expected_g = expected_leaves["g"]
+    if gate_in_kernel:
+        expected_g = frontend_log_decay(expected_g, expected_decay["A_log"], expected_decay["dt_bias"])
+    expected = chunk_gdn2(expected_leaves["q"], expected_leaves["k"], expected_leaves["v"], expected_g,
+                          expected_leaves["b"], expected_leaves["w"], scale=scale, use_qk_l2norm_in_kernel=True,
+                          disable_recompute=True, state_v_first=state_v_first)[0]
+    actual_leaves = {name: tensor.clone().requires_grad_() for name, tensor in tensors.items()}
+    actual_decay = {name: None if value is None else value.clone().requires_grad_() for name, value in decay.items()}
+    actual = ops.chunk_gdn2_training(*(actual_leaves[n] for n in "qkvgbw"), scale=scale, state_v_first=state_v_first,
+                                     **actual_decay)
+    # Gradients leave both operators in bf16. The in-kernel gate cumsum accumulates the same fp32 sums
+    # in a different order, and its dt_bias gradient reduces the bf16 dg instead of the frontend's fp32
+    # dg; single-ulp bf16 differences, about 4e-3 per element, reach the norm-relative comparison as
+    # a few 1e-3.
+    tolerance = 4e-3 if gate_in_kernel else 1e-3
+    if gate_in_kernel:
+        relative(actual, expected, tolerance, "output")
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    do = torch.randn_like(expected)
+    expected.backward(do)
+    actual.backward(do)
+    for name in "qkvgbw":
+        relative(actual_leaves[name].grad, expected_leaves[name].grad, tolerance, name)
+        assert actual_leaves[name].grad.dtype == tensors[name].dtype
+    for name in ("A_log", "dt_bias"):
+        if gate_in_kernel:
+            relative(actual_decay[name].grad, expected_decay[name].grad, tolerance, name)
+            assert actual_decay[name].grad.dtype == torch.float32 and expected_decay[name].grad.norm() > 0
+
+
+@pytest.mark.parametrize("state_v_first,gate_in_kernel", KERNEL_OPTIONS)
+def test_whole_graph_custom_ops_model_matches_graph_break_model(state_v_first, gate_in_kernel):
+    actual = model(state_v_first=state_v_first, custom_ops=True, gate_in_kernel=gate_in_kernel).train()
+    reference = model(state_v_first=state_v_first).train()
+    assert actual.state_dict().keys() == reference.state_dict().keys()
+    for (name, left), (_, right) in zip(actual.named_parameters(), reference.named_parameters()):
+        torch.testing.assert_close(left, right, rtol=0, atol=0, msg=name)
+    tokens = torch.randint(32, (2, 128), device="cuda", dtype=torch.int32)
+    targets = torch.randint(32, tokens.shape, device="cuda")
+    # Graph-break counters are process-global: audit each model before the
+    # other one compiles.
+    actual_loss = CompiledGatedDeltaLoss(actual, 64)
+    assert actual_loss.fullgraph
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        observed = actual_loss(tokens, targets)
+    observed.backward()
+    assert actual_loss.audit_graph_breaks() == {}
+    reference_loss = CompiledGatedDeltaLoss(reference, 64)
+    assert not reference_loss.fullgraph
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        expected = reference_loss(tokens, targets)
+    expected.backward()
+    assert len(reference_loss.audit_graph_breaks()) == 3
+    torch.testing.assert_close(observed, expected, rtol=1e-4, atol=.003)
+    references = dict(reference.named_parameters())
+    for name, parameter in actual.named_parameters():
+        relative(parameter.grad, references[name].grad, .01, name)

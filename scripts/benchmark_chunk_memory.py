@@ -80,22 +80,25 @@ def optimizers(model):
 
 def benchmark(model, inputs, targets, *, microbatch, chunk_size, repeats, warmups=5,
               validation_microbatch=None):
+    rows, seq_len = inputs.shape
+    if targets.shape != inputs.shape or inputs.numel() != 524288 or rows % microbatch:
+        raise ValueError("Benchmark requires complete microbatches totaling 524288 tokens")
     model = model.cuda().train()
     loss_fn = CompiledFullLoss(model, segment_size=chunk_size)
     opts = optimizers(model)
     validation = None
     if validation_microbatch is not None:
         model.eval()
-        validation = CUDAGraphValidation(loss_fn, batch_size=validation_microbatch, seq_len=1024)
+        validation = CUDAGraphValidation(loss_fn, batch_size=validation_microbatch, seq_len=seq_len)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             validation.replay(inputs[:validation_microbatch], targets[:validation_microbatch])
         model.train()
-    graph = CUDAGraphMicrobatch(loss_fn, batch_size=microbatch, seq_len=1024)
+    graph = CUDAGraphMicrobatch(loss_fn, batch_size=microbatch, seq_len=seq_len)
 
     def update():
         graph.zero_grad()
         loss_sum = torch.zeros((), device="cuda")
-        for row in range(0, 512, microbatch):
+        for row in range(0, rows, microbatch):
             loss_sum += graph.replay(inputs[row:row + microbatch], targets[row:row + microbatch])
         gradient_max = torch.stack(torch._foreach_norm(
             [p.grad for p in model.parameters()], float("inf"))).amax()
@@ -119,7 +122,8 @@ def benchmark(model, inputs, targets, *, microbatch, chunk_size, repeats, warmup
         samples.append(time.perf_counter() - started)
         losses.append(float(loss) / 524288)
     median = statistics.median(samples)
-    result = dict(model_config=model.config, microbatch=microbatch,
+    result = dict(model_config=model.config, microbatch=microbatch, seq_len=seq_len,
+                  validation_seq_len=seq_len, microsteps_per_update=rows // microbatch,
                   chunk_size=chunk_size, slots=model.config.get("slots"),
                   parameters=sum(p.numel() for p in model.parameters()),
                   tokens_per_second=524288 / median, median_update_seconds=median,

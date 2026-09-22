@@ -21,7 +21,7 @@ import sentencepiece as spm
 import torch
 import torch.nn.functional as F
 
-from pretraining.nanogpt_mini.gated_delta_model import GatedDeltaGPT
+from pretraining.nanogpt_mini.gated_delta_model import build_gated_delta_model
 from pretraining.nanogpt_mini.gated_delta_runtime import (
     CompiledGatedDeltaLoss, gdn2_dependency_provenance,
 )
@@ -63,6 +63,54 @@ class ObservedForward:
             observed.append((b, w, log_decay.view_as(b), k, branch))
         logits = model.logits(model.norm2(x))
         return logits, tuple(observed)
+
+
+class CanonicalLogits:
+    """Uninstrumented model path, retaining logits for numerical attribution."""
+    def __init__(self, model):
+        self.model = model
+        self.compiled = torch.compile(self.forward, fullgraph=False, dynamic=False)
+
+    def forward(self, tokens):
+        hidden, _ = self.model.forward_hidden(tokens, segment_size=64)
+        return self.model.logits(hidden)
+
+
+def numerical_comparison(observed, reference, targets, canonical_loss):
+    # Returning intermediate statistics can change Inductor fusion and BF16
+    # rounding. Measure logits and token losses, not only cancellation in sum CE.
+    delta = observed.float() - reference.float()
+    observed_ce = F.cross_entropy(observed.flatten(0, 1), targets.flatten(), reduction="none")
+    reference_ce = F.cross_entropy(reference.flatten(0, 1), targets.flatten(), reduction="none")
+    ce_delta = observed_ce - reference_ce
+    reference_rms = reference.float().square().mean().sqrt()
+    relative_rms = delta.square().mean().sqrt() / reference_rms.clamp_min(1e-12)
+    # CE is 2-Lipschitz in the infinity norm; this also detects inconsistent
+    # target/position alignment independently of the aggregate CE criterion.
+    token_bound = 2 * delta.abs().amax(-1).flatten()
+    metrics = dict(logit_reference_rms=float(reference_rms),
+                   logit_relative_rms_error=float(relative_rms),
+                   logit_absolute_error=distribution(delta.abs()),
+                   logit_max_absolute_error=float(delta.abs().max()),
+                   token_ce_absolute_error=distribution(ce_delta.abs()),
+                   observed_ce_sum=float(observed_ce.sum()),
+                   reference_logits_ce_sum=float(reference_ce.sum()),
+                   canonical_compiled_ce_sum=float(canonical_loss),
+                   observed_ce_relative_error=float((observed_ce.sum() - canonical_loss).abs()
+                                                    / canonical_loss.abs().clamp_min(1e-12)),
+                   reference_ce_relative_error=float((reference_ce.sum() - canonical_loss).abs()
+                                                     / canonical_loss.abs().clamp_min(1e-12)),
+                   ce_lipschitz_violation=float((ce_delta.abs() - token_bound).clamp_min(0).max()),
+                   bounds=dict(logit_relative_rms_error=.01, aggregate_ce_relative_error=.001,
+                               ce_lipschitz_roundoff=1e-5),
+                   interpretation="Diagnostic BF16 equivalence bounds, not bitwise parity or a quality acceptance threshold")
+    finite = bool(torch.isfinite(observed).all() & torch.isfinite(reference).all()
+                  & torch.isfinite(canonical_loss))
+    metrics["passed"] = (finite and metrics["logit_relative_rms_error"] <= .01
+                         and metrics["observed_ce_relative_error"] <= .001
+                         and metrics["reference_ce_relative_error"] <= .001
+                         and metrics["ce_lipschitz_violation"] <= 1e-5)
+    return metrics, reference_ce.view_as(targets)
 
 
 def distribution(x):
@@ -210,7 +258,7 @@ def main():
     sources += [p for p in (ROOT / "pretraining/gated_delta/vendor").rglob("*") if p.is_file() and "__pycache__" not in p.parts]
     report = dict(status="running", optimizer_updates=0, rows=row_ids.tolist(), seq_len=1024,
                   sample_tokens=targets.numel(), sample_bytes=int(byte_counts.sum()),
-                  checkpoint_sha256=checkpoint_hash, checkpoint=str(checkpoint_path),
+                  checkpoint_sha256=checkpoint_hash, checkpoint_path=str(checkpoint_path),
                   tokenizer_sha256=digest(tokenizer_path), validation_shard_sha256=digest(loader.files[loader.shard_index]),
                   model_config=checkpoint["model_config"], torch=str(torch.__version__), gpu=torch.cuda.get_device_name(),
                   installed_fla=gdn2_dependency_provenance(),
@@ -220,6 +268,8 @@ def main():
                            "Keys reconstructed with FLA normalization epsilon; covariance is uncentered across sampled rows.",
                            "Initialization can have zero upstream gradients because the LM output weight starts at zero.",
                            "Diagnostic projections/convolutions are duplicated; no throughput claims.",
+                           "Instrumentation may alter BF16 compiler fusion; numerical errors are recorded against uninstrumented compiled logits and CE.",
+                           "Reported sample loss bins use uninstrumented compiled logits; layer observables use the instrumented path.",
                            "Gradient norms use mean CE and are not Muon/Adam update magnitudes."])
     for p in sources:
         destination = args.output / "source" / p.relative_to(ROOT)
@@ -230,16 +280,21 @@ def main():
     try:
         for arm in ("initialization", "checkpoint"):
             torch.manual_seed(training["seed"])
-            model = GatedDeltaGPT(**checkpoint["model_config"]).cuda().eval()
+            model = build_gated_delta_model(checkpoint["model_config"]).cuda().eval()
             if arm == "checkpoint":
                 model.load_state_dict(checkpoint["model"], strict=True)
             wrapper = ObservedForward(model)
+            canonical_logits = CanonicalLogits(model)
             audit = CompiledGatedDeltaLoss(model, 64)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
                 logits, observations = wrapper.compiled(inputs)
-                per_token = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), reduction="none").view_as(targets)
+                reference_logits = canonical_logits.compiled(inputs)
                 canonical = audit(inputs, targets)
-                torch.testing.assert_close(per_token.sum(), canonical, rtol=2e-5, atol=.01)
+                parity, per_token = numerical_comparison(logits, reference_logits, targets, canonical)
+            report.setdefault("numerical_comparisons", {})[arm] = parity
+            atomic_json(path, report)
+            if not parity["passed"]:
+                raise RuntimeError(f"Instrumented BF16 comparison failed: {parity}")
             audit.audit_graph_breaks()
             layers = [layer_statistics(value) for value in observations]
             bins = [dict(start=start, end=start + 128,
@@ -249,7 +304,7 @@ def main():
                     for start in range(0, 1024, 128)]
             arm_result = dict(sample_bpb=float(per_token.double().sum() / (math.log(2) * byte_counts.sum())),
                               position_bins=bins, layers=layers)
-            del logits, observations, per_token, canonical, wrapper, audit
+            del logits, reference_logits, observations, per_token, canonical, wrapper, canonical_logits, audit
             gc.collect()
             arm_result["gradients"] = gradients(model, inputs, targets)
             report[arm] = arm_result

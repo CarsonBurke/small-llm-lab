@@ -164,3 +164,13 @@ def test_reference_requires_verified_complete_validation_panel(reference_fixture
     else:
         reference["val_entries"][-1]["val_bpb"] += 0.01
     assert not check()[1]
+
+
+def test_four_k_cannot_claim_matched_one_k_reference(reference_fixture):
+    args, _, check = reference_fixture
+    args.seq_len = 4096
+    _, matched, metadata = check()
+    assert not matched
+    assert not metadata['matched_fields']['seq_len']
+    assert metadata['comparison_scope'] == 'same_token_panel_different_context'
+    assert metadata['run_train_seq_len'] == metadata['run_val_seq_len'] == 4096

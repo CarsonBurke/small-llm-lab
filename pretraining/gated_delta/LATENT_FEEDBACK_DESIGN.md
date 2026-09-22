@@ -183,7 +183,7 @@ Existing complete-update measurements are recorded in [README.md](README.md):
 
 These are not measurements of the proposed shared-bank architecture. In
 particular, the scalar quality failure is not a GDN v2 quality result.
-The historical `run_optimal_gdn2_ablation.py` is a different vocabulary/hybrid
+The historical `run_optimal_gdn2_ablation.py` (removed 2026-09-22; in git history) is a different vocabulary/hybrid
 experiment, requests 2,000 updates, and is not a suitable launcher. Its
 isolated-kernel win did not establish a whole-model win.
 

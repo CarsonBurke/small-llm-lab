@@ -1,0 +1,25 @@
+{
+  "autotune_entries": {
+    "fa10a47733a5a8c705694dbadf942a80": {
+      "autotune_key": [
+        4,
+        128,
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.float32",
+        "torch.float32",
+        "torch.float32",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {},
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 32
+      }
+    }
+  },
+  "kernel_name": "kda_gate_bwd_kernel",
+  "triton_version": "3.7.1"
+}

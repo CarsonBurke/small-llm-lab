@@ -1,0 +1,33 @@
+{
+  "autotune_entries": {
+    "b5442291c76bdae9b8993abe434ffbd4": {
+      "autotune_key": [
+        32,
+        4,
+        64,
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.float32",
+        "torch.float32",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.float32",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {},
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 1
+      }
+    }
+  },
+  "kernel_name": "chunk_gdn2_bwd_kernel_intra",
+  "triton_version": "3.7.1"
+}

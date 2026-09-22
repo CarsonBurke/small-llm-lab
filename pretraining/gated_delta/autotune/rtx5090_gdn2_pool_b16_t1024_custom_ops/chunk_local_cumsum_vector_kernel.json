@@ -1,0 +1,94 @@
+{
+  "autotune_entries": {
+    "41dfad0acea3494b5a86618d77e28b72": {
+      "autotune_key": [
+        16,
+        4,
+        128,
+        64,
+        false,
+        false,
+        "torch.float32",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {
+          "BS": 32
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 8
+      }
+    },
+    "830478d6091e28a430b371c2a8381516": {
+      "autotune_key": [
+        1,
+        4,
+        128,
+        64,
+        true,
+        true,
+        "torch.float32",
+        "torch.float32",
+        "torch.int32",
+        "torch.int32"
+      ],
+      "config": {
+        "kwargs": {
+          "BS": 16
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 8
+      }
+    },
+    "9bdf61e7456b4993fc6e701c3c1d9978": {
+      "autotune_key": [
+        16,
+        4,
+        128,
+        64,
+        false,
+        true,
+        "torch.float32",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {
+          "BS": 32
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4
+      }
+    },
+    "bff64addb29fd83f99ae18a1f74d3889": {
+      "autotune_key": [
+        1,
+        4,
+        128,
+        64,
+        true,
+        false,
+        "torch.float32",
+        "torch.float32",
+        "torch.int32",
+        "torch.int32"
+      ],
+      "config": {
+        "kwargs": {
+          "BS": 16
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 8
+      }
+    }
+  },
+  "kernel_name": "chunk_local_cumsum_vector_kernel",
+  "triton_version": "3.7.1"
+}

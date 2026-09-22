@@ -7,10 +7,11 @@
   "files": {
     "gdn2.py": {
       "upstream_path": "lit_gpt/gdn2.py",
-      "sha256": "33f7b0e2e91f0c0035bf6dfef11d1a3beba44ab42e882543bb79f8ef3e807254",
+      "sha256": "c043c1c3e0c1fe412e3af1111e7407db9c79956e769952669f5f8e22f6f4333e",
       "modifications": [
         "Add _project_inputs hook for the seven independent first projections after optional unpadding; forward consumes its outputs while second f/g linears remain at their original stages. No recurrence, convolution, cache, initialization, or parameter-key changes.",
-        "Add _chunk_recurrence and _recurrent_recurrence dispatch hooks; forward calls the hooks with unchanged arguments. The model execution subclass can select installed FLA kernels, state layout and backward recomputation schedule without copying the frontend or modifying any kernel."
+        "Add _chunk_recurrence and _recurrent_recurrence dispatch hooks; forward calls the hooks with unchanged arguments. The model execution subclass can select installed FLA kernels, state layout and backward recomputation schedule without copying the frontend or modifying any kernel.",
+        "Add _log_decay hook computing the channel-wise fp32 log-decay exactly as before; forward calls it with the selected kernel mode. The execution subclass can hand the raw decay projection to installed FLA chunk kernels that compute the same gate in-kernel. No arithmetic, initialization, or parameter-key changes."
       ],
       "upstream_sha256": "5d93765adcb4e9bf755e7d4160a01d4e2ee8438ec55759d17903223dd18b0324"
     },
@@ -44,7 +45,7 @@
     "fla-core": "0.5.2",
     "flash-linear-attention": "0.5.2"
   },
-  "integration": "Official fused-recurrent kernel copied byte-for-byte. Mixer has a documented input-projection hook; chunk kernel has two helper-import relocations to the fla-core 0.5.2 compatibility adapter. The optional fused model subclass packs existing independent Parameters each forward; no persistent packed weights.",
+  "integration": "Official fused-recurrent kernel copied byte-for-byte. Mixer has documented input-projection, log-decay and recurrence-dispatch hooks; chunk kernel has two helper-import relocations to the fla-core 0.5.2 compatibility adapter. The optional fused model subclass packs existing independent Parameters each forward; no persistent packed weights.",
   "runtime_requirements": {
     "convolution_backend": "triton",
     "FLA_CONV_BACKEND": "unset or triton; model wrapper rejects other effective backends"

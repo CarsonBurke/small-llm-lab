@@ -103,7 +103,9 @@ class MiniInference:
             q, k = F.rms_norm(q, (128,)), F.rms_norm(k, (128,))
             q, k = attention.rotary(q).transpose(1, 2), attention.rotary(k).transpose(1, 2)
             v = v.transpose(1, 2).contiguous()
-            k = k.contiguous()
+            # RMSNorm/RoPE retain FP32 here, but autocast SDPA consumes BF16.
+            # Persist that effective attention input instead of a FP32 cache.
+            k = k.to(torch.bfloat16).contiguous()
             output = F.scaled_dot_product_attention(q, k, v, scale=.12, is_causal=True)
             x = x + attention.proj(output.transpose(1, 2).contiguous().view(*tokens.shape, 512))
             x = x + block.mlp(block.norm2(x))
@@ -227,7 +229,7 @@ def benchmark_case(architecture, batch, prefix, repeats, checkpoint_path=None):
     weights = "random_nonzero_output_projections"
     if checkpoint_path is not None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        if checkpoint.get("model_config") != model.config:
+        if checkpoint["model_config"] != model.config:
             raise ValueError(f"Checkpoint configuration differs for {architecture}")
         model.load_state_dict(checkpoint["model"], strict=True)
         weights = dict(checkpoint=str(checkpoint_path), sha256=sha256(checkpoint_path))
@@ -254,6 +256,8 @@ def benchmark_case(architecture, batch, prefix, repeats, checkpoint_path=None):
         deployment_error = parity(expected, original_precision_logits, "persistent BF16 versus original parameters")
     if architecture == "plain_mini":
         original_states = tuple(F.pad(tensor, (0, 0, 0, 1)) for tensor in original_states)
+        if any(tensor.dtype != torch.bfloat16 for tensor in original_states):
+            raise AssertionError("Mini deployment requires BF16 keys and values")
     reference_states = tuple(tensor.clone() for tensor in original_states)
     states = tuple(tensor.clone() for tensor in original_states)
 
@@ -309,6 +313,8 @@ def benchmark_case(architecture, batch, prefix, repeats, checkpoint_path=None):
                   cached_next_token=decode_graph.measure(repeats, batch),
                   cache_tensor_bytes=sum(t.numel() * t.element_size() for t in states),
                   cache_bytes_per_document=sum(t.numel() * t.element_size() for t in states) // batch,
+                  cache_storage_contract=("BF16_keys_and_values_after_RoPE" if architecture == "plain_mini"
+                                          else "FP32_recurrence_and_BF16_short_convolution"),
                   cache_tensors=[dict(shape=list(t.shape), dtype=str(t.dtype), bytes=t.numel() * t.element_size()) for t in states],
                   peak_allocated_mib=torch.cuda.max_memory_allocated() / 2**20,
                   peak_reserved_mib=torch.cuda.max_memory_reserved() / 2**20)
@@ -336,6 +342,9 @@ def main(argv=None):
         raise RuntimeError("CUDA BF16 required; submit through mlq")
     torch._dynamo.config.suppress_errors = False
     torch._dynamo.config.fail_on_recompile_limit_hit = True
+    # Six static cache layer indices specialize separately for prefill and
+    # decode. Allow that bounded set; never fall back on a cache-limit hit.
+    torch._dynamo.config.recompile_limit = 32
     args.output.mkdir(parents=True, exist_ok=False)
     paths = [Path(__file__), ROOT / "scripts/benchmark_chunk_memory.py", ROOT / "scripts/train_recurrent_slots.py"]
     paths += [ROOT / "pretraining/nanogpt_mini" / name for name in

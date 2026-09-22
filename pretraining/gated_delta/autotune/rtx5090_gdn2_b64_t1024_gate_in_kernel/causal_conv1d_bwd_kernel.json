@@ -1,0 +1,28 @@
+{
+  "autotune_entries": {
+    "0ae5562e74b714e831d4f34c08591a9e": {
+      "autotune_key": [
+        512,
+        4,
+        64,
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {
+          "BD": 32
+        },
+        "maxnreg": null,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4
+      }
+    }
+  },
+  "kernel_name": "causal_conv1d_bwd_kernel",
+  "triton_version": "3.7.1"
+}
