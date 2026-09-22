@@ -9,19 +9,21 @@ import pytest
 import torch
 from torch import nn
 
-import postraining.minicpm_vapo as vapo
-from postraining.minicpm_vapo import (
+import postraining.vapo.policy as vapo
+from postraining.vapo.model import readout as readout_module
+from postraining.vapo.model.hf import HFCausalTrunk, HFModelSpec
+from postraining.vapo.policy import (
     CONTINUE_THOUGHT,
     FIRST_THOUGHT,
     FORCED_STOP_THINKING,
+    VAPOCritic,
+    VAPOPolicy,
     STOP_THINKING,
     TOKEN_ACTION,
-    LoRAConfig,
-    MiniCPMVAPOCritic,
-    MiniCPMVAPOPolicy,
     TrajectoryRecord,
     collate_replay_microbatch,
 )
+from postraining.vapo.model.lora import LoRAConfig
 
 
 class _Trunk(nn.Module):
@@ -64,15 +66,29 @@ class _LM(nn.Module):
         return self.model.embed_tokens
 
 
+
+TEST_SPEC = HFModelSpec(
+    key="test",
+    model_id="test/fixture",
+    revision="0" * 40,
+    vocab_size=17,
+    requires_chat_template=False,
+)
+
+
+def _trunk(model):
+    """Wrap a fixture causal LM in the Hugging Face trunk adapter."""
+    return HFCausalTrunk(model, TEST_SPEC)
+
+
 @pytest.fixture
 def models(monkeypatch):
-    monkeypatch.setattr(vapo, "MINICPM5_VOCAB_SIZE", 17)
     torch.manual_seed(83)
     base = _LM()
     config = LoRAConfig(rank=2, alpha=4, targets=("q_proj",))
-    actor = MiniCPMVAPOPolicy(copy.deepcopy(base), config, latent_thinking=True)
-    critic = MiniCPMVAPOCritic(
-        copy.deepcopy(base), config, critic_width=5, latent_thinking=True
+    actor = VAPOPolicy(_trunk(copy.deepcopy(base)), config, latent_thinking=True)
+    critic = VAPOCritic(
+        _trunk(copy.deepcopy(base)), config, critic_width=5, latent_thinking=True
     )
     # ValueHead intentionally starts at zero; train its readout away from zero
     # so this test measures the gradient path into the independent adapter.
@@ -312,13 +328,13 @@ def test_action_likelihood_scores_only_phase_distribution_and_trains_heads(
     batch = _batch(_record())
     hidden = torch.randn(batch.action_count, 4, requires_grad=True)
     projected = []
-    original = vapo.chunked_frozen_head_logprobs
+    original = readout_module.chunked_frozen_head_logprobs
 
     def lexical(states, targets, weight, *, chunk_tokens):
         projected.append(states.shape[0])
         return original(states, targets, weight, chunk_tokens=chunk_tokens)
 
-    monkeypatch.setattr(vapo, "chunked_frozen_head_logprobs", lexical)
+    monkeypatch.setattr(readout_module, "chunked_frozen_head_logprobs", lexical)
     actual = actor.action_logprobs(hidden, batch, chunk_tokens=2)
     mean = actor.transition.predict_mean(hidden[:2])
     gaussian = actor.transition.log_prob(
@@ -432,11 +448,10 @@ def test_latent_checkpoint_restores_behavior_and_rejects_mode_config_or_head_mis
 
 def test_native_payload_and_replay_remain_separate(models):
     actor, _ = models
-    native = MiniCPMVAPOPolicy(_LM(), actor.lora_config)
+    native = VAPOPolicy(_trunk(_LM()), actor.lora_config)
     payload = native.checkpoint_payload()
     assert set(payload) == {
-        "model_id",
-        "revision",
+        "trunk",
         "lora_config",
         "lora_modules",
         "nextlat_projection_factor",

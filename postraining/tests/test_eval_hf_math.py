@@ -189,7 +189,7 @@ def test_vapo_adapter_evaluation_loads_bf16_policy_weights(tmp_path) -> None:
             ):
                 setattr(self, name, nn.Linear(4, 4, bias=False))
 
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.model.lora import (
         LoRAConfig,
         adapter_state_dict,
         inject_lora,

@@ -39,9 +39,47 @@ scratch pages (see ``LatentThoughtModel.paged_step``).
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from torch import Tensor
+
+# fla dispatches the KDA chunked backward to its TileLang backend by default,
+# and in this environment that backend cannot run: TileLang vendors its own
+# TVM while tvm_ffi is also installed standalone, so both register the FFI
+# TypeAttr ``__ffi_repr__`` for the same TVM type index. The first backward
+# then dies with "TypeAttr `__ffi_repr__` is already registered for type
+# index 132" and the process deadlocks unwinding it -- a hang, not a clean
+# crash. fla's Triton KDA backward is its reference implementation and is
+# what every KDA run in this repository already uses; the pretraining
+# ablations and GPU tests all pin FLA_TILELANG=0 the same way. Forward-only
+# paths never notice, which is why this only ever bites training.
+#
+# fla caches BaseBackend.can_use() per class, and that cache is populated
+# when ``fla.ops.kda.backends`` is imported, so this must be set before the
+# first KDA op runs. Importing this module is that point: it is the only way
+# a KDA checkpoint enters the post-training stack.
+os.environ.setdefault("FLA_TILELANG", "0")
+
+
+def _assert_kda_backward_is_usable() -> None:
+    """Fail loudly if the unusable TileLang KDA backend won the dispatch.
+
+    Setting the environment variable above is only effective while fla's
+    cached capability check has not run yet. If some earlier import already
+    resolved it the other way, the run would otherwise proceed to its first
+    backward and hang there instead of saying why.
+    """
+    from fla.ops.kda.backends.tilelang import KDATileLangBackend
+
+    if KDATileLangBackend.can_use():
+        raise RuntimeError(
+            "fla resolved the TileLang KDA backend, whose backward cannot "
+            "run here (duplicate TVM FFI __ffi_repr__ registration). "
+            "FLA_TILELANG=0 must be set before fla.ops.kda.backends is "
+            f"first imported; it is currently "
+            f"{os.environ.get('FLA_TILELANG')!r}."
+        )
 
 from pretraining.nanogpt_mini import nanogpt_mini_kda_model as kda_model
 from postraining.nano_backbone import _NanoPostrainingMixin
@@ -51,6 +89,7 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
     """KDA-mixer nanogpt-mini trunk with the post-training interface."""
 
     def __init__(self, **model_config):
+        _assert_kda_backward_is_usable()
         super().__init__(**model_config)
         self._finalize_construction(
             model_config["num_layers"], model_config["model_dim"]

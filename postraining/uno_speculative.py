@@ -13,7 +13,7 @@ from postraining.fast_inference import (
     PromptPrefixBank,
     _CompactStaticLayer,
 )
-from postraining.minicpm_vapo import MiniCPMVAPOPolicy
+from postraining.vapo.policy import VAPOPolicy
 from postraining.invariant_linear import compile_invariant
 from postraining.uno import attach_uno_adapters, load_uno_adapter
 
@@ -192,7 +192,7 @@ class UnoTrainingRolloutEngine(CapturedTrainingRolloutEngine):
 
     def __init__(
         self,
-        source_policy: MiniCPMVAPOPolicy,
+        source_policy: VAPOPolicy,
         *,
         uno_checkpoint: str,
         uno_block_size: int = 4,

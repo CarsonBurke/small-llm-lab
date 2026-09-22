@@ -33,13 +33,13 @@ from postraining.invariant_linear import (
     OPTIMIZED_ARITHMETIC,
     compile_invariant,
 )
-from postraining.minicpm_vapo import (
+from postraining.vapo.policy import (
     CONTINUE_THOUGHT,
     FIRST_THOUGHT,
     FORCED_STOP_THINKING,
     STOP_THINKING,
     TOKEN_ACTION,
-    MiniCPMVAPOPolicy,
+    VAPOPolicy,
 )
 
 
@@ -75,7 +75,7 @@ class _LatentStateDecoder:
 
     def __init__(
         self,
-        policy: MiniCPMVAPOPolicy,
+        policy: VAPOPolicy,
         batch_size: int,
         cache_length: int,
         compile_decode: bool,
@@ -566,7 +566,7 @@ class MiniCPMLatentRolloutEngine:
 
     def __init__(
         self,
-        policy: MiniCPMVAPOPolicy,
+        policy: VAPOPolicy,
         *,
         stop_ids: Sequence[int],
         thinking_start_token_id: int,
@@ -693,7 +693,7 @@ class MiniCPMLatentRolloutEngine:
         self._answer = compile_head(answer) if compile_decode else answer
 
     @torch.no_grad()
-    def synchronize_from(self, policy: MiniCPMVAPOPolicy) -> None:
+    def synchronize_from(self, policy: VAPOPolicy) -> None:
         if not getattr(policy, "latent_thinking", False):
             raise ValueError("cannot refresh latent rollout from a token-only policy")
         self._release_decode_storage()

@@ -20,6 +20,45 @@ ANSWER_FIELD_INSTRUCTIONS = (
     'Remember to put your answer on its own line after "Answer:".',
 )
 
+# openbmb/UltraData-RL-2609 prompts are rendered with the MiniCPM5 chat
+# template, which appends a boxed-answer contract and a literal context
+# budget.  The budget sentence is not merely redundant here: it states 9k
+# tokens, which is false for every model in this repository, so leaving it in
+# a prompt would train the policy against a context it does not have.
+ULTRADATA_REASONING_INSTRUCTION = (
+    "Please reason step by step, and put your final answer within \\boxed{}."
+)
+ULTRADATA_FINAL_ANSWER_INSTRUCTION = (
+    "After any reasoning, give the final answer as Answer: \\boxed{...}, "
+    "replacing ... with only the answer."
+)
+ULTRADATA_BUDGET_SUFFIX = "You have a budget of 9k tokens"
+# "The input will be given via stdin and the output should be printed to
+# stdout by your code." is deliberately NOT registered: that sentence occurs
+# inside competitive-programming problem statements as well as in the
+# template, and unconditional removal would mutilate the problem body.
+ULTRADATA_CODE_INSTRUCTIONS = (
+    "End with the complete executable Python program in one ```python fenced "
+    "code block. Read standard input and write standard output.",
+    "Now solve the problem by providing the code.",
+)
+
+# Registered because it survived canonicalization: the Chinese answer-field
+# clause removes the "Answer:" half of these prompts, after which neither the
+# Answer: demand nor the context-budget check can see the remaining
+# output-format sentence, and it was reaching "bare" problems as their tail.
+ULTRADATA_CHINESE_OUTPUT_FORMAT = (
+    "如果是选择题，请按顺序输出正确的选项，不带任何标点或空格。"
+    "对于其他类型的问题，请只输出最终答案的数值。"
+)
+ULTRADATA_SOURCE_INSTRUCTIONS = (
+    ULTRADATA_REASONING_INSTRUCTION,
+    ULTRADATA_FINAL_ANSWER_INSTRUCTION,
+    ULTRADATA_BUDGET_SUFFIX,
+    ULTRADATA_CHINESE_OUTPUT_FORMAT,
+    *ULTRADATA_CODE_INSTRUCTIONS,
+)
+
 CHINESE_ANSWER_FIELD_INSTRUCTION = (
     "请以“Answer: \\boxed{<final_answer>}”的格式输出最终答案。"
 )
@@ -58,11 +97,25 @@ SOURCE_INSTRUCTIONS = (
     CHINESE_ANSWER_FIELD_INSTRUCTION,
     CHINESE_REASONING_INSTRUCTION,
     *LEGACY_FENCE_INSTRUCTIONS,
+    *ULTRADATA_SOURCE_INSTRUCTIONS,
 )
 
 # The verifier's Answer: field is case-insensitive.  Canonicalization must use
 # the same rule or an unlisted source template could survive silently.
 ANSWER_FIELD_DEMAND = re.compile(r"(?i)answer\s*:")
+
+# A token-budget clause carries no ``Answer:``, so the demand check above
+# cannot see it.  Match the shape rather than the one literal we register: a
+# corpus rebuilt at a different budget must fail closed instead of teaching
+# the policy a context size it does not have.
+CONTEXT_BUDGET_DEMAND = re.compile(
+    r"(?i)you have a budget of\s*\S+\s*tokens"
+)
+
+# Chinese output-format instructions carry no ``Answer:`` once the registered
+# clause is removed, so match their shape rather than the one literal we
+# register: "请...输出...答案" / "请...输出...选项".
+CHINESE_OUTPUT_FORMAT_DEMAND = re.compile(r"请[^。]{0,40}输出[^。]{0,40}(答案|选项)")
 
 
 def require_answer_fence_prompt_schema(
@@ -101,6 +154,18 @@ def strip_math_prompt_framing(content: str) -> tuple[str, int]:
         raise ValueError(
             "answer-fence prompt canonicalization left an Answer: demand "
             f"in place (unlisted instruction template?): {content[:200]!r}"
+        )
+    if CONTEXT_BUDGET_DEMAND.search(content):
+        raise ValueError(
+            "answer-fence prompt canonicalization left a context-budget "
+            "clause in place; register the exact wording rather than "
+            f"training against a false context: {content[:200]!r}"
+        )
+    if CHINESE_OUTPUT_FORMAT_DEMAND.search(content):
+        raise ValueError(
+            "answer-fence prompt canonicalization left a Chinese "
+            "output-format instruction in place (unlisted template?): "
+            f"{content[:200]!r}"
         )
     return content, removed
 

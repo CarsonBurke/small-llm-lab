@@ -23,13 +23,12 @@ import torch
 from torch import Tensor, nn
 
 from postraining.hf_runtime import prepare_text_only_transformers_runtime
-from postraining.minicpm_vapo import (
-    MINICPM5_MODEL_ID,
-    MINICPM5_REVISION,
+from postraining.vapo.model.hf import MINICPM5_SPEC
+from postraining.vapo.model.lora import (
     LoRAConfig,
-    chunked_frozen_head_logprobs,
     inject_lora,
 )
+from postraining.vapo.model.readout import chunked_frozen_head_logprobs
 
 
 QWEN35_MODEL_ID = "Qwen/Qwen3.5-0.8B"
@@ -124,8 +123,8 @@ def load_model(model_key: str, rank: int, alpha: float) -> tuple[Any, dict[str, 
     if model_key == "minicpm":
         from transformers import AutoModelForCausalLM
 
-        model_id = MINICPM5_MODEL_ID
-        revision = MINICPM5_REVISION
+        model_id = MINICPM5_SPEC.model_id
+        revision = MINICPM5_SPEC.revision
         targets = MINICPM_TARGETS
         model = AutoModelForCausalLM.from_pretrained(
             model_id,

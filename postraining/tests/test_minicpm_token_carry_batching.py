@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from postraining.minicpm_vapo import TrajectoryRecord
+from postraining.vapo.policy import TrajectoryRecord
 from postraining.token_carry import TokenCarryCombiner, token_carry_replay_hidden
 import postraining.train_minicpm_vapo as trainer
 
@@ -17,6 +17,7 @@ import postraining.train_minicpm_vapo as trainer
 class _CarrySide(nn.Module):
     token_carry = True
     latent_thinking = False
+    hidden_size = 8
 
     def __init__(self, offset):
         super().__init__()

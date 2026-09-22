@@ -26,7 +26,7 @@ import triton
 import triton.language as tl
 
 from postraining.fast_inference import _FusedFirstProjection, _FusedProjectionSlice
-from postraining.minicpm_vapo import LoRALinear
+from postraining.vapo.model.lora import LoRALinear
 
 
 @triton.jit

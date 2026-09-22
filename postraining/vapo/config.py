@@ -7,6 +7,11 @@ import math
 from pathlib import Path
 
 from postraining.benchmark_report import CAPTURE_SAMPLES_PER_PROBLEM
+from postraining.latent_thought import (
+    DEFAULT_INIT_STOP_THINKING_PROBABILITY,
+    DEFAULT_THOUGHT_SIGMA,
+)
+from postraining.reasoning_modes import REASONING_MODES
 
 
 # One 8-row eval batch at the 1024-token guard sequence length. The guard is
@@ -72,7 +77,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument(
         "--rl-mixture-manifest",
-        default="postraining/data/vapo_broad_v6_bare.manifest.json",
+        default="postraining/data/vapo_broad_v9_bare.manifest.json",
         help="immutable multi-source verifier manifest whose exact source "
         "quotas replace --math-data (pass an empty string for a single "
         "--math-data source)",
@@ -85,10 +90,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # The reasoning mode fixes the rollout policy family for the whole run:
     # "latent" takes one mandatory raw Gaussian THINK action, then samples a
     # one-way continuation gate until STOP_AND_EMIT; "cot" and "none" are
-    # token-only controls that bypass the entire gate/noise/thought path.
+    # token-only controls that bypass the entire gate/noise/thought path;
+    # "carry" is the deterministic hidden carry: a token-only policy whose
+    # generated-token inputs add, through a zero-init combiner, the detached
+    # belief that produced each token.
     parser.add_argument(
         "--reasoning-mode",
-        choices=("latent", "cot", "none"),
+        choices=REASONING_MODES,
         default="latent",
     )
     # none-mode emission budget: the final answer value plus its terminator.
@@ -179,60 +187,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # as the actor. The critic trunk is from scratch, so its constant rate can
     # be ablated independently without changing the actor.
     parser.add_argument("--critic-muon-learning-rate", type=float, default=None)
+    # The critic trunk's starting weights. "scratch" is a random instance of
+    # the actor's architecture; "actor" is a storage-independent copy of the
+    # actor's weights at run start (VAPO initializes its critic from a
+    # pretrained LM-based reward model, never randomly). Either way the value
+    # head is zero-initialized and nothing is shared with the actor.
+    parser.add_argument(
+        "--critic-init", choices=("scratch", "actor"), default="scratch"
+    )
     # Trunk-optimizer migration: resume model/critic/step/prompt-cursor from
     # a checkpoint whose optimizer layout differs, starting all optimizer
     # state empty instead of loading it.
     parser.add_argument(
         "--reset-optimizers-on-resume", action="store_true"
     )
-    # With the anchored support (default): interior divisions of [0, 1], so
-    # bin width is 1/value_bins and the total head width is
-    # value_bins + 1 + 2 * value_margin_bins. With --no-value-anchored-support:
-    # the legacy total bin count over [0, 1] edges.
-    parser.add_argument("--value-bins", type=int, default=101)
-    # Dreamer3's exact-zero bucket generalized to both ends of the unit
-    # target range: 0 and 1 become bin CENTERS with margin bins beyond each,
-    # so the dominant exact-0/exact-1 verifier targets project symmetrically
-    # instead of decoding a truncation bias ~0.8*sigma inward.
-    parser.add_argument(
-        "--value-anchored-support",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    # Bins beyond each anchor. margin + 0.5 half-widths must cover >= 3 sigma
-    # of the label Gaussian or the truncation bias the anchors exist to
-    # remove comes back through the support edge.
-    parser.add_argument("--value-margin-bins", type=int, default=4)
-    # HL-Gauss projection sigma as a fraction of bin width. cleanrl v215 /
-    # Dreamer4 used 2.0; the dg_v25 critic ablations walked it down (0.75,
-    # then 0.5 on a much coarser grid), and sharper labels also shrink what
-    # remains of any boundary bias proportionally.
-    parser.add_argument("--value-sigma-ratio", type=float, default=1.0)
-    # Head bias starts at the projected prior. The CE loss is a divergence in
-    # DISTRIBUTION space, so the prior belongs on the target distribution's
-    # MODE, not its mean: the optimal constant output is the mixture of
-    # projected targets (~92% of targets are exactly 0), which no single
-    # projected scalar can match, so the best one sits on the dominant mode.
-    # 0 is an exact bin center under the anchored support, so project(0) is
-    # symmetric and untruncated. Measured against the warmup target moments
-    # (mean 0.0136, var 0.0068), KL(optimum || project(prior)) is 0.68 nats at
-    # 0.0, 1.65 at 0.015 (the target MEAN), and 9.84 at the old 0.05 --
-    # which the near-frozen bias (AdamW at 2e-5) then takes many steps to
-    # unwind through head.weight alone.
-    parser.add_argument("--value-prior", type=float, default=0.0)
     # Latent policy noise is specified at vector scale. At runtime width d,
     # components use std = sigma/sqrt(d), hence E||noise||² = sigma².
+    # Both stochastic-policy arguments default to None so an explicit value
+    # outside latent mode can be refused; validate_args fills the recorded
+    # 1.0/0.9 priors for every mode that builds the stochastic heads, which
+    # keeps their resume contract byte-identical. Carry records None.
     parser.add_argument(
         "--thought-sigma",
         type=float,
-        default=1.0,
-        help="expected L2 magnitude scale of isotropic latent-action noise",
+        default=None,
+        help="expected L2 magnitude scale of isotropic latent-action noise "
+        "(sampled only in latent mode; cot and none keep it as a resume field; "
+        "carry refuses it; default 1.0)",
     )
     parser.add_argument(
         "--init-stop-thinking-probability",
         type=float,
-        default=0.9,
-        help="initial Bernoulli STOP probability after the forced first thought",
+        default=None,
+        help="initial Bernoulli STOP probability after the forced first "
+        "thought (sampled only in latent mode; cot and none keep it as a "
+        "resume field; carry refuses it; default 0.9)",
     )
     # Combined-embedding geometry used to adapt raw Gaussian thought slots.
     parser.add_argument("--combined-mlp-blocks", type=int, default=1)
@@ -364,6 +353,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--bench-every", type=int, default=DEFAULT_MATH_EVAL_EVERY
     )
     parser.add_argument("--bench-samples", type=int, default=8)
+    # Training-rollout transcripts (postraining/rollout_report.py): every N
+    # actor steps, the first correct and first incorrect trajectory of each
+    # RL source in that pool. Display only, so not a resume invariant; 0
+    # disables capture.
+    parser.add_argument("--rollout-sample-every", type=int, default=25)
     parser.add_argument(
         "--bench-max-rows",
         type=int,
@@ -707,15 +701,49 @@ def validate_args(
         parser.error("--combined-mlp-blocks must be nonnegative")
     if args.combined_mlp_hidden < 1:
         parser.error("--combined-mlp-hidden must be positive")
-    if not math.isfinite(args.thought_sigma) or args.thought_sigma <= 0.0:
-        parser.error("--thought-sigma must be finite and positive")
-    if (
-        not math.isfinite(args.init_stop_thinking_probability)
-        or not 0.0 < args.init_stop_thinking_probability < 1.0
+    # cot/none build (unused) Gaussian and gate heads whose priors are resume
+    # fields, so they keep accepting the flags exactly as before; only carry,
+    # which builds no such head, refuses them.
+    if args.reasoning_mode == "carry":
+        for flag, value in (
+            ("--thought-sigma", args.thought_sigma),
+            (
+                "--init-stop-thinking-probability",
+                args.init_stop_thinking_probability,
+            ),
+        ):
+            if value is not None:
+                parser.error(
+                    f"{flag} configures the latent-thought policy; "
+                    "--reasoning-mode carry samples no thought or stop gate"
+                )
+    if args.reasoning_mode != "carry":
+        if args.thought_sigma is None:
+            args.thought_sigma = DEFAULT_THOUGHT_SIGMA
+        if args.init_stop_thinking_probability is None:
+            args.init_stop_thinking_probability = (
+                DEFAULT_INIT_STOP_THINKING_PROBABILITY
+            )
+    if args.reasoning_mode == "carry" and (
+        args.rollout_scheduler != "lockstep"
     ):
         parser.error(
-            "--init-stop-thinking-probability must be strictly in (0, 1)"
+            "--reasoning-mode carry requires --rollout-scheduler lockstep: "
+            "continuous refill does not implement the hidden carry"
         )
+    if args.reasoning_mode != "carry":
+        if (
+            not math.isfinite(args.thought_sigma)
+            or args.thought_sigma <= 0.0
+        ):
+            parser.error("--thought-sigma must be finite and positive")
+        if (
+            not math.isfinite(args.init_stop_thinking_probability)
+            or not 0.0 < args.init_stop_thinking_probability < 1.0
+        ):
+            parser.error(
+                "--init-stop-thinking-probability must be strictly in (0, 1)"
+            )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         parser.error("--learning-rate must be finite and positive")
     if args.critic_learning_rate is None:
@@ -879,21 +907,8 @@ def validate_args(
         parser.error("--bench-only-repeats must be positive")
     if args.bench_max_rows < 0:
         parser.error("--bench-max-rows must be nonnegative")
-    if args.value_bins < 1:
-        parser.error("--value-bins must be positive")
-    if args.value_margin_bins < 0:
-        parser.error("--value-margin-bins must be nonnegative")
-    if not math.isfinite(args.value_sigma_ratio) or args.value_sigma_ratio <= 0.0:
-        parser.error("--value-sigma-ratio must be finite and positive")
-    if (
-        args.value_anchored_support
-        and args.value_margin_bins + 0.5 < 3.0 * args.value_sigma_ratio
-    ):
-        parser.error(
-            "--value-margin-bins must give the anchors >= 3 sigma of slack "
-            "(margin + 0.5 >= 3 * sigma_ratio), or boundary targets decode "
-            "the truncation bias the anchored support exists to remove"
-        )
+    if args.rollout_sample_every < 0:
+        parser.error("--rollout-sample-every must be nonnegative")
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
     if args.rl_mixture_manifest and args.exclude_modules:
@@ -952,6 +967,11 @@ def validate_args(
         parser.error(
             "--actor-init, --actor-critic-init, --curriculum-init, and "
             "--resume are mutually exclusive"
+        )
+    if args.critic_init == "actor" and args.actor_critic_init:
+        parser.error(
+            "--critic-init actor conflicts with --actor-critic-init, which "
+            "loads an already-trained critic"
         )
     if args.samples_per_prompt < 1:
         parser.error("--samples-per-prompt must be positive")

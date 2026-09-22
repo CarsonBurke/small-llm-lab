@@ -192,7 +192,7 @@ def test_posttraining_freezes_moe_router_and_uses_dense_fresh_critic() -> None:
     assert [block.use_mlp for block in critic.blocks] == [False, True, False, True]
 
     wrapper = LatentThoughtModel(actor)
-    value_model = SeparateCritic(critic, num_bins=8)
+    value_model = SeparateCritic(critic)
     optimizers = build_optimizers(
         wrapper,
         value_model,
@@ -441,7 +441,7 @@ def test_muon_partition_keeps_conv_windows_and_gates_out_of_muon():
         )
     }
     assert conv_ids.isdisjoint({id(p) for p in matrices})
-    critic = SeparateCritic(_seeded_backbone(4), num_bins=8)
+    critic = SeparateCritic(_seeded_backbone(4))
     for parameter in wrapper.parameters():
         parameter.requires_grad_(True)
     optimizers = build_optimizers(

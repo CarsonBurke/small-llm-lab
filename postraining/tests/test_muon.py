@@ -36,7 +36,7 @@ def _wrapper(seed: int = 3) -> LatentThoughtModel:
 def _critic(wrapper: LatentThoughtModel, seed: int = 11) -> SeparateCritic:
     torch.manual_seed(seed)
     trunk = NanoGPTBackbone(**KWARGS).float()
-    return SeparateCritic(trunk, num_bins=17, sigma_ratio=2.0).eval()
+    return SeparateCritic(trunk).eval()
 
 
 def _newtonschulz12(G: torch.Tensor) -> torch.Tensor:
@@ -651,6 +651,23 @@ def test_build_optimizers_adamw_layout_is_unchanged():
     assert {
         id(p) for p in wrapper.backbone.blocks.parameters() if p.ndim >= 2
     } <= registered
+
+
+def test_build_optimizers_refuses_actor_critic_sharing():
+    wrapper = _wrapper()
+    # The same Parameter object in both models.
+    tied = _critic(wrapper)
+    tied.trunk.tok_emb.weight = wrapper.backbone.tok_emb.weight
+    with pytest.raises(AssertionError, match="must not share"):
+        build_optimizers(wrapper, tied, learning_rate=1e-3, fused=False)
+    # A distinct Parameter viewing actor memory.
+    aliased = _critic(wrapper)
+    actor_matrix = wrapper.backbone.tok_emb.weight
+    aliased.head.weight = torch.nn.Parameter(
+        actor_matrix.data[1:2, : aliased.head.in_features]
+    )
+    with pytest.raises(AssertionError, match="must not share"):
+        build_optimizers(wrapper, aliased, learning_rate=1e-3, fused=False)
 
 
 def test_role_helpers_drive_muon_optimizers():

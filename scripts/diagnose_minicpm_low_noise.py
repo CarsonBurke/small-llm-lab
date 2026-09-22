@@ -8,7 +8,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from postraining.minicpm_vapo import MiniCPMVAPOPolicy, LoRAConfig
+from postraining.vapo.policy import VAPOPolicy
+from postraining.vapo.model.lora import LoRAConfig
 from postraining.fast_inference import build_fused_rollout_replica
 from postraining.invariant_linear import InvariantLinear
 from postraining.train_minicpm_vapo import encode_math_prompt
@@ -22,7 +23,7 @@ assert torch.cuda.is_available()
 torch.manual_seed(1337)
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
-side, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+side, tokenizer = VAPOPolicy.from_family("minicpm5", 
     device=torch.device('cuda'), lora_config=LoRAConfig(initialization='nora'),
     latent_thinking=True, gradient_checkpointing=False,
 )

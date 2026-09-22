@@ -10,7 +10,7 @@ from typing import Any, cast
 import torch
 
 from checkpointing import atomic_torch_save
-from postraining.minicpm_vapo import NextLatAuxiliaryHead
+from postraining.vapo.policy import NextLatAuxiliaryHead
 
 
 def _append_parameter_group(

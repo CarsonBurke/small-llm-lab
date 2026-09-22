@@ -9,7 +9,8 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from postraining.minicpm_vapo import DEFAULT_LORA_TARGETS, NextLatAuxiliaryHead
+from postraining.vapo.policy import NextLatAuxiliaryHead
+from postraining.vapo.model.lora import DEFAULT_LORA_TARGETS
 from postraining.train_minicpm_vapo import (
     build_parser as build_trainer_parser,
     load_training_math_corpus,

@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 
 if TYPE_CHECKING:
-    from postraining.minicpm_vapo import MiniCPMVAPOPolicy
+    from postraining.vapo.policy import VAPOPolicy
 
 
 def file_sha256(path: Path) -> str:
@@ -33,7 +33,7 @@ def source_sha256() -> str:
     digest = hashlib.sha256()
     for relative in (
         "postraining/fast_inference.py",
-        "postraining/minicpm_vapo.py",
+        "postraining/vapo/policy.py",
         "postraining/nextlat_speculative.py",
         "postraining/train_minicpm_vapo.py",
         "postraining/validate_minicpm_vapo.py",
@@ -94,10 +94,10 @@ def load_policy(
     checkpoint_path: Path,
     *,
     target_dtype: str,
-) -> tuple[MiniCPMVAPOPolicy, Any, dict[str, int | str | float]]:
-    from postraining.minicpm_vapo import (
+) -> tuple[VAPOPolicy, Any, dict[str, int | str | float]]:
+    from postraining.vapo.policy import VAPOPolicy
+    from postraining.vapo.model.lora import (
         LoRAConfig,
-        MiniCPMVAPOPolicy,
         load_adapter_state_dict,
         merge_lora_for_inference,
     )
@@ -114,7 +114,7 @@ def load_policy(
             "benchmark requires a checkpoint with completed value warmup"
         )
     device = torch.device("cuda")
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         model_id=actor["model_id"],
         revision=actor["revision"],
         device=device,
@@ -142,7 +142,7 @@ def load_policy(
 
 @torch.inference_mode()
 def apply_target_dtype(
-    policy: MiniCPMVAPOPolicy,
+    policy: VAPOPolicy,
     prompt: torch.Tensor,
     target_dtype: str,
 ) -> dict[str, int | float | str]:
@@ -285,7 +285,7 @@ def timed_generation(
 
 
 def benchmark_engine(
-    policy: MiniCPMVAPOPolicy,
+    policy: VAPOPolicy,
     tokenizer: Any,
     prompt: torch.Tensor,
     *,

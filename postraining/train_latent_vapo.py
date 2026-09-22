@@ -10,22 +10,29 @@ uses component std sigma/sqrt(d). The default DG and optional TPO token
 estimators remain selected exactly as before; gate and Gaussian factors are
 trained by the clipped VAPO path. ``--no-delightful-policy-gradient`` selects
 the standard joint clipped VAPO actor.
+
+``--reasoning-mode`` selects the policy family: ``latent`` (above), the
+token-only controls ``cot`` and ``none``, and ``carry``, the deterministic
+hidden carry. Carry is a token-only policy whose generated-token inputs add,
+through a zero-initialized combiner, the detached post-final-norm belief that
+produced that token; prompt tokens and the first generation input carry
+nothing, there is no gate, Gaussian, or thought slot, and the stored beliefs
+are replay constants (no BPTT). It starts from the SFT ``--checkpoint``
+exactly like cot, and a zero-init carry rollout is bitwise the cot rollout.
 - The critic is a SEPARATE from-scratch model (same architecture class,
   fresh weights, fully trainable, no SIGReg or latent prediction) trained
-  purely by HL-Gauss cross-entropy on [0, 1] value targets. It re-derives
-  combined embeddings with its own combiner weights, so credit lands on the
-  same carried-belief inputs the actor conditions on. The support anchors
-  bin CENTERS at exactly 0 and 1 with margin bins beyond each — Dreamer3's
-  exact-zero bucket applied to both ends of the unit range — so the dominant
-  exact-0/exact-1 verifier targets project symmetrically instead of decoding
-  a truncation bias inward; labels smooth at sigma_ratio 1.0.
+  purely by unclipped squared error on its scalar value head
+  (``CRITIC_SCHEMA``). It re-derives combined embeddings with its own
+  combiner weights, so credit lands on the same raw-thought or
+  carried-belief inputs the actor conditions on. No parameter or gradient
+  clip applies anywhere.
 - No pretraining anchor: SIGReg and the latent target-prediction objective
   are dropped at RL time. The combiner trains purely on its ability to make
-  carried beliefs useful; the teacher-forced val-BPB guard is the drift
-  detector.
+  its thought or carry inputs useful; the teacher-forced val-BPB guard is
+  the drift detector.
 
 Deferred by design: test-time-read-compute (carrying hiddens for read/prompt
-tokens) is out of scope for this policy schema.
+tokens) is out of scope for the carry policy schema.
 
 The default broad-v5 prompt cycle is stratified across DAPO-Math-17K,
 DeepMind Mathematics, GSM8K train, and MBPP train. Rewards are binary exact
@@ -72,6 +79,13 @@ from pretraining.latent_moe_training import (
 import postraining.latent_rollout
 from postraining.latent_eval import evaluate_latent_math
 from postraining.benchmark_report import write_benchmark_report
+from postraining.rollout_report import (
+    RolloutSampleRecorder,
+    RowVerdict,
+    capture_due,
+    purge_rollout_samples_from,
+    write_rollout_samples,
+)
 from postraining.core import (
     POSTTRAIN_REWARD_SCHEMA,
     JsonlLogger,
@@ -104,7 +118,6 @@ from postraining.core import (
     validate_posttraining_context_budget,
     verify_answer,
 )
-from postraining.hl_gauss import anchored_unit_geometry
 from postraining.latent_rollout import (
     PAD_SLOT,
     THOUGHT_SLOT,
@@ -119,22 +132,24 @@ from postraining.latent_rollout import (
     compact_stream_to_device,
     compact_thought_actions,
     emitted_token_rows,
+    generated_slot_mask,
     pack_rollout_groups_for_replay,
     iter_planned_replay_microbatches,
     refresh_old_statistics,
     replay_head_inputs,
     scatter_replay_statistics,
     scatter_slots,
+    slot_index,
     rollout_continuations,
     split_rollout_groups,
     think_slot_mask,
     trim_stream,
+    validate_hidden_carry_rollout,
 )
 from postraining.latent_thought import (
     EMIT,
     THINK,
     RENDERER_FEATURES_SCHEMA,
-    THOUGHT_DISTRIBUTION_SCHEMA,
     DecodeRangeMask,
     LatentThoughtModel,
     combiner_init_kwargs_from_checkpoint,
@@ -150,9 +165,11 @@ from postraining.rollout_scheduler import (
     rollout_continuous_refill_groups,
     warmup_decode_width_buckets,
 )
-from postraining.model_io import fresh_trunk, load_model
+from postraining.model_io import copy_trunk, fresh_trunk, load_model
 from postraining.muon import Muon
 from postraining.reasoning_modes import (
+    mode_carries_hidden,
+    mode_pins_emit,
     mode_rollout_budget,
     training_rollout_budget,
 )
@@ -180,23 +197,25 @@ from postraining.vapo.mixture import (
     rollout_window_source_quotas,
 )
 from postraining.vapo.schemas import (
+    CRITIC_SCHEMA,
     PROMPT_ORDER_SCHEMA,
-    REPLAY_NUMERICS_SCHEMA,
     actor_objective_schema,
-    execution_schema_for_rollout_scheduler,
+    execution_schema_for,
     optimizer_schema_for_trunk_optimizer,
     resume_execution_schema_compatible,
+    replay_numerics_schema_for,
     resume_replay_schema_compatible,
-    value_support_geometry_matches,
+    resume_critic_schema_compatible,
 )
 
 
 # Refreshed device minibatches held for their update instead of the
 # scatter-to-CPU/repack/re-upload round trip. Bounded because packed batch
-# bytes track the pool's longest stream and each slot stores an fp32
-# carried hidden; past the budget the refresh loop falls back to the
-# scatter path for the remaining minibatches. VRAM-resident only between a
-# pool's refresh and its last update — never across a collection.
+# bytes track the pool's longest stream and, under the hidden carry, each
+# slot stores a full-width carried belief; past the budget the refresh loop
+# falls back to the scatter path for the remaining minibatches.
+# VRAM-resident only between a pool's refresh and its last update — never
+# across a collection.
 RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
 # v2: the grading style follows each row's reward_model.style (Minerva for
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
@@ -213,11 +232,6 @@ RESUME_EXACT_ARG_FIELDS = (
     "ppo_epochs",
     "temperature",
     "top_p",
-    "value_bins",
-    "value_anchored_support",
-    "value_margin_bins",
-    "value_sigma_ratio",
-    "value_prior",
     "combined_mlp_blocks",
     "combined_mlp_hidden",
     "thought_sigma",
@@ -308,6 +322,53 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
         raise ValueError(
             "exact resume changed environment/objective arguments: " + details
         )
+
+
+CRITIC_INIT_PROVENANCE_FIELDS = ("init", "checkpoint", "source_execution_schema")
+
+
+def resolve_critic_init_provenance(
+    args: argparse.Namespace,
+    actor_init_payload: dict | None,
+    resumed_manifest: dict | None,
+) -> dict:
+    """How the critic's weights started, for the run manifest.
+
+    A resume loads the critic from its checkpoint, so its start is whatever
+    the resumed run recorded (``resumed_manifest``: the manifest of the run
+    that wrote the checkpoint, whether resuming in place or into a new
+    directory). That record is carried forward, and a --critic-init that
+    contradicts it is refused.
+    """
+    if args.resume:
+        if resumed_manifest is None:
+            raise ValueError(
+                "resume needs the resumed run's manifest to carry its critic "
+                "init forward"
+            )
+        recorded = resumed_manifest.get("critic") or {}
+        init = recorded.get("init")
+        if init not in ("scratch", "actor_copy", "warm_checkpoint"):
+            raise ValueError(
+                f"resume manifest records an unknown critic init {init!r}"
+            )
+        if (init == "actor_copy") != (args.critic_init == "actor"):
+            raise ValueError(
+                f"resume run's critic started as {init!r}; resume it with "
+                f"--critic-init {'actor' if init == 'actor_copy' else 'scratch'}"
+            )
+        return {name: recorded.get(name) for name in CRITIC_INIT_PROVENANCE_FIELDS}
+    if args.actor_critic_init:
+        return {
+            "init": "warm_checkpoint",
+            "checkpoint": str(args.actor_critic_init),
+            "source_execution_schema": actor_init_payload.get("execution_schema"),
+        }
+    return {
+        "init": "actor_copy" if args.critic_init == "actor" else "scratch",
+        "checkpoint": None,
+        "source_execution_schema": None,
+    }
 
 
 def resume_topology_history(
@@ -688,8 +749,10 @@ def score_math_rollout(
     think_fence_ids: tuple[int, int] | None = None,
     min_think_tokens: int = 1,
     answer_fence_ids: tuple[int, int] | None = None,
-) -> None:
+) -> list[RowVerdict]:
     """Exact verifier reward plus bounded final-answer numeric proximity.
+
+    Returns each row's gate verdict and graded prediction for transcripts.
 
     ``solution_prefix_ids`` are teacher-forced solution tokens that live at
     the end of the prompt (the none-mode ``Answer:`` prefix): the emitted
@@ -718,6 +781,7 @@ def score_math_rollout(
     if answer_fence_ids is not None and think_fence_ids is None:
         raise ValueError("answer_fence_ids requires think_fence_ids")
     scores = []
+    verdicts = []
     gate_zeroed_correct = 0
     for emitted in emitted_token_rows(batch):
         stop_cut = next(
@@ -726,10 +790,11 @@ def score_math_rollout(
         )
         if stop_cut is None:
             scores.append(0.0)
+            verdicts.append(RowVerdict(format_ok=False, parsed_answer=None))
             continue
         visible = emitted[: stop_cut + 1]
         solution = tokenizer.decode(list(solution_prefix_ids) + visible)
-        correct, _ = verify_answer(solution, truth, style)
+        correct, prediction = verify_answer(solution, truth, style)
         if answer_fence_ids is not None:
             if not structural_format_ok(
                 visible, think_fence_ids, answer_fence_ids, min_think_tokens
@@ -742,11 +807,12 @@ def score_math_rollout(
                     visible, tokenizer, answer_fence_ids
                 )
                 if relaxed is not None:
-                    correct, _ = verify_answer(
+                    correct, prediction = verify_answer(
                         "Answer: " + relaxed, truth, style, window=None
                     )
                 gate_zeroed_correct += bool(correct)
                 scores.append(0.0)
+                verdicts.append(RowVerdict(format_ok=False, parsed_answer=prediction))
                 continue
             # The gate guarantees a single non-empty anchored span, so
             # the graded field is the fenced value re-framed for the
@@ -756,7 +822,9 @@ def score_math_rollout(
             solution = "Answer: " + fenced_answer_text(
                 visible, tokenizer, answer_fence_ids
             )
-            correct, _ = verify_answer(solution, truth, style, window=None)
+            correct, prediction = verify_answer(
+                solution, truth, style, window=None
+            )
         elif think_fence_ids is not None and not think_format_ok(
             visible, think_fence_ids, tokenizer,
             min_think_tokens,
@@ -767,7 +835,9 @@ def score_math_rollout(
         ):
             gate_zeroed_correct += bool(correct)
             scores.append(0.0)
+            verdicts.append(RowVerdict(format_ok=False, parsed_answer=prediction))
             continue
+        verdicts.append(RowVerdict(format_ok=True, parsed_answer=prediction))
         raw_final_answer = extract_final_answer(
             solution,
             window=None if answer_fence_ids is not None else 300,
@@ -804,6 +874,7 @@ def score_math_rollout(
     assign_terminal_rewards(
         batch, torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device)
     )
+    return verdicts
 
 
 def score_python_rollout(
@@ -814,8 +885,12 @@ def score_python_rollout(
     think_fence_ids: tuple[int, int],
     answer_fence_ids: tuple[int, int],
     min_think_tokens: int,
-) -> None:
-    """Binary all-tests-pass reward over the strict fenced code span."""
+) -> list[RowVerdict]:
+    """Binary all-tests-pass reward over the strict fenced code span.
+
+    Returns each row's gate verdict, with the test harness's result as the
+    graded prediction of an eligible row.
+    """
     if verification_info.get("schema") != PYTHON_REWARD_SCHEMA:
         raise ValueError("Python row uses an incompatible verifier schema")
     answers: list[str] = []
@@ -823,6 +898,9 @@ def score_python_rollout(
     emitted_rows = emitted_token_rows(batch)
     scores = [0.0] * len(emitted_rows)
     statuses = [PYTHON_RESULT_CODES["format_ineligible"]] * len(emitted_rows)
+    verdicts = [
+        RowVerdict(format_ok=False, parsed_answer=None) for _ in emitted_rows
+    ]
     for index, emitted in enumerate(emitted_rows):
         stop_cut = next(
             (position for position, token in enumerate(emitted) if token in stop_ids),
@@ -845,6 +923,7 @@ def score_python_rollout(
         for index, result in zip(eligible_indices, results, strict=True):
             scores[index] = float(result == "pass")
             statuses[index] = PYTHON_RESULT_CODES[result]
+            verdicts[index] = RowVerdict(format_ok=True, parsed_answer=result)
     batch.verifier_status = torch.tensor(
         statuses, dtype=torch.long, device=batch.rewards.device
     )
@@ -853,6 +932,7 @@ def score_python_rollout(
         batch,
         torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device),
     )
+    return verdicts
 
 
 evaluate_aime_latent = evaluate_latent_math
@@ -1255,9 +1335,7 @@ def aggregate_value_diagnostics(
         "target_variance": target_variance,
         "residual_variance": residual_variance,
         "explained_variance": explained_variance,
-        "excess_ce": _weighted_metric_mean(
-            metrics, "value_excess_ce", "action_count"
-        ),
+        "loss": _weighted_metric_mean(metrics, "value_loss", "action_count"),
     }
 
 
@@ -1297,7 +1375,7 @@ def aggregate_actor_tensorboard_metrics(
     dashboard = {
         "loss/policy": policy_contribution,
         "loss/actor_total": policy_contribution,
-        "value/token_weighted_excess_ce": value["excess_ce"],
+        "value/token_weighted_mse": value["loss"],
         "value/prediction_mean": value["prediction_mean"],
         "value/target_mean": value["target_mean"],
         "value/residual_mean": value["residual_mean"],
@@ -1332,9 +1410,17 @@ def aggregate_actor_tensorboard_metrics(
         "grad/renderer": last["renderer_grad_norm"],
         "grad/combiner": last["combiner_grad_norm"],
         "grad/critic": last["critic_grad_norm"],
-        "grad/gate": last["gate_grad_norm"],
-        "grad/thought_mean": last["thought_mean_grad_norm"],
     }
+    if "carry_input_delta_rms_ratio" in last:
+        # The hidden carry has no stochastic factor or head to report.
+        dashboard.pop("loss/stochastic_policy")
+        dashboard.pop("clip/stochastic_policy")
+        dashboard["carry/input_delta_rms_ratio"] = _weighted_metric_mean(
+            metrics, "carry_input_delta_rms_ratio", "action_count"
+        )
+    else:
+        dashboard["grad/gate"] = last["gate_grad_norm"]
+        dashboard["grad/thought_mean"] = last["thought_mean_grad_norm"]
     if "delightful_gate_mean" in last:
         dashboard.pop("clip/policy")
         dashboard.pop("ratio/harmful_positive_log_max")
@@ -1994,6 +2080,23 @@ def build_optimizers(
         id(p) for p in critic.parameters() if p.requires_grad
     } or len(critic_registered) != len({id(p) for p in critic_registered}):
         raise AssertionError("critic parameters must partition across optimizers")
+    # Actor and critic share nothing: not a Parameter object and not the
+    # memory behind one, so a tied view cannot leak value gradients into the
+    # policy (or the reverse) through either optimizer.
+    # Zero-size parameters own no memory (data_ptr 0) and cannot alias.
+    def storages(module: torch.nn.Module) -> set[tuple[torch.device, int]]:
+        return {
+            (p.device, p.untyped_storage().data_ptr())
+            for p in module.parameters()
+            if p.numel()
+        }
+
+    actor_storages = storages(wrapper)
+    critic_storages = storages(critic)
+    if actor_storages & critic_storages or {
+        id(p) for p in wrapper.parameters()
+    } & {id(p) for p in critic.parameters()}:
+        raise AssertionError("actor and critic must not share parameters")
     return optimizers
 
 
@@ -2043,6 +2146,14 @@ def update_minibatch(
         raise ValueError("replay attention budget must be positive")
     if delightful_policy_gradient and target_policy_optimization:
         raise ValueError("actor objectives are mutually exclusive")
+    hidden_carry = wrapper.hidden_carry
+    if batch.carry_injected != hidden_carry:
+        # A carry policy must be optimized on its own carried streams, and a
+        # stochastic or token-only policy never on them.
+        raise ValueError(
+            "rollout carry does not match the policy: batch carry_injected="
+            f"{batch.carry_injected}, wrapper hidden_carry={hidden_carry}"
+        )
     if not value_only and not batch.statistics_refreshed:
         # An unrefreshed batch carries zeros in ``old_token_logprobs`` and
         # ``old_values``; nothing about the tensor shapes can express "not
@@ -2071,7 +2182,7 @@ def update_minibatch(
         key: zero.clone()
         for key in (
             "value_loss", "value_sum", "value_target_sum", "target_square_sum",
-            "target_entropy_sum", "advantage_sum", "advantage_square_sum",
+            "advantage_sum", "advantage_square_sum",
             "policy_loss", "policy_clip", "token_kl_sum",
             "stochastic_policy_loss", "stochastic_policy_clip",
             "residual_sum", "residual_square_sum",
@@ -2094,6 +2205,7 @@ def update_minibatch(
             "tpo_negative_count", "tpo_neutral_count",
             "tpo_positive_target_probability_sum",
             "tpo_negative_target_probability_sum",
+            "carry_input_delta_square_sum", "carry_token_square_sum",
         )
     }
 
@@ -2160,9 +2272,12 @@ def update_minibatch(
         micro_advantages = advantages[rows, :stream_length]
         micro_value_targets = value_targets[rows, :stream_length]
         local_action_count = microbatch.action_mask.sum()
-        value_logits = critic.value_logits(microbatch)
-        value_ce = critic.support.cross_entropy(value_logits, micro_value_targets)
-        local_value_numerator = (value_ce * microbatch.action_mask).sum()
+        values = critic.values(microbatch)
+        # Unclipped squared error: the regression target is the lambda-one
+        # return, independent of the old values, so there is no old-value
+        # trust region to enforce.
+        value_error = (values - micro_value_targets).square()
+        local_value_numerator = (value_error * microbatch.action_mask).sum()
         emit_index = shard.emit_index if not value_only else None
         weighted_critic_loss = (
             local_value_numerator / value_action_denominator.clamp_min(1)
@@ -2177,7 +2292,7 @@ def update_minibatch(
         )
         weighted_critic_loss.backward()
         with torch.no_grad():
-            values = critic.support.to_expected_scalar(value_logits)
+            values = values.detach()
             # During critic pretraining there is no actor objective, but the
             # diagnostics must still measure calibration against the CURRENT
             # critic.  The MC training target is independent of the baseline
@@ -2186,10 +2301,6 @@ def update_minibatch(
             diagnostic_advantages = (
                 micro_value_targets - values if value_only else micro_advantages
             )
-            target_probs = critic.support.project(micro_value_targets)
-            target_entropy = -(
-                target_probs * target_probs.clamp_min(1e-20).log()
-            ).sum(-1)
             totals["value_loss"] += local_value_numerator.detach()
             totals["value_sum"] += (values * microbatch.action_mask).sum()
             totals["value_target_sum"] += (
@@ -2204,9 +2315,6 @@ def update_minibatch(
             ).sum()
             totals["residual_square_sum"] += (
                 residuals.square() * microbatch.action_mask
-            ).sum()
-            totals["target_entropy_sum"] += (
-                target_entropy * microbatch.action_mask
             ).sum()
             totals["advantage_sum"] += (
                 diagnostic_advantages * microbatch.action_mask
@@ -2244,59 +2352,90 @@ def update_minibatch(
             )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
-
-        new_stop_logprobs = -F.binary_cross_entropy_with_logits(
-            wrapper.gate.stop_logit(beliefs),
-            microbatch.actions.float(),
-            reduction="none",
-        )
-        new_thought_joint = torch.zeros_like(new_token_logprobs)
-        old_thought_joint = torch.zeros_like(new_token_logprobs)
-        think_index = shard.think_index
-        if think_index.numel():
-            thought_means, thought_targets = compact_thought_actions(
-                wrapper, microbatch, beliefs, think_index
-            )
-            thought_log_sigma = wrapper.transition.predict_log_sigma(
-                compact_slots(beliefs, think_index)
-            )
-            compact_new_thought = wrapper.transition.per_dim_log_prob(
-                thought_targets, thought_means, thought_log_sigma
-            )
-            compact_old_thought = compact_slots(
-                microbatch.old_thought_logprobs, think_index
-            )
-            scatter_slots(
-                new_thought_joint, think_index, compact_new_thought.sum(-1)
-            )
-            scatter_slots(
-                old_thought_joint, think_index, compact_old_thought.sum(-1)
-            )
-        new_stochastic_logprobs = (
-            new_stop_logprobs * microbatch.stop_mask + new_thought_joint
-        )
-        old_stochastic_logprobs = (
-            microbatch.old_stop_logprobs * microbatch.stop_mask
-            + old_thought_joint
-        )
-        stochastic_mask = (
-            (microbatch.stop_mask.bool() | think_slot_mask(microbatch))
-            .to(microbatch.action_mask.dtype)
-            * actor_signal_rows[rows, None]
-        )
         active_emit_mask = (
             microbatch.emit_mask * actor_signal_rows[rows, None]
         )
-        weighted_stochastic_loss, weighted_stochastic_clip, _ = (
-            clipped_policy_loss(
-                new_stochastic_logprobs,
-                old_stochastic_logprobs,
-                micro_advantages,
-                stochastic_mask,
-                denominator=value_action_denominator,
-                estimate_kl=False,
+
+        if hidden_carry:
+            # Tokens are the carry policy's only actions: there is no gate or
+            # Gaussian factor to clip, so the joint VAPO ratio is the token
+            # ratio itself. The carry's credit reaches the combiner through
+            # the replayed stream inputs of the token objective.
+            new_stochastic_logprobs = None
+            old_stochastic_logprobs = None
+            weighted_stochastic_loss = new_token_logprobs.new_zeros(())
+            weighted_stochastic_clip = new_token_logprobs.new_zeros(())
+            with torch.no_grad():
+                # The combiner's whole input delta (carry projection, type
+                # bias and MLP stack) against the token embedding it rides
+                # on, over generated slots only: zero at initialization, and
+                # the first sign the carry is being used.
+                # Compacted to the generated slots first, so the diagnostic
+                # costs (slots, dim) rather than two dense stream temporaries.
+                generated_index = slot_index(generated_slot_mask(microbatch))
+                token_latent = wrapper.embed_tokens(
+                    compact_slots(microbatch.token_ids, generated_index)
+                ).float()
+                injected = (
+                    compact_slots(stream_inputs, generated_index).float()
+                    - token_latent
+                )
+                totals["carry_input_delta_square_sum"] += injected.square().sum()
+                totals["carry_token_square_sum"] += token_latent.square().sum()
+        else:
+            new_stop_logprobs = -F.binary_cross_entropy_with_logits(
+                wrapper.gate.stop_logit(beliefs),
+                microbatch.actions.float(),
+                reduction="none",
             )
-        )
+            new_thought_joint = torch.zeros_like(new_token_logprobs)
+            old_thought_joint = torch.zeros_like(new_token_logprobs)
+            think_index = shard.think_index
+            if think_index.numel():
+                thought_means, thought_targets = compact_thought_actions(
+                    wrapper, microbatch, beliefs, think_index
+                )
+                thought_log_sigma = wrapper.transition.predict_log_sigma(
+                    compact_slots(beliefs, think_index)
+                )
+                compact_new_thought = wrapper.transition.per_dim_log_prob(
+                    thought_targets, thought_means, thought_log_sigma
+                )
+                compact_old_thought = compact_slots(
+                    microbatch.old_thought_logprobs, think_index
+                )
+                scatter_slots(
+                    new_thought_joint,
+                    think_index,
+                    compact_new_thought.sum(-1),
+                )
+                scatter_slots(
+                    old_thought_joint,
+                    think_index,
+                    compact_old_thought.sum(-1),
+                )
+            new_stochastic_logprobs = (
+                new_stop_logprobs * microbatch.stop_mask + new_thought_joint
+            )
+            old_stochastic_logprobs = (
+                microbatch.old_stop_logprobs * microbatch.stop_mask
+                + old_thought_joint
+            )
+            stochastic_mask = (
+                (microbatch.stop_mask.bool() | think_slot_mask(microbatch))
+                .to(microbatch.action_mask.dtype)
+                * actor_signal_rows[rows, None]
+            )
+            weighted_stochastic_loss, weighted_stochastic_clip, _ = (
+                clipped_policy_loss(
+                    new_stochastic_logprobs,
+                    old_stochastic_logprobs,
+                    micro_advantages,
+                    stochastic_mask,
+                    denominator=value_action_denominator,
+                    estimate_kl=False,
+                )
+            )
 
         if target_policy_optimization:
             new_token_log_odds = torch.zeros_like(
@@ -2383,10 +2522,14 @@ def update_minibatch(
             ]
         else:
             joint_new_logprobs = (
-                new_token_logprobs + new_stochastic_logprobs
+                new_token_logprobs
+                if new_stochastic_logprobs is None
+                else new_token_logprobs + new_stochastic_logprobs
             )
             joint_old_logprobs = (
-                microbatch.old_token_logprobs + old_stochastic_logprobs
+                microbatch.old_token_logprobs
+                if old_stochastic_logprobs is None
+                else microbatch.old_token_logprobs + old_stochastic_logprobs
             )
             weighted_policy_loss, weighted_policy_clip, _ = clipped_policy_loss(
                 joint_new_logprobs,
@@ -2501,10 +2644,6 @@ def update_minibatch(
         "value_residual_mean": residual_mean,
         "value_residual_variance": residual_variance,
         "explained_variance": explained_variance,
-        "value_excess_ce": (
-            totals["value_loss"] / action_denom
-            - totals["target_entropy_sum"] / action_denom
-        ),
         "advantage_mean": advantage_mean,
         "advantage_std": advantage_variance.sqrt(),
         "action_count": batch.action_mask.sum(),
@@ -2536,11 +2675,14 @@ def update_minibatch(
             wrapper.combiner.parameters()
         ),
         "critic_grad_norm": gradient_norm_tensor(critic.parameters()),
-        "gate_grad_norm": gradient_norm_tensor(wrapper.gate.parameters()),
-        "thought_mean_grad_norm": gradient_norm_tensor(
-            wrapper.transition.parameters()
-        ),
     }
+    if not hidden_carry:
+        grad_norms.update(
+            gate_grad_norm=gradient_norm_tensor(wrapper.gate.parameters()),
+            thought_mean_grad_norm=gradient_norm_tensor(
+                wrapper.transition.parameters()
+            ),
+        )
     if critic_step:
         step_optimizers(optimizers, "critic")
     if actor_step and "actor" in optimizers:
@@ -2561,9 +2703,21 @@ def update_minibatch(
         ),
         reward=batch.reward_scalar.mean(),
         **grad_norms,
-        stochastic_policy_loss=totals["stochastic_policy_loss"],
-        stochastic_policy_clip_fraction=totals["stochastic_policy_clip"],
     )
+    if hidden_carry:
+        # Per-minibatch RMS ratio over generated slots, summed across shards
+        # before the one division.
+        metric_tensors.update(
+            carry_input_delta_rms_ratio=(
+                totals["carry_input_delta_square_sum"]
+                / totals["carry_token_square_sum"].clamp_min(1e-30)
+            ).sqrt(),
+        )
+    else:
+        metric_tensors.update(
+            stochastic_policy_loss=totals["stochastic_policy_loss"],
+            stochastic_policy_clip_fraction=totals["stochastic_policy_clip"],
+        )
     if target_policy_optimization:
         positive_count = totals["tpo_positive_count"]
         negative_count = totals["tpo_negative_count"]
@@ -2857,17 +3011,28 @@ def save_checkpoint(
     zero_reward_frozen_updates: int = 0,
 ) -> None:
     reasoning_mode = getattr(args, "reasoning_mode", "latent")
+    # The schema tags below are derived from the mode; the parameters come
+    # from the wrapper. A mismatch would label one policy with another's
+    # contract, and `combiner_init_kwargs_from_checkpoint` would rebuild it
+    # with the wrong heads.
+    if wrapper.hidden_carry != mode_carries_hidden(reasoning_mode):
+        raise ValueError(
+            f"reasoning mode {reasoning_mode!r} does not match a wrapper with "
+            f"hidden_carry={wrapper.hidden_carry}"
+        )
     payload = {
         "step": step,
         "value_warmup_step": warmup_step,
-        "execution_schema": execution_schema_for_rollout_scheduler(
-            getattr(args, "rollout_scheduler", "lockstep")
+        "execution_schema": execution_schema_for(
+            reasoning_mode, getattr(args, "rollout_scheduler", "lockstep")
         ),
         "actor_objective_schema": actor_objective_schema(
+            reasoning_mode,
             getattr(args, "delightful_policy_gradient", False),
             getattr(args, "target_policy_optimization", False),
         ),
         "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
+        "critic_schema": CRITIC_SCHEMA,
         "source_signal_mask_schema": (
             SOURCE_SIGNAL_MASK_SCHEMA
             if (
@@ -2881,7 +3046,7 @@ def save_checkpoint(
             if getattr(args, "rl_mixture_manifest", None)
             else None
         ),
-        "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
+        "replay_numerics_schema": replay_numerics_schema_for(reasoning_mode),
         "source_provenance": getattr(args, "source_provenance", None),
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
         "answer_fence_prompt_schema": (
@@ -2901,7 +3066,7 @@ def save_checkpoint(
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": rollout_policy_schema_for_mode(reasoning_mode),
         "thought_input_schema": wrapper.thought_input_schema,
-        "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
+        "thought_distribution_schema": wrapper.thought_distribution_schema,
         "optimizer_schema": optimizer_schema_for_trunk_optimizer(
             getattr(args, "trunk_optimizer", "adamw")
         ),
@@ -3119,7 +3284,8 @@ def main() -> None:
     if args.answer_tokens < 2:
         parser.error("--answer-tokens must fit an answer plus its terminator")
 
-    pin_emit = args.reasoning_mode != "latent"
+    pin_emit = mode_pins_emit(args.reasoning_mode)
+    hidden_carry = mode_carries_hidden(args.reasoning_mode)
     rollout_policy_schema = rollout_policy_schema_for_mode(args.reasoning_mode)
 
     def mode_budgets(max_tokens: int) -> tuple[int, int]:
@@ -3183,6 +3349,8 @@ def main() -> None:
     backbone.eval()
     # Full-model RL: trunk, renderer, combiner, Gaussian mean, and one-way
     # continuation gate all train. Noise scale is a strict policy hyperparameter.
+    # The hidden-carry policy builds only the combiner: it has no Gaussian or
+    # gate to train, and its sigma/stop arguments are None.
     wrapper = LatentThoughtModel(
         backbone,
         mlp_hidden=args.combined_mlp_hidden,
@@ -3191,6 +3359,7 @@ def main() -> None:
         init_stop_thinking_probability=(
             args.init_stop_thinking_probability
         ),
+        hidden_carry=hidden_carry,
     ).to(device)
     # No module here behaves differently under train(): pin eval mode once so
     # the training flag (a dynamo guard) never flips between the step-0 evals
@@ -3303,37 +3472,39 @@ def main() -> None:
         for parameter in backbone.critic_probe.parameters():
             parameter.requires_grad_(False)
 
-    if args.value_anchored_support:
-        value_num_bins, value_v_min, value_v_max = anchored_unit_geometry(
-            args.value_bins, args.value_margin_bins
-        )
-    else:
-        value_num_bins, value_v_min, value_v_max = args.value_bins, 0.0, 1.0
     critic_uses_dense_trunk = bool(
         getattr(backbone, "model_config", {}).get("moe_num_experts", 0)
     )
-    critic_trunk = fresh_trunk(
-        backbone,
-        device,
-        model_config_overrides=(
-            {"moe_num_experts": 0, "moe_layer_indices": []}
-            if critic_uses_dense_trunk
-            else None
-        ),
-        architecture_override=(
-            backbone.architecture.replace("_stable_latentmoe_v1", "")
-            + "_dense_critic"
-            if critic_uses_dense_trunk
-            else None
-        ),
-    )
+    if args.critic_init == "actor":
+        if critic_uses_dense_trunk:
+            raise ValueError(
+                "--critic-init actor copies the actor trunk, but a LatentMoE "
+                "actor's critic is a dense trunk with no matching weights"
+            )
+        # The actor as loaded at this point (base checkpoint, or the
+        # --actor-init/--curriculum-init weights), in storage of its own:
+        # pretrained features without sharing a single tensor. The critic
+        # head stays zero-initialized, so the copy starts at value 0 and gets
+        # no trunk gradient until the head has learned a readout.
+        critic_trunk = copy_trunk(backbone, device)
+    else:
+        critic_trunk = fresh_trunk(
+            backbone,
+            device,
+            model_config_overrides=(
+                {"moe_num_experts": 0, "moe_layer_indices": []}
+                if critic_uses_dense_trunk
+                else None
+            ),
+            architecture_override=(
+                backbone.architecture.replace("_stable_latentmoe_v1", "")
+                + "_dense_critic"
+                if critic_uses_dense_trunk
+                else None
+            ),
+        )
     critic = SeparateCritic(
         critic_trunk,
-        num_bins=value_num_bins,
-        sigma_ratio=args.value_sigma_ratio,
-        v_min=value_v_min,
-        v_max=value_v_max,
-        prior_value=args.value_prior,
         mlp_hidden=args.combined_mlp_hidden,
         num_blocks=args.combined_mlp_blocks,
     ).to(device)
@@ -3376,15 +3547,12 @@ def main() -> None:
             )
     if args.actor_critic_init:
         init_args = actor_init_payload.get("args", {})
-        if not value_support_geometry_matches(init_args, args):
+        if not resume_critic_schema_compatible(actor_init_payload):
             raise ValueError(
-                "--actor-critic-init warm critic was trained on a different "
-                "value support geometry (anchored/bins/margin/sigma_ratio "
-                f"{init_args.get('value_anchored_support', False)}/"
-                f"{init_args.get('value_bins')}/"
-                f"{init_args.get('value_margin_bins')}/"
-                f"{init_args.get('value_sigma_ratio')}); rerun critic warmup "
-                "under the current flags or start with --actor-init"
+                "--actor-critic-init warm critic schema is "
+                f"{actor_init_payload.get('critic_schema')!r}, expected "
+                f"{CRITIC_SCHEMA!r}; rerun critic warmup or start with "
+                "--actor-init"
             )
         expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
             args.trunk_optimizer
@@ -3737,8 +3905,8 @@ def main() -> None:
     resume_args = None
     resumed_zero_reward_frozen_updates = None
     if args.resume:
-        target_execution_schema = execution_schema_for_rollout_scheduler(
-            args.rollout_scheduler
+        target_execution_schema = execution_schema_for(
+            args.reasoning_mode, args.rollout_scheduler
         )
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         resume_args = payload.get("args", {})
@@ -3777,13 +3945,13 @@ def main() -> None:
                 "resume checkpoint execution schema must be "
                 f"{target_execution_schema!r}; got "
                 f"{payload.get('execution_schema')!r}. v29 changes stream, "
-                "Gaussian scale, gate, and request-RNG semantics; there are "
-                "no migrations."
+                "Gaussian scale, gate, and request-RNG semantics, and v30 "
+                "is the hidden-carry contract; there are no migrations."
             )
-        if not resume_replay_schema_compatible(payload):
+        if not resume_replay_schema_compatible(payload, args.reasoning_mode):
             raise ValueError(
                 "resume checkpoint replay numerics schema must be "
-                f"{REPLAY_NUMERICS_SCHEMA!r}; got "
+                f"{replay_numerics_schema_for(args.reasoning_mode)!r}; got "
                 f"{payload.get('replay_numerics_schema')!r}; old replay "
                 "layouts are never migrated"
             )
@@ -3793,6 +3961,7 @@ def main() -> None:
                 f"got {payload.get('reward_schema')!r}"
             )
         expected_actor_objective_schema = actor_objective_schema(
+            args.reasoning_mode,
             args.delightful_policy_gradient,
             args.target_policy_optimization,
         )
@@ -3877,16 +4046,11 @@ def main() -> None:
                 f"got {args.seed})"
             )
         wrapper.load_state_dict(payload["model"], strict=True)
-        if not value_support_geometry_matches(resume_args, args):
+        if not resume_critic_schema_compatible(payload):
             raise ValueError(
-                "resume checkpoint critic support geometry "
-                "(anchored/bins/margin/sigma_ratio "
-                f"{resume_args.get('value_anchored_support', False)}/"
-                f"{resume_args.get('value_bins')}/"
-                f"{resume_args.get('value_margin_bins')}/"
-                f"{resume_args.get('value_sigma_ratio')}) does not match "
-                "the current flags; resume with the checkpoint's value "
-                "support flags"
+                "resume checkpoint critic schema must be "
+                f"{CRITIC_SCHEMA!r}; got {payload.get('critic_schema')!r}; "
+                "old critic heads are never migrated"
             )
         critic.load_state_dict(payload["critic"], strict=True)
         expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
@@ -4014,7 +4178,7 @@ def main() -> None:
     )
 
     # Every compiled graph in this process reaches a fp32 region —
-    # CombinedEmbedding's inject or SeparateCritic.value_logits both disable
+    # CombinedEmbedding's inject or SeparateCritic.values both disable
     # the ambient autocast — so all of them carry _enter_autocast
     # nodes, and AOTAutogradCache refuses to key on an unrecognized
     # call_function target. It therefore BYPASSED on every process start
@@ -4338,10 +4502,10 @@ def main() -> None:
     trim_multiple = args.replay_bucket if args.compile_replay else 1
     if args.compile_replay:
         torch._dynamo.config.cache_size_limit = 64
-        critic.value_logits = profiler.register_artifact(
-            "critic_value_logits",
+        critic.values = profiler.register_artifact(
+            "critic_values",
             torch.compile(
-                critic.value_logits,
+                critic.values,
                 # Length buckets still span many GEMM shapes. Max-autotune
                 # repeatedly stalls training to benchmark each new regime;
                 # default Inductor dispatches them to stable cuBLAS kernels.
@@ -4450,6 +4614,20 @@ def main() -> None:
         step=start_step,
         sampler_cursor=sampler.cursor,
     )
+    resumed_manifest = existing_manifest
+    if args.resume and resumed_manifest is None:
+        # Resuming into a new directory: the lineage lives beside the
+        # checkpoint, in the run directory that wrote it.
+        resumed_manifest_path = Path(args.resume).parent / "manifest.json"
+        if not resumed_manifest_path.is_file():
+            raise ValueError(
+                f"resume checkpoint {args.resume} has no run manifest beside "
+                "it to carry its critic init forward"
+            )
+        resumed_manifest = json.loads(resumed_manifest_path.read_text())
+    critic_init_provenance = resolve_critic_init_provenance(
+        args, actor_init_payload, resumed_manifest
+    )
     # A DG rollout is consumed in one optimizer update, so it needs no
     # within-pool source stratification. This also permits the deterministic
     # 24-prompt rotation (10/8/3/3, then 11/7/3/3) while preserving the exact
@@ -4472,6 +4650,14 @@ def main() -> None:
     if args.resume:
         removed = logger.purge_after(start_step, warmup_step)
         removed_reports = purge_benchmark_reports_after(output, start_step)
+        # The pool at start_step is collected again, so its capture goes too.
+        removed_captures = purge_rollout_samples_from(output, start_step)
+        if removed_captures:
+            print(
+                f"purged {removed_captures} stale rollout sample captures "
+                f"from actor step {start_step}",
+                flush=True,
+            )
         if removed:
             print(
                 f"purged {removed} stale metrics after actor step {start_step} "
@@ -4504,10 +4690,11 @@ def main() -> None:
                 "profile_schema": PROFILE_SCHEMA if args.profile else None,
                 "source_provenance": source_provenance,
                 "topology_history": topology_history,
-                "execution_schema": execution_schema_for_rollout_scheduler(
-                    args.rollout_scheduler
+                "execution_schema": execution_schema_for(
+                    args.reasoning_mode, args.rollout_scheduler
                 ),
                 "actor_objective_schema": actor_objective_schema(
+                    args.reasoning_mode,
                     args.delightful_policy_gradient,
                     args.target_policy_optimization,
                 ),
@@ -4518,7 +4705,9 @@ def main() -> None:
                     else None
                 ),
                 "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
-                "replay_numerics_schema": REPLAY_NUMERICS_SCHEMA,
+                "replay_numerics_schema": replay_numerics_schema_for(
+                    args.reasoning_mode
+                ),
                 "prompt_order_schema": PROMPT_ORDER_SCHEMA,
                 "answer_fence_prompt_schema": (
                     ANSWER_FENCE_PROMPT_SCHEMA if args.answer_fence else None
@@ -4544,7 +4733,9 @@ def main() -> None:
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
                 "rollout_policy_schema": rollout_policy_schema,
                 "thought_input_schema": wrapper.thought_input_schema,
-                "thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA,
+                "thought_distribution_schema": (
+                    wrapper.thought_distribution_schema
+                ),
                 "optimizer_schema": optimizer_schema_for_trunk_optimizer(
                     args.trunk_optimizer
                 ),
@@ -4561,35 +4752,14 @@ def main() -> None:
                 },
                 "actor_init": actor_init_provenance,
                 "critic": {
-                    "init": (
-                        "warm_checkpoint"
-                        if args.actor_critic_init
-                        else "scratch"
-                    ),
-                    "checkpoint": (
-                        str(args.actor_critic_init)
-                        if args.actor_critic_init
-                        else None
-                    ),
-                    "source_execution_schema": (
-                        actor_init_payload.get("execution_schema")
-                        if args.actor_critic_init
-                        else None
-                    ),
+                    **critic_init_provenance,
                     "architecture": critic.trunk.architecture,
                     "model_config": critic.trunk.model_config,
                     "dense_for_latent_moe": critic_uses_dense_trunk,
                     "frozen_actor_moe_router_parameters": (
                         frozen_moe_router_parameters
                     ),
-                    "value_bins": args.value_bins,
-                    "value_anchored_support": args.value_anchored_support,
-                    "value_margin_bins": args.value_margin_bins,
-                    "value_num_bins_total": value_num_bins,
-                    "value_v_min": value_v_min,
-                    "value_v_max": value_v_max,
-                    "value_sigma_ratio": args.value_sigma_ratio,
-                    "value_prior": args.value_prior,
+                    "critic_schema": CRITIC_SCHEMA,
                     "combined_mlp_hidden": args.combined_mlp_hidden,
                     "combined_mlp_blocks": args.combined_mlp_blocks,
                     "parameters": sum(p.numel() for p in critic.parameters()),
@@ -4613,15 +4783,21 @@ def main() -> None:
     if not args.resume:
         logger.log(type="math_modal_answer_baseline", **math_modal_baseline)
 
+    rollout_recorder = RolloutSampleRecorder(
+        tokenizer, stop_ids, source_names, answer_prefix_ids
+    )
+
     def finish_group(
         batch: LatentRolloutBatch,
         row: dict,
         refresh_statistics: bool,
     ) -> LatentRolloutBatch:
         batch = trim_stream(batch, multiple=trim_multiple)
+        if hidden_carry:
+            validate_hidden_carry_rollout(batch)
         verifier_kind = row.get("_verifier_kind", "math")
         if verifier_kind == "math":
-            score_math_rollout(
+            verdicts = score_math_rollout(
                 batch, row["reward_model"]["ground_truth"], tokenizer, stop_ids,
                 answer_style(row),
                 args.nearby_reward_max,
@@ -4632,7 +4808,7 @@ def main() -> None:
             )
         elif verifier_kind == "python_mbpp":
             assert think_fence_ids is not None and answer_fence_ids is not None
-            score_python_rollout(
+            verdicts = score_python_rollout(
                 batch,
                 row["verification_info"],
                 tokenizer,
@@ -4644,6 +4820,18 @@ def main() -> None:
         else:
             raise ValueError(f"unsupported verifier kind {verifier_kind!r}")
         source_name = str(row.get("_rl_source", "math"))
+        if rollout_recorder.armed:
+            rollout_recorder.offer(
+                batch,
+                verdicts,
+                prompt_text(row),
+                (
+                    str(row["reward_model"]["ground_truth"])
+                    if verifier_kind == "math"
+                    else json.dumps(row["verification_info"], ensure_ascii=False)
+                ),
+                source_name,
+            )
         batch.source_id = torch.full(
             (batch.kind.size(0),),
             source_ids[source_name],
@@ -4724,6 +4912,7 @@ def main() -> None:
                         args.temperature, args.top_p,
                         stop_ids=stop_ids or None,
                         pin_emit=pin_emit,
+                        hidden_carry=hidden_carry,
                         record_likelihoods=False,
                         cache_dtype=torch.bfloat16,
                         sync_every=args.rollout_sync_every,
@@ -4971,6 +5160,7 @@ def main() -> None:
                     args.temperature, args.top_p, stop_ids=stop_ids or None,
                     prompt_lengths=prompt_lengths,
                     pin_emit=pin_emit,
+                    hidden_carry=hidden_carry,
                     record_likelihoods=False,
                     cache_dtype=torch.bfloat16,
                     sync_every=args.rollout_sync_every,
@@ -5085,6 +5275,7 @@ def main() -> None:
             answer_style_override="aime",
             captured_attempts=captured_attempts,
             pin_emit=pin_emit,
+            hidden_carry=hidden_carry,
             prompt_suffix_ids=answer_prefix_ids,
             answer_fence_ids=answer_fence_ids,
         )
@@ -5137,6 +5328,7 @@ def main() -> None:
             compiled_tail_batch=args.eval_tail_batch or None,
             captured_attempts=captured_attempts,
             pin_emit=pin_emit,
+            hidden_carry=hidden_carry,
             prompt_suffix_ids=answer_prefix_ids,
             answer_fence_ids=answer_fence_ids,
         )
@@ -5353,10 +5545,7 @@ def main() -> None:
                 value_residual_mean=value_metrics["residual_mean"],
                 value_residual_variance=value_metrics["residual_variance"],
                 explained_variance=value_metrics["explained_variance"],
-                value_excess_ce=value_metrics["excess_ce"],
-                value_loss=_weighted_metric_mean(
-                    group_metrics, "value_loss", "action_count"
-                ),
+                value_loss=value_metrics["loss"],
                 critic_grad_norm=group_metrics[-1]["critic_grad_norm"],
                 advantage_mean=_weighted_metric_mean(
                     group_metrics, "advantage_mean", "action_count"
@@ -5364,9 +5553,7 @@ def main() -> None:
             )
             logger.log(type="value_warmup", step=warmup, **metrics)
             warmup_dashboard = {
-                "value_warmup/token_weighted_excess_ce": metrics[
-                    "value_excess_ce"
-                ],
+                "value_warmup/token_weighted_mse": metrics["value_loss"],
                 "value_warmup/prediction_mean": metrics["value_mean"],
                 "value_warmup/target_mean": metrics["value_target_mean"],
                 "value_warmup/residual_mean": metrics["value_residual_mean"],
@@ -5502,11 +5689,19 @@ def main() -> None:
             pool_prompt_count / args.prompts_per_minibatch
         )
         torch.cuda.reset_peak_memory_stats()
+        capture_rollouts = capture_due(
+            step, pool_updates, args.rollout_sample_every
+        )
+        if capture_rollouts:
+            rollout_recorder.begin(step, metrics_step=step + pool_updates)
         groups = collect(
             refresh_statistics=False,
             prompt_count=pool_prompt_count,
             offload_to_cpu=True,
         )
+        if capture_rollouts:
+            # collect() has joined its scoring worker: every group is in.
+            write_rollout_samples(output, rollout_recorder.finish())
         with profiler.phase("rollout_diagnostics"):
             rollout_metrics = aggregate_diagnostics(
                 groups,
@@ -6014,7 +6209,12 @@ def main() -> None:
                         name: actor_dashboard[name]
                         for name in (
                             "grad/trunk", "grad/renderer", "grad/combiner",
-                            "grad/gate", "grad/thought_mean", "grad/critic",
+                            "grad/critic",
+                            *(
+                                ()
+                                if hidden_carry
+                                else ("grad/gate", "grad/thought_mean")
+                            ),
                         )
                         if not math.isfinite(actor_dashboard[name])
                     }

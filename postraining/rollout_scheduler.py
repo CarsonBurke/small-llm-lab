@@ -304,6 +304,8 @@ class _RecordLedger:
             action_mask = assembled["action_mask"]
             result[origin_id] = LatentRolloutBatch(
                 **assembled,
+                # Continuous refill never injects a hidden carry.
+                hiddens=action_mask.new_zeros((*action_mask.shape, 0)),
                 emit_mask=(assembled["actions"] == EMIT).float() * action_mask,
                 rewards=torch.zeros_like(action_mask),
                 reward_scalar=torch.zeros(
@@ -693,6 +695,13 @@ def rollout_continuous_refill_groups(
         raise ValueError("max_new_tokens must be positive")
     if max_stream_steps < max_new_tokens + (0 if pin_emit else 1):
         raise ValueError("stream budget cannot fit the requested actions")
+    if model.gate is None or model.transition is None:
+        # Only the hidden-carry wrapper is built without the stochastic
+        # heads, and the paged scheduler does not implement its carry.
+        # Running it here would silently roll out a token-only policy.
+        raise ValueError(
+            "continuous refill does not implement the hidden carry"
+        )
     widths = {chunk.size(1) for chunk in prompt_chunks}
     if len(widths) != 1:
         raise ValueError("all chunks must use one common prompt width")

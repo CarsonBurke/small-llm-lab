@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
+import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
@@ -678,6 +679,11 @@ class GPT2BPETokenizer:
     def encode(self, text: str) -> list[int]:
         return self._tokenizer.encode(text)
 
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        # The fast tokenizer's batch call is ``encode`` per text (GPT-2 adds
+        # no BOS/EOS) with the Rust implementation parallel across texts.
+        return self._tokenizer(list(texts))["input_ids"]
+
     def decode(self, ids) -> str:
         return self._tokenizer.decode(list(ids), skip_special_tokens=True)
 
@@ -806,8 +812,16 @@ def single_fence_span(
     duplicated-fence ambiguity about which span is "the" span.
     """
     open_id, close_id = fence_ids
-    opens = [index for index, token in enumerate(tokens) if token == open_id]
-    closes = [index for index, token in enumerate(tokens) if token == close_id]
+    if isinstance(tokens, np.ndarray):
+        # The same scan, vectorized: iterating an array element by element
+        # boxes every token, and SFT validates a whole corpus through here.
+        opens = np.flatnonzero(tokens == open_id).tolist()
+        closes = np.flatnonzero(tokens == close_id).tolist()
+    else:
+        opens = [index for index, token in enumerate(tokens) if token == open_id]
+        closes = [
+            index for index, token in enumerate(tokens) if token == close_id
+        ]
     if len(opens) != 1 or len(closes) != 1 or closes[0] < opens[0]:
         return None
     return opens[0], closes[0]
@@ -932,6 +946,21 @@ def emitted_display_segments(
     return segments
 
 
+def encode_many(tokenizer, texts: list[str]) -> list[list[int]]:
+    """``[tokenizer.encode(text) for text in texts]``, batched when possible.
+
+    Tokenizers with a native batched encoder expose it as ``encode_batch``;
+    the GPT-2 one runs the Rust tokenizer across every core instead of one
+    Python call per text, which is the difference between minutes and hours
+    of CPU on a million-document corpus. Results are identical to per-text
+    ``encode``.
+    """
+    encode_batch = getattr(tokenizer, "encode_batch", None)
+    if encode_batch is None:
+        return [list(tokenizer.encode(text)) for text in texts]
+    return encode_batch(texts)
+
+
 def encode_prompt(tokenizer, text: str, max_tokens: int | None = None) -> list[int]:
     """Encode a prompt the way pretraining framed documents: BOS-first.
 
@@ -941,7 +970,14 @@ def encode_prompt(tokenizer, text: str, max_tokens: int | None = None) -> list[i
     the problem as a mid-document continuation.  Truncation (``max_tokens``)
     keeps the BOS plus the LAST ``max_tokens - 1`` content tokens.
     """
-    ids = list(tokenizer.encode(text))
+    return frame_prompt(tokenizer, tokenizer.encode(text), max_tokens)
+
+
+def frame_prompt(
+    tokenizer, ids, max_tokens: int | None = None
+) -> list[int]:
+    """``encode_prompt``'s BOS framing and truncation over encoded ids."""
+    ids = list(ids)
     bos = tokenizer.bos_id()
     if bos < 0:
         return ids if max_tokens is None else ids[-max_tokens:]

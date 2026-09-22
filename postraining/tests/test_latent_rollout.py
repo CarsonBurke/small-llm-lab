@@ -61,6 +61,7 @@ from postraining.vapo.config import (
     build_arg_parser,
     validate_args,
 )
+from postraining.rollout_report import RowVerdict
 from postraining.train_latent_vapo import (
     MathPromptSampler,
     REWARD_SCHEMA,
@@ -78,15 +79,16 @@ from postraining.train_latent_vapo import (
 from postraining.latent_eval import verify_terminated_answer
 from postraining.vapo.schemas import (
     ACTOR_OBJECTIVE_SCHEMA,
+    CRITIC_SCHEMA,
     DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA,
     EXECUTION_SCHEMA,
     REPLAY_NUMERICS_SCHEMA,
     TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA,
     actor_objective_schema,
-    execution_schema_for_rollout_scheduler,
+    execution_schema_for,
     resume_execution_schema_compatible,
+    resume_critic_schema_compatible,
     resume_replay_schema_compatible,
-    value_support_geometry_matches,
 )
 from postraining.value_model import SeparateCritic
 
@@ -140,14 +142,10 @@ def _critic(seed: int = 11) -> SeparateCritic:
     torch.manual_seed(seed)
     with _pope_construction():
         trunk = FreshLeJEPASharedRMSV1PoPE(**KWARGS).eval()
-    critic = SeparateCritic(
-        trunk,
-        num_bins=17,
-        sigma_ratio=2.0,
-    ).eval()
-    # The v215 head init (zero weight, prior bias) makes every value the
-    # constant prior; de-zero the weight so values are input-dependent and
-    # the exactness assertions below carry weight.
+    critic = SeparateCritic(trunk).eval()
+    # The zero head init makes every value exactly 0; de-zero the weight so
+    # values are input-dependent and the exactness assertions below carry
+    # weight.
     with torch.no_grad():
         critic.head.weight.normal_(std=0.05)
     return critic
@@ -795,6 +793,7 @@ def _decode_group(row_actions: list[int], prompt: int, bucket: int = 1):
         kind=torch.full((rows, stream), TOKEN_SLOT, dtype=torch.long),
         token_ids=torch.zeros((rows, stream), dtype=torch.long),
         thoughts=torch.zeros(rows, stream, 0),
+        hiddens=torch.zeros(rows, stream, 0),
         actions=torch.zeros((rows, stream), dtype=torch.long),
         action_mask=action_mask,
         stop_mask=zeros.clone(),
@@ -1243,7 +1242,7 @@ def test_default_cli_selects_current_delightful_broad_regime():
     assert cli.steps == 40_000
     assert (
         cli.rl_mixture_manifest
-        == "postraining/data/vapo_broad_v6_bare.manifest.json"
+        == "postraining/data/vapo_broad_v9_bare.manifest.json"
     )
     assert cli.reasoning_mode == "latent"
     assert cli.delightful_policy_gradient
@@ -1259,6 +1258,25 @@ def test_default_cli_selects_current_delightful_broad_regime():
     assert cli.answer_fence
     assert cli.zero_reward_stop_pools == 0
     assert cli.actor_critic_init is None
+    assert cli.critic_init == "scratch"
+
+
+def test_actor_critic_init_conflicts_with_actor_copied_critic(capsys):
+    parser = build_arg_parser()
+    cli = parser.parse_args(
+        [
+            "--checkpoint", "c", "--output", "o",
+            "--critic-init", "actor",
+            "--actor-critic-init", "warm.pt",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, cli)
+    assert "--critic-init actor conflicts" in capsys.readouterr().err
+    actor_copy = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o", "--critic-init", "actor"]
+    )
+    validate_args(parser, actor_copy)
 
 
 def test_dg_topology_migration_requires_resume(capsys):
@@ -1364,14 +1382,20 @@ def test_tpo_cli_rejects_stale_pool_and_invalid_eta(capsys):
 
 
 def test_actor_objective_schema_distinguishes_vapo_dg_and_tpo():
-    assert actor_objective_schema(False) == ACTOR_OBJECTIVE_SCHEMA
-    assert actor_objective_schema(True) == DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA
-    assert (
-        actor_objective_schema(False, True)
-        == TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA
-    )
+    for mode in ("latent", "cot", "none"):
+        assert actor_objective_schema(mode) == ACTOR_OBJECTIVE_SCHEMA
+        assert (
+            actor_objective_schema(mode, True)
+            == DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA
+        )
+        assert (
+            actor_objective_schema(mode, False, True)
+            == TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA
+        )
     with pytest.raises(ValueError, match="mutually exclusive"):
-        actor_objective_schema(True, True)
+        actor_objective_schema("latent", True, True)
+    with pytest.raises(ValueError, match="unknown reasoning mode"):
+        actor_objective_schema("thought")
 
 
 def test_rollout_only_repeats_are_benchmark_scoped(capsys):
@@ -3580,51 +3604,13 @@ def test_logged_zero_reward_frozen_updates_recovers_unique_steps(tmp_path):
     assert logged_zero_reward_frozen_updates(metrics, through_step=3) == 2
 
 
-def test_value_support_geometry_matches_compares_args_not_shapes() -> None:
-    current = SimpleNamespace(
-        value_anchored_support=True,
-        value_bins=101,
-        value_margin_bins=4,
-        value_sigma_ratio=1.0,
+def test_resume_critic_schema_rejects_categorical_critics() -> None:
+    assert resume_critic_schema_compatible({"critic_schema": CRITIC_SCHEMA})
+    # HL-Gauss checkpoints never recorded a critic schema.
+    assert not resume_critic_schema_compatible({})
+    assert not resume_critic_schema_compatible(
+        {"critic_schema": "hl_gauss_categorical/v1"}
     )
-    saved = {
-        "value_anchored_support": True,
-        "value_bins": 101,
-        "value_margin_bins": 4,
-        "value_sigma_ratio": 1.0,
-    }
-    assert value_support_geometry_matches(saved, current)
-    # Anchored 103/3 collides with 101/4 on total head width (110 bins) but
-    # changes bin width and sigma; the args comparison catches what a strict
-    # state-dict shape check cannot.
-    assert not value_support_geometry_matches(
-        dict(saved, value_bins=103, value_margin_bins=3), current
-    )
-    assert not value_support_geometry_matches(
-        dict(saved, value_anchored_support=False), current
-    )
-    assert not value_support_geometry_matches(
-        dict(saved, value_sigma_ratio=2.0), current
-    )
-    # Pre-v22 checkpoints carry none of the keys.
-    assert not value_support_geometry_matches({}, current)
-    legacy = SimpleNamespace(
-        value_anchored_support=False,
-        value_bins=101,
-        value_margin_bins=4,
-        value_sigma_ratio=1.0,
-    )
-    # Unanchored grids ignore the margin flag entirely.
-    assert value_support_geometry_matches(
-        {
-            "value_anchored_support": False,
-            "value_bins": 101,
-            "value_margin_bins": 9,
-            "value_sigma_ratio": 1.0,
-        },
-        legacy,
-    )
-    assert not value_support_geometry_matches({}, legacy)
 
 
 def test_score_math_rollout_requires_termination_before_verifier_reward(monkeypatch):
@@ -3808,7 +3794,7 @@ def test_think_min_tokens_floor_gates_short_fences(monkeypatch):
             [think_open, 1, think_close, 9, eos],  # under the floor
         ],
     )
-    score_math_rollout(
+    verdicts = score_math_rollout(
         batch,
         "42",
         tokenizer,
@@ -3819,6 +3805,10 @@ def test_think_min_tokens_floor_gates_short_fences(monkeypatch):
     )
     assert batch.reward_scalar.tolist() == [1.0, 0.0]
     assert batch.think_gate_zeroed_correct == 1
+    assert verdicts == [
+        RowVerdict(format_ok=True, parsed_answer="42"),
+        RowVerdict(format_ok=False, parsed_answer="42"),
+    ]
 
 
 def test_structural_answer_fence_gate(monkeypatch):
@@ -3904,7 +3894,7 @@ def test_structural_answer_fence_gate(monkeypatch):
             honest[:-1],
         ],
     )
-    score_math_rollout(
+    verdicts = score_math_rollout(
         batch,
         "42",
         tokenizer,
@@ -3916,6 +3906,16 @@ def test_structural_answer_fence_gate(monkeypatch):
     )
     assert batch.reward_scalar.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     assert batch.think_gate_zeroed_correct == 3
+    # Transcripts receive the gate's verdict and the prediction each row
+    # was actually graded on — the counterfactual's for gate-zeroed rows.
+    assert verdicts == [
+        RowVerdict(format_ok=True, parsed_answer="42"),
+        RowVerdict(format_ok=False, parsed_answer="37"),
+        RowVerdict(format_ok=False, parsed_answer="42"),
+        RowVerdict(format_ok=False, parsed_answer="42"),
+        RowVerdict(format_ok=False, parsed_answer="42"),
+        RowVerdict(format_ok=False, parsed_answer=None),
+    ]
 
     with pytest.raises(ValueError, match="requires think_fence_ids"):
         score_math_rollout(
@@ -4965,17 +4965,19 @@ def test_clip_bounds_are_the_same_constants_without_the_host_copy():
 
 def test_resume_schema_compatibility_is_strict_equality():
     """v29 has no migrations: every pre-stochastic schema is refused."""
-    lockstep = execution_schema_for_rollout_scheduler("lockstep")
-    refill = execution_schema_for_rollout_scheduler("continuous_refill")
+    lockstep = execution_schema_for("latent", "lockstep")
+    refill = execution_schema_for("latent", "continuous_refill")
     assert lockstep == EXECUTION_SCHEMA
     assert refill != lockstep
-    assert resume_execution_schema_compatible({"execution_schema": lockstep})
+    assert resume_execution_schema_compatible(
+        {"execution_schema": lockstep}, expected_execution_schema=lockstep
+    )
     assert resume_execution_schema_compatible(
         {"execution_schema": refill},
         expected_execution_schema=refill,
     )
     assert not resume_execution_schema_compatible(
-        {"execution_schema": refill}
+        {"execution_schema": refill}, expected_execution_schema=lockstep
     )
     for stale in (
         None,
@@ -4984,14 +4986,14 @@ def test_resume_schema_compatibility_is_strict_equality():
         "sequential_data/v27",
     ):
         assert not resume_execution_schema_compatible(
-            {"execution_schema": stale}
+            {"execution_schema": stale}, expected_execution_schema=lockstep
         )
     assert resume_replay_schema_compatible(
-        {"replay_numerics_schema": REPLAY_NUMERICS_SCHEMA}
+        {"replay_numerics_schema": REPLAY_NUMERICS_SCHEMA}, "latent"
     )
     assert not resume_replay_schema_compatible(
-        {"replay_numerics_schema": "per_position_dense/v1"}
+        {"replay_numerics_schema": "per_position_dense/v1"}, "latent"
     )
-    assert not resume_replay_schema_compatible({})
+    assert not resume_replay_schema_compatible({}, "latent")
     with pytest.raises(ValueError, match="unknown rollout scheduler"):
-        execution_schema_for_rollout_scheduler("tail_merge")
+        execution_schema_for("latent", "tail_merge")

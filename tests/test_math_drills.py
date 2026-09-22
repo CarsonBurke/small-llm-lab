@@ -534,6 +534,39 @@ def test_a_trained_combiner_is_detected_from_the_parameters():
     assert not carries_trained_combiner({})
 
 
+def test_a_wrapper_policy_is_read_from_its_rollout_policy_schema():
+    """The probe decodes a wrapper by the policy tag it was trained under.
+
+    A mode name is not enough: the v1 hidden carry and the retired
+    latent-thought tags still say "carry" and "latent" in their `args`, and
+    measuring them as current policies would name the wrong contract.
+    """
+    from postraining.latent_thought import (
+        HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA,
+        PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS,
+        ROLLOUT_POLICY_SCHEMA,
+    )
+    from postraining.run_arithmetic_probe import wrapper_reasoning_mode
+
+    assert (
+        wrapper_reasoning_mode(
+            {"rollout_policy_schema": HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA}
+        )
+        == "carry"
+    )
+    for mode, schema in PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS.items():
+        assert wrapper_reasoning_mode({"rollout_policy_schema": schema}) == mode
+    assert (
+        wrapper_reasoning_mode({"rollout_policy_schema": ROLLOUT_POLICY_SCHEMA})
+        == "latent"
+    )
+    for stale in ("deterministic_hidden_carry/v1", None):
+        with pytest.raises(ValueError, match="names no current reasoning mode"):
+            wrapper_reasoning_mode(
+                {"rollout_policy_schema": stale, "args": {"reasoning_mode": "carry"}}
+            )
+
+
 DRILL_CORPUS = Path(__file__).resolve().parents[1] / "data" / "math_drills" / "v4"
 
 

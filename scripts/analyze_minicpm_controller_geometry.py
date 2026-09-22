@@ -61,7 +61,7 @@ def validate_batch(torch, batch, captured_trainer_source=None, captured_rollout_
     if not isinstance(batch["seed"], int) or not batch["records"]:
         raise ValueError("a seeded, nonempty actual rollout batch is required")
     required_sources = {"scripts/train_minicpm_latent_controller.py",
-                        "postraining/latent_thought.py", "postraining/minicpm_vapo.py"}
+                        "postraining/latent_thought.py", "postraining/vapo/policy.py"}
     if not required_sources.issubset(batch["source_hashes"]):
         raise ValueError("missing scoring/head source hashes")
     current_hashes = {}

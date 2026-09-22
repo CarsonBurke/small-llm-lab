@@ -16,6 +16,13 @@ caller (the DAPO trainer writes exact verifier reward plus bounded numeric
 distance shaping through ``assign_terminal_rewards``);
 ``continuation_reward`` survives only for the ``sample_latent --fineweb``
 inspection tool.
+
+Deterministic hidden carry (``hidden_carry=True``) is a pinned-EMIT token
+policy: tokens are the only actions, and the belief that produced each
+generated token is stored at that token's slot (``hiddens``) and added through
+the combiner when the token is consumed. Prompt slots and the input of the
+first generation step carry nothing. Stored hiddens are behavior-time
+constants, so there is no BPTT through the carry.
 """
 
 from __future__ import annotations
@@ -120,11 +127,19 @@ class LatentRolloutBatch:
     ``token_ids`` holds prompt and emitted tokens
     at TOKEN slots; ``thoughts`` (batch, stream, dim, fp32) holds the raw
     transition samples at THOUGHT slots.
+
+    ``hiddens`` (batch, stream, dim) is the hidden-carry record: at every
+    generated TOKEN slot, the detached belief that produced that token, in
+    the live belief dtype. A slot carries exactly where the previous slot
+    took an action (``generated_slot_mask``); everything else is zero. It
+    has a zero-width final dimension unless the rollout both injected the
+    carry and kept replay storage.
     """
 
     kind: Tensor
     token_ids: Tensor
     thoughts: Tensor
+    hiddens: Tensor
     actions: Tensor
     action_mask: Tensor
     # Subset of action_mask where CONTINUE/STOP was sampled. The mandatory
@@ -157,6 +172,12 @@ class LatentRolloutBatch:
     # TPO additionally needs the stable executed-token-versus-rest log odds.
     # Ordinary PPO/DG refreshes leave the zero-initialized storage untouched.
     tpo_statistics_refreshed: bool = False
+    # True when the rollout added carried hiddens to its decode inputs
+    # (reasoning mode ``carry``). Zero-width ``hiddens`` are replayable only
+    # when this is False: a carry rollout that discarded its hiddens
+    # (``replay_storage=False``) cannot be replayed, because replay would
+    # silently feed plain token embeddings where the rollout fed carries.
+    carry_injected: bool = False
     # Plans are tied to a logical packed layout, not merely its shape. Device
     # copies preserve the token; structural transforms create a fresh one so
     # an unrelated same-shape batch cannot silently reuse stale indices.
@@ -434,6 +455,7 @@ def rollout_continuations(
     cache_dtype: torch.dtype | None = None,
     prompt_repeats: int = 1,
     pin_emit: bool = False,
+    hidden_carry: bool = False,
     tail_caches: list[tuple[Tensor, ...]] | None = None,
     tail_step_core=None,
     sync_every: int = 16,
@@ -464,6 +486,13 @@ def rollout_continuations(
     ever taken, so every gate/thought loss term degrades to zero through its
     mask), and thought storage keeps a zero-width final dimension exactly
     like ``replay_storage=False``.
+
+    ``hidden_carry`` (pinned-EMIT only) is the deterministic hidden-carry
+    policy: each decode input is ``wrapper.combined_input(token, belief)``,
+    where ``belief`` is the state that produced ``token``, and that belief is
+    stored at the token's slot in ``hiddens``. Token sampling is the pinned
+    path unchanged, so under a zero-initialized combiner the rollout is
+    bitwise the pinned-EMIT one for the same generator state.
 
     ``caches`` switches to the fixed-shape step path: the caller passes
     preallocated caches (``make_static_generation_cache``, at least
@@ -569,6 +598,23 @@ def rollout_continuations(
     """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
+    if hidden_carry and not pin_emit:
+        raise ValueError(
+            "hidden carry is a pinned-EMIT token policy: tokens are its only "
+            "actions"
+        )
+    if hidden_carry and not wrapper.hidden_carry:
+        # The reverse is allowed: a carry policy rolled out token-only is the
+        # carry ablation's no-carry arm.
+        raise ValueError(
+            "hidden-carry rollout needs a hidden-carry wrapper; this one's "
+            "combiner was trained for another policy"
+        )
+    if not pin_emit and (wrapper.gate is None or wrapper.transition is None):
+        raise ValueError(
+            "a latent-thought rollout needs the stop gate and Gaussian "
+            "transition; this wrapper was built without them"
+        )
     required_stream_steps = max_new_tokens + (0 if pin_emit else 1)
     if max_stream_steps < required_stream_steps:
         raise ValueError(
@@ -968,17 +1014,21 @@ def rollout_continuations(
                     grouped_target[:, :, :, :prompt_length].copy_(expanded)
         caches = expanded_caches
 
-        def expand_rows(value: Tensor) -> Tensor:
-            return value.repeat_interleave(prompt_repeats, dim=0)
-
-        output = output.__class__(
-            belief=expand_rows(output.belief),
-            predicted=expand_rows(output.predicted),
-            thought_log_sigma=expand_rows(output.thought_log_sigma),
-            input_latent=expand_rows(output.input_latent),
-            logits=expand_rows(output.logits),
-            caches=caches,
+        output = _map_step_output_rows(
+            output,
+            lambda value: value.repeat_interleave(prompt_repeats, dim=0),
+            caches,
         )
+
+    # The carry record is allocated in the live belief dtype, known only once
+    # the prefill has produced a belief. Storing it losslessly is what lets
+    # replay inject the identical value the decode step injected.
+    stored_hidden_dim = model_dim if replay_storage and hidden_carry else 0
+    hiddens = torch.zeros(
+        (batch, max_stream, stored_hidden_dim),
+        dtype=output.belief.dtype if stored_hidden_dim else torch.float32,
+        device=device,
+    )
 
     emitted = torch.zeros(batch, dtype=torch.long, device=device)
     ended = torch.zeros(batch, dtype=torch.bool, device=device)
@@ -1207,13 +1257,10 @@ def rollout_continuations(
                             ].copy_(survivors)
                             compacted.append(tensor[:compacted_count])
                         caches[layer] = tuple(compacted)
-                output = output.__class__(
-                    belief=output.belief.index_select(0, keep),
-                    predicted=output.predicted.index_select(0, keep),
-                    thought_log_sigma=output.thought_log_sigma.index_select(0, keep),
-                    input_latent=output.input_latent.index_select(0, keep),
-                    logits=output.logits.index_select(0, keep),
-                    caches=caches,
+                output = _map_step_output_rows(
+                    output,
+                    lambda value: value.index_select(0, keep),
+                    caches,
                 )
                 active = active.index_select(0, keep)
         belief = output.belief
@@ -1360,6 +1407,17 @@ def rollout_continuations(
                 output.thought_log_sigma.float(),
                 old_thought_log_sigmas[row_slots],
             )
+        if stored_hidden_dim:
+            # The belief that produced this token, stored at the token's own
+            # slot: the +1-shifted carry that replay's combiner re-injects.
+            if belief.dtype != hiddens.dtype:
+                raise RuntimeError(
+                    f"decode belief dtype {belief.dtype} changed from the "
+                    f"carry record's {hiddens.dtype}"
+                )
+            hiddens[next_slots] = torch.where(
+                emits[:, None], belief, hiddens[next_slots]
+            )
         emitted += emits.long()
         if stop_tensor is not None:
             ended |= emits & torch.isin(token, stop_tensor)
@@ -1369,7 +1427,12 @@ def rollout_continuations(
         # loss masks it); batched caches make per-row early exit impractical.
         next_kinds = kind[live_rows, next_position]
         next_token_ids = token_ids[live_rows, next_position]
-        if thought is None:
+        if hidden_carry:
+            # Every decode input carries the belief that produced its token.
+            # Finished rows carry a stale belief onto token 0; nothing they
+            # produce is recorded, exactly like their token embedding.
+            next_input = wrapper.combined_input(next_token_ids, belief)
+        elif thought is None:
             next_input = wrapper.embed_tokens(next_token_ids[:, None])
         else:
             next_input = torch.where(
@@ -1424,6 +1487,7 @@ def rollout_continuations(
         kind=kind,
         token_ids=token_ids,
         thoughts=thoughts,
+        hiddens=hiddens,
         actions=actions,
         action_mask=action_mask,
         stop_mask=stop_mask,
@@ -1438,8 +1502,31 @@ def rollout_continuations(
         rewards=torch.zeros_like(action_mask),
         reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
         prompt_length=prompt_length,
+        carry_injected=hidden_carry,
     )
     return rolled if not filler_rows else _drop_filler_rows(rolled, filler_rows)
+
+
+def _map_step_output_rows(
+    output: StepOutput, rows, caches: list[tuple[Tensor, ...]]
+) -> StepOutput:
+    """Apply a row transform to every per-row policy output.
+
+    A hidden-carry wrapper has no Gaussian head, so its ``predicted`` and
+    ``thought_log_sigma`` are None and pass through untouched.
+    """
+
+    def mapped(value: Tensor | None) -> Tensor | None:
+        return None if value is None else rows(value)
+
+    return StepOutput(
+        belief=rows(output.belief),
+        predicted=mapped(output.predicted),
+        thought_log_sigma=mapped(output.thought_log_sigma),
+        input_latent=rows(output.input_latent),
+        logits=rows(output.logits),
+        caches=caches,
+    )
 
 
 def _drop_filler_rows(
@@ -1543,6 +1630,12 @@ def pack_rollout_groups_for_replay(
     """
     if not groups:
         raise ValueError("at least one rollout group is required")
+    # Checked before any field is packed: a carry stream and a token-only
+    # stream differ in their hiddens width too, and the shape refusal that
+    # would otherwise fire first names the symptom rather than the cause.
+    carry_flags = {group.carry_injected for group in groups}
+    if len(carry_flags) != 1:
+        raise ValueError("cannot pack carry-injected and token-only rollouts")
     devices = {group.kind.device for group in groups}
     if len(devices) != 1:
         raise ValueError("rollout groups must share one device")
@@ -1562,6 +1655,9 @@ def pack_rollout_groups_for_replay(
             combined[field.name] = all(
                 bool(getattr(group, field.name)) for group in groups
             )
+            continue
+        if field.name == "carry_injected":
+            combined[field.name] = groups[0].carry_injected
             continue
         if field.name == "replay_layout_token":
             # Packing creates a new logical layout; callers that deliberately
@@ -1771,12 +1867,86 @@ def assign_terminal_rewards(batch: LatentRolloutBatch, scores: Tensor) -> None:
     batch.reward_scalar.copy_(scores)
 
 
+def generated_slot_mask(batch: LatentRolloutBatch) -> Tensor:
+    """Slots holding a model-generated token: the hidden-carry flag.
+
+    A slot holds a generated token exactly where the previous slot took an
+    action, so the flag is ``action_mask`` shifted right by one. Deriving it
+    from per-row data rather than the scalar ``prompt_length`` is what keeps
+    it exact for packed replay batches, whose scalar prompt length is only
+    the minimum across groups.
+    """
+    mask = batch.action_mask.bool()
+    shifted = torch.zeros_like(mask)
+    shifted[:, 1:] = mask[:, :-1]
+    return shifted
+
+
+def carried_hiddens(batch: LatentRolloutBatch) -> Tensor:
+    """The stored carry of a hidden-carry batch, or an error.
+
+    Both the actor and the critic read the carry through here, so neither
+    can replay a carry rollout that discarded its record, nor mistake a
+    token-only or latent-thought batch for one.
+    """
+    if not batch.carry_injected:
+        raise ValueError("batch was not rolled out with a hidden carry")
+    if batch.hiddens.size(-1) == 0:
+        raise ValueError(
+            "hidden-carry rollout discarded its carried hiddens "
+            "(replay_storage=False); the stream cannot be replayed"
+        )
+    if batch.thoughts.size(-1):
+        raise ValueError(
+            "a hidden-carry batch cannot also store latent thoughts"
+        )
+    return batch.hiddens
+
+
+def validate_hidden_carry_rollout(batch: LatentRolloutBatch) -> None:
+    """Refuse a carry batch that took any action other than a token.
+
+    One host synchronization covers every structural invariant: no THOUGHT
+    slot, no gate decision, and EMIT at every action position.
+    """
+    carried_hiddens(batch)
+    violation = (
+        (batch.kind == THOUGHT_SLOT).any()
+        | batch.stop_mask.bool().any()
+        | ((batch.actions != EMIT) & batch.action_mask.bool()).any()
+    )
+    if bool(violation):
+        raise RuntimeError(
+            "hidden-carry rollout recorded a thought, gate decision, or "
+            "non-EMIT action; tokens are its only actions"
+        )
+
+
 def assemble_stream_latents(
     wrapper: LatentThoughtModel, batch: LatentRolloutBatch
 ) -> Tensor:
     """Rebuild the exact (batch, stream, dim) inputs the rollout consumed."""
+    if batch.carry_injected != wrapper.hidden_carry:
+        # Replaying a carry stream through another policy's combiner, or a
+        # token-only stream through a carry policy, prices tokens under
+        # inputs the rollout never consumed.
+        raise ValueError(
+            "rollout carry does not match the policy: batch carry_injected="
+            f"{batch.carry_injected}, wrapper hidden_carry="
+            f"{wrapper.hidden_carry}"
+        )
     token_latent = wrapper.embed_tokens(batch.token_ids)
     pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+    if batch.carry_injected:
+        # The dense combiner evaluation with a flag-select is value- and
+        # gradient-equivalent to boolean-index assignment, but keeps static
+        # shapes and the full replay trunk inside one Inductor graph.
+        inputs = wrapper.combiner(
+            token_latent, carried_hiddens(batch), generated_slot_mask(batch)
+        )
+        return inputs * pad_scale
+    if batch.hiddens.size(-1):
+        raise ValueError("batch stores hiddens it never injected")
     if batch.thoughts.size(-1) == 0:
         if bool((batch.kind == THOUGHT_SLOT).any()):
             raise ValueError(
@@ -2380,8 +2550,12 @@ def refresh_old_statistics(
         )
         values = critic.values(microbatch).float()
         with torch.no_grad():
+            # A hidden-carry wrapper has no gate, and its stop mask is empty
+            # by construction: there is no gate decision to score.
             stop_logprobs = (
-                wrapper.gate.log_prob(
+                torch.zeros_like(microbatch.stop_mask)
+                if wrapper.gate is None
+                else wrapper.gate.log_prob(
                     microbatch.actions.float(), beliefs
                 ).float()
                 * microbatch.stop_mask

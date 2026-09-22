@@ -17,6 +17,26 @@ CAPTURE_ATTEMPTS = CAPTURE_PROBLEMS * CAPTURE_SAMPLES_PER_PROBLEM
 BENCHMARK_ANSWER_SCHEMA = "deterministic_hidden_carry_answers/v4"
 
 
+# Token-stream styling shared by every report that renders emitted segments
+# (this module's benchmark panels and ``rollout_report``). The host page
+# defines the palette variables: --line --panel-2 --muted --think --answer
+# --eos --think-bg --answer-bg.
+STREAM_CSS = """
+    .legend { display:flex; flex-wrap:wrap; align-items:center; gap:1rem .9rem; margin:0 0 1rem; padding:.65rem .9rem; border:1px solid var(--line); border-radius:12px; background:var(--panel-2); color:var(--muted); font:12.5px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .legend-item { white-space:nowrap; }
+    .stream { flex:1; margin:0; padding:.9rem 1rem; border-radius:9px; background:var(--panel-2); color:#d7deec; font:13px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; overflow-x:auto; }
+    .tok { display:inline-block; margin:0 .12rem; padding:0 .34rem; border-radius:5px; border:1px solid var(--line); font-size:.86em; line-height:1.55; vertical-align:baseline; color:var(--muted); background:#ffffff08; white-space:nowrap; }
+    .tok-think_open,.tok-think_close { color:var(--think); border-color:#c4a7ff66; background:var(--think-bg); }
+    .tok-answer_open,.tok-answer_close { color:var(--answer); border-color:#47d18c66; background:var(--answer-bg); }
+    .tok-eos,.tok-bos { color:var(--eos); border-color:#ffab7066; background:#ffab701a; }
+    .txt.in-think { background:var(--think-bg); border-radius:3px; }
+    .txt.in-answer { background:var(--answer-bg); border-radius:3px; }
+    .txt.prefix { color:var(--muted); font-style:italic; }
+    .tok.prefix { font-style:italic; opacity:.7; }
+    .nl { color:#5b688044; user-select:none; }
+"""
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Replace ``path`` atomically so readers never observe partial reports."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,8 +300,7 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
     .summary div {{ padding:.9rem 1.1rem; }}
     .summary span {{ display:block; color:var(--muted); font-size:.74rem; text-transform:uppercase; letter-spacing:.08em; }}
     .summary strong {{ display:block; margin-top:.3rem; font-size:1.45rem; font-variant-numeric:tabular-nums; }}
-    .legend {{ display:flex; flex-wrap:wrap; align-items:center; gap:1rem .9rem; margin:0 0 1rem; padding:.65rem .9rem; border:1px solid var(--line); border-radius:12px; background:var(--panel-2); color:var(--muted); font:12.5px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace; }}
-    .legend-item {{ white-space:nowrap; }}
+    {STREAM_CSS}
     .problem {{ margin:1.4rem 0; padding:clamp(1rem,3vw,1.7rem); box-shadow:0 18px 45px #0005; }}
     .problem-title {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:.6rem .9rem; margin-bottom:.8rem; }}
     .problem-title h2 {{ margin:0; font-size:1.25rem; }}
@@ -298,16 +317,6 @@ def render_benchmark_report(payload: Mapping[str, Any]) -> str:
     .badge {{ padding:.16rem .48rem; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:.72rem; white-space:nowrap; }}
     .badge.correct,.badge.solved.correct {{ border-color:#47d18c88; color:var(--good); }}
     .badge.incorrect,.badge.solved.incorrect {{ border-color:#ff6b7a88; color:var(--bad); }}
-    .stream {{ flex:1; margin:0; padding:.9rem 1rem; border-radius:9px; background:var(--panel-2); color:#d7deec; font:13px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; overflow-x:auto; }}
-    .tok {{ display:inline-block; margin:0 .12rem; padding:0 .34rem; border-radius:5px; border:1px solid var(--line); font-size:.86em; line-height:1.55; vertical-align:baseline; color:var(--muted); background:#ffffff08; white-space:nowrap; }}
-    .tok-think_open,.tok-think_close {{ color:var(--think); border-color:#c4a7ff66; background:var(--think-bg); }}
-    .tok-answer_open,.tok-answer_close {{ color:var(--answer); border-color:#47d18c66; background:var(--answer-bg); }}
-    .tok-eos,.tok-bos {{ color:var(--eos); border-color:#ffab7066; background:#ffab701a; }}
-    .txt.in-think {{ background:var(--think-bg); border-radius:3px; }}
-    .txt.in-answer {{ background:var(--answer-bg); border-radius:3px; }}
-    .txt.prefix {{ color:var(--muted); font-style:italic; }}
-    .tok.prefix {{ font-style:italic; opacity:.7; }}
-    .nl {{ color:#5b688044; user-select:none; }}
     .stats {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.65rem; margin:.9rem 0 0; }}
     .stats div {{ min-width:0; }}
     dt {{ color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; }}

@@ -9,7 +9,7 @@ from torch import nn
 
 from postraining import fast_inference
 from postraining.fast_inference import CapturedTrainingRolloutEngine, PromptPrefixBank
-from postraining.minicpm_vapo import MiniCPMVAPOPolicy
+from postraining.vapo.policy import VAPOPolicy
 from postraining.nextlat_speculative import NextLatSpeculativeEngine
 from postraining.thinking_budget import force_thinking_end_, validate_thinking_budget
 
@@ -65,7 +65,7 @@ def test_budget_only_updates_active_lanes_and_reserves_tokens_after_delimiter() 
 @pytest.mark.parametrize("reserve", [1, 2, 3, 4])
 def test_nextlat_recomputes_answer_after_forcing_across_commit_boundaries(reserve) -> None:
     engine = NextLatSpeculativeEngine(
-        cast(MiniCPMVAPOPolicy, _TokenPolicy()), stop_ids=(8,),
+        cast(VAPOPolicy, _TokenPolicy()), stop_ids=(8,),
         prompts_per_rollout=3, samples_per_prompt=1, cache_length=12,
         draft_length=2, temperature=1.0, top_p=1.0, compile_decode=False,
         answer_reserve_tokens=reserve, thinking_end_token_id=9,
@@ -94,7 +94,7 @@ def test_captured_steps_force_before_model_forward_and_reset_on_refill(monkeypat
     monkeypatch.setattr(fast_inference, "compile_invariant", lambda function: function)
     monkeypatch.setattr(fast_inference, "install_invariant_linears", lambda model: ())
     engine = CapturedTrainingRolloutEngine(
-        cast(MiniCPMVAPOPolicy, policy), stop_ids=(8,), prompts_per_rollout=3,
+        cast(VAPOPolicy, policy), stop_ids=(8,), prompts_per_rollout=3,
         samples_per_prompt=1, cache_length=12, temperature=1.0, top_k=1, top_p=1.0,
         compile_decode=mode == "invariant", invariant_decode=mode == "invariant",
         answer_reserve_tokens=2, thinking_end_token_id=9,

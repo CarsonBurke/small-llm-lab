@@ -322,7 +322,7 @@ def wrap_phase(recorder, original, name, *, cuda=False, counters=True, context=N
 
 def save_analysis(recorder, policy, records, args, output, source_hashes):
     torch = recorder.torch
-    from postraining.minicpm_vapo import FIRST_THOUGHT, CONTINUE_THOUGHT, STOP_THINKING
+    from postraining.vapo.policy import FIRST_THOUGHT, CONTINUE_THOUGHT, STOP_THINKING
 
     compact = []
     noise = {'sampled_states': 0, 'elements': 0, 'raw_minus_saved_state_sum_sq': 0.0,
@@ -393,7 +393,7 @@ def generation_details(result, engine, *args, **kwargs):
     observations = result.controller_observations
     positions = sum(value.size(0) for value in observations)
     thoughts = sum(value.size(0) for value in result.latent_vectors)
-    from postraining.minicpm_vapo import STOP_THINKING
+    from postraining.vapo.policy import STOP_THINKING
     genuine_stops = sum(int((kinds == STOP_THINKING).sum()) for kinds in result.action_kinds)
     return {
         'engine_telemetry': dict(engine.telemetry),
@@ -556,7 +556,7 @@ def main(argv=None):
         args = trainer.parser().parse_args(trainer_argv)
         sys.argv = [trainer.__file__, *trainer_argv]
         sources = [Path(__file__), Path(trainer.__file__), Path(rollout.__file__), Path(runtime.__file__),
-                   ROOT / 'postraining/minicpm_vapo.py', ROOT / 'postraining/latent_thought.py',
+                   ROOT / 'postraining/vapo/policy.py', ROOT / 'postraining/latent_thought.py',
                    ROOT / 'postraining/fast_inference.py', ROOT / 'postraining/invariant_linear.py',
                    ROOT / 'postraining/invariant_attention.py']
         hashes = {str(path.resolve().relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}

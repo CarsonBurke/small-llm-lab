@@ -31,7 +31,11 @@ import triton
 from postraining.fast_inference import build_fused_rollout_replica, synchronize_fused_lora_policy_
 from postraining.invariant_attention import INVARIANT_ATTENTION
 from postraining.minicpm_latent_rollout import _LatentStateDecoder
-from postraining.minicpm_vapo import LoRAConfig, LoRALinear, MiniCPMVAPOPolicy
+from postraining.vapo.policy import VAPOPolicy
+from postraining.vapo.model.lora import (
+    LoRAConfig,
+    LoRALinear,
+)
 from postraining.train_minicpm_vapo import encode_math_prompt
 from scripts.minicpm_canonical_attention_probe import canonical_attention, KERNEL_METADATA
 from scripts.minicpm_canonical_norm_probe import install_canonical_norms_
@@ -508,7 +512,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     files = [Path(__file__).relative_to(root), *map(Path, (
         "scripts/minicpm_canonical_attention_probe.py", "scripts/minicpm_canonical_projection_probe.py",
-        "scripts/minicpm_canonical_norm_probe.py", "postraining/minicpm_vapo.py",
+        "scripts/minicpm_canonical_norm_probe.py", "postraining/vapo/policy.py",
         "postraining/minicpm_latent_rollout.py", "postraining/fast_inference.py", "postraining/latent_thought.py"))]
     report = {"schema": "minicpm-canonical-training-probe/v1", "status": "initializing",
               "argv": sys.argv[1:], "sources": {str(p): hashlib.sha256((root / p).read_bytes()).hexdigest() for p in files},
@@ -527,7 +531,7 @@ def main():
         report["runtime"] = {"torch": torch.__version__, "triton": triton.__version__,
                              "gpu": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability()}
         report["attention_gradient_reference"] = attention_gradient_probe()
-        source, tokenizer = MiniCPMVAPOPolicy.from_pretrained(device=torch.device("cuda"),
+        source, tokenizer = VAPOPolicy.from_family("minicpm5", device=torch.device("cuda"),
             lora_config=LoRAConfig(initialization="nora"), gradient_checkpointing=False,
             latent_thinking=True, thought_sigma=args.thought_sigma)
         source.eval()

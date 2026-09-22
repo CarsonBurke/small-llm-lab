@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 import postraining.minicpm_latent_rollout as rollout
-from postraining.minicpm_vapo import (
+from postraining.vapo.policy import (
     CONTINUE_THOUGHT,
     FIRST_THOUGHT,
     FORCED_STOP_THINKING,

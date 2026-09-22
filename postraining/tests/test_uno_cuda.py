@@ -217,7 +217,7 @@ def test_split_fa4_retains_small_residual_across_cancelling_partitions():
 @pytest.fixture(scope="module")
 def numerical_adapter(tmp_path_factory):
     from postraining.hf_runtime import prepare_text_only_transformers_runtime
-    from postraining.minicpm_vapo import MINICPM5_MODEL_ID, MINICPM5_REVISION
+    from postraining.vapo.model.hf import MINICPM5_SPEC
     from postraining.uno import (
         UnoAdapterBank,
         UnoConfig,
@@ -236,12 +236,12 @@ def numerical_adapter(tmp_path_factory):
     torch.manual_seed(151)
     device = torch.device("cuda")
     tokenizer = AutoTokenizer.from_pretrained(
-        MINICPM5_MODEL_ID, revision=MINICPM5_REVISION
+        MINICPM5_SPEC.model_id, revision=MINICPM5_SPEC.revision
     )
     model = (
         AutoModelForCausalLM.from_pretrained(
-            MINICPM5_MODEL_ID,
-            revision=MINICPM5_REVISION,
+            MINICPM5_SPEC.model_id,
+            revision=MINICPM5_SPEC.revision,
             dtype=torch.bfloat16,
             attn_implementation="flex_attention",
             low_cpu_mem_usage=True,
@@ -391,7 +391,7 @@ def numerical_adapter(tmp_path_factory):
     corpus_digest = hashlib.sha256(clean.cpu().numpy().tobytes()).hexdigest()
     teacher_digest = hashlib.sha256(
         json.dumps(
-            {"model_id": MINICPM5_MODEL_ID, "revision": MINICPM5_REVISION},
+            {"model_id": MINICPM5_SPEC.model_id, "revision": MINICPM5_SPEC.revision},
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -399,8 +399,8 @@ def numerical_adapter(tmp_path_factory):
     payload = uno_checkpoint_payload(
         bank,
         model,
-        model_id=MINICPM5_MODEL_ID,
-        revision=MINICPM5_REVISION,
+        model_id=MINICPM5_SPEC.model_id,
+        revision=MINICPM5_SPEC.revision,
         trained_tokens=2048,
         step=1,
         teacher_sha256=teacher_digest,
@@ -802,12 +802,13 @@ def _actual_ar_reference(
 def test_captured_full_model_refill_capacity_and_actor_resynchronization(
     numerical_adapter,
 ):
-    from postraining.minicpm_vapo import MiniCPMVAPOPolicy, LoRAConfig
+    from postraining.vapo.policy import VAPOPolicy
+    from postraining.vapo.model.lora import LoRAConfig
     from postraining.uno_speculative import UnoTrainingRolloutEngine
     from postraining.invariant_linear import compile_invariant
 
     torch.manual_seed(157)
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         device=torch.device("cuda"),
         lora_config=LoRAConfig(initialization="standard"),
         gradient_checkpointing=False,
@@ -950,7 +951,7 @@ def test_captured_full_model_refill_capacity_and_actor_resynchronization(
         torch.device("cuda"),
     )
     assert digest == file_sha256(actor_path)
-    from postraining.minicpm_vapo import merge_lora_for_inference
+    from postraining.vapo.model.lora import merge_lora_for_inference
 
     # The teacher's target is the merged actor, not the differently rounded
     # unmerged training representation.

@@ -24,14 +24,18 @@ import torch
 import torch.nn.functional as F
 
 from postraining import train_minicpm_vapo as trainer
-from postraining.minicpm_vapo import (
-    LoRAConfig,
-    LoRALinear,
-    MiniCPMVAPOCritic,
-    MiniCPMVAPOPolicy,
+from postraining.vapo.policy import (
+    VAPOCritic,
+    VAPOPolicy,
     TrajectoryRecord,
+)
+from postraining.vapo.model.hf import (
     _packed_replay_attention,
     enable_packed_replay_attention,
+)
+from postraining.vapo.model.lora import (
+    LoRAConfig,
+    LoRALinear,
     load_adapter_state_dict,
 )
 from postraining.train_minicpm_vapo import (
@@ -151,12 +155,12 @@ def build_models():
         saved = torch.load(CHECKPOINT, map_location="cpu", weights_only=True, mmap=True)
     actor = saved["policy"]["actor"]
     config = LoRAConfig(**actor["lora_config"])
-    policy, _ = MiniCPMVAPOPolicy.from_pretrained(
+    policy, _ = VAPOPolicy.from_family("minicpm5", 
         model_id=actor["model_id"], revision=actor["revision"], device=torch.device("cuda"),
         lora_config=config, nextlat_projection_factor=float(actor["nextlat_projection_factor"]),
         gradient_checkpointing=True,
     )
-    critic = MiniCPMVAPOCritic.from_pretrained(
+    critic = VAPOCritic.from_family("minicpm5", 
         model_id=actor["model_id"], revision=actor["revision"], device=torch.device("cuda"),
         lora_config=config, critic_width=int(saved["args"]["critic_width"]),
         nextlat_projection_factor=float(actor["nextlat_projection_factor"]),

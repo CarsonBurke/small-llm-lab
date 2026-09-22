@@ -10,7 +10,8 @@ import torch
 from scripts.diagnose_minicpm_canonical import (
     AttentionControl, cached_run, full_run, projection_variant,
 )
-from postraining.minicpm_vapo import MiniCPMVAPOPolicy, LoRAConfig
+from postraining.vapo.policy import VAPOPolicy
+from postraining.vapo.model.lora import LoRAConfig
 from postraining.fast_inference import build_fused_rollout_replica
 
 p=argparse.ArgumentParser()
@@ -24,7 +25,7 @@ torch.manual_seed(1337)
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32=True
 assert torch.cuda.is_available()
-source,_=MiniCPMVAPOPolicy.from_pretrained(device=torch.device('cuda'), lora_config=LoRAConfig(), latent_thinking=True, gradient_checkpointing=False)
+source,_=VAPOPolicy.from_family("minicpm5", device=torch.device('cuda'), lora_config=LoRAConfig(), latent_thinking=True, gradient_checkpointing=False)
 source.eval()
 with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
     policy,_=build_fused_rollout_replica(source)

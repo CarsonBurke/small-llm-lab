@@ -523,3 +523,21 @@ def test_temperature_zero_still_consumes_one_generator_draw():
     sampled = torch.Generator().manual_seed(3)
     top_p_sample(logits, 1.0, 1.0, generator=sampled)
     assert greedy.get_state().equal(sampled.get_state())
+
+
+def test_single_fence_span_array_path_matches_the_list_path():
+    """SFT validates a corpus through the vectorized path; RL uses lists."""
+    import random
+
+    import numpy as np
+
+    from postraining.core import single_fence_span, structural_format_ok
+
+    rng = random.Random(5)
+    fences = ((1, 2), (3, 4))
+    for _ in range(2000):
+        tokens = [rng.choice((0, 0, 0, 1, 2, 3, 4, 9)) for _ in range(rng.randrange(0, 12))]
+        array = np.array(tokens, dtype=np.int32)
+        for fence in fences:
+            assert single_fence_span(array, fence) == single_fence_span(tokens, fence)
+        assert structural_format_ok(array, *fences) == structural_format_ok(tokens, *fences)

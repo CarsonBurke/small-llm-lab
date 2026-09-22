@@ -82,15 +82,17 @@ def test_compiled_flex_replay_matches_dense_reference_with_gradients():
 
 def test_real_rollout_records_replay_to_the_same_joint_likelihood():
     from postraining.fast_inference import CapturedTrainingRolloutEngine
-    from postraining.minicpm_vapo import (
-        LoRAConfig,
-        MiniCPMVAPOCritic,
-        MiniCPMVAPOPolicy,
+    from postraining.vapo.policy import (
+        VAPOCritic,
+        VAPOPolicy,
         TrajectoryRecord,
         collate_replay_microbatch,
+    )
+    from postraining.vapo.model.hf import (
         enable_packed_replay_attention,
         enable_replay_mlp_compilation,
     )
+    from postraining.vapo.model.lora import LoRAConfig
     from postraining.slot_memory import NO_WRITE, SlotMemoryConfig
     from postraining.train_minicpm_vapo import (
         _action_logprobs,
@@ -104,7 +106,7 @@ def test_real_rollout_records_replay_to_the_same_joint_likelihood():
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
     config = SlotMemoryConfig(slots=64, heads=1, head_dim=128)
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         device=device, lora_config=LoRAConfig(), gradient_checkpointing=False,
         token_carry=True, slot_memory=config,
     )
@@ -218,7 +220,7 @@ def test_real_rollout_records_replay_to_the_same_joint_likelihood():
     torch.testing.assert_close(batch.carry_hiddens, frozen_carries, rtol=0, atol=0)
     policy.zero_grad(set_to_none=True)
 
-    critic = MiniCPMVAPOCritic.from_pretrained(
+    critic = VAPOCritic.from_family("minicpm5", 
         device=device, lora_config=LoRAConfig(), gradient_checkpointing=False,
         shared_frozen_source=policy.causal_lm, token_carry=True, slot_memory=config,
     )

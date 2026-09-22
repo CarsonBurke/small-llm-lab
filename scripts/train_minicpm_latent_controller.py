@@ -30,11 +30,23 @@ from postraining.controller_metrics import write_controller_metrics
 from checkpointing import atomic_torch_save
 from postraining.core import load_unique_math_rows
 from postraining.latent_thought import GaussianTransitionHead, StopThinkingGate
-from postraining.minicpm_vapo import (
-    MiniCPMVAPOPolicy, MiniCPMVAPOCritic, LoRAConfig, FIRST_THOUGHT, MINICPM5_VOCAB_SIZE,
-    STOP_THINKING, collate_replay_microbatch, plan_replay_microbatches,
-    enable_packed_replay_attention, enable_replay_mlp_compilation,
-    load_adapter_state_dict, adapter_state_dict,
+from postraining.vapo.policy import (
+    FIRST_THOUGHT,
+    VAPOCritic,
+    VAPOPolicy,
+    STOP_THINKING,
+    collate_replay_microbatch,
+    plan_replay_microbatches,
+)
+from postraining.vapo.model.hf import (
+    MINICPM5_SPEC,
+    enable_packed_replay_attention,
+    enable_replay_mlp_compilation,
+)
+from postraining.vapo.model.lora import (
+    LoRAConfig,
+    adapter_state_dict,
+    load_adapter_state_dict,
 )
 from postraining.minicpm_latent_rollout import MiniCPMLatentRolloutEngine
 from postraining.minicpm_paired_rollout import PairedControllerRolloutEngine
@@ -305,7 +317,7 @@ def main():
     }
     if args.train_seconds <= 0 or args.max_controller_kl <= 0:
         raise ValueError('positive duration and KL budget required')
-    if not 1 <= args.top_k <= MINICPM5_VOCAB_SIZE:
+    if not 1 <= args.top_k <= MINICPM5_SPEC.vocab_size:
         raise ValueError('top-k must be positive and fit the MiniCPM vocabulary')
     if args.eval_prompts % args.prompts_per_rollout:
         raise ValueError('evaluation must contain complete prompt groups')
@@ -342,7 +354,7 @@ def main():
     excluded.update(digest(row['prompt']) for row in evaluation)
     rows = [row for row in rows if digest(row['prompt']) not in excluded]
     data_sha = hashlib.sha256(Path(args.data).read_bytes()).hexdigest()
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         device=torch.device('cuda'), lora_config=LoRAConfig(), gradient_checkpointing=False,
         latent_thinking=True, thought_sigma=args.thought_sigma,
         init_stop_thinking_probability=args.gate_probability,
@@ -374,7 +386,7 @@ def main():
     elif args.normalize_thought_input:
         policy.thought_adapter = NormalizedThoughtInput(policy.thought_adapter, input_norm, dimension)
     torch.manual_seed(args.seed+1)
-    critic = MiniCPMVAPOCritic.from_pretrained(
+    critic = VAPOCritic.from_family("minicpm5", 
         device=torch.device('cuda'), lora_config=LoRAConfig(), critic_width=256,
         gradient_checkpointing=False, shared_frozen_source=policy.causal_lm, latent_thinking=True,
     )
@@ -424,7 +436,7 @@ def main():
         head_bucket_size=args.head_bucket_size,
         temperature=0.9, top_k=args.top_k, top_p=0.95, answer_reserve_tokens=1024,
     )
-    source_paths = [Path(__file__), Path('postraining/minicpm_vapo.py'),
+    source_paths = [Path(__file__), Path('postraining/vapo/policy.py'),
                     Path('postraining/minicpm_latent_rollout.py'), Path('postraining/train_minicpm_vapo.py')]
     if args.sampling == 'antithetic':
         source_paths.extend([Path('postraining/minicpm_paired_rollout.py'),

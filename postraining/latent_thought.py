@@ -7,6 +7,11 @@ replay data and are adapted into stream inputs through the current combined
 embedding stack. Pinned-EMIT modes bypass the gate, Gaussian, and thought
 slots entirely.
 
+Deterministic hidden carry (``hidden_carry=True``, reasoning mode ``carry``)
+is a pinned-EMIT token policy whose generated-token inputs add, through the
+zero-initialized combiner, the detached belief that produced that token. It
+builds no Gaussian transition or stop gate: tokens are its only actions.
+
 ``thought_sigma`` is the expected isotropic vector-magnitude scale. For a
 runtime hidden width ``d`` the Gaussian component standard deviation is
 ``thought_sigma / sqrt(d)``, so ``E[||noise||²] = thought_sigma²``.
@@ -34,12 +39,20 @@ PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS = {
     "cot": "pinned_emit_token_only_cot/v2",
     "none": "pinned_emit_token_only_answer_prefix/v2",
 }
+# v2 of the v28 ``deterministic_hidden_carry/v1`` policy: the same carry, now
+# over the v29 trainer's streams and objective. v1 checkpoints are refused.
+HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA = "deterministic_hidden_carry/v2"
+# The v28 carry input path, unchanged: a zero-initialized full-width carry
+# map plus type bias behind the prenorm relu^2 residual stack.
+HIDDEN_CARRY_INPUT_SCHEMA = "zero_init_hidden_residual_prenorm_mlp/v2"
 
 
 def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
     """The rollout-policy schema tag a reasoning mode trains and resumes."""
     if reasoning_mode == "latent":
         return ROLLOUT_POLICY_SCHEMA
+    if reasoning_mode == "carry":
+        return HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA
     try:
         return PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS[reasoning_mode]
     except KeyError:
@@ -50,11 +63,23 @@ THOUGHT_INPUT_SCHEMA = "combined_raw_gaussian_prenorm_mlp/v3"
 THOUGHT_DISTRIBUTION_SCHEMA = (
     "belief_centered_isotropic_vector_sigma_over_sqrt_dim/v2"
 )
+DEFAULT_THOUGHT_SIGMA = 1.0
+DEFAULT_INIT_STOP_THINKING_PROBABILITY = 0.9
 
 
 def combiner_init_kwargs_from_checkpoint(payload: dict) -> dict:
-    """Recover strict policy geometry and stochastic semantics."""
+    """Recover strict policy geometry and stochastic semantics.
+
+    A hidden-carry checkpoint (by its rollout-policy schema, never by key
+    presence) has no stochastic heads and records no sigma or stop prior.
+    """
     saved_args = payload.get("args", {})
+    if payload.get("rollout_policy_schema") == HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA:
+        return {
+            "mlp_hidden": saved_args.get("combined_mlp_hidden"),
+            "num_blocks": saved_args.get("combined_mlp_blocks", 1),
+            "hidden_carry": True,
+        }
     try:
         thought_sigma = float(saved_args["thought_sigma"])
         stop_probability = float(
@@ -94,6 +119,21 @@ def validate_renderer_checkpoint(
             "under a different reasoning mode or deployed policy and cannot "
             "be resumed or evaluated as this policy."
         )
+    if expected_rollout_policy_schema == HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA:
+        carry_input = payload.get("thought_input_schema")
+        if carry_input != HIDDEN_CARRY_INPUT_SCHEMA:
+            raise ValueError(
+                f"incompatible latent-policy checkpoint {checkpoint!r}: "
+                f"hidden-carry input schema is {carry_input!r}, expected "
+                f"{HIDDEN_CARRY_INPUT_SCHEMA!r}."
+            )
+        distribution = payload.get("thought_distribution_schema")
+        if distribution is not None:
+            raise ValueError(
+                f"incompatible latent-policy checkpoint {checkpoint!r}: a "
+                "hidden-carry policy samples no thought distribution, got "
+                f"{distribution!r}."
+            )
     if expected_rollout_policy_schema == ROLLOUT_POLICY_SCHEMA:
         thought_input = payload.get("thought_input_schema")
         if thought_input != THOUGHT_INPUT_SCHEMA:
@@ -606,12 +646,13 @@ class StepOutput:
 
     ``belief`` is the post-final-norm state. ``predicted`` and
     ``thought_log_sigma`` parameterize the raw continuous action policy at
-    that state. The critic remains a separate replay-only model.
+    that state; they are None for a hidden-carry wrapper, which has no
+    Gaussian head. The critic remains a separate replay-only model.
     """
 
     belief: Tensor
-    predicted: Tensor
-    thought_log_sigma: Tensor
+    predicted: Tensor | None
+    thought_log_sigma: Tensor | None
     input_latent: Tensor
     logits: Tensor
     caches: list[tuple[Tensor, ...]]
@@ -814,6 +855,14 @@ class LatentThoughtModel(nn.Module):
     ``step`` consumes one already-embedded stream input (the combined
     embedding) and mirrors the backbone's block loop. The renderer consumes
     the combined input and the raw temporal belief.
+
+    ``hidden_carry`` builds the deterministic-carry policy: the combiner is
+    its only fresh module, and no Gaussian transition or stop gate exists,
+    so neither can be sampled, optimized, or silently loaded. Every other
+    wrapper builds both heads, including the token-only cot/none controls:
+    their checkpoints carry those (unused) keys and must load strictly.
+    ``thought_sigma``/``init_stop_thinking_probability`` default to the
+    stochastic policy's priors and are refused outright under carry.
     """
 
     def __init__(
@@ -822,22 +871,67 @@ class LatentThoughtModel(nn.Module):
         *,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
-        thought_sigma: float = 1.0,
-        init_stop_thinking_probability: float = 0.9,
+        thought_sigma: float | None = None,
+        init_stop_thinking_probability: float | None = None,
+        hidden_carry: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
         model_dim = backbone.tok_emb.embedding_dim
-        self.thought_input_schema = THOUGHT_INPUT_SCHEMA
+        self.hidden_carry = bool(hidden_carry)
         self.combiner = CombinedEmbedding(
             model_dim, mlp_hidden=mlp_hidden, num_blocks=num_blocks
         )
+        self.transition: GaussianTransitionHead | None
+        self.gate: StopThinkingGate | None
+        if self.hidden_carry:
+            if (
+                thought_sigma is not None
+                or init_stop_thinking_probability is not None
+            ):
+                raise ValueError(
+                    "a hidden-carry policy has no thought sigma or stop gate"
+                )
+            self.thought_input_schema = HIDDEN_CARRY_INPUT_SCHEMA
+            self.transition = None
+            self.gate = None
+            self.thought_sigma = None
+            self.thought_component_std = None
+            return
+        if thought_sigma is None:
+            thought_sigma = DEFAULT_THOUGHT_SIGMA
+        if init_stop_thinking_probability is None:
+            init_stop_thinking_probability = (
+                DEFAULT_INIT_STOP_THINKING_PROBABILITY
+            )
+        self.thought_input_schema = THOUGHT_INPUT_SCHEMA
         self.transition = GaussianTransitionHead(model_dim, thought_sigma)
         self.gate = StopThinkingGate(
             model_dim, init_stop_thinking_probability
         )
         self.thought_sigma = float(thought_sigma)
         self.thought_component_std = self.transition.component_std
+
+    @property
+    def thought_distribution_schema(self) -> str | None:
+        """The checkpointed Gaussian contract; None when no head exists."""
+        return None if self.hidden_carry else THOUGHT_DISTRIBUTION_SCHEMA
+
+    def thought_parameters(
+        self, belief: Tensor
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Gaussian mean and log-sigma at ``belief``; None without the head.
+
+        A hidden-carry wrapper keeps both off its compiled step surface: the
+        decode loop never reads them, and a D-by-D mean projection per step
+        would be pure waste.
+        """
+        if self.transition is None:
+            return None, None
+        return (
+            self.transition.predict_mean(belief),
+            self.transition.predict_log_sigma(belief),
+        )
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.backbone.embed_tokens(token_ids)
@@ -1054,7 +1148,7 @@ class LatentThoughtModel(nn.Module):
         block_mask: BlockMask,
         cache_addresses: Tensor,
         lane_rows: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor]:
         """Compiled fixed-capacity policy surface."""
         backbone = self.backbone
         x = input_latent
@@ -1088,8 +1182,7 @@ class LatentThoughtModel(nn.Module):
                 lane_rows,
             )
         belief = backbone.final_norm(x)
-        predicted = self.transition.predict_mean(belief.squeeze(1))
-        thought_log_sigma = self.transition.predict_log_sigma(
+        predicted, thought_log_sigma = self.thought_parameters(
             belief.squeeze(1)
         )
         logits = backbone.logits_from_features(
@@ -1376,7 +1469,9 @@ class LatentThoughtModel(nn.Module):
         ).repeat_interleave(repeats)
         cache.kv_starts.index_copy_(0, flat_slots, starts)
 
-        def select_state(value: Tensor) -> Tensor:
+        def select_state(value: Tensor | None) -> Tensor | None:
+            if value is None:
+                return None
             return value.index_select(0, group_indices).repeat_interleave(
                 repeats, dim=0
             )
@@ -1422,7 +1517,7 @@ class LatentThoughtModel(nn.Module):
         position: int | Tensor,
         key_mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor]:
         """The compiled policy surface: belief, Gaussian parameters, logits.
 
         Caches are mutated strictly in place.
@@ -1468,8 +1563,7 @@ class LatentThoughtModel(nn.Module):
                 block_mask,
             )
         belief = backbone.final_norm(x)
-        predicted = self.transition.predict_mean(belief.squeeze(1))
-        thought_log_sigma = self.transition.predict_log_sigma(
+        predicted, thought_log_sigma = self.thought_parameters(
             belief.squeeze(1)
         )
         features = self.renderer_features(input_latent, belief)
@@ -1481,14 +1575,13 @@ class LatentThoughtModel(nn.Module):
         input_latent: Tensor,
         caches: list[tuple[Tensor, ...]],
         key_valid: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor]:
         """Densely ingest a deterministic prefix and expose its final state."""
         belief = self.backbone.prefill_belief(
             input_latent, caches, key_valid
         )[:, -1:]
         final_input = input_latent[:, -1:]
-        predicted = self.transition.predict_mean(belief.squeeze(1))
-        thought_log_sigma = self.transition.predict_log_sigma(
+        predicted, thought_log_sigma = self.thought_parameters(
             belief.squeeze(1)
         )
         logits = self.backbone.logits_from_features(
@@ -1566,14 +1659,20 @@ class LatentThoughtModel(nn.Module):
         return adapted[:, None] if adapted.dim() == 2 else adapted
 
     def combined_input(self, token_ids: Tensor, hidden: Tensor) -> Tensor:
-        """Retained model primitive for direct combiner probes."""
+        """(batch, 1, dim) decode input: token embedding plus carried belief.
+
+        The hidden-carry decode path. Every position of the step carries, so
+        no flag is needed; replay reaches bitwise the same values at
+        ``generated_slot_mask`` positions through the flag-select.
+        """
         base = self.embed_tokens(token_ids[:, None])
         return self.combiner(base, hidden[:, None])
 
     def new_parameters(self):
         """Post-training parameters absent from the pretrained checkpoint."""
         for module in (self.combiner, self.transition, self.gate):
-            yield from module.parameters()
+            if module is not None:
+                yield from module.parameters()
 
     def load_backbone_checkpoint(self, state: dict[str, Tensor]) -> None:
         """Strict backbone load: every checkpoint key must land in the backbone."""

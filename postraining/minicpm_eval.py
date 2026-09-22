@@ -191,14 +191,18 @@ def load_evaluation_policy(
     if type(stock) is not bool:
         raise ValueError("stock must be a boolean")
     actor, _ = _checkpoint_actor(checkpoint)
-    from postraining.minicpm_vapo import LoRAConfig, MiniCPMVAPOPolicy, load_adapter_state_dict
+    from postraining.vapo.policy import VAPOPolicy
+    from postraining.vapo.model.lora import (
+        LoRAConfig,
+        load_adapter_state_dict,
+    )
     from postraining.slot_memory import SlotMemoryConfig
 
     lora = actor["lora_config"]
     slot_memory = None
     if not stock and actor.get("slot_memory") is not None:
         slot_memory = SlotMemoryConfig.from_payload(actor["slot_memory"])
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         model_id=actor["model_id"],
         revision=actor["revision"],
         device=device,

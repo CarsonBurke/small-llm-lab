@@ -71,7 +71,7 @@ def main() -> None:
                 name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                 for name in (
                     "postraining/token_carry.py", "postraining/slot_memory.py",
-                    "postraining/minicpm_vapo.py",
+                    "postraining/vapo/policy.py",
                     "postraining/train_minicpm_vapo.py", "postraining/fast_inference.py",
                     "postraining/core.py", "scripts/run_minicpm_vapo.py",
                 )

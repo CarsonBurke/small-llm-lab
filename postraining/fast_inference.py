@@ -15,9 +15,9 @@ import triton.language as tl
 from transformers.cache_utils import Cache, StaticLayer
 
 from postraining.core import top_p_sample
-from postraining.minicpm_vapo import (
+from postraining.vapo.policy import VAPOPolicy
+from postraining.vapo.model.lora import (
     LoRALinear,
-    MiniCPMVAPOPolicy,
     merge_lora_for_inference,
 )
 from postraining.invariant_linear import (
@@ -34,6 +34,11 @@ from postraining.split_kv_plan import (
     plan_split_kv,
     split_kv_metadata,
     split_kv_plan_shapes,
+)
+from postraining.vapo.rollout.results import (
+    ContinuousTrainingGeneration,
+    FastTrainingDecodeStats,
+    response_token_limits,
 )
 from postraining.thinking_budget import force_thinking_end_, validate_thinking_budget
 
@@ -216,8 +221,8 @@ def _copy_merged_lora_weight_(destination: Tensor, source: LoRALinear) -> None:
 
 @torch.no_grad()
 def synchronize_fused_lora_policy_(
-    destination: MiniCPMVAPOPolicy,
-    source: MiniCPMVAPOPolicy,
+    destination: VAPOPolicy,
+    source: VAPOPolicy,
 ) -> int:
     """Refresh a fused inference replica from the live actor LoRA."""
 
@@ -489,8 +494,8 @@ def _fixed_varlen_fa4_attention(
     return attention_output, None
 
 def build_fused_rollout_replica(
-    source: MiniCPMVAPOPolicy,
-) -> tuple[MiniCPMVAPOPolicy, tuple[str, ...]]:
+    source: VAPOPolicy,
+) -> tuple[VAPOPolicy, tuple[str, ...]]:
     """Create the persistent merged policy used only for actor rollouts."""
 
     nextlat_head = source.nextlat_head
@@ -752,7 +757,7 @@ class FixedLengthInferenceEngine:
 
     def __init__(
         self,
-        policy: MiniCPMVAPOPolicy,
+        policy: VAPOPolicy,
         *,
         batch_size: int,
         cache_length: int,
@@ -957,14 +962,6 @@ class FixedLengthInferenceEngine:
 
 
 @dataclass(frozen=True)
-class FastTrainingDecodeStats:
-    prefill_seconds: float
-    decode_seconds: float
-    target_decode_calls: int
-    target_decode_positions: int
-
-
-@dataclass(frozen=True)
 class PromptPrefixBank:
     """Prompt KV reused when continuous lanes are refilled."""
 
@@ -979,36 +976,6 @@ class PromptPrefixBank:
     def prompts(self) -> int:
         return int(self.lengths.numel())
 
-
-@dataclass(frozen=True)
-class ContinuousTrainingGeneration:
-    """Completed rows in stable prompt-major/sample-major order.
-
-    ``logprobs`` contains shape-compatible zeros because training refreshes
-    exact behavior statistics from replay before PPO.
-    ``carry_hiddens`` owns the CPU BF16 producer of every response token in
-    token-carry mode when history recording is enabled, including the prompt
-    producer and terminal action. Otherwise it is ``None``.
-    """
-
-    responses: tuple[Tensor, ...]
-    logprobs: tuple[Tensor, ...]
-    prefill_seconds: float
-    decode_seconds: float
-    decode_steps: int
-    useful_tokens: int
-    capacity_row_steps: int
-    admission_events: int
-    minimum_active_rows_with_backlog: int
-    carry_hiddens: tuple[Tensor, ...] | None = None
-    response_limits: tuple[int, ...] = ()
-    slot_choices: tuple[Tensor, ...] | None = None
-
-    @property
-    def productive_utilization(self) -> float:
-        if not self.capacity_row_steps:
-            return 0.0
-        return self.useful_tokens / self.capacity_row_steps
 
 def _retire_inactive_flash_rows_(
     flash_sequence_lengths: Tensor,
@@ -1030,40 +997,6 @@ def _take_refill_rows(
     remaining = max(total_rows - pending_row, 0)
     rows = min(len(free_slots), remaining)
     return list(free_slots[:rows]), rows
-
-def response_token_limits(
-    prompt_lengths: Sequence[int],
-    *,
-    max_new_tokens: int,
-    context_tokens: int | None = None,
-    answer_reserve_tokens: int = 0,
-    thinking_end_token_id: int | None = None,
-) -> tuple[int, ...]:
-    """Resolve output budgets from full, untruncated chat prompt lengths."""
-    if type(max_new_tokens) is not int or max_new_tokens < 1:
-        raise ValueError("max_new_tokens must be a positive integer")
-    if context_tokens is not None and (
-        type(context_tokens) is not int or context_tokens < 1
-    ):
-        raise ValueError("context_tokens must be a positive integer")
-    limits = []
-    for length in prompt_lengths:
-        if type(length) is not int or length < 1:
-            raise ValueError("full chat prompt lengths must be positive integers")
-        limit = (
-            max_new_tokens if context_tokens is None
-            else min(max_new_tokens, context_tokens - length)
-        )
-        if limit < 1:
-            raise ValueError("full chat prompt leaves no response within context_tokens")
-        validate_thinking_budget(
-            answer_reserve_tokens, thinking_end_token_id, limit
-        )
-        limits.append(limit)
-    return tuple(limits)
-
-
-
 
 def _completion_poll_chunk(
     host_output_positions: Sequence[int],
@@ -1106,7 +1039,7 @@ class CapturedTrainingRolloutEngine:
 
     def __init__(
         self,
-        source_policy: MiniCPMVAPOPolicy,
+        source_policy: VAPOPolicy,
         *,
         stop_ids: Sequence[int],
         prompts_per_rollout: int,
@@ -1541,6 +1474,15 @@ class CapturedTrainingRolloutEngine:
 
             self._predict_pending = compile_invariant(predict_pending)
             self._commit_pending = torch.compile(commit_pending, fullgraph=True)
+
+    @property
+    def trunk(self) -> Any:
+        """The adapter this engine samples through.
+
+        Part of the rollout-engine interface: the trainer reads geometry and
+        identity from here rather than from a Hugging Face ``config``.
+        """
+        return self.policy.trunk
 
     def _new_cache(self) -> Cache:
         return Cache(

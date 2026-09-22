@@ -1,8 +1,11 @@
-"""Ablate raw stochastic thought content on a trained latent-VAPO policy.
+"""Ablate thought or carry content on a trained latent- or carry-VAPO policy.
 
 The full arm reproduces the checkpoint policy, ``no_content`` disables the
-combiner's learned residual over raw thought inputs, and ``token_only`` uses
-``pin_emit=True`` to bypass gate, noise, and thought slots entirely.
+combiner's learned residual over its thought/carry input, and ``token_only``
+uses ``pin_emit=True`` without the carry to bypass gate, noise, thought slots,
+and carried beliefs entirely. For a hidden-carry checkpoint ``no_content`` is
+exactly the zero-hiddens arm: the carry enters only through the zeroed matrix,
+so the type bias and MLP stack still see every generated slot.
 
 Per-prompt correct counts from ``evaluate_latent_math`` give paired deltas;
 significance comes from a sign-flip permutation test on the per-prompt mean
@@ -11,9 +14,10 @@ sampling unit — samples within a prompt are exchangeable but not
 independent evidence about the panel).
 
 Separately, mechanistic probes use the production replay path:
-``refresh_old_statistics`` consumes the stored raw fp32 thought actions, then
-the probe zeros ``batch.thoughts`` and recomputes actor/critic statistics. The
-contrast measures dependence on action content without any redraw.
+``refresh_old_statistics`` consumes the stored raw fp32 thought actions (or
+carried beliefs), then the probe zeros ``batch.thoughts`` (``batch.hiddens``)
+and recomputes actor/critic statistics. The contrast measures dependence on
+that content without any redraw.
 The probes deliberately roll at the TRAINING operating point (the checkpoint's
 saved temperature/top-p) because they measure what PPO and GAE consumed
 during training; the behavioral arms use the evaluation protocol
@@ -59,10 +63,10 @@ from postraining.core import (
     load_unique_math_rows,
     modal_answer_baseline,
 )
-from postraining.hl_gauss import anchored_unit_geometry
 from postraining.latent_eval import evaluate_latent_math
 from postraining.latent_rollout import (
     THOUGHT_SLOT,
+    generated_slot_mask,
     refresh_old_statistics,
     rollout_continuations,
     trim_stream,
@@ -81,8 +85,9 @@ from postraining.train_latent_vapo import (
 )
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
+from postraining.vapo.schemas import CRITIC_SCHEMA, resume_critic_schema_compatible
 
-CARRY_ABLATION_SCHEMA = "carry_ablation_eval/v1"
+CARRY_ABLATION_SCHEMA = "carry_ablation_eval/v2"
 
 ARMS = ("full", "no_content", "token_only")
 
@@ -174,8 +179,13 @@ def run_arm(
     capture_problems: int,
     capture_samples: int,
     answer_fence_ids: tuple[int, int] | None = None,
+    hidden_carry: bool = False,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """One arm's full-panel evaluation; identical rows/seed across arms."""
+    """One arm's full-panel evaluation; identical rows/seed across arms.
+
+    ``hidden_carry`` marks a carry-trained policy: its full and no-content
+    arms decode with the carry, and token-only drops it.
+    """
     captured: list[dict[str, object]] = []
     context = (
         zeroed_carry(wrapper)
@@ -198,7 +208,8 @@ def run_arm(
             answer_style_override=answer_style_override,
             capture_problem_count=min(capture_problems, len(rows)),
             capture_samples_per_problem=min(capture_samples, samples),
-            pin_emit=arm == "token_only",
+            pin_emit=hidden_carry or arm == "token_only",
+            hidden_carry=hidden_carry and arm != "token_only",
             answer_fence_ids=answer_fence_ids,
         )
     return metrics, captured
@@ -214,12 +225,13 @@ def hidden_probes(
     seed: int,
     device: torch.device,
     stop_ids: tuple[int, ...],
+    hidden_carry: bool = False,
 ) -> dict[str, object]:
-    """Measure actor/critic dependence on stored raw thought actions.
+    """Measure actor/critic dependence on stored thought or carry content.
 
-    Rollout samples each fp32 raw action once. Refresh first uses those exact
-    vectors, then zeroes the stored actions and refreshes again; no path redraws
-    noise.
+    Rollout samples each fp32 raw action (or records each carried belief)
+    once. Refresh first uses those exact vectors, then zeroes the stored
+    content and refreshes again; no path redraws noise or re-decodes.
     """
     max_new_tokens = saved_args["resolved_train_max_new_tokens"]
     max_stream_steps = saved_args["resolved_train_max_stream_steps"]
@@ -274,6 +286,8 @@ def hidden_probes(
                     stop_ids=stop_ids or None,
                     cache_dtype=torch.bfloat16,
                     prompt_repeats=samples,
+                    pin_emit=hidden_carry,
+                    hidden_carry=hidden_carry,
                 )
             )
         score_math_rollout(
@@ -289,10 +303,19 @@ def hidden_probes(
         )
         action = batch.action_mask.bool()
         with torch.no_grad():
-            carried = batch.kind == THOUGHT_SLOT
+            if hidden_carry:
+                # A carried belief rides on its token's embedding.
+                carried = generated_slot_mask(batch)
+                content = batch.hiddens
+                base_latent = wrapper.embed_tokens(batch.token_ids)
+            else:
+                # A raw thought is its own base latent.
+                carried = batch.kind == THOUGHT_SLOT
+                content = batch.thoughts
+                base_latent = batch.thoughts
             if bool(carried.any()):
-                hiddens = batch.thoughts[carried].float()
-                base = hiddens
+                hiddens = content[carried].float()
+                base = base_latent[carried].float()
                 injected = F.linear(
                     hiddens, wrapper.combiner.carry.weight.float()
                 )
@@ -307,7 +330,7 @@ def hidden_probes(
             refresh_old_statistics(wrapper, critic, batch, **refresh_budgets)
             logp_full = batch.old_token_logprobs.clone()
             values_full = batch.old_values.clone()
-            batch.thoughts.zero_()
+            (batch.hiddens if hidden_carry else batch.thoughts).zero_()
             refresh_old_statistics(wrapper, critic, batch, **refresh_budgets)
 
         logp_delta = (logp_full - batch.old_token_logprobs)[action].float()
@@ -439,11 +462,12 @@ def main() -> None:
         source=str(wrapper_path),
     )
     reasoning_mode = saved_args.get("reasoning_mode", "latent")
-    if reasoning_mode != "latent":
+    if reasoning_mode not in ("latent", "carry"):
         raise SystemExit(
-            "carry ablation only makes sense for a latent-mode checkpoint; "
-            f"got reasoning mode {reasoning_mode!r}"
+            "carry ablation only makes sense for a latent- or carry-mode "
+            f"checkpoint; got reasoning mode {reasoning_mode!r}"
         )
+    hidden_carry = reasoning_mode == "carry"
     wrapper = LatentThoughtModel(
         backbone, **combiner_init_kwargs_from_checkpoint(payload)
     ).to(device)
@@ -464,21 +488,13 @@ def main() -> None:
         f"carry weight rms {carry_rms:.3e}"
     )
 
-    if saved_args.get("value_anchored_support", False):
-        value_num_bins, value_v_min, value_v_max = anchored_unit_geometry(
-            saved_args.get("value_bins", 101),
-            saved_args.get("value_margin_bins", 4),
+    if not resume_critic_schema_compatible(payload):
+        raise ValueError(
+            f"{wrapper_path} critic schema {payload.get('critic_schema')!r} "
+            f"is not {CRITIC_SCHEMA!r}"
         )
-    else:
-        value_num_bins = saved_args.get("value_bins", 101)
-        value_v_min, value_v_max = 0.0, 1.0
     critic = SeparateCritic(
         fresh_trunk(backbone, device),
-        num_bins=value_num_bins,
-        sigma_ratio=saved_args.get("value_sigma_ratio", 2.0),
-        v_min=value_v_min,
-        v_max=value_v_max,
-        prior_value=saved_args.get("value_prior", 0.05),
         **{
             key: value
             for key, value in combiner_init_kwargs_from_checkpoint(
@@ -569,6 +585,7 @@ def main() -> None:
                     if saved_args.get("answer_fence")
                     else None
                 ),
+                hidden_carry=hidden_carry,
             )
             arm_metrics[panel_name][arm] = metrics
             transcripts[panel_name][arm] = captured
@@ -601,6 +618,7 @@ def main() -> None:
         "step": step,
         "wrapper_checkpoint": str(wrapper_path),
         "base_checkpoint": args.checkpoint,
+        "reasoning_mode": reasoning_mode,
         "actor_carry_weight_rms": carry_rms,
         "critic_carry_weight_rms": critic_carry_rms,
         "aime_modal_baseline": modal_answer_baseline(aime_rows),
@@ -632,6 +650,7 @@ def main() -> None:
         args.seed + 2,
         device,
         stop_ids,
+        hidden_carry=hidden_carry,
     )
     result["probes"] = {
         key: value

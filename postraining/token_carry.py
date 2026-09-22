@@ -70,7 +70,7 @@ def token_carry_replay_hidden(side: Any, batch: Any) -> Tensor:
     if (
         batch.input_ids.ndim != 2 or batch.input_ids.shape[0] != 1
         or carries.ndim != 2 or carries.dtype != torch.bfloat16
-        or carries.shape[1] != side.causal_lm.config.hidden_size
+        or carries.shape[1] != side.hidden_size
         or positions.ndim != 1 or positions.dtype != torch.long
         or positions.numel() != carries.shape[0]
         or carries.device != batch.input_ids.device

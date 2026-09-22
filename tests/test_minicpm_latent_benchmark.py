@@ -86,7 +86,7 @@ def test_invalid_comparison_configuration_rejected_before_loading(options, messa
 
 
 def generation(*, thoughts=2, answers=3, rows=4, forced=True):
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.policy import (
         CONTINUE_THOUGHT,
         FIRST_THOUGHT,
         FORCED_STOP_THINKING,
@@ -209,7 +209,7 @@ def test_existing_measurement_is_not_overwritten(tmp_path):
 
 
 def test_natural_replay_budget_fits_later_longer_responses():
-    from postraining.minicpm_vapo import plan_replay_microbatches
+    from postraining.vapo.policy import plan_replay_microbatches
 
     args = arguments()
     prompts = [torch.tensor([8, 9])]

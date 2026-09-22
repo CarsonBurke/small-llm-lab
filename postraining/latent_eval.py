@@ -99,6 +99,7 @@ def evaluate_latent_math(
     compact_finished: bool = False,
     compiled_tail_batch: int | None = COMPILED_EVAL_TAIL_BATCH,
     pin_emit: bool = False,
+    hidden_carry: bool = False,
     prompt_suffix_ids: tuple[int, ...] = (),
     think_fence_ids: tuple[int, int] | None = None,
     answer_fence_ids: tuple[int, int] | None = None,
@@ -109,6 +110,9 @@ def evaluate_latent_math(
     ``pin_emit`` evaluates cot/none token-only policy semantics: gate, noise,
     and thought slots are bypassed. ``prompt_suffix_ids`` are teacher-forced
     onto the end of every truncated prompt and rejoin the decoded solution.
+    ``hidden_carry`` (with ``pin_emit``) evaluates the deterministic
+    hidden-carry policy: each generated token's input adds the belief that
+    produced it.
 
     Latent generation takes the mandatory first thought and one-way gate used
     in training. RNG state is saved and restored so evaluation never perturbs
@@ -287,6 +291,7 @@ def evaluate_latent_math(
                             ),
                             prompt_repeats=width,
                             pin_emit=pin_emit,
+                            hidden_carry=hidden_carry,
                             top_k=top_k,
                         )
                     )
@@ -471,6 +476,7 @@ def evaluate_latent_math(
             compact_finished=compact_finished,
             compiled_tail_batch=compiled_tail_batch,
             pin_emit=pin_emit,
+            hidden_carry=hidden_carry,
             prompt_suffix_ids=prompt_suffix_ids,
             think_fence_ids=think_fence_ids,
             answer_fence_ids=answer_fence_ids,
@@ -569,6 +575,10 @@ def evaluate_latent_math(
             else "global_rng_fixed_batch/v1"
         ),
     }
+    if hidden_carry:
+        # Added only when set, so token-only and latent reports keep their
+        # exact key set and stay comparable with earlier runs.
+        metrics["hidden_carry"] = True
     if module_total:
         metrics["module_accuracy"] = {
             module: module_correct.get(module, 0) / count

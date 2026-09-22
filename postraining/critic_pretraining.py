@@ -25,10 +25,12 @@ import torch
 from torch import Tensor
 from checkpointing import atomic_torch_save
 
-from postraining.minicpm_vapo import (
-    LoRAConfig,
-    MiniCPMVAPOCritic,
+from postraining.vapo.policy import (
+    VAPOCritic,
     ValueHead,
+)
+from postraining.vapo.model.lora import (
+    LoRAConfig,
     load_adapter_state_dict,
 )
 
@@ -561,7 +563,7 @@ def _feature_specs(
 
 
 def extract_cached_features(
-    policy: MiniCPMVAPOCritic,
+    policy: VAPOCritic,
     records: Sequence[Mapping[str, Any]],
     *,
     samples_per_trajectory: int,
@@ -977,7 +979,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not isinstance(critic_state, Mapping) or "input.weight" not in critic_state:
         raise ValueError("source checkpoint value head is missing")
     critic_width = int(critic_state["input.weight"].shape[0])
-    critic_model = MiniCPMVAPOCritic.from_pretrained(
+    critic_model = VAPOCritic.from_family("minicpm5", 
         model_id=corpus["model_id"],
         revision=corpus["revision"],
         device=device,

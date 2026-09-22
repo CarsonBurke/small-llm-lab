@@ -786,19 +786,41 @@ instead of synchronously flushing every progress callback.
 Render saved rollout responses as a standalone HTML transcript:
 
 ```bash
-.venv/bin/python scripts/render_minicpm_responses.py \
+.venv/bin/python -m postraining.rollout_report \
   --run postraining/runs/<run_name> --last 4 --compare-steps 44,64-84
 ```
 
-The default destination is `<run>/responses.html`; `--output <path>.html`
-selects another destination. Re-run the command to atomically refresh the
-latest saved steps. Omit `--compare-steps` for only the latest examples.
-Questions and reference answers accompany the original correct/incorrect
-response text; different questions are not paired as if they were the same
-problem. Original TensorBoard text omissions remain marked. These are selected
-examples, not a random sample, and a live writer may not have flushed its
-latest text yet. This command reads event files only: no model, checkpoint,
-or GPU workload, so it can run directly without `mlq`.
+The same command serves the KDA trainer, which writes its own captures
+(below); for a MiniCPM run it reads the TensorBoard text samples. The default
+destination is `<run>/rollout_samples.html`; `--output <path>.html` selects
+another. Re-run it to atomically refresh the latest saved steps; omit
+`--compare-steps` for only the latest examples. Questions and reference answers
+accompany the original correct/incorrect response text, and different questions
+are not paired as if they were the same problem. Original TensorBoard text
+omissions remain marked. These are selected examples, not a random sample, and
+a live writer may not have flushed its latest text yet. The command reads saved
+files only (no model, checkpoint, or GPU workload), so it can run directly
+without `mlq`.
+
+KDA training transcripts: every `--rollout-sample-every` actor steps (default
+25, always including step 0; 0 disables) `train_latent_vapo` keeps, for each RL
+source, one correct (exact verifier reward 1) and one incorrect trajectory from
+that pool. The pick is uniform over the pool's matching trajectories, by the
+smallest hash of (step, prompt, row), so it is deterministic and does not
+follow the collector's shortest-prompt-first scoring order. Each capture
+records the prompt, ground truth, full emitted token stream with its fence and
+EOS tokens (plus any teacher-forced `Answer:` prefix, marked as such), reward,
+termination, and the scorer's own row verdict: its format-gate decision and
+the verifier's prediction for the graded field (for a gate-zeroed row, the
+counterfactual the gate-zeroed-correct alarm scored). It also records the
+group's correct count. A capture is labelled with the number of updates the
+policy had taken when it collected the pool; that pool's rollout metrics are
+logged at that step plus the pool's update count, which the report shows
+beside each step. Captures land in `<run>/rollout_samples/step_XXXXXX.json`
+(`training_rollout_samples/v1`), and `<run>/rollout_samples.html` is
+re-rendered from the latest eight after each one. Resume deletes captures at or
+after the resume step, because those pools are collected again. The option is
+display-only and not a resume invariant.
 
 ### Generic verifiable tasks
 
@@ -1250,6 +1272,61 @@ selection flags. Checkpoint, manifest, replay, evaluation, and exact-resume
 schemas are strict; deterministic-carry and older stochastic checkpoints have
 no migration into v29.
 
+### Deterministic hidden carry
+
+`--reasoning-mode carry` (execution schema v30) is a token-only policy like
+`cot`, except that each generated token's input adds the detached
+post-final-norm belief that sampled it:
+
+```
+input(x_t) = combiner(E(x_t), stopgrad(h_{t-1}))
+```
+
+Prompt tokens, including the last one that seeds the first decode step, enter
+as plain embeddings. There is no gate, Gaussian, or thought slot: the stream
+is prompt plus emitted tokens, tokens are the only actions, and nothing
+backpropagates through generated history. The combiner is the same
+zero-initialized `CombinedEmbedding` stack (`--combined-mlp-hidden`,
+`--combined-mlp-blocks`), an exact identity at initialization, and carry draws
+tokens from the same generator lane as `cot`, so a fresh carry rollout is
+bitwise the `cot` rollout of the same checkpoint and seed.
+
+Rollout stores each belief, in its live dtype, at the slot of the token it
+produced. Actor replay and the separate critic read those identical stored
+carries, each through its own combiner; value loss never reaches the actor's.
+DG, TPO, and clipped VAPO keep their token objectives with no stochastic
+factor, under carry-specific objective schemas. `carry/input_delta_rms_ratio`
+replaces the stochastic loss/clip and gate/thought-mean gradient tags: at
+generated slots, the RMS of the stream input minus the plain token embedding,
+over the token-embedding RMS. It is the combiner's whole effect (carry
+projection, type bias and MLP stack), so it is not the same number as
+`carry_ablation_eval`'s `injection_to_embedding_rms_ratio`, which measures the
+linear carry projection `W h` alone.
+
+The separate critic (every mode) is a trunk of the actor's architecture read
+by a zero-initialized fp32 scalar head (`CRITIC_SCHEMA`), trained by
+unclipped MSE against the lambda-one return, with no parameter shared with
+the actor and no gradient-norm clip. `--critic-init scratch` (default) starts
+the trunk from a random instance; `--critic-init actor` starts it from a
+storage-independent copy of the actor's weights as loaded at run start,
+matching VAPO's pretrained-LM critic init without its reward-model bias. The
+manifest's `critic.init` records `scratch`, `actor_copy`, or
+`warm_checkpoint` (`--actor-critic-init`). A resume carries that record forward
+from the resumed run's manifest (its own directory, or the checkpoint's when
+resuming into a new one) and refuses a contradicting `--critic-init`.
+
+Carry refuses `--thought-sigma`, `--init-stop-thinking-probability`, and
+`--rollout-scheduler continuous_refill`. Its checkpoints record rollout policy
+`deterministic_hidden_carry/v2`, input schema
+`zero_init_hidden_residual_prenorm_mlp/v2`, and no thought distribution; the
+v28 `deterministic_hidden_carry/v1` checkpoints and every cot/latent checkpoint
+are refused on resume. `sample_latent`, `run_arithmetic_probe
+--wrapper-checkpoint` (which also accepts cot wrappers and refuses latent and
+none), and `carry_ablation_eval` read the policy from the checkpoint's
+rollout-policy schema and decode it with the carry on. This is
+the MiniCPM token carry's idea on the nano/KDA trainer, not its LayerScale
+parameterization. Whether the carry improves reasoning is unmeasured.
+
 The campaign uses GPT-2 BPE with token 50256 as both BOS and EOS. The final
 checkpoint records its exact architecture, corpus manifest, and maximum
 pretraining context.
@@ -1278,16 +1355,18 @@ python3 -m postraining.train_latent_vapo \
   --output postraining/runs/<name>
 ```
 
-The default immutable broad-v6 bare-prompt manifest and MBPP verifier corpus
-are rebuilt with `python3 -m postraining.prepare_vapo_mixture`; the builder
-defaults to the same `postraining/data/vapo_broad_v6_bare` prefix consumed by
-training.
+The default immutable bare-prompt manifest is rebuilt with `python3 -m
+postraining.prepare_vapo_mixture`; the builder defaults to the same
+`postraining/data/vapo_broad_v8_bare` prefix consumed by training and requires
+`--sft-corpus`. See "RL mixture quotas follow measured learnability" below for
+the v8 sources; the MBPP verifier corpus is now built only when `mbpp` is
+explicitly selected with a `--quota`.
 
 Each emitted token is one action. Its actor score term is gated by
 `sigmoid(advantage * -current_token_log_probability)` with the paper's fixed
 temperature eta=1. The gate is stop-gradient, and this mode uses neither PPO
 importance ratios nor clipping. The critic, tokenwise GAE, verifier rewards,
-and hidden-carry replay are unchanged.
+and stored-stream replay are unchanged.
 
 DG is an on-policy estimator. The trainer therefore rejects configurations
 where one frozen rollout pool would feed multiple sequential actor updates;
@@ -1539,3 +1618,233 @@ from step 0, format, termination, and per-prompt success coverage. Evaluation
 uses 128-way trajectory batches by default. An OPSD export preserves the input
 checkpoint's nested `sft` metadata, so it can initialize the current VAPO
 trainer with the same fence-token reconstruction and provenance gates.
+
+## Post-training any model: the VAPO model library
+
+`postraining/vapo/model/` declares what the RL algorithm needs from a model, so
+a backbone plugs in by satisfying a contract rather than by being a particular
+class. Nothing in the algorithm branches on a model id.
+
+- `protocols.py` — `Capability` (LoRA adapters, frozen output head, gradient
+  checkpointing, packed replay attention, compiled replay MLP, static vs paged
+  KV cache, fused projections, FA4/split-KV decode, W8A16 head, chat
+  template), `TrunkGeometry`, the `Readout` protocol, the `TrunkAdapter` ABC,
+  the `RolloutEngine` protocol and the `ModelFamily` ABC.
+- `registry.py` — `register_family` / `get_family` / `list_families`.
+- `hf.py` — `HFCausalFamily` plus `MINICPM5_SPEC` (pinned id, revision and
+  vocab). `HFCausalFamily.resolved_spec(model_id=..., revision=...)` records an
+  override instead of mutating the pin.
+- `nano.py` — `NanoFamily` for nanoGPT-mini and KDA backbones via `model_io`.
+- `lora.py`, `readout.py` — shared LoRA and chunked-frozen-head primitives.
+
+A trunk answers `family`, `hidden_size`, `vocab_size`, `geometry`,
+`capabilities`, `identity()`, `readout`, `embed_tokens`, `hidden_states`,
+`cached_hidden_states`, `new_kv_cache` and `layers()`. Ask before you act:
+`trunk.supports(Capability.X)` branches, `trunk.require(Capability.X)` fails
+with the family name and the missing capability. `identity()` is what lands in
+a checkpoint payload under `"trunk"`, so lineage travels with the weights
+rather than being reconstructed from a model id.
+
+Build a policy with `VAPOPolicy.from_family("minicpm5", device=..., ...)` or
+`from_family("nano", checkpoint=...)`; `VAPOCritic.from_family` mirrors it.
+
+Adding a family means implementing `TrunkAdapter` and `ModelFamily` and calling
+`register_family`. If your family exposes no LoRA capability, `VAPOPolicy`
+trains the whole trunk instead of injecting adapters.
+
+Family-specific code stays honest: `TrunkAdapter.causal_lm` raises a
+family-mismatch error rather than an `AttributeError` from deep inside a
+rollout engine, and the packed-replay/static-cache/fused-projection paths live
+in the Hugging Face entrypoints only.
+
+Two rollout backends sit behind the `RolloutEngine` protocol and share
+`ContinuousTrainingGeneration` as their currency. `fast_inference.py` is the
+measured Hugging Face engine (continuous lane refill, FA4 varlen replay, fused
+projections, graph decode). `vapo/rollout/nano_engine.py` is a correct
+lockstep decoder for nano/KDA trunks: fixed physical lanes, one paged cache,
+left-padded batched prefill, per-row limits and stop tokens, and exact
+untruncated log-probabilities for sampled tokens — the same convention as the
+Hugging Face engine's `selected_token_logprobs`. It does **not** do continuous
+lane refill and its throughput has never been measured; do not treat it as the
+fast path.
+
+### KDA backbones
+
+`postraining/kda_backbone.py` defaults `FLA_TILELANG=0` at import. fla's
+TileLang KDA backward cannot run in this environment — it collides with the
+standalone `tvm_ffi` over the same TVM FFI TypeAttr, and a KDA training run
+otherwise dies at its first backward and then deadlocks unwinding, looking like
+a hang rather than a failure. The Triton KDA backward is fla's reference path
+and what these checkpoints were pretrained with. `NanoKDABackbone.__init__`
+asserts the resolved backend is not TileLang, because fla caches that decision
+when its backend module is first imported.
+
+### Reproducing the KDA post-training pipeline
+
+`scripts/launch_kda8_posttrain.sh {sft|rl}` queues each stage through `mlq`
+with every value pinned explicitly and the reason for each non-default
+recorded in the script header. Stage `rl` consumes the checkpoint stage `sft`
+writes, so run `sft`, read its gate, then run `rl`.
+
+Both stages are budget-bound to the base checkpoint's own context:
+`sft_trace_train.py` derives `--seq-len` and its sampling-gate budgets from
+`backbone.train_context_tokens` and refuses a gate budget larger than that
+window, so a short-context checkpoint can no longer pack or sample into RoPE
+positions it never saw. They are also hash-bound: the RL mixture manifest
+binds `sft_corpus_sha256`, and the RL trainer rejects a base checkpoint whose
+recorded `traces_sha256` differs.
+
+## Large single-epoch SFT corpora
+
+`prepare_sft_corpus.py` builds an SFT corpus from published instruction data
+in the same schema the curated trace corpora use, so `sft_trace_train.py`
+consumes it unchanged:
+
+| column | meaning |
+|---|---|
+| `source` | `{adapter}:{provenance}`, e.g. `openmathinstruct2:augmented_math` |
+| `problem` | canonical bare problem, all source wrappers stripped |
+| `document` | `problem` + `<think>\n{solution}\n</think>\n<answer>{answer}</answer>` |
+| `final_answer` | the graded answer span |
+| `verified` | `"False"` for model-generated solutions that were not re-verified |
+| `doc_tokens` | GPT-2 BPE length of `document` |
+
+`document` begins with `problem` because the answer-fence prompt contract
+appends no instruction suffix; the trainer recovers the completion as
+`document[len(problem):]` and errors loudly if that does not hold.
+
+Adapters declare a corpus rather than sniffing it. Each names its columns,
+its provenance column, and the provenance values to exclude:
+
+```bash
+.venv/bin/python -m postraining.prepare_sft_corpus \
+    --source openmathinstruct2 --source math_drills=500000 \
+    --shards 8 --output postraining/data/sft_mix_omi2_drills_v1.parquet
+```
+
+`--source NAME[=MAX]` is repeatable and `MAX` caps that corpus alone;
+`--max-documents` caps the whole build. Remote adapters stream shards into
+`postraining/data/instruction_corpus_shards/` and hash every one into the
+manifest; local adapters read a materialized parquet directly.
+
+Two rules are part of the corpus contract rather than later filters:
+
+- **Evaluation protection.** `excluded_provenance` rows are dropped by the
+  adapter and the exclusion is recorded in the manifest. OpenMathInstruct-2
+  excludes `gsm8k` and `augmented_gsm8k` (17.5% of rows) because GSM8K is an
+  evaluation set for this project. A corpus that cannot report per-row
+  provenance cannot be admitted.
+- **Drop, never reshape.** Documents over `--seq-len`, problems the
+  canonicalizer rejects, multi-line answers and too-short completions are
+  counted in the manifest and discarded.
+
+`--epochs` defaults to **1**. Repeated passes over a small trace set drove
+holdout completion CE from 3.9449 to 0.9009 while the derived policy scored
+0.000 on every arithmetic-probe family at every digit count; that gap is
+memorisation, not reasoning.
+
+A corpus that is gated is declared in `CREDENTIALED_ADAPTERS` and refuses
+with the reason, so it reads as a missing credential and not a typo.
+
+## RL mixture quotas follow measured learnability
+
+`prepare_vapo_mixture.py` ships per-source prompts-per-pool quotas set by
+frozen-policy gate accuracy, not by source size. VAPO's advantage is
+group-relative, so a uniformly wrong rollout group contributes no policy
+gradient — weighting an all-zero source heavily spends the pool on prompts
+that cannot teach anything.
+
+- `deepmind_easy` (48) — `mathematics_dataset-v1.0` **train-easy** tier,
+  18 verifier-compatible modules, 4,000 prompts each. Build it with
+  `scripts/build_deepmind_rl_prompts.py --source-dir .../train-easy --split
+  train-easy`; `--split` must name the directory or the build refuses, so a
+  manifest cannot misreport its tier. Note that `deepmind-interpolate-easy`
+  is the **bench panel** and "easy" there names the module selection, not a
+  difficulty tier.
+- `ultradata_math` (8) — `openbmb/UltraData-RL-2609` Math rows, promoted from
+  the pinned extraction by `scripts/build_ultradata_math_rl_prompts.py`.
+  Math only: 95% of its math prompts fit a 256-token budget, against 16% for
+  Code and 0% for Long_Context.
+- `dapo` (8) — small hard tail, so the policy cannot narrow onto one
+  templated prompt shape.
+- `deepmind` (interpolate) and `mbpp` ship at **quota 0**: selectable, off by
+  default, and each needs an explicit `--quota SOURCE=N` to contribute.
+- `gsm8k` is in `RETIRED_SOURCES` and cannot be selected at all.
+
+`--sft-corpus` is required and is bound into the manifest by sha256, so RL
+cannot resume against a base distilled on different bytes.
+
+## `prepare_sft_corpus.py` — large single-epoch SFT corpora
+
+Builds a corpus in the canonical answer-fence schema
+(`instruction_corpus_answer_fence/v2`) from published instruction data, for
+the one-epoch-over-a-lot regime that replaced three-epochs-over-a-little.
+
+```bash
+.venv/bin/python -m postraining.prepare_sft_corpus \
+  --source ultradata_sft_2605 --source openmathinstruct2 --source math_drills \
+  --shards 8 --seq-len 5120 --workers 16 \
+  --output postraining/data/sft_mix_ud2605_omi2_drills_v1.parquet
+```
+
+Build every corpus in **one invocation**. Deduplication spans adapters, so
+overlapping sources resolve there — UltraData's Math half is largely
+OpenMathInstruct-2 derived, and listing UltraData first keeps its reasoning
+trace and drops the short duplicate.
+
+### Adapters
+
+Two record shapes, declared per adapter rather than sniffed:
+
+- `parquet_columns` — flat columnar corpora (`openmathinstruct2`,
+  `math_drills`).
+- `ultradata_chat` — openbmb JSONL chat records. **Only the `think` split is
+  admitted.** `reasoning_content` becomes the `<think>` body and the
+  presented answer supplies `<answer>`. The `no_think` split has no reasoning
+  field at all, so admitting it would mean synthesising a `<think>` body.
+  Math answers come from the balanced `\boxed{}` span; Code answers are the
+  final fenced program.
+
+### Rows are dropped, never reshaped
+
+Everything here fails closed. A row whose problem carries an unregistered
+instruction clause, whose provenance is missing or unrecognised, whose answer
+span would be empty, or which restates an evaluation problem is dropped and
+counted in the manifest.
+
+Provenance is an **allowlist** (`known_sources`). A denylist fails open: a
+renamed or newly added evaluation-derived source in an unmirrored shard would
+train by default.
+
+### Decontamination is two rules, not one
+
+Math rows use the shared exact-plus-any-8-gram index from
+`prepare_sft_traces` (GSM8K test, DeepMind interpolate, AIME 2024/2025/2026).
+
+Code rows need their own rule, because KodCode is an evaluation set here and
+programming statements share heavy boilerplate — "the first line of the input
+contains two" — plus digit-run grams out of example I/O blocks. Folding
+KodCode into the binary index rejected **466 of 800** distinct UltraData code
+problems while catching **zero** actual duplicates. `code_contaminated` uses
+an overlap *fraction* instead: measured, real KodCode problems score exactly
+1.000 (200/200 sampled) against median 0.004 / p99 0.092 / max 0.308 for
+distinct problems, so the 0.30 threshold catches every duplicate with a 3.3x
+margin and loses about 1 problem in 800.
+
+### Mixed-domain corpora and the sampling gate
+
+Code rows carry `gradeable = False`. The trainer's sampling gate scores every
+panel row with the MATH verifier, so a program in `final_answer` would be
+wrong by construction and would deflate gate accuracy and the mixed-group
+rate the RL stage is sized from. `split_holdout` keeps ungradeable rows out
+of the panel; they still train and still count toward holdout CE. Raise
+`--holdout-problems` for a mixed corpus — the trainer errors rather than
+silently gating on a short panel.
+
+### `--workers`
+
+Screening and tokenizing are pure and order-preserving; deduplication and the
+caps stay in the parent, so the corpus is byte-identical for any worker count
+(verified for 1 vs 8 and 1 vs 16). The pool uses an explicit `fork` context:
+Python 3.14 defaults to `forkserver` on Linux, which re-imports the module and
+would leave the shared decontamination index unset in the workers.

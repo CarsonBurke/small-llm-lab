@@ -3,12 +3,17 @@
 A fresh trunk (same architecture class as the policy backbone, random init,
 fully trainable) reads the identical token/thought stream. Raw fp32 Gaussian
 actions stored by the actor are adapted by the critic's own combined-embedding
-stack; they are never redrawn. No parameters are shared with the policy.
+stack; they are never redrawn. Under the deterministic hidden carry the critic
+reads the actor's stored beliefs through that same separate combiner, at the
+same generated-token slots. No parameters are shared with the policy.
 
-The trainer passes ``hl_gauss.anchored_unit_geometry`` for v_min/v_max/
-num_bins by default, putting bin centers at exactly 0 and 1 with margin bins
-beyond each so boundary targets project without truncation bias; the
-constructor defaults below are the legacy [0, 1]-edge grid.
+The value head is one zero-initialized linear readout trained by unclipped
+squared error (``CRITIC_SCHEMA``). Under Adam a zero head's output moves by
+about lr * ||belief||_1 per step through its weight, so it can fit the ~2%
+verifier success marginal within a few updates; the HL-Gauss categorical head
+it replaced started every off-prior bin ~14 nats down and moved them only by
+lr per step through the bias, which pinned its decoded value at 6e-5 through
+a whole run (NOTES 2026-09-22).
 """
 
 from __future__ import annotations
@@ -16,11 +21,12 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from postraining.hl_gauss import HLGaussSupport
 from postraining.latent_rollout import (
     PAD_SLOT,
     THOUGHT_SLOT,
     LatentRolloutBatch,
+    carried_hiddens,
+    generated_slot_mask,
 )
 from postraining.latent_thought import CombinedEmbedding
 
@@ -29,11 +35,6 @@ class SeparateCritic(nn.Module):
     def __init__(
         self,
         trunk: nn.Module,
-        num_bins: int = 101,
-        sigma_ratio: float = 2.0,
-        v_min: float = 0.0,
-        v_max: float = 1.0,
-        prior_value: float = 0.0,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
     ):
@@ -45,21 +46,27 @@ class SeparateCritic(nn.Module):
             mlp_hidden=mlp_hidden,
             num_blocks=num_blocks,
         )
-        self.support = HLGaussSupport(num_bins, v_min, v_max, sigma_ratio)
-        self.head = nn.Linear(model_dim, num_bins)
+        self.head = nn.Linear(model_dim, 1)
         with torch.no_grad():
+            # Zero output at init: the trunk's random features start with no
+            # say, and the head learns the marginal before anything finer.
             self.head.weight.zero_()
-            # The floor bounds the bias range (v215's critic_prior_floor):
-            # 1e-6 keeps far bins ~14 nats down instead of saturating the
-            # softmax at -46, which would stall the early decode.
-            self.head.bias.copy_(
-                self.support.project_to_logprobs(torch.tensor(prior_value), eps=1e-6)
-            )
+            self.head.bias.zero_()
 
     def assemble_inputs(self, batch: LatentRolloutBatch) -> Tensor:
         """Rebuild the exact token/thought stream in the critic's latent space."""
         token_latent = self.trunk.embed_tokens(batch.token_ids)
         pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+        if batch.carry_injected:
+            # The actor's recorded carry, projected by the critic's own
+            # combiner: the value sees what the policy consumed, while the
+            # two input maps stay separately trainable.
+            inputs = self.combiner(
+                token_latent, carried_hiddens(batch), generated_slot_mask(batch)
+            )
+            return inputs * pad_scale
+        if batch.hiddens.size(-1):
+            raise ValueError("batch stores hiddens it never injected")
         if batch.thoughts.size(-1) == 0:
             if bool((batch.kind == THOUGHT_SLOT).any()):
                 raise ValueError(
@@ -76,15 +83,12 @@ class SeparateCritic(nn.Module):
         )
         return inputs * pad_scale
 
-    def value_logits(self, batch: LatentRolloutBatch) -> Tensor:
-        """(batch, stream, num_bins) value distribution logits, fp32."""
+    def values(self, batch: LatentRolloutBatch) -> Tensor:
+        """(batch, stream) scalar value estimates, fp32."""
         beliefs = self.trunk.temporal_belief_from_token_latent(
             self.assemble_inputs(batch)
         )
-        # Distribution parameters are fp32 statistics even under autocast.
+        # The value is an fp32 regression output even under autocast: bf16's
+        # 8-bit mantissa cannot resolve a ~0.02 marginal's residuals.
         with torch.autocast(device_type=beliefs.device.type, enabled=False):
-            return self.head(beliefs.float())
-
-    def values(self, batch: LatentRolloutBatch) -> Tensor:
-        """Scalar value estimates via the expected-bin-center decode."""
-        return self.support.to_expected_scalar(self.value_logits(batch))
+            return self.head(beliefs.float()).squeeze(-1)

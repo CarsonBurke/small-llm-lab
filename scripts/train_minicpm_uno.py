@@ -27,15 +27,14 @@ import torch
 
 from checkpointing import RecoveryCheckpointPolicy, atomic_torch_save
 from postraining.hf_runtime import prepare_text_only_transformers_runtime
-from postraining.minicpm_vapo import (
-    MINICPM5_MODEL_ID,
-    MINICPM5_REVISION,
+from postraining.vapo.model.hf import MINICPM5_SPEC
+from postraining.vapo.model.lora import (
     LoRAConfig,
-    TrajectoryRecord,
     inject_lora,
     load_adapter_state_dict,
     merge_lora_for_inference,
 )
+from postraining.vapo.policy import TrajectoryRecord
 from postraining.uno import (
     UnoConfig,
     UnoAdapterBank,
@@ -297,8 +296,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional disjoint local heldout documents",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model", default=MINICPM5_MODEL_ID)
-    parser.add_argument("--revision", default=MINICPM5_REVISION)
+    parser.add_argument("--model", default=MINICPM5_SPEC.model_id)
+    parser.add_argument("--revision", default=MINICPM5_SPEC.revision)
     parser.add_argument(
         "--teacher-checkpoint",
         help="optional VAPO v6 RL checkpoint supplying the frozen actor",

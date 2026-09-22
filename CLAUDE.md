@@ -18,16 +18,49 @@ mandatory 2,000-step ablation rules do not govern post-training work.
 
 ## Current Model Lineage
 
-- Next canonical post-training base (after its required SFT run):
-  `postraining/runs/sft6_bare_a1swap10k_e3/sft_final_model.pt`. Do not treat
-  this path as available until the immutable run directory exists.
-- It is a three-epoch SFT checkpoint trained on verified reasoning traces with
-  registered `<think>`, `</think>`, `<answer>`, and `</answer>` tokens.
+- Pretrained base: `logs/nanogpt_gpt2_kda8_kkkdkkkd_triton_mbs32_optimized_2k_final_model.pt`
+  (val_bpb 1.1824, lowest of the KDA pretraining runs; 64.0M params, 8 layers
+  x 512 dim, GPT-2 padded vocab 50304, KDA mixers on layers 0-2/4-6,
+  `train_seq_len` 1024). Post-training ran inside that 1024-token window
+  until 2026-09-21, when the 5,120-token context extension below was
+  authorized; layers 3 and 7 carry half-truncate RoPE computed dynamically
+  from `torch.arange(T)`, so longer windows run without a code change but are
+  extrapolation for those two layers until trained at length.
+- Canonical post-training base: `postraining/runs/kda8_sft_omi2_drills_e1/`
+  `sft_final_model.pt` (job 9040), a **single-epoch** SFT checkpoint over
+  `postraining/data/sft_mix_omi2_drills_v2.parquet` (931,057 decontaminated
+  documents, 293.8M tokens). It is the first checkpoint in this lineage with
+  measurable reasoning: held-out sampling gate 26.17% accuracy and 39.84%
+  mixed prompts (v6: 0.00% and 12.5%), and arithmetic-probe 0.516 overall
+  against v6's 0.000 on all 15 families. Multi-digit multiplication is its
+  bottleneck primitive: it has learned every procedure and drifts on the
+  partial-product chain, so `mul_decimal` and `percent_change` are still
+  0.000 while addition and subtraction reach 0.81-0.98. See NOTES.md
+  2026-09-21.
+- Context extension, authorized 2026-09-21: SFT corpora and runs may use up
+  to **5,120** tokens so reasoning traces survive intact. At 1024 only 36.6%
+  of UltraData think-split math traces and 3.3% of code traces fit; at 5,120
+  it is 71.0% and 33.4%. Whole-document packing gives positions 1024-5120
+  dense signal from packed short documents, which is how the extension is
+  trained rather than assumed. Measure it; do not assume it transferred.
+  The first such run (`kda8_sft_ud2605_5k_v2_e1_r2`) lost to job 9040 on
+  every matched panel (arithmetic probe 0.368 vs 0.516), with drills diluted
+  from 28% to 6.8% of tokens by long think traces; it is not a stage 2 base.
+  See NOTES.md 2026-09-22.
 - Its pretrained ancestor, architecture metadata, tokenizer contract, source
   hashes, and SFT metadata travel in the checkpoint. Preserve and validate that
   lineage through every derived checkpoint.
+- The three-epoch v6 trace lineage is **retired and deleted**
+  (`sft_traces_v6_answer_bare_a1swap10k.parquet`, `kda8_sft_v6_bare_e3`,
+  `sft6_bare_a1swap10k_e3`). It reached 0.9009 holdout completion CE while
+  scoring 0.000 on all 15 arithmetic-probe families at every digit count —
+  memorisation of a small trace set. Each run directory keeps its metrics and
+  a `RETIRED.md`. Do not start runs from it or rebuild it.
 - Earlier SFT/RL artifacts with the duplicated legacy prompt are historical
   controls only. Do not start new runs from them under the canonical schema.
+- GSM8K is an evaluation set here. It is retired from the RL mixture
+  (`prepare_vapo_mixture` refuses to select it) and GSM8K-derived rows are
+  excluded from SFT corpora by `problem_source`. Do not reintroduce either.
 
 Read the newest relevant entries in `NOTES.md` and `postraining/README.md`
 before designing or resuming an experiment. Historical sections explain old
@@ -55,14 +88,21 @@ with multiple responses from the current policy. Rewards come from explicit,
 source-appropriate verifiers. Track learnability and failure modes per source;
 an all-zero source or pool is not useful policy evidence.
 
-The implementation uses a clipped policy objective with a separate HL-Gauss
-critic and length-adaptive GAE. `cot` is the token-only reasoning control.
-`latent` is deterministic hidden-carry VAPO: the post-final-norm belief that
+The implementation uses a clipped policy objective with a separate scalar
+critic (zero-init linear value head, unclipped MSE; the HL-Gauss head it
+replaced stayed pinned at its prior, NOTES 2026-09-22), whose trunk starts
+random or, with `--critic-init actor`, as a copy of the actor, and
+length-adaptive GAE. Actor and critic share no weights, and no gradient-norm
+clip applies. `cot` is the token-only reasoning control.
+`carry` is deterministic hidden-carry VAPO: the post-final-norm belief that
 produced a generated token is detached, replayed, transformed by the learned
 combiner, and added when that token is consumed on the next step. There are no
 extra sampled latent actions and no BPTT through generated history. Actor and
 critic must use the same recorded carry contract, with separate trainable
-combiner parameters.
+combiner parameters. The combiner is zero-initialized, so a fresh `carry` run
+is exactly `cot` at step 0. `latent` is a different policy: stochastic latent
+thought (v29), with a forced Gaussian THINK action and a Bernoulli stop gate.
+Do not treat it as the carry arm.
 
 Primary implementation:
 

@@ -195,9 +195,7 @@ def _fresh_critic(wrapper):
     return SeparateCritic(
         type(wrapper.backbone)(**wrapper.backbone.init_kwargs)
         if hasattr(wrapper.backbone, "init_kwargs")
-        else _wrapper(seed=5).backbone,
-        num_bins=17,
-        prior_value=0.1,
+        else _wrapper(seed=5).backbone
     )
 
 
@@ -256,6 +254,7 @@ def test_score_math_rollout_prepends_answer_prefix():
         kind=kind,
         token_ids=token_ids,
         thoughts=torch.zeros(1, stream, 0),
+        hiddens=torch.zeros(1, stream, 0),
         actions=torch.ones((1, stream), dtype=torch.long),
         action_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
         stop_mask=zeros.clone(),
@@ -547,9 +546,7 @@ def test_build_optimizers_nano_backbone_three_group_layout():
     ).float()
     wrapper = LatentThoughtModel(backbone)
     critic = SeparateCritic(
-        NanoGPTBackbone(vocab_size=64, num_layers=2, model_dim=256).float(),
-        num_bins=17,
-        prior_value=0.1,
+        NanoGPTBackbone(vocab_size=64, num_layers=2, model_dim=256).float()
     )
     optimizers = build_optimizers(wrapper, critic, 1e-4, fused=False)
     groups = optimizers["actor"].param_groups

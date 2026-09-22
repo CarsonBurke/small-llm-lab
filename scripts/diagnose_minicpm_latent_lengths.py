@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 from postraining.core import load_unique_math_rows
-from postraining.minicpm_vapo import MiniCPMVAPOPolicy, LoRAConfig
+from postraining.vapo.policy import VAPOPolicy
+from postraining.vapo.model.lora import LoRAConfig
 from postraining.minicpm_latent_rollout import MiniCPMLatentRolloutEngine
 from postraining.fast_inference import CapturedTrainingRolloutEngine
 from postraining.train_minicpm_vapo import (
@@ -44,7 +45,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 rows = load_unique_math_rows(args.data)
 random.Random(args.seed).shuffle(rows)
 rows = rows[:args.prompts]
-policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
     device=torch.device('cuda'), lora_config=LoRAConfig(initialization='nora'),
     gradient_checkpointing=False, latent_thinking=True,
 )

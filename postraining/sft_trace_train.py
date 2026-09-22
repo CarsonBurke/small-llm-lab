@@ -53,11 +53,16 @@ GPU workload — submit through mlq:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import hashlib
 import json
+import itertools
 import math
+import numpy as np
 import os
 import random
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,7 +78,9 @@ from pretraining.latent_moe_training import (
     reset_quantile_balance_accumulators,
 )
 from postraining.core import (
+    encode_many,
     encode_prompt,
+    frame_prompt,
     load_posttraining_tokenizer,
     structural_format_ok,
 )
@@ -163,16 +170,47 @@ class TokenizedDocument:
     """One trace, framed exactly as an RL episode."""
 
     prompt_length: int  # [BOS] + problem + instruction suffix
-    ids: tuple[int, ...]  # prompt then completion, no terminal separator
+    # int32 array, NOT a tuple of Python ints: token ids exceed the small-int
+    # cache, so every element would be a ~28-byte object behind an 8-byte
+    # pointer. A 900k-document corpus is ~355M tokens, i.e. ~13 GB as Python
+    # objects against ~1.4 GB here.
+    ids: np.ndarray  # prompt then completion, no terminal separator
 
 
-def load_documents(path: Path) -> list[dict]:
+def load_documents(path: Path, allow_unverified: bool = False) -> list[dict]:
+    """Rows from a corpus parquet, honouring the ``verified`` column.
+
+    The curated trace corpora carry per-row verification, and admitting an
+    unverified row from them silently would defeat the point of the column.
+    Large published instruction corpora carry model-generated solutions that
+    were never re-verified here, so admitting them is a deliberate choice the
+    caller states rather than something the truthiness of the column's
+    contents decides -- a corpus that stored the string "False" would
+    otherwise pass this filter.
+    """
     import pyarrow.parquet as pq
 
     rows = pq.read_table(path).to_pylist()
+    for row in rows:
+        if "gradeable" in row and not isinstance(row["gradeable"], bool):
+            raise ValueError(
+                f"{path} stores 'gradeable' as "
+                f"{type(row['gradeable']).__name__}, not bool"
+            )
+        if not isinstance(row["verified"], bool):
+            raise ValueError(
+                f"{path} stores 'verified' as "
+                f"{type(row['verified']).__name__}, not bool; a non-empty "
+                "string would pass a truthiness filter regardless of value"
+            )
+    if allow_unverified:
+        return rows
     kept = [row for row in rows if row["verified"]]
     if not kept:
-        raise ValueError(f"{path} holds no verified documents")
+        raise ValueError(
+            f"{path} holds no verified documents; pass --allow-unverified to "
+            "train on a corpus whose solutions were not re-verified here"
+        )
     return kept
 
 
@@ -184,6 +222,15 @@ def split_holdout(
     Problems are keyed by their normalized identity (the GSM8K-matching
     key), so trace variants of one problem never straddle the split. The
     holdout panel carries one row per problem for the sampling gate.
+
+    Only rows the math verifier can grade enter that panel. A corpus may mix
+    domains -- a code row's final answer is a program graded by executing
+    tests, not by comparing an answer string -- and the gate scores every
+    panel row with the MATH verifier. Admitting a code row would therefore
+    count it wrong by construction, deflating gate accuracy and the
+    mixed-group rate the RL stage is sized from. Such rows still train and
+    still count toward holdout CE; they just cannot certify the run.
+    Corpora without the column are math-only and wholly gradeable.
     """
     by_problem: dict[str, list[dict]] = {}
     for document in documents:
@@ -205,7 +252,12 @@ def split_holdout(
         docs = by_problem[key]
         if key in held:
             holdout_docs.extend(docs)
-            panel.append(docs[0])
+            gradeable = [
+                document for document in docs
+                if document.get("gradeable", True)
+            ]
+            if gradeable:
+                panel.append(gradeable[0])
         else:
             train_docs.extend(docs)
     return train_docs, holdout_docs, panel
@@ -230,25 +282,45 @@ def tokenize_documents(
     startswith check below fails loudly on a mismatch.
     """
     tokenized = []
-    for document in documents:
-        prompt_text = document["problem"] + instruction_suffix
-        body = document["document"]
-        if not body.startswith(prompt_text):
-            raise ValueError(
-                "document does not start with its own prompt: "
-                f"{body[:80]!r}"
+    # Chunked so the batch encoder's Python lists (~28 bytes per token) never
+    # hold more than one chunk; each chunk is packed to int32 immediately.
+    chunk = 4096
+    for chunk_start in range(0, len(documents), chunk):
+        batch = documents[chunk_start:chunk_start + chunk]
+        prompt_texts = [
+            document["problem"] + instruction_suffix for document in batch
+        ]
+        completion_texts = []
+        for document, prompt_text in zip(batch, prompt_texts, strict=True):
+            body = document["document"]
+            if not body.startswith(prompt_text):
+                raise ValueError(
+                    "document does not start with its own prompt: "
+                    f"{body[:80]!r}"
+                )
+            completion_texts.append(body[len(prompt_text):])
+        for prompt_ids, completion_ids, body in zip(
+            encode_many(tokenizer, prompt_texts),
+            encode_many(tokenizer, completion_texts),
+            (document["document"] for document in batch),
+            strict=True,
+        ):
+            prompt_ids = frame_prompt(tokenizer, prompt_ids)
+            if not completion_ids:
+                raise ValueError(
+                    f"empty completion in document {body[:80]!r}"
+                )
+            if len(completion_ids) < min_completion_tokens:
+                continue
+            # +1 for the stop/separator target after the completion.
+            if len(prompt_ids) + len(completion_ids) + 1 > seq_len:
+                continue
+            ids = np.fromiter(
+                itertools.chain(prompt_ids, completion_ids),
+                dtype=np.int32,
+                count=len(prompt_ids) + len(completion_ids),
             )
-        prompt_ids = encode_prompt(tokenizer, prompt_text)
-        completion_ids = tokenizer.encode(body[len(prompt_text):])
-        if not completion_ids:
-            raise ValueError(f"empty completion in document {body[:80]!r}")
-        if len(completion_ids) < min_completion_tokens:
-            continue
-        ids = tuple(prompt_ids) + tuple(completion_ids)
-        # +1 for the stop/separator target after the completion.
-        if len(ids) + 1 > seq_len:
-            continue
-        tokenized.append(TokenizedDocument(len(prompt_ids), ids))
+            tokenized.append(TokenizedDocument(len(prompt_ids), ids))
     if not tokenized:
         raise ValueError("no documents fit --seq-len")
     return tokenized
@@ -268,12 +340,12 @@ def answer_fence_document_fraction(
     """
     think = (tokenizer.think_open_id, tokenizer.think_close_id)
     answer = (tokenizer.answer_open_id, tokenizer.answer_close_id)
+    stop = np.array([tokenizer.eos_id()], dtype=np.int32)
     compliant = sum(
         1
         for document in documents
         if structural_format_ok(
-            list(document.ids[document.prompt_length:])
-            + [tokenizer.eos_id()],
+            np.concatenate((document.ids[document.prompt_length:], stop)),
             think,
             answer,
         )
@@ -321,7 +393,7 @@ def pack_rows(
     seq_len: int,
     separator: int,
     rng: random.Random | None,
-) -> list[tuple[list[int], list[int]]]:
+) -> list[tuple[np.ndarray, np.ndarray]]:
     """Greedy whole-document packing into (input, target) rows.
 
     Documents follow each other directly — each document starts with BOS,
@@ -334,30 +406,42 @@ def pack_rows(
     order = list(range(len(documents)))
     if rng is not None:
         rng.shuffle(order)
-    rows: list[tuple[list[int], list[int]]] = []
-    tokens: list[int] = []
+    # Rows are int32 arrays rather than Python int lists. At seq_len 5120 a
+    # packed corpus is tens of thousands of rows and each row carried two
+    # 5120-element int lists, ~25 GB of interpreter objects for a 900k-
+    # document corpus; as int32 the same content is ~2.8 GB.
+    rows: list[tuple[np.ndarray, np.ndarray]] = []
+    row_tokens = np.full(seq_len, separator, dtype=np.int32)
+    filled = 0
     spans: list[tuple[int, int, int]] = []  # (offset, prompt_length, length)
 
     def close_row() -> None:
-        tokens.append(separator)
-        targets = [IGNORE_INDEX] * seq_len
+        nonlocal filled
+        row_tokens[filled] = separator
+        length_with_stop = filled + 1
+        row_tokens[length_with_stop:] = separator
+        targets = np.full(seq_len, IGNORE_INDEX, dtype=np.int32)
         for offset, prompt_length, length in spans:
-            for position in range(offset + prompt_length - 1, offset + length):
-                targets[position] = tokens[position + 1]
-        tokens.extend([separator] * (seq_len - len(tokens)))
-        rows.append((list(tokens), targets))
-        tokens.clear()
+            start = offset + prompt_length - 1
+            stop = offset + length
+            # Targets are the next token, exactly as the list version read
+            # tokens[position + 1]; the stop slot is covered because the
+            # separator was written at ``filled`` above.
+            targets[start:stop] = row_tokens[start + 1:stop + 1]
+        rows.append((row_tokens.copy(), targets))
+        row_tokens[:] = separator
+        filled = 0
         spans.clear()
 
     for index in order:
         document = documents[index]
-        if len(tokens) + len(document.ids) + 1 > seq_len:
+        length = int(document.ids.shape[0])
+        if filled + length + 1 > seq_len:
             close_row()
-        spans.append(
-            (len(tokens), document.prompt_length, len(document.ids))
-        )
-        tokens.extend(document.ids)
-    if tokens:
+        spans.append((filled, document.prompt_length, length))
+        row_tokens[filled:filled + length] = document.ids
+        filled += length
+    if filled:
         close_row()
     return rows
 
@@ -461,54 +545,183 @@ def lr_scale_at(step: int, total_steps: int, warmup_steps: int) -> float:
     return max(0.0, (total_steps - step) / remaining)
 
 
-def masked_ce_sum(backbone, inputs: torch.Tensor, targets: torch.Tensor):
-    """(summed CE over supervised positions, supervised position count).
+@dataclass(frozen=True)
+class DeviceBatch:
+    """One micro-batch on the device, with its supervision fixed on the host.
 
-    The vocab readout renders ONLY the supervised positions: full-sequence
-    logits at 50k vocab retain multiple [B*S, V] fp32 tensors through the
-    softcap's autograd graph — the exact linear-in-slots term the replay
-    path bounds with its slot budget after a measured OOM on this card
-    (NOTES.md). Gathering features before ``logits_from_features`` is
-    exact (the readout is positionwise) and cuts that memory to the ~66%
-    of packed slots that carry loss.
+    The supervised slots are read from the packed numpy targets on the host,
+    so the device never has to report how many there are: a boolean-mask
+    gather would size its output from device data, which stalls the host on
+    every micro-batch and hands the compiler a data-dependent shape.
     """
-    supervised = targets != IGNORE_INDEX
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        token_latent = backbone.embed_tokens(inputs)
-        belief = backbone.temporal_belief_from_token_latent(token_latent)
-        features = torch.cat((token_latent, belief), dim=-1)[supervised]
-        logits = backbone.logits_from_features(features)
-    loss = F.cross_entropy(
-        logits.float(), targets[supervised], reduction="sum"
+
+    inputs: torch.Tensor  # [B, T] int64
+    positions: torch.Tensor  # [N] int64 flat indices into B*T
+    labels: torch.Tensor  # [N] int64 next-token targets
+    supervised: int  # N
+
+
+def device_batch(
+    rows: list[tuple[np.ndarray, np.ndarray]], device: torch.device
+) -> DeviceBatch:
+    tokens = np.stack([tokens for tokens, _ in rows])
+    targets = np.stack([targets for _, targets in rows]).reshape(-1)
+    positions = np.flatnonzero(targets != IGNORE_INDEX)
+    labels = targets[positions]
+
+    def upload(array: np.ndarray) -> torch.Tensor:
+        host = torch.from_numpy(array)
+        if device.type == "cuda":
+            host = host.pin_memory()
+        return host.to(device=device, non_blocking=True).long()
+
+    return DeviceBatch(
+        inputs=upload(tokens),
+        positions=upload(positions),
+        labels=upload(labels),
+        supervised=int(positions.size),
     )
-    return loss, int(supervised.sum())
+
+
+def readout_ce_sum(
+    backbone, features: torch.Tensor, labels: torch.Tensor
+) -> torch.Tensor:
+    """Summed CE of the renderer's softcapped logits at the given features."""
+    with torch.autocast(features.device.type, dtype=torch.bfloat16):
+        logits = backbone.logits_from_features(features)
+    return F.cross_entropy(logits.float(), labels, reduction="sum")
+
+
+class SupervisedCE:
+    """Summed completion CE over a packed micro-batch.
+
+    The vocab readout renders ONLY the supervised positions: the readout is
+    positionwise, so gathering features first is exact, and it keeps the
+    ~1/3 of packed slots that carry no loss off the model's largest matmul.
+    Full-sequence logits at 50k vocab would also retain multiple [B*S, V]
+    fp32 tensors through the softcap's autograd graph.
+
+    ``compiled`` compiles each residual block independently, as pretraining
+    does, so an opaque FLA recurrence splits the graph at one mixer instead
+    of forcing the whole model eager; the readout, softcap and cross-entropy
+    compile as one region with a dynamic supervised-slot count, so the
+    [N, V] logits are produced and consumed by fused kernels. Blocks are
+    compiled as modules, so only their ``__call__`` changes: the sampling
+    gate's decode path calls ``block.attn``/``block.mlp`` directly and is
+    unaffected.
+    """
+
+    def __init__(self, backbone, compiled: bool):
+        self.backbone = backbone
+        self.readout = readout_ce_sum
+        self.dynamo_config = contextlib.nullcontext
+        if compiled:
+            for block in backbone.blocks:
+                block.compile(dynamic=False)
+            self.readout = torch.compile(readout_ce_sum, dynamic=True)
+            # Every block shares ``Block.forward``'s code object, whose cache
+            # holds one graph per {KDA, attention} x {grad, no-grad} x
+            # micro-batch row count (the full split, each epoch's tail step,
+            # the holdout tail): 8 in a single epoch, exactly Dynamo's
+            # default budget. Past the budget Dynamo would silently run the
+            # block eagerly, so a shape nobody anticipated stops the run
+            # instead. Scoped to this loss: the sampling gate compiles its
+            # own decode graphs in the same process.
+            self.dynamo_config = functools.partial(
+                torch._dynamo.config.patch,
+                recompile_limit=64,
+                fail_on_recompile_limit_hit=True,
+            )
+
+    def __call__(self, batch: DeviceBatch) -> torch.Tensor:
+        with self.dynamo_config():
+            return self._supervised_ce(batch)
+
+    def _supervised_ce(self, batch: DeviceBatch) -> torch.Tensor:
+        backbone = self.backbone
+        with torch.autocast(batch.inputs.device.type, dtype=torch.bfloat16):
+            token_latent = backbone.embed_tokens(batch.inputs)
+            belief = backbone.temporal_belief_from_token_latent(token_latent)
+            features = torch.cat(
+                (
+                    token_latent.flatten(0, 1).index_select(
+                        0, batch.positions
+                    ),
+                    belief.flatten(0, 1).index_select(0, batch.positions),
+                ),
+                dim=-1,
+            )
+        return self.readout(backbone, features, batch.labels)
+
+
+class AsyncScalar:
+    """A device scalar copied to the host without draining the stream."""
+
+    def __init__(self, value: torch.Tensor):
+        if value.device.type != "cuda":
+            self._host, self._event = value.detach().cpu(), None
+            return
+        self._host = torch.empty(
+            (), dtype=value.dtype, device="cpu", pin_memory=True
+        )
+        self._host.copy_(value.detach(), non_blocking=True)
+        self._event = torch.cuda.Event()
+        self._event.record()
+
+    def read(self) -> float:
+        if self._event is not None:
+            self._event.synchronize()
+        return float(self._host)
+
+
+def accumulate_step_gradients(
+    loss_fn: SupervisedCE,
+    step_rows: list[tuple[np.ndarray, np.ndarray]],
+    rows_per_micro_batch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Backward one optimizer step's rows; returns its mean CE on device.
+
+    The loss is normalized by the step-wide supervised count, so any
+    micro-batch split of ``step_rows`` computes the same gradient. Nothing
+    here synchronizes with the device; the caller reads the returned scalar
+    when it logs.
+    """
+    supervised_total = sum(
+        int(np.count_nonzero(targets != IGNORE_INDEX))
+        for _, targets in step_rows
+    )
+    step_loss = torch.zeros((), device=device)
+    for micro_start in range(0, len(step_rows), rows_per_micro_batch):
+        batch = device_batch(
+            step_rows[micro_start:micro_start + rows_per_micro_batch], device
+        )
+        loss = loss_fn(batch) / supervised_total
+        loss.backward()
+        step_loss += loss.detach()
+    return step_loss
 
 
 @torch.no_grad()
 def holdout_ce(
-    backbone,
-    rows: list[tuple[list[int], list[int]]],
+    loss_fn: SupervisedCE,
+    rows: list[tuple[np.ndarray, np.ndarray]],
     rows_per_batch: int,
     device: torch.device,
 ) -> float:
     """Mean completion CE (nats/token) over the held-out packed rows."""
+    backbone = loss_fn.backbone
     was_training = backbone.training
     backbone.eval()
-    total, count = 0.0, 0
+    total = torch.zeros((), device=device, dtype=torch.float64)
+    count = 0
     for start in range(0, len(rows), rows_per_batch):
-        batch = rows[start:start + rows_per_batch]
-        inputs = torch.tensor(
-            [tokens for tokens, _ in batch], dtype=torch.long, device=device
-        )
-        targets = torch.tensor(
-            [targets for _, targets in batch], dtype=torch.long, device=device
-        )
-        loss, supervised = masked_ce_sum(backbone, inputs, targets)
-        total += float(loss)
-        count += supervised
+        batch = device_batch(rows[start:start + rows_per_batch], device)
+        total += loss_fn(batch)
+        count += batch.supervised
     if was_training:
         backbone.train()
-    return total / count
+    return float(total) / count
 
 
 def gate_metrics_from_counts(
@@ -530,6 +743,33 @@ def gate_metrics_from_counts(
     }
 
 
+def assert_gate_panel_fits(panel, tokenizer, args, instruction_suffix) -> None:
+    """Refuse a gate panel whose prompts would be front-truncated.
+
+    ``encode_prompt`` keeps BOS plus the LAST ``max_tokens-1`` tokens, so a
+    problem that overflows the budget loses its opening and the gate would
+    report accuracy on a question the policy never saw in full. The gate is
+    the run's certificate, so this is checked at startup as well as here --
+    a one-epoch pass over a 900k-document corpus must not spend hours before
+    discovering its panel cannot be graded.
+    """
+    overflow = [
+        length
+        for length in (
+            len(encode_prompt(tokenizer, document["problem"] + instruction_suffix))
+            for document in panel[: args.gate_prompts]
+        )
+        if length > args.gate_prompt_tokens
+    ]
+    if overflow:
+        raise ValueError(
+            f"{len(overflow)} of {min(args.gate_prompts, len(panel))} gate "
+            f"prompts exceed --gate-prompt-tokens {args.gate_prompt_tokens} "
+            f"(longest {max(overflow)}); encode_prompt would drop their "
+            "opening tokens and the gate would grade a truncated question"
+        )
+
+
 def run_sampling_gate(
     backbone,
     tokenizer,
@@ -544,6 +784,7 @@ def run_sampling_gate(
     through the production rollout/eval stack while bypassing the combiner
     entirely — the measured policy is exactly the SFT'd token policy.
     """
+    assert_gate_panel_fits(panel, tokenizer, args, instruction_suffix)
     wrapper = LatentThoughtModel(backbone).to(device)
     wrapper.eval()
     rows = [
@@ -593,6 +834,7 @@ def run_sampling_gate(
         think_fence_ids=think_fence_ids,
         answer_fence_ids=answer_fence_ids,
         min_think_tokens=getattr(args, "gate_think_min_tokens", 1),
+        batch_trajectories=args.gate_batch_trajectories,
     )
     count_key = (
         "contract_prompt_correct_counts"
@@ -622,7 +864,9 @@ def run_sampling_gate(
     return gate, captured
 
 
-def save_backbone_checkpoint(backbone, path: Path, sft_metadata: dict) -> None:
+def save_backbone_checkpoint(
+    backbone, path: Path, sft_metadata: dict, trained_seq_len: int
+) -> None:
     """The exact payload shape ``model_io.load_model`` consumes, atomically."""
     payload = {
         "model": {
@@ -632,11 +876,204 @@ def save_backbone_checkpoint(backbone, path: Path, sft_metadata: dict) -> None:
         "model_config": backbone.model_config,
         "architecture": backbone.architecture,
         "train_seq_len": backbone.train_context_tokens,
+        # train_seq_len stays the PRETRAINED bound: every downstream loader
+        # derives its budgets from it and RL stage 2 must stay inside 1024.
+        # trained_seq_len records the window this SFT pass actually trained.
+        "trained_seq_len": trained_seq_len,
+        "context_extension": trained_seq_len > backbone.train_context_tokens,
         "sft": sft_metadata,
     }
     staging = path.with_name(path.name + ".tmp")
     torch.save(payload, staging)
     os.replace(staging, path)
+
+
+RESUME_STATE_SCHEMA = "sft_exact_resume/v1"
+RESUME_STATE_NAME = "resume.pt"
+# Arguments that steer how a run is checkpointed, not what it trains, so a
+# resume may change them.
+RESUME_EXEMPT_ARGS = frozenset({"resume", "checkpoint_interval_seconds"})
+# EX_TEMPFAIL: the run stopped at a checkpoint and is meant to be resumed.
+EXIT_CHECKPOINTED = 75
+# Everything that executes on both sides of a resume boundary: the update
+# path, the model, the optimizers and the schedule. A resumed run whose code
+# differs is a different run. The sampling gate runs after the last step in
+# one process, so its modules need no binding.
+RESUME_BOUND_MODULES = (
+    "train_gpt",
+    "postraining.sft_trace_train",
+    "postraining.core",
+    "postraining.model_io",
+    "postraining.muon",
+    "postraining.kda_backbone",
+    "postraining.nano_backbone",
+    "postraining.vapo.config",
+    "pretraining.latent_moe_training",
+    "pretraining.nanogpt_mini.nanogpt_mini_kda_model",
+)
+
+
+def resume_source_sha256() -> dict[str, str]:
+    """Byte hashes of the modules a resumed run must share."""
+    import importlib
+
+    return {
+        name: file_sha256(Path(importlib.import_module(name).__file__))
+        for name in RESUME_BOUND_MODULES
+    }
+
+
+def packed_schedule_sha256(
+    epoch_rows: list[list[tuple[np.ndarray, np.ndarray]]],
+) -> str:
+    """Digest of every packed row in step order, targets included.
+
+    Resume recomputes the schedule from the corpus rather than storing
+    gigabytes of rows, so this is what proves the recomputation reproduced
+    the interrupted run's data order bit for bit.
+    """
+    digest = hashlib.sha256()
+    for rows in epoch_rows:
+        digest.update(len(rows).to_bytes(8, "little"))
+        for tokens, targets in rows:
+            digest.update(tokens.tobytes())
+            digest.update(targets.tobytes())
+    return digest.hexdigest()
+
+
+def resume_contract(args: argparse.Namespace, **identity) -> dict:
+    """What a resumed run must share with the run that wrote the state."""
+    return {
+        "resume_schema": RESUME_STATE_SCHEMA,
+        "sft_checkpoint_schema": SFT_CHECKPOINT_SCHEMA,
+        "torch_version": torch.__version__,
+        "args": {
+            key: value
+            for key, value in sorted(vars(args).items())
+            if key not in RESUME_EXEMPT_ARGS
+        },
+        **identity,
+    }
+
+
+def rng_state() -> dict:
+    """Every global generator, for a resumed run that draws any randomness.
+
+    Training draws none today and the sampling gate reseeds, so this is a
+    guard for future stochastic training (dropout, sampled packing) rather
+    than a current dependency.
+    """
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    """Inverse of ``rng_state``."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def fsync_path(path: Path) -> None:
+    """Flush a file's (or directory's) data and metadata to stable storage."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def save_resume_state(
+    path: Path,
+    *,
+    contract: dict,
+    backbone,
+    optimizers: list[torch.optim.Optimizer],
+    step: int,
+    progress: dict,
+) -> None:
+    """Everything the next step depends on, written atomically.
+
+    ``progress`` is the loop's own bookkeeping (elapsed time, last holdout
+    CE, the metrics byte offset, resume history), restored verbatim.
+    """
+    payload = {
+        "contract": contract,
+        "step": step,
+        "model": backbone.state_dict(),
+        "optimizers": [optimizer.state_dict() for optimizer in optimizers],
+        "rng": rng_state(),
+        "progress": progress,
+    }
+    staging = path.with_name(path.name + ".tmp")
+    torch.save(payload, staging)
+    # Durable before it replaces the previous state: after a host crash the
+    # rename must never expose a truncated file in place of a good one.
+    fsync_path(staging)
+    os.replace(staging, path)
+    fsync_path(path.parent)
+
+
+def resume_contract_mismatch(saved: dict, current: dict) -> list[str]:
+    """Dotted names of the contract fields that differ."""
+    changed = []
+    for key in sorted(saved.keys() | current.keys()):
+        before, after = saved.get(key), current.get(key)
+        if before == after:
+            continue
+        if isinstance(before, dict) and isinstance(after, dict):
+            changed.extend(
+                f"{key}.{name}"
+                for name in resume_contract_mismatch(before, after)
+            )
+        else:
+            changed.append(key)
+    return changed
+
+
+def require_resume_contract(path: Path, contract: dict, saved: dict) -> None:
+    changed = resume_contract_mismatch(saved, contract)
+    if changed:
+        raise ValueError(
+            f"refusing to resume {path}: the run contract changed "
+            f"({', '.join(changed)})"
+        )
+
+
+def load_resume_contract(path: Path) -> dict:
+    """The saved contract alone; mmap keeps the tensors on disk."""
+    return torch.load(
+        path, map_location="cpu", weights_only=False, mmap=True
+    )["contract"]
+
+
+def load_resume_state(
+    path: Path,
+    *,
+    contract: dict,
+    backbone,
+    optimizers: list[torch.optim.Optimizer],
+) -> tuple[int, dict]:
+    """Restore a run in place; refuse any change to what it trains."""
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    require_resume_contract(path, contract, payload["contract"])
+    backbone.load_state_dict(payload["model"], strict=True)
+    if len(payload["optimizers"]) != len(optimizers):
+        raise ValueError(f"{path} holds a different optimizer layout")
+    for optimizer, state in zip(optimizers, payload["optimizers"]):
+        optimizer.load_state_dict(state)
+    restore_rng_state(payload["rng"])
+    return payload["step"], payload["progress"]
 
 
 def file_sha256(path: Path) -> str:
@@ -679,7 +1116,7 @@ def validate_trace_manifest(
 
 
 def create_fresh_run_dir(path: Path) -> None:
-    """Create one immutable run root; this trainer has no resume semantics."""
+    """Create one run root; only ``--resume`` may reopen it."""
     try:
         path.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:
@@ -697,13 +1134,38 @@ def main() -> None:
     parser.add_argument(
         "--traces", default="postraining/data/sft_traces_v1.parquet"
     )
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--seq-len", type=int, default=4096)
-    # 2x4096 rows keep grad-enabled vocab slots (~5.4k supervised) inside
-    # the replay path's measured-safe 8192 slot budget; the step-wide loss
-    # normalization makes the 2x4 accumulation bit-comparable to 4x2.
-    parser.add_argument("--rows-per-micro-batch", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="admit rows whose 'verified' column is False. Required for the "
+        "large published instruction corpora, whose solutions are "
+        "model-generated and are not re-verified by this repository",
+    )
+    # One epoch. Repeated passes over a small trace set drive holdout
+    # completion CE down (3.9449 -> 0.9009 over three epochs on the retired v6
+    # traces) while the derived policy still scored 0.00 on every DeepMind
+    # interpolate module: that gap is memorisation of the trace set, not
+    # reasoning. A single pass over a large corpus is the idiomatic setting.
+    parser.add_argument("--epochs", type=int, default=1)
+    # None = the checkpoint's own pretraining context. Packing past that
+    # window makes the model attend at positions RoPE never saw.
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument(
+        "--allow-context-extension",
+        action="store_true",
+        help="train past the checkpoint's pretraining context. Off by "
+        "default: a longer window runs without a code change because RoPE is "
+        "computed from torch.arange(T), so the failure would otherwise be "
+        "silent extrapolation rather than an error. Setting it makes the "
+        "extension deliberate and records it in the checkpoint's metadata.",
+    )
+    # The step-wide loss normalization makes any micro-batch split of a
+    # step's rows compute the same gradient, so the split is a memory knob.
+    # One micro-batch is fastest: 8x5120 rows measured 110 ms/step at 9.4 GiB
+    # peak (scripts/benchmark_sft_step.py, job 9155) against 130 ms for 2x4
+    # (job 9152).
+    parser.add_argument("--rows-per-micro-batch", type=int, default=8)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--lr-scale", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--min-completion-tokens", type=int, default=0)
@@ -724,18 +1186,55 @@ def main() -> None:
     # a 512 budget would truncate ~5% of solvable groups and register
     # length-driven "mixed" groups — contaminating the exact diversity
     # metric the gate reads. 768 clears the panel's maximum.
-    parser.add_argument("--gate-max-new-tokens", type=int, default=768)
-    parser.add_argument("--gate-prompt-tokens", type=int, default=512)
+    # None = context-derived: keep the 768-token generation budget the
+    # panel needs and give the prompt whatever the window has left,
+    # capped at the 512 a bare math problem can never exceed (p99 is
+    # 136 tokens). A short-context checkpoint therefore samples inside
+    # its window instead of extrapolating RoPE mid-gate.
+    parser.add_argument("--gate-max-new-tokens", type=int, default=None)
+    parser.add_argument("--gate-prompt-tokens", type=int, default=None)
     parser.add_argument("--gate-think-min-tokens", type=int, default=1)
+    # The gate's GPU rollout width. ``evaluate_latent_math`` packs
+    # ``batch_trajectories // gate_samples`` problem groups into each rollout,
+    # so 128 runs a 128-prompt panel as 8 sequential passes and the device has
+    # ample room for more at 64M parameters. It stays at 128 anyway: the gate
+    # is sampled with ``pin_emit=True``, which disables the counter-based
+    # per-row uniform in ``latent_rollout`` and draws from the global RNG at
+    # the live batch width, so this knob changes which tokens are sampled and
+    # therefore the reported gate accuracy. 128 is the width job 9040's
+    # numbers were measured at and every comparison against the canonical
+    # base depends on matching it. The whole panel costs ~30 s at the measured
+    # 13.5k tok/s (job 9082), so there is no throughput case for breaking that
+    # comparability. Widen it only alongside a batch-invariant sampling path.
+    parser.add_argument("--gate-batch-trajectories", type=int, default=128)
     parser.add_argument("--seed", type=int, default=1234)
+    # Wall-clock, not steps: the point is to bound the work a stop loses
+    # whatever the step time. A save is ~1 GB (weights plus both optimizers'
+    # state) and takes seconds, so five minutes costs well under 1%. Named
+    # as in train_latent_vapo, whose rolling checkpoints use the same knob.
+    parser.add_argument(
+        "--checkpoint-interval-seconds", type=float, default=300.0
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=f"continue postraining/runs/<name> from its {RESUME_STATE_NAME}. "
+        "Every argument except the checkpoint cadence must match, and the "
+        "corpus, base checkpoint and recomputed packed schedule must hash "
+        "identically. SIGTERM (mlq cancel) saves a checkpoint at the next "
+        f"step boundary and exits {EXIT_CHECKPOINTED}.",
+    )
     args = parser.parse_args()
+    if not args.checkpoint_interval_seconds > 0:
+        parser.error("--checkpoint-interval-seconds must be positive")
     for field in (
         "epochs", "seq_len", "rows_per_micro_batch", "grad_accum",
         "holdout_problems", "eval_every", "gate_prompts", "gate_samples",
         "gate_max_new_tokens", "gate_prompt_tokens",
-        "gate_think_min_tokens",
+        "gate_think_min_tokens", "gate_batch_trajectories",
     ):
-        if getattr(args, field) < 1:
+        value = getattr(args, field)
+        if value is not None and value < 1:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if not 0.0 < args.lr_scale <= 1.0:
         parser.error("--lr-scale must be in (0, 1]")
@@ -750,21 +1249,87 @@ def main() -> None:
         parser.error(str(error))
 
     run_dir = Path("postraining/runs") / args.name
-    try:
-        create_fresh_run_dir(run_dir)
-    except FileExistsError as error:
-        parser.error(str(error))
+    resume_path = run_dir / RESUME_STATE_NAME
+    metrics_path = run_dir / "metrics.jsonl"
+    # A run is finished when its gate result exists: the final checkpoint is
+    # written before the gate, so a stop during the gate still resumes.
+    if args.resume:
+        if not resume_path.is_file():
+            parser.error(f"--resume: no {resume_path}")
+        if (run_dir / "result.json").exists():
+            parser.error(f"--resume: {run_dir} already finished")
+    elif run_dir.exists():
+        # Checked now, created only once preparation is done: a stop during
+        # the minutes of tokenization must not strand an empty run dir that
+        # neither a fresh run nor --resume will open.
+        parser.error(f"refusing to overwrite existing SFT run directory {run_dir}")
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
-    metrics_path = run_dir / "metrics.jsonl"
-    metrics_path.write_text("")
 
     backbone = load_model(args.checkpoint, device)
-    if args.seq_len > backbone.train_context_tokens:
-        parser.error(
-            f"--seq-len {args.seq_len} exceeds the checkpoint's pretraining "
-            f"context ({backbone.train_context_tokens})"
+    context_tokens = backbone.train_context_tokens
+    if args.seq_len is None:
+        args.seq_len = context_tokens
+    # The window the run actually trains and gates at. Beyond the pretrained
+    # context this is extrapolation for the full-attention layers until the
+    # run itself trains those positions, which is why it is opt-in.
+    effective_context = context_tokens
+    if args.seq_len > context_tokens:
+        if not args.allow_context_extension:
+            parser.error(
+                f"--seq-len {args.seq_len} exceeds the checkpoint's "
+                f"pretraining context ({context_tokens}); pass "
+                "--allow-context-extension to train the longer window "
+                "deliberately"
+            )
+        effective_context = args.seq_len
+    # The prompt budget is floored, and the response budget yields to it.
+    # Deriving max_new first and giving the prompt whatever remains looks
+    # safe because the result is always >= 1, but for a context in the
+    # 770..1023 range it leaves a 2..255-token prompt window -- and
+    # encode_prompt keeps BOS plus the LAST max_tokens-1 tokens, so problems
+    # would silently lose their opening and the gate would report accuracy on
+    # truncated questions. A gate that cannot see the whole prompt is not a
+    # measurement, so the run fails instead.
+    GATE_PROMPT_FLOOR = 256
+    if args.gate_prompt_tokens is None:
+        args.gate_prompt_tokens = min(
+            512, max(GATE_PROMPT_FLOOR, effective_context // 4)
         )
+    if args.gate_max_new_tokens is None:
+        args.gate_max_new_tokens = min(
+            768, effective_context - args.gate_prompt_tokens
+        )
+    if args.gate_max_new_tokens < 1:
+        parser.error(
+            f"gate context ({effective_context}) cannot hold a "
+            f"{args.gate_prompt_tokens}-token gate prompt and any response"
+        )
+    gate_window = args.gate_prompt_tokens + args.gate_max_new_tokens
+    if gate_window > effective_context:
+        parser.error(
+            f"gate budget {args.gate_prompt_tokens}+"
+            f"{args.gate_max_new_tokens} exceeds the training window "
+            f"({effective_context})"
+        )
+    # Every argument is resolved now, so the whole contract except the
+    # packed schedule is known: a resume that would be refused fails here,
+    # before minutes of tokenization, not after.
+    traces_sha256 = file_sha256(Path(args.traces))
+    base_checkpoint_sha256 = file_sha256(Path(args.checkpoint))
+    contract = resume_contract(
+        args,
+        traces_sha256=traces_sha256,
+        base_checkpoint_sha256=base_checkpoint_sha256,
+        source_sha256=resume_source_sha256(),
+    )
+    if args.resume:
+        saved = load_resume_contract(resume_path)
+        saved.pop("packed_schedule_sha256", None)
+        try:
+            require_resume_contract(resume_path, contract, saved)
+        except ValueError as error:
+            parser.error(str(error))
     for parameter in backbone.parameters():
         parameter.requires_grad_(True)
     frozen_moe_router_parameters = (
@@ -791,10 +1356,26 @@ def main() -> None:
     instruction_suffix = (
         INSTRUCTION_SUFFIX_ANSWER if args.answer_fence else INSTRUCTION_SUFFIX
     )
-    documents = load_documents(Path(args.traces))
+    documents = load_documents(Path(args.traces), args.allow_unverified)
     train_docs, holdout_docs, panel = split_holdout(
         documents, args.holdout_problems
     )
+    # The panel holds only gradeable problems, so a mixed-domain corpus can
+    # yield fewer than --holdout-problems. The gate silently truncating to a
+    # short panel would change what its accuracy means between runs, so the
+    # shortfall is an error the caller resolves by raising
+    # --holdout-problems.
+    if len(panel) < args.gate_prompts:
+        raise ValueError(
+            f"sampling gate needs {args.gate_prompts} gradeable held-out "
+            f"problems but the split yielded {len(panel)} from "
+            f"{args.holdout_problems} held-out problems; raise "
+            "--holdout-problems or lower --gate-prompts"
+        )
+    # Checked here, not only inside the gate: the gate runs after the whole
+    # training pass, and an ungradeable panel must not cost a full epoch to
+    # discover.
+    assert_gate_panel_fits(panel, tokenizer, args, instruction_suffix)
     train_tokens = tokenize_documents(
         tokenizer, train_docs, args.seq_len, args.min_completion_tokens,
         instruction_suffix=instruction_suffix,
@@ -856,30 +1437,62 @@ def main() -> None:
         )
         for epoch in range(args.epochs)
     ]
-    steps_per_epoch = [
-        math.ceil(len(rows) / rows_per_step) for rows in epoch_rows
+    # One (rows, offset) slice per optimizer step, in order, so a resumed
+    # run continues at exactly the slice the interrupted one would have run.
+    step_slices = [
+        (rows, start)
+        for rows in epoch_rows
+        for start in range(0, len(rows), rows_per_step)
     ]
-    total_steps = sum(steps_per_epoch)
+    total_steps = len(step_slices)
     print(
         f"schedule: {total_steps} steps "
         f"({rows_per_step} rows x {args.seq_len} tokens per step)"
     )
+    contract["packed_schedule_sha256"] = packed_schedule_sha256(epoch_rows)
 
     optimizers = build_optimizers(backbone, args.lr_scale)
-    backbone.train()
-    started = time.perf_counter()
     step = 0
+    progress = {
+        "elapsed_seconds": 0.0,
+        "last_val_ce": None,
+        "metrics_bytes": 0,
+        "resumed_at_steps": [],
+    }
+    if args.resume:
+        step, progress = load_resume_state(
+            resume_path,
+            contract=contract,
+            backbone=backbone,
+            optimizers=optimizers,
+        )
+        # Entries logged after the checkpoint describe steps this run is
+        # about to redo; the stream must hold each step exactly once. The
+        # save fsyncs the stream first, so a shorter file means it was lost
+        # or edited, and truncate() would pad it with NULs.
+        if metrics_path.stat().st_size < progress["metrics_bytes"]:
+            raise ValueError(
+                f"{metrics_path} is shorter than the {progress['metrics_bytes']} "
+                f"bytes {resume_path} recorded"
+            )
+        with metrics_path.open("r+b") as stream:
+            stream.truncate(progress["metrics_bytes"])
+        progress["resumed_at_steps"].append(step)
+        print(f"resumed {resume_path} at step {step}/{total_steps}")
+    loss_fn = SupervisedCE(backbone, compiled=True)
+    backbone.train()
+    started = time.perf_counter() - progress["elapsed_seconds"]
 
     def log(entry: dict) -> None:
         with metrics_path.open("a") as stream:
             stream.write(json.dumps(entry) + "\n")
 
-    last_val_ce: float | None = None
+    last_val_ce: float | None = progress["last_val_ce"]
 
     def log_val(at_step: int) -> float:
         nonlocal last_val_ce
         ce = holdout_ce(
-            backbone, holdout_rows, args.rows_per_micro_batch, device
+            loss_fn, holdout_rows, args.rows_per_micro_batch, device
         )
         last_val_ce = ce
         log(
@@ -896,70 +1509,135 @@ def main() -> None:
         print(f"step {at_step}: holdout completion ce {ce:.4f}", flush=True)
         return ce
 
-    log_val(0)
-    for rows in epoch_rows:
-        for start in range(0, len(rows), rows_per_step):
-            step_rows = rows[start:start + rows_per_step]
-            supervised_total = sum(
-                sum(1 for target in targets if target != IGNORE_INDEX)
-                for _, targets in step_rows
-            )
-            scale = lr_scale_at(step, total_steps, args.warmup_steps)
-            momentum = muon_momentum_at(step)
-            for optimizer in optimizers:
-                for group in optimizer.param_groups:
-                    group["lr"] = group["initial_lr"] * scale
-                    if isinstance(optimizer, Muon):
-                        group["mu"] = momentum
-            step_loss = 0.0
-            if frozen_moe_router_parameters:
-                reset_quantile_balance_accumulators(backbone)
-            for micro_start in range(
-                0, len(step_rows), args.rows_per_micro_batch
-            ):
-                micro = step_rows[
-                    micro_start:micro_start + args.rows_per_micro_batch
-                ]
-                inputs = torch.tensor(
-                    [tokens for tokens, _ in micro],
-                    dtype=torch.long, device=device,
-                )
-                targets = torch.tensor(
-                    [targets for _, targets in micro],
-                    dtype=torch.long, device=device,
-                )
-                loss, _ = masked_ce_sum(backbone, inputs, targets)
-                (loss / supervised_total).backward()
-                step_loss += float(loss) / supervised_total
-            if frozen_moe_router_parameters:
-                moe_load_cv, moe_max_load = apply_accumulated_quantile_balance(
-                    backbone
-                )
-            for optimizer in optimizers:
-                optimizer.step()
-            for optimizer in optimizers:
-                optimizer.zero_grad(set_to_none=True)
-            step += 1
-            log(
-                {
-                    "type": "train",
-                    "step": step,
-                    "train_loss": step_loss,
-                    "lr_scale": scale,
-                    **(
-                        {
-                            "moe_load_cv2": float(moe_load_cv),
-                            "moe_max_load": float(moe_max_load),
-                        }
-                        if frozen_moe_router_parameters
-                        else {}
-                    ),
-                    "train_time_ms": (time.perf_counter() - started) * 1000,
-                }
-            )
-            if step % args.eval_every == 0:
-                log_val(step)
+    pending_train_entry: dict | None = None
 
+    def flush_train_entry() -> None:
+        nonlocal pending_train_entry
+        if pending_train_entry is None:
+            return
+        log(
+            {
+                key: (
+                    value.read()
+                    if isinstance(value, AsyncScalar)
+                    else float(value) if torch.is_tensor(value) else value
+                )
+                for key, value in pending_train_entry.items()
+            }
+        )
+        pending_train_entry = None
+
+    def save_checkpoint() -> None:
+        flush_train_entry()
+        fsync_path(metrics_path)
+        progress.update(
+            elapsed_seconds=time.perf_counter() - started,
+            last_val_ce=last_val_ce,
+            metrics_bytes=metrics_path.stat().st_size,
+        )
+        save_resume_state(
+            resume_path,
+            contract=contract,
+            backbone=backbone,
+            optimizers=optimizers,
+            step=step,
+            progress=progress,
+        )
+
+    # mlq cancel sends SIGTERM. From creating the run dir until the last
+    # step's checkpoint, stop at the next step boundary with a checkpoint
+    # rather than dying mid-step with up to a cadence of work unsaved; the
+    # handler only sets a flag, so the step in flight finishes. Outside that
+    # window the default handler applies: preparation has nothing to save,
+    # and after the last step's checkpoint a stop resumes into the final
+    # holdout, save and gate.
+    stop_requested = False
+
+    def request_stop(signum, frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    def stop_if_requested() -> None:
+        if stop_requested:
+            print(
+                f"SIGTERM: {resume_path} holds step {step}/{total_steps}; "
+                "continue with --resume",
+                flush=True,
+            )
+            raise SystemExit(EXIT_CHECKPOINTED)
+
+    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    if step == 0:
+        create_fresh_run_dir(run_dir)
+        metrics_path.write_text("")
+        log_val(0)
+        # Resumable from the first moment the run dir exists.
+        save_checkpoint()
+        stop_if_requested()
+    last_checkpoint = time.perf_counter()
+    for rows, start in step_slices[step:]:
+        step_rows = rows[start:start + rows_per_step]
+        scale = lr_scale_at(step, total_steps, args.warmup_steps)
+        momentum = muon_momentum_at(step)
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * scale
+                if isinstance(optimizer, Muon):
+                    group["mu"] = momentum
+        if frozen_moe_router_parameters:
+            reset_quantile_balance_accumulators(backbone)
+        step_loss = accumulate_step_gradients(
+            loss_fn, step_rows, args.rows_per_micro_batch, device
+        )
+        if frozen_moe_router_parameters:
+            moe_load_cv, moe_max_load = apply_accumulated_quantile_balance(
+                backbone
+            )
+        for optimizer in optimizers:
+            optimizer.step()
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+        step += 1
+        # Logged one step late through an async copy: ``float`` on a
+        # device tensor waits for everything queued on the stream, so
+        # reading this step's loss now would drain the queue and idle
+        # the GPU while the host prepares the next step. The event
+        # waits only for this step's copy, which the next flush finds
+        # long finished.
+        flush_train_entry()
+        pending_train_entry = {
+            "type": "train",
+            "step": step,
+            "train_loss": AsyncScalar(step_loss),
+            "lr_scale": scale,
+            # Host time once the step is queued; the device finishes it
+            # later by however much work is still in the launch queue.
+            "train_time_ms": (time.perf_counter() - started) * 1000,
+            **(
+                {
+                    "moe_load_cv2": AsyncScalar(moe_load_cv),
+                    "moe_max_load": AsyncScalar(moe_max_load),
+                }
+                if frozen_moe_router_parameters
+                else {}
+            ),
+        }
+        if step % args.eval_every == 0:
+            flush_train_entry()
+            log_val(step)
+        if (
+            stop_requested
+            or step == total_steps
+            or time.perf_counter() - last_checkpoint
+            >= args.checkpoint_interval_seconds
+        ):
+            save_checkpoint()
+            last_checkpoint = time.perf_counter()
+            print(f"step {step}: saved {resume_path}", flush=True)
+            stop_if_requested()
+    signal.signal(signal.SIGTERM, previous_sigterm)
+
+    flush_train_entry()
     if step % args.eval_every:
         log_val(step)
     final_ce = last_val_ce
@@ -971,12 +1649,14 @@ def main() -> None:
             "schema": SFT_CHECKPOINT_SCHEMA,
             "base_checkpoint": args.checkpoint,
             "traces": args.traces,
-            "traces_sha256": file_sha256(Path(args.traces)),
+            "traces_sha256": traces_sha256,
+            "base_checkpoint_sha256": base_checkpoint_sha256,
             "traces_manifest": (
                 str(traces_manifest) if traces_manifest is not None else None
             ),
             "args": vars(args),
             "steps": step,
+            "resumed_at_steps": progress["resumed_at_steps"],
             "moe_router_frozen_parameters": frozen_moe_router_parameters,
             "moe_quantile_balance_bins": (
                 1000 if frozen_moe_router_parameters else None
@@ -991,6 +1671,7 @@ def main() -> None:
             # (a floor above the corpus median is refused at startup).
             "think_span_token_percentiles": think_span_percentiles,
         },
+        trained_seq_len=args.seq_len,
     )
     print(f"saved {checkpoint_path}")
 

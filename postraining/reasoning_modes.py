@@ -1,4 +1,4 @@
-"""Shared rollout-budget semantics for latent, CoT, and answer-only policies."""
+"""Shared rollout semantics for latent, carry, CoT, and answer-only policies."""
 
 from __future__ import annotations
 
@@ -9,6 +9,23 @@ from postraining.core import (
     POSTTRAIN_PROMPT_TOKENS,
     POSTTRAIN_STREAM_TOKENS,
 )
+
+
+REASONING_MODES = ("latent", "carry", "cot", "none")
+
+
+def mode_pins_emit(reasoning_mode: str) -> bool:
+    """Whether tokens are the mode's only actions (no gate, no thoughts)."""
+    if reasoning_mode not in REASONING_MODES:
+        raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
+    return reasoning_mode != "latent"
+
+
+def mode_carries_hidden(reasoning_mode: str) -> bool:
+    """Whether generated-token inputs add the belief that produced them."""
+    if reasoning_mode not in REASONING_MODES:
+        raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
+    return reasoning_mode == "carry"
 
 
 def mode_rollout_budget(
@@ -22,7 +39,9 @@ def mode_rollout_budget(
     """Return ``(emitted-token cap, stream-slot cap)`` for one evaluation."""
     if reasoning_mode == "none":
         return answer_tokens, answer_tokens
-    if reasoning_mode == "cot":
+    if reasoning_mode in ("cot", "carry"):
+        # Carry adds no stream slots: its stream is prompt plus emitted
+        # tokens, exactly like cot.
         return max_tokens, max_tokens
     if reasoning_mode != "latent":
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")

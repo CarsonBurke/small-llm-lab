@@ -10,14 +10,13 @@ from typing import Any
 import torch
 
 from postraining.hf_runtime import prepare_text_only_transformers_runtime
-from postraining.minicpm_vapo import (
-    MINICPM5_MODEL_ID,
-    MINICPM5_REVISION,
-    LoRAConfig,
-    MiniCPMVAPOPolicy,
+from postraining.vapo.model.hf import MINICPM5_SPEC, HFCausalTrunk
+from postraining.vapo.policy import (
+    VAPOPolicy,
     StaticCachePool,
-    chunked_frozen_head_logprobs,
 )
+from postraining.vapo.model.lora import LoRAConfig
+from postraining.vapo.model.readout import chunked_frozen_head_logprobs
 
 
 PROMPTS = (
@@ -41,7 +40,7 @@ def prompt_ids(tokenizer, prompt: str, device: torch.device) -> torch.Tensor:
 
 @torch.inference_mode()
 def greedy_static_generation(
-    policy: MiniCPMVAPOPolicy,
+    policy: VAPOPolicy,
     inputs: torch.Tensor,
     *,
     max_new_tokens: int,
@@ -73,8 +72,8 @@ def greedy_static_generation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=MINICPM5_MODEL_ID)
-    parser.add_argument("--revision", default=MINICPM5_REVISION)
+    parser.add_argument("--model", default=MINICPM5_SPEC.model_id)
+    parser.add_argument("--revision", default=MINICPM5_SPEC.revision)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument(
         "--output", default="postraining/runs/minicpm5_vapo_parity.json"
@@ -120,7 +119,7 @@ def main() -> None:
                 )[:, tokens.shape[1]:].cpu()
             )
 
-    policy = MiniCPMVAPOPolicy(model, LoRAConfig()).to(device).eval()
+    policy = VAPOPolicy(HFCausalTrunk(model, MINICPM5_SPEC), LoRAConfig()).to(device).eval()
     max_cache_length = max(tokens.shape[1] for tokens in inputs) + args.max_new_tokens
     cache_pool = StaticCachePool(
         lambda: StaticCache(

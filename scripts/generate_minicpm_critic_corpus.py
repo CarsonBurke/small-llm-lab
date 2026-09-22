@@ -19,9 +19,9 @@ import torch
 from checkpointing import atomic_torch_save
 from postraining.core import answer_style, load_unique_math_rows, verify_answer
 from postraining.fast_inference import CapturedTrainingRolloutEngine
-from postraining.minicpm_vapo import (
+from postraining.vapo.policy import VAPOPolicy
+from postraining.vapo.model.lora import (
     LoRAConfig,
-    MiniCPMVAPOPolicy,
     load_adapter_state_dict,
 )
 from postraining.runtime.profiling import DeviceSampler
@@ -123,7 +123,7 @@ def main() -> None:
     lora_payload = dict(actor["lora_config"])
     lora_payload["targets"] = tuple(lora_payload["targets"])
     lora_config = LoRAConfig(**lora_payload)
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         model_id=actor["model_id"],
         revision=actor["revision"],
         device=device,

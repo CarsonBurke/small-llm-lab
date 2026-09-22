@@ -204,13 +204,12 @@ def fingerprints(args: argparse.Namespace) -> dict[str, str]:
 
 
 def load_policy(args: argparse.Namespace) -> tuple[Any, Any, dict[str, Any]]:
-    from postraining.minicpm_vapo import (
-        MINICPM5_MODEL_ID,
-        MINICPM5_REVISION,
+    from postraining.vapo.model.hf import MINICPM5_SPEC
+    from postraining.vapo.model.lora import (
         LoRAConfig,
-        MiniCPMVAPOPolicy,
         load_adapter_state_dict,
     )
+    from postraining.vapo.policy import VAPOPolicy
 
     payload = None
     if args.checkpoint is not None:
@@ -234,14 +233,14 @@ def load_policy(args: argparse.Namespace) -> tuple[Any, Any, dict[str, Any]]:
             )
     else:
         actor = {
-            "model_id": MINICPM5_MODEL_ID,
-            "revision": MINICPM5_REVISION,
+            "model_id": MINICPM5_SPEC.model_id,
+            "revision": MINICPM5_SPEC.revision,
             "lora_config": {"initialization": "nora"},
             "nextlat_projection_factor": 1.6,
             "thought_sigma": 1.0,
             "init_stop_thinking_probability": 0.9,
         }
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         model_id=actor["model_id"],
         revision=actor["revision"],
         device=torch.device("cuda"),
@@ -263,17 +262,17 @@ def load_policy(args: argparse.Namespace) -> tuple[Any, Any, dict[str, Any]]:
 
 
 def load_critic(payload: dict[str, Any], policy: Any, args: argparse.Namespace) -> Any:
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.model.lora import (
         LoRAConfig,
-        MiniCPMVAPOCritic,
         load_adapter_state_dict,
     )
+    from postraining.vapo.policy import VAPOCritic
 
     saved = payload["critic"]
     config = saved if saved is not None else payload["actor"]
     # Independent deterministic initialization, unaffected by rollout RNG usage.
     torch.manual_seed(args.seed + 1)
-    critic = MiniCPMVAPOCritic.from_pretrained(
+    critic = VAPOCritic.from_family("minicpm5", 
         model_id=config["model_id"],
         revision=config["revision"],
         device=torch.device("cuda"),
@@ -427,7 +426,7 @@ def timed(call: Any, *, reset_peak: bool = True) -> tuple[Any, dict[str, float |
 def validate_generation(
     result: Any, name: str, args: argparse.Namespace, work: dict[str, int]
 ) -> dict[str, int]:
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.policy import (
         CONTINUE_THOUGHT,
         FIRST_THOUGHT,
         FORCED_STOP_THINKING,
@@ -593,7 +592,10 @@ def natural_generation(
 def make_records(
     result: Any, prompts: list[torch.Tensor], args: argparse.Namespace, name: str
 ) -> list[Any]:
-    from postraining.minicpm_vapo import FORCED_STOP_THINKING, TrajectoryRecord
+    from postraining.vapo.policy import (
+        FORCED_STOP_THINKING,
+        TrajectoryRecord,
+    )
 
     records = []
     for index, response in enumerate(result.responses):
@@ -642,7 +644,7 @@ def rollout_replay_drift(
     fixed: bool,
 ) -> dict[str, Any]:
     from contextlib import nullcontext
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.policy import (
         CONTINUE_THOUGHT,
         FIRST_THOUGHT,
         FORCED_STOP_THINKING,
@@ -744,10 +746,8 @@ def deterministic_replay_check():
 def qualify_replay(
     side: Any, records: list[Any], args: argparse.Namespace, *, actor: bool
 ) -> dict[str, Any]:
-    from postraining.minicpm_vapo import (
-        collate_replay_microbatch,
-        use_packed_replay_attention,
-    )
+    from postraining.vapo.model.hf import use_packed_replay_attention
+    from postraining.vapo.policy import collate_replay_microbatch
     from postraining.train_minicpm_vapo import configure_replay_checkpointing
 
     record = records[0]
@@ -876,7 +876,7 @@ def qualify_replay(
 def benchmark_replay(
     side: Any, records: list[Any], args: argparse.Namespace, *, actor: bool
 ) -> dict[str, Any]:
-    from postraining.minicpm_vapo import collate_replay_microbatch
+    from postraining.vapo.policy import collate_replay_microbatch
     from postraining.train_minicpm_vapo import configure_replay_checkpointing
 
     configure_replay_checkpointing(side.causal_lm, args.replay_checkpoint_interval)
@@ -1351,7 +1351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "sha256": file_sha256(records_path),
         }
         if args.mode != "inference":
-            from postraining.minicpm_vapo import (
+            from postraining.vapo.model.hf import (
                 enable_packed_replay_attention,
                 enable_replay_mlp_compilation,
             )

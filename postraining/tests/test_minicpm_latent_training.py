@@ -8,8 +8,9 @@ import torch
 from torch import nn
 
 from postraining.latent_thought import GaussianTransitionHead, StopThinkingGate
-from postraining.minicpm_vapo import (
-    MiniCPMVAPOPolicy,
+from postraining.vapo.model.readout import FrozenLinearReadout
+from postraining.vapo.policy import (
+    VAPOPolicy,
     NextLatAuxiliaryHead,
     TrajectoryRecord,
     FIRST_THOUGHT,
@@ -33,10 +34,19 @@ from postraining.train_minicpm_vapo import (
 )
 
 
+def _frozen_head(weight):
+    """A bias-free linear view over an existing frozen head weight."""
+    head = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    with torch.no_grad():
+        head.weight.copy_(weight)
+    head.weight.requires_grad_(False)
+    return head
+
+
 class ReplaySide(nn.Module):
     """Small causal state accumulator for testing the real trainer objectives."""
 
-    action_logprobs = MiniCPMVAPOPolicy.action_logprobs
+    action_logprobs = VAPOPolicy.action_logprobs
 
     def __init__(self):
         super().__init__()
@@ -54,6 +64,10 @@ class ReplaySide(nn.Module):
             "lm_head_weight", torch.arange(64).view(16, 4).float() / 100
         )
         self.causal_lm = SimpleNamespace(config=SimpleNamespace(pad_token_id=0))
+        # The real action_logprobs scores tokens through the trunk's readout.
+        self.trunk = SimpleNamespace(
+            readout=FrozenLinearReadout(_frozen_head(self.lm_head_weight))
+        )
 
     def replay_hidden(
         self,
@@ -213,8 +227,16 @@ def test_latent_nextlat_does_not_project_thought_states(monkeypatch):
 
 
 def test_native_resume_cannot_silently_enable_latent_thinking():
-    native = build_parser().parse_args([])
-    latent = build_parser().parse_args(["--latent-thinking"])
+    # Both sides pass --top-k 20 explicitly: the sampling default is now -1
+    # and the resume check compares sampling policy BEFORE latent_thinking,
+    # so a mismatch here would mask what this test is about.
+    native = build_parser().parse_args(["--top-k", "20"])
+    # --top-k 20 on the latent side too: the default -1 is full categorical,
+    # the only unbiased choice for a policy-gradient rollout) and
+    # _validate_args refuses -1 together with --latent-thinking, which cannot
+    # sample from the untruncated head. This test is about resume-time
+    # latent_thinking agreement, not sampling.
+    latent = build_parser().parse_args(["--latent-thinking", "--top-k", "20"])
     _validate_args(latent)
     with pytest.raises(ValueError, match="latent_thinking"):
         validate_resume_configuration(

@@ -1,7 +1,9 @@
 """SFT trace training: packing, splits, optimizer partition, gate metrics."""
 
+import random
 import math
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,13 +13,22 @@ from postraining.nano_backbone import NanoGPTBackbone
 from postraining.prepare_sft_traces import INSTRUCTION_SUFFIX
 from postraining.sft_trace_train import (
     IGNORE_INDEX,
+    SupervisedCE,
     TokenizedDocument,
+    accumulate_step_gradients,
     build_optimizers,
     create_fresh_run_dir,
     gate_metrics_from_counts,
+    device_batch,
+    load_resume_contract,
+    load_resume_state,
     lr_scale_at,
-    masked_ce_sum,
     pack_rows,
+    packed_schedule_sha256,
+    resume_contract,
+    resume_contract_mismatch,
+    resume_source_sha256,
+    save_resume_state,
     split_holdout,
     tokenize_documents,
 )
@@ -68,6 +79,13 @@ def test_sampling_gate_uses_contract_counts_style_and_think_floor(monkeypatch):
             "think_close_id": 2,
             "answer_open_id": 3,
             "answer_close_id": 4,
+            # The gate now measures panel prompt lengths before sampling, so
+            # the stub has to tokenize like the real one.
+            "bos_id": lambda self: 7,
+            "eos_id": lambda self: 7,
+            "encode": lambda self, text: [
+                10 + (byte % 40) for byte in text.encode("utf-8")
+            ],
         },
     )()
     args = type(
@@ -78,7 +96,11 @@ def test_sampling_gate_uses_contract_counts_style_and_think_floor(monkeypatch):
             "gate_samples": 8,
             "gate_max_new_tokens": 32,
             "seed": 4,
-            "gate_prompt_tokens": 64,
+            # The stub tokenizer emits one token per byte, so the instruction
+            # suffix alone costs ~70; this is about style and the think floor,
+            # not about prompt budgets.
+            "gate_prompt_tokens": 256,
+            "gate_batch_trajectories": 128,
             "gate_think_min_tokens": 33,
         },
     )()
@@ -125,6 +147,42 @@ def _document(problem: str, reasoning: str, final: str) -> dict:
     }
 
 
+class _BatchTokenizer(_Tokenizer):
+    def encode(self, text: str) -> list[int]:
+        raise AssertionError("the batch path must not encode one text")
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        return [_Tokenizer.encode(self, text) for text in texts]
+
+
+def test_tokenize_documents_batched_encoding_is_identical():
+    documents = [
+        _document(f"What is {n}+{n}?", f"{n}+{n} = {2 * n}.", str(2 * n))
+        for n in range(9000)  # spans more than one encode chunk
+    ]
+    serial = tokenize_documents(_Tokenizer(), documents, seq_len=4096)
+    batched = tokenize_documents(_BatchTokenizer(), documents, seq_len=4096)
+    assert len(serial) == len(batched) == len(documents)
+    for left, right in zip(serial, batched, strict=True):
+        assert left.prompt_length == right.prompt_length
+        assert np.array_equal(left.ids, right.ids)
+
+
+def test_gpt2_encode_batch_matches_encode():
+    from postraining.core import GPT2BPETokenizer
+
+    tokenizer = GPT2BPETokenizer(think_tokens=True, answer_tokens=True)
+    texts = [
+        "What is 12 x 7?",
+        "<think>\n12 x 7 = 84.\n</think><answer>84</answer>",
+        " leading space and  double  spaces\n\n",
+        "",
+    ]
+    assert tokenizer.encode_batch(texts) == [
+        tokenizer.encode(text) for text in texts
+    ]
+
+
 def test_tokenize_documents_matches_rl_framing():
     tokenizer = _Tokenizer()
     doc = _document("What is 2+3?", "2+3 = 5.", "5")
@@ -156,33 +214,40 @@ def test_tokenize_documents_matches_rl_framing():
     )
 
 
+def _doc(prompt_length, ids):
+    """TokenizedDocument.ids is an int32 array, not a tuple of Python ints."""
+    return TokenizedDocument(prompt_length, np.asarray(ids, dtype=np.int32))
+
+
 def test_pack_rows_targets_and_boundaries():
-    doc_a = TokenizedDocument(2, (7, 1, 2, 3))
-    doc_b = TokenizedDocument(1, (7, 4))
+    doc_a = _doc(2, (7, 1, 2, 3))
+    doc_b = _doc(1, (7, 4))
     [(tokens, targets)] = pack_rows(
         [doc_a, doc_b], seq_len=12, separator=7, rng=None
     )
     # Whole documents back to back, one terminal separator, separator pad.
-    assert tokens == [7, 1, 2, 3, 7, 4, 7, 7, 7, 7, 7, 7]
+    assert tokens.tolist() == [7, 1, 2, 3, 7, 4, 7, 7, 7, 7, 7, 7]
     expected = [IGNORE_INDEX] * 12
     expected[1] = 2  # A: completion token
     expected[2] = 3  # A: completion token
     expected[3] = 7  # A: stop target = B's BOS
     expected[4] = 4  # B: completion token
     expected[5] = 7  # B: stop target = terminal separator
-    assert targets == expected
+    assert targets.tolist() == expected
     # Prompt positions (and padding) supervise nothing.
     assert targets[0] == IGNORE_INDEX
     assert all(target == IGNORE_INDEX for target in targets[6:])
 
 
 def test_pack_rows_never_splits_documents():
-    docs = [TokenizedDocument(1, tuple(range(7, 7 + 5))) for _ in range(3)]
+    docs = [_doc(1, range(7, 7 + 5)) for _ in range(3)]
     rows = pack_rows(docs, seq_len=11, separator=7, rng=None)
     # 5+5+1 fits in 11; the third document opens a second row.
     assert len(rows) == 2
-    assert rows[0][0][:10] == list(docs[0].ids) + list(docs[1].ids)
-    assert rows[1][0][:5] == list(docs[2].ids)
+    assert rows[0][0][:10].tolist() == (
+        docs[0].ids.tolist() + docs[1].ids.tolist()
+    )
+    assert rows[1][0][:5].tolist() == docs[2].ids.tolist()
     for tokens, targets in rows:
         assert len(tokens) == 11
         assert len(targets) == 11
@@ -507,19 +572,322 @@ def test_think_span_percentiles_expose_floor_reachability():
     assert think_span_token_percentiles([_NoSpan()], tokenizer) is None
 
 
-def test_masked_ce_sum_ignores_masked_positions():
+def _packed_rows(count: int, seq_len: int = 8, vocab: int = 64, seed: int = 0):
+    generator = np.random.default_rng(seed)
+    rows = []
+    for _ in range(count):
+        tokens = generator.integers(0, vocab, seq_len, dtype=np.int32)
+        targets = generator.integers(0, vocab, seq_len, dtype=np.int32)
+        targets[generator.random(seq_len) < 0.4] = IGNORE_INDEX
+        rows.append((tokens, targets))
+    return rows
+
+
+def test_supervised_ce_matches_full_sequence_masked_ce():
+    """Host-selected positions must price exactly the masked full logits."""
     backbone = _nano_backbone()
-    inputs = torch.randint(0, 64, (2, 8))
-    targets = torch.randint(0, 64, (2, 8))
-    targets[:, :3] = IGNORE_INDEX
-    targets[1, 6:] = IGNORE_INDEX
-    loss, supervised = masked_ce_sum(backbone, inputs, targets)
-    assert supervised == int((targets != IGNORE_INDEX).sum())
-    logits = backbone.policy_logits(inputs)
+    rows = _packed_rows(3)
+    batch = device_batch(rows, torch.device("cpu"))
+    targets = torch.from_numpy(np.stack([t for _, t in rows])).long()
+    assert batch.supervised == int((targets != IGNORE_INDEX).sum())
+    assert torch.equal(batch.labels, targets.view(-1)[batch.positions])
+    loss = SupervisedCE(backbone, compiled=False)(batch)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = backbone.policy_logits(batch.inputs)
     expected = F.cross_entropy(
-        logits.view(-1, 64),
+        logits.float().view(-1, 64),
         targets.view(-1),
         ignore_index=IGNORE_INDEX,
         reduction="sum",
     )
     assert math.isclose(float(loss), float(expected), rel_tol=1e-4)
+
+
+def test_step_gradients_do_not_depend_on_the_micro_batch_split():
+    """The step-wide normalization makes micro-batching a pure memory knob."""
+    rows = _packed_rows(4, seed=3)
+    results = []
+    for micro in (1, 2, 4):
+        backbone = _nano_backbone()
+        loss = accumulate_step_gradients(
+            SupervisedCE(backbone, compiled=False),
+            rows,
+            micro,
+            torch.device("cpu"),
+        )
+        results.append(
+            (
+                float(loss),
+                [p.grad.clone() for p in backbone.parameters()],
+            )
+        )
+    # Exact in fp32 (measured 1e-7 relative); the forward runs under bf16
+    # autocast, where a different row composition changes matmul rounding
+    # (measured 2.3e-3), so compare against the gradient norm rather than
+    # elementwise.
+    reference_loss, reference_grads = results[0]
+    reference = torch.cat([grad.flatten() for grad in reference_grads])
+    for loss, grads in results[1:]:
+        assert math.isclose(loss, reference_loss, rel_tol=1e-3)
+        flat = torch.cat([grad.flatten() for grad in grads])
+        assert float((flat - reference).norm() / reference.norm()) < 1e-2
+
+
+def test_save_backbone_checkpoint_records_the_trained_window(tmp_path):
+    """The payload must carry both contexts, and must not read a global.
+
+    ``save_backbone_checkpoint`` once referenced ``args.seq_len``, which
+    resolves as a module global that does not exist: every run raised
+    NameError AFTER the whole training pass and before the checkpoint was
+    written. No test exercised this function, which is why that survived.
+    ``train_seq_len`` must stay the PRETRAINED bound (downstream loaders and
+    the RL budget derivation read it) while ``trained_seq_len`` records the
+    window this pass actually trained.
+    """
+
+    class Stub:
+        architecture = "nanogpt_mini_gpt2vocab_kda_kkkdkkkd_mixers_v3"
+        model_config = {"n_layer": 1}
+        train_context_tokens = 1024
+
+        def state_dict(self):
+            return {"tok_emb.weight": torch.zeros(2, 3)}
+
+    path = tmp_path / "sft_final_model.pt"
+    sft_train.save_backbone_checkpoint(
+        Stub(), path, {"schema": "test"}, trained_seq_len=5120
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert payload["train_seq_len"] == 1024
+    assert payload["trained_seq_len"] == 5120
+    assert payload["context_extension"] is True
+
+    # An unextended run must report no extension rather than omitting it.
+    same = tmp_path / "same.pt"
+    sft_train.save_backbone_checkpoint(
+        Stub(), same, {"schema": "test"}, trained_seq_len=1024
+    )
+    assert torch.load(same, map_location="cpu", weights_only=False)[
+        "context_extension"
+    ] is False
+
+
+def _pack_rows_reference(documents, seq_len, separator, rng):
+    """The original Python-list packer, kept only as a differential oracle."""
+    order = list(range(len(documents)))
+    if rng is not None:
+        rng.shuffle(order)
+    rows, tokens, spans = [], [], []
+
+    def close_row():
+        tokens.append(separator)
+        targets = [IGNORE_INDEX] * seq_len
+        for offset, prompt_length, length in spans:
+            for position in range(offset + prompt_length - 1, offset + length):
+                targets[position] = tokens[position + 1]
+        tokens.extend([separator] * (seq_len - len(tokens)))
+        rows.append((list(tokens), targets))
+        tokens.clear()
+        spans.clear()
+
+    for index in order:
+        document = documents[index]
+        ids = list(document.ids)
+        if len(tokens) + len(ids) + 1 > seq_len:
+            close_row()
+        spans.append((len(tokens), document.prompt_length, len(ids)))
+        tokens.extend(ids)
+    if tokens:
+        close_row()
+    return rows
+
+
+def test_pack_rows_matches_the_list_implementation_exactly():
+    """The int32 packer must be content-identical to the list version.
+
+    ``pack_rows`` was rewritten from Python int lists to int32 arrays purely
+    for memory: at --seq-len 5120 a ~900k-document corpus packs into tens of
+    thousands of rows, and two 5120-element int lists per row cost ~25 GB of
+    interpreter objects against ~2.8 GB as int32. A packing change would
+    silently alter what is supervised, so the old implementation is retained
+    here as an oracle over randomized shapes, including shuffled orders and
+    documents that exactly fill or overflow a row.
+    """
+    master = random.Random(0)
+    for trial in range(200):
+        seq_len = master.randint(8, 64)
+        documents = []
+        for _ in range(master.randint(1, 25)):
+            length = master.randint(2, max(2, seq_len - 1))
+            documents.append(
+                _doc(
+                    master.randint(1, length),
+                    [7] + [master.randint(0, 50000) for _ in range(length - 1)],
+                )
+            )
+        shuffled = master.random() < 0.5
+        actual = pack_rows(
+            documents, seq_len, 7, random.Random(trial) if shuffled else None
+        )
+        expected = _pack_rows_reference(
+            documents, seq_len, 7, random.Random(trial) if shuffled else None
+        )
+        assert len(actual) == len(expected)
+        for (tokens, targets), (want_tokens, want_targets) in zip(
+            actual, expected
+        ):
+            assert tokens.tolist() == want_tokens
+            assert targets.tolist() == want_targets
+
+
+def _optimizer_step(backbone, optimizers, rows) -> None:
+    accumulate_step_gradients(
+        SupervisedCE(backbone, compiled=False), rows, 2, torch.device("cpu")
+    )
+    for optimizer in optimizers:
+        optimizer.step()
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
+
+
+def test_resume_state_continues_training_exactly(tmp_path):
+    """Two steps, save, reload into fresh objects, two more steps == four.
+
+    Both optimizers carry state (AdamW moments, Muon momentum) that the
+    next update depends on, so it must round-trip for the resumed run to be
+    the uninterrupted one. The global RNG is restored too, as a guard for
+    any future stochastic training.
+    """
+    steps = [_packed_rows(2, seed=10 + index) for index in range(4)]
+    contract = {"resume_schema": "test", "args": {"seed": 1}}
+
+    torch.manual_seed(5)
+    straight = _nano_backbone()
+    straight_optimizers = build_optimizers(straight, 0.1)
+    for rows in steps:
+        _optimizer_step(straight, straight_optimizers, rows)
+    straight_draw = torch.rand(4)
+
+    torch.manual_seed(5)
+    first = _nano_backbone()
+    first_optimizers = build_optimizers(first, 0.1)
+    for rows in steps[:2]:
+        _optimizer_step(first, first_optimizers, rows)
+    path = tmp_path / "resume.pt"
+    progress = {"elapsed_seconds": 1.5, "resumed_at_steps": []}
+    save_resume_state(
+        path,
+        contract=contract,
+        backbone=first,
+        optimizers=first_optimizers,
+        step=2,
+        progress=progress,
+    )
+    torch.manual_seed(999)  # the resumed process starts from other RNG state
+
+    resumed = _nano_backbone()
+    resumed_optimizers = build_optimizers(resumed, 0.1)
+    step, restored = load_resume_state(
+        path,
+        contract=contract,
+        backbone=resumed,
+        optimizers=resumed_optimizers,
+    )
+    assert (step, restored) == (2, progress)
+    for rows in steps[2:]:
+        _optimizer_step(resumed, resumed_optimizers, rows)
+
+    for (name, expected), actual in zip(
+        straight.state_dict().items(), resumed.state_dict().values()
+    ):
+        assert torch.equal(expected, actual), name
+    assert torch.equal(torch.rand(4), straight_draw)
+
+
+def test_resume_refuses_a_changed_contract_and_names_the_change(tmp_path):
+    backbone = _nano_backbone()
+    optimizers = build_optimizers(backbone, 0.1)
+    path = tmp_path / "resume.pt"
+    saved = {"traces_sha256": "a", "args": {"lr_scale": 0.1, "seed": 1}}
+    save_resume_state(
+        path,
+        contract=saved,
+        backbone=backbone,
+        optimizers=optimizers,
+        step=1,
+        progress={},
+    )
+    for changed, message in (
+        ({**saved, "traces_sha256": "b"}, "traces_sha256"),
+        ({**saved, "args": {"lr_scale": 0.2, "seed": 1}}, "args.lr_scale"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            load_resume_state(
+                path,
+                contract=changed,
+                backbone=backbone,
+                optimizers=optimizers,
+            )
+
+
+def test_resume_contract_exempts_only_the_checkpoint_cadence():
+    import argparse
+
+    base = dict(
+        lr_scale=0.1, seed=1, resume=False, checkpoint_interval_seconds=300.0
+    )
+    first = resume_contract(argparse.Namespace(**base), traces_sha256="a")
+    resumed = resume_contract(
+        argparse.Namespace(
+            **{**base, "resume": True, "checkpoint_interval_seconds": 60.0}
+        ),
+        traces_sha256="a",
+    )
+    assert first == resumed
+    assert first != resume_contract(
+        argparse.Namespace(**{**base, "seed": 2}), traces_sha256="a"
+    )
+
+
+def test_packed_schedule_digest_sees_order_and_targets():
+    rows = _packed_rows(3, seed=4)
+    digest = packed_schedule_sha256([rows])
+    assert digest == packed_schedule_sha256([[(t.copy(), g.copy()) for t, g in rows]])
+    assert digest != packed_schedule_sha256([rows[::-1]])
+    tokens, targets = rows[0]
+    altered = targets.copy()
+    altered[np.flatnonzero(altered != IGNORE_INDEX)[0]] = IGNORE_INDEX
+    assert digest != packed_schedule_sha256([[(tokens, altered), *rows[1:]]])
+    # Epoch boundaries are part of the schedule, not just the row stream.
+    assert digest != packed_schedule_sha256([rows[:1], rows[1:]])
+
+
+def test_resume_contract_reads_without_loading_the_state(tmp_path):
+    backbone = _nano_backbone()
+    path = tmp_path / "resume.pt"
+    contract = {"args": {"seed": 1}, "source_sha256": {"m": "x"}}
+    save_resume_state(
+        path,
+        contract=contract,
+        backbone=backbone,
+        optimizers=build_optimizers(backbone, 0.1),
+        step=3,
+        progress={},
+    )
+    assert load_resume_contract(path) == contract
+    assert not path.with_name("resume.pt.tmp").exists()
+
+
+def test_resume_contract_mismatch_names_nested_fields():
+    saved = {"args": {"seed": 1, "lr": 2}, "source_sha256": {"a": "x"}, "t": 1}
+    current = {"args": {"seed": 1, "lr": 3}, "source_sha256": {"a": "y"}, "t": 1}
+    assert resume_contract_mismatch(saved, current) == [
+        "args.lr", "source_sha256.a",
+    ]
+    assert resume_contract_mismatch(saved, saved) == []
+
+
+def test_resume_binds_every_training_path_module():
+    hashes = resume_source_sha256()
+    assert set(hashes) == set(sft_train.RESUME_BOUND_MODULES)
+    assert all(len(digest) == 64 for digest in hashes.values())

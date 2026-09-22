@@ -26,15 +26,17 @@ import torch.nn.functional as F
 from postraining.core import load_unique_math_rows
 from postraining.fast_inference import CapturedTrainingRolloutEngine
 from postraining.minicpm_latent_rollout import MiniCPMLatentRolloutEngine
-from postraining.minicpm_vapo import (
-    LoRAConfig,
-    MiniCPMVAPOPolicy,
+from postraining.vapo.policy import (
+    VAPOPolicy,
     collate_replay_microbatch,
+    plan_replay_microbatches,
+)
+from postraining.vapo.model.hf import (
     enable_packed_replay_attention,
     enable_replay_mlp_compilation,
-    plan_replay_microbatches,
     use_packed_replay_attention,
 )
+from postraining.vapo.model.lora import LoRAConfig
 from postraining.train_minicpm_vapo import (
     _stop_ids,
     collect_rollouts,
@@ -394,7 +396,7 @@ def main() -> None:
         ],
         "provenance": {"source_sha256": file_sha256(__file__), "torch_version": torch.__version__,
                        "source_dependencies": {path: file_sha256(path) for path in (
-                           "postraining/minicpm_vapo.py", "postraining/minicpm_latent_rollout.py",
+                           "postraining/vapo/policy.py", "postraining/minicpm_latent_rollout.py",
                            "postraining/fast_inference.py", "postraining/train_minicpm_vapo.py",
                            "postraining/latent_thought.py")}},
         "arms": {},
@@ -429,7 +431,7 @@ def main() -> None:
                                      "validation_used_for_hyperparameter_selection": False,
                                      "fit_selection": "fixed shuffled prompt partition; never correctness-filtered"}
         flush(args.output, report)
-        policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(device=torch.device("cuda"),
+        policy, tokenizer = VAPOPolicy.from_family("minicpm5", device=torch.device("cuda"),
             lora_config=LoRAConfig(initialization="nora"), gradient_checkpointing=False,
             latent_thinking=True, thought_sigma=1.0)
         policy.eval().requires_grad_(False)

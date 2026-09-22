@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from pretraining.nanogpt_mini import nanogpt_mini_model
 from postraining.latent_thought import LatentThoughtModel
-from postraining.model_io import fresh_trunk, load_model
+from postraining.model_io import copy_trunk, fresh_trunk, load_model
 from postraining.nano_backbone import NanoGPTBackbone, NanoTiedDotBackbone
 from postraining.value_model import SeparateCritic
 
@@ -583,6 +583,29 @@ def test_checkpoint_roundtrip(tmp_path):
     assert trunk.model_config == model.model_config
     assert not torch.equal(trunk.embed.weight, model.embed.weight)
 
+    # --critic-init actor: the loaded actor's exact values in storage of its
+    # own, trainable while the frozen reference stays untouched by its steps.
+    copy = copy_trunk(model, torch.device("cpu"))
+    assert type(copy) is NanoGPTBackbone
+    assert copy.architecture == model.architecture
+    reference = model.state_dict()
+    copied = copy.state_dict()
+    assert copied.keys() == reference.keys()
+    reference_storage = {
+        tensor.untyped_storage().data_ptr() for tensor in reference.values()
+    }
+    for name, tensor in copied.items():
+        assert tensor.dtype == reference[name].dtype, name
+        torch.testing.assert_close(tensor, reference[name], rtol=0, atol=0)
+        assert tensor.untyped_storage().data_ptr() not in reference_storage, name
+    assert all(parameter.requires_grad for parameter in copy.parameters())
+    snapshot = {name: tensor.clone() for name, tensor in reference.items()}
+    with torch.no_grad():
+        for parameter in copy.parameters():
+            parameter.add_(1.0)
+    for name, tensor in model.state_dict().items():
+        assert torch.equal(tensor, snapshot[name]), name
+
 
 def test_tieddot_checkpoint_dispatch(tmp_path):
     torch.manual_seed(29)
@@ -599,10 +622,10 @@ def test_tieddot_checkpoint_dispatch(tmp_path):
 
 
 def test_nano_critic_smoke():
-    """SeparateCritic on a fresh nano trunk decodes the prior value."""
+    """SeparateCritic on a fresh nano trunk predicts exactly zero."""
     torch.manual_seed(31)
     trunk = NanoGPTBackbone(**KWARGS).float().eval()
-    critic = SeparateCritic(trunk, num_bins=17, prior_value=0.25).eval()
+    critic = SeparateCritic(trunk).eval()
     from postraining.latent_rollout import LatentRolloutBatch, PAD_SLOT, TOKEN_SLOT
 
     batch_size, stream = 2, 4
@@ -613,6 +636,7 @@ def test_nano_critic_smoke():
         kind=kind,
         token_ids=torch.randint(0, KWARGS["vocab_size"], (batch_size, stream)),
         thoughts=torch.zeros(batch_size, stream, KWARGS["model_dim"]),
+        hiddens=torch.zeros(batch_size, stream, 0),
         actions=torch.zeros((batch_size, stream), dtype=torch.long),
         action_mask=torch.zeros(batch_size, stream, dtype=torch.bool),
         stop_mask=zeros.clone(),
@@ -633,6 +657,4 @@ def test_nano_critic_smoke():
     with torch.no_grad():
         values = critic.values(batch)
     assert values.shape == (batch_size, stream)
-    torch.testing.assert_close(
-        values, torch.full_like(values, 0.25), rtol=0, atol=0.02
-    )
+    assert torch.equal(values, torch.zeros_like(values))

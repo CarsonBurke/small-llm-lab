@@ -43,9 +43,12 @@ from postraining.latent_thought import (
     validate_renderer_checkpoint,
 )
 from postraining.math_prompt import require_answer_fence_prompt_schema
-from postraining.hl_gauss import anchored_unit_geometry
 from postraining.model_io import fresh_trunk, load_model
-from postraining.reasoning_modes import checkpoint_training_rollout_budget
+from postraining.reasoning_modes import (
+    checkpoint_training_rollout_budget,
+    mode_carries_hidden,
+    mode_pins_emit,
+)
 from postraining.train_latent_vapo import (
     answer_prefix_token_ids,
     rewrite_prompts_for_answer_fence,
@@ -53,6 +56,7 @@ from postraining.train_latent_vapo import (
 )
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
+from postraining.vapo.schemas import CRITIC_SCHEMA, resume_critic_schema_compatible
 
 
 def value_color(value: float, low: float, high: float) -> str:
@@ -164,22 +168,13 @@ def main() -> None:
     step = payload.get("step")
     print(f"policy+critic: {wrapper_path} (step {step}, mode {reasoning_mode})")
 
-    # Reconstruct the training run's support geometry from the saved args.
-    if saved_args.get("value_anchored_support", False):
-        value_num_bins, value_v_min, value_v_max = anchored_unit_geometry(
-            saved_args.get("value_bins", 101),
-            saved_args.get("value_margin_bins", 4),
+    if not resume_critic_schema_compatible(payload):
+        raise ValueError(
+            f"{wrapper_path} critic schema {payload.get('critic_schema')!r} "
+            f"is not {CRITIC_SCHEMA!r}"
         )
-    else:
-        value_num_bins = saved_args.get("value_bins", 101)
-        value_v_min, value_v_max = 0.0, 1.0
     critic = SeparateCritic(
         fresh_trunk(backbone, device),
-        num_bins=value_num_bins,
-        sigma_ratio=saved_args.get("value_sigma_ratio", 2.0),
-        v_min=value_v_min,
-        v_max=value_v_max,
-        prior_value=saved_args.get("value_prior", 0.05),
         **{
             key: value
             for key, value in combiner_init_kwargs_from_checkpoint(
@@ -220,7 +215,8 @@ def main() -> None:
         )
     )
     prompt_budget = saved_args.get("prompt_tokens", 512)
-    pin_emit = reasoning_mode != "latent"
+    pin_emit = mode_pins_emit(reasoning_mode)
+    hidden_carry = mode_carries_hidden(reasoning_mode)
     response_budget, stream_budget = checkpoint_training_rollout_budget(
         saved_args
     )
@@ -269,6 +265,7 @@ def main() -> None:
                     generator=generator,
                     stop_ids=stop_ids or None,
                     pin_emit=pin_emit,
+                    hidden_carry=hidden_carry,
                     record_likelihoods=False,
                     cache_dtype=torch.bfloat16,
                     prompt_repeats=args.samples,

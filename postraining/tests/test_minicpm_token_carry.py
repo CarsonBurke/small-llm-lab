@@ -10,15 +10,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import postraining.minicpm_vapo as vapo
+import postraining.vapo.policy as vapo
 from postraining.token_carry import TokenCarryCombiner
-from postraining.minicpm_vapo import (
-    LoRAConfig,
-    MiniCPMVAPOCritic,
-    MiniCPMVAPOPolicy,
+from postraining.vapo.model.hf import HFCausalTrunk, HFModelSpec
+from postraining.vapo.policy import (
+    VAPOCritic,
+    VAPOPolicy,
     TrajectoryRecord,
     collate_replay_microbatch,
 )
+from postraining.vapo.model.lora import LoRAConfig
 
 
 class _CausalTrunk(nn.Module):
@@ -56,15 +57,29 @@ class _LM(nn.Module):
         return self.model.embed_tokens
 
 
+
+TEST_SPEC = HFModelSpec(
+    key="test",
+    model_id="test/fixture",
+    revision="0" * 40,
+    vocab_size=17,
+    requires_chat_template=False,
+)
+
+
+def _trunk(model):
+    """Wrap a fixture causal LM in the Hugging Face trunk adapter."""
+    return HFCausalTrunk(model, TEST_SPEC)
+
+
 @pytest.fixture
 def models(monkeypatch):
-    monkeypatch.setattr(vapo, "MINICPM5_VOCAB_SIZE", 17)
     torch.manual_seed(19)
     base = _LM()
     lora = LoRAConfig(rank=2, alpha=4, targets=("q_proj",))
     return (
-        MiniCPMVAPOPolicy(copy.deepcopy(base), lora, token_carry=True),
-        MiniCPMVAPOCritic(copy.deepcopy(base), lora, token_carry=True, critic_width=5),
+        VAPOPolicy(_trunk(copy.deepcopy(base)), lora, token_carry=True),
+        VAPOCritic(_trunk(copy.deepcopy(base)), lora, token_carry=True, critic_width=5),
     )
 
 
@@ -294,14 +309,14 @@ def test_checkpoint_restores_carry_behavior_and_rejects_mode_mismatch(models, si
         restored.load_token_carry_state_dict(dict(
             payload, token_combiner={"token.weight": torch.eye(4), "carry.weight": torch.zeros(4, 4)},
         ))
-    native = type(side)(_LM(), side.lora_config)
+    native = type(side)(_trunk(_LM()), side.lora_config)
     with pytest.raises(ValueError, match="mode"):
         native.load_token_carry_state_dict(payload)
     with pytest.raises(ValueError, match="token-carry state"):
         native.load_token_carry_state_dict({"token_combiner": payload["token_combiner"]})
 
 
-@pytest.mark.parametrize("model_type", [MiniCPMVAPOPolicy, MiniCPMVAPOCritic])
+@pytest.mark.parametrize("model_type", [VAPOPolicy, VAPOCritic])
 def test_gaussian_latent_actions_cannot_be_enabled_with_token_carry(models, model_type):
     with pytest.raises(ValueError, match="cannot be combined"):
-        model_type(_LM(), models[0].lora_config, token_carry=True, latent_thinking=True)
+        model_type(_trunk(_LM()), models[0].lora_config, token_carry=True, latent_thinking=True)

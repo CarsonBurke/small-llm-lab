@@ -14,15 +14,16 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-import postraining.minicpm_vapo as vapo
+import postraining.vapo.policy as vapo
 import postraining.train_minicpm_vapo as trainer
-from postraining.minicpm_vapo import (
-    LoRAConfig,
-    MiniCPMVAPOCritic,
-    MiniCPMVAPOPolicy,
+from postraining.vapo.model.hf import HFCausalTrunk, HFModelSpec
+from postraining.vapo.policy import (
+    VAPOCritic,
+    VAPOPolicy,
     TrajectoryRecord,
     collate_replay_microbatch,
 )
+from postraining.vapo.model.lora import LoRAConfig
 from postraining.slot_memory import (
     NO_WRITE,
     SlotChoiceHead,
@@ -290,15 +291,29 @@ class _LM(nn.Module):
 CONFIG = SlotMemoryConfig(slots=3, heads=2, head_dim=4)
 
 
+
+TEST_SPEC = HFModelSpec(
+    key="test",
+    model_id="test/fixture",
+    revision="0" * 40,
+    vocab_size=17,
+    requires_chat_template=False,
+)
+
+
+def _trunk(model):
+    """Wrap a fixture causal LM in the Hugging Face trunk adapter."""
+    return HFCausalTrunk(model, TEST_SPEC)
+
+
 @pytest.fixture
 def models(monkeypatch):
-    monkeypatch.setattr(vapo, "MINICPM5_VOCAB_SIZE", 17)
     monkeypatch.setattr(torch, "autocast", lambda **kwargs: nullcontext())
     torch.manual_seed(19)
     base = _LM()
     lora = LoRAConfig(rank=2, alpha=4, targets=("q_proj",))
-    actor = MiniCPMVAPOPolicy(copy.deepcopy(base), lora, token_carry=True, slot_memory=CONFIG)
-    critic = MiniCPMVAPOCritic(copy.deepcopy(base), lora, token_carry=True, slot_memory=CONFIG, critic_width=5)
+    actor = VAPOPolicy(_trunk(copy.deepcopy(base)), lora, token_carry=True, slot_memory=CONFIG)
+    critic = VAPOCritic(_trunk(copy.deepcopy(base)), lora, token_carry=True, slot_memory=CONFIG, critic_width=5)
     for side in (actor, critic):
         side.slot_replay_backend = "dense"
         with torch.no_grad():
@@ -448,10 +463,10 @@ def test_checkpoint_roundtrip_and_geometry_mismatch(models):
     batch = _batch(_record([1, 2, 3, 4, 5], 1, [0, 2, 1, 1]))
     torch.testing.assert_close(restored.token_carry_replay_hidden(batch), actor.token_carry_replay_hidden(batch))
     torch.testing.assert_close(restored.slot_head.projection.weight, actor.slot_head.projection.weight)
-    wrong = MiniCPMVAPOPolicy(_LM(), actor.lora_config, token_carry=True, slot_memory=SlotMemoryConfig(slots=4, heads=2, head_dim=4))
+    wrong = VAPOPolicy(_trunk(_LM()), actor.lora_config, token_carry=True, slot_memory=SlotMemoryConfig(slots=4, heads=2, head_dim=4))
     with pytest.raises(ValueError, match="geometry"):
         wrong.load_token_carry_state_dict(actor.checkpoint_payload())
-    plain = MiniCPMVAPOPolicy(_LM(), actor.lora_config, token_carry=True)
+    plain = VAPOPolicy(_trunk(_LM()), actor.lora_config, token_carry=True)
     with pytest.raises(ValueError, match="slot-memory mode"):
         plain.load_token_carry_state_dict(actor.checkpoint_payload())
     with pytest.raises(ValueError, match="slot-memory mode"):
@@ -459,7 +474,7 @@ def test_checkpoint_roundtrip_and_geometry_mismatch(models):
     with pytest.raises(ValueError, match="slot head presence"):
         critic.load_token_carry_state_dict(actor.checkpoint_payload())
     with pytest.raises(ValueError, match="extends token carry"):
-        MiniCPMVAPOPolicy(_LM(), actor.lora_config, slot_memory=CONFIG)
+        VAPOPolicy(_trunk(_LM()), actor.lora_config, slot_memory=CONFIG)
 
 
 def test_checkpoint_schema_selection():

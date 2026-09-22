@@ -240,7 +240,7 @@ def inspect_continuation(
         "initialization": saved_args.get("lora_initialization", "standard"),
     }
     if not expected_lora_config["targets"]:
-        from postraining.minicpm_vapo import DEFAULT_LORA_TARGETS
+        from postraining.vapo.model.lora import DEFAULT_LORA_TARGETS
 
         expected_lora_config["targets"] = tuple(DEFAULT_LORA_TARGETS)
     for side, label in ((actor, "actor"), (critic, "critic")):

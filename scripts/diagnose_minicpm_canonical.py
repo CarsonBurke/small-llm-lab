@@ -36,9 +36,9 @@ from postraining.fast_inference import build_fused_rollout_replica
 from postraining.invariant_attention import INVARIANT_ATTENTION
 from postraining.invariant_linear import InvariantLinear
 from postraining.minicpm_latent_rollout import _LatentStateDecoder
-from postraining.minicpm_vapo import (
-    LoRAConfig, MINICPM5_MODEL_ID, MINICPM5_REVISION, MiniCPMVAPOPolicy,
-)
+from postraining.vapo.model.hf import MINICPM5_SPEC
+from postraining.vapo.model.lora import LoRAConfig
+from postraining.vapo.policy import VAPOPolicy
 from postraining.train_minicpm_vapo import encode_math_prompt
 
 
@@ -549,7 +549,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "schema": "minicpm-canonical-cached-replay/v1", "status": "initializing",
-        "argv": sys.argv[1:], "model_id": MINICPM5_MODEL_ID, "revision": MINICPM5_REVISION,
+        "argv": sys.argv[1:], "model_id": MINICPM5_SPEC.model_id, "revision": MINICPM5_SPEC.revision,
         "precision": "bf16 trunk/stream; fixed64x128x32 GEMM fp32 accumulator; raw actions/head fp32",
         "residual_dtype": "fp32" if args.residual_fp32 else "bf16",
         "canonical_norm": args.canonical_norm,
@@ -560,7 +560,7 @@ def main():
     }
     for name in ("scripts/diagnose_minicpm_canonical.py", "postraining/invariant_linear.py",
                  "postraining/invariant_attention.py", "postraining/fast_inference.py",
-                 "postraining/minicpm_latent_rollout.py", "postraining/minicpm_vapo.py",
+                 "postraining/minicpm_latent_rollout.py", "postraining/vapo/policy.py",
                  "postraining/latent_thought.py", "postraining/split_kv_attention.py",
                  "scripts/minicpm_canonical_attention_probe.py",
                  "scripts/minicpm_canonical_norm_probe.py"):
@@ -580,8 +580,8 @@ def main():
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             report["handcheck"] = handcheck()
             save_report(args.output, report)
-            source, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
-                model_id=MINICPM5_MODEL_ID, revision=MINICPM5_REVISION,
+            source, tokenizer = VAPOPolicy.from_family("minicpm5", 
+                model_id=MINICPM5_SPEC.model_id, revision=MINICPM5_SPEC.revision,
                 device=torch.device("cuda"), lora_config=LoRAConfig(initialization="nora"),
                 latent_thinking=True, thought_sigma=args.thought_sigma,
                 gradient_checkpointing=False,
@@ -612,7 +612,7 @@ def main():
                     "sampling": "once from frozen merged cuBLAS, same raw stream prefix for every variant/length",
                     "sampling_attention": control.describe(),
                 })
-                torch.save({"revision": MINICPM5_REVISION, "seed": args.seed,
+                torch.save({"revision": MINICPM5_SPEC.revision, "seed": args.seed,
                             "streams": [{"prompt": p.cpu(), "raw": r.cpu(), "embeddings": e.cpu()}
                                         for p, r, e in streams]}, stream_artifact)
                 report["stream_artifact"] = str(stream_artifact)

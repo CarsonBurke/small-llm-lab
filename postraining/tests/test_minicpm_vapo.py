@@ -34,33 +34,37 @@ from postraining.fast_inference import (
     selected_token_logprobs,
     top_k_top_p_sample,
 )
-from postraining.minicpm_vapo import (
-    LoRAConfig,
-    LoRALinear,
-    MiniCPMVAPOPolicy,
+from postraining.vapo.policy import (
+    VAPOPolicy,
     NextLatAuxiliaryHead,
     StaticCachePool,
     TrajectoryRecord,
     _nucleus_membership,
-    _packed_replay_attention,
-    _packed_replay_attention_fa4,
-    _ReplaySiLU,
-    adapter_state_dict,
-    chunked_frozen_head_logprobs,
     collate_replay_microbatch,
     dense_top_p_probabilities,
-    enable_replay_mlp_compilation,
     exact_top_p_sample,
     maximal_coupling_verify,
+    plan_replay_microbatches,
+    prepare_text_only_transformers_runtime,
+    replay_storage_bytes,
+)
+from postraining.vapo.model.hf import (
+    _ReplaySiLU,
+    _packed_replay_attention,
+    _packed_replay_attention_fa4,
+    enable_replay_mlp_compilation,
+    use_packed_replay_attention,
+)
+from postraining.vapo.model.lora import (
+    LoRAConfig,
+    LoRALinear,
+    adapter_state_dict,
     inject_lora,
     load_adapter_state_dict,
     merge_lora_for_inference,
-    plan_replay_microbatches,
-    prepare_text_only_transformers_runtime,
     share_frozen_parameters_,
-    replay_storage_bytes,
-    use_packed_replay_attention,
 )
+from postraining.vapo.model.readout import chunked_frozen_head_logprobs
 from postraining.runtime.profiling import DeviceSampler
 from postraining.nextlat_speculative import (
     NextLatSpeculativeEngine,
@@ -1016,7 +1020,7 @@ def test_nextlat_auxiliary_trains_source_hidden_and_predictor() -> None:
         nextlat_sequence_ranges=((0, 5),),
     )
     result = _nextlat_training_loss(
-        cast(MiniCPMVAPOPolicy, policy),
+        cast(VAPOPolicy, policy),
         hidden,
         batch,
         max_samples=3,
@@ -1185,7 +1189,7 @@ def test_speculative_engine_keeps_independent_row_lengths() -> None:
 
     exact_policy = ExactPolicy()
     engine = NextLatSpeculativeEngine(
-        cast(MiniCPMVAPOPolicy, exact_policy),
+        cast(VAPOPolicy, exact_policy),
         stop_ids=(3,),
         prompts_per_rollout=2,
         samples_per_prompt=2,
@@ -1228,7 +1232,7 @@ def test_speculative_engine_keeps_independent_row_lengths() -> None:
 
     mixed_stop_policy = MixedStopPolicy()
     mixed_stop_engine = NextLatSpeculativeEngine(
-        cast(MiniCPMVAPOPolicy, mixed_stop_policy),
+        cast(VAPOPolicy, mixed_stop_policy),
         stop_ids=(3,),
         prompts_per_rollout=2,
         samples_per_prompt=1,
@@ -1251,7 +1255,7 @@ def test_speculative_engine_keeps_independent_row_lengths() -> None:
     ]
 
     long_engine = NextLatSpeculativeEngine(
-        cast(MiniCPMVAPOPolicy, ExactPolicy()),
+        cast(VAPOPolicy, ExactPolicy()),
         stop_ids=(-1,),
         prompts_per_rollout=1,
         samples_per_prompt=1,
@@ -1282,7 +1286,7 @@ def test_speculative_engine_keeps_independent_row_lengths() -> None:
             ).float()
 
     rejecting_engine = NextLatSpeculativeEngine(
-        cast(MiniCPMVAPOPolicy, WrongPolicy()),
+        cast(VAPOPolicy, WrongPolicy()),
         stop_ids=(-1,),
         prompts_per_rollout=1,
         samples_per_prompt=1,
@@ -1311,7 +1315,7 @@ def test_speculative_engine_keeps_independent_row_lengths() -> None:
             ).float()
 
     divergent_engine = NextLatSpeculativeEngine(
-        cast(MiniCPMVAPOPolicy, RowDivergentPolicy()),
+        cast(VAPOPolicy, RowDivergentPolicy()),
         stop_ids=(-1,),
         prompts_per_rollout=2,
         samples_per_prompt=1,
@@ -1342,7 +1346,7 @@ def test_multi_prompt_preparation_forms_one_left_padded_batch() -> None:
         causal_lm = CausalLM()
 
     engine = object.__new__(RolloutEngine)
-    engine.policy = cast(MiniCPMVAPOPolicy, Policy())
+    engine.policy = cast(VAPOPolicy, Policy())
     engine.prompts_per_rollout = 2
     engine.samples_per_prompt = 2
     engine.batch_size = 4
@@ -2197,7 +2201,7 @@ def test_resume_rejects_stale_corpus_before_model_or_cuda_work(
     monkeypatch.setattr(trainer.argparse.ArgumentParser, "parse_args", lambda self: args)
     monkeypatch.setattr(trainer.torch, "load", lambda *a, **kw: resume)
     monkeypatch.setattr(trainer.torch, "manual_seed", forbidden)
-    monkeypatch.setattr(trainer.MiniCPMVAPOPolicy, "from_pretrained", forbidden)
+    monkeypatch.setattr(trainer.VAPOPolicy, "from_family", forbidden)
     with pytest.raises(ValueError, match="math_corpus_identity|different effective math corpus"):
         trainer.main()
 
@@ -2494,7 +2498,13 @@ def test_tensorboard_rollout_samples_publish_rewarded_training_text() -> None:
 
 
 def test_uno_rollout_requires_trained_artifact_and_captured_fast_path(tmp_path) -> None:
-    args = build_parser().parse_args(["--uno-rollout"])
+    # --top-k 20 explicitly: the default is now -1 (full categorical, the only
+    # unbiased choice for a policy-gradient rollout), and _validate_args
+    # refuses -1 together with --uno-rollout because the speculative path
+    # cannot sample from the untruncated head. This test is about the
+    # pretrained-artifact and CUDA-graph validations, so it opts into a
+    # bounded top-k to reach them.
+    args = build_parser().parse_args(["--uno-rollout", "--top-k", "20"])
     with pytest.raises(ValueError, match="pretrained"):
         _validate_args(args)
     checkpoint = tmp_path / "uno.pt"
@@ -2692,3 +2702,27 @@ def test_carry_probe_reports_signed_scales_and_bf16_rounded_residual() -> None:
         "probe_carry_to_token_rms": scale_rms / 256,
         "probe_residual_to_token_rms": scale_rms,
     })
+
+
+def test_sampling_defaults_are_untruncated() -> None:
+    """A run launched with no sampling flags must not bias its gradients.
+
+    The defaults were --top-p 0.95 --top-k 20, which renormalizes the sampling
+    distribution while the policy gradient is computed as though the action
+    came from the full current policy. That bias is silent: nothing in the
+    metrics stream distinguishes it from a correct run.
+    """
+    args = build_parser().parse_args([])
+    assert args.top_k == -1
+    assert args.top_p == 1.0
+    # And the unbiased combination must actually survive validation on the
+    # native token rollout, which is the path RL uses.
+    _validate_args(args)
+
+
+def test_truncated_sampling_must_be_requested_explicitly() -> None:
+    """The biased modes remain reachable, but only by asking for them."""
+    args = build_parser().parse_args(["--top-k", "20", "--top-p", "0.95"])
+    assert args.top_k == 20
+    assert args.top_p == 0.95
+    _validate_args(args)

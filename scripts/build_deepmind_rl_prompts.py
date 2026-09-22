@@ -1,4 +1,4 @@
-"""Build the DeepMind-interpolate RL prompt pool.
+"""Build a DeepMind mathematics_dataset RL prompt pool from one split.
 
 The binding rollout gate showed total reward starvation on DAPO-Math-17K
 (128/128 trajectories at reward 0.0 — the step-1500 mathmix model cannot
@@ -14,7 +14,19 @@ The 144 problems of the held-out eval set (``deepmind-interpolate-easy
 .parquet``) are excluded by question text, keeping the RL trainer's bench
 eval genuinely held out.
 
-    python3 scripts/build_deepmind_rl_prompts.py
+``--source-dir`` selects the difficulty tier.  ``interpolate`` is the test
+split and shares its distribution with the bench panel, so a pool built from
+it trains on exactly what the bench measures.  ``train-easy`` is a disjoint
+training split at a markedly easier surface difficulty -- the same 18 modules
+phrased with smaller magnitudes and fewer decimal places -- which is what a
+policy scoring 0.00 on interpolate needs before group-relative RL has any
+within-group variance to learn from.  The split name is recorded in the
+manifest; it is not inferred by any consumer.
+
+    python3 scripts/build_deepmind_rl_prompts.py \
+        --source-dir postraining/data/mathematics_dataset-v1.0/train-easy \
+        --split train-easy \
+        --output postraining/data/deepmind-train-easy-rl.parquet
 """
 
 from __future__ import annotations
@@ -45,8 +57,14 @@ READ_LIMIT_PAIRS = 20000
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--interpolate-dir",
+        "--source-dir",
         default="postraining/data/mathematics_dataset-v1.0/interpolate",
+        help="mathematics_dataset split directory to draw prompts from",
+    )
+    parser.add_argument(
+        "--split",
+        default="interpolate",
+        help="split name recorded in the manifest; must match --source-dir",
     )
     parser.add_argument(
         "--eval-file", default="postraining/data/deepmind-interpolate-easy.parquet"
@@ -61,6 +79,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.per_module < 0:
         parser.error("--per-module must be nonnegative")
+    if Path(args.source_dir).name != args.split:
+        parser.error(
+            f"--split {args.split!r} does not name --source-dir "
+            f"{Path(args.source_dir).name!r}; the manifest must record the "
+            "split the rows actually came from"
+        )
 
     eval_questions = set()
     for row in pq.read_table(args.eval_file).to_pylist():
@@ -68,16 +92,20 @@ def main() -> None:
         question = content.removeprefix(DAPO_PREAMBLE).removesuffix(DAPO_REMINDER)
         eval_questions.add(question.strip())
 
-    interpolate_dir = Path(args.interpolate_dir)
+    source_dir = Path(args.source_dir)
+    excluded = 0
     rows_by_module = []
     for module in DEEPMIND_EASY_MODULES:
+        read = module_pairs(source_dir / f"{module}.txt", READ_LIMIT_PAIRS)
         pairs = [
             (question, answer)
-            for question, answer in module_pairs(
-                interpolate_dir / f"{module}.txt", READ_LIMIT_PAIRS
-            )
+            for question, answer in read
             if question not in eval_questions
         ]
+        # The real number of rows this split lost to the bench panel. For a
+        # tier disjoint from interpolate this is 0, and saying so is the point:
+        # the manifest must not imply an exclusion it never performed.
+        excluded += len(read) - len(pairs)
         if args.per_module and len(pairs) < args.per_module:
             parser.error(f"{module}: only {len(pairs)} non-eval pairs available")
         selected = pairs if args.per_module == 0 else pairs[: args.per_module]
@@ -117,8 +145,12 @@ def main() -> None:
         "problems": len(rows),
         "per_module": args.per_module or "all",
         "modules": DEEPMIND_EASY_MODULES,
-        "source": "mathematics_dataset-v1.0 interpolate, eval-set problems excluded",
-        "excluded_eval_problems": len(eval_questions),
+        "split": args.split,
+        "source": (
+            f"mathematics_dataset-v1.0 {args.split}, eval-set problems excluded"
+        ),
+        "eval_panel_problems": len(eval_questions),
+        "excluded_eval_problems": excluded,
         "template": "verbatim DAPO-Math-17K prompt wrapper",
         "order": "deterministic module round-robin in source-file order; no RNG",
     }

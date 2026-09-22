@@ -1107,7 +1107,7 @@ def load_vapo_adapter_for_evaluation(
     revision: str,
 ) -> dict[str, Any]:
     """Apply a native VAPO adapter while preserving rollout bf16 arithmetic."""
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.model.lora import (
         LoRAConfig,
         inject_lora,
         load_adapter_state_dict,

@@ -9,8 +9,8 @@ from typing import Any, Callable, Sequence
 import torch
 from torch import Tensor
 
-from postraining.minicpm_vapo import (
-    MiniCPMVAPOPolicy,
+from postraining.vapo.policy import (
+    VAPOPolicy,
     dense_top_p_probabilities,
     maximal_coupling_verify,
 )
@@ -157,7 +157,7 @@ class NextLatSpeculativeEngine:
 
     def __init__(
         self,
-        policy: MiniCPMVAPOPolicy,
+        policy: VAPOPolicy,
         *,
         stop_ids: tuple[int, ...],
         prompts_per_rollout: int,

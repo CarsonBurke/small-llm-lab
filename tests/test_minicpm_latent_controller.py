@@ -7,7 +7,7 @@ import torch
 import pytest
 import scripts.train_minicpm_latent_controller as controller_runtime
 
-from postraining.minicpm_vapo import FIRST_THOUGHT, CONTINUE_THOUGHT, STOP_THINKING
+from postraining.vapo.policy import FIRST_THOUGHT, CONTINUE_THOUGHT, STOP_THINKING
 from scripts.train_minicpm_latent_controller import (
     WhitenedGaussianController, NormalizedStopGate, controller_scores,
 )

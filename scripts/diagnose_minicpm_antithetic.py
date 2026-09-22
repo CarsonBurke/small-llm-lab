@@ -393,7 +393,7 @@ def main(argv=None):
         sources = [Path(__file__), Path(trainer.__file__), Path(rollout.__file__), Path(profile.__file__),
                    ROOT/'scripts/minicpm_coupled_rng.py', ROOT/'postraining/runtime/coupled_rng.py',
                    ROOT/'postraining/minicpm_paired_rollout.py', ROOT/'postraining/train_minicpm_vapo.py',
-                   ROOT/'postraining/minicpm_vapo.py', ROOT/'postraining/latent_thought.py',
+                   ROOT/'postraining/vapo/policy.py', ROOT/'postraining/latent_thought.py',
                    ROOT/'postraining/fast_inference.py', ROOT/'postraining/invariant_linear.py',
                    ROOT/'postraining/invariant_attention.py', ROOT/'scripts/diagnose_minicpm_latent_bridge.py']
         hashes = {str(path.resolve().relative_to(ROOT)): sha256(path) for path in sources}

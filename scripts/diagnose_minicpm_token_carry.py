@@ -32,10 +32,20 @@ def worker(args):
     import faulthandler
     import torch
     from postraining.fast_inference import CapturedTrainingRolloutEngine
-    from postraining.minicpm_vapo import (
-        LoRAConfig, MiniCPMVAPOPolicy, MiniCPMVAPOCritic, TrajectoryRecord,
-        adapter_state_dict, load_adapter_state_dict, collate_replay_microbatch,
-        enable_packed_replay_attention, enable_replay_mlp_compilation,
+    from postraining.vapo.policy import (
+        VAPOCritic,
+        VAPOPolicy,
+        TrajectoryRecord,
+        collate_replay_microbatch,
+    )
+    from postraining.vapo.model.hf import (
+        enable_packed_replay_attention,
+        enable_replay_mlp_compilation,
+    )
+    from postraining.vapo.model.lora import (
+        LoRAConfig,
+        adapter_state_dict,
+        load_adapter_state_dict,
     )
     from postraining.train_minicpm_vapo import (
         _replay_hidden, _action_logprobs, _stop_ids, refresh_behavior_statistics,
@@ -50,7 +60,7 @@ def worker(args):
         "source_sha256": {
             path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
             for path in (
-                "postraining/minicpm_vapo.py", "postraining/token_carry.py",
+                "postraining/vapo/policy.py", "postraining/token_carry.py",
                 "postraining/fast_inference.py", "postraining/train_minicpm_vapo.py",
                 "scripts/diagnose_minicpm_token_carry.py",
             )
@@ -77,7 +87,7 @@ def worker(args):
         torch.set_float32_matmul_precision("high")
         device = torch.device("cuda")
         config = LoRAConfig()
-        policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+        policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
             device=device, lora_config=config, gradient_checkpointing=False,
             token_carry=True,
         )
@@ -202,7 +212,7 @@ def worker(args):
         assert change > 1e-4, change
         report["checks"]["current_weight_replay_logprob_change"] = change
         phase("independent_critic_and_optimizer_transition")
-        critic = MiniCPMVAPOCritic.from_pretrained(
+        critic = VAPOCritic.from_family("minicpm5", 
             device=device, lora_config=config, gradient_checkpointing=False,
             shared_frozen_source=policy.causal_lm, token_carry=True,
         )

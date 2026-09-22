@@ -13,6 +13,7 @@ from postraining.train_latent_vapo import (
     actor_minibatch_action_denominator,
     optimizer_minibatch_orders,
     plan_one_pass_training,
+    resolve_critic_init_provenance,
     rollout_tensorboard_metrics,
     resume_topology_history,
     source_actor_signal_mask,
@@ -241,7 +242,7 @@ def _actor_metrics(**overrides: float) -> dict[str, float]:
         "value_target_variance": 0.1,
         "value_residual_mean": 0.1,
         "value_residual_variance": 0.05,
-        "value_excess_ce": 0.4,
+        "value_loss": 0.4,
         "advantage_mean": 0.1,
         "advantage_std": 0.2,
         "policy_loss": 1.0,
@@ -531,3 +532,75 @@ def test_actor_writer_logs_one_compact_row_per_optimizer_step() -> None:
     assert "clip/policy" in behavior_age_one_tags
     assert "ratio/harmful_positive_log_max" in behavior_age_one_tags
     assert "advantage/mean" in behavior_age_one_tags
+
+
+def _critic_init_args(**overrides) -> SimpleNamespace:
+    return SimpleNamespace(
+        **{
+            "critic_init": "scratch",
+            "actor_critic_init": None,
+            "resume": None,
+            **overrides,
+        }
+    )
+
+
+def test_fresh_critic_init_provenance_names_its_start() -> None:
+    assert resolve_critic_init_provenance(_critic_init_args(), None, None) == {
+        "init": "scratch",
+        "checkpoint": None,
+        "source_execution_schema": None,
+    }
+    assert resolve_critic_init_provenance(
+        _critic_init_args(critic_init="actor"), None, None
+    )["init"] == "actor_copy"
+    assert resolve_critic_init_provenance(
+        _critic_init_args(actor_critic_init="warm.pt"),
+        {"execution_schema": "exec/v30"},
+        None,
+    ) == {
+        "init": "warm_checkpoint",
+        "checkpoint": "warm.pt",
+        "source_execution_schema": "exec/v30",
+    }
+
+
+def test_resume_keeps_the_recorded_critic_init_and_refuses_a_contradiction() -> None:
+    warm = {
+        "critic": {
+            "init": "warm_checkpoint",
+            "checkpoint": "warm.pt",
+            "source_execution_schema": "exec/v30",
+            "parameters": 7,
+        }
+    }
+    resumed = _critic_init_args(resume="run/latent_vapo_checkpoint.pt")
+    # A resume carries no --actor-critic-init, yet the run's critic still
+    # started from that warm checkpoint: the record survives the resume.
+    assert resolve_critic_init_provenance(resumed, None, warm) == {
+        "init": "warm_checkpoint",
+        "checkpoint": "warm.pt",
+        "source_execution_schema": "exec/v30",
+    }
+    actor_copy = {"critic": {"init": "actor_copy"}}
+    with pytest.raises(ValueError, match="--critic-init actor"):
+        resolve_critic_init_provenance(resumed, None, actor_copy)
+    resumed.critic_init = "actor"
+    assert resolve_critic_init_provenance(resumed, None, actor_copy)[
+        "init"
+    ] == "actor_copy"
+    with pytest.raises(ValueError, match="--critic-init scratch"):
+        resolve_critic_init_provenance(
+            resumed, None, {"critic": {"init": "scratch"}}
+        )
+    with pytest.raises(ValueError, match="unknown critic init"):
+        resolve_critic_init_provenance(resumed, None, {"critic": {}})
+    # A resume into a new directory reads the parent run's manifest, and its
+    # own manifest then carries the same record, so a resume chain of any
+    # length keeps the original start.
+    with pytest.raises(ValueError, match="resumed run's manifest"):
+        resolve_critic_init_provenance(resumed, None, None)
+    chained = {"critic": resolve_critic_init_provenance(resumed, None, actor_copy)}
+    assert resolve_critic_init_provenance(resumed, None, chained)[
+        "init"
+    ] == "actor_copy"

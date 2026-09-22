@@ -22,6 +22,13 @@ arms to each other is a job for the per-domain bits-per-byte the trainer
 already emits -- that metric is tokenizer-independent, which the probe's
 answer-span parse is not.
 
+An RL policy is probed through `--wrapper-checkpoint`, with `--checkpoint`
+naming the base it was trained from. The policy is read from the wrapper's
+rollout-policy schema: cot and hidden-carry policies are measured as
+trained. A latent-thought policy samples Gaussian thoughts that greedy
+decoding does not describe, and a none-mode policy answers behind a prefix
+this probe does not supply; both are refused.
+
 This executes a model on the GPU and must be submitted through mlq.
 """
 
@@ -38,12 +45,18 @@ import torch
 from postraining.arithmetic_probe import PROBE_SCHEMA, read_panel, score
 from postraining.core import load_posttraining_tokenizer
 from postraining.latent_eval import evaluate_latent_math
-from postraining.latent_thought import LatentThoughtModel
+from postraining.latent_thought import (
+    LatentThoughtModel,
+    combiner_init_kwargs_from_checkpoint,
+    rollout_policy_schema_for_mode,
+    validate_renderer_checkpoint,
+)
 from postraining.math_prompt import (
     ANSWER_FENCE_SUFFIX,
     require_answer_fence_prompt_schema,
 )
 from postraining.model_io import load_model
+from postraining.reasoning_modes import REASONING_MODES
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 
 PROBE_RUN_SCHEMA = "arithmetic_probe_run/v1"
@@ -58,7 +71,7 @@ def file_sha256(path: Path) -> str:
 
 
 def carries_trained_combiner(payload: dict) -> bool:
-    """Whether a checkpoint holds a hidden-carry combiner this probe would hide.
+    """Whether a base checkpoint is really a wrapper this probe would misread.
 
     Decided on the parameters, because they are the property being refused.
     `args["reasoning_mode"]` is the weakest available signal: the latent VAPO
@@ -71,6 +84,23 @@ def carries_trained_combiner(payload: dict) -> bool:
     return any(
         key.startswith("combiner.") for key in parameters
     ) or payload.get("reasoning_mode") == "latent"
+
+
+def wrapper_reasoning_mode(payload: dict) -> str:
+    """The reasoning mode a wrapper checkpoint's rollout-policy schema names.
+
+    Decided on the schema tag rather than on `args`, because the tag is what
+    the trainer binds to the policy semantics: a v1 hidden carry or a retired
+    latent policy has a mode name that still parses and a schema that does not.
+    """
+    schema = payload.get("rollout_policy_schema")
+    modes = {rollout_policy_schema_for_mode(mode): mode for mode in REASONING_MODES}
+    try:
+        return modes[schema]
+    except KeyError:
+        raise ValueError(
+            f"rollout-policy schema {schema!r} names no current reasoning mode"
+        ) from None
 
 
 def contract_predictions(
@@ -95,7 +125,18 @@ def contract_predictions(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="post-training base; with --wrapper-checkpoint, the base that "
+        "policy was trained from",
+    )
+    parser.add_argument(
+        "--wrapper-checkpoint",
+        default=None,
+        help="an RL policy from train_latent_vapo.py; its rollout-policy "
+        "schema decides how it is decoded",
+    )
     parser.add_argument(
         "--panel",
         default="data/math_drills/v4/probe.jsonl",
@@ -157,33 +198,82 @@ def main() -> None:
 
     checkpoint_path = Path(args.checkpoint)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    # `LatentThoughtModel(backbone)` below builds a zero-init combiner and the
-    # rollout runs with `pin_emit=True`, which is the SFT gate's arrangement
-    # and the right one for a checkpoint that has no trained carry. A latent
-    # VAPO checkpoint does have one, and measuring it with the carry pinned
-    # off would report the wrong policy under the right name -- so refuse it
-    # rather than silently produce a number.
+    # A wrapper passed as the base would load as a bare backbone and be
+    # measured with its trained combiner silently dropped -- the wrong policy
+    # under the right name. It belongs in `--wrapper-checkpoint`.
     #
     # This has to run before the prompt-schema check below: a latent VAPO
     # checkpoint has no top-level `sft` key, so that check would reject it
     # first and name the wrong reason.
     if carries_trained_combiner(payload):
         parser.error(
-            f"{checkpoint_path} carries a trained hidden-carry combiner; this "
-            "probe pins the carry off and would measure a different policy "
-            "than the one that was trained"
+            f"{checkpoint_path} is a latent VAPO wrapper checkpoint, not a "
+            "base; pass it as --wrapper-checkpoint with its base as "
+            "--checkpoint"
         )
+    wrapper_path = (
+        Path(args.wrapper_checkpoint) if args.wrapper_checkpoint else None
+    )
+    wrapper_payload = None
+    reasoning_mode: str | None = None
+    if wrapper_path is not None:
+        wrapper_payload = torch.load(
+            wrapper_path, map_location="cpu", weights_only=False
+        )
+        try:
+            reasoning_mode = wrapper_reasoning_mode(wrapper_payload)
+            validate_renderer_checkpoint(
+                wrapper_payload,
+                str(wrapper_path),
+                expected_rollout_policy_schema=rollout_policy_schema_for_mode(
+                    reasoning_mode
+                ),
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if reasoning_mode == "latent":
+            parser.error(
+                f"{wrapper_path} is a latent-thought policy; its Gaussian "
+                "thoughts and stop gate are sampled, and a greedy token probe "
+                "would measure a different policy than the one trained"
+            )
+        if reasoning_mode == "none":
+            # none-mode policies were trained behind a teacher-forced answer
+            # prefix under an answer-sized budget; this probe decodes neither.
+            parser.error(
+                f"{wrapper_path} is a none-mode policy; this probe decodes "
+                "reasoning completions, not a prefixed bare answer"
+            )
+        # The wrapper's backbone weights replace the base's below, so the
+        # base only supplies the architecture -- but it must be the one the
+        # policy was trained from, or the architecture is a guess.
+        base_sha256 = file_sha256(checkpoint_path)
+        if wrapper_payload.get("base_checkpoint_sha256") != base_sha256:
+            parser.error(
+                f"{wrapper_path} was trained from base "
+                f"{str(wrapper_payload.get('base_checkpoint_sha256'))[:12]}, "
+                f"not {checkpoint_path} ({base_sha256[:12]})"
+            )
     # The probe is only a measurement of the policy if the prompt it sees is
     # the one the policy was trained under. Reported through `parser.error`
     # like every other rejection here, rather than as a bare traceback.
     try:
         require_answer_fence_prompt_schema(
-            payload.get("sft") or {},
+            wrapper_payload
+            if wrapper_payload is not None
+            else payload.get("sft") or {},
             answer_fence=True,
-            source="arithmetic-probe checkpoint",
+            source=(
+                "arithmetic-probe wrapper checkpoint"
+                if wrapper_payload is not None
+                else "arithmetic-probe checkpoint"
+            ),
         )
     except ValueError as error:
         parser.error(str(error))
+    # The hidden carry is a property of the trained policy, never a decoding
+    # choice: it is on exactly when the wrapper was trained in carry mode.
+    hidden_carry = reasoning_mode == "carry"
     device = torch.device("cuda")
     backbone = load_model(checkpoint_path, device, payload=payload)
     tokenizer = load_posttraining_tokenizer(
@@ -195,7 +285,16 @@ def main() -> None:
             "tokenizer_provenance"
         ),
     )
-    wrapper = LatentThoughtModel(backbone).to(device)
+    if wrapper_payload is None:
+        # A zero-init combiner under `pin_emit=True`: the SFT gate's
+        # arrangement, and exactly the base's token policy.
+        wrapper = LatentThoughtModel(backbone).to(device)
+    else:
+        wrapper = LatentThoughtModel(
+            backbone, **combiner_init_kwargs_from_checkpoint(wrapper_payload)
+        ).to(device)
+        wrapper.load_state_dict(wrapper_payload["model"], strict=True)
+    del wrapper_payload
     wrapper.eval()
 
     rows = [
@@ -239,6 +338,7 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         pin_emit=True,
+        hidden_carry=hidden_carry,
         think_fence_ids=think_fence_ids,
         answer_fence_ids=answer_fence_ids,
     )
@@ -299,8 +399,20 @@ def main() -> None:
         "unterminated": unterminated,
         "malformed_format": malformed,
         "generation_metrics": metrics,
-        "args": vars(args),
+        # The wrapper is reported at the top level when set, so `args` keeps
+        # the v1 key set.
+        "args": {
+            key: value
+            for key, value in vars(args).items()
+            if key != "wrapper_checkpoint"
+        },
     }
+    if wrapper_path is not None:
+        # Additive: a base-checkpoint report keeps exactly the v1 key set, so
+        # it stays comparable field for field with earlier probe runs.
+        report["wrapper_checkpoint"] = str(wrapper_path)
+        report["wrapper_checkpoint_sha256"] = file_sha256(wrapper_path)
+        report["reasoning_mode"] = reasoning_mode
     temporary = output / f"result.json.{os.getpid()}.tmp"
     temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, output / "result.json")

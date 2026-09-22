@@ -39,28 +39,30 @@ from postraining.fast_inference import (
     response_token_limits,
     top_k_top_p_sample,
 )
-from postraining.minicpm_vapo import (
-    MINICPM5_MODEL_ID,
-    MINICPM5_VOCAB_SIZE,
-    MINICPM5_REVISION,
-    LoRAConfig,
-    MiniCPMVAPOPolicy,
-    MiniCPMVAPOCritic,
-    adapter_state_dict,
-    StaticCachePool,
+from postraining.vapo.model.hf import MINICPM5_SPEC
+from postraining.vapo.policy import (
+    VAPOCritic,
+    VAPOPolicy,
     ReplayMicrobatch,
+    StaticCachePool,
     TrajectoryRecord,
     _precompute_advantages,
-    chunked_frozen_head_logprobs,
     collate_replay_microbatch,
-    enable_packed_replay_attention,
-    enable_replay_mlp_compilation,
     exact_top_p_sample,
-    load_adapter_state_dict,
     plan_replay_microbatches,
     replay_storage_bytes,
+)
+from postraining.vapo.model.hf import (
+    enable_packed_replay_attention,
+    enable_replay_mlp_compilation,
     use_packed_replay_attention,
 )
+from postraining.vapo.model.lora import (
+    LoRAConfig,
+    adapter_state_dict,
+    load_adapter_state_dict,
+)
+from postraining.vapo.model.readout import chunked_frozen_head_logprobs
 from postraining.minicpm_latent_rollout import MiniCPMLatentRolloutEngine
 from postraining.runtime.profiling import DEVICE_SAMPLE_FIELDS, DeviceSampler
 from postraining.slot_memory import (
@@ -383,7 +385,7 @@ def reassert_optimizer_learning_rates(
 
 
 
-def _stop_ids(policy: MiniCPMVAPOPolicy, tokenizer) -> tuple[int, ...]:
+def _stop_ids(policy: VAPOPolicy, tokenizer) -> tuple[int, ...]:
     return resolved_eos_ids(policy.causal_lm, tokenizer, "chat")
 
 
@@ -494,7 +496,7 @@ class RolloutEngine:
 
     def __init__(
         self,
-        policy: MiniCPMVAPOPolicy,
+        policy: VAPOPolicy,
         tokenizer,
         *,
         prompts_per_rollout: int,
@@ -1002,7 +1004,7 @@ def collect_rollouts(
     slot_config = getattr(engine.policy, "slot_memory", None)
     if (slot_config is not None) != (slot_choices is not None):
         raise ValueError("rollout slot-memory mode differs from stored slot choices")
-    invalid_tokens = (responses < 0) | (responses >= MINICPM5_VOCAB_SIZE)
+    invalid_tokens = (responses < 0) | (responses >= MINICPM5_SPEC.vocab_size)
     if invalid_tokens.any():
         coordinates = invalid_tokens.nonzero()[:8].tolist()
         details = [
@@ -1086,7 +1088,7 @@ def collect_latent_rollouts(
     progress_callback=None,
 ) -> RolloutResult:
     """Score visible answers while retaining every continuous critic transition."""
-    from postraining.minicpm_vapo import (
+    from postraining.vapo.policy import (
         FIRST_THOUGHT, CONTINUE_THOUGHT, FORCED_STOP_THINKING,
     )
 
@@ -1134,7 +1136,7 @@ def collect_latent_rollouts(
         generated_tokens=sum(record.response_length for record in records),
         scheduled_tokens=result.capacity_row_steps,
         elapsed_seconds=time.perf_counter() - started,
-        sampling_scanned_vocabulary=MINICPM5_VOCAB_SIZE,
+        sampling_scanned_vocabulary=MINICPM5_SPEC.vocab_size,
         sampling_candidate_support=engine.top_k,
         sampling_full_policy_mass_lower_bound=0.0,
         sampling_conditional_mass_lower_bound=engine.top_p,
@@ -1289,7 +1291,7 @@ def rollout_diagnostics(
             })
     latent_records = [record for record in records if record.action_kinds is not None]
     if latent_records:
-        from postraining.minicpm_vapo import TOKEN_ACTION, STOP_THINKING
+        from postraining.vapo.policy import TOKEN_ACTION, STOP_THINKING
 
         thought_steps = sum(record.latent_vectors.shape[0] for record in latent_records)
         answer_tokens = sum(
@@ -1414,7 +1416,7 @@ class _ChunkedNextLatKL(torch.autograd.Function):
             ).to(predicted.dtype)
         return grad_predicted, None, None, None
 def _nextlat_training_loss(
-    side: MiniCPMVAPOPolicy | MiniCPMVAPOCritic,
+    side: VAPOPolicy | VAPOCritic,
     hidden: Tensor,
     batch,
     *,
@@ -1519,7 +1521,7 @@ def _nextlat_record_capacity(record: TrajectoryRecord, horizon: int) -> int:
 
 
 def _replay_hidden(
-    side: MiniCPMVAPOPolicy | MiniCPMVAPOCritic,
+    side: VAPOPolicy | VAPOCritic,
     batch: ReplayMicrobatch,
 ) -> Tensor:
     if bool(getattr(side, "latent_thinking", False)) != (
@@ -1664,8 +1666,8 @@ def _carry_input_probe(side, batch: ReplayMicrobatch) -> dict[str, float]:
 
 @torch.no_grad()
 def refresh_behavior_statistics(
-    policy: MiniCPMVAPOPolicy,
-    critic: MiniCPMVAPOCritic,
+    policy: VAPOPolicy,
+    critic: VAPOCritic,
     records: list[TrajectoryRecord],
     *,
     replay_token_budget: int,
@@ -1764,7 +1766,7 @@ def refresh_behavior_statistics(
 
 @torch.no_grad()
 def measure_post_update_behavior_kl(
-    policy: MiniCPMVAPOPolicy,
+    policy: VAPOPolicy,
     records: list[TrajectoryRecord],
     *,
     replay_token_budget: int,
@@ -2404,8 +2406,8 @@ def _clip_finite_grad_norm_(
 # them during either forward compilation or lazy backward compilation.
 @aot_config.patch(donated_buffer=False)
 def update_step(
-    policy: MiniCPMVAPOPolicy,
-    critic: MiniCPMVAPOCritic,
+    policy: VAPOPolicy,
+    critic: VAPOCritic,
     records: list[TrajectoryRecord],
     actor_optimizer,
     critic_optimizer,
@@ -3082,8 +3084,8 @@ def update_step(
 
 def save_checkpoint(
     path: Path,
-    policy: MiniCPMVAPOPolicy,
-    critic: MiniCPMVAPOCritic,
+    policy: VAPOPolicy,
+    critic: VAPOCritic,
     actor_optimizer,
     critic_optimizer,
     *,
@@ -3127,9 +3129,13 @@ def save_checkpoint(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=MINICPM5_MODEL_ID)
-    parser.add_argument("--revision", default=MINICPM5_REVISION)
-    parser.add_argument("--data", default="postraining/data/dapo-math-17k.parquet")
+    parser.add_argument("--model", default=MINICPM5_SPEC.model_id)
+    parser.add_argument("--revision", default=MINICPM5_SPEC.revision)
+    parser.add_argument(
+        "--data",
+        default="postraining/data/minicpm_verifiable_mix_deepmind60_ultra40_20260921.parquet",
+        help="mixed verifiable corpus (DeepMind/Ultra math plus Code, Knowledge, and Long_Context)",
+    )
     parser.add_argument(
         "--output",
         default="postraining/runs/minicpm5_vapo",
@@ -3162,12 +3168,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="reserve tokens after forced </think> inside each prompt's response allowance; zero disables",
     )
     parser.add_argument("--temperature", type=float, default=0.9)
-    parser.add_argument("--top-p", type=float, default=0.95)
+    # Both default to the UNTRUNCATED distribution. A truncated sampler makes
+    # the rollout distribution differ from the one the policy gradient is
+    # computed under, which biases every actor update -- the estimator assumes
+    # the sampled action came from the current policy, not from a renormalized
+    # head of it. The old defaults here were --top-p 0.95 --top-k 20, so a run
+    # launched without these flags trained on biased gradients silently.
+    # postraining/train_latent_vapo.py refuses any top-p != 1 outright; these
+    # stay settable because the MiniCPM decode path also serves generation,
+    # but training must opt IN to the bias rather than inherit it.
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--top-k",
         type=int,
-        default=20,
-        help="positive: bounded top-k; -1: full categorical (requires top-p=1); zero: slow exact top-p",
+        default=-1,
+        help="-1 (default): full categorical, the only unbiased choice for a "
+        "policy-gradient rollout; positive: bounded top-k; zero: slow exact "
+        "top-p. Anything but -1 biases the actor gradient.",
     )
     parser.set_defaults(thinking=True)
     parser.add_argument(
@@ -3403,7 +3420,7 @@ def _validate_args(args) -> None:
         raise ValueError("training step counts must be nonnegative and epochs positive")
     if not 0 < args.top_p <= 1 or args.temperature <= 0:
         raise ValueError("sampling temperature/top-p are invalid")
-    if not -1 <= args.top_k <= MINICPM5_VOCAB_SIZE:
+    if not -1 <= args.top_k <= MINICPM5_SPEC.vocab_size:
         raise ValueError("top-k must be -1, zero, or fit the model vocabulary")
     if args.top_k == -1:
         if args.top_p != 1.0:
@@ -3526,7 +3543,7 @@ def main() -> None:
         alpha=args.lora_alpha,
         initialization=args.lora_initialization,
     )
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         model_id=args.model,
         revision=args.revision,
         device=device,
@@ -3539,7 +3556,7 @@ def main() -> None:
         thought_sigma=args.thought_sigma,
         init_stop_thinking_probability=args.init_stop_thinking_probability,
     )
-    critic = MiniCPMVAPOCritic.from_pretrained(
+    critic = VAPOCritic.from_family("minicpm5", 
         model_id=args.model,
         revision=args.revision,
         device=device,

@@ -127,13 +127,14 @@ def _worker(args: argparse.Namespace) -> dict[str, Any]:
     import torch
     from postraining.core import answer_style, load_unique_math_rows
     from postraining.fast_inference import CapturedTrainingRolloutEngine
-    from postraining.minicpm_vapo import (
-        MINICPM5_MODEL_ID,
-        MINICPM5_REVISION,
+    from postraining.vapo.model.hf import MINICPM5_SPEC
+    from postraining.vapo.model.lora import (
         LoRAConfig,
-        TrajectoryRecord,
-        MiniCPMVAPOPolicy,
         load_adapter_state_dict,
+    )
+    from postraining.vapo.policy import (
+        VAPOPolicy,
+        TrajectoryRecord,
     )
     from postraining.train_minicpm_vapo import (
         encode_math_prompt,
@@ -155,14 +156,14 @@ def _worker(args: argparse.Namespace) -> dict[str, Any]:
         if state["policy"].get("schema") != "minicpm5_vapo_adapter/v6":
             raise ValueError("actor checkpoint must use the MiniCPM VAPO v6 schema")
         actor = state["policy"]["actor"]
-    model_id = actor["model_id"] if actor else MINICPM5_MODEL_ID
-    revision = actor["revision"] if actor else MINICPM5_REVISION
+    model_id = actor["model_id"] if actor else MINICPM5_SPEC.model_id
+    revision = actor["revision"] if actor else MINICPM5_SPEC.revision
     config = (
         LoRAConfig(**actor["lora_config"])
         if actor
         else LoRAConfig(initialization="standard")
     )
-    policy, tokenizer = MiniCPMVAPOPolicy.from_pretrained(
+    policy, tokenizer = VAPOPolicy.from_family("minicpm5", 
         model_id=model_id,
         revision=revision,
         device=torch.device("cuda"),

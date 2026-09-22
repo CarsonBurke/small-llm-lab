@@ -363,3 +363,15 @@ def fresh_trunk(
         else reference.architecture + architecture_suffix
     )
     return model
+
+
+def copy_trunk(reference, device: torch.device):
+    """An independent, fully trainable copy of a loaded model's current weights.
+
+    Same class, config and values as ``reference``, but every parameter and
+    buffer owns its own storage (``load_state_dict`` copies into the fresh
+    instance), so optimizer steps on the copy never reach the reference.
+    """
+    model = fresh_trunk(reference, device)
+    model.load_state_dict(reference.state_dict(), strict=True)
+    return model

@@ -15,7 +15,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from torch.utils.tensorboard import SummaryWriter
 
 from postraining.core import JsonlLogger
-from postraining.minicpm_vapo import (
+from postraining.vapo.policy import (
     FIRST_THOUGHT,
     STOP_THINKING,
     TOKEN_ACTION,
@@ -133,7 +133,7 @@ def test_invalid_task_schema_fails_before_cuda_or_model(tmp_path, monkeypatch):
         raise AssertionError("CUDA or model construction before schema validation")
 
     monkeypatch.setattr(trainer.torch, "manual_seed", forbidden)
-    monkeypatch.setattr(trainer.MiniCPMVAPOPolicy, "from_pretrained", forbidden)
+    monkeypatch.setattr(trainer.VAPOPolicy, "from_family", forbidden)
     with pytest.raises(ValueError):
         trainer.main()
 

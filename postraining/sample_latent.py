@@ -164,6 +164,9 @@ def main() -> None:
     del base_payload
     backbone.eval()
     wrapper_step = None
+    # The hidden carry is a property of the trained policy, never a sampling
+    # choice: it is on exactly when the checkpoint was trained in carry mode.
+    hidden_carry = False
     if args.wrapper_checkpoint:
         payload = torch.load(
             args.wrapper_checkpoint, map_location="cpu", weights_only=False
@@ -189,6 +192,7 @@ def main() -> None:
                 f"checkpoint was trained in reasoning mode {saved_mode!r}; "
                 "sample it with --emit-only"
             )
+        hidden_carry = saved_mode == "carry"
     else:
         wrapper = LatentThoughtModel(
             backbone,
@@ -199,7 +203,9 @@ def main() -> None:
         ).to(device)
         print("policy: fresh forced-initial Gaussian policy")
     wrapper.eval()
-    if args.emit_only:
+    if hidden_carry:
+        print("hidden-carry policy: generated tokens carry their belief")
+    elif args.emit_only:
         print("token-only policy: gate, noise, and thought slots bypassed")
 
     # Fence flags come from the RL run's saved args when a wrapper
@@ -252,6 +258,7 @@ def main() -> None:
                     record_likelihoods=False,
                     cache_dtype=torch.bfloat16,
                     pin_emit=args.emit_only,
+                    hidden_carry=hidden_carry,
                 )
             )
         emitted_rows = emitted_token_rows(batch)
@@ -326,6 +333,7 @@ def main() -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             pin_emit=args.emit_only,
+            hidden_carry=hidden_carry,
             answer_fence_ids=answer_fence_ids,
         )
 
@@ -447,6 +455,7 @@ def main() -> None:
                 record_likelihoods=False,
                 cache_dtype=torch.bfloat16,
                 pin_emit=args.emit_only,
+                hidden_carry=hidden_carry,
             )
         )
 
