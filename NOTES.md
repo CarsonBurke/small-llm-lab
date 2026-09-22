@@ -8440,3 +8440,27 @@ variant gives identical maxima.
 - **Cancelled and resumed (2026-09-22):** job 9240 was cancelled at RL step ~10 on warmup explained variance ~0 (prediction mean 0.0097 against target 0.0176 at warmup step 50; EV -0.005 to +0.001 through RL step 9). That was premature: think tokens (263-287), think-format (0.81-0.84) and emitted length (~770) showed no collapse, and a from-scratch trunk is expected to need many steps before it resolves state-dependent value on a ~2% reward. Job 9245 resumes it from the post-warmup step-0 checkpoint with identical arguments and the default critic rate.
 - **VAPO on critic init (`papers/vapo_2504.05118v3.pdf`, sections 4.1 and 5.1):** the critic is never random. It is initialized from a reward model (a full pretrained LM), then value-pretrained on a fixed policy (pi_sft) with Monte Carlo returns "until key training metrics, including value loss and explained variance, attain sufficiently low values", saved, and loaded for RL; the reported config is a 50-step warmup. Critic lr is 2x the actor's (2e-6 vs 1e-6). Without value pretraining VAPO collapses like vanilla PPO (shorter responses, answering without reasoning; AIME24 11 vs 60). The init bias VC-PPO identified comes from the reward model's EOS-scoring objective, which a zero-init head on a copied trunk would avoid. Our 50-step warmup is fixed-count rather than EV-gated, and our trunk is random, so both depart from the paper; the paper says nothing about embedding-only init.
 - **`--critic-init {scratch,actor}` (2026-09-22):** `actor` starts the critic trunk from `model_io.copy_trunk`, a storage-independent copy of the actor as loaded at run start (base checkpoint or `--actor-init`/`--curriculum-init` weights), behind the same zero head. Default stays `scratch`, so job 9245 is unchanged. The manifest's `critic.init` records `scratch`, `actor_copy` or `warm_checkpoint`; a resume now carries the recorded block forward from the resumed run's manifest, in place or from the checkpoint's own directory when resuming into a new one (previously a resume of an `--actor-critic-init` run relabelled it `scratch`), and refuses a contradicting `--critic-init`. Refused with `--actor-critic-init` and for LatentMoE actors. Not yet run.
+
+### `kda8_vapo_cot_v9_scalar` degradation: DG turns critic noise into an entropy bonus (2026-09-22, job 9245, step ~500)
+
+- **Trajectory (50-step means):**
+  - Think tokens fell from 263 to 74 by step 350; the length collapse recurred despite the scalar critic.
+  - Ended rose from 0.875 to 0.998, then fell to 0.975. Think-format peaked at 0.915 (step 76) and fell to 0.834.
+  - Actions per trajectory are rising again, while think length stays flat.
+  - ultradata_math accuracy peaked at 0.045 (step 300) and fell to 0.027.
+  - Bench at step 250: 0.0174, below the dataset modal-answer baseline of 0.0208, at 101 mean emitted tokens (382 at step 0).
+- **Transcripts:**
+  - Correct samples are mostly lucky small-integer guesses (0, 1) after incoherent think text.
+  - The unterminated rows are 768-token word salad: mixed scripts, mojibake, random numerals.
+- **Entropy:** DG surprisal mean (mean -log pi of the sampled tokens, a sampled-entropy proxy) went 0.88 (step 150) -> 1.01 (300) -> 1.56 (400) -> 2.55 (500), and is accelerating.
+- **The DG gate is inert as designed:**
+  - Gate means are 0.495-0.512 throughout, at eta = 1 on raw GAE advantages (std 0.03-0.06).
+  - 24-38% of policy tokens carry positive advantage, while only 2-3.5% of trajectories are correct. With explained variance ~0, per-token advantage signs come from the critic's V_{t+1} - V_t differences, which is noise.
+- **Mechanism:** a token with surprisal l and zero-mean advantage noise +-u gets expected DG coefficient
+  - 1/2 [sigmoid(u l) u - sigmoid(-u l) u], which is approximately u^2 l / 4 for small u l, and positive.
+  - E_a[l(a) grad log pi(a)] = grad H exactly. So DG over zero-mean advantage noise is, in expectation, entropy ascent with strength about Var(u) / (4 eta).
+  - At the observed advantage std, that is about 1e-3, a typical LLM entropy-bonus coefficient, applied with no counterweight.
+  - Plain PG has no such term: it is linear in U, so zero-mean noise averages out.
+  - The DG paper's token-reversal runs used a sequence-level empirical-mean baseline, with no per-token critic noise. None of Osband's three DG papers (2603.14608, 2603.20521, 2603.20526) has LLM experiments.
+  - TPO (2604.06159, Appendix E) notes that DG has no trust region, and shows DG's cross-context coefficient vanishing as beta ~ p_n on hard contexts.
+- **Implication:** with an EV ~0 critic, DG's token-level gating needs either a trustworthy advantage or a sequence-level one. For an all-fail group, a group-mean baseline gives exactly zero advantage and so no noise.
