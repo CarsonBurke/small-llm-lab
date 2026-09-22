@@ -7764,3 +7764,679 @@ modulation across six width-512 blocks. No BPB improvement is presumed.
 Initialize modulation to identity; zero residual gates combined with the
 backbone's zero output projections can block learning. Both-pass training
 cost remains; this idea is separate from progressive pass scheduling.
+
+## Model-agnostic VAPO library, and KDA post-training
+
+### The RL stack is no longer bound to MiniCPM5
+
+The VAPO/RL post-training capability built against MiniCPM5 reached into
+`LlamaForCausalLM` internals and a pinned model id/revision/vocab, so no
+custom backbone could use it. It is now a library with declared contracts in
+`postraining/vapo/model/`:
+
+- `protocols.py` — `Capability`, `TrunkGeometry`, the `Readout` protocol, the
+  `TrunkAdapter` ABC, the `RolloutEngine` protocol, and the `ModelFamily` ABC.
+  A trunk *declares* what it can do (LoRA adapters, packed replay attention,
+  static vs paged KV cache, FA4 decode, ...) instead of being recognized by
+  class name.
+- `hf.py` / `nano.py` — the two families. `MINICPM5_SPEC` keeps the exact
+  pinned id, revision and 130,560 vocab; `NanoFamily` covers the nanoGPT-mini
+  and KDA backbones through `model_io`.
+- `lora.py`, `readout.py` — the shared primitives, moved verbatim so the
+  qualified MiniCPM arithmetic is unchanged.
+
+`minicpm_vapo.py` became `vapo/policy.py`; `MiniCPMVAPOPolicy`/`Critic` became
+`VAPOPolicy`/`VAPOCritic`, and `.from_pretrained()` became
+`.from_family(key, ...)`. `TrajectoryRecord` and `ContinuousTrainingGeneration`
+were already model-agnostic and are the shared replay/rollout currency; the two
+rollout backends (the measured HF engine in `fast_inference.py`, and
+`vapo/rollout/nano_engine.py`) now sit behind one interface.
+
+Deliberately *not* merged: the MiniCPM rollout engine's optimizations
+(continuous lane refill, FA4 varlen replay, fused projections, CUDA-graph
+decode) are heavily measured against Llama internals. `NanoRolloutEngine` is a
+correct lockstep decoder with no measured throughput claim. Do not describe it
+as fast until someone benchmarks it.
+
+Family-specific escape hatches stay explicit: `TrunkAdapter.causal_lm` raises a
+family-mismatch error rather than an `AttributeError` from inside a rollout
+engine, and every packed-replay/static-cache call site lives in the Hugging
+Face entrypoints.
+
+### fla's TileLang KDA backward cannot run here — it hangs training
+
+Any KDA training run through the post-training stack died at its first
+backward, then **deadlocked while unwinding the exception**: all threads in
+`futex_wait`, GPU at 0-8% and 25W, no progress and no crash. `mlq` reports such
+a job as running forever.
+
+The error, recoverable only via `PYTHONFAULTHANDLER=1` plus `SIGABRT`:
+
+```
+RuntimeError: TypeAttr `__ffi_repr__` is already registered for type index 132.
+```
+
+`fla` dispatches the KDA chunked backward to `fla.ops.kda.backends.tilelang`.
+TileLang vendors its own TVM while `tvm_ffi` is also installed standalone, so
+both register the same FFI TypeAttr for the same TVM type index. Reproduced in
+about thirty lines with a bare `chunk_kda` forward/backward and no
+post-training code, and `KDATileLangBackend.can_use()` is `True` by default in
+this environment — so this was never specific to one entrypoint. Forward-only
+paths never touch the kernel, which is why it surfaced only once KDA reached
+training.
+
+`postraining/kda_backbone.py` now defaults `FLA_TILELANG=0` at import, the same
+pin the KDA GPU tests and ablation scripts already carry, which selects fla's
+reference Triton KDA backward. Verified finite gradients for q/k/v/g/beta on
+well-conditioned inputs (an early probe's `nan` came from unscaled synthetic
+inputs blowing up the delta-rule recurrence, not from the kernel). Because fla
+caches its per-class capability check when the backend module is imported, the
+environment default only works if it lands first: `NanoKDABackbone.__init__`
+asserts the resolved backend is not TileLang and fails with the diagnosis
+otherwise, rather than hanging.
+
+### Post-training the best pretrained KDA checkpoint
+
+Base: `logs/nanogpt_gpt2_kda8_kkkdkkkd_triton_mbs32_optimized_2k_final_model.pt`
+— the lowest `val_bpb` (1.1824) of the 63 KDA pretraining runs in `logs/`, full
+2000 steps, validated on `data/datasets/fineweb10B_gpt2` like its peers so the
+comparison is like-for-like. 64.0M parameters, 8 layers x 512 dim, GPT-2 padded
+vocab 50304, KDA mixers on layers 0-2/4-6 with full attention on 3 and 7,
+`train_seq_len` 1024. Runners-up: `kda5_outer_reduce_fixed_1k` (1.2068, 1000
+steps) and `k3mix_v5_kda8_ref_2k` (1.2371).
+
+The 1024-token pretraining window governs every budget. Layers 3 and 7 carry
+half-truncate RoPE with no extrapolation story, so nothing may pack or sample
+past it. The shipped defaults did exactly that — SFT packed at `--seq-len 4096`
+and its sampling gate ran `512 + 768` — because they were tuned for the
+8k-context K3 lineage. `sft_trace_train.py` now derives all three from
+`backbone.train_context_tokens` and refuses a gate budget that exceeds it.
+Measured on the corpus: prompts are p50 43 / p99 136 / max 941 tokens, so a
+256-token prompt covers 99.7% of them, and 35,894 of 36,286 documents (98.9%)
+fit the packed 1024 window.
+
+Pipeline: `scripts/launch_kda8_posttrain.sh {sft|rl}`, every value pinned
+explicitly. SFT runs the canonical `sft_traces_v6_answer_bare_a1swap10k`
+corpus for three epochs at 8 rows x 1024 x 4 accumulation — 32,768 tokens per
+step, matching the K3 reference recipe's 2 x 4096 x 4 so its `lr-scale` and
+warmup carry over. RL then runs `vapo_broad_v6_bare`, which binds
+`sft_corpus_sha256` to those exact corpus bytes; `train_latent_vapo` rejects a
+base checkpoint whose recorded `traces_sha256` differs, so the chain is
+hash-bound end to end.
+
+RL uses `cot`, not `latent`: latent requires `stream_steps >= emitted + 1` and
+a 1024-token window leaves only 768 stream slots after a 256-token prompt, so
+latent would cost a third of the response budget. `cot` is also the token-only
+control, which is the right first measurement on a new backbone. Latent at
+`--continuation-tokens 512` is the follow-up ablation.
+
+### UltraData SFT is gated, so it is not in the pipeline
+
+`openbmb/UltraData-SFT-2605` is the natural SFT companion to the pinned
+`UltraData-RL-2609` — a `think` split across Math/Code/Knowledge/IF, with 74 GB
+of Math traces over 250 shards, which the existing bounded byte-window
+acquisition in `ultradata_data.py` could sample the same way. It is **gated**:
+`Access to dataset openbmb/UltraData-SFT-2605 is restricted... Please log in`,
+and there is no HF token in the environment or any auth path in
+`data_acquisition.py`. `openbmb/UltraData-Math` is public but is pretraining
+web math, not SFT traces; `UltraData-SFT-Agent-2609` is tool-use/agent data.
+Adding the SFT source needs accepted dataset terms plus a token; until then the
+pipeline uses the repository's verified-trace corpus.
+
+## 2026-09-21 — Arithmetic is absent, not weak; SFT corpus and RL mixture rebuilt
+
+### The measurement that reframed everything
+
+The arithmetic capability probe (`postraining/arithmetic_probe.py`,
+`data/math_drills/v4/probe.jsonl`, 1,920 items disjoint from drill training)
+run against the 3-epoch v6 SFT policy:
+
+    overall 0.000 over 1,920 items
+    add_integer      0.000  3d=0.00 4d=0.00 5d=0.00 6d=0.00
+    sub_integer      0.000  3d=0.00 4d=0.00 5d=0.00 6d=0.00
+    ... all 15 families 0.000 at every digit count ...
+    ungradable 1,497  unterminated 1,385  malformed 1,407
+    lenient 0.000 (scraped tail answers credited)
+
+Zero at three-digit integer addition, and zero again under lenient grading,
+so this is not the completion contract costing us credit. The primitive is
+absent. That is consistent with the 2026-08-06 audit recorded in
+`postraining/math_drills.py`: 0.115% of the pretraining mix was core
+arithmetic drill and none of it showed working.
+
+Everything else follows from this. The earlier RL result — 0.00 on every
+DeepMind interpolate module, 0.20% on dapo-math-17k, 2.73% on gsm8k — was
+never a tuning problem.
+
+### The 3-epoch SFT was memorisation
+
+Holdout completion CE fell 3.9449 -> 0.9009 over three epochs on ~36k
+self-generated traces, beside the all-zero probe above. A near-zero training
+loss next to an absent primitive is memorisation of a small trace set.
+`postraining/data/sft_traces_v6_answer_bare_a1swap10k.parquet` and both
+3-epoch checkpoints (`kda8_sft_v6_bare_e3`, `sft6_bare_a1swap10k_e3`,
+245 MB each) are deleted; `metrics.jsonl`, `result.json` and
+`gate_transcripts.json` are kept in each run directory beside a `RETIRED.md`
+so the negative result stays auditable. `--epochs` now defaults to 1.
+
+### UltraData: which repo is actually usable
+
+- `openbmb/UltraData-SFT-Agent-2609` is public (54 GB, ~500k samples) but is
+  the wrong corpus for a 1024-token, tool-less, 30M-param policy. Measured
+  over 1,870 real records with GPT-2 BPE: **100% of samples exceed the 1024
+  context** in every one of its four domains. Median tokens per sample —
+  Code_Agent 73,966 (median 108 messages), General_Agent 39,095,
+  Search_Agent 37,090, Tool_Use 8,656. It targets MiniCPM5-2B and trains
+  function-calling against 6-25 tool schemas.
+- `openbmb/UltraData-SFT-2605` is the core-domain SFT corpus that would fit
+  (319 GB; `think/Math` 74 GB, `think/Code` 177 GB, `no_think/Math` 30 GB,
+  and its `think` split maps straight onto our `<think>`/`<answer>`
+  contract). It is `gated: auto` and returns **HTTP 401 for both its data
+  files and its README** with no token in the environment, so its record
+  schema cannot even be inspected. `prepare_sft_corpus.py` declares it in
+  `CREDENTIALED_ADAPTERS` and refuses with that explanation rather than
+  reporting an unknown-source typo.
+- `openbmb/UltraData-RL-2609` is public and already adapted at a pinned
+  revision by `postraining/ultradata_data.py`. This is the MiniCPM RL corpus.
+
+### New SFT corpus: `postraining/prepare_sft_corpus.py`
+
+Streams published instruction corpora into the schema `sft_trace_train`
+already consumes (`source`, `problem`, `document`, `final_answer`,
+`verified`, `doc_tokens`), with `document = problem + <think>\n{solution}\n
+</think>\n<answer>{answer}</answer>` because the answer-fence contract
+appends no instruction suffix. Adapters declare a corpus instead of sniffing
+it; rows are dropped, never reshaped.
+
+- `openmathinstruct2` (nvidia/OpenMathInstruct-2, CC-BY-4.0, 12.6 GB / 32
+  shards / ~14M rows). Worked step-by-step solutions; measured 98.5% of
+  documents fit 1024 tokens, median 313, p90 676.
+- `math_drills` (local `data/math_drills/v4/drills.parquet`, 2M rows). The
+  only corpus here that shows carrying, borrowing, place value and
+  digit-by-digit long division. Its own `document` column carries the retired
+  plain `Answer:` framing and is ignored; the document is rebuilt under the
+  canonical contract.
+
+Evaluation protection is part of the corpus contract, not a later filter:
+`problem_source` values in `excluded_provenance` are dropped by the adapter
+and the exclusion is recorded in the manifest. For OpenMathInstruct-2 that is
+`gsm8k` and `augmented_gsm8k` — 17.5% of rows — because GSM8K is an
+evaluation set here. A corpus that cannot report per-row provenance cannot be
+admitted.
+
+### RL mixture v8: weighted by measured learnability
+
+The v7 mixture gave dapo 28/64 of every pool and DeepMind interpolate 20/64,
+i.e. it weighted most heavily the two sources a frozen-policy gate scored at
+0.20% and 0.00%, and gave gsm8k (2.73%, the only source with signal) 8/64.
+VAPO's advantage is group-relative, so a uniformly wrong group contributes
+exactly no policy gradient: 87% of every rollout pool could not teach
+anything.
+
+| source | v7 | v8 | gate accuracy |
+|---|---:|---:|---:|
+| deepmind_easy (train-easy) | — | 48 | not yet measured |
+| ultradata_math | — | 8 | not yet measured |
+| dapo | 28 | 8 | 0.0020 |
+| deepmind (interpolate) | 20 | 0 | 0.0000 |
+| mbpp | 8 | 0 | 100% format-ineligible |
+| gsm8k | 8 | retired | 0.0273 (eval set) |
+
+- **`deepmind_easy` is the `train-easy` tier**, not the bench panel. All
+  three `deepmind-*` parquets draw the same 18 modules from the `interpolate`
+  (test) split; "easy" in `deepmind-interpolate-easy` names the *module*
+  selection, not a difficulty tier, which is why the bench panel and the
+  `deepmind` training source score identically at 0.00%. `train-easy` is a
+  disjoint training split at markedly easier surface difficulty — compare
+  train-easy `What is -5 - 110911?` against interpolate `What is the
+  difference between -221017 and -1429.06?` — and the 144 bench problems are
+  excluded from it by question text. 72,000 prompts, 4,000 per module.
+  `scripts/build_deepmind_rl_prompts.py` now takes `--source-dir`/`--split`
+  and refuses a `--split` that does not name the directory, so the manifest
+  cannot misreport which tier the rows came from.
+- **`gsm8k` is retired from the mixture.** `RETIRED_SOURCES` names the reason
+  (training RL on it would make every reported gsm8k number a training-set
+  score) instead of surfacing as an unknown source.
+- **`mbpp` and `deepmind` ship at quota 0**: available, off by default, and
+  they require an explicit `--quota SOURCE=N` to contribute.
+- **`--sft-corpus` is now required**, not defaulted to a deleted file.
+
+### UltraData-RL-2609 generalized for this policy
+
+`postraining/task_data.py` is a pinned MiniCPM campaign: it hard-errors
+unless `--context-tokens` is exactly 10000, tokenizes with MiniCPM5-1B and
+bundles CodeContests. Rather than re-acquire 4 GiB to change a tokenizer,
+`scripts/build_ultradata_math_rl_prompts.py` promotes the Math rows of the
+existing hash-bound extraction into a standalone pool: 2,973 unique prompts,
+deduplicated by `original_query_sha256`, ordered by content hash, bound to
+revision `e6ecfa73`. Math only — measured against GPT-2 BPE, its math prompts
+are median 132 tokens with 95% inside a 256-token budget, against a 502-token
+median (16% fit) for Code and 4,036 (0% fit) for Long_Context.
+
+Its prompts are rendered with the MiniCPM5 chat template, so
+`postraining/math_prompt.py` now registers those clauses:
+`ULTRADATA_REASONING_INSTRUCTION`, `ULTRADATA_FINAL_ANSWER_INSTRUCTION`,
+`ULTRADATA_BUDGET_SUFFIX` and the three code-agent clauses. The budget
+sentence matters beyond redundancy: it states 9k tokens, which is false for
+every model in this repository, so leaving it in a prompt would train the
+policy against a context it does not have. Because a budget clause contains
+no `Answer:`, the existing fail-closed check could not see it, so
+`CONTEXT_BUDGET_DEMAND` now matches the shape rather than the one registered
+literal — a corpus rebuilt at a different budget fails closed instead of
+drifting. 3,599 of 3,600 rows canonicalize; 4 rows across both extractions
+carry a literal `Answer:` inside the problem body and are quarantined with
+their reason in the manifest rather than reshaped.
+
+### Still blocked
+
+`UltraData-SFT-2605` needs a Hugging Face token that has accepted its terms.
+`hf auth whoami` reports "Not logged in" and `hf env` reports
+`Has saved token ?: False`. Everything else in this entry is done.
+
+## 2026-09-21 — One-epoch SFT restores arithmetic; multiplication is the bottleneck
+
+### The measurement that reframed everything
+
+The retired three-epoch v6 lineage scored **0.000 on all 15 arithmetic-probe
+families at every digit count**, over 1,920 items, and 0.000 leniently as
+well. That is not a weak skill; the primitive was absent. It made the 0.00%
+RL results a capability gap rather than a tuning problem.
+
+Job 9040 (`kda8_sft_omi2_drills_e1`) is the reply: **one** epoch over 931,057
+decontaminated documents (293.8M tokens) — OpenMathInstruct-2 plus worked
+arithmetic drills — instead of three epochs over a few tens of thousands of
+traces.
+
+### Held-out sampling gate (job 9040)
+
+The panel comes from `split_holdout`, a deterministic problem-level split, so
+these are held-out problems, not training reward. They are nonetheless
+*in-distribution*: this is the corpus's own held-out split, not transfer.
+
+| metric | v6 (3 epochs) | 9040 (1 epoch) |
+| --- | --- | --- |
+| accuracy | 0.00% | 26.17% |
+| structural format | — | 84.86% |
+| terminated | — | 85.94% |
+| mixed-prompt fraction | 12.5% | 39.84% |
+| holdout completion CE | 0.9009 | 0.4660 |
+
+The mixed-prompt fraction is the one that governs what comes next. A
+uniformly-wrong group produces zero policy gradient under group-relative
+advantage, so at 12.5% the RL stage had almost nothing to learn from; at
+39.84% it does. Falling CE was deliberately *not* read as success — that was
+the signal that misled the v6 lineage, which reached 0.9009 CE while scoring
+zero everywhere.
+
+### Arithmetic capability probe (job 9041)
+
+Construction-disjoint panel, 1,920 items, greedy decoding. Overall **0.516**,
+from 0.000.
+
+```
+add_integer     0.977   (6d=0.94)    mul_integer     0.422
+compare_decimal 0.945                div_integer     0.281
+percent_of      0.875                fraction_mul    0.195
+sub_integer     0.859   (6d=0.75)    div_decimal     0.117
+round_decimal   0.844                fraction_add    0.023
+add_decimal     0.812                mul_decimal     0.000
+unit_convert    0.742                percent_change  0.000
+sub_decimal     0.648
+```
+
+All 15 families had 12,542-58,094 drills in the training corpus, so the zeros
+are not data gaps. `mul_decimal` scoring exactly 0.000 while `mul_integer`
+scores 0.422 looked like a grading artifact, so the transcripts were read
+rather than trusted. It is not an artifact. The model has learned every
+*procedure* and fails on one *primitive*:
+
+- `fraction_add`: LCD of 65 and 61 computed correctly as 3195, method
+  correct, but `43/65 = 2187/3195` (2115 is right) — the cross-multiplication
+  is wrong.
+- `percent_change`: method correct, but `29380 x 50 = 2945000`
+  (1469000 is right), then `29380 - 29450 = 29450` — it emitted the
+  subtrahend.
+- `mul_decimal`: correct long-multiplication scaffold and correct
+  decimal-place rule ("1 decimal place and 1, so the product has 2"), but the
+  partial-product addition chain drifts (`865200 + 360 = 865160`).
+
+So multi-digit **multiplication** is the bottleneck, and every family
+downstream of it inherits its error rate; addition, subtraction, comparison
+and rounding are solid at 0.81-0.98. One `mul_decimal` trace also hit the
+512-token cap mid-multiplication, which a longer context fixes directly.
+
+The ordering does not track data volume — `mul_decimal` had 37,190 drills and
+scores 0.000 while `percent_of` had 16,986 and scores 0.875 — so it tracks
+compositional depth instead.
+
+### Consequences
+
+- The arithmetic drills work and stay in every subsequent corpus.
+- One epoch over a large corpus beats three over a small one, decisively.
+- Reasoning traces need room: the next corpus is built at 5,120 tokens.
+
+## 2026-09-21 — Rollout throughput is not a bottleneck; single-repeat benchmarks are
+
+Measured generation throughput on the job 9040 SFT checkpoint
+(`postraining/runs/kda8_sft_omi2_drills_e1/sft_final_model.pt`) through
+`train_latent_vapo --rollout-only` against the v9 mixture, cot mode, 256
+prompt + 768 continuation tokens. Reported metric is the trainer's own
+`useful_actions_per_second` (generated tokens/s) with `peak_vram_bytes`.
+
+**The headline result is a measurement lesson.** With
+`--rollout-only-repeats 1` (jobs 9082, 9083) the width curve looked like a
+clean bottleneck: 512 rows/wave 13.5k tok/s, 1024 rows 15.6k, 2048 rows
+25.3k, 4096 rows 33.9k. All four numbers were `torch.compile` warmup. The
+same 2048-row config re-read 18.7k tok/s in a second single-repeat job at
+identical flags and seed — a 35% swing I initially mistook for GPU clock
+noise. At 4 repeats per config, discarding repeat 0:
+
+| rows/wave | groups x samples | steady tok/s (reps 1-3) | peak VRAM |
+| --------- | ---------------- | ----------------------- | --------- |
+| 512       | 32 x 16          | 82-93k                  | 3.5 GB    |
+| 1024      | 64 x 16          | 111-115k                | 6.3 GB    |
+| 2048      | 64 x 32          | 100-119k                | 12.1 GB   |
+| 4096      | 64 x 64          | 81-129k                 | 23.6 GB   |
+
+Repeat 0 reads 14-16k tok/s at every width (23-44 s collect) against 3-7 s
+once warm. Throughput saturates at ~113k tok/s from 1024 rows onward, so the
+extra width buys nothing and costs 2-4x the VRAM. `--rollout-groups 64` with
+`--prompts-per-rollout 64` is the production setting (job 9086); 64 is also
+the v9 mixture's cycle length, which `rollout_window_source_quotas` refuses
+to exceed.
+
+`act/traj` (~355), `trajectories`, `ended_fraction` (~0.85) and
+`think_format_fraction` (~0.80) were identical across every config and flag
+combination, which is what makes these throughput comparisons and not
+behaviour changes.
+
+### The three default-off decode flags, now A/B'd
+
+Their code comments in `postraining/vapo/config.py` each said "off until the
+A/B says so". It now says so, and the answer is no for all three:
+
+- `--rollout-flex-decode`: ~93k tok/s against the default ~113k, and a 93 s
+  first-repeat compile against 23 s. A regression.
+- `--rollout-flex-decode --rollout-graph-decode`: ~65k tok/s. A larger
+  regression.
+- `--rollout-tail-graph`: 117-125k against the default's 100-119k at the same
+  width, i.e. indistinguishable. Its warmup repeat matched the default's to
+  within 1% (16,554 vs 16,664 tok/s, 43.7 vs 43.5 s), which is what exposed
+  the warmup artifact in the first place.
+- `--rollout-scheduler continuous_refill`: raises `decode_step_utilization` to
+  0.83 from lockstep's 0.45 exactly as designed, but collects 2048 rows in
+  258 s against lockstep's ~6 s. The per-step scheduling and paged-attention
+  overhead swamps the utilization win by ~40x. Not viable at this model size.
+
+Note that `decode_step_utilization` is mean actions over the chunk's LONGEST
+trajectory, so 0.45 is an upper bound on wasted decode work rather than a
+measured loss — dead-row compaction claws some of it back, and `should_compact`
+disables itself only under a preallocated arena, which is what the flex and
+graph flags introduce.
+
+**Conclusion: generation is not the RL bottleneck.** At ~113k tok/s a
+1024-row pool of 768-token continuations collects in ~3.3 s. Any future
+optimization effort belongs on the replay/update half of the step, which
+`--rollout-only` does not exercise.
+
+### Full-step attribution (job 9087, production widths)
+
+`--rollout-only` measures generation alone. A real 60-step run at the chosen
+widths (64 prompts x 16 samples, `--rollout-groups 64`, 1024 rows/wave) gives
+the whole step. The two phases report under different keys, and they disagree
+about which half dominates:
+
+| phase | n | pool/total | rollout | update | rollout share |
+| ----- | - | ---------- | ------- | ------ | ------------- |
+| `value_warmup` | 50 | 7.14 s | 3.25 s (`collect_seconds`) | 3.80 s | 46% |
+| `train` (actor+critic) | 38 | 6.02 s (`pool_seconds`) | 3.69 s | 2.33 s (`seconds`) | 61% |
+
+Critic warmup is update-heavy; the real actor phase is rollout-heavy at 61%.
+The 3.69 s rollout is 1024 rows x ~355 actions / 3.69 s = ~99k tok/s, i.e. at
+the measured width ceiling already, so there is no width change left to make.
+A 40,000-step run is therefore ~67 h, and roughly 60% of that is generation
+running at its throughput limit rather than at a fixable inefficiency.
+
+Note the early `train` steps carry compile cost and are excluded above (first
+5 dropped); including them inflates the median pool time.
+
+## 2026-09-22 — SFT step 3.5x faster; v10 mixture; the latent RL mode is not what the docs say
+
+### Throughput
+
+The first 5,120-token SFT attempt (job 9132, `kda8_sft_ud2605_5k_v2_e1`) ran
+at ~380 ms/step and ~108k tok/s. That is a quarter of pretraining's ~454k
+tok/s on this card, so it was cancelled at step 1,161 of 22,099. Its
+`metrics.jsonl` stays as the eager reference loss curve (`CANCELLED.md`).
+
+Measured with `scripts/benchmark_sft_step.py`. It drives the trainer's own
+`SupervisedCE`, `accumulate_step_gradients` and optimizers on real packed
+rows of `sft_mix_ud2605_omi2_drills_v2.parquet`: 40,960 tokens per step, 10
+warmup steps discarded, 40 timed. Final losses agree across configurations
+to 2.2587-2.2595.
+
+| configuration                                     | ms/step | tok/s | peak alloc |
+| ------------------------------------------------- | ------- | ----- | ---------- |
+| old trainer (job 9132)                            | ~380    | ~108k | -          |
+| gathered readout, eager, 2x4 micro-batches        | 330     | 124k  | 15.8 GiB   |
+| compiled blocks, old whole-`forward` KDA fence    | 150     | 273k  | 3.8 GiB    |
+| compiled blocks, fence on the FLA kernel only     | 130     | 314k  | 3.3 GiB    |
+| same, 4x2                                         | 124     | 331k  | 6.3 GiB    |
+| same, 8x1 (job 9155; production)                  | 110     | 374k  | 9.4 GiB    |
+
+What each row changed:
+
+- **Readout.** The vocab head renders only supervised positions, gathered
+  by `index_select` on host-computed indices. It no longer renders
+  full-sequence logits masked after the fact. This drops the ~1/3 of packed
+  slots that carry no loss off the largest matmul, and removes the
+  boolean-mask sync and the dynamic shape.
+- **Compilation.** Each residual block compiles on its own, as pretraining
+  does. Readout, softcap and CE compile as one dynamic-shape region.
+- **KDA fence.** `torch.compiler.disable` used to cover all of
+  `KimiDeltaAttention.forward`, so its projections, short convolutions and
+  gated norm ran eagerly. It now covers only `_delta_rule`, the `chunk_kda`
+  call. That is worth 13% on its own.
+- **Micro-batch split.** The loss is normalised by the step-wide supervised
+  count, so the split is a pure memory knob. It is exact in fp32 (1e-7);
+  under bf16 the difference is ~2e-3 relative, from rounding. One micro-batch
+  is fastest.
+- **Host side.** Uploads are pinned and non-blocking. The loss is logged one
+  step late through a pinned async copy plus event, because `.item()` is
+  stream-ordered and would drain the queue.
+- **Tokenisation.** Encoding is batched through the HF fast tokenizer. It is
+  identical to per-document encoding on 40k real rows. Tokenising the
+  corpus takes ~3 min, where per-document preparation took ~13 min in total.
+
+Profile at 8x1 (job 9155): host/device wall ratio 1.00, so the GPU is
+saturated. Time splits as matmuls ~45% (the head GEMM runs at ~205 TFLOPS),
+FLA KDA ~25%, flash attention ~8%, CE ~7%, and the eager depthwise short
+conv ~5%. The conv is what is left. Fusing it changes shared numerics, so it
+is deferred.
+
+FLA's `disable_recompute=True` bought nothing here: 130.4 vs 130.5 ms at
+2x4, and 115.8 ms at 8x1 against 109.5 ms with recompute on. So the knob was
+not added; the call keeps `disable_recompute=False`.
+
+Review follow-ups:
+
+- All blocks share `Block.forward`'s code object. A single epoch already
+  needs exactly Dynamo's default 8 graphs ({KDA, attention} x {grad, no-grad}
+  x {full, tail micro-batch}). `SupervisedCE` now raises the budget to 64
+  inside a scoped `torch._dynamo.config.patch`, with
+  `fail_on_recompile_limit_hit`, so an unanticipated shape fails the run
+  instead of silently running the block eagerly.
+- `postraining/tests/test_sft_compiled_step_cuda.py` checks compiled against
+  eager per parameter (each < 5e-2 relative), a tail micro-batch, and the
+  no-grad holdout path.
+- The fence change also means Inductor now traces the KDA projections and
+  convolutions for the RL replay/critic compile, bolmo, and the few-shot
+  prefill. `kda_gpu_parity.py` re-ran to a new file,
+  `postraining/runs/kda_gpu_parity/result_kernel_fence_20260922.json`. The
+  script now takes `--output` and refuses to overwrite an existing result.
+
+### v10 RL mixture
+
+`vapo_broad_v9_bare` binds `sft_corpus_sha256` to the job 9040 corpus. The
+RL trainer requires that hash to equal the parent checkpoint's
+`traces_sha256`, so v9 cannot follow a v2-corpus SFT. `vapo_broad_v10_bare`
+is v9 rebuilt with `--sft-corpus
+postraining/data/sft_mix_ud2605_omi2_drills_v2.parquet`. The rows are the
+same; only the corpus binding differs. v9 is unchanged.
+
+### Latent mode discrepancy
+
+CLAUDE.md, the README and the launch script describe `latent` as
+deterministic hidden carry. That was v28 (ac2d67c). v29 (0969a9d) replaced
+it in `train_latent_vapo` with a stochastic policy: a forced Gaussian THINK
+action plus a Bernoulli stop gate. Deterministic carry now exists only on
+the MiniCPM path (`train_minicpm_vapo --token-carry`). v29 also needs
+`stream >= continuation + 1`, so at the checkpoint's 1,024-token RL context,
+256 prompt + 768 continuation does not fit. A KDA latent run needs one of
+two things: v28 carry restored as a versioned mode, or v29 with a shorter
+continuation or a longer RL context.
+
+### Stage 1 result: `kda8_sft_ud2605_5k_v2_e1_r2` (job 9182)
+
+- **Training:** 22,099 steps in 44.8 min (121.6 ms/step including 222 holdout passes), at ~517 W and 99% utilisation.
+- **Parity with the cancelled eager run:** holdout CE matches it to four decimals at every shared eval through step 1,100. The one exception is step 700, where eager reads 1.505 and the compiled run 1.459; the two agree again from step 800.
+- **Final holdout completion CE:** 0.9446. This is on this corpus's own holdout, so it is not comparable to job 9040's 0.466.
+
+Sampling gate on its own panel. 128 prompts x 8 samples, 448 prompt + 768 response tokens, T=1.
+
+| metric                  | this run | job 9040 (own panel) |
+| ----------------------- | -------- | -------------------- |
+| accuracy                | 0.086    | 0.262                |
+| mixed-prompt fraction   | 0.219    | 0.398                |
+| prompts all wrong       | 100/128  | 70/128               |
+| structural format       | 0.453    | 0.849                |
+| ended within 768 tokens | 0.458    | 0.859                |
+| emitted tokens (mean)   | 539      | 344                  |
+
+The panels differ, and they cannot be crossed. The new corpus contains OMI2, so job 9040's held-out problems may sit in its training split, and `sft_gate_eval` refuses cross-corpus panels for exactly that reason. The gate therefore does not say this checkpoint is worse. What it does show is behavioural: over half the samples never close their answer within 768 tokens.
+
+The 35 unterminated transcripts in the capture are not repetition loops (median zlib ratio 0.43, against 0.56 for terminated ones). They are long, unfocused imitations of the UltraData/Nemotron think style ("Actually... Let's check..."), cut off by the budget. That is the likely cost of training on traces up to 5,120 tokens and then gating and RL-ing at 768.
+
+The matched comparisons are:
+
+- the arithmetic probe (`data/math_drills/v4/probe.jsonl`, same settings as job 9040's `arith_probe_kda8_sft_e1`);
+- `train_latent_vapo --bench-only` on the DeepMind interpolate panel. It runs only that panel; AIME is not in it. Both corpora are decontaminated against the panel.
+
+Read those before choosing a stage 2 base.
+
+### `--reasoning-mode carry`: deterministic hidden carry restored
+
+`carry` is the v28 contract under new schemas: execution
+`..._deterministic_hidden_carry_token_only_generator_token_rng/v30`, replay
+`compact_token_logprob_next_slot_hidden_carry_exact_replay/v5`, rollout policy
+`deterministic_hidden_carry/v2`, input `zero_init_hidden_residual_prenorm_mlp/v2`.
+The `cot`, `latent` and `none` schema bytes are unchanged, and a test pins
+them. The belief that produced token t is stored detached at t's slot and fed
+through the zero-init combiner when t is consumed. Replay reads the stored
+beliefs, never recomputed ones. The critic has its own combiner. Carry is
+lockstep-only and refuses the thought-sigma and stop-probability flags. At
+zero init its rollout is bitwise the `cot` rollout.
+
+Verification:
+
+- **CPU tests:** `test_hidden_carry.py` (26 tests) plus the affected suites give 414 passed. Covered: nonzero-combiner rollout vs replay on nano and KDA, where zeroing the carry moves log-probs by more than 100x the tolerance; left padding, split/pack, compaction and the static tail; per-row isolation for actor and critic; resume refusal of v1 and cross-mode checkpoints.
+- **Red-team (independent subagent):** no defect found in alignment, replay, gradient flow, resume or mode plumbing. Its one real gap was that nothing ran a whole carry rollout through the compiled decode step, which is the production path. Parity section 7 now does, with and without the CUDA-graph tail.
+- **GPU parity, job 9192, sections 1-6:** carry rollout-vs-replay log-prob error 0.0080, beside cot's 0.0077 on the same trunk; stored carry vs replayed belief 0.025; compiled vs eager carry step 0.015 (logits) and 0.017 (belief). Section 7 is job 9208.
+- **Section 5 fails** (Stable LatentMoE, not used by this lineage; the SFT checkpoint has no expert weights). `moe_bf16_decode_vs_dense` reads 0.540 against a 0.5 bound, and `moe_bf16_compiled_paged_vs_eager` reads 0.459 against 0.02. No recorded run of section 5 has passed: the only earlier result (July) predates it, and HEAD's script died in section 2 before reaching it. The kernel-fence change does not touch this: section 5 runs eager `forward` and compiles only `paged_step_core`, which uses `step`. A logit gap of that size is consistent with top-2 routing flips under bf16 rounding. That diagnosis is not verified, and the bound was not loosened.
+
+The launch script's `rl-carry` stage is `rl` with `--reasoning-mode carry`
+and its own run name: same SFT checkpoint, mixture, arguments and seed.
+
+### SFT exact resume, end to end on GPU (job 9194)
+
+The same 766-step run was trained straight through, and separately SIGTERMed
+at step 38 and resumed.
+
+- **The resume works:** the first leg exited 75 with the step-38 checkpoint, and the metric streams have identical keys (784 entries each).
+- **It is not bitwise identical on GPU, and resume is not the cause:** the two runs already differ at step 2 (about 1e-4 train loss), 36 steps before the resume point, so the compiled GPU step is nondeterministic from run to run. The gap around step 38 stays at that noise level. By step 766 chaos has amplified it to a 0.004 difference in holdout CE.
+- **Division of evidence:** bitwise exactness is established by the CPU test (`test_resume_state_continues_training_exactly`, which fails with the optimizer-state restore removed); the GPU run establishes the SIGTERM/exit-75/resume plumbing.
+- **Practical noise floor:** about 0.004 holdout CE separates identical SFT runs at this scale.
+
+### Matched comparison: the 5120-token stage 1 is worse; stage 2 stays on job 9040
+
+Same panels, settings and seed for both checkpoints.
+
+| metric                                  | job 9040 | `_r2` (job 9182) |
+| --------------------------------------- | -------- | ---------------- |
+| arithmetic probe, 1,920 items (T=0)     | 0.516    | 0.368            |
+| probe structural format                 | 0.920    | 0.931            |
+| probe unterminated at 512 tokens        | 152      | 132              |
+| DeepMind interpolate avg@8 (job 9203/9204) | 0.018 | 0.005            |
+| interpolate mixed-prompt fraction       | 0.083    | 0.042            |
+| interpolate mean emitted tokens (of 768) | 375     | 550              |
+
+- **Probe:** the gap is about 10 standard errors. `_r2` is lower on 13 of 15 families and ties the other two at 0.000 (`mul_decimal`, `percent_change`). The biggest losses are `sub_decimal` 0.648 -> 0.133 and `sub_integer` 0.859 -> 0.398. Format and termination are unchanged, so this is lost arithmetic, not truncation.
+- **Interpolate:** both checkpoints sit below the modal-answer baseline (0.021), so this panel only supports the direction.
+- **Diagnosis, measured from the corpora:** drills fell from 83M tokens (28.2% of 293M) to 50M (6.8% of 738M). Two thirds of the new corpus is UltraData think traces averaging 1.8k-2.5k tokens (OMI2 subset 45.9%, Nemotron-Cascade 19.9%), so drill steps are both fewer and a smaller share of each step. The longer, unfocused responses on both panels are what imitating those traces looks like inside a 768-token budget.
+- **Decision:** stage 2 (cot, then carry) starts from `kda8_sft_omi2_drills_e1` with the v9 mixture. That checkpoint was trained in the same 1,024-token window RL uses, and the v9 hash binding was exercised by job 9203. The `_r2` checkpoint is kept as the context-extension negative result. A later 5,120-token attempt would need drill share restored and a response budget that matches the traces it imitates.
+
+### Stage 2 cot launched: `kda8_vapo_cot_v9` (job 9223)
+
+Launched with `scripts/launch_kda8_posttrain.sh rl`: job 9040 base, v9
+mixture, 64 prompts x 16 samples, 768 response tokens.
+
+- **Matched setup:** the step-0 bench, 0.0182 on DeepMind interpolate, reproduces job 9203 exactly.
+- **Step time:** 9.1 s (about 6.5 s collect plus 2.3 s update). 40,000 steps is about 101 h, not the 67 h estimated earlier.
+- **The learnability gate was missing:** the "39.84% mixed prompts" the launch comment cites is job 9040's SFT gate on OMI2 holdout problems, not a frozen-policy gate on this mixture. The first 18 pools stand in for that gate:
+
+| source         | groups/pool | reward | within-group std | ended | mean actions |
+| -------------- | ----------- | ------ | ---------------- | ----- | ------------ |
+| deepmind_easy  | 48          | 0.021  | 0.055            | 0.93  | 264          |
+| dapo           | 8           | 0.010  | 0.032            | 0.74  | 540          |
+| ultradata_math | 8           | 0.008  | 0.025            | 0.63  | 590          |
+
+- **Reading the table:** a 1-of-16 group has std 0.24, so roughly a fifth of groups carry advantage signal. That is sparse but not absent. dapo and ultradata_math also run out of budget on a quarter to a third of samples.
+- **Cull rule, fixed before looking:** at step 1,000, and again at 2,000, compare held-out interpolate policy accuracy and deepmind_easy pool reward against step 0. Stop the run if neither has risen beyond noise, rather than spend four days of the card.
+- **Carry arm:** `rl-carry` follows only if cot shows learning. A carry-vs-cot comparison on a policy that is not learning measures nothing.
+
+
+### Parity section 7: carry through the compiled decode step (job 9208 retry)
+
+The unmasked tensor-position `torch.narrow` path cannot trace fullgraph
+(`Could not guard on data-dependent expression Eq(u0, 0)`), so section 7 feeds
+left-padded ragged prompts with `prompt_lengths`, as `upload_chunk` does.
+Only the sequential `--rollout-groups 0` branch reaches the narrow path; that
+is a latent problem for non-default configs, not for production.
+`result_compiled_carry_rollout_20260922_v2.json`: compiled rollout vs replay
+log-prob error 0.0275 (cot) and 0.0342 (carry) against a 0.5 bound; carry
+stored hidden vs replayed belief 0.114 against 0.25. The CUDA-graph-tail
+variant gives identical maxima.
+
+### `kda8_vapo_cot_v9` collapsed because its critic never left its prior; cancelled at ~step 274
+
+- **Symptoms by step 250:** mean think tokens fell from 276 to 58 and the think-format fraction from 0.84 to 0.67. Gate-zeroed correct samples rose from 0 to 1.2%. Bench answers degenerated toward `\boxed{0}`, and mean emitted tokens on interpolate fell from 375 to 64. Bench 0.0182 -> 0.0252 is inside noise at 64 tokens and is not learning evidence. AIME stayed at 0 -> 0. Pool reward went from about 2.0% to 2.2%.
+- **Root cause:** the HL-Gauss head bias was initialized to the log-probs of a point prior at 0 with a 1e-6 floor, so every bin outside roughly [-0.02, 0.02] started at logit -13.8. AdamW at 2e-5 moves a bias by about 2e-5 per step.
+  - The decoded value mean was 6e-5, constant over all 50 warmup steps and 270 RL steps. Explained variance was 0.000, and excess CE was 0.1-0.2 nats throughout.
+  - The critic parameters did train, but slowly: all 142 moved, by at most 0.008. Head bias went from -0.961 to -0.966, and head weight RMS from 8e-4 to 5e-3.
+- **Mechanism:** with V ≈ 0 the advantage is ≈ reward, so the update only reinforces correct samples. The positive contribution was about 2.5e-3 against about 4e-5 negative. Correct samples are short, so the policy learned their length rather than their correctness.
+- **Kept:** the run directory and its checkpoints, as the negative result.
+
+### Scalar critic replaces HL-Gauss (`CRITIC_SCHEMA scalar_zero_init_linear_unclipped_mse/v1`)
+
+- **Head and loss:** `SeparateCritic.head` is `Linear(model_dim, 1)` with zero weight and zero bias, read in fp32. It trains by unclipped, token-weighted squared error against the lambda-one (Monte Carlo) return; the actor's advantages still use length-adaptive lambda.
+  - Under Adam a zero head's output moves by about lr x ||belief||_1 per step through its weight. That is about 0.008 per step at 2e-5 for 512 post-norm features with a consistent-sign component, so the ~2% marginal is within a few updates rather than hundreds. That lr x ||belief||_1 figure is an upper bound (it assumes the mean belief is sign-coherent across tokens). Measured on CPU with a whole 512-wide fresh critic at 2e-5 AdamW against a natural 2.5% Bernoulli marginal: 0.0029 after one step, 0.0196 after 5 and 0.0294 after 8, then settling to 0.0228 by step 50 (`test_scalar_head_fits_the_success_marginal_at_the_production_rate`). That settles the marginal only. A from-scratch trunk at 2e-5 moves its embeddings about one init std only after about 1,000 steps, so state-dependent value comes from a linear probe of near-random features. Warmup explained variance on the real pool is the measurement that decides whether the critic rate has to rise.
+- **Removed:** `hl_gauss.py`, its test, `scripts/compare_hl_gauss_cpu.py`, and the five `--value-*` support flags.
+- **Resume:** refuses any checkpoint without the critic schema, so categorical critics are never migrated.
+- **Dashboards:** `value/token_weighted_mse` replaces `value/token_weighted_excess_ce`.
+- **Audited alongside:** there is no gradient-norm clip and no value clip anywhere on this path. `build_optimizers` now asserts that actor and critic share no Parameter and no storage; the critic trunk is a fresh random instance from `fresh_trunk`.
+- **If this does not fix it:** the next suspects are the critic learning rate (default = actor 2e-5, AdamW for head, combiner and embeddings, Muon for trunk matrices) and the fresh trunk's init. The decision gate is warmup explained variance and prediction mean against the target mean.
+
+### Training-rollout transcripts and `scripts/` cleanup
+
+- **Transcripts:** `postraining/rollout_report.py` replaces `scripts/render_minicpm_responses.py`. It renders both MiniCPM TensorBoard text samples and the KDA trainer's own captures (`<run>/rollout_samples/step_XXXXXX.json`, `training_rollout_samples/v1`, re-rendered into `<run>/rollout_samples.html`). Every `--rollout-sample-every` steps (default 25, step 0 included) the trainer keeps one correct and one incorrect trajectory per source.
+  - **Picks:** a hash of (step, prompt, row), not first match. The collector scores groups shortest prompt first, so first-match picks showed only the easiest problems.
+  - **Verdicts:** `score_math_rollout` and `score_python_rollout` now return a `RowVerdict` per row, and the transcript stores that verdict and the verifier's own prediction rather than re-parsing, so it shows exactly what was graded.
+  - **Steps:** each capture also records `metrics_step` (= step + pool updates), the step at which that pool's rollout metrics are logged.
+  - **Resume:** captures at or after the resume step are purged.
+- **`scripts/` cleanup:** no directory restructure, because manifests hash script paths and tests and package code import `scripts.<name>`. `scripts/README.md` is now a domain index.
+  - **Deleted with `git rm`, as superseded or dead:** `compare_hl_gauss_cpu`, `render_minicpm_responses` (and its test), `rbf_bench`, `benchmark_components`, `run_kda18_dense6_ablation`, `run_optimal_gdn2_ablation`, `benchmark_qwen35_sglang` and `benchmark_qwen35_vllm`.
+  - **Path fixes:** ten MiniCPM scripts and two tests still referenced the pre-move `postraining/minicpm_vapo.py`; they now use `postraining/vapo/policy.py`. Old controller-geometry artifacts recorded under the old path key may be refused.
+- **Relaunch:** `kda8_vapo_cot_v9_scalar` (job 9240) started after the scalar-critic CUDA tests passed (job 9239, 274 tests).
+- **Cancelled and resumed (2026-09-22):** job 9240 was cancelled at RL step ~10 on warmup explained variance ~0 (prediction mean 0.0097 against target 0.0176 at warmup step 50; EV -0.005 to +0.001 through RL step 9). That was premature: think tokens (263-287), think-format (0.81-0.84) and emitted length (~770) showed no collapse, and a from-scratch trunk is expected to need many steps before it resolves state-dependent value on a ~2% reward. Job 9245 resumes it from the post-warmup step-0 checkpoint with identical arguments and the default critic rate.
+- **VAPO on critic init (`papers/vapo_2504.05118v3.pdf`, sections 4.1 and 5.1):** the critic is never random. It is initialized from a reward model (a full pretrained LM), then value-pretrained on a fixed policy (pi_sft) with Monte Carlo returns "until key training metrics, including value loss and explained variance, attain sufficiently low values", saved, and loaded for RL; the reported config is a 50-step warmup. Critic lr is 2x the actor's (2e-6 vs 1e-6). Without value pretraining VAPO collapses like vanilla PPO (shorter responses, answering without reasoning; AIME24 11 vs 60). The init bias VC-PPO identified comes from the reward model's EOS-scoring objective, which a zero-init head on a copied trunk would avoid. Our 50-step warmup is fixed-count rather than EV-gated, and our trunk is random, so both depart from the paper; the paper says nothing about embedding-only init.
+- **`--critic-init {scratch,actor}` (2026-09-22):** `actor` starts the critic trunk from `model_io.copy_trunk`, a storage-independent copy of the actor as loaded at run start (base checkpoint or `--actor-init`/`--curriculum-init` weights), behind the same zero head. Default stays `scratch`, so job 9245 is unchanged. The manifest's `critic.init` records `scratch`, `actor_copy` or `warm_checkpoint`; a resume now carries the recorded block forward from the resumed run's manifest, in place or from the checkpoint's own directory when resuming into a new one (previously a resume of an `--actor-critic-init` run relabelled it `scratch`), and refuses a contradicting `--critic-init`. Refused with `--actor-critic-init` and for LatentMoE actors. Not yet run.
