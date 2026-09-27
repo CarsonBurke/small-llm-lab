@@ -8464,3 +8464,1825 @@ variant gives identical maxima.
   - The DG paper's token-reversal runs used a sequence-level empirical-mean baseline, with no per-token critic noise. None of Osband's three DG papers (2603.14608, 2603.20521, 2603.20526) has LLM experiments.
   - TPO (2604.06159, Appendix E) notes that DG has no trust region, and shows DG's cross-context coefficient vanishing as beta ~ p_n on hard contexts.
 - **Implication:** with an EV ~0 critic, DG's token-level gating needs either a trustworthy advantage or a sequence-level one. For an all-fail group, a group-mean baseline gives exactly zero advantage and so no noise.
+- **Superseded:** the step-683 measurement below refutes the sequence-level fix; the entropy push is intrinsic to DG, not specific to critic noise.
+
+### DG entropy diagnostic at step 683: the group-baseline fix is refuted (2026-09-22, job 9246)
+
+- **Tool:** `postraining/diagnose_dg_entropy.py` (CPU tests in `postraining/tests/test_diagnose_dg_entropy.py`).
+  - It collects one mixture pool (48/8/8 prompts x 16 samples) from the checkpoint through the training rollout, `score_math_rollout`, `refresh_old_statistics` and length-adaptive GAE.
+  - It reports two first-order entropy-change proxies per emitted token, each proven exact for a tabular softmax by the tests:
+    - natural, c (l - H);
+    - softmax, c [pi_a (l - H) + sum_k pi_k^2 (log pi_k + H)].
+  - The coefficients c are DG and 0.5 * PG, each on critic GAE and on a group baseline (R - group mean R). CIs are a 95% bootstrap over prompt groups.
+  - Output: `postraining/runs/kda8_vapo_cot_v9_scalar/dg_entropy_diagnostic/step_000683.json`.
+- **Pool:** 1,024 trajectories, 2.44% correct, 132k emitted tokens.
+  - Mean surprisal 3.786 and mean entropy 3.796: on-policy consistency holds, and entropy is up from a surprisal of 2.55 at step 500.
+  - Failed-token critic advantage: mean -0.0040, std 0.0105, 29.2% positive.
+- **Per emitted token, natural proxy [95% CI]:**
+  - dg_critic: failed +1.06e-4 [+5.2e-5, +1.6e-4]; total -3.5e-6 [-1.5e-4, +1.1e-4].
+  - pg_critic: failed -2.4e-5 [-8.0e-5, +3.2e-5]; total -3.59e-4 [-6.7e-4, -1.2e-4].
+  - dg_group: failed +3.23e-3 [+5.4e-4, +7.4e-3]; total +4.11e-3 [+6.0e-4, +9.0e-3].
+  - pg_group: total -6.5e-4 [-1.4e-3, -7.9e-5].
+  - The softmax proxy agrees in sign: dg_critic +2.1e-5, pg_critic -2.2e-5, dg_group +5.1e-4, pg_group -4.6e-5 (totals).
+- **What this shows:**
+  - The noise term exists as predicted. DG on failed-trajectory critic noise pushes entropy up, and the matched 0.5 * PG control does not.
+  - The general cause: DG's coefficient c(l) = U sigmoid(U l / eta) has dc/dl = U^2 sigmoid'(U l / eta) / eta >= 0 for either sign of U. It always weights surprising tokens more than PG does: more credit on success, less blame on failure.
+  - Relative to 0.5 * PG, that is an entropy bonus of about E[U^2 Var_pi(l | s)] / (4 eta) for small U l, with per-state varentropy, whether U is signal or noise.
+  - At first order, DG does not create a rise here. Its excess over 0.5 * PG (natural +3.55e-4) cancels PG's sharpening (-3.59e-4), leaving a dg_critic total of about 0, and the two proxies disagree on its sign.
+    - PG's sharpening sits mostly in the correct cell, which rests on a handful of groups at 2.44% correct.
+    - So DG removes the sharpening, and whatever drives the observed rise lies outside these local proxies: shared-parameter spillover, optimizer geometry, state drift.
+  - **Group baseline:** it is not a fix at any eta.
+    - Scaling U and eta together scales c and 0.5 * PG alike, so the fair comparison is at matched gate strength |U| / eta.
+    - At eta = 1, the group-baseline DG excess is 7.3x (natural) and 12x (softmax) PG's sharpening, against about 1.0x and 1.9x for critic GAE.
+    - At eta ~ 6, which matches |U| / eta to critic GAE (group |U| is about 6x larger), the linearised ratio is about 1.2x, no better than critic GAE.
+    - The sequence-level fix therefore moves none of this mechanism, and **it was not implemented.**
+  - These are sums per group, so an eta sweep needs per-token tensors, which the v1 output does not keep.
+  - The render-versus-replay surprisal mismatch was 0.395 at its maximum, and only the maximum was recorded (v2 records signed mean and RMS). Near-zero totals like dg_critic's are within that uncertainty; the large group effects are not.
+- **Open, and not measured here:**
+  - Under Muon, whose update size is set by the orthogonalization and not by gradient magnitude, a pool gradient that is mostly noise (EV ~ 0, 2.4% correct) still becomes a full-size step.
+  - That weight-space random walk may drive the entropy rise more than the first-order bias does, which is about 0 in total for dg_critic here.
+  - The discriminating measurement is the cosine between actor gradients from two independent pools at the same checkpoint.
+- **Action:** the run was resumed unchanged from step 683 as job 9247.
+  - The alternatives for a follow-up are:
+    - the clipped VAPO actor objective (`--no-delightful-policy-gradient`), whose PG control is entropy-decreasing here;
+    - a gradient-SNR measurement before choosing.
+
+
+### DG under sequence rewards: the reference code, the author's own failure mode, and a simulation (2026-09-22)
+
+- **Question:** for the restart of `kda8_vapo_cot_v9_scalar` from job 9040 with `--critic-init actor`, keep DG on critic GAE (option 1), switch DG to the author's group baseline (option 2), or drop DG.
+- **Reference code** (google-deepmind/egg, `egg/losses/dg.py`):
+  - The default is `use_grouped_baseline=True`: the advantage is R minus the group mean, broadcast to every answer token.
+  - The gate is sigmoid((chi - lambda)/eta) on the stop-grad current-policy surprisal, and the loss is token-mean.
+  - Its DPG task is token reversal over vocab 2, with a **sequence-scalar** reward (fraction correct, optionally to the first error). Every token is causal. The paper uses eta = 1.
+- **The author's own failure mode** (Osband, 2603.20526 section 4.2, Prop 3):
+  - When an action has sigma/Delta >> 1, lucky draws look like breakthroughs, and delight amplifies them. DG collapses sharply where PG degrades gracefully.
+  - "No per-sample statistic computed from (R, pi) can distinguish a genuine breakthrough from a lucky draw."
+  - A sequence reward broadcast to tokens puts every weakly causal token in exactly this regime. For a non-causal token in a group with success rate p, PG's expected coefficient is 0, while DG's is p(1-p)[sigmoid((1-p) l) - sigmoid(-p l)] > 0 (checked by Monte Carlo). At high p, DG's negative gate also shuts off the blame for junk tokens that cause the remaining failures.
+- **Simulation:** `postraining/sim_dg_sequence_credit.py`, CPU only (it hides the GPU; Adam's graph-capture health check otherwise opens a CUDA context).
+  - Setup: 64 prompts x 16 samples, Adam, 1500 steps, 3 seeds. Outputs are in the session scratchpad and not kept.
+  - Tabular policy: DG never beat PG on any task, including egg's.
+  - A red-team review found no bugs, but pointed out that a tabular policy cannot show DG's claimed shared-budget benefit. So a **residual MLP** policy was added, with the same initial distribution and every context sharing parameters.
+  - With the MLP, the paper's claim reproduces. Final accuracy, lr 1e-3, eta 1:
+
+    | task | pg_group | dg_group | pg_gae | dg_gae |
+    |---|---|---|---|---|
+    | sequential (egg, first error) | 0.717 | **0.877** | 0.671 | **0.889** |
+    | graded (egg) | 0.962 | 0.983 | 0.963 | 0.993 |
+    | lottery (filler non-causal) | 0.986 | 0.970 | 0.969 | 0.984 |
+    | chain_rare (1 rare causal token) | 0.979 | 0.974 | 0.931 | 0.864 |
+    | chain (3 causal tokens) | 0.942 | 0.885 | 0.882 | 0.708 |
+    | coherence (junk mildly harmful) | **0.980** | 0.378 | **0.965** | 0.562 |
+    | chain_coherence | **0.955** | 0.336 | **0.866** | 0.422 |
+
+  - DG wins where PG collapses prematurely onto wrong tokens and every token is causal. Filler entropy is 0.05 for both there, but PG locks in errors.
+  - DG loses catastrophically once junk tokens carry any small cost. Filler entropy goes from 1.0 to 2.4-2.9 and coherent mass falls from 0.96 to 0.41. This is the shape seen in the real runs (v9 surprisal 0.88 -> 3.8; v5 9.2).
+  - **Learning rate does not change the picture** (coherence / sequential final accuracy):
+    - lr 3e-4: DG group 0.53 vs PG 0.97 / 0.85 vs 0.69.
+    - lr 3e-3: 0.33 vs 0.99 / 0.87 vs 0.71.
+    - Tabular Adam at twice DG's lr made DG worse. Tabular SGD tuned per estimator also kept PG ahead (0.965 vs 0.83-0.89).
+  - **Raising eta trades the benefit away** rather than finding a sweet spot (MLP, lr 1e-3):
+
+    | eta | coherence DG group / gae (PG 0.980 / 0.965) | sequential DG group / gae (PG 0.717 / 0.671) |
+    |---|---|---|
+    | 1 | 0.378 / 0.562 | 0.877 / 0.889 |
+    | 4 | 0.590 / 0.907 | 0.767 / 0.787 |
+    | 16 | 0.959 / 0.962 | 0.737 / 0.722 |
+
+  - **Unstable lr (1e-2, MLP):** PG itself collapses onto junk (coherence 0.166, filler entropy 0.06), and only DG at eta 16 survives (0.986). DG at large eta is a robustness hedge against an over-aggressive step, not a credit-assignment improvement.
+- **Option 1 vs option 2:**
+  - Critic-GAE DG beat group-baseline DG on every junk-token task, in both parameterizations and at every eta. This agrees with the step-683 diagnostic (group excess 7-12x PG sharpening vs 1-2x).
+  - The mechanism is lambda decay (0.95^k): it shrinks |U| on early tokens and so acts as a larger, position-dependent eta. The real trainer has the same decay (lambda 0.95-0.974).
+  - Option 1's own cost, zero-mean critic noise becoming positive entropy drift of about l sigma^2 / (4 eta), grew only slowly with value noise in the toy (tabular 0.752 -> 0.690 at noise 0.01 -> 0.3).
+  - **Option 2 is dominated. Neither DG option is recommended at eta = 1.**
+- **Superseded:** the entry below traces the junk-token failure to non-token-specific advantages, not to DG, and the restart keeps DG with a lambda-0 actor.
+- **Verdict (confidence about 75%; the toy is not the LM):**
+  - Restart with the clipped VAPO actor (`--no-delightful-policy-gradient`) plus `--critic-init actor`.
+  - PG's known risk in this toy is premature collapse onto wrong tokens, so watch sampled-token entropy/surprisal for a collapse, not a rise.
+  - If DG is kept, use option 1, not option 2.
+  - No matched DG vs VAPO comparison in this lineage justified making DG the default (commit 0288aed).
+
+### DG needs token-specific advantages: oracle critic, lambda 0, and the `kda8_vapo_cot_v10_dg_td0` restart (2026-09-22, jobs 9268, 9277)
+
+- **Question:** the verdict above ("neither DG option at eta = 1") rested on broadcast group advantages and long-lambda GAE. Is the junk-token failure intrinsic to DG, or to the advantage it is given?
+- **Audit:** a subagent compared the trainer's DG loss with egg's `dg.py` line by line (gate, surprisal, slots, mask, denominator, on-policy, no extra actor terms). They match. There is no DG code bug.
+- **Mechanism:** DG's coefficient U sigmoid(U l / eta) is nonlinear in U. Luck that is not caused by the token (independent of it) enters U as zero-mean spread, and DG turns that into a bias of about l Var(U) / 4 toward rare tokens, i.e. entropy ascent. PG is linear in U, so the same luck is only variance. That is why the luck hurts DG and not PG.
+  - The papers' DG has no critic. egg broadcasts a group-mean baseline, but its tasks are vocab 2 with every token causal, so there is no non-causal luck to amplify. Our per-token GAE critic is inherited from VAPO.
+  - Under an exact critic, a lambda-0 (TD(0)) advantage is exactly zero for a non-causal token. Later TD errors have zero conditional mean (martingale), so the "leak" from lambda > 0 carries information only to the extent the critic is wrong. That is the lambda bias/variance trade.
+- **Simulation** (`postraining/sim_dg_sequence_credit.py`, now with `{pg,dg}_oracle` estimators on exact E[R | prefix]; MLP policy, Adam lr 1e-3, eta 1, 3 seeds, final accuracy / filler entropy):
+
+  | oracle critic | coherence PG | coherence DG | sequential PG | sequential DG |
+  |---|---|---|---|---|
+  | exact, lambda 0 | 0.999 / 0.11 | **0.996 / 0.09** | 0.699 | **0.837** |
+  | exact, lambda 0.5 | 0.999 | 0.995 | 0.697 | 0.817 |
+  | exact, lambda 0.8 | 0.998 | 0.983 / 0.43 | 0.704 | 0.830 |
+  | exact, lambda 0.95 | 0.993 | **0.709 / 2.08** | 0.693 | 0.829 |
+  | shrink 0.1 + noise 0.01, lambda 0 | 0.983 | 0.965 / 0.90 | 0.679 | 0.733 |
+  | shrink 0.3 + noise 0.01, lambda 0 | 0.994 | 0.985 | 0.705 | 0.760 |
+  | shrink 0.3 + noise 0.01, lambda 0.8 | 0.989 | 0.929 | 0.707 | 0.823 |
+
+  - With token-specific advantages, DG matches PG on the junk-token tasks and keeps its sequential win (chain_coherence at lambda 0: 0.991 vs 0.998; lottery 0.997 vs 0.995).
+  - The same exact values at lambda 0.95, the trainer's length-adaptive range, reproduce the entropy blow-up. Lambda, not DG, is the failure.
+  - DG tolerates iid value noise of 0.01 per state (coherence 0.994). With a partial (shrunk) critic, a longer lambda buys sequential credit at a coherence cost, as the trade predicts.
+- **Choosing the actor lambda:** minimize the MSE of A_t(lambda) as an estimate of the token's own effect. With v the per-step luck variance and s^2 the iid critic error variance, the optimum solves lambda / (1 - lambda)^2 = s^2 / v (r 0.1 -> 0.08; r 1 -> 0.38; r 10 -> 0.73).
+  - The ratio is not reliably measurable: it moves as the policy and critic change, and critic shrinkage is invisible to the TD-error autocovariance.
+  - DG's cost of variance is bias (entropy), while PG's is only noise, so DG wants the low-variance end. The chosen setting is **actor lambda 0**, with critic targets kept as lambda-1 returns. With an EV ~0 critic no lambda helps; the critic has to learn.
+  - Historical risk: TD(0) over a bad critic produced the think-fraction ratchet. That is why the run is monitored for calibration (below).
+- **Implementation:**
+  - `--actor-gae-lambda` (fixed actor lambda; `core.actor_gae_lambdas`), which is resume-exact. Critic targets are unchanged.
+  - Telemetry `credit/td0_calibration_slope`: MC advantage regressed on the TD(0) advantage. It is about 1 for a calibrated critic, about 1/2 when critic noise dominates, and above 1 when the critic under-reacts.
+  - Telemetry `credit/failed_advantage_surprisal_corr`: advantage vs. sampled-token surprisal on the emit slots of trained failed rows. Positive means the critic is paying a rarity pseudo-reward that DG amplifies.
+  - Both are pooled from float64 sums and omitted when undefined.
+  - `diagnose_dg_entropy.py` schema v3 adds `--lambdas` and critic EV.
+  - A red-team review found no blocking bugs. Its three low findings were fixed: rows zeroed by the source gate are excluded, sums are resolved in float64, and undefined statistics are omitted rather than logged as 0.
+- **Critic gate (job 9268):** `--critic-init actor`, 300 online warmup steps, `--steps 0`. EV by 50-step block: 0.0013, 0.0060, 0.0069, 0.0080, 0.0063, 0.0084.
+  - The critic learns the mean (token-weighted target mean ~0.013, about 2% of rollouts correct) and little else.
+  - For scale: prompt identity explained ~12% of reward variance in-sample in the step-683 pool, inflated by 16-sample noise, so a critic that fully learned problem difficulty would reach roughly 0.05. The warm critic is far below that.
+- **Restart (job 9277, `postraining/runs/kda8_vapo_cot_v10_dg_td0`):**
+  - It starts from `--actor-critic-init postraining/runs/kda8_critic_gate_actor_w300/critic_warmup_checkpoint.pt` (SFT job-9040 actor, warm critic, cursor 19200) with `--actor-gae-lambda 0`, DG at eta 1, and otherwise the v9_scalar arguments. It replaces `kda8_vapo_cot_v9_scalar`.
+  - Watch: EV rising above ~0.01, the calibration slope toward 1, the surprisal correlation near 0, and sampled entropy / surprisal against v9's 0.88 -> 3.8 rise.
+  - A weak critic at lambda 0 means little credit for think tokens. The expected failure is slow learning, not entropy growth.
+  - The lambda diagnostic on the warm checkpoint (job 9276) is held so it does not delay the run.
+
+
+## 2026-09-22 — v10 degraded; DG's only difference from PG is a sign-blind rare-token push
+
+Scripts and outputs: session scratchpad `dgref/` (`ref_egg.py`, `port_torch.py`, `port_batched.py`, `sim_think_length.py`; red-team scripts in `dgref/redteam/`). CPU only; no GPU time used.
+
+- **v10 (job 9277) outcome: degraded; cancelled by request at step 491.**
+
+  | steps | think tokens (intact fences) | think-format | ended | accuracy | surprisal | EV |
+  |---|---|---|---|---|---|---|
+  | 1–50 | 257 | 0.833 | 0.886 | 0.020 | 1.21 | 0.011 |
+  | 301–350 | 139 | 0.751 | 0.891 | 0.028 | 0.78 | 0.026 |
+  | 401–437 | 123 | 0.599 | 0.860 | 0.018 | 0.84 | 0.011 |
+
+  - Bench: 0.0095 at step 0, 0.0139 at step 250. AIME stayed at 0.
+  - Late samples are repetition loops ("-5k-5k-5k…", "Therefore, Δ < 5 or Δ < 5…") and a shared phrase ("Using algebra 5") across unrelated prompts.
+  - `think_tokens_mean` counts intact fences only. From step 350 on, the decline is format and termination breakdown rather than early `</think>`.
+  - Gate means were 0.4978 (negative advantage) and 0.5022 (positive) throughout. With |A| ~0.01 at eta 1, that is automatic and not diagnostic. Surprisal *fell*, so v10 does not show DG's aggregate entropy fingerprint.
+  - v9_scalar (lambda ~0.95) does show it: surprisal 1.0 -> 3.9 while the positive gate mean rose 0.503 -> 0.527. Its think length fell 194 -> 74 *before* surprisal rose.
+  - The calibration slope logged by 9277 (~0.72) predates the terminal-slot exclusion fix.
+- **Reference check: our DG loss reproduces the paper.** Token reversal (M=2, H=10, reward to first error), 10x10 batch, Adam 1e-4, 1000 steps, median sampled sequence error:
+
+  | friction | egg DG | egg REINFORCE | port DG (prod loss) | port PG |
+  |---|---|---|---|---|
+  | none (5 seeds) | 0.005 | 0.951 | 0.007 | 0.560 |
+  | bugs pE=3e-3 (15 seeds) | 0.010 | 0.747 | 0.023 | 0.675 |
+  | corruption pR=0.01 (5 seeds) | 0.006 | 0.671 | 0.008 | 0.522 |
+
+  - egg's REINFORCE fails by committing to deterministic wrong answers (entropy ~0.001).
+  - One residual port gap is unexplained: on bugs, 9/15 port DG seeds reach error < 0.05, against 15/15 for egg.
+- **Identity:** U·σ(U·s/η) = U/2 + (U/2)·tanh(U·s/(2η)).
+  - DG is half of PG plus a term that is even in U: it pushes the sampled token up whatever the sign of the outcome, in proportion to |U| and to the token's surprisal. This is the only way DG differs from PG.
+  - It is not baseline-invariant. An error d common to all actions at a state pushes rare tokens up for either sign of d (red-team derivation).
+- **That term is DG's benefit on reversal** (port, 3–5 seeds):
+  - DG at eta=100 (gate linear) loses the win: none 0.357, bugs 0.987.
+  - dgsym, which gates on |U|·s so the coefficient is odd in U, is PG-level on none (0.53–0.75).
+  - PG with the importance ratio plus only the sampled U²·s/(2η) term ("taylr", red team) recovers DG's greedy win (bugs and none, greedy error ~0.00–0.01).
+  - Reversal scores every answer token causally, so the rows with large |U| are rows whose rare tokens caused it.
+- **The same term is the proposed think-length mechanism** (`sim_think_length.py`, a tabular stop logit, early `</think>` rare at s ≈ 7, success q(L) rising to 0.04 at L*=48). Early-stop probability, starting from 0.041:
+
+  | credit | PG | DG | dgsym |
+  |---|---|---|---|
+  | group baseline (sequence) | 0.019 | 0.070 | 0.032 |
+  | oracle TD(0) | 0.003 | 0.004 | 0.004 |
+  | oracle + critic noise sd 0.1 | 0.021 | 0.999 (length 48 -> 8) | 0.021 |
+
+  - With exact group accounting (red team; G=16, p=0.03, s=7), DG reinforces a rare action once its success rate exceeds about 0.36p, while PG requires more than p.
+  - Once stopping at t is common, stopping at t-1 becomes the new rare lucky action, so the collapse cascades.
+  - The red team reproduced the collapse under per-state fixed, per-step, and pure-offset critic errors, so the noise model does not build the result in.
+- **Not established:** the production magnitude.
+  - Full collapse in the toy needs TD noise about 10x v10's scaled level. The sparse group-credit toy only drifts.
+  - There is no matched PG arm: every kda8 cot run had DG on.
+  - Pre-DG PG runs 1024/1025 also collapsed length (382 -> 16), but from a base with a taught terse mode. Truncation (11–17% unterminated rows) favours shorter output under PG too.
+- **Retracted:**
+  - "Decoupled DG" (critic-TD gate x leave-one-out group magnitude) is not a fix. Its expected sign follows Q − V0, not Q − V(h), so it is biased whenever V(h) ≠ V0, and it lost DG's reversal win (none 0.53, bugs 0.998).
+  - PG plus a U²-weighted exact-entropy bonus ("pgent") failing on bugs was a confound: it had no importance ratio.
+  - Port critic runs at lambda 0/0.8 trained the critic on lambda-matched targets instead of the production lambda-1 targets. They are quarantined in `dgref/out/invalid_critic_lambda_targets/`; the fixed rerun is pending.
+- **Next (GPU):**
+  1. Step-0 direction test on one pool. Project g_DG, g_PG and g_DG − g_dgsym onto ∇ Σ log π(`</think>` | h) at think positions, bootstrapped over groups. Split the DG − PG part into |delight| > 1 tokens and the rest, and compare E[A | `</think>`] with continue at matched positions.
+  2. A matched PG / DG / dgsym trio from the same start for ~300 steps, measuring think length over all rows.
+  3. `port_batched.py`, the whole reversal grid in one ensemble process. It is FLOP-bound on CPU (~3 s/step for 165 members).
+
+### Correction: the actor-lambda-0 prediction for v10 was wrong (2026-09-22)
+
+The entry "DG needs token-specific advantages" above concluded "Lambda, not DG, is the failure". It chose actor lambda 0 and predicted that v10's failure would be "slow learning, not entropy growth". **Both claims are refuted.** v10 degraded: think length fell, format and termination broke, it fell into repetition loops, and it produced a shared phrase across unrelated prompts.
+
+v10 telemetry by 50-step block (`kda8_vapo_cot_v10_dg_td0/metrics.jsonl`):
+
+| blocks | EV | td0 calibration slope | advantage std | positive gate mean |
+|---|---|---|---|---|
+| all 10 blocks | 0.006–0.025, never rose | 0.69–0.74 | 0.011–0.016 | 0.5014–0.5027 |
+
+- **Calibration slope:** 0.5 means critic noise dominates and 1 means calibrated. The failed-advantage/surprisal correlation stayed between −0.03 and 0.02.
+
+Why the prediction failed:
+
+- **It rested on an oracle toy.** The toy's lambda-0 win used exact E[R | prefix]. Its own partial-critic row (shrink 0.1, lambda 0) already showed DG degrading, and the production critic (EV ~0.01) was worse than any toy row. The entry even said "with an EV ~0 critic no lambda helps", then predicted a benign failure anyway.
+- **Lambda 0 swaps reward luck for critic error; it does not remove non-causal credit.** A think token's advantage becomes V(s') − V(s), so the actor ascends the critic's own function.
+  - A learned critic's errors are systematic: the same function scores similar states the same way across prompts. They accumulate instead of averaging out as iid noise would. A pattern shared across prompts is what that predicts.
+  - This is the same failure as the earlier TD(0) think-fraction ratchet, which was listed as a risk and underweighted.
+  - Critic exploitation is a hypothesis. It has not been measured; that needs critic values on the looping and shared-phrase states.
+- **v10 barely exercised DG.** With |A| ~0.01, A·s/η is small for nearly every token, and the positive gate mean was 0.502. v10 was effectively PG/2 on TD(0) credit from a near-useless critic.
+  - Its failure is evidence about TD(0) over a bad critic. It is not evidence about DG.
+  - Its surprisal falling does not clear DG either.
+- **Lambda 0 could not have fixed DG in production anyway.** DG's nonlinearity engages only where |A|·s is order 1. In this pool (about 2% success) that is essentially the rare successful rows under lambda ≈ 1 credit: A ≈ +1 there, so the gate rises toward 1 on their rare tokens. This is the same terminal-reward, rare-success regime as TPO Table 3.
+  - Lambda 0 shrinks those rows to |A| ~0.01, which removes DG's effect together with the think tokens' only real credit. It removes credit; it does not repair DG.
+  - Inference to verify: v9's positive gate mean rose only 0.503 -> 0.527, so any DG effect there must concentrate in a small set of tokens. The step-0 direction test, split by |delight| > 1, is the check.
+
+### Scale-aware DG gate temperature (RMS(A) or baseline b): wins where every token is causal, not a production fix (2026-09-23, jobs 9306–9307)
+
+- **Hypothesis:** with eta fixed at 1 and sparse reward, |A| is ~0.01–0.02 on failures, so the failure gate sits at ~0.5 and only the success-row gate is active (DG paper Prop 1: w- <= pi(a)^(b/eta)). Setting the gate temperature from the batch's own advantage scale should activate the gate and recover DG's benefit.
+  - `dgrms`: eta_eff = eta * RMS(A) over the batch's tokens, zero advantages of all-equal groups included.
+  - `dgbase`: eta_eff = eta * b. For group advantages, b is the prompt's group-mean reward, so a binary-reward failure has A / eta_eff = -1 / eta (Prop 1's regime). For critic advantages, b is the critic's value level.
+  - The magnitude stays the raw A; only the gate temperature changes.
+- **Analytic expectation at success rate p << 1 (batch baseline):**
+  - dgrms gives failures |A| / eta_eff = sqrt(p / (1 - p)) ≈ 0.14 at p = 0.02, so their gate stays near 0.5; mostly the success gate saturates.
+  - dgbase is the variant that activates the failure gate (σ(-s)).
+  - Reversal gate telemetry agrees. Failure-token gate mean ± std, episodes 1–100, H=7: dg@3 0.500±0.001, dgrms 0.487±0.018, dgbase 0.377±0.091.
+- **TPO Table 3 reversal proxy** (reverse-copy, V=2, terminal all-correct reward, 20 seeds x 2000 episodes, Muon; scratchpad `da621980…/scratchpad/tporepro/`, `out/r1`, `out/r1scale`). Last-100 error, paired-by-seed differences ± SE:
+  - **dg reproduces the paper:** H=7 final 35.5% vs 33.8%; H=8 60.0% vs 58.8%.
+  - **The gate beats matched PG at one epoch.** The epoch-matched REINFORCE control pg1 fails (97.2%, 99.2%); dg - pg1 = -61 ± 9 pp (H=7) and -39 ± 8 pp (H=8).
+  - **Grouped DG:** gdg reaches 1.8% / 1.2% against gpg1 31% / 66%. Every grouped scale variant sits at 0–2.4%, so the grouped arms cannot separate the variants.
+  - **Single-sample:**
+
+    | H | dg eta 1 | dg eta 0.03 | dgbase eta 1 | dgbase eta 3 | dgrms | dgrms eta 0.3 |
+    |---|---|---|---|---|---|---|
+    | 7 | 36.7 | 3.6 | 25.2 | 5.4 | 40.8 | 36.0 |
+    | 8 | 60.2 | 5.6 | 43.6 | 4.8 | 50.2 | 47.9 |
+
+    - dgbase at eta 1 is not significant against dg: -11 ± 11 pp (H=7), -17 ± 10 pp (H=8).
+    - dgbase at eta 3 is: -31 ± 10 pp and -55 ± 8 pp.
+    - **dgbase at eta 3 cannot be told apart from a fixed eta of 0.03** (+1.9 ± 3.1 pp, -0.8 ± 3.2 pp). On reversal, the gain comes from a sharper gate, and adapting it to the batch adds nothing.
+  - Operational: `tpo.runtime.bootstrap_runtime()` crashes on the CUDA-13 `nvidia` namespace-package layout, so the runner now sets only its XLA autotune and compilation-cache variables. The full grid runs in minutes on the GPU, not hours.
+- **Junk-token toy** (`postraining/sim_dg_sequence_credit.py`, new `dgrms_*` / `dgbase_*` estimators plus gate telemetry; MLP policy, Adam 1e-3, 1500 steps):
+  - **eta 1, 3 seeds, with a pool-mean b for gae** (superseded by the critic-level b below):
+    - sequential: pg 0.71, dg 0.88, dgrms 0.99, dgbase 0.99 (group).
+    - coherence: PG 0.98 (group) / 0.97 (gae); every DG variant 0.38–0.56, filler entropy 2.4–2.9.
+    - The scaled gates are more active (group failure gate 0.27 -> ~0.10; gae 0.37 -> 0.18–0.30). They lift the group collapse only slightly (coherence 0.38 -> 0.45–0.47).
+    - dgrms normalizes critic noise up to O(1) in the gate, so a larger eta does not rescue it: coherence stays at 0.39–0.65 through eta 8. It remains the best sequential estimator at every eta. It is dropped for critic advantages, where noise dominates.
+  - **dgbase with b = the critic's running mean, 6 seeds, partial-critic oracle** (shrink 0.5, noise 0.01, lambda 0.95). Final accuracy / filler entropy:
+
+    | task | pg gae | dg gae 16 | dgbase gae 16 | dgbase gae 32 | pg oracle | dgbase oracle 16 |
+    |---|---|---|---|---|---|---|
+    | sequential | 0.722 | 0.726 | **0.827** | 0.799 | 0.720 | **0.807** |
+    | coherence | **0.970** / 0.73 | 0.963 / 0.91 | 0.954 / 1.05 | 0.961 / 0.93 | **0.987** / 0.49 | 0.977 / 0.75 |
+    | chain_coherence | **0.878** / 0.72 | 0.869 / 1.00 | 0.853 / 1.21 | 0.863 / 1.03 | 0.955 / 0.46 | 0.961 / 0.76 |
+
+    - At eta 16–32, dgbase is Pareto-better than fixed-eta DG. Against PG it gains 8–10 points on sequential and loses about 1 point of junk-task accuracy, with 0.2–0.5 nats more filler entropy.
+    - Large eta partly just interpolates toward PG: under Adam, σ -> 0.5 is a constant factor.
+- **Why this does not transfer to production:**
+  - The filler-entropy excess is created early. dgbase_gae coherence at eta 16 goes 1.00 -> 1.29 by step 250, then decays in parallel with PG, while success is low and eta_eff = eta·b is small.
+  - In the toy, success climbs within a few hundred steps, so b grows and the gate cools. Production success stays near 2% for the whole run (v9, v10). So dgbase there is effectively a fixed eta of about 16–32 x 0.02 ≈ 0.3–0.6, held permanently in the entropy-raising phase.
+  - That is a sharper gate than v9's eta 1, which already showed the entropy blow-up (surprisal 1.0 -> 3.9).
+  - The reversal proxy cannot test this risk because every token is causal there. Its win is the sharp gate's win, which is exactly what makes non-causal luck expensive.
+- **Verdict:** not qualified for a full training run. Neither the RMS nor the baseline temperature separates signal from luck, since both only rescale the gate.
+  - dgbase at large eta is the best DG form measured in the toy. A production test would need a regime where b rises, or a matched short PG/DG/dgbase trio from job 9040 with sampled-token entropy as the stop criterion.
+  - These are toy results, and the mechanism paragraph is an argument, not a measurement.
+- **Decision (2026-09-23): PG.** The restart uses the clipped VAPO actor (`--no-delightful-policy-gradient`), launched as job 9314 in `postraining/runs/kda8_vapo_cot_v11_pg`.
+  - The command is v10's with `--actor-gae-lambda 0` dropped, so the trainer's length-adaptive default applies. Lambda 0 was a DG-specific fix, and it failed.
+  - The production critic's EV is about 0.01, which matches the toy's mean-only `gae` arm. There PG was best on every junk-token task, and every DG variant raised filler entropy.
+  - Reward-mean DG becomes competitive only with a critic that knows state values (the partial-oracle arm). Revisit it if critic EV rises well above 0.01.
+  - The full reversal grid (job 9308) was cancelled at H=8 with these partial results:
+    - dgsym H=7 80.3% vs dg 35.5%, which refutes the failure-blame hypothesis.
+    - gdgclip 29.3% vs gdg 1.4%, so multi-epoch clipped DG hurts.
+    - gdgz 1.1%, so GRPO normalization makes no difference to grouped DG.
+    - TPO 0.0% (paper 6.9%), GRPO 15.3% (14.5%), PPO 21.1% (12.0%; the gap is unexplained).
+  - Watch sampled-token entropy and surprisal for premature collapse (PG's toy failure mode), think length over all rows, EV, and the bench panel against step 0.
+
+## 2026-09-23 — Full UltraData Math RL pool (v3), DAPO rebuilt to yield (v2), mixture `vapo_broad_v11_exact`
+
+Hypothesis: the 2,306-row `ultradata-math-rl-v2` pool used 10% of the
+UltraData-RL-2609 Math domain. The whole domain can replace it, provided the
+UltraData and DAPO pools do not serve the same problem under two names. No
+GPU work. The artifacts:
+
+- `postraining/data/ultradata-math-rl-v3.parquet` (19,865 rows, sha256 `2d2468a5…`)
+- `postraining/data/dapo-math-17k-v2-ud3dedup.parquet` (8,408 rows, sha256 `70ce9d37…`)
+- `postraining/data/vapo_broad_v11_exact.manifest.json`, which passed the builder's exact-overlap refusal
+
+### Source
+
+`verifiable_mixed_10k_20260917` already converted all 32,412 published Math
+records (four shards whose hashes match `PUBLISHED_COUNTS`). It kept 23,635
+source-eligible rows and dropped:
+
+- 6,884 rows with an unverifiable text target
+- 1,879 rows with an unverifiable question structure
+- 14 non-atomic rows
+
+After 263 duplicate prompts and 11 conflicting-prompt quarantines, 23,361 rows
+remained across both splits, so no new download was needed. The v2 builder
+deduplicated only by `original_query_sha256` and missed 143
+whitespace-identical rows.
+
+### UD vs DAPO overlap by matcher
+
+This is `postraining/problem_overlap.py` on canonical problems, UD 23,355
+canonicalizable vs DAPO 17,390, before any filter:
+
+| matcher | DAPO rows matched | answer agreement |
+|---|---|---|
+| raw prompt (pre-canonicalization) | 0 | – |
+| whitespace/case on canonical prompt | 5,193 | 0.961 |
+| LaTeX skeleton, not already whitespace-matched | +300 | 0.983 |
+| 8-token shingle containment (c >= 0.3, k >= 6, digit guard), not already matched | +809 | 0.670 |
+| total | 6,302 of DAPO (36%), 6,110 UD rows | |
+
+Sensitivity of the total to the thresholds:
+
+- c >= 0.5: 6,185
+- c >= 0.2: 6,356
+- k >= 4: 6,315
+
+The total is flat because most mass sits in the exact and skeleton tiers.
+
+Shingle-tier "disagreement" is mostly not label noise. DAPO rewrites answers
+into integers ("... in the form \frac{m}{n} ... provide m + n"; 1/4 against
+5). So agreement measures the answer transform, not match precision.
+
+### Calibration
+
+Manual inspection of matched pairs, bucketed by containment:
+
+- c >= 0.5: about 95% are the same problem.
+- 0.3–0.4: 18 of 20 are the same problem.
+- 0.2–0.3: about 13 of 20. The false positives share template fragments at k = 5–7.
+
+Other calibration findings:
+
+- Pairs with k of 4–7 are about half false positives (BALLOONIST/TARTAR, "Gugu napkin"), hence k >= 6.
+- The digit-multiset guard separates sibling variants: the same sentence with 100 instead of 200. At the chosen thresholds without the guard there are 259 UD / 289 DAPO such pairs. Only 9% of them agree on the answer, so they are different problems and are kept.
+- Fixes made during calibration:
+  - Template clauses shared by more than 10 problems in a pool are ignored: DAPO's m+n clause is on about 640 problems and UD's Chinese "原始的答案是…" on about 310. This cut 0.5–0.6-band pairs from 19,955 to a handful.
+  - CJK text is tokenized per character. The ASCII rule matched unrelated Chinese problems on their subscripts.
+  - The skeleton keeps `+ - = < >`. `(x+y)^2dx - …` and `… + …` had collided.
+- Known false negatives: English/Chinese translations of one problem, and heavy paraphrases below c = 0.3.
+- About 220 whitespace-identical cross-source pairs carry different labels. Where checked, UD had the corrected label: the 1996 AIME locker problem is 342 in UD against 1024 in DAPO, and "visionary integers" is 88 against 2020. That is why UD owns the overlap.
+
+Within UD, the chosen rule puts about 2,656 rows in near-duplicate pairs:
+
+- 143 whitespace duplicates
+- conflicting labels, such as 380 vs 382, and Bob's binary string at 30 vs 19
+
+A first build used union-find components and quarantined any component whose
+targets disagreed. A red-team review of it found that this cost 595 UD rows
+and 242 DAPO rows while catching almost no label errors:
+
+- 219 of the 242 conflicting UD components were joined only by shingle edges.
+- 86 of the components were answer-form rewrites, where both labels are right for their own question.
+- A sample of 12 shingle-only conflicts held 7 rewrites, 5 symbolic siblings, and 0 label errors.
+- 25 components were chains, not cliques. One shingle edge fused a clean 4-copy "∫ sin x/x^a converges" cluster with a different e^{-ax}/(x²+1) problem, and the whole component was lost.
+
+The revised policy, which is the one built here, works in two tiers:
+
+- **Same text** (equal skeleton): agreeing targets collapse to the lowest identity; disagreeing targets quarantine the group.
+- **Shingle**: a row collapses only into an earlier kept row it matches directly with an agreeing target. No chaining. A different target is kept as a distinct question.
+
+The same review found:
+
+- 430+ DAPO rows with a form-feed byte: `\f`-escape corruption ("\x0crac{m}{n}") mixed with ligature loss ("\x0crst"). The two cannot be separated by rule, so these rows are dropped, never repaired.
+- The skeleton erased `^`, `/` and decimal points, so it now keeps them.
+
+The first build's artifacts were never consumed. They are staged outside the
+repository, not deleted.
+
+### Ownership
+
+UD owns every shared problem. DAPO yields to all UD Math *candidates*, not
+only to the screened pool, so a problem that UD quarantined for a label
+conflict does not return under DAPO's label. What DAPO keeps after yielding
+(8,619) is not negligible, so DAPO stays as a residual source.
+
+The final pools overlap as follows:
+
+- UD v3 vs DAPO v2:
+  - whitespace 0, skeleton 0
+  - shingle 6 with pairwise templates, all different problems on inspection. Examples: two regions enclosed by different equations; Chinese problems sharing only a "答案应为" answer clause.
+- Either pool vs `deepmind_easy`: 0 under every matcher, with or without template filtering.
+
+### Screens
+
+Both pools pass the screens in `postraining/math_rl_pool.py`, in this order.
+
+| screen | UD v3 | DAPO v2 |
+|---|---|---|
+| input | 23,361 | 17,390 |
+| uncanonicalizable (literal `Answer:`) | 6 | 0 |
+| C0 control byte | 72 | 643 |
+| target fails self-verification | 0 | 0 |
+| eval 8-gram / exact contamination | 859 | 1,317 |
+| containment of GSM8K-RL / KodCode | 1 | 1 |
+| prompt > 256 GPT-2 tokens | 458 (2.0% of measured) | 568 (3.7%) |
+| yielded to UD | – | 5,268 (4,344 whitespace, 248 skeleton, 676 shingle) |
+| same-text copies collapsed | 633 | 490 |
+| same-text label conflicts quarantined | 8 rows | 10 rows |
+| shingle near-duplicates collapsed (agreeing target) | 1,459 | 685 |
+| shingle neighbours kept (distinct target) | 260 pairs | 103 pairs |
+| kept | 19,865 | 8,408 |
+
+Prompt tokens are measured with BOS on problems that reach the budget screen:
+
+- UD: median 77, p90 161, p99 304
+- DAPO: median 85, p90 187, p99 371
+
+The contamination screen is the SFT corpora's rule unchanged: exact match, or
+any shared word 8-gram with AIME 2024/2025/2026, GSM8K test, or the DeepMind
+bench. It over-rejects competition math:
+
+- Of UD's 866 hits (before the control-byte screen), none exceeds 0.38 containment of an evaluation problem. All 20 sampled hits are false positives on AIME boilerplate such as "m and n are relatively prime positive integers. Find m+n" and "is not divisible by the square of any prime".
+- DAPO has exactly one true hit: containment 1.0 of AIME 2026's "Patrick started walking …".
+
+The rule was kept for consistency with the project's single eval-contamination
+definition. The rows it costs are AIME-style problems this policy cannot yet
+solve.
+
+The mixture cycle is 100,017 prompts:
+
+| source | rows | share |
+|---|---|---|
+| deepmind_easy | 71,744 | 71.7% |
+| ultradata_math | 19,865 | 19.9% |
+| dapo | 8,408 | 8.4% |
+
+v10 was 71,744 / 2,306 / 17,390.
+
+### Open issue: verifier brittleness on UD targets
+
+8,538 of the UD v3 targets are not plain integers or decimals. For 1,857 of
+them (9.3% of the pool) a trivially equivalent rendering scores zero under the
+trainer's Minerva normalization:
+
+- `\dfrac{5}{6}` against `\frac{5}{6}` or `5/6`
+- `\[ 2047 \]` against `2047`
+
+`normalize_final_answer` has no `\dfrac` fold. Those rows reward only the
+target's exact rendering. All DAPO v2 targets are integers. The fix belongs in
+the verifier, as a versioned reward change, not in the pool. Not done here.
+
+## 2026-09-23 — UltraData Knowledge (STEM) for SFT and RL: adapter, 2,048-token cap, benchmark-question screen
+
+This supersedes "UltraData SFT is gated, so it is not in the pipeline" (under
+"Model-agnostic VAPO library, and KDA post-training"):
+the Code/Math think split already had an adapter, and now the Knowledge
+think split does too. No GPU time was used. The built artifacts, with the
+answer balancing, GPQA and science pools that followed, are under "Final
+artifacts" at the end of this entry.
+
+**Data on disk.** All 50 shards of `data/think/Knowledge` (13.9 GB, 499,667
+two-turn records) at revision `affda6ac` are in
+`instruction_corpus_shards/ultradata_sft_2605_hf`. Every shard matches the
+hub's `lfs_sha256` (`knowledge_think.sha256.json`). MMLU `all`
+test/validation/dev (`c30699e8`) and MMLU-Pro test/validation (`b189ec76`) are
+in `postraining/data/stem_eval_decontam` with a verified `manifest.json`, and
+they are for screening only. GPQA was missing at first (gated); it was
+added later the same day, see "Final artifacts". Before this, the only
+verifier-ready STEM data on disk was UltraData-RL-2609 Knowledge, and there
+was no local MMLU, MMLU-Pro, GPQA, ARC, SciQ or OBQA.
+
+**What the Knowledge split is.** It is keyword-classified as 45% chemistry,
+22% math, 16% physics, 4% biology and 3% engineering. About 0.07% of it
+contains CJK, and every record's `source` is the dataset name, so there is no
+upstream provenance. The records fall into these categories:
+
+| Category | Share | How the adapter treats it |
+|---|---|---|
+| Untemplated MC | 35.2% | Dropped: it concludes in dozens of free styles |
+| Templated MC | 30.8% (154,111 rows) | Admitted |
+| Free-form | 22.8% | Dropped: no gradeable answer |
+| MC with options missing | 10.8% | Dropped |
+
+A templated MC row has a two-line header that declares the labels and a
+`'<prefix> $LETTER'` conclusion (8 prefixes, used equally). Its presented
+answer ends by filling that template in. Among the templated rows:
+
+- Label styles are split evenly: upper 52.9k, lower 51.0k, digit 50.2k.
+- Separators are split evenly too: `:` `)` `.` `-` each about 38k.
+- Most rows have 8 options (94.9k) or 10 (47.1k).
+- The 160-character identity duplicates 1.5% of them.
+
+**The traces are long.** The median templated document is 5,070 tokens (p10
+1,932, p90 11,617), which is longer than the traces that diluted the 5,120 run
+(2026-09-22). Here is what each document cap keeps:
+
+| Cap (tokens) | Documents kept | Share | Tokens |
+|---:|---:|---:|---:|
+| 1,024 | 1,035 | 0.7% | 0.9M |
+| 2,048 | 18,061 | 11.7% | 28.6M |
+| 3,072 | 39,958 | 25.9% | 84.3M |
+| 5,120 | 77,893 | 50.5% | 238.8M |
+
+At 5,120 this one source would match the whole 293.8M-token canonical mix.
+The adapter therefore carries a per-source `max_doc_tokens=2048`, which binds
+under any `--seq-len`, and the manifest records it.
+
+**Most templated traces talk about the header this contract removes.** The
+header is stripped from the prompt, but the teacher's reasoning still quotes
+it, for example "Final line: 'The correct answer is $LETTER'" or "Respond with
+a single symbol from A-H". Training on those traces would teach the model to
+answer an instruction it never sees. A first scratch build (17,958 documents,
+28.5M tokens) found that 75.6% of admitted traces contained `$LETTER`, and a
+review caught it. `choice_prompt.cites_answer_format` now drops any row whose
+reasoning cites `$LETTER`, a "last/final line", "without quotes", a
+"required/answer/output format", or "the instructions". It leaves "The user
+wants ..." restatements alone. With the screen in place, the end-to-end scratch
+build (`--seq-len 5120`, GPQA patched out) produced **2,803 documents and 4.35M
+tokens** (median 1,592) from 499,667 rows. The drops were:
+
+- 343,992 not templated;
+- 99,720 whose reasoning cites the answer format;
+- 51,460 over the cap (26,463 over length, 24,670 by the prefix probe, 327 by the character bound);
+- 1,182 with no single-label conclusion;
+- 382 with malformed framing;
+- 63 caught by the math-eval index;
+- 28 with a fence literal;
+- 27 with a completion that was too short;
+- 4 duplicates;
+- 3 caught by the benchmark-question screen;
+- 2 caught by the KodCode/GSM8K containment.
+
+**This is small, and it is skewed.** Answer positions are b 32%, c 28%,
+d 15% and a 13%, while chance is about 12%, so SFT would teach a B/C prior.
+Options can be permuted only where the trace's label references are provably
+complete; the balancing that follows is under "Final artifacts". The answer
+span is the label exactly as the prompt shows it (`b`, `2`, `B`). Before the
+format screen, a 2,048 cap kept 43% chemistry, 24% math and 17% physics.
+
+A larger clean source would be the 35% of *untemplated* MC rows. They never
+saw a header, so their traces cannot cite one, but they conclude in dozens of
+free styles, and a label extractor for them would need its own verified
+conclusion grammar. That is not built.
+
+**The benchmark-question screen is a new rule, not the 0.30 containment.**
+Exam stems are short and formulaic. At 0.30, the containment rule flagged 86
+RL Knowledge queries, and every inspected one shared only phrasing ("which of
+the following statements best describes the") with a short MMLU question.
+Distinctive-gram filtering alone does not fix it at small n. With 5-grams at
+0.4–0.5, UltraData's own boilerplate ("statements accurately describes a") is
+rare in MMLU and still matched.
+
+`contains_benchmark_question` works in two steps. First it checks for an exact
+normalized match of the problem or of its question stem. Then, over 8-grams
+that occur in at most 3 benchmark questions, it flags a candidate that holds
+≥60% of a question's distinctive grams, for questions with at least 4 of them.
+A verbatim-substring test for shorter questions was tried and removed: "Which
+of the following is not a true statement?" (an MMLU question with 2
+distinctive grams) rejected fluorescence problems.
+
+Results against MMLU and MMLU-Pro:
+
+| Measurement | Result |
+|---|---|
+| RL queries flagged | 0 of 11,872 (the highest scored 0.5, on phrasing only) |
+| SFT templated rows flagged | 10 of 154,111, all genuine (quartic k=86, the variable-force integral, Larmor frequency, Bob's die) plus one generic exact stem |
+| Recall, stem rendered with options | 2,000/2,000 |
+| Recall, embedded after a prefix sentence | 83% (the misses are the 21% of questions with <4 distinctive grams) |
+| Recall, one mid-sentence word changed | 47% |
+
+Paraphrase is not caught. That is the limit of a text screen.
+
+**The RL pool (`scripts/build_ultradata_knowledge_rl_prompts.py`, dry run,
+GPQA unscreened) has 2,413 rows.** 2,320 are single-choice: 1,980 with 10
+options, 321 with 8, 15 with 7 and 4 with 9. The other 93 are numeric. The
+builder:
+
+- parses options with `choice_prompt.split_options`;
+- resolves the target by label or by unique option text, and resolves it to nothing when both name different options, which avoids 14 wrong letters from digit labels over numeric options, such as truth "3" with an option "4: 3";
+- drops duplicate option texts (4), cross-references in options or the question (262, e.g. "none of the above"), and repeated question stems (35);
+- permutes options with a content-seeded RNG, so the answer position is uniform (modal letter 11.3% against a source skew of B 818 to J 241);
+- renders options as `A. option` lines;
+- grades one exact upper-case letter (`rule` → `exact`).
+
+The other drops were 7,127 free-text targets, 2,007 rows over the 256-token
+prompt budget and 20 unresolved targets. Chance accuracy is 10.4%, reported
+per `choice_{k}` module. Forty-four raw RL queries overlap SFT Knowledge stems
+from the pre-screen build. That is train/train overlap, not evaluation
+contamination, but a stage-2 run that uses both sources should exclude one
+from the other. The mixture
+source `ultradata_knowledge` is **off by default**. MiniCPM5-1B scored 0.39%
+on this slice, and a 64M model is likely at chance on graduate STEM MC, so run
+a frozen gate that shows accuracy above chance before any RL. Otherwise mixed
+groups come from lucky letters and carry no signal.
+
+### Final artifacts: answer balancing, GPQA screen, science pools
+
+**GPQA is a screen target only.** `Idavidrein__gpqa` at revision `83022cef`
+is in `stem_eval_decontam`: extended 546, main 448 and diamond 198 rows (main
+and diamond are subsets of extended), each file matching the hub's git blob
+hash. Its terms were accepted; it is CC BY 4.0 and must not be republished.
+Everything under `postraining/data/stem_eval_decontam` is evaluation-only:
+`shard_paths` and `prepare_vapo_mixture` refuse any path under it, and
+`tests/test_benchmark_isolation.py` fails if:
+
+- a declared input lies under it;
+- a GPQA question, bare or rendered with its options, passes the production
+  screen;
+- a built Knowledge or science artifact holds a GPQA question.
+
+The SciQ, ARC and OpenBookQA validation and test splits are in the same
+directory and were added to `STEM_QUESTION_TARGETS`, which now holds 15
+targets and 36,469 texts.
+
+**SFT answer balancing, first build (superseded).** `sft_ultradata_knowledge_v1`
+(630 documents, 109 relabelled) was built under looser proof rules. A
+subagent red team then checked all 109 relabelled pairs against their
+originals, and **27 were contradictory**. The trace's label and the
+option it named no longer agreed after the permutation. The final rules close
+these classes of error:
+
+- a label-shaped token that was not an option: an article, a variable or a
+  quantity (`B = 0.5 T`);
+- `(X)` and `**X**` taken as proofs of a reference;
+- a keyword on the previous line vouching for a label on the next;
+- quoted, possessive, `$`-, brace- or underscore-adjacent labels (`'D'`,
+  `__D__`) that the tokenizer did not see and so left unrenamed;
+- keyed labels outside the row's label set, which silently stayed put;
+- positional wording ("the last two options", "the former").
+
+The byte-exact inverse round trip could not catch any of these. It only
+proves the tokenization is stable, not that the renamed token meant an
+option. v1 was never used. It and the matching RL v1 files are staged in the
+session scratchpad, not deleted.
+
+**SFT answer balancing, final rules.** A row is relabelled only when every
+standalone label token in its trace, including quoted, possessive, `$`- or
+brace-adjacent ones, is provably an option reference. A token that is an
+article ("a force") or is followed by `=`, `<`, "stands for" and similar
+never counts. The only proofs are:
+
+- a keyword directly before the label, on the same line ("option B", "answer
+  is B");
+- `\boxed{B}` for letter labels;
+- a line that restates the option as label, separator and that option's
+  text;
+- a list continuing a proven reference, with no clause following.
+
+A row is refused when any of these holds:
+
+- the trace names a label the row does not have;
+- the trace, question or options use positional wording ("the last option",
+  "the former");
+- the question or an option refers to options itself (cross-reference
+  phrases, bare label lists);
+- an option text holds any non-article label token;
+- digit-labelled options contain label numbers.
+
+Only **26 of 1,526** rows that pass the format and trace screens qualify
+(1.7%). The main refusals are unprovable "a"/"A" (373 + 309) and "1" (98).
+`balance_choice_answers` is unchanged: exact per-option-count balance, with
+unrelabelable rows at their position and relabelable rows filling the
+deficits. The coordinator kept exact balance over yield, because the tokens
+are negligible next to the 293.8M-token base mix.
+
+**Additional screens in the final build:**
+
+- `cites_answer_format` also catches quoted answer phrases ("'The answer
+  is'"), "format the conclusion as", "concluding sentence", "a specific
+  format", "end with 'The correct option is'", and a capitalised `LETTER`
+  placeholder. It drops 103,407 rows.
+- A new `defective_trace` drops traces:
+  - that never state the label in their last 300 characters (2,972);
+  - whose text degenerates into a 20+ repeat of a short unit (6);
+  - that end in sentence debris such as ".ted" (10).
+- Deduplication for this adapter uses `choice_identity`: the casefolded
+  question plus the sorted option texts. The same question under A–H and 1–8
+  labels, or with reordered options, is one problem. The manifest's
+  `deduplicated_by` now records the identity per corpus.
+
+Result: **235 documents, 379,353 tokens, 26 relabelled.** Answer positions
+went from a 195, b 462, c 421, d 237, e 93, f 42, g 37, h 15, i 11, j 16 to
+a–h 25–27 each, i 13, j 13 (i and j exist only with 10 options). By option
+count:
+
+| Options | Rows before | Relabelable | Documents |
+|---:|---:|---:|---:|
+| 10 | 368 | 3 | 131 |
+| 8 | 1,022 | 18 | 89 |
+| 7 | 91 | 5 | 15 |
+| 5, 6, 9 | 25, 2, 21 | 0 | 0 |
+
+With no relabelable rows, the balanced size of the 5-, 6- and 9-option groups
+is zero, because some position in each has no source rows. I read all 26
+relabelled pairs against their originals. Every renamed token names the
+same option text as before, and every conclusion and `<answer>` follows. One
+cosmetic effect remains: a trace that walked the options in order now walks
+them in shuffled label order.
+
+**RL option-text rule.** The first Knowledge RL v1 build let options such as
+"All of A, C, D, E, G, and H" through, and the shuffle breaks them. It was
+never used and was replaced the same day. `choice_rl_pool.choice_problem`
+now:
+
+- drops bare label references (label lists, or an option that is just a
+  label) against both the rendered letters and the source labels;
+- drops positional references ("the previous statement", "any former");
+- drops a rendering that does not parse back to the same options (SciQ's
+  "E. coli ..." questions read as an option line).
+
+The narrower `POSITIONAL_REFERENCE` is used rather than the SFT's
+cross-reference phrase, because "all of these" survives any shuffle. The
+tokenizer fixes above made the label-list rule stricter. Rebuilt as
+`ultradata-knowledge-rl-v2`, it drops 14 more rows than v1, and every other
+row is byte-identical:
+
+- 2 are true positional references;
+- 12 are false positives: math that collides with labels, such as `$G/H$`,
+  `D/H`, `{1, 1, 10}` or `Q^{1/2}` against digit source labels.
+
+Together with "A/B testing" and the like, the rule costs about 6% of the
+choice rows. It fails closed.
+
+**Science MC pool.** `scripts/build_science_mc_rl_prompts.py` takes the ARC-Challenge,
+ARC-Easy, OpenBookQA and SciQ **train** splits only, each pinned by revision
+and sha256. It uses the shared single-choice contract with modules
+`{source}_choice_{k}` and chance mostly 1/4. Screens:
+
+- MMLU, MMLU-Pro, GPQA and each source's own validation and test splits; a
+  generic stem shared with an evaluation question drops the row even when its
+  options differ;
+- owners: the Knowledge RL v2 pool, the Knowledge SFT v2 corpus and every
+  earlier source, in ARC-Challenge, ARC-Easy, OpenBookQA, SciQ order.
+
+No math pool is an owner. The math pools are free-form, not single-choice.
+SciQ lists its answer first (13,722 A in source order), and the shuffle
+brings every letter to about 25%. SciQ is CC BY-NC 3.0 (non-commercial);
+OpenBookQA's hub card says "unknown" (Apache-2.0 upstream). The mixture
+source `science_mc` is off by default.
+
+Built pool, 19,763 rows. `science-mc-rl-v2` is byte-identical to the v1
+build: the new owner files change nothing, and the new RL rules drop no
+science row. Only its manifest's owner hashes differ.
+
+| Source | Seen | Kept | Evaluation screen | Other drops |
+|---|---:|---:|---:|---|
+| ARC-Challenge | 1,119 | 1,095 | 13 | 8 cross-reference, 2 duplicate options, 1 duplicate |
+| ARC-Easy | 2,251 | 2,224 | 19 | 4 cross-reference, 4 owned |
+| OpenBookQA | 4,957 | 4,851 | 53 | 42 duplicates, 6 cross-reference, 3 duplicate options, 2 owned |
+| SciQ | 11,679 | 11,593 | 42 | 36 duplicate options, 4 cross-reference, 3 ambiguous rendering, 1 owned |
+
+Letters: A 4,980, B 4,795, C 5,023, D 4,964, E 1. The modal share is 25.4%
+against 25.0% chance. Prompts have a median of 37 tokens and a max of 189.
+No science question matched the Knowledge pools.
+
+| Artifact | Rows | sha256 |
+|---|---:|---|
+| `postraining/data/sft_ultradata_knowledge_v2.parquet` | 235 docs | `e5a0505b908b07d100b6b553b93c245e79d5761a790f941c9ed385f763304c5d` |
+| `postraining/data/ultradata-knowledge-rl-v2.parquet` | 2,337 | `aee5610b4a8ef70598467ce971911a2a79b2669d6341c11c6cf389cfeea41728` |
+| `postraining/data/science-mc-rl-v2.parquet` | 19,763 | `77c6f99be840d5219b7b5a5e2785da2d0eaa96c634fe50d37f56c6a80e2a0538` |
+
+The Knowledge RL v2 pool keeps 2,337 rows: 1,926 with 10 options, 300 with
+8, 14 with 7, 4 with 9 and 93 numeric. Its letters run from 186 to 252
+(modal 11.2% against 10.4% chance); in source order they ran from 142 to 343.
+`prepare_vapo_mixture` and the isolation test point at the v2 files. The
+isolation tests pass on all three, and the CPU suite passes except for
+failures unrelated to this work: CUDA-only tests, a missing ablation
+checkpoint, and `UnoTrainingRolloutEngine.logprobs`.
+
+**Risks.**
+
+- The balanced Knowledge SFT corpus is tiny: 235 documents and 0.38M tokens,
+  0.13% of the base mix. It will teach the choice format and little
+  knowledge. 98% of its traces cannot be relabelled provably, and the 5-, 6-
+  and 9-option groups are empty.
+- A relabelled row that exceeds the token cap is dropped rather than kept, so
+  that position ends one short (T-1). The cap is applied before balancing, so
+  this is rare.
+- The Knowledge source has label noise: some rows have two defensible
+  answers.
+- A 64M model is probably at chance on the Knowledge pool (10.4% chance), so
+  run a frozen gate before selecting either choice source.
+- The text screen does not catch paraphrases.
+
+## 2026-09-23 — Exact-pass RL mixtures, fused behavior statistics, rollout decode flags
+
+Job 9314 (`kda8_vapo_cot_v11_pg`, PG from the job 9040 SFT base) was healthy
+when cancelled at step ~950: bench accuracy rose from 0.0095 to 0.0547 by
+step 750. It was cancelled to adopt two changes it could not pick up mid-run.
+Its `CANCELLED.md` records this.
+
+### Exact-pass mixtures (`vapo_verifiable_mixture/v2`)
+
+The v8/v9 manifests fixed per-rollout quotas (48/8/8 of 64). This replayed
+the 2,306-prompt UltraData pool about 31 times for every pass over
+`deepmind_easy`. A v2 manifest carries no quotas:
+
+- One cycle serves every row of every source exactly once. The manifest records `prompts_per_cycle`, which the loader checks against the rows it reads.
+- Sources are interleaved by a largest-deficit schedule over row counts, so every window of the cycle holds each source at its share to within about one prompt.
+- Cycle 0 takes each source in file order; later cycles take a seeded reshuffle. The sampler cursor is the only resume state.
+- v1 manifests and `"quota"` entries are rejected.
+
+Two related changes:
+
+- Optimizer minibatches deal each source's groups by the same largest-deficit rule, so no minibatch is single-source. This now holds even when a pool is split into several minibatches.
+- `source_diagnostics` omits a source that is absent from a pool instead of raising. With exact-pass scheduling, a small source can be missing from a pool.
+
+A run meets "one corpus iteration = one pass of every problem" when
+(value-warmup steps + policy steps) x 64 is a whole number of cycles, because
+warmup draws from the same cursor. For v12 (99,917 prompts, odd), no step
+count is exact below 64 cycles. 38,730 policy steps after 300 warmup steps
+end 5 prompts short of 25 cycles: every problem is served 25 times except 5,
+which are served 24.
+
+### Fused behavior statistics
+
+When a pool is a single optimizer minibatch, the behavior policy is the
+current policy (behavior age 0). The separate refresh forward that
+recomputed old log-probs and values was pure overhead: about 0.52 s/step
+(`pool_refresh_seconds`, job 9314). `update_minibatch` with
+`fused_behavior_statistics=True` now:
+
+1. runs the critic pass and writes `batch.old_values`;
+2. computes GAE once;
+3. runs the actor pass with old = new.detach().
+
+Actor gradients are bit-identical to refresh-then-update. The critic differs
+by at most 6e-8 (CPU tests, delightful and source-gate variants, cot and
+carry). The fused path is off for latent mode, TPO and multi-minibatch pools,
+and it refuses latent thoughts. Consequences for reading metrics:
+
+- The behavior-age-0 canary is vacuous in fused runs: old equals new by construction.
+- `rollout_metrics.fused_behavior_statistics` marks such steps.
+- `pool_refresh_seconds` and `old_value_mean` are absent, so the old `collect_seconds - pool_refresh_seconds` recipe does not apply.
+
+GPU suite job 9348 ran 1301 passed and 2 failed, both unrelated:
+
+- `fixed_yarn`: missing file
+- `uno_speculative`
+
+### Rollout decode flags (tp_v10_rollout_*, v10 prompts, warm repeats 1-5)
+
+| flags | collect_seconds, repeats 1-5 | trajectories |
+|---|---|---|
+| default | 3.28 3.13 3.93 4.97 4.56 | reference |
+| `--rollout-tail-graph` 16 | 3.26 3.24 3.06 3.18 3.15 | identical to default |
+| `--rollout-tail-graph` 64 | 3.26 3.19 3.13 3.47 3.38 | identical to default |
+| sync every 8 | 3.15 3.20 3.41 3.22 3.32 | differ |
+
+Agents were running CPU-bound work during these jobs, which explains the
+default's spread from 3.1 to 5.0 s. The best repeats are within noise of
+each other. Decode defaults are unchanged; tail16 is worth re-measuring on a
+quiet host. Collection was 65% of the 4.06 s pre-fusion step. The fused step
+should be about 3.5 s (4.06 - 0.52). That figure is an estimate, not a measurement.
+
+### Math verifier v4 (`terminated_final_answer_exact1_numeric_log1p_max01/v4`)
+
+This resolves the "verifier brittleness" open issue of the UltraData v3 pool
+entry above. The policy, trained with SFT on OpenMathInstruct-2 and drills,
+writes fractions as `\frac{a}{b}` (77k SFT answers) or `a/b` (the drills).
+1,795 UltraData targets are `\dfrac`, and under v3 a correct answer scored
+zero on every one. v4 changes `postraining/core.py` as follows:
+
+- **Notation that changes typesetting but not value:**
+  - `\dfrac`/`\tfrac` fold to `\frac`.
+  - `\left`/`\right` sizing is dropped, with `\rightarrow` guarded.
+  - A whole-answer `$…$`, `\[…\]`, `\(…\)` or `\boxed{…}` is unwrapped before and after the `=` split.
+  - A bare `p/q` becomes `\frac{p}{q}`.
+- **The `=` split** happens only at an `=` outside braces, so `\sum_{k=1}^{n}` survives.
+- **Commas** collapse only as thousands grouping. Under v3, `2, 5` graded as `25`, and `7, 6, 2, 2, 2, 1, 5` graded as `762, 22, 15`.
+- **The single-number gate** reads `graded_answer_field` of both the truth and the prediction: the value after an optional single `head =`, where head is a variable, subscript or `f(x)`. `n = 25` therefore gates like `25`, while `a = 7, b = 3` and `19,7` state no single number. Digits separated only by whitespace never grade as one number (`4 0` against `40^\circ`).
+- **`parse_numeric_answer`** accepts the same wrappers, a spaced leading sign (and rejects a second sign), spaces inside `\frac{ }{ }` and around `/`, and `\frac12`.
+- **Kept strict:** unreduced (`2/16`) and decimal (`0.125`, `5.00`) forms, and leading zeros. The zeros are digits of the answer to questions like "last four digits": `0352`, the binary string `0111`.
+
+Measured on the pools:
+
+| check | v3 | v4 |
+|---|---|---|
+| `\dfrac` → `\frac` variants accepted | 1 of 1,795 | 1,795 |
+| `\frac` → `p/q` variants accepted | 1 of 1,954 | 1,835 |
+| `\[…\]`-wrapped variants accepted | 22 of 19,865 | 19,851 |
+
+Other results:
+
+- Every target still verifies against itself.
+- Nothing changed on DAPO.
+- 317 saved RL answer spans and 500 SFT gate-transcript spans grade identically under v3 and v4, so matched comparisons against job 9040 and 9314 stand.
+
+Two rounds of adversarial review found no value-changing hack. `verifiable_reward_identity` now hashes the new helpers.
+
+**Equation targets.** Minerva keeps only the text after the last `=`. A
+target like `x + 2y - 5 = 0` therefore paid a bare `0` and zeroed the
+equation actually asked for. `math_rl_pool` now quarantines Minerva targets
+with no graded field as `equation_target` (102 rows): an equation between
+expressions, several equations, or `a = b = c`. Pool manifests record
+`policy.reward_schema`.
+
+The pool is rebuilt as `ultradata-math-rl-v5` (19,765 rows, sha256
+`output_sha256` in its manifest), and it is the `ultradata_math` default. An
+intermediate v4 build, never consumed, is staged outside the repository.
+Remaining known gaps:
+
+- 63 degree targets such as `40^\circ` fall outside the numeric gate. They are covered only by the digit-space rule.
+- English/Chinese translations are still missed by the overlap matchers.
+
+The reward-schema bump means an `--actor-critic-init` checkpoint from v3,
+such as job 9268's critic warmup, is refused. The next PG run needs a fresh
+warmup.
+
+## 2026-09-23 — UltraData-Code L3/py: sandbox-verified SFT corpus and RL pool
+
+**Hypothesis.** UltraData-Code L3 exercises (`task` / `analysis` / `solution`
+/ `test`) can supply both code SFT and code RL for the 64M model, provided
+a row is admitted only when this repository's own Python reward agrees with
+it. The dataset card calls the tests "test candidates", and nothing upstream
+ran them. No GPU time was used. Nothing is in a mixture yet.
+
+**Mirror.** 19 of 147 L3/py shards at revision `85182d82`, evenly spaced
+(1, 9, …, 147; upstream shard order is not documented as random): 2,681,998
+rows, 20.57 GB, each sha256 equal to the hub LFS hash
+(`instruction_corpus_shards/ultradata_code_hf/l3_py.download.manifest.json`).
+The hub's xet transfer stalled at 67 MB, so the tool streams the pinned
+`resolve` URLs over plain HTTP with retries.
+
+**Verification is whole-module, and the pass rate is about half.** On a
+2,000-row pass, 51% verified. Of the 978 rows that failed:
+
+| Asserts failing | Rows |
+|---|---:|
+| 0 (a non-assert statement raised) | 16 |
+| 1 | 358 |
+| 2 | 232 |
+| 3 | 146 |
+| 4 or more | 211 |
+| Crashed or timed out | 15 |
+
+The median failing row still passed 80% of its asserts. Per-assert salvage
+was rejected. Data is abundant, and a partial pass means solution and tests
+disagree somewhere, so the "passing" asserts only certify agreement with a
+solution that is wrong elsewhere.
+
+In v2, 140,817 of 378,768 sandboxed rows verified (37.2%; 50–52% before
+repeat-skipping). The remaining verdicts:
+
+| Verdict | Rows |
+|---|---:|
+| `reference_tests_failed` | 237,737 |
+| `reference_too_slow` | 160 |
+| `reference_nondeterministic` | 20 |
+| `verifier_error_RuntimeError` | 18 |
+| `stub_passes` | 16 |
+
+The 18 verifier errors survived three attempts, so they are row-specific
+rather than transient. The suspected cause is a program too large for one
+argv argument (E2BIG), and it is unconfirmed. These rows are rejected,
+since they would raise inside RL too. For verified rows the wall time was
+p50 28 ms and p99 86 ms.
+
+**Screening drops (of 2,681,998).** The largest single filter is the
+reward's own AST policy: 32% of reference solutions would be rejected as
+policy output (`.startswith`, `typing`, and so on).
+
+| Drop | Rows | Reason |
+|---|---:|---|
+| `solution_policy_rejected` | 858,598 | Fails the reward's AST policy |
+| `meta_reference` | 442,730 | Cites "the snippet" or "original code", context the prompt never shows |
+| `entry_point_not_in_task` | 110,814 | Task never names the function it grades |
+| `test_import_unsupported` | 44,015 | Test imports an unsupported module |
+| `contains_reference_problem` | 30,496 | Evaluation containment |
+| `test_syntax_error` | 21,214 | Test does not parse |
+| `test_unbound_name` / `test_reads_solution_name` | 10,164 / 7,426 | Tests read solution-only imports, classes or constants |
+| `contaminated_math_index` | 5,411 | Math decontamination index |
+
+That leaves 1,147,903 screened rows. Deduplication then removed 186,128
+exact duplicates and 2,130 MinHash near-duplicates (126 permutations, 42×3
+bands, estimated Jaccard ≥ 0.5; exhaustive checks on a sample found no pair
+above 0.5 that the LSH missed).
+
+**Containment is conservative and mostly false positives.** A 16,949-row
+row group produced 318 raw containment hits. Almost all were KodCode, via
+boilerplate ("Create a function that takes a list of integers and
+returns…"). There was 1 MBPP hit (also a false positive) and 0 HumanEval hits. The rule
+therefore costs about 1–2% of rows for little real protection. This
+contradicts the README's earlier "loses about 1 problem in 800" for
+UltraData-SFT code prompts, which are a different distribution.
+
+**Paraphrase duplicates dominate, so problem identity is the entry-point
+name.** After exact and MinHash dedupe, 34% of 3,726 verified sample rows
+shared their entry-point name with another row (`factorial` 30×,
+`is_palindrome_number` 19×, `max_profit` 17×). Those pairs are the same
+problem reworded, at a median estimated Jaccard of only 0.056, and 13% reach
+0.15. Word shingles cannot separate them. Therefore:
+
+- An identity (the sorted entry-point names) belongs to one pool only.
+- RL takes 1 row per identity and SFT at most 3.
+- Saturated identities are skipped before sandboxing: 492,603 rows. Without
+  the skip, about 60% of verified rows were repeats.
+
+Given the same verdicts, the pools are identical for any worker count. The
+verdicts are wall-clock bound, so heavy load can flip a borderline row. A
+second review found about 290 near-twins across the pools under different
+names, at estimated Jaccard 0.3–0.5 (`cigar_party` / `party_success`). The
+build now drops SFT rows at estimated Jaccard ≥ 0.3 to any RL task
+(63-band LSH): 294 rows in v2. In v2, 20,000 RL identities and 90,794 SFT
+identities share nothing.
+
+**RL pool** (`ultradata-code-l3-v2-rl.parquet`, 20,000 rows, MBPP row
+schema, `SOURCE_SPECS` entry off by default):
+
+- Prompts are the bare task plus 2 example asserts (18,038 rows) or 1
+  (1,962). Prompt tokens have mean 195 and max 255, within the 256 budget.
+- Grading covers every kept statement: median 10, p99 27.
+- A row is RL-eligible only if the unshown statements call an entry point
+  with arguments no shown example uses.
+- A scratch `prepare_vapo_mixture --sources ultradata_code_l3` manifest
+  loads.
+- 200 of 200 sampled reference solutions pass through
+  `normalize_python_answer` / `python_tests_pass` on the RL rows, and 0 of
+  200 empty answers pass.
+
+**SFT corpus** (`sft_ultradata_code_l3_v2.parquet`): 116,525 documents,
+102.5M tokens, every row `verified = True`.
+
+- Document tokens: mean 879, p10 543, p50 800, p90 1,343, p99 1,899.
+- The adapter's 2,048-token ceiling dropped 3,668 of 120,206 rows (3%).
+- 74% of documents fit 1,024 tokens.
+
+The v1 artifacts (`ultradata-code-l3-v1*`, `sft_ultradata_code_l3_v1*`)
+predate the cross-pool screen and the SFT-target fix. They are superseded
+and were never consumed.
+
+The 5,120 run (2026-09-22) lost because long traces diluted drills, and
+this corpus alone is a third of the 293.8M-token canonical mix. So mix it
+with a `--source ultradata_code_l3=N` cap sized against the drill share, and
+prefer 1,024-token packing when extending job 9040's lineage. Code rows are
+`gradeable = False`, so they stay out of the math sampling-gate panel.
+`load_documents` now refuses a partly verified corpus without
+`--allow-unverified`.
+
+**Known risks.**
+
+1. **Reward hack, pre-existing in `code_reward.py`.** Candidate code and the
+   tests share one namespace, and the AST policy allows module-level
+   rebinding of builtins (`abs = lambda x: 0`) and stores to safe attributes
+   of imported modules (`math.sqrt = …`). A near-miss answer can therefore
+   neutralise tolerance asserts. Among screened rows, 5% use `abs(`/`isclose`
+   tolerance asserts and 16% name a builtin in an assert. A generic
+   "stub + shadow builtins" candidate passed 0 of 370 verified rows, so this
+   is not a blanket exploit. Fixing it changes the reward and needs a
+   `PYTHON_REWARD_SCHEMA` bump, which also touches MBPP.
+2. **SFT and RL prompts differ in shape.** SFT prompts are the bare task and
+   show no examples; RL prompts append `Example(s):` asserts.
+3. **A pass certifies consistency, not correctness.** The tests are
+   synthetic, and a verified pair can agree on a wrong spec.
+4. **Licensing.** Apache-2.0 plus each source repository's license, with no
+   unchanged redistribution.
+
+### Choice sources fail the frozen gate; math-only v12 launched
+
+Job 9466 (`kda8_gate_choice_9040`) ran a frozen rollout gate of the job 9040
+SFT policy on `vapo_gate_choice_v2`:
+
+- `science_mc` v2: 19,763 rows, chance mostly 1/4
+- `ultradata_knowledge` v2: 2,337 rows, chance about 1/10
+
+It ran 8 repeats of 64 prompts x 16 samples at the production 768-token
+budget:
+
+| metric | science_mc | ultradata_knowledge |
+|---|---|---|
+| exact accuracy per repeat | 0.000–0.005 | 0.000–0.009 |
+| fenced-format fraction | 0.17–0.24 | 0.13–0.36 |
+| terminated | about 0.38 | about 0.38 |
+
+Within-group reward std was at or near 0, so the gate failed (exit 2). The
+policy was never taught to answer with a letter. It is far *below* chance,
+not at it, so RL from 9040 has no signal on these sources. They need a base
+whose SFT includes letter-answer traces. The 235-document Knowledge SFT
+source alone is too small for that, so a choice-trace SFT source is needed
+first.
+
+The RL mixture for the 9040 base is therefore math-only:
+
+- `postraining/data/vapo_broad_v12_exact.manifest.json`: deepmind_easy 71,744 + `ultradata-math-rl-v5` 19,765 + dapo v2 8,408 = 99,917 per cycle. It is the default.
+- Critic warmup job 9467 (`kda8_critic_warm_v12`, 300 steps, `--critic-init actor`) runs under reward schema v4. The v3 warmup from job 9268 is refused.
+- PG job 9468 (`kda8_vapo_cot_v12_pg`) is gated on 9467's success: 38,730 steps, the same recipe as the cancelled job 9314.
+
+## 2026-09-23 — Python reward v6: isolated test namespace; code pools v3; v12 PG stopped
+
+**Math-only PG on v12 (job 9468, from critic warmup 9467).** Plain PG
+(`--no-delightful-policy-gradient`) learned: `bench_policy_avg@1152` 0.0095
+(step 0) -> 0.0226 (250) -> 0.0295 (500) -> 0.0573 (750), against job 9314's
+0.0547 at step 750; AIME stayed 0. The critic warmup ended at explained
+variance 0.018 (mean target 0.017; sparse reward). Cancelled at step 912 by
+decision: every RL step on the 9040 base is redone after the next SFT stage
+(math + code + letter-answer data), so the GPU goes to that. The last
+exact-resume checkpoint is 19:25; it cannot resume under the new
+Python-schema binding rule below (its payload records v5).
+
+**Reward hack closed (v5 -> v6, `bwrap_python_positive_ast_isolated_tests_binary/v6`).**
+v5 executed candidate and tests in one namespace. Five hacks passed v5 with a
+wrong answer (`abs = lambda x: 0`; a deferred `global abs` rebind inside the
+entry point; `sorted = ...`; `m = math; m.sqrt = ...`, eagerly or at call
+time; `C = Counter; C.most_common = ...`). In the 20,000 v2 RL rows, tests
+reference `abs` 1,608 times, `sorted` 742, `sum` 337. v6:
+
+- tests run in a separate namespace over pristine builtins and receive only
+  `verification_info.entry_points` (required; UltraData-Code: the solution
+  functions the tests call, already the only solution names screening
+  admits; MBPP: `mbpp_entry_points`, reference module-scope bindings the
+  tests read; KodCode: the one `from solution import`). Declared entry points
+  may shadow builtins (2 of 20,000 tasks ask for `sum`/`pow`);
+- candidate imports return private module copies; classes of imported
+  modules are snapshotted and must be identical (keys and value identity)
+  after the candidate and after each test statement;
+- the AST policy rejects attribute/subscript stores rooted at an
+  import-bound name;
+- two pre-existing harness bugs found by the red-team: candidate `print`
+  output was flushed after the sentinel, so any printing solution failed
+  (402 of 120,206 v2 pool solutions contain `print(`); and `-I` implies
+  `-E`, so `PYTHONHASHSEED=0` never applied and set-order verdicts were
+  random (one v2 pool row passed 37/64 runs). stdout now goes to /dev/null;
+  bwrap `--clearenv` plus `-s -P -S` replaces `-I`.
+
+Checks: all 374 MBPP train references pass; the AST rule changes no verdict
+on the 120,206 v2 SFT-pool solutions; 26 benign import/identity probes
+(datetime, re.Pattern, Counter identity, heapq, namedtuple, module
+identity) match v5; on 2,500 sampled v2 pool rows, 6 v5 passes fail v6, 5
+of them tasks whose *tests* define a helper the solution uses ("helper is
+provided") — unsolvable under isolation, dropped by rebuilding. Known
+residual: in-place mutation of a mutable container held by a library class
+is not detected by the identity snapshot. The red-team's exploit-search
+goal was blocked by a safety classifier, so the exploit search is the
+author's own review, not an independent one.
+
+The trainer now binds `python_reward_schema` (mixture check, checkpoint
+payload, resume, run manifest) only when the mixture contains a
+`python_mbpp` source, so math-only mixtures such as `vapo_broad_v12_exact`
+remain launchable across Python-verifier revisions.
+
+**UltraData-Code pools v3** (`ultradata-code-l3-v3`, build schema v2, same
+arguments as v2): 374,792 sandboxed, 140,814 verified (v2: 140,817);
+RL 20,000 rows (sha `4b5a1ec7…`), SFT pool 120,211 rows (sha `c116d127…`).
+`stub_passes` rose from 16 to 1,154 — most likely references that print
+(always failing under v5) paired with tests that constrain nothing; the stub
+screen drops them. Mean verified wall time 31 -> 47 ms (p99 86 -> 191 ms).
+v2 artifacts are staged out of `postraining/data/` (never consumed by RL).
+
+## 2026-09-24 — Science multiple-choice teacher traces v1
+
+Teacher generation job 9506 succeeded: Qwen3.8-27B produced two samples for
+each of 10,020 questions (20,040 completions). Selection required **both**
+samples to give the gold letter (`--min-correct-share 1.0`); 9,426 questions
+met that rule, and 9,329 retained one screened trace. This is 93.10% of all
+complete questions. Of the others, 274 had one correct sample and 320 had
+none; 97 passed the two-answer rule but had no trace survive the content and
+length screens. The teacher's letter accuracy is an outcome check, not a
+proof that every reasoning sentence is sound.
+
+The immutable pool is `postraining/data/science-mc-traces-v1-pool.parquet`
+(sha256 `8ff03b177440f432b6a9c0be3866579df037457844d6e863169a85f485098631`),
+selected from generation JSONL sha256
+`f72185a0a5a40ed0f9b88b4c2ccdb5aba3514ebfc7fa23bdc0d2692689d7a2b4`.
+The science-only SFT corpus is
+`postraining/data/sft_science_mc_traces_v1.parquet` (9,329 verified documents;
+sha256 `aa31a3b80400432893b1f4d2c3be7264164b004daad07eeeddbbcabfad136282`).
+The corpus builder rechecked the pool against the complete SFT question
+partition and its RL counterpart; all 9,329 pool rows survived the adapter.
+They set `gradeable = False` because the SFT trainer's sampling gate uses a
+math verifier that cannot grade a letter; science accuracy needs a separate
+exact-letter evaluation after SFT.
+Pool document lengths total 1,827,405 GPT-2 tokens (median 182, p90 270,
+maximum 765). Kept letters are A/B/C/D = 2,346/2,280/2,372/2,331.
+
+The red-team read the real kept traces and found two that explicitly called
+their correct option incorrect. The answer-aware mechanical screen now rejects
+that direct contradiction and selection uses the other, coherent teacher
+sample for both questions. It rejected four candidate completions in all;
+the question and document yields did not change. The review found 28 groups
+of repeated question stems with the same answer (58 rows), mostly alternate
+distractors; no exact question/choice overlap with science RL v5 or Knowledge
+v5 and no confirmed answer-key or teacher-instruction leak. Correct final
+letters still do not prove that every reasoning sentence is sound. One kept
+trace (`6bdbca9b0a36…`) briefly rejects a fraction of a week before correctly
+equating one seventh of a week with one day; the reviewer judged that local
+inconsistency too small to block this corpus.
+
+| SFT question source | Complete | Kept | Yield |
+|---|---:|---:|---:|
+| ARC-Challenge | 529 | 514 | 97.16% |
+| ARC-Easy | 1,112 | 1,086 | 97.66% |
+| OpenBookQA | 2,489 | 2,163 | 86.90% |
+| SciQ | 5,890 | 5,566 | 94.50% |
+
+The Knowledge rows are excluded from this science corpus. No Knowledge v6
+corpus was built; `sft_ultradata_knowledge_v5.parquet` remains the reference
+against which the science question split was built (sha256
+`f55c56adabd969f0449f5820e54a40ff76184ac81dba4224298330fa729b3967`).
+At that point, no new multiple-choice GPU job was authorized; the combined
+run was authorized in the next exchange.
+
+### Combined 1,024-token SFT, authorized 2026-09-24
+
+The user authorized the combined SFT at a 1,024-token window. CPU build job
+9525 produced `postraining/data/sft_mix_omi2_drills_code30k_science_v1.parquet`
+(sha256 `56a069ff217d6abe764c26e59ff0d3fcd33dc05759c91f3873341feb1aeaad4b`):
+eight OpenMathInstruct-2 shards to match job 9040, 500,000 arithmetic drills,
+the first 30,000 verified code documents that pass the 1,024-token screen,
+and all 9,329 verified science traces. The extra code/science benchmark
+screens leave 430,611 OMI2 rows, 446 fewer than the 9040-only build. The
+combined corpus has 969,940 documents and 316,405,222 document tokens:
+
+| Source | Documents | Document tokens | Token share |
+|---|---:|---:|---:|
+| OpenMathInstruct-2 | 430,611 | 209,807,664 | 66.31% |
+| Arithmetic drills | 500,000 | 83,038,228 | 26.24% |
+| UltraData-Code L3 | 30,000 | 21,731,925 | 6.87% |
+| Science MC traces | 9,329 | 1,827,405 | 0.58% |
+
+Science and code rows train and enter holdout CE, but have `gradeable = False`
+for the trainer's math-only sampling gate. The 256-problem held-out split has
+248 math-gradeable panel rows; two of the first 128 prompts exceed 256 tokens
+(maximum 265). Job 9529 uses a 272-token prompt plus 752-token response gate,
+within the pretrained 1,024-token window. It starts from the pretrained KDA8
+checkpoint, takes one epoch (12,470 scheduled updates, 32 packed 1,024-token
+rows per update), and otherwise follows job 9040's SFT recipe. A separate
+science exact-letter gate against RL v5 is queued for the new checkpoint (job
+9530) and job 9040 (9531), with the same rollout settings, followed by the
+matched arithmetic probe (9532). No Knowledge rows are in the combined SFT.
+
+#### Combined SFT outcome
+
+Job 9529 completed one epoch and saved
+`postraining/runs/kda8_sft_omi2_drills_code30k_science_v1_e1/sft_final_model.pt`
+(sha256 `c882966296b9109a828af67cc2ad4a3851a1233411727bb0ec0479b2a04b2742`).
+It ran 12,470 updates in 1,767.5 training-clock seconds. Its own holdout
+completion CE was 0.5271; the holdout differs from job 9040's and those CE
+values are not a matched comparison. The math-only SFT sampling gate scored
+25.39% exact accuracy on 128 prompts × 8 samples, with 34.38% mixed prompts.
+
+The matched frozen science RL-v5 rollout gates used 64 prompts × 16 samples ×
+8 repeats and a 256-token prompt plus 768-token continuation budget:
+
+| Checkpoint | Job | Exact science accuracy | Mean within-group reward std | Think format | Ended |
+|---|---:|---:|---:|---:|---:|
+| Combined SFT | 9530 | 14.60% | 0.3085 | 78.06% | 81.08% |
+| Job 9040 SFT | 9531 | 0.085% | 0.0033 | 21.22% | 39.59% |
+
+Job 9530 passed the rollout learnability gate. Job 9531 exited 2 because its
+gate failed. **Scope correction (2026-09-24):** the sampler takes file order in
+its first cycle, and science RL v5 is grouped by source. All 8 × 64 prompts
+above are distinct ARC-Challenge questions (the first 512 rows), not a
+science-wide sample. The logged 25.56% modal-answer baseline describes all
+9,743 RL questions and is not a matched comparator. The 512 ARC-Challenge
+questions have a 26.56% modal-label share, but a constant-letter answer would
+not satisfy the rollout's required think/answer structure; the 14.60% figure
+is a strict reward rate, not a measure of raw answer accuracy. Thus this gate
+establishes a strong improvement over 9040 on ARC-Challenge and usable reward
+variation there. It does not yet establish whether the checkpoint is strong or
+weak across SciQ, OpenBookQA, and ARC-Easy; use a source-stratified evaluation
+with saved responses before deciding on science RL.
+
+The matched greedy arithmetic probe (`data/math_drills/v4/probe.jsonl`,
+256-token prompt, 512-token continuation) scored 972/1,920 = 50.63% for
+combined SFT (job 9532) versus 991/1,920 = 51.61% for job 9040. Keep 9040
+as the math RL reference. This is a 19-question regression on this panel;
+other ability changes require matched evaluation before claiming them.
+
+#### Source-balanced science diagnostic (job 9629)
+
+The user authorized one further multiple-choice GPU diagnostic after the
+source-order limitation above was found. A deterministic 256-question panel,
+`postraining/data/science-mc-rl-v5-balanced-diagnostic-v1.parquet` (sha256
+`a66de30f3a5915faa6d276462612b0e21a7f3566036fee4e10edecbe7779d46d`),
+hash-selects 64 disjoint RL-v5 questions per source and interleaves the four
+sources. The largest stored prompt is 189 tokens, below the 256-token budget.
+Job 9629 evaluated the combined SFT checkpoint with eight samples per prompt,
+768 continuation tokens, temperature 1.0, and the benchmark evaluator's
+top-p 0.7. Its answer check is raw exact-letter accuracy after termination,
+with a fallback for responses without an answer fence. This differs from the
+strict rollout gate (top-p 1.0 plus think/answer structure requirement).
+
+| Source | Correct / 512 samples | Raw exact accuracy | Prompts with any correct / 64 |
+|---|---:|---:|---:|
+| ARC-Challenge | 97 | 18.95% | 44 |
+| ARC-Easy | 99 | 19.34% | 50 |
+| OpenBookQA | 100 | 19.53% | 51 |
+| SciQ | 100 | 19.53% | 50 |
+| **Balanced total** | **396 / 2,048** | **19.34%** | **195 / 256** |
+
+The run ended 85.25% of completions. Its benchmark report's
+`structural_format_fraction = 1.0` is not an assessment of think/answer
+structure: the job-9629 evaluator call omitted think-fence IDs, so that field
+was always 1.0. The AIME and benchmark call sites now pass think-fence IDs
+and the configured think-token minimum; evaluation metric schema v7 separates
+future reports from this artifact. Raw accuracy is unaffected. Only the first
+four prompts × four samples are saved
+in `postraining/runs/kda8_science_balanced_probe_v1/bench_answers/step_000000.json`.
+Their text is often incoherent and imports math reasoning into science. One
+captured response with gold `D` wrote `<answer>\\text{D}</answer>` and was
+marked wrong by exact-letter grading; this shows some formatting undercount,
+but the 16 saved examples cannot quantify its rate across all 2,048 samples.
+Independent inspection found that 15/16 captured responses satisfy the
+33-token think/answer structure, and the three exact-correct captured
+responses also satisfy it. This small sample does not suggest a large
+raw-versus-contract gap; the full-panel gap remains unmeasured.
+The matched 256-question panel's modal-letter share is 27.34%, though a
+constant letter that does not terminate or meet the strict answer contract is
+not a valid rollout-policy baseline. The diagnostic supports weak sampled
+science MC answer performance on all four sources, while the earlier 14.60%
+number specifically measures strict RL reward on ARC-Challenge.
+
+## 2026-09-25 — KDA8 VAPO step throughput: fused decode, per-rollout arena workspace, fused readout
+
+Scope: the production cot pool (64 prompts x 16 samples = 1,024 rows, prompt
+<= 256, 768 generated tokens, `kda8_sft_omi2_drills_e1` actor, v12 exact
+mixture). The code does not change what a step computes; replay numerics
+change only by fp32/bf16 rounding (schemas bumped, below). Every measurement
+is an mlq job on the shared RTX 5090 with an 8-step `--profile` run (pools
+4-7 steady) or a 6-repeat `--rollout-only` run. GPU condition varies by up to
+~10% between jobs: back-to-back A/B decode benches of identical tick code
+differed by 5%, so single-pool differences below ~0.3 s are not evidence.
+
+### Result
+
+| Measure | Baseline (9992 profile, rollout-only) | Now (v9 profile 10086) |
+|---|---:|---:|
+| Steady pool wall | 6.0-6.6 s | 4.3-4.7 s |
+| Decode | 3.3-3.7 s | 1.8-2.1 s |
+| Update (forward_backward) | 2.4-3.0 s | 2.2-2.8 s |
+| Useful tok/s (rollout-only) | 84-101k | 146-155k (v6) |
+| First rollout (compile + capture) | 56 s | 19 s |
+| Update peak VRAM | 10.4-11.1 GiB | 7.1-7.2 GiB |
+| Step-1 update peak (drift diagnostic) | 16.5 GiB | 6.7 GiB |
+| Rollout peak VRAM | 6.4-7.1 GiB | 8.2 GiB |
+
+### Decode: what bound it and what changed
+
+The per-rollout loop was already one compiled, CUDA-graphed tick per step
+after the arena work (graph per live-row bucket), but it gave only ~8%:
+decode is bandwidth-bound, not launch-bound. A 1024-row tick moves about
+2.4 GB of fp32 KDA state (6 layers x [1024, 3, 128, 128]) plus live
+attention KV; the floor is ~3 ms against ~7-10.5 ms measured.
+
+- **KDA state update:** the compiled pure-PyTorch recurrence made several
+  passes over the state per layer, and its two einsums ran as bf16 cutlass
+  bmm under autocast — the documented fp32 recurrence was contracting in
+  bf16 (a numerics bug; CPU test error 0.05 before the fix). Now one Triton
+  kernel (`pretraining/nanogpt_mini/kda_decode_kernel.py`, a `triton_op`
+  inside the compiled tick) reads and writes the state once per step, all in
+  fp32; `kda_recurrent_step` is the fp32 reference with autocast disabled.
+- **Decode attention:** prompts are short (mean 35.6 tokens, median 17, p90
+  92) but a pool is left-padded to ~190, so most prompt KV reads were
+  padding. `postraining/decode_attention.py` (split-K flash-decoding over
+  each row's live key range, `triton_op`) reads only live keys.
+- 1024-row tick at positions 256/512/1022: 7.1/8.0/10.5 ms -> 3.97/4.82/6.21
+  ms (v5 bench 10019). Full-budget rollout (no stops): 8.0 s -> 4.4-4.9 s.
+- Parity (`kda_gpu_parity`, v5/v6/v8): all decode, arena, race and carry
+  bounds pass. The only failures are MoE section 5 (`moe_bf16_decode_vs_dense`
+  0.51 > 0.5, `moe_bf16_compiled_paged_vs_eager` 0.60 > 0.02), which fail
+  identically on the untouched baseline tree (job 9962).
+
+### Arena memory and a capture bug
+
+Holding the arena's full-width caches (5.21 GiB at 1024 rows) for the run
+kept them resident through the update and OOM'd the step-1 drift diagnostic
+(job 10021). `PinnedDecodeArena.workspace()` now allocates caches, belief
+and hidden buffers and captures the bucket graphs per rollout, then frees
+them: re-opening costs 35-37 ms (memset + 17 captures; the side-stream
+warm-up runs once), and closing returns the allocator to +0 MiB. Separately,
+the compiled tick guards on grad and autocast state, so a capture opened
+under a different autocast than warm-up recompiled inside the capture
+(`cudaErrorStreamCaptureInvalidated`, job 10029). `_call_tick` now pins
+no-grad and autocast-off around every tick; the CPU regression test fails
+without it.
+
+### Update: where its time goes
+
+Kernel trace of a steady update (v6): 2.39 s device time — GEMM 0.80, FLA
+KDA 0.50, other Inductor 0.45, other aten 0.25, log-softmax 0.23, conv1d
+0.15. Replay packing is already good: new `replay_slot_utilization`
+telemetry (real tokens / computed shard slots) reads 0.87-0.90 over 21
+shards, far above what `packed_padding_utilization` (~0.4) suggests, so
+varlen repacking would buy
+at most ~12% of replay compute and was not pursued. A 2x slot budget
+(`--replay-slot-budget 49152 --replay-max-trajectories 256`, job 10087) only
+cuts shards 21 -> 18 because the attention budget binds for long rows,
+lowers utilization to 0.85, raises the update peak to 11.7 GiB, and shows
+no measurable update-time change. Replay attention is flash SDPA (memory
+linear in B*L), so the B*L^2 budget does not bind memory for this backbone;
+lifting it (`--replay-attention-budget 1073741824 --replay-max-trajectories
+1024`) with 2x / 3x slot budgets (jobs 10093 / 10094) cuts shards 21 -> 10 ->
+7 and kernel launches 211k -> 172k per pool, but device time per pool stays
+3.85-4.06 s and the update 2.2-3.0 s in all three: slot utilization falls
+0.88 -> 0.83 -> 0.80, so the extra padded compute cancels the per-shard
+overhead saved, while the update peak rises 7.1 -> 12.8 -> 18.1 GiB. The
+update is device-bound (GEMM + FLA), not shard-overhead-bound; the defaults
+stay.
+
+### Fused softcapped readout
+
+The emit tail (readout GEMM -> rational softcap -> fp32 log-softmax ->
+target gather) was the update's largest memory-bound piece: its compiled
+backward was zeros + scatter_add + log-softmax backward + a separate bias
+sum over fp32 (slots, 50304) tensors, ~0.27 s per pool, and it set the
+update's peak memory. `SoftcappedTargetLogprobs` (`nano_backbone.py`,
+exposed as `target_logprobs_from_features`) saves only the bf16 GEMM output
+and a per-slot logsumexp; its backward is one elementwise pass writing the
+bf16 raw-logit gradient. It serves VAPO scoring
+(`compact_emit_token_logprobs`), SFT's CE and `TrunkRenderReadout`.
+
+- Readout bench (`postraining/bench_emit_readout.py`, job 10075, fwd+bwd
+  compiled): 4,096 / 16,384 / 24,576 slots take 7.2 / 27.5 / 43.4 ms
+  composed vs 5.5 / 22.2 / 31.4 ms fused; peak 1.09 / 4.51 / 6.79 GiB vs
+  0.33 / 1.46 / 2.21 GiB; values agree to 2e-6. At 24,576 slots the rough
+  floor (three 1.27-TFLOP GEMMs plus ~6 passes over the bf16 logits) is
+  ~27 ms.
+- In the trainer the readout kernels fell from ~0.27 s to ~0.13-0.15 s per
+  pool and the update peak from ~11 GiB to ~7.1 GiB. The forward logsumexp
+  is a two-pass reduction (0.04-0.06 s) where the old log-softmax used
+  Inductor's online softmax (0.025 s); not worth an indirect formulation.
+- Compiled, Inductor fuses the bias-gradient sum into the backward without
+  emulating the bf16 rounding of the per-row gradient, so the compiled bias
+  gradient is closer to fp64 than eager's; the CUDA test pins "no less exact
+  than the eager composed readout", not bit equality.
+- The post-update drift diagnostic (step 1 and every 100 steps) ran the tail
+  eagerly and was the run's peak-memory step (17-19 GiB; its 4.97 GiB fp32
+  temporary OOM'd the 2x-budget run, job 10077). It now uses its own
+  compiled no-grad artifact: step-1 update peak 6.7 GiB, drift 1.6 -> 1.1 s.
+- `REPLAY_NUMERICS_SCHEMA` (v5) and `CARRY_REPLAY_NUMERICS_SCHEMA` (v6) are
+  bumped: behavior log-probs round differently, so VAPO resume across this
+  change is refused. SFT resume is refused through its module hashes.
+
+### Other
+
+- `RunProfiler` created its output directory in `__init__`, so every fresh
+  `--profile` run refused its own nonempty output; it now creates it lazily.
+- An ~8.5 GB GPU allocation from another tenant persists on the device and
+  is not listed by nvidia-smi; account for it when sizing budgets.
+- Remaining decode opportunities: small-bucket ticks (8-128 rows) are
+  ~0.4-1.0 ms, dominated by per-kernel latency across ~8 layers; the update
+  remains GEMM + FLA bound after this.
+
+## 2026-09-26 — STEM/code/QA readiness audit and missing frozen-policy gates
+
+The combined SFT is **finished**, not awaiting a restart:
+`postraining/runs/kda8_sft_omi2_drills_code30k_science_v1_e1/result.json`
+records 12,470 updates, completion CE 0.527120, and a 25.39% math-only
+sampling gate. Its corpus contains 30,000 code documents and 9,329 science
+traces, but no UltraData Knowledge SFT documents. The science traces were
+only 0.58% of document tokens. Completed SFT is not evidence that all domains
+are RL-ready: the source-balanced science diagnostic measured 19.34% raw
+exact-letter accuracy, and the earlier passing strict gate covered only
+ARC-Challenge. A rollout gate's exit status checks reward variation, not
+above-chance accuracy.
+
+Existing effective RL pools: math 99,917 (71,744 DeepMind easy + 19,765
+UltraData math + 8,408 DAPO), code 20,000, science 9,743, Knowledge 2,337.
+Both the existing math and combined-SFT science manifests load under the
+current corpus contracts. Knowledge here is verifiable multiple-choice and
+numeric QA, not an open-ended QA corpus.
+
+Queued through mlq, priority 1, max parallel runs 1, one attempt each:
+
+- 10175: `scripts.prepare_posttraining_gates`, 20-minute limit. Produces
+  immutable panels under `postraining/data/readiness_20260926_v1/`, bound to
+  the completed combined SFT's exact corpus bytes.
+- 10176 / 10177 / 10178: code / science / Knowledge frozen-policy gates,
+  respectively; depend on 10175 success, one-hour limit each. Each covers
+  512 distinct prompts x 16 samples, 256 prompt + 768 continuation tokens,
+  production CoT think/answer contract, seed 1337. Panels hash-select and
+  interleave strata to avoid the old file-order sampling error. Science
+  balances datasets; Knowledge balances modules until a small module is
+  exhausted, so its aggregate must not be called population accuracy.
+- 10179: immutable full math+code+science candidate manifest,
+  `postraining/data/vapo_combined_candidate_20260926.manifest.json`, bound
+  to combined SFT. Twenty-minute limit. A candidate manifest does not
+  authorize or qualify a training mixture. Knowledge is excluded pending
+  its independent gate.
+- 10180: after all three gates terminate, summarize full evidence into
+  `postraining/runs/readiness_20260926_v1/result.json`; ten-minute limit.
+  Reports per-module contract accuracy, format, termination, mixed groups,
+  and terminated parsed-letter accuracy/chance for choice questions. Missing
+  or repeated prompt/sample coverage fails rather than producing a success.
+
+`--gate-transcripts` now optionally saves **every** frozen gate response,
+including failures, token IDs, prompt/module, grading contract and verdict,
+to each run's `gate_transcripts.jsonl`. It leaves ordinary training and
+throughput probes unchanged. Existing transcript files are refused. Future
+analysis can diagnose code verifier failures and formatting loss without
+re-running the model. No optimizer updates or further SFT were submitted;
+the remaining training decision depends on these results. At submission,
+an unrelated running GPU job occupied the queue; it was not interrupted.
+
+Validation: 47 focused panel/capture/summary/mixture/reasoning tests and all
+22 benchmark-isolation tests passed. An independent reviewer checked panel
+selection, CoT budgets, thread-safe transcript coverage and queue dependencies.
+
+## 2026-09-26 — Corpus quality review and completed six-source SFT evaluation
+
+All six frozen-policy evaluations completed their full 512 distinct prompts x
+16 samples (49,152 completions total). They used the completed combined SFT,
+temperature 1, top-p 1, 256 prompt + 768 continuation tokens, production
+think/answer grading, and no optimizer updates. These are stratified
+training-pool learnability diagnostics, not held-out benchmark estimates.
+
+| Source | Correct / 8,192 | Strict accuracy | Mixed prompts / 512 |
+|---|---:|---:|---:|
+| DeepMind easy | 158 | 1.93% | 98 |
+| UltraData math | 135 | 1.65% | 75 |
+| DAPO | 95 | 1.16% | 60 |
+| Code | 1 | 0.012% | 1 |
+| Science MC | 1,346 | 16.43% | 475 |
+| Knowledge/QA | 140 | 1.71% | 93 |
+
+Canonical evidence: `postraining/runs/corpus_quality_20260926/final_result.json`
+and `model_gate_summary_v2.json`, with complete transcripts in each
+`kda8_readiness_<source>_20260926/` run. The first full summary (job 10185)
+failed on math rows without module metadata; the source-name fallback was
+fixed, regression-tested, and the read-only summarizer rerun successfully.
+An exit 2 from a completed frozen gate indicates insufficient reward
+variation in at least one batch, not a crashed or incomplete evaluation.
+
+Semantic review found 11 primary flags among 64 deterministic code tasks
+(contract/test contradictions, invalid-input requirements or overly strict
+outputs); at least three ambiguous/nonunique keys among 16 Knowledge rows;
+and one confirmed wrong science key among 32 science questions. Evidence,
+row IDs, reviewer samples and proposed quarantines are saved alongside the
+result. These are sampled findings, not estimates that certify every other
+row. Original immutable corpora were not edited. The 30,000 actual trained
+code problems map to the current SFT sibling pool and have zero entry-point
+identity overlap with RL. Twelve reviewed science SFT traces had no confirmed
+serious defect. Math review checked 12 questions/source, substantiating all
+DeepMind targets, 11 DAPO targets and seven UltraData targets; unproved and
+ambiguous examples are explicitly recorded.
+
+Code audit job 10184 tested ten input-blind trivial programs on 128 sampled
+tasks through the production sandbox: all 1,280 failed. Thirty-one of 20,000
+code rows contain a provably vacuous assertion, although other assertions
+can still constrain those tasks. Passing a reference and rejecting trivial
+programs do not prove agreement with the task's prose.
+
+Canonical prompt-budget audit 10186 found all sources fit except 16 Knowledge
+rows at 257 tokens including BOS. `choice_rl_pool.screen_problem` omitted
+BOS; it now uses `encode_prompt`, with an exact-boundary regression test.
+Existing corpora remain unchanged and must be rebuilt into new outputs to
+apply that fix. Two affected prompts were in the Knowledge gate; excluding
+them changes its strict accuracy only from 1.709% to 1.716%. Excluding the
+one reviewed flagged code task in the code panel does not change the verdict.
+The initial census counted raw math source wrappers; its mutation results
+are valid, but its budget section is superseded by `canonical_census.json`.
+
+Readiness interpretation:
+
+- Code: 4,879 unterminated, 2,458 terminated but invalid structure, 673 policy
+  rejections, 181 test failures, one pass. At least 625 policy rejections
+  contain malformed Python; this is not just an import-policy problem.
+- Science: valid-option accuracy is 22.44–27.15% across sources. Prompt-cluster
+  label-permutation tests found no compelling above-chance signal; all 16
+  sampled explanations (including eight rewarded) were incoherent. Reward
+  variance alone would admit a guessing policy.
+- Knowledge: ten-option questions emit a valid letter in only 606/3,216
+  responses, and 94.2% of those letters are A–D. The combined SFT contained
+  no Knowledge data. Dataset ambiguity independently blocks promotion.
+- Math: some genuine workings exist, but sampled successes often have invalid
+  reasoning. 99/135 UltraData successes target 0 or 1. Constant-answer gold
+  prevalence is 4.49% for DeepMind answer 1 and 8.01% for UltraData answer 0;
+  these are answer-frequency controls, not measured model policies.
+
+Do not launch broad RL from this evidence. The user's proposed curriculum
+should gate hard sources on improved held-out easy-task performance and a
+new source-specific probe, not on reward variance or a source name alone.
+There are no calibrated item-difficulty labels: DeepMind has 18 modules,
+science has ARC-Easy/Challenge/source labels, and code/UltraData/DAPO have no
+useful calibrated item labels. DeepMind's place-value, GCD and multi-add/sub
+modules have the strongest sampled mixed-group rates, but even those need
+answer-frequency controls before being treated as mastery. Keep DAPO/code/
+Knowledge locked; establish coherent elementary capability before promotion.
+Science's high mixed-group rate is not sufficient to unlock it.
+
+Validation for this turn: 102 choice/budget tests and six focused
+panel/capture/summary/audit tests passed; `git diff --check` clean. No further
+SFT or RL optimizer run was launched.
+
+
+### Saved-response attribution and MC reward interpretation (2026-09-26)
+
+Queued offline attribution jobs 10187 and 10188 completed. Evidence lives in
+`postraining/runs/corpus_quality_20260926/response_format_attribution.json`
+and `code_format_regrade.json`. Each source contains 8192 saved responses.
+Truncated / terminated-invalid-format counts: DeepMind 767/508; UltraData
+math 3221/200; DAPO 2358/339; science 1303/228; Knowledge 3568/496; code
+4879/2458. Every truncated response emitted the full 768-token allowance.
+Gold-independent extraction plus wrapper normalization changes correct counts
+158->170, 135->140, 95->102, 1346->1368, and 140->163 respectively. This is
+counterfactual recovery, not validated deployment accuracy: provisional
+answers can be selected, and oversized fields were left ungraded. Of 612
+recovered AST-valid code candidates, 602 failed tests and 10 were rejected by
+sandbox policy; none passed. No strict correct answer disagreed with selected
+raw grading. Focused normalization/first-answer-selection checks passed.
+These results establish little recoverable correctness in existing text;
+they do not measure the causal benefit of a larger generation budget.
+
+MC recommendation: retain correctness rewards and the learned critic baseline;
+do not treat subtracting 1/K as a way to identify guesses. An action-independent
+policy-gradient baseline reduces variance without changing the expected
+objective (OpenAI Spinning Up, rl_intro3). Constant subtraction cancels exactly
+under group mean centering; our VAPO/GAE stack is not interchangeable with GRPO,
+so no terminal-reward offset was patched. Use above-chance held-out accuracy
+with answer-position controls for curriculum admission. Current option
+permutations are fixed at corpus construction. Fresh option-order randomization
+and a correctness-plus-permutation-consistency diagnostic are useful next
+experiments; consistency alone does not prove reasoning. ACRE
+(https://arxiv.org/abs/2510.10104) studies this idea in larger multimodal models,
+not this checkpoint. Pure independent four-way guessing produces mixed groups
+on about 99% of questions with 16 samples, so group reward variance is not a
+science readiness criterion. No new model generation, SFT, RL, or reward change
+was performed for this follow-up.
+
+
+### Long-budget follow-up and MC controls (2026-09-26)
+
+Recent KDA8 CoT RL v7/v9/v10/v11/v12 used 1,024 total tokens: 256 prompt +
+768 response. The launcher selected the older 1,024-token checkpoint for RL,
+separately from its 5,120-token SFT stage. Older latent runs had larger context
+windows but separate emitted-token and latent-stream caps. See
+`corpus_quality_20260926/historical_rollout_budgets.json` for exact manifests.
+
+The current code/science SFT checkpoint trained at 1,024 tokens. All six frozen
+panels now completed 512 questions x 16 samples at 4,096 response tokens plus
+256 prompt tokens (jobs 10189-10194). This explicitly extrapolates that model's
+trained window. The new `--eval-context-tokens` override is restricted to frozen
+evaluation; checkpoint metadata and training limits are preserved. Manifests
+record actual SFT training length separately from the checkpoint context limit.
+
+Source | Accuracy at 768 | Accuracy at 4096 | Capped at 4096 | Late correct
+--- | ---: | ---: | ---: | ---:
+deepmind_easy | 1.929% | 1.965% | 1.72% | 10
+ultradata_math | 1.648% | 3.027% | 2.37% | 90
+dapo | 1.160% | 1.660% | 1.89% | 32
+ultradata_code_l3 | 0.012% | 0.012% | 3.70% | 0
+science_mc | 16.431% | 16.565% | 1.48% | 6
+ultradata_knowledge | 1.709% | 2.014% | 1.87% | 21
+
+Late correct means this successful saved trajectory ended beyond 768 tokens;
+it does not establish failure of an independently generated shorter response.
+The comparison records realized prefix equality and prompt-cluster uncertainty.
+Independent hash-selected review found no coherent derivation in 12 sampled
+late-correct UDmath/DAPO responses. Of all late-correct UDmath responses, 72/90
+had literal gold 0 or 1. Score gains alone do not establish reasoning mastery.
+
+The older 5,120-token SFT lineage was also tested with 4,096 response tokens.
+It has a different corpus, so this is checkpoint selection, not an isolated
+training-context ablation. Accuracies: DeepMind 2.136%, UDmath 1.221%, DAPO
+0.745%, code 0%. It does not establish a stronger broad RL starting point.
+An initial UDmath attempt ran out of memory during cache compaction; its partial
+evidence is excluded. Recovery jobs 10207-10209 use 32 concurrent prompt groups,
+retaining all 512 questions x 16 samples. Summary job 10210 completed. Code
+variance-gate exits were nonzero but all required transcript coverage completed.
+
+Fresh option shuffling is now the training default for screened MC rows, seeded
+by source-qualified identity and sampler cursor. Gold and source-option IDs
+remap immutably. Dataset identity binds the presentation policy; legacy resumes
+use `--no-randomize-choice-options` to preserve their previous policy. Frozen
+gates stay fixed unless explicitly enabled. Correctness rewards and the critic
+are unchanged. Shuffled science (10195) scored 1,271/8,192 versus 1,357 fixed;
+four-option valid-letter accuracy ranged from 22.0% to 24.9%, without positive
+above-chance evidence. Shared sampling seeds mean independent-guess 1/K^2 is
+not the null for paired joint correctness.
+
+Long code format recovery (10204): 988 AST-valid excluded candidates yielded
+980 test failures, six policy rejections, and two passes. Both extra passes
+ended before token 768. Strict plus recovered accuracy is only 3/8,192. The
+older lineage's recovery (10212) yielded zero passes from 730 candidates.
+
+The immutable reviewed candidate contains 131,292 rows across all six sources,
+excluding 16 reviewed defects and 16 canonical over-budget prompts. It reserves
+673 science question-family rows around the 512-question validation panel.
+No question/component overlap was detected against the actual 969,940-row SFT
+corpus. This panel was already used for development, and lexical screens do not
+certify absence of semantic paraphrases or pretraining exposure. Candidate prep
+10206 completed after correcting its input to explicitly include all six sources;
+original pools and launcher defaults were not changed. Candidate path:
+`postraining/data/reviewed_candidate_20260926_v1/mixture.manifest.json`.
+
+Broad RL is not promoted by these results. No optimizer updates were run.
+Validation: 44 focused tests passed, conservative code-extraction checks passed,
+and independent review covered MC remapping/resume identity, budget attribution,
+and corpus exclusions. Full evidence and final decision live under
+`postraining/runs/corpus_quality_20260926/`, including `followup_result.json`.
+
+
+## RL response defaults and math overlap review (2026-09-26)
+
+Future `train_latent_vapo.py` runs now resolve the response cap to 2048 tokens;
+benchmark/AIME caps inherit it unless overridden. The KDA launcher explicitly
+uses 256 prompt + 2048 response tokens, with runtime context 2304. The actual
+checkpoint training window is preserved and extrapolation is recorded in the
+manifest. Latent modes reserve additional stream capacity; answer-only mode
+keeps its answer budget. Exact resume also checks saved effective emitted and
+stream budgets. Default training is 950 joint updates + 50 critic warmup =
+1000 total. Historical explicit token budgets remain usable for exact resumes.
+The 2048 training configuration has not been benchmarked; old launcher memory
+and throughput measurements were at 768 tokens.
+
+The existing DAPO builder removed 5,268 rows against raw UltraData candidates,
+but broader retrieval still found residual paraphrase overlap. The first review
+covered 148 pairs (top 110 cosine, all 42 numeric skeleton and all 6 production
+matcher hits). Independent full-text adjudication of 49 proposed exclusions
+confirmed 47 duplicates and 1 underspecified DAPO rewrite; one ambiguous decimal
+variant was retained. Exact integer enumeration independently supports 90 for
+the double-dipped recurrence problem, contradicting DAPO's 48. Existing matcher
+failures include short paraphrases below its six-eight-token-shingle threshold
+and raw numeric spelling guards (percent/decimal, fraction markup). All 6 current
+production shingle hits were false positives. Do not lower global thresholds
+or delete similarity candidates without adjudication.
+
+Evidence lives in `postraining/runs/corpus_quality_20260926/`:
+`math_source_overlap_review_v2.json` reconciles the initial review;
+`math_source_overlap_independent_review.json` records independent adjudication.
+This audit concerns cross-source RL overlap, not SFT exposure or evaluation
+contamination. Confirmed overlaps are a lower bound.
+
+Extended review through cosine rank 219 increased coverage to 256 distinct pairs.
+After independent adjudication, the cleanup removes 65 unique duplicate DAPO
+questions (66 cross-source pairs), two underspecified DAPO rewrites, and one
+invalid UltraData probability question (Math_04930). This is 68 additional rows
+relative to candidate v1. See `math_source_overlap_final.json` for consolidated
+counts. UltraData Math_04163 is retained after deduplication, but its 1/8 key has
+not received a complete global-minimum proof; duplicate identity is confirmed.
+No global overlap thresholds or canonical source pools were changed.
+Validation: 125 focused tests pass, launcher shell syntax and diff whitespace
+checks pass. No new model training or evaluation was launched for these edits.
+
+Candidate build mlq10217 succeeded. `postraining/data/reviewed_candidate_20260926_v2/mixture.manifest.json` has 131,224 rows: DAPO8,340 and UltraData math19,764; other source counts unchanged. The actual SFT/science holdout audit still passes its recorded matching rules. This is a prepared candidate, not an activated training mixture.
+
+
+## Partial code reward RL launch (2026-09-26)
+
+User authorized training with passed/total test feedback despite low all-tests
+accuracy. Added `--python-reward-mode test-fraction` (default); binary remains
+explicitly selectable. Reward schema `bwrap_python_isolated_test_fraction/v1`
+is distinct from the unchanged v6 corpus verifier contract. Ordered setup
+statements are grouped with the next assertion-bearing case; failed cases do
+not skip later cases. Initialization, timeout, syntax/policy, and integrity
+failures receive zero. Harness integrity is checked after each original test
+statement, including grouped fixtures. Full-suite accuracy stays separate from
+partial reward. Resume and actor/critic initialization reject objective changes.
+
+80 focused tests pass. Final saved-rollout audit mlq10223 succeeded: among
+8192 code responses at the previous 4096 cap, 33 earn partial credit and 1
+passes all tests; 24/512 questions have mixed fractional rewards versus 1/512
+under binary rewards. Mean test fraction is 0.00087246. Constant-return
+controls can earn substantial partial credit; do not interpret average test
+fraction alone as solved-task accuracy. See `code_partial_reward_final_audit.json`
+and `code_partial_reward_semantic_review.json` in corpus_quality_20260926.
+
+Launched mlq10224, `kda8_rl_reviewed_v2_partial_2048_20260926_r2`, via
+`scripts/launch_reviewed_rl.sh`: reviewed candidate v2 (all six sources),
+math/code/science SFT checkpoint, 256 prompt + 2048 response, 64 prompts x16
+samples per update in 32-group waves, 50 critic warmup + 950 joint updates,
+held-out math/BPB every20, checkpoints every300seconds, choice permutations,
+priority1/maxparallel1/time limit12h. Sustained32all-zero pools stop the run;
+no short-plateau cutoff. Initial10222 was cancelled before optimizer updates
+because the final verifier change landed during startup;10224 starts fresh
+with the final-harness audit prerequisite. No binary critic state is reused.
+
+
+Final launch supersedes the startup records above: **mlq10228**, run
+`kda8_rl_reviewed_v2_partial_2048_20260926_r3`, queued automatically after
+final scorer-v2 replay audit10227. Schema is now
+`bwrap_python_isolated_test_fraction/v2`, scorer SHA256
+`8c580aeb8e52773a1345ed2a8a3d1044a0cfdaba5d0ee29c5ba1271d14cdfe7e`.
+Uncalled helper definitions no longer earn credit; invoked assertion-bearing
+helpers count as cases. All19,989code rows statically group without errors;
+all11helper-definition rows independently reviewed;84focused tests passed.
+10224 was also cancelled before optimizer updates; the shared queue now owns
+final audit/training startup. Configuration and1000total-update budget remain
+as above. `corpus_quality_20260926/partial_rl_launch.json` is the launch record.
+
+
+### GPU-idle stall fixed (2026-09-26)
+
+User reported idleGPU on10228. Nine critic warmup updates completed at roughly
+11–20s/update afterinitialcompilation; warmup10 then spent minutes on oneCPU
+core withnoGPUtraining. SIGINT traceback proved the stall was
+`parse_numeric_answer -> Fraction -> numerator *= 10**exp`: a generated
+scientific exponent requested an enormous exact integer. Interrupted before
+anyactorupdates; no checkpoint existed yet. This was a reward-parser resource
+bug, not insufficientGPUcapacity or lack ofreward signal.
+
+Bounded scientific exponent magnitude to4096 before everyFraction conversion,
+including numerator/denominator forms; existing128character input limit stays.
+No gold answer among131224reviewedrows exceeds this bound.160focused tests
+passed, with independentreview. Reward schema bumpedv5. SIGUSR1 now dumpslive
+Pythonstacks withoutptrace and warmup timings printto stdout. SamefullRLrun
+requeuedas10242 / `kda8_rl_reviewed_v2_partial_2048_20260926_r4`, pri1,max1,12h;
+the9criticwarmupupdates repeat because no recoverycheckpoint wasavailable.
+
+
+## Standard PG default; SFT actor with retained critic (2026-09-26)
+
+User requested standardPG insteadofDG and explicitly resetactor toSFT while
+retainingcritic. ConfigdefaultDGFalse, launcherspin--no-delightful-policy-gradient.
+Added --critic-only-init withsource/reward/corpus/fence/budget/schema guards;
+onlycriticweightsload, actorremainsSFT, optimizers/RNG/samplerfresh. Critictransfer
+provenance persists through resumes.130focused tests pass; actualdonor passes
+compatibilitycheck. Independentimplementation review complete beforelaunch.
+
+DGjob10242cancelled atcompletedactorstep420. Latestcheckpoint containsstep397
+critic plus50warmupupdates; actorweightsfromit areignored. PGjob10265queued as
+`kda8_pg_reviewed_v2_partial_2048_20260926`, 530PGupdates, nowarmup, same2048
+responses/partialcoderewards/all6sources. Budget50+420+530=1000. Initial estimate
+553usedsavedstep397; correctedto530usingactualcompletedstep420 beforestart
+(queued10264cancelledwithoutstarting). Queuepriority1,maxparallel1,12h limit.
+See corpus_quality_20260926/pg_critic_transfer_launch.json.

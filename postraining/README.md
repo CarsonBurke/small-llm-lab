@@ -33,9 +33,10 @@ not certification of every remaining answer.
 MiniCPM's seeded sequential cursor now traverses the content-unique corpus
 before wrapping. Generating 16 attempts together for one prompt is intentional;
 it does not select that prompt again later in the same corpus pass. Warmup
-consumes the same cursor, and exact resume preserves it. Existing weighted
-mixture samplers retain their independent per-source passes and quotas; they
-do not promise a single global corpus epoch.
+consumes the same cursor, and exact resume preserves it. The VAPO mixture
+sampler (`vapo_verifiable_mixture/v2`) makes the same promise: one cycle is
+one pass over every prompt of every source (see "RL mixtures are exact-pass"
+below).
 
 New training checkpoints bind the ordered effective prompts, grading contracts,
 and review-policy identity in addition to their existing dataset guards.
@@ -171,12 +172,25 @@ The KDA adapter for gate 3 exists: `postraining/kda_backbone.py`
 `*_kda_*` checkpoints through `model_io.load_model` with zero key mapping.
 Dense MHA layers keep KV caches; KDA mixers carry
 `(conv_q, conv_k, conv_v, state)` decode caches — the delta-rule state is
-always fp32. Rollout decode is a pure-PyTorch recurrence (stays inside the
-fullgraph-compiled step artifact); prefill and teacher-forced replay dispatch
+always fp32. Rollout decode runs the recurrence as one fused Triton kernel
+(`pretraining/nanogpt_mini/kda_decode_kernel.py`: one read and one write of
+the fp32 state per step, all arithmetic in fp32), registered as a
+`torch.library.triton_op` so it stays inside the fullgraph-compiled step
+artifact; the PyTorch recurrence `kda_recurrent_step` is its reference and
+the CPU path, and runs its contractions in fp32 even under autocast. Decode
+attention in the dense layers reads only each row's live key range
+(`postraining/decode_attention.py`, split-K flash-decoding, same op
+registration), so left-pad slots and the unwritten tail cost no bandwidth.
+Prefill and teacher-forced replay dispatch
 to FLA's `chunk_kda` on CUDA (the mixer is an eager region, so the replay
 artifacts compile with graph breaks — set automatically). The
 continuous-refill scheduler is KV-address machinery and is refused for KDA;
-use lockstep. CPU parity/integration tests live in
+use lockstep. Scoring (VAPO's emit log-probs, SFT's completion CE) goes
+through the nano family's `target_logprobs_from_features`
+(`SoftcappedTargetLogprobs`): it saves only the bf16 readout GEMM output and
+a logsumexp per scored position, and its backward is one elementwise pass
+over (positions, vocab) instead of the composed softcap / fp32 log-softmax /
+gather graph. CPU parity/integration tests live in
 `postraining/tests/test_kda_backbone.py`; the CUDA parity gate
 (kernel-vs-reference, dense-vs-decode logits, left-pad invariance) is
 `postraining/kda_gpu_parity.py`, run through mlq.
@@ -1357,10 +1371,10 @@ python3 -m postraining.train_latent_vapo \
 
 The default immutable bare-prompt manifest is rebuilt with `python3 -m
 postraining.prepare_vapo_mixture`; the builder defaults to the same
-`postraining/data/vapo_broad_v8_bare` prefix consumed by training and requires
-`--sft-corpus`. See "RL mixture quotas follow measured learnability" below for
-the v8 sources; the MBPP verifier corpus is now built only when `mbpp` is
-explicitly selected with a `--quota`.
+`postraining/data/vapo_broad_v12_exact` prefix consumed by training and
+requires `--sft-corpus`. See "RL mixtures are exact-pass" below for the
+sources; the MBPP verifier corpus is built only when `mbpp` is selected in
+`--sources`.
 
 Each emitted token is one action. Its actor score term is gated by
 `sigmoid(advantage * -current_token_log_probability)` with the paper's fixed
@@ -1683,16 +1697,23 @@ when its backend module is first imported.
 
 `scripts/launch_kda8_posttrain.sh {sft|rl}` queues each stage through `mlq`
 with every value pinned explicitly and the reason for each non-default
-recorded in the script header. Stage `rl` consumes the checkpoint stage `sft`
-writes, so run `sft`, read its gate, then run `rl`.
+recorded in the script header. Check `RL_BASE_RUN` before launching: the current RL default names the older
+drills checkpoint, while the SFT stage produces a separate long-context run.
 
-Both stages are budget-bound to the base checkpoint's own context:
-`sft_trace_train.py` derives `--seq-len` and its sampling-gate budgets from
-`backbone.train_context_tokens` and refuses a gate budget larger than that
-window, so a short-context checkpoint can no longer pack or sample into RoPE
-positions it never saw. They are also hash-bound: the RL mixture manifest
-binds `sft_corpus_sha256`, and the RL trainer rejects a base checkpoint whose
-recorded `traces_sha256` differs.
+Future RL runs default to 2,048 generated response tokens. Benchmark and AIME
+budgets inherit the response cap unless explicitly overridden. Runtime context
+expands to fit the prompt and response; the KDA launcher uses 256 + 2,048 =
+2,304 tokens. Checkpoint training-window metadata is preserved, and the run
+manifest records context extrapolation when runtime capacity exceeds it. This
+allocation does not establish that a short-context checkpoint learned to use
+longer contexts. Latent reasoning additionally reserves internal stream slots.
+The default update budget is 950 joint updates plus 50 critic warmup updates.
+For exact historical resumes, pass the original response/evaluation budgets;
+changed effective training budgets are rejected.
+
+SFT sequence length and gate budgets are configured separately. Both stages
+are hash-bound: the RL mixture manifest binds `sft_corpus_sha256`, and the RL
+trainer rejects a base checkpoint whose recorded `traces_sha256` differs.
 
 ## Large single-epoch SFT corpora
 
@@ -1706,7 +1727,7 @@ consumes it unchanged:
 | `problem` | canonical bare problem, all source wrappers stripped |
 | `document` | `problem` + `<think>\n{solution}\n</think>\n<answer>{answer}</answer>` |
 | `final_answer` | the graded answer span |
-| `verified` | `"False"` for model-generated solutions that were not re-verified |
+| `verified` | bool: `True` only for rows this repository re-verified (the sandbox-verified `ultradata_code_l3` pool); `False` for model-generated solutions |
 | `doc_tokens` | GPT-2 BPE length of `document` |
 
 `document` begins with `problem` because the answer-fence prompt contract
@@ -1746,29 +1767,103 @@ memorisation, not reasoning.
 A corpus that is gated is declared in `CREDENTIALED_ADAPTERS` and refuses
 with the reason, so it reads as a missing credential and not a typo.
 
-## RL mixture quotas follow measured learnability
+## RL mixtures are exact-pass
 
-`prepare_vapo_mixture.py` ships per-source prompts-per-pool quotas set by
-frozen-policy gate accuracy, not by source size. VAPO's advantage is
-group-relative, so a uniformly wrong rollout group contributes no policy
-gradient — weighting an all-zero source heavily spends the pool on prompts
-that cannot teach anything.
+A `vapo_verifiable_mixture/v2` manifest has no per-source quotas. One mixture
+cycle serves every row of every selected source exactly once: each source's
+rows in file order in cycle 0 and a seeded reshuffle afterwards, interleaved
+by a largest-deficit schedule over source sizes so every rollout window holds
+each source within about one prompt of its share of the corpus. No prompt is
+revisited before every other prompt has been seen, and `--consume-all-prompts`
+bounds a run to exactly one pass. Composition is chosen by selecting (or
+rebuilding) sources, not by weighting them. The v1 quotas (48/8/8 per 64 in
+v8/v9) reran the 2,306-prompt ultradata pool about 31 times per pass over
+deepmind_easy; v1 manifests no longer load.
 
-- `deepmind_easy` (48) — `mathematics_dataset-v1.0` **train-easy** tier,
-  18 verifier-compatible modules, 4,000 prompts each. Build it with
-  `scripts/build_deepmind_rl_prompts.py --source-dir .../train-easy --split
-  train-easy`; `--split` must name the directory or the build refuses, so a
-  manifest cannot misreport its tier. Note that `deepmind-interpolate-easy`
-  is the **bench panel** and "easy" there names the module selection, not a
-  difficulty tier.
-- `ultradata_math` (8) — `openbmb/UltraData-RL-2609` Math rows, promoted from
-  the pinned extraction by `scripts/build_ultradata_math_rl_prompts.py`.
-  Math only: 95% of its math prompts fit a 256-token budget, against 16% for
-  Code and 0% for Long_Context.
-- `dapo` (8) — small hard tail, so the policy cannot narrow onto one
-  templated prompt shape.
-- `deepmind` (interpolate) and `mbpp` ship at **quota 0**: selectable, off by
-  default, and each needs an explicit `--quota SOURCE=N` to contribute.
+A small source can be absent from a pool (the 2,306-row v2 ultradata pool
+was 2.5% of the v10 corpus, about 1.6 prompts per 64-prompt pool), so
+per-source rollout telemetry is
+emitted only for sources present in that pool. Optimizer minibatches deal
+each source's groups round-robin, so a source's count differs by at most one
+between minibatches of a pool.
+
+- `deepmind_easy` (default, 71,744 prompts) — `mathematics_dataset-v1.0`
+  **train-easy** tier, 18 verifier-compatible modules, 4,000 prompts each.
+  Build it with `scripts/build_deepmind_rl_prompts.py --source-dir
+  .../train-easy --split train-easy`; `--split` must name the directory or
+  the build refuses, so a manifest cannot misreport its tier. Note that
+  `deepmind-interpolate-easy` is the **bench panel** and "easy" there names
+  the module selection, not a difficulty tier.
+- `ultradata_math` (default, 19,765; `ultradata-math-rl-v5`) — the whole
+  `openbmb/UltraData-RL-2609` Math domain (all 32,412 records converted,
+  23,361 with a deterministic atomic target in `verifiable_mixed_10k_20260917`),
+  built by `scripts/build_ultradata_math_rl_prompts.py`. Math only: 97.9% of
+  its math problems fit a 256-token budget, against 16% for Code and 0% for
+  Long_Context. It **owns** every problem it shares with DAPO.
+- `dapo` (default, 8,408; `dapo-math-17k-v2-ud3dedup`) — DAPO-Math-17K less
+  the 5,268 problems that restate an UltraData Math problem, built by
+  `scripts/build_dapo_rl_prompts.py`. Hard tail, so the policy cannot narrow
+  onto one templated prompt shape.
+
+Both math pools pass the screens of `postraining/math_rl_pool.py`, in order,
+with every drop counted, and its row ids listed, in the pool manifest:
+canonicalization (a literal `Answer:` demand quarantines), C0 control bytes
+(DAPO's `\f`-escape corruption, dropped rather than repaired), target
+self-verification under the trainer's own `verify_answer` call, equation
+targets (a Minerva truth such as `x + 2y - 5 = 0` states no single value,
+and Minerva grades only the text after its last `=`), the math
+evaluation decontamination and containment screens of the SFT corpora, the
+256-token GPT-2 prompt budget (`encode_prompt` keeps the *last* tokens, so an
+over-long problem would be served beheaded), yielding to an owner pool, and
+restatement collapse: same-text copies (equal LaTeX skeleton) keep the lowest
+identity when their targets agree and are quarantined when they do not;
+shingle near-duplicates collapse only into a row they match directly with an
+agreeing target, and are kept when the target differs (answer-form rewrites
+and symbolic siblings, not label errors). Overlap between pools is measured
+by `postraining/problem_overlap.py` — whitespace, LaTeX skeleton, and 8-token
+shingle containment with a digit-multiset guard — because whitespace-exact
+matching sees only 4,344 of the 5,268 DAPO problems UltraData restates.
+Calibration: NOTES.md 2026-09-23.
+- `deepmind` (interpolate) and `mbpp` are selectable but off by default.
+- `ultradata_code_l3` (off by default; `ultradata-code-l3-v3-rl`, 20,000
+  rows, verifier `python_mbpp`) — sandbox-verified UltraData-Code L3/py
+  exercises from `prepare_ultradata_code.py` (below). The prompt is the bare
+  task plus one or two example asserts. Grading covers every kept test
+  statement, a median of 10. No row shares a problem identity with the
+  `ultradata_code_l3` SFT corpus. Python reward v6
+  (`vapo/code_reward.py`) runs the tests in their own namespace over pristine
+  builtins, exposing only the row's `verification_info.entry_points`; the
+  candidate's imports are private module copies whose classes must stay
+  unmodified. v5 rows (no `entry_points`) are refused. A mixture binds the
+  Python reward schema only when it contains a `python_mbpp` source.
+- `ultradata_knowledge` (off by default; `ultradata-knowledge-rl-v2`, 2,337
+  rows) — UltraData-RL-2609 Knowledge. Its single-choice rows are
+  re-rendered as `A. option` lines, and each answer is permuted to a uniform
+  position and graded as one exact letter (`rule`). It also carries numeric
+  rows. Build it with `scripts/build_ultradata_knowledge_rl_prompts.py`,
+  which refuses to run without the GPQA/MMLU/MMLU-Pro screening files. Chance
+  is 1/k and is reported per `choice_{k}` module, so gate the model above
+  chance before selecting it. See NOTES.md 2026-09-23.
+- `science_mc` (off by default; `science-mc-rl-v3`, 9,788 rows) — ARC-Challenge,
+  ARC-Easy, OpenBookQA and SciQ **train** splits under the same single-choice
+  contract (`postraining/choice_rl_pool.py`), mostly four options, modules
+  `{source}_choice_{k}`. Built by `scripts/build_science_mc_rl_prompts.py`,
+  which screens against MMLU, MMLU-Pro, GPQA and these sources' own
+  validation/test splits, and yields to questions the Knowledge RL pool or
+  SFT corpus already hold. SciQ is CC BY-NC 3.0 (non-commercial).
+  v3 is v2 minus the questions reserved for teacher traces
+  (`science-mc-sft-questions-v1`, 9,975 rows). The split
+  (`question_component_hash_split/v2`, `choice_rl_pool.partition_questions`)
+  groups rows into question components and sends each whole component to one
+  side by `sha256(salt NUL min original_query_sha256)`. A component is the
+  union of rows that share a normalized problem or stem, or that restate one
+  another under `contains_benchmark_question`. That rule is evaluated three
+  ways: against the global index, against the global index with every 8-gram
+  treated as distinctive, and against each partition's own index, iterated
+  until no join remains. The third check exists because distinctiveness
+  depends on the index, and a two-sided global index hides pairs that a
+  one-sided screen later sees. Both manifests record the rule, salt, fraction
+  and per-source counts. `--sft-fraction 0` rebuilds v2 byte for byte.
 - `gsm8k` is in `RETIRED_SOURCES` and cannot be selected at all.
 
 `--sft-corpus` is required and is bound into the manifest by sha256, so RL
@@ -1803,7 +1898,61 @@ Two record shapes, declared per adapter rather than sniffed:
   presented answer supplies `<answer>`. The `no_think` split has no reasoning
   field at all, so admitting it would mean synthesising a `<think>` body.
   Math answers come from the balanced `\boxed{}` span; Code answers are the
-  final fenced program.
+  final fenced program. `ultradata_sft_2605_knowledge` reads the Knowledge
+  domain and admits only templated single-choice rows. It removes the
+  `$LETTER` header, checks the options against the declared labels, and
+  takes the concluded label as the answer. It also caps documents at 2,048
+  tokens (`max_doc_tokens`) under any `--seq-len`, and drops any row whose
+  reasoning discusses the removed header (`cites_answer_format`; that is 65%
+  of the templated rows). It also screens against MMLU, MMLU-Pro, GPQA and
+  the SciQ/ARC/OpenBookQA evaluation splits with
+  `contains_benchmark_question`. Teacher answers skew to early labels, so the
+  adapter sets `balance_choice_answers`: rows whose every label reference is
+  provable are permuted consistently (`choice_prompt.permute_choice_row`:
+  options moved, trace references renamed, byte-exact inverse round trip) to
+  fill under-represented positions, and the rest are subsampled so every
+  position per option count ends within one row of the others. The manifest
+  records `choice_answer_balance` per option count. The proof rules
+  exclude articles, quantities, positional wording and labels outside the
+  row's set, and a relabelling is refused on any unprovable token. The
+  round trip proves only stable tokenization, not meaning. The adapter also
+  drops traces that never state the label near their end, degenerate into
+  repeats or end in debris (`choice_prompt.defective_trace`), and it
+  deduplicates by question plus sorted option texts (`choice_identity`).
+  Built as `sft_ultradata_knowledge_v2` (235 documents, 0.38M tokens; 26
+  relabelled). v1 (630 documents) relabelled 27 of its 109 rows
+  inconsistently and is superseded.
+- `choice_trace` — verified teacher traces for single-choice questions.
+  `science_mc_traces` reads the pool that `generate_choice_traces.py select`
+  writes. The v1 pool requires both Qwen3.8-27B samples to answer correctly
+  (`--min-correct-share 1.0` with `--samples 2`); a question with only one
+  correct sample is excluded. The prompt is the bare rendered problem, the teacher's
+  reasoning (without its `Answer:` line) becomes the `<think>` body, and the
+  verified letter becomes `<answer>`. Rows must carry `verified = True`, a
+  letter among the rendered labels and a known source. They must also pass
+  `choice_prompt.choice_trace_defect`, which rejects traces that directly call
+  the verified answer option wrong, mention the answer format or the teacher's
+  instructions, or are degenerate, truncated, or repetitive. The adapter
+  caps documents at 1,024 tokens. It deduplicates by `choice_identity`, and
+  the manifest records each option count's answer labels
+  (`choice_documents`). It does not rebalance. The manifest also carries
+  `teacher_traces`: the teacher, sampling and yield from the pool manifest,
+  which is checked against the pool's sha256.
+  Choice rows set `gradeable = False` for the SFT trainer's math-only
+  sampling gate; they still train and count toward holdout CE. Science
+  accuracy needs a separate exact-letter evaluation after SFT.
+  The built source is `postraining/data/sft_science_mc_traces_v1.parquet`
+  (9,329 documents; sha256 `aa31a3b80400432893b1f4d2c3be7264164b004daad07eeeddbbcabfad136282`).
+  It contains science traces only. The existing
+  `sft_ultradata_knowledge_v5.parquet` remains the reference used when the
+  science question split was built; no Knowledge v6 corpus was built for this
+  SFT stage. See NOTES.md 2026-09-24 for yields and provenance hashes.
+- Evaluation-only data. Everything under `postraining/data/stem_eval_decontam`
+  (MMLU, MMLU-Pro, GPQA, the SciQ/ARC/OpenBookQA validation and test splits)
+  is a screening target only: `shard_paths` and `prepare_vapo_mixture` refuse
+  paths under it, and `tests/test_benchmark_isolation.py` checks every
+  declared input and every built Knowledge/science artifact for GPQA
+  questions.
 
 ### Rows are dropped, never reshaped
 
@@ -1841,6 +1990,17 @@ of the panel; they still train and still count toward holdout CE. Raise
 `--holdout-problems` for a mixed corpus — the trainer errors rather than
 silently gating on a short panel.
 
+### Verified code exercises (`code_exercise`)
+
+`ultradata_code_l3` reads the local verified pool that
+`prepare_ultradata_code.py` writes, not the raw shards. `analysis` becomes
+the `<think>` body and the fenced reference program becomes `<answer>`.
+These are the only rows marked `verified = True`, and the adapter caps them
+at 2,048 tokens. `sft_trace_train.load_documents` refuses a corpus that
+mixes verified and unverified rows unless `--allow-unverified` is given.
+Filtering such a corpus to its verified rows would silently train on the
+code slice alone.
+
 ### `--workers`
 
 Screening and tokenizing are pure and order-preserving; deduplication and the
@@ -1848,3 +2008,108 @@ caps stay in the parent, so the corpus is byte-identical for any worker count
 (verified for 1 vs 8 and 1 vs 16). The pool uses an explicit `fork` context:
 Python 3.14 defaults to `forkserver` on Linux, which re-imports the module and
 would leave the shared decontamination index unset in the workers.
+
+## `prepare_ultradata_code.py` — verified UltraData-Code SFT and RL pools
+
+openbmb/UltraData-Code L3/py (revision `85182d82`) has four generated fields
+per exercise: `task`, `analysis`, `solution` and `test`. Nothing upstream
+executed the tests. This tool admits a row only when this repository's own
+Python reward agrees with it, then splits the admitted rows into a disjoint
+SFT pool and RL pool. It runs on CPU only.
+
+```bash
+# 19 evenly spaced shards of 147, sha256-checked against the hub LFS hashes
+HF_TOKEN=... .venv/bin/python -m postraining.prepare_ultradata_code download --shards 19
+.venv/bin/python -m postraining.prepare_ultradata_code targets   # MBPP + HumanEval screens
+.venv/bin/python -m postraining.prepare_ultradata_code build \
+  --sample-rows 2681998 --rl-rows 20000 --sft-rows 120500 --workers 14 \
+  --output-prefix postraining/data/ultradata-code-l3-v3
+.venv/bin/python -m postraining.prepare_sft_corpus --source ultradata_code_l3 \
+  --seq-len 5120 --workers 12 --output postraining/data/sft_ultradata_code_l3_v2.parquet
+```
+
+**Admission.** A row is admitted only if all of the following hold:
+
+- The reference solution passes `python_candidate_allowed`, the reward's own
+  AST policy.
+- The whole test module, split into top-level statements, passes twice in
+  the bwrap sandbox, each run within 1 s.
+- The solution with every top-level function body replaced by `return None`
+  fails those tests.
+- The tests read only entry points, builtins and their own bindings.
+- There are at least 3 distinct top-level asserts.
+- Every entry point is named in the task.
+- The task and analysis never cite "the snippet" or "the original code".
+
+Evaluation containment is screened against KodCode, MBPP, HumanEval and
+GSM8K RL prompts (30% 8-gram containment), plus the math index.
+
+**Problem identity.** Word-shingle MinHash does not see paraphrase: in a
+3,726-row verified sample, 34% of rows share their entry-point name with
+another row, at a median estimated Jaccard of 0.056, and those pairs are the
+same problem reworded. The sorted entry-point name set is therefore the
+problem identity.
+
+- An identity belongs to exactly one pool.
+- RL holds 1 row per identity and SFT at most 3.
+- Rows of a saturated identity are skipped before sandboxing. Given the
+  same verdicts, the pools do not depend on `--workers`. Verdicts are
+  wall-clock bound, so heavy contention can flip a borderline row.
+- An SFT row is also dropped if its task reaches estimated Jaccard 0.3 with
+  any RL task. This catches the same problem under a different function
+  name (`cigar_party` / `party_success`): 294 rows in v2.
+
+**RL prompts.** Each prompt is the task plus one or two self-contained,
+single-line example asserts, within a 256-token BOS+prompt budget. A row is
+RL-eligible only if its unshown statements call an entry point with
+arguments no example shows, so returning the shown outputs cannot pass.
+
+**v2 numbers.** From 2,681,998 rows:
+
+- 1,147,903 screened, 959,645 left after dedupe, 378,768 sandboxed.
+- 140,817 verified: 37.2% of sandboxed rows, and 50–52% before
+  repeat-skipping.
+- 20,000 RL rows and 120,206 SFT pool rows over 90,794 identities.
+- The SFT corpus has 116,525 documents and 102.5M tokens: median 800, p99
+  1,899, 74% at or under 1,024.
+
+v1 has no cross-pool twin screen and is superseded.
+
+NOTES.md 2026-09-23 has the full audit.
+
+
+### Reviewed STEM/code/QA RL with partial code credit
+
+`scripts/launch_reviewed_rl.sh [run-name]` starts the reviewed six-source mixture
+from `kda8_sft_omi2_drills_code30k_science_v1_e1`. It uses 2,048 response tokens,
+950 joint updates plus 50 critic warmup updates, and per-presentation option
+permutation for multiple-choice questions. The queue limit is one job, priority
+1, with a 12-hour timeout. Held-out math evaluation runs every 20 updates;
+all-source training transcripts and exact/partial reward metrics are retained.
+
+`--python-reward-mode test-fraction` is the training default: code receives the
+number of passed assertion-bearing cases divided by the fixed case count.
+Consecutive fixture statements belong to the following assertion-bearing case;
+setup and uncalled helper definitions do not earn credit. Standalone calls
+to assertion-bearing test helpers count as cases. Syntax/policy violations, timeout, initialization
+failure, or harness integrity failure receive zero. Full-suite success remains
+a separate metric, so partial credit is not reported as accuracy. `binary`
+selects the historical all-tests-pass reward. The run/checkpoint reward schema
+binds this objective separately from the unchanged corpus verifier schema.
+
+
+### Policy-gradient default and critic-only initialization
+
+Standard policy gradient is the default; Delightful Policy Gradient requires
+`--delightful-policy-gradient`. Both launch scripts explicitly disable DG.
+The existing PPO/VAPO actor path is used with one fresh batch and one update;
+at the on-policy point its unclipped gradient is the standard policy gradient.
+
+`--critic-only-init CHECKPOINT --value-warmup-steps 0` initializes trained
+critic weights while retaining the SFT actor from `--checkpoint`. Actor weights,
+optimizer state, RNG, and sampler position from the donor are not restored.
+The critic transfer checks reward, corpus, and model compatibility and records
+its source in the manifest. This is a new run, not an exact resume.
+
+For the reviewed launcher, optional second and third arguments select a critic
+checkpoint and joint-update budget: `scripts/launch_reviewed_rl.sh RUN CRITIC STEPS`.
