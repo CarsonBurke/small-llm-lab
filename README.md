@@ -47,7 +47,7 @@ and retained base-model capability under matched evaluation settings.
 | [`tests/`](tests/), [`pretraining/tests/`](pretraining/tests/), [`postraining/tests/`](postraining/tests/) | Test suites |
 | [`docs/`](docs/) | Research assessments and design documentation |
 | [`NOTES.md`](NOTES.md) | Experiment history, measurements, and operational notes |
-| [`ablations/`](ablations/), [`records/`](records/) | Historical ablations and Parameter Golf submissions |
+| [`ablations/`](ablations/) | Historical ablations and Parameter Golf experiments |
 
 `train_gpt.py` and `train_gpt_mlx.py` are preserved upstream entry points.
 New experiments belong in their domain directories.
@@ -120,6 +120,5 @@ runs. See the domain guides for exact requirements and artifact locations.
 The repository began with OpenAI's Parameter Golf code and includes work
 adapted from modded-nanogpt. The original copyright notices are preserved in
 [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-The historical submissions in `records/` retain their authorship and context.
 Dataset and external model licenses are separate from this repository's MIT
 license; consult the corresponding source manifests and notices.
