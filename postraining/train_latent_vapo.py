@@ -51,6 +51,8 @@ vary within prompt groups before any update is attempted.
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import signal
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
@@ -77,8 +79,13 @@ from pretraining.latent_moe_training import (
     reset_quantile_balance_accumulators,
 )
 import postraining.latent_rollout
-from postraining.latent_eval import evaluate_latent_math
+from postraining.latent_eval import (
+    EVAL_TEMPERATURE,
+    EVAL_TOP_P,
+    evaluate_latent_math,
+)
 from postraining.benchmark_report import write_benchmark_report
+from postraining.gate_transcripts import GateTranscriptWriter
 from postraining.rollout_report import (
     RolloutSampleRecorder,
     RowVerdict,
@@ -94,8 +101,6 @@ from postraining.core import (
     ANSWER_OPEN,
     THINK_CLOSE,
     THINK_OPEN,
-    POSTTRAIN_PROMPT_TOKENS,
-    POSTTRAIN_RESPONSE_TOKENS,
     answer_style,
     clipped_policy_loss,
     delightful_policy_loss,
@@ -107,7 +112,8 @@ from postraining.core import (
     single_fence_span,
     structural_format_ok,
     generalized_advantage_and_return_targets,
-    length_adaptive_lambda,
+    actor_gae_lambdas,
+    temporal_difference_residuals,
     load_posttraining_tokenizer,
     load_unique_math_rows,
     math_corpus_identity,
@@ -143,9 +149,11 @@ from postraining.latent_rollout import (
     rollout_continuations,
     split_rollout_groups,
     think_slot_mask,
+    trajectory_token_seeds,
     trim_stream,
     validate_hidden_carry_rollout,
 )
+from postraining.graph_decode import PinnedDecodeArena
 from postraining.latent_thought import (
     EMIT,
     THINK,
@@ -183,18 +191,19 @@ from postraining.runtime.profiling import (
 )
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
-from postraining.vapo.config import build_arg_parser, validate_args
+from postraining.vapo.config import build_arg_parser, resolve_rollout_defaults, validate_args
 from postraining.vapo.code_reward import (
     PYTHON_REWARD_SCHEMA,
+    PYTHON_PARTIAL_REWARD_SCHEMA,
     PYTHON_RESULT_CODES,
     batch_python_test_results,
+    batch_python_test_scores,
 )
 from postraining.vapo.mixture import (
     MixedPromptSampler,
     file_sha256,
     load_mixture_manifest,
     mixture_identity,
-    rollout_window_source_quotas,
 )
 from postraining.vapo.schemas import (
     CRITIC_SCHEMA,
@@ -237,6 +246,7 @@ RESUME_EXACT_ARG_FIELDS = (
     "thought_sigma",
     "init_stop_thinking_probability",
     "gae_lambda_alpha",
+    "actor_gae_lambda",
     "nearby_reward_max",
     "think_tokens",
     "think_min_tokens",
@@ -314,6 +324,9 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
         for name in exact_fields
         if saved.get(name) != getattr(current, name)
     ]
+    for name in ("resolved_train_max_new_tokens", "resolved_train_max_stream_steps"):
+        if name in saved and saved[name] != getattr(current, name, None):
+            mismatches.append((name, saved[name], getattr(current, name, None)))
     if mismatches:
         details = ", ".join(
             f"{name}: checkpoint={before!r}, current={after!r}"
@@ -324,7 +337,43 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
         )
 
 
-CRITIC_INIT_PROVENANCE_FIELDS = ("init", "checkpoint", "source_execution_schema")
+CRITIC_INIT_PROVENANCE_FIELDS = (
+    "init", "checkpoint", "source_execution_schema", "checkpoint_sha256",
+    "source_actor_step", "source_value_warmup_step", "optimizer_state",
+)
+
+
+def validate_critic_only_init(payload: dict, args: argparse.Namespace,
+                              data_identity: str) -> None:
+    """Accept critic weights with the same value task, independent of actor loss."""
+    if args.value_warmup_steps != 0:
+        raise ValueError("--critic-only-init requires --value-warmup-steps 0")
+    if not resume_critic_schema_compatible(payload):
+        raise ValueError("critic-only checkpoint uses an incompatible critic schema")
+    expected = {
+        "base_checkpoint_sha256": args.base_checkpoint_sha256,
+        "reward_schema": REWARD_SCHEMA,
+        "python_reward_schema": getattr(args, "python_reward_schema", None),
+        "math_data_identity": data_identity,
+        "answer_fence_prompt_schema": (
+            ANSWER_FENCE_PROMPT_SCHEMA if args.answer_fence else None
+        ),
+    }
+    for name, value in expected.items():
+        if payload.get(name) != value:
+            raise ValueError(f"critic-only checkpoint changed {name}")
+    saved = payload.get("args", {})
+    for name in ("reasoning_mode", "think_tokens", "answer_fence",
+                 "think_min_tokens", "nearby_reward_max", "combined_mlp_hidden",
+                 "combined_mlp_blocks", "prompt_tokens", "continuation_tokens",
+                 "resolved_train_max_new_tokens", "resolved_train_max_stream_steps"):
+        if saved.get(name) != getattr(args, name, None):
+            raise ValueError(f"critic-only checkpoint changed {name}")
+    if int(payload.get("value_warmup_step", 0)) < 1:
+        raise ValueError("critic-only checkpoint has no completed critic warmup")
+    if "critic" not in payload:
+        raise ValueError("critic-only checkpoint has no critic weights")
+
 
 
 def resolve_critic_init_provenance(
@@ -348,7 +397,7 @@ def resolve_critic_init_provenance(
             )
         recorded = resumed_manifest.get("critic") or {}
         init = recorded.get("init")
-        if init not in ("scratch", "actor_copy", "warm_checkpoint"):
+        if init not in ("scratch", "actor_copy", "warm_checkpoint", "critic_only_checkpoint"):
             raise ValueError(
                 f"resume manifest records an unknown critic init {init!r}"
             )
@@ -357,7 +406,10 @@ def resolve_critic_init_provenance(
                 f"resume run's critic started as {init!r}; resume it with "
                 f"--critic-init {'actor' if init == 'actor_copy' else 'scratch'}"
             )
-        return {name: recorded.get(name) for name in CRITIC_INIT_PROVENANCE_FIELDS}
+        return {name: recorded.get(name) for name in CRITIC_INIT_PROVENANCE_FIELDS
+                if name in recorded}
+    if getattr(args, "critic_only_init", None):
+        return dict(args.critic_only_init_provenance)
     if args.actor_critic_init:
         return {
             "init": "warm_checkpoint",
@@ -885,12 +937,15 @@ def score_python_rollout(
     think_fence_ids: tuple[int, int],
     answer_fence_ids: tuple[int, int],
     min_think_tokens: int,
+    reward_mode: str = "binary",
 ) -> list[RowVerdict]:
-    """Binary all-tests-pass reward over the strict fenced code span.
+    """Test-based reward over the strict fenced code span.
 
     Returns each row's gate verdict, with the test harness's result as the
     graded prediction of an eligible row.
     """
+    if reward_mode not in {"binary", "test-fraction"}:
+        raise ValueError(f"unsupported Python reward mode {reward_mode!r}")
     if verification_info.get("schema") != PYTHON_REWARD_SCHEMA:
         raise ValueError("Python row uses an incompatible verifier schema")
     answers: list[str] = []
@@ -919,11 +974,21 @@ def score_python_rollout(
         answers.append(fenced_answer_text(visible, tokenizer, answer_fence_ids))
         eligible_indices.append(index)
     if answers:
-        results = batch_python_test_results(answers, verification_info)
-        for index, result in zip(eligible_indices, results, strict=True):
-            scores[index] = float(result == "pass")
-            statuses[index] = PYTHON_RESULT_CODES[result]
-            verdicts[index] = RowVerdict(format_ok=True, parsed_answer=result)
+        if reward_mode == "test-fraction":
+            results = batch_python_test_scores(answers, verification_info)
+            for index, result in zip(eligible_indices, results, strict=True):
+                scores[index] = result.reward
+                statuses[index] = PYTHON_RESULT_CODES[result.status]
+                verdicts[index] = RowVerdict(
+                    format_ok=True,
+                    parsed_answer=f"{result.status}: {result.passed}/{result.total} tests passed",
+                )
+        else:
+            results = batch_python_test_results(answers, verification_info)
+            for index, result in zip(eligible_indices, results, strict=True):
+                scores[index] = float(result == "pass")
+                statuses[index] = PYTHON_RESULT_CODES[result]
+                verdicts[index] = RowVerdict(format_ok=True, parsed_answer=result)
     batch.verifier_status = torch.tensor(
         statuses, dtype=torch.long, device=batch.rewards.device
     )
@@ -1197,18 +1262,18 @@ def source_diagnostics(
     min_think_tokens: int = 1,
     answer_fence_ids: tuple[int, int] | None = None,
 ) -> dict[str, dict[str, float | int]]:
-    """Compute the same rollout diagnostics independently for every source."""
-    by_source: dict[int, list[LatentRolloutBatch]] = {
-        source_id: [] for source_id in range(len(source_names))
-    }
+    """Compute the same rollout diagnostics independently for every source.
+
+    An exact-pass mixture gives a small source well under one prompt per
+    pool, so a source absent from this pool is omitted rather than reported
+    as a zero it never earned.
+    """
+    by_source: dict[int, list[LatentRolloutBatch]] = {}
     for group in groups:
         source_id = source_group_id(group)
-        if source_id not in by_source:
+        if not 0 <= source_id < len(source_names):
             raise ValueError(f"rollout carries unknown source id {source_id}")
-        by_source[source_id].append(group)
-    missing = [source_names[index] for index, rows in by_source.items() if not rows]
-    if missing:
-        raise ValueError(f"rollout pool omitted configured sources: {missing}")
+        by_source.setdefault(source_id, []).append(group)
     return {
         source_names[source_id]: aggregate_diagnostics(
             source_groups,
@@ -1220,7 +1285,7 @@ def source_diagnostics(
             min_think_tokens=min_think_tokens,
             answer_fence_ids=answer_fence_ids,
         )
-        for source_id, source_groups in by_source.items()
+        for source_id, source_groups in sorted(by_source.items())
     }
 
 
@@ -1339,6 +1404,100 @@ def aggregate_value_diagnostics(
     }
 
 
+def credit_assignment_moments(
+    batch: LatentRolloutBatch,
+    advantages: torch.Tensor,
+    value_targets: torch.Tensor,
+    actor_signal_rows: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Raw token moments for two credit-assignment health checks.
+
+    - Calibration of the critic's one-step differences: regressing the
+      Monte-Carlo advantage (lambda-1 return minus value) on the TD(0)
+      advantage gives slope 1 for a calibrated critic, about 1/2 when critic
+      noise dominates the differences, and above 1 when the critic
+      under-reacts. Lambda-0 actor advantages are trustworthy only near 1.
+      Only non-terminal slots enter: at a row's last action both residuals
+      are R - V exactly, and those identical points would pull a pure-noise
+      critic's slope from 1/2 toward 1.
+    - Advantage versus sampled-token surprisal on failed rows the actor
+      trains on (rows a source gate zeroed carry no pseudo-reward): a critic
+      whose differences reward rare tokens regardless of outcome is a
+      pseudo-reward that Delightful PG amplifies into entropy growth.
+
+    Sums, not ratios, so groups pool exactly in the dashboard. Masked
+    products rather than boolean indexing keep the update free of host syncs.
+    """
+    # An action slot followed by another action slot is non-terminal.
+    actions = batch.action_mask.double()
+    actions = torch.cat((actions[:, :-1] * actions[:, 1:], actions[:, -1:] * 0), dim=1)
+    td0 = temporal_difference_residuals(
+        batch.rewards, batch.old_values, batch.action_mask
+    ).double() * actions
+    mc = (value_targets - batch.old_values).double() * actions
+    failed = batch.emit_mask.double() * (
+        (batch.reward_scalar <= 0) * actor_signal_rows
+    )[:, None].double()
+    failed_advantage = advantages.double() * failed
+    failed_surprisal = -batch.old_token_logprobs.double() * failed
+    return {
+        "credit_count": actions.sum(),
+        "credit_td0_sum": td0.sum(),
+        "credit_mc_sum": mc.sum(),
+        "credit_td0_square_sum": td0.square().sum(),
+        "credit_td0_mc_sum": (td0 * mc).sum(),
+        "failed_count": failed.sum(),
+        "failed_advantage_sum": failed_advantage.sum(),
+        "failed_surprisal_sum": failed_surprisal.sum(),
+        "failed_advantage_square_sum": failed_advantage.square().sum(),
+        "failed_surprisal_square_sum": failed_surprisal.square().sum(),
+        "failed_advantage_surprisal_sum": (
+            failed_advantage * failed_surprisal
+        ).sum(),
+    }
+
+
+def credit_assignment_dashboard(
+    metrics: list[dict[str, float]],
+) -> dict[str, float]:
+    """Pool ``credit_assignment_moments`` across groups into the two checks."""
+    total = {
+        key: sum(metric[key] for metric in metrics)
+        for key in metrics[0]
+        if key.startswith(("credit_", "failed_"))
+    }
+
+    def covariance(first: str, second: str, cross: str, count: str) -> float:
+        n = max(total[count], 1.0)
+        return total[cross] / n - (total[first] / n) * (total[second] / n)
+
+    td0_variance = covariance(
+        "credit_td0_sum", "credit_td0_sum", "credit_td0_square_sum", "credit_count"
+    )
+    advantage_variance = covariance(
+        "failed_advantage_sum", "failed_advantage_sum",
+        "failed_advantage_square_sum", "failed_count",
+    )
+    surprisal_variance = covariance(
+        "failed_surprisal_sum", "failed_surprisal_sum",
+        "failed_surprisal_square_sum", "failed_count",
+    )
+    scale = math.sqrt(max(advantage_variance, 0.0) * max(surprisal_variance, 0.0))
+    # A statistic without variance to normalize by is undefined, not zero;
+    # omit it rather than log a value indistinguishable from a real result.
+    dashboard = {}
+    if td0_variance > 1e-18:
+        dashboard["credit/td0_calibration_slope"] = covariance(
+            "credit_td0_sum", "credit_mc_sum", "credit_td0_mc_sum", "credit_count"
+        ) / td0_variance
+    if scale > 1e-18:
+        dashboard["credit/failed_advantage_surprisal_corr"] = covariance(
+            "failed_advantage_sum", "failed_surprisal_sum",
+            "failed_advantage_surprisal_sum", "failed_count",
+        ) / scale
+    return dashboard
+
+
 def aggregate_actor_tensorboard_metrics(
     metrics: list[dict[str, float]],
 ) -> dict[str, float]:
@@ -1411,6 +1570,8 @@ def aggregate_actor_tensorboard_metrics(
         "grad/combiner": last["combiner_grad_norm"],
         "grad/critic": last["critic_grad_norm"],
     }
+    if "credit_count" in last:
+        dashboard.update(credit_assignment_dashboard(metrics))
     if "carry_input_delta_rms_ratio" in last:
         # The hidden carry has no stochastic factor or head to report.
         dashboard.pop("loss/stochastic_policy")
@@ -1651,56 +1812,64 @@ def optimizer_minibatch_orders(
 def stratified_optimizer_minibatch_orders(
     groups: list[LatentRolloutBatch],
     groups_per_minibatch: int,
-    source_quotas: list[int],
+    source_count: int,
     generator: torch.Generator | None = None,
+    allow_partial_final: bool = False,
 ) -> list[list[int]]:
-    """Partition one complete mixture cycle with identical source shares.
+    """Partition one mixture pool so every minibatch mirrors its composition.
 
-    Every optimizer step sees the same source composition, preventing an
-    unlucky shuffle from turning one domain into an all-zero minibatch while
-    another domain supplies all of the policy signal.
+    Each source's groups are shuffled and laid end to end, then dealt across
+    the minibatches by a largest-deficit schedule over their sizes. With
+    complete minibatches the deal is round-robin, so a source's count differs
+    by at most one between optimizer steps; an unlucky shuffle cannot turn one
+    domain into an all-zero minibatch while another supplies all of the
+    policy signal. The minibatch order is then shuffled so no step
+    systematically receives the remainders.
     """
     group_count = len(groups)
-    if group_count < 1 or group_count % groups_per_minibatch:
-        raise ValueError("a stratified pool must contain complete minibatches")
-    if sum(source_quotas) != group_count:
-        raise ValueError("source quotas must exactly describe the rollout pool")
-    minibatch_count = group_count // groups_per_minibatch
-    if any(quota % minibatch_count for quota in source_quotas):
-        raise ValueError(
-            "each source quota must divide across all optimizer minibatches"
-        )
-    indices_by_source = [[] for _ in source_quotas]
+    if group_count < 1:
+        raise ValueError("group_count must be positive")
+    if groups_per_minibatch < 1:
+        raise ValueError("groups_per_minibatch must be positive")
+    if group_count % groups_per_minibatch and not allow_partial_final:
+        raise ValueError("group_count must divide into complete minibatches")
+    indices_by_source: list[list[int]] = [[] for _ in range(source_count)]
     for index, group in enumerate(groups):
         source_id = source_group_id(group)
-        if not 0 <= source_id < len(source_quotas):
+        if not 0 <= source_id < source_count:
             raise ValueError(f"rollout carries unknown source id {source_id}")
         indices_by_source[source_id].append(index)
-    observed = [len(indices) for indices in indices_by_source]
-    if observed != source_quotas:
-        raise ValueError(
-            f"rollout source counts {observed} do not match quotas {source_quotas}"
-        )
+    stratified = []
     for indices in indices_by_source:
         permutation = torch.randperm(len(indices), generator=generator).tolist()
-        indices[:] = [indices[position] for position in permutation]
+        stratified.extend(indices[position] for position in permutation)
 
-    minibatches = [[] for _ in range(minibatch_count)]
-    for source_id, quota in enumerate(source_quotas):
-        per_minibatch = quota // minibatch_count
-        for minibatch_index in range(minibatch_count):
-            start = minibatch_index * per_minibatch
-            minibatches[minibatch_index].extend(
-                indices_by_source[source_id][start : start + per_minibatch]
-            )
+    capacities = [
+        min(groups_per_minibatch, group_count - start)
+        for start in range(0, group_count, groups_per_minibatch)
+    ]
+    minibatches: list[list[int]] = [[] for _ in capacities]
+    for position, index in enumerate(stratified, start=1):
+        # Ties go to the lowest minibatch, which makes equal capacities an
+        # exact round-robin deal.
+        target = max(
+            range(len(capacities)),
+            key=lambda slot: (
+                position * capacities[slot] / group_count
+                - len(minibatches[slot]),
+                -slot,
+            ),
+        )
+        minibatches[target].append(index)
+    if [len(minibatch) for minibatch in minibatches] != capacities:
+        raise AssertionError("stratified optimizer minibatch has wrong size")
     for minibatch in minibatches:
-        if len(minibatch) != groups_per_minibatch:
-            raise AssertionError("stratified optimizer minibatch has wrong size")
         permutation = torch.randperm(
             len(minibatch), generator=generator
         ).tolist()
         minibatch[:] = [minibatch[position] for position in permutation]
-    return minibatches
+    order = torch.randperm(len(minibatches), generator=generator).tolist()
+    return [minibatches[position] for position in order]
 
 
 def plan_one_pass_training(
@@ -1840,12 +2009,15 @@ def gradient_norm(parameters) -> float:
 def scalar_tensors_to_floats(
     values: dict[str, torch.Tensor],
 ) -> dict[str, float]:
-    """Resolve same-device scalar telemetry with one device synchronization."""
+    """Resolve same-device scalar telemetry with one device synchronization.
+
+    Stacked in float64 so raw moment sums keep their precision for pooling.
+    """
     if not values:
         return {}
     keys = tuple(values)
     packed = torch.stack(
-        [values[key].detach().reshape(()).float() for key in keys]
+        [values[key].detach().reshape(()).double() for key in keys]
     ).cpu().tolist()
     return dict(zip(keys, packed, strict=True))
 
@@ -2111,6 +2283,7 @@ def update_minibatch(
     policy_action_denominator: torch.Tensor | None = None,
     value_action_denominator: torch.Tensor | None = None,
     gae_lambda_alpha: float = 0.05,
+    actor_gae_lambda: float | None = None,
     replay_max_trajectories: int = 32,
     replay_attention_budget: int = 4 * 1024 * 1024,
     replay_bucket: int = 1,
@@ -2120,6 +2293,7 @@ def update_minibatch(
     target_policy_optimization: bool = False,
     tpo_eta: float = 2.0,
     source_success_actor_gate: bool = False,
+    fused_behavior_statistics: bool = False,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -2134,6 +2308,18 @@ def update_minibatch(
     independently. The actor objectives keep denominators from the COMPLETE
     optimizer minibatch, which can span prompt groups, so sharding changes
     only floating-point reduction order.
+
+    ``fused_behavior_statistics`` derives the behavior statistics from this
+    update's own forwards instead of a prior ``refresh_old_statistics``
+    pass. It is valid only at behavior age 0 -- the pool's sole optimizer
+    minibatch, before any step -- where the refresh would replay the same
+    parameters through the same compiled artifacts and return exactly these
+    values. Each shard's critic forward runs first and fills the GAE
+    baseline; the actor forward then takes its own detached log-probs as
+    the old policy, so every ratio is one and the gradient is the refreshed
+    update's. The lambda-one value targets come from rewards alone, which
+    they equal in exact arithmetic without the telescoped baseline terms.
+    Latent thoughts and TPO log-odds have no fused form.
     """
     backbone = wrapper.backbone
     if critic_step:
@@ -2154,7 +2340,17 @@ def update_minibatch(
             "rollout carry does not match the policy: batch carry_injected="
             f"{batch.carry_injected}, wrapper hidden_carry={hidden_carry}"
         )
-    if not value_only and not batch.statistics_refreshed:
+    if fused_behavior_statistics and (
+        value_only or target_policy_optimization
+    ):
+        raise ValueError(
+            "fused behavior statistics need an actor update without TPO"
+        )
+    if (
+        not value_only
+        and not fused_behavior_statistics
+        and not batch.statistics_refreshed
+    ):
         # An unrefreshed batch carries zeros in ``old_token_logprobs`` and
         # ``old_values``; nothing about the tensor shapes can express "not
         # yet refreshed", so the explicit flag is the only guard.
@@ -2213,23 +2409,44 @@ def update_minibatch(
     lambdas = (
         torch.ones_like(action_counts)
         if value_only
-        else length_adaptive_lambda(action_counts, gae_lambda_alpha)
+        else actor_gae_lambdas(action_counts, gae_lambda_alpha, actor_gae_lambda)
     )
-    advantages, value_targets = generalized_advantage_and_return_targets(
-        batch.rewards,
-        batch.old_values,
-        batch.action_mask,
-        lambdas,
-    )
-    advantages = advantages.detach()
-    value_targets = value_targets.detach()
     actor_signal_rows = source_actor_signal_mask(
         batch.source_id,
         batch.reward_scalar,
         enabled=source_success_actor_gate,
     )
-    if not value_only:
-        advantages = advantages * actor_signal_rows[:, None]
+
+    def actor_advantages() -> torch.Tensor:
+        advantages, _ = generalized_advantage_and_return_targets(
+            batch.rewards,
+            batch.old_values,
+            batch.action_mask,
+            lambdas,
+        )
+        return advantages.detach() * actor_signal_rows[:, None]
+
+    if fused_behavior_statistics:
+        # The baseline does not exist until the critic pass below; the
+        # lambda-one targets never needed it.
+        _, value_targets = generalized_advantage_and_return_targets(
+            batch.rewards,
+            torch.zeros_like(batch.old_values),
+            batch.action_mask,
+            lambdas,
+        )
+        advantages = None
+    else:
+        advantages, value_targets = generalized_advantage_and_return_targets(
+            batch.rewards,
+            batch.old_values,
+            batch.action_mask,
+            lambdas,
+        )
+        advantages = advantages.detach()
+        if not value_only:
+            advantages = advantages * actor_signal_rows[:, None]
+    value_targets = value_targets.detach()
     actor_active_mask = (
         batch.action_mask * actor_signal_rows[:, None]
         if not value_only
@@ -2264,21 +2481,19 @@ def update_minibatch(
         tuple[int, str, torch.Tensor, dict[str, torch.Tensor]]
     ] = []
 
-    for shard_index, (microbatch, shard) in enumerate(
-        iter_planned_replay_microbatches(batch, replay_plan)
-    ):
+    def critic_shard(
+        shard_index: int, microbatch: LatentRolloutBatch, shard
+    ) -> torch.Tensor:
+        """Critic forward/backward for one shard; returns detached values."""
         rows = shard.rows
         stream_length = shard.stream_length
-        micro_advantages = advantages[rows, :stream_length]
         micro_value_targets = value_targets[rows, :stream_length]
-        local_action_count = microbatch.action_mask.sum()
         values = critic.values(microbatch)
         # Unclipped squared error: the regression target is the lambda-one
         # return, independent of the old values, so there is no old-value
         # trust region to enforce.
         value_error = (values - micro_value_targets).square()
         local_value_numerator = (value_error * microbatch.action_mask).sum()
-        emit_index = shard.emit_index if not value_only else None
         weighted_critic_loss = (
             local_value_numerator / value_action_denominator.clamp_min(1)
         )
@@ -2293,14 +2508,6 @@ def update_minibatch(
         weighted_critic_loss.backward()
         with torch.no_grad():
             values = values.detach()
-            # During critic pretraining there is no actor objective, but the
-            # diagnostics must still measure calibration against the CURRENT
-            # critic.  The MC training target is independent of the baseline
-            # at lambda=1; reporting the earlier zero-baseline GAE made every
-            # successful action look positively advantageous by construction.
-            diagnostic_advantages = (
-                micro_value_targets - values if value_only else micro_advantages
-            )
             totals["value_loss"] += local_value_numerator.detach()
             totals["value_sum"] += (values * microbatch.action_mask).sum()
             totals["value_target_sum"] += (
@@ -2316,15 +2523,29 @@ def update_minibatch(
             totals["residual_square_sum"] += (
                 residuals.square() * microbatch.action_mask
             ).sum()
-            totals["advantage_sum"] += (
-                diagnostic_advantages * microbatch.action_mask
-            ).sum()
-            totals["advantage_square_sum"] += (
-                diagnostic_advantages.square() * microbatch.action_mask
-            ).sum()
-        if value_only:
-            continue
+            if value_only:
+                # During critic pretraining there is no actor objective, but
+                # the diagnostics must still measure calibration against the
+                # CURRENT critic. The MC training target is independent of
+                # the baseline at lambda=1; reporting the earlier
+                # zero-baseline GAE made every successful action look
+                # positively advantageous by construction.
+                totals["advantage_sum"] += (
+                    residuals * microbatch.action_mask
+                ).sum()
+                totals["advantage_square_sum"] += (
+                    residuals.square() * microbatch.action_mask
+                ).sum()
+        return values
 
+    def actor_shard(
+        shard_index: int, microbatch: LatentRolloutBatch, shard
+    ) -> None:
+        """Actor forward/backward for one shard at the current advantages."""
+        rows = shard.rows
+        stream_length = shard.stream_length
+        micro_advantages = advantages[rows, :stream_length]
+        emit_index = shard.emit_index
         # Each stream position is an MDP action. THINK is a stored raw
         # Gaussian vector (plus an optional continuation gate); EMIT is a
         # token (plus the one-way STOP gate only while thinking is active).
@@ -2352,6 +2573,16 @@ def update_minibatch(
             )
         new_token_logprobs = torch.zeros_like(microbatch.old_token_logprobs)
         scatter_slots(new_token_logprobs, emit_index, compact_token_logprobs)
+        if fused_behavior_statistics:
+            old_token_logprobs = new_token_logprobs.detach()
+            with torch.no_grad():
+                # The post-update drift and credit diagnostics read the
+                # behavior log-probs back from the batch.
+                batch.old_token_logprobs[rows, :stream_length] = (
+                    old_token_logprobs
+                )
+        else:
+            old_token_logprobs = microbatch.old_token_logprobs
         active_emit_mask = (
             microbatch.emit_mask * actor_signal_rows[rows, None]
         )
@@ -2391,6 +2622,10 @@ def update_minibatch(
             new_thought_joint = torch.zeros_like(new_token_logprobs)
             old_thought_joint = torch.zeros_like(new_token_logprobs)
             think_index = shard.think_index
+            if think_index.numel() and fused_behavior_statistics:
+                raise ValueError(
+                    "fused behavior statistics do not cover latent thoughts"
+                )
             if think_index.numel():
                 thought_means, thought_targets = compact_thought_actions(
                     wrapper, microbatch, beliefs, think_index
@@ -2417,10 +2652,18 @@ def update_minibatch(
             new_stochastic_logprobs = (
                 new_stop_logprobs * microbatch.stop_mask + new_thought_joint
             )
-            old_stochastic_logprobs = (
-                microbatch.old_stop_logprobs * microbatch.stop_mask
-                + old_thought_joint
-            )
+            if fused_behavior_statistics:
+                old_stochastic_logprobs = new_stochastic_logprobs.detach()
+                with torch.no_grad():
+                    batch.old_stop_logprobs[rows, :stream_length] = (
+                        new_stop_logprobs.detach().float()
+                        * microbatch.stop_mask
+                    )
+            else:
+                old_stochastic_logprobs = (
+                    microbatch.old_stop_logprobs * microbatch.stop_mask
+                    + old_thought_joint
+                )
             stochastic_mask = (
                 (microbatch.stop_mask.bool() | think_slot_mask(microbatch))
                 .to(microbatch.action_mask.dtype)
@@ -2527,9 +2770,9 @@ def update_minibatch(
                 else new_token_logprobs + new_stochastic_logprobs
             )
             joint_old_logprobs = (
-                microbatch.old_token_logprobs
+                old_token_logprobs
                 if old_stochastic_logprobs is None
-                else microbatch.old_token_logprobs + old_stochastic_logprobs
+                else old_token_logprobs + old_stochastic_logprobs
             )
             weighted_policy_loss, weighted_policy_clip, _ = clipped_policy_loss(
                 joint_new_logprobs,
@@ -2559,9 +2802,7 @@ def update_minibatch(
         )
         actor_total.backward()
         with torch.no_grad():
-            token_log_ratio = (
-                new_token_logprobs - microbatch.old_token_logprobs
-            )
+            token_log_ratio = new_token_logprobs - old_token_logprobs
             active_log_ratio = token_log_ratio * microbatch.action_mask
             totals["token_abs_log_ratio_max"] = torch.maximum(
                 totals["token_abs_log_ratio_max"],
@@ -2585,6 +2826,38 @@ def update_minibatch(
             totals["token_kl_sum"] += (
                 (torch.expm1(token_log_ratio) - token_log_ratio)
                 * microbatch.action_mask
+            ).sum()
+
+
+    if fused_behavior_statistics:
+        for shard_index, (microbatch, shard) in enumerate(
+            iter_planned_replay_microbatches(batch, replay_plan)
+        ):
+            values = critic_shard(shard_index, microbatch, shard)
+            with torch.no_grad():
+                # Advanced row indexing materializes a copy, so assignment
+                # targets the parent, as in refresh_old_statistics.
+                batch.old_values[shard.rows, : shard.stream_length] = (
+                    values.float()
+                )
+        advantages = actor_advantages()
+        for shard_index, (microbatch, shard) in enumerate(
+            iter_planned_replay_microbatches(batch, replay_plan)
+        ):
+            actor_shard(shard_index, microbatch, shard)
+        batch.statistics_refreshed = True
+    else:
+        for shard_index, (microbatch, shard) in enumerate(
+            iter_planned_replay_microbatches(batch, replay_plan)
+        ):
+            critic_shard(shard_index, microbatch, shard)
+            if not value_only:
+                actor_shard(shard_index, microbatch, shard)
+    if not value_only:
+        with torch.no_grad():
+            totals["advantage_sum"] = (advantages * batch.action_mask).sum()
+            totals["advantage_square_sum"] = (
+                advantages.square() * batch.action_mask
             ).sum()
 
     if finite_guards:
@@ -2657,6 +2930,11 @@ def update_minibatch(
         if critic_step:
             step_optimizers(optimizers, "critic")
         return scalar_tensors_to_floats(metric_tensors)
+    metric_tensors.update(
+        credit_assignment_moments(
+            batch, advantages, value_targets, actor_signal_rows
+        )
+    )
 
     # Norms are cumulative across prompt groups; the final group reports the
     # complete pre-step norm. Fresh probes are registered
@@ -2826,6 +3104,7 @@ def measure_post_update_policy_drift(
     target_policy_optimization: bool = False,
     tpo_eta: float = 2.0,
     gae_lambda_alpha: float = 0.05,
+    actor_gae_lambda: float | None = None,
     source_success_actor_gate: bool = False,
 ) -> dict[str, float]:
     """Evaluate the just-updated policy on its behavior trajectories.
@@ -2835,13 +3114,11 @@ def measure_post_update_policy_drift(
     policy. This read-only replay measures the actual post-step drift
     without reusing trajectories for a gradient. It runs only at the explicit
     diagnostic cadence because it costs one additional policy forward.
-    ``replay_function`` and ``emit_logprob_function`` deliberately stay eager
-    in the trainer: invoking a grad-enabled training artifact under this
-    function's no-grad context would force Dynamo/AOTAutograd to compile a
-    second guarded graph, while enabling gradients here retains a full replay
-    graph and can exceed peak memory. Both are parameters rather than module
-    lookups precisely because the trainer rebinds those globals to compiled
-    artifacts.
+    The trainer passes an eager ``replay_function`` and a separately compiled
+    no-grad ``emit_logprob_function``: enabling gradients here would retain
+    a full replay graph and can exceed peak memory. Both are parameters
+    rather than module lookups precisely because the trainer rebinds those
+    globals to its grad-enabled training artifacts.
     """
     if not batches:
         raise ValueError("post-update drift requires at least one rollout batch")
@@ -2894,7 +3171,7 @@ def measure_post_update_policy_drift(
                 batch.rewards,
                 batch.old_values,
                 batch.action_mask,
-                length_adaptive_lambda(action_counts, gae_lambda_alpha),
+                actor_gae_lambdas(action_counts, gae_lambda_alpha, actor_gae_lambda),
             )
             actor_signal_rows = source_actor_signal_mask(
                 batch.source_id,
@@ -3041,11 +3318,7 @@ def save_checkpoint(
             )
             else None
         ),
-        "python_reward_schema": (
-            PYTHON_REWARD_SCHEMA
-            if getattr(args, "rl_mixture_manifest", None)
-            else None
-        ),
+        "python_reward_schema": getattr(args, "python_reward_schema", None),
         "replay_numerics_schema": replay_numerics_schema_for(reasoning_mode),
         "source_provenance": getattr(args, "source_provenance", None),
         "prompt_order_schema": PROMPT_ORDER_SCHEMA,
@@ -3151,6 +3424,8 @@ def purge_benchmark_reports_after(output: Path, step: int) -> int:
 
 
 def main() -> None:
+    # Read-only live stack diagnostics without ptrace privileges or stopping RL.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     run_started = time.monotonic()
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -3172,6 +3447,10 @@ def main() -> None:
         args.checkpoint, map_location="cpu", weights_only=False
     )
     backbone = load_model(args.checkpoint, device, payload=checkpoint_payload)
+    checkpoint_trained_seq_len = (
+        checkpoint_payload.get("trained_seq_len")
+        if isinstance(checkpoint_payload, dict) else None
+    )
     sft_provenance = (
         (checkpoint_payload.get("sft") or {})
         if isinstance(checkpoint_payload, dict)
@@ -3256,31 +3535,28 @@ def main() -> None:
     is_recurrent_trunk = "_kda_" in backbone.architecture
     trunk_fullgraph = not is_recurrent_trunk
 
-    # Backbone-derived context contract: fresh PoPE executes 5x its pretrained
-    # window, so RL keeps the full 1024-token prompt plus a 4096-slot stream.
-    # Nano's half-truncate RoPE (base 1024) has no extrapolation story, so RL
-    # stays strictly inside the pretraining window the checkpoint records
-    # (train_seq_len; 1024 for checkpoints predating the field). The response
-    # budget targets the standard ~1k tokens for DAPO math as soon as the
-    # window affords it after the prompt.
-    if is_nano:
-        context_tokens = getattr(backbone, "train_context_tokens", 1024)
-        default_prompt_tokens = 512
-        default_response_tokens = min(
-            1024, (context_tokens - default_prompt_tokens) // 2
+    # Runtime rollout capacity follows the requested response budget; record
+    # checkpoint/training windows separately so extension is never mislabeled.
+    checkpoint_context_limit = (
+        getattr(backbone, "train_context_tokens", 1024)
+        if is_nano else POSTTRAIN_CONTEXT_TOKENS
+    )
+    trained_context_tokens = (
+        int(checkpoint_trained_seq_len or checkpoint_context_limit) if is_nano else None
+    )
+    try:
+        context_tokens = resolve_rollout_defaults(
+            args, is_nano=is_nano, checkpoint_context_tokens=checkpoint_context_limit,
+            trained_context_tokens=trained_context_tokens,
         )
-    else:
-        context_tokens = POSTTRAIN_CONTEXT_TOKENS
-        default_prompt_tokens = POSTTRAIN_PROMPT_TOKENS
-        default_response_tokens = POSTTRAIN_RESPONSE_TOKENS
-    if args.prompt_tokens is None:
-        args.prompt_tokens = default_prompt_tokens
-    if args.continuation_tokens is None:
-        args.continuation_tokens = default_response_tokens
-    if args.aime_max_tokens is None:
-        args.aime_max_tokens = default_response_tokens
-    if args.bench_max_tokens is None:
-        args.bench_max_tokens = default_response_tokens
+    except ValueError as error:
+        parser.error(str(error))
+    context_extrapolation = (
+        trained_context_tokens is not None and context_tokens > trained_context_tokens
+    )
+    if context_extrapolation:
+        print(f"Rollout context: {context_tokens} tokens; checkpoint trained window: "
+              f"{trained_context_tokens} tokens (context extension)", flush=True)
     if args.answer_tokens < 2:
         parser.error("--answer-tokens must fit an answer plus its terminator")
 
@@ -3674,7 +3950,6 @@ def main() -> None:
     bench_subset_baseline = modal_answer_baseline(bench_rows)
     mixture_manifest = None
     mixture_sources = None
-    mixture_rollout_source_quotas = None
     corpus_audit = {}
     if args.rl_mixture_manifest:
         math_rows, mixture_sources, mixture_manifest = load_mixture_manifest(
@@ -3685,8 +3960,27 @@ def main() -> None:
             != ANSWER_FENCE_PROMPT_SCHEMA
         ):
             raise ValueError("mixture uses a different answer-fence prompt schema")
-        if mixture_manifest.get("python_reward_schema") != PYTHON_REWARD_SCHEMA:
+        # Only a mixture that executes Python rewards is bound to the Python
+        # verifier; a math-only mixture's rewards never touch it.
+        args.python_reward_schema = (
+            (PYTHON_PARTIAL_REWARD_SCHEMA if args.python_reward_mode == "test-fraction"
+             else PYTHON_REWARD_SCHEMA)
+            if any(source.verifier == "python_mbpp" for source in mixture_sources)
+            else None
+        )
+        if (
+            args.python_reward_schema is not None
+            and mixture_manifest.get("python_reward_schema") != PYTHON_REWARD_SCHEMA
+        ):
             raise ValueError("mixture uses a different Python reward schema")
+        if (
+            actor_init_payload is not None
+            and actor_init_payload.get("python_reward_schema") != args.python_reward_schema
+        ):
+            raise ValueError(
+                "actor-critic initialization uses a different Python reward objective; "
+                "start a fresh critic for the selected code reward mode"
+            )
         if (
             sft_provenance.get("traces_sha256")
             != mixture_manifest.get("sft_corpus_sha256")
@@ -3774,14 +4068,35 @@ def main() -> None:
         )
     else:
         data_identity = mixture_identity(
-            args.rl_mixture_manifest, mixture_manifest
+            args.rl_mixture_manifest, mixture_manifest,
+            randomize_choice_options=args.randomize_choice_options,
         )
         assert mixture_sources is not None
         sampler = MixedPromptSampler(
             mixture_sources,
             args.seed,
             dataset_identity=data_identity,
+            randomize_choice_options=args.randomize_choice_options,
         )
+    if getattr(args, "critic_only_init", None):
+        critic_source = Path(args.critic_only_init)
+        if Path(args.output).exists():
+            raise ValueError("--critic-only-init requires a new output directory")
+        critic_payload = torch.load(critic_source, map_location="cpu", weights_only=False)
+        validate_critic_only_init(critic_payload, args, data_identity)
+        critic.load_state_dict(critic_payload["critic"], strict=True)
+        args.critic_only_init_provenance = {
+            "init": "critic_only_checkpoint",
+            "checkpoint": str(critic_source),
+            "checkpoint_sha256": file_sha256(critic_source),
+            "source_execution_schema": critic_payload.get("execution_schema"),
+            "source_actor_step": int(critic_payload.get("step", 0)),
+            "source_value_warmup_step": int(critic_payload["value_warmup_step"]),
+            "optimizer_state": "fresh",
+        }
+        del critic_payload
+        print("Loaded critic-only weights; actor remains base SFT, with fresh "
+              "optimizers, RNG, sampler, and actor step", flush=True)
     if actor_init_payload is not None:
         if args.curriculum_init:
             print(
@@ -3940,14 +4255,21 @@ def main() -> None:
         if not resume_execution_schema_compatible(
             payload,
             expected_execution_schema=target_execution_schema,
+            allow_token_rng_migration=args.allow_token_rng_migration,
         ):
             raise ValueError(
                 "resume checkpoint execution schema must be "
                 f"{target_execution_schema!r}; got "
-                f"{payload.get('execution_schema')!r}. v29 changes stream, "
-                "Gaussian scale, gate, and request-RNG semantics, and v30 "
-                "is the hidden-carry contract; there are no migrations."
+                f"{payload.get('execution_schema')!r}. v29 is the latent "
+                "stream, Gaussian scale, gate, and request-RNG contract; v32 "
+                "draws cot/none/carry tokens by the counter-keyed graph "
+                "decode race on each row's unpadded slot. The only migration "
+                "is lockstep cot/none v31 -> v32, acknowledged with "
+                "--allow-token-rng-migration."
             )
+        # Lands in the manifest's args: a migrated continuation names the
+        # contract its restored state was trained under.
+        args.resumed_execution_schema = payload.get("execution_schema")
         if not resume_replay_schema_compatible(payload, args.reasoning_mode):
             raise ValueError(
                 "resume checkpoint replay numerics schema must be "
@@ -3990,9 +4312,7 @@ def main() -> None:
                 f"{expected_source_mask_schema!r}; got "
                 f"{payload.get('source_signal_mask_schema')!r}"
             )
-        expected_python_reward_schema = (
-            PYTHON_REWARD_SCHEMA if args.rl_mixture_manifest else None
-        )
+        expected_python_reward_schema = getattr(args, "python_reward_schema", None)
         if payload.get("python_reward_schema") != expected_python_reward_schema:
             raise ValueError(
                 "resume checkpoint Python reward schema must be "
@@ -4114,17 +4434,6 @@ def main() -> None:
         torch.cuda.set_rng_state_all(actor_init_payload["cuda_rng"])
         random.setstate(actor_init_payload["python_rng"])
 
-    if mixture_sources is not None:
-        mixture_rollout_source_quotas = rollout_window_source_quotas(
-            mixture_sources,
-            args.prompts_per_rollout,
-            allow_balanced_rotation=(
-                args.delightful_policy_gradient
-                or args.target_policy_optimization
-            ),
-            start_cursor=sampler.cursor,
-        )
-
     if args.bpb_only or args.bench_only:
         planned_prompt_count = 0
     elif args.rollout_only:
@@ -4230,14 +4539,15 @@ def main() -> None:
     # cost at step-0 eval and again at the first training collect. If eval ever
     # latches an eager fallback, the eval closure below also disables this
     # shared artifact for training before it can be called again.
+    # Pinned-EMIT lockstep modes (cot/none/carry) decode through the graph
+    # arena below instead; only the latent lockstep rollout steps this one.
+    eager_lockstep_rollout = (
+        args.rollout_compile
+        and args.rollout_scheduler == "lockstep"
+        and not pin_emit
+    )
     compiled_generation_step = None
-    if (
-        args.eval_compile
-        or (
-            args.rollout_compile
-            and args.rollout_scheduler == "lockstep"
-        )
-    ):
+    if args.eval_compile or eager_lockstep_rollout:
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, 64
         )
@@ -4251,9 +4561,7 @@ def main() -> None:
             ),
         )
     rollout_step_core = (
-        compiled_generation_step
-        if args.rollout_compile and args.rollout_scheduler == "lockstep"
-        else None
+        compiled_generation_step if eager_lockstep_rollout else None
     )
     if rollout_step_core is not None and args.rollout_flex_decode:
         # Flex decoding needs its OWN artifact: the shared one above is
@@ -4470,6 +4778,58 @@ def main() -> None:
             dtype=torch.bfloat16,
         )
 
+    # Lockstep cot/none/carry decode: one CUDA graph per live-row bucket,
+    # replayed once per token; see graph_decode.py. The compiled tick lives
+    # for the run; its caches and captures only for each rollout, so they do
+    # not stay resident through the update.
+    decode_arena = None
+    if (
+        pin_emit
+        and args.rollout_scheduler == "lockstep"
+        and planned_prompt_count > 0
+    ):
+        decode_arena = PinnedDecodeArena(
+            wrapper,
+            rows=max(args.rollout_groups, 1) * args.samples_per_prompt,
+            kv_width=args.prompt_tokens + max_stream_steps,
+            temperature=args.temperature,
+            stop_ids=stop_ids,
+            device=device,
+            hidden_carry=hidden_carry,
+            sync_every=args.rollout_sync_every,
+            compile=args.rollout_compile,
+            cuda_graphs=args.rollout_compile and device.type == "cuda",
+        )
+    # Pinned-EMIT evaluation decodes through its own arena: the eval
+    # protocol's nucleus is a compile-time constant of the tick, which the
+    # untruncated training arena must never carry. It is sized to evaluate
+    # a whole panel in as few rollouts as possible -- each rollout pays for
+    # its longest row, so AIME's 30x32 samples fit one -- and holds its
+    # caches only while an evaluation runs.
+    eval_arena = None
+    eval_stream_steps = max(
+        [aime_stream_steps] * bool(aime_rows)
+        + [bench_stream_steps] * bool(bench_rows)
+        or [0]
+    )
+    if (
+        pin_emit
+        and args.eval_compile
+        and device.type == "cuda"
+        and eval_stream_steps > 0
+    ):
+        eval_arena = PinnedDecodeArena(
+            wrapper,
+            rows=args.eval_batch_trajectories,
+            kv_width=args.prompt_tokens + eval_stream_steps,
+            temperature=EVAL_TEMPERATURE,
+            top_p=EVAL_TOP_P,
+            stop_ids=stop_ids,
+            device=device,
+            hidden_carry=hidden_carry,
+            sync_every=args.rollout_sync_every,
+        )
+
     if args.rollout_flex_decode and rollout_tail_caches is not None:
         rollout_tail_decode_mask = DecodeRangeMask(
             args.rollout_tail_batch,
@@ -4478,14 +4838,38 @@ def main() -> None:
             block_size=decode_block_size,
         )
 
-    # Preserve the eager functions for infrequent no-grad diagnostics. Calling
-    # a compiled training artifact under no-grad would create a distinct
-    # AOTAutograd specialization solely because grad mode is a Dynamo guard.
-    # Both the replay head and the readout tail get rebound below, so both
-    # need capturing here.
+    # The no-grad post-update drift diagnostic keeps its own functions: the
+    # training artifacts below are rebound over these names, and calling a
+    # grad-enabled artifact under no-grad adds a guarded specialization to it.
+    # Its replay head stays eager — once per 100 steps it is not worth a
+    # second no-grad specialization per shard shape, and without autograd its
+    # memory is only the live activations. Its readout tail is compiled as a
+    # separate no-grad artifact: eagerly it materializes several
+    # (slots, vocab) fp32 temporaries, which made this diagnostic the run's
+    # peak-memory step (~19 GiB against a ~7 GiB update).
     diagnostic_replay_head_inputs = replay_head_inputs
     diagnostic_emit_token_logprobs = compact_emit_token_logprobs
     diagnostic_emit_token_log_odds = compact_emit_token_log_odds
+    if args.compile_replay:
+        diagnostic_emit_token_logprobs = profiler.register_artifact(
+            "diagnostic_emit_token_logprobs",
+            torch.compile(
+                compact_emit_token_logprobs,
+                mode="default",
+                fullgraph=True,
+                dynamic=True,
+            ),
+        )
+        if args.target_policy_optimization:
+            diagnostic_emit_token_log_odds = profiler.register_artifact(
+                "diagnostic_emit_token_log_odds",
+                torch.compile(
+                    compact_emit_token_log_odds,
+                    mode="default",
+                    fullgraph=True,
+                    dynamic=True,
+                ),
+            )
 
     # Replay compilation is independent of rollout. Dynamic B/L plus bounded
     # 64-token buckets lets one artifact cover the length-aware shard plan;
@@ -4628,19 +5012,6 @@ def main() -> None:
     critic_init_provenance = resolve_critic_init_provenance(
         args, actor_init_payload, resumed_manifest
     )
-    # A DG rollout is consumed in one optimizer update, so it needs no
-    # within-pool source stratification. This also permits the deterministic
-    # 24-prompt rotation (10/8/3/3, then 11/7/3/3) while preserving the exact
-    # broad-v5 ratio over its eight-update cursor phase cycle.
-    mixture_source_quotas = (
-        mixture_rollout_source_quotas
-        if mixture_manifest is not None
-        and not (
-            args.delightful_policy_gradient
-            or args.target_policy_optimization
-        )
-        else None
-    )
     source_provenance = capture_source_provenance(
         output / "provenance", Path(__file__).resolve().parents[1]
     )
@@ -4717,18 +5088,16 @@ def main() -> None:
                 "math_corpus_audit": corpus_audit,
                 "rl_mixture_manifest": mixture_manifest,
                 "rl_source_ids": source_ids,
-                "python_reward_schema": (
-                    PYTHON_REWARD_SCHEMA
-                    if mixture_manifest is not None
-                    and any(
-                        entry["verifier"] == "python_mbpp"
-                        for entry in mixture_manifest["sources"]
-                    )
-                    else None
-                ),
+                "python_reward_schema": getattr(args, "python_reward_schema", None),
                 "reward_schema": REWARD_SCHEMA,
                 "reasoning_mode": args.reasoning_mode,
                 "context_tokens": context_tokens,
+                "checkpoint_context_limit": checkpoint_context_limit,
+                "trained_context_tokens": trained_context_tokens,
+                "context_extrapolation": context_extrapolation,
+                "eval_context_extrapolation": bool(
+                    context_extrapolation and (args.rollout_only or args.bench_only)
+                ),
                 "math_modal_answer_baseline": math_modal_baseline,
                 "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
                 "rollout_policy_schema": rollout_policy_schema,
@@ -4786,6 +5155,10 @@ def main() -> None:
     rollout_recorder = RolloutSampleRecorder(
         tokenizer, stop_ids, source_names, answer_prefix_ids
     )
+    gate_transcripts = (
+        GateTranscriptWriter(output / "gate_transcripts.jsonl", tokenizer, stop_ids)
+        if args.rollout_only and args.gate_transcripts else None
+    )
 
     def finish_group(
         batch: LatentRolloutBatch,
@@ -4816,10 +5189,13 @@ def main() -> None:
                 think_fence_ids,
                 answer_fence_ids,
                 args.think_min_tokens,
+                reward_mode=args.python_reward_mode,
             )
         else:
             raise ValueError(f"unsupported verifier kind {verifier_kind!r}")
         source_name = str(row.get("_rl_source", "math"))
+        if gate_transcripts is not None:
+            gate_transcripts.write(batch, verdicts, row)
         if rollout_recorder.armed:
             rollout_recorder.offer(
                 batch,
@@ -4869,12 +5245,6 @@ def main() -> None:
         nonlocal last_decode_schedule_metrics, rollout_paged_cache
         last_decode_schedule_metrics = None
         pool_start_cursor = sampler.cursor
-        if (
-            mixture_source_quotas is not None
-            and prompt_count == args.prompts_per_rollout
-        ):
-            assert isinstance(sampler, MixedPromptSampler)
-            sampler.validate_next_source_quotas(mixture_source_quotas)
         rollout_rows = sampler.next_rows(prompt_count)
         prompt_budget = args.prompt_tokens - len(answer_prefix_ids)
         with profiler.phase("prompt_encode"):
@@ -4899,46 +5269,87 @@ def main() -> None:
         ) -> LatentRolloutBatch:
             return finish_group(batch, row, refresh_statistics)
 
+        # The sampler cursor is monotonic and checkpointed, so mixed with the
+        # user seed it gives each pool a resume-stable key namespace; a
+        # trajectory's key is then (pool, position in the sorted pool,
+        # sample), whatever the chunking.
+        pool_seed = (args.seed << 32) ^ pool_start_cursor
+
+        def lockstep_rollout(
+            prompt_ids: torch.Tensor,
+            prompt_lengths_cpu: torch.Tensor | None,
+            first_request: int,
+        ) -> LatentRolloutBatch:
+            """Roll out every sample of a prompt chunk.
+
+            ``prompt_lengths_cpu`` is None for an unpadded single prompt.
+            """
+            if decode_arena is not None:
+                request_ids = range(
+                    first_request, first_request + prompt_ids.size(0)
+                )
+                return decode_arena.rollout(
+                    prompt_ids,
+                    (
+                        torch.full((1,), prompt_ids.size(1))
+                        if prompt_lengths_cpu is None
+                        else prompt_lengths_cpu
+                    ),
+                    prompt_repeats=args.samples_per_prompt,
+                    max_new_tokens=train_max_new_tokens,
+                    max_stream_steps=max_stream_steps,
+                    token_seeds=trajectory_token_seeds(
+                        pool_seed,
+                        request_ids,
+                        args.samples_per_prompt,
+                        device,
+                    ),
+                )
+            return rollout_continuations(
+                wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
+                args.temperature, args.top_p, stop_ids=stop_ids or None,
+                prompt_lengths=(
+                    None
+                    if prompt_lengths_cpu is None
+                    else prompt_lengths_cpu.to(device)
+                ),
+                pin_emit=pin_emit,
+                hidden_carry=hidden_carry,
+                record_likelihoods=False,
+                cache_dtype=torch.bfloat16,
+                sync_every=args.rollout_sync_every,
+                compact_dead_ratio=args.rollout_compact_dead_ratio,
+                tensor_positions=rollout_step_core is not None,
+                compact_finished=(
+                    rollout_step_core is None
+                    or args.rollout_tail_batch > 0
+                ),
+                finished_batch_size=(
+                    args.rollout_tail_batch
+                    if rollout_step_core is not None
+                    and args.rollout_tail_batch > 0
+                    else None
+                ),
+                prompt_repeats=args.samples_per_prompt,
+                caches=(
+                    rollout_graph_caches
+                    if rollout_step_core is not None
+                    else None
+                ),
+                tail_caches=rollout_tail_caches,
+                tail_step_core=rollout_tail_step_core,
+                decode_mask=decode_mask_for(prompt_ids.size(1)),
+                tail_decode_mask=rollout_tail_decode_mask,
+            )
+
         if args.rollout_groups <= 1:
-            for row, encoded in encoded_rows:
+            for request_id, (row, encoded) in enumerate(encoded_rows):
                 prompt_ids = torch.tensor(
                     encoded,
                     dtype=torch.long, device=device,
                 )
                 with profiler.phase("decode"):
-                    batch = rollout_continuations(
-                        wrapper, prompt_ids[None],
-                        train_max_new_tokens, max_stream_steps,
-                        args.temperature, args.top_p,
-                        stop_ids=stop_ids or None,
-                        pin_emit=pin_emit,
-                        hidden_carry=hidden_carry,
-                        record_likelihoods=False,
-                        cache_dtype=torch.bfloat16,
-                        sync_every=args.rollout_sync_every,
-                        compact_dead_ratio=args.rollout_compact_dead_ratio,
-                        tensor_positions=rollout_step_core is not None,
-                        compact_finished=(
-                            rollout_step_core is None
-                            or args.rollout_tail_batch > 0
-                        ),
-                        finished_batch_size=(
-                            args.rollout_tail_batch
-                            if rollout_step_core is not None
-                            and args.rollout_tail_batch > 0
-                            else None
-                        ),
-                        prompt_repeats=args.samples_per_prompt,
-                        caches=(
-                            rollout_graph_caches
-                            if rollout_step_core is not None
-                            else None
-                        ),
-                        tail_caches=rollout_tail_caches,
-                        tail_step_core=rollout_tail_step_core,
-                        decode_mask=decode_mask_for(len(encoded)),
-                        tail_decode_mask=rollout_tail_decode_mask,
-                    )
+                    batch = lockstep_rollout(prompt_ids[None], None, request_id)
                 if offload_to_cpu:
                     with profiler.phase("stream_d2h"):
                         batch = compact_stream_to_device(batch, cpu)
@@ -5039,13 +5450,12 @@ def main() -> None:
         ) -> tuple[list[dict], torch.Tensor, torch.Tensor]:
             chunk = [row for row, _ in encoded_chunk]
             encoded = [ids for _, ids in encoded_chunk]
-            prompt_ids = torch.zeros(
-                (len(chunk), width), dtype=torch.long, device=device
-            )
+            prompt_ids = torch.zeros((len(chunk), width), dtype=torch.long)
             for index, ids in enumerate(encoded):
                 prompt_ids[index, width - len(ids):] = torch.tensor(
-                    ids, dtype=torch.long, device=device
+                    ids, dtype=torch.long
                 )
+            prompt_ids = prompt_ids.to(device)
             prompt_lengths_cpu = torch.tensor(
                 [len(ids) for ids in encoded], dtype=torch.long
             )
@@ -5147,45 +5557,17 @@ def main() -> None:
             drain_scored()
             return groups
 
-        for encoded_chunk in encoded_chunks:
+        for chunk_index, encoded_chunk in enumerate(encoded_chunks):
             with profiler.phase("prompt_upload"):
                 chunk_width = max(len(ids) for _, ids in encoded_chunk)
                 chunk, prompt_ids, prompt_lengths_cpu = upload_chunk(
                     encoded_chunk, chunk_width
                 )
-                prompt_lengths = prompt_lengths_cpu.to(device)
             with profiler.phase("decode"):
-                batched = rollout_continuations(
-                    wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
-                    args.temperature, args.top_p, stop_ids=stop_ids or None,
-                    prompt_lengths=prompt_lengths,
-                    pin_emit=pin_emit,
-                    hidden_carry=hidden_carry,
-                    record_likelihoods=False,
-                    cache_dtype=torch.bfloat16,
-                    sync_every=args.rollout_sync_every,
-                    compact_dead_ratio=args.rollout_compact_dead_ratio,
-                    tensor_positions=rollout_step_core is not None,
-                    compact_finished=(
-                        rollout_step_core is None
-                        or args.rollout_tail_batch > 0
-                    ),
-                    finished_batch_size=(
-                        args.rollout_tail_batch
-                        if rollout_step_core is not None
-                        and args.rollout_tail_batch > 0
-                        else None
-                    ),
-                    prompt_repeats=samples,
-                    caches=(
-                        rollout_graph_caches
-                        if rollout_step_core is not None
-                        else None
-                    ),
-                    tail_caches=rollout_tail_caches,
-                    tail_step_core=rollout_tail_step_core,
-                    decode_mask=decode_mask_for(chunk_width),
-                    tail_decode_mask=rollout_tail_decode_mask,
+                batched = lockstep_rollout(
+                    prompt_ids,
+                    prompt_lengths_cpu,
+                    chunk_index * args.rollout_groups,
                 )
             complete_chunk(batched, prompt_lengths_cpu, chunk)
             del batched
@@ -5270,14 +5652,17 @@ def main() -> None:
             aime_stream_steps, args.aime_chunk, args.seed, device,
             prompt_tokens=args.prompt_tokens,
             batch_trajectories=args.eval_batch_trajectories,
-            compiled_step_core=eval_step_core,
+            compiled_step_core=None if eval_arena is not None else eval_step_core,
             compiled_tail_batch=args.eval_tail_batch or None,
+            decode_arena=eval_arena,
             answer_style_override="aime",
             captured_attempts=captured_attempts,
             pin_emit=pin_emit,
             hidden_carry=hidden_carry,
             prompt_suffix_ids=answer_prefix_ids,
+            think_fence_ids=think_fence_ids,
             answer_fence_ids=answer_fence_ids,
+            min_think_tokens=args.think_min_tokens,
         )
         metrics["dataset_modal_answer"] = aime_modal_baseline["answer"]
         metrics["dataset_modal_answer_style"] = "aime"
@@ -5324,13 +5709,16 @@ def main() -> None:
             bench_max_new_tokens, bench_stream_steps, args.bench_samples,
             eval_seed, device, prompt_tokens=args.prompt_tokens,
             batch_trajectories=args.eval_batch_trajectories,
-            compiled_step_core=eval_step_core,
+            compiled_step_core=None if eval_arena is not None else eval_step_core,
             compiled_tail_batch=args.eval_tail_batch or None,
+            decode_arena=eval_arena,
             captured_attempts=captured_attempts,
             pin_emit=pin_emit,
             hidden_carry=hidden_carry,
             prompt_suffix_ids=answer_prefix_ids,
+            think_fence_ids=think_fence_ids,
             answer_fence_ids=answer_fence_ids,
+            min_think_tokens=args.think_min_tokens,
         )
         metrics["dataset_modal_answer"] = bench_dataset_baseline["answer"]
         metrics["dataset_modal_answer_style"] = bench_dataset_baseline["style"]
@@ -5406,6 +5794,8 @@ def main() -> None:
     if args.rollout_only:
         all_passed = True
         for repeat in range(args.rollout_only_repeats):
+            if gate_transcripts is not None:
+                gate_transcripts.repeat = repeat
             torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
             groups = collect(
@@ -5552,6 +5942,12 @@ def main() -> None:
                 ),
             )
             logger.log(type="value_warmup", step=warmup, **metrics)
+            print(
+                f"critic warmup:{warmup}/{args.value_warmup_steps} "
+                f"collect:{collect_seconds:.2f}s update:{update_seconds:.2f}s "
+                f"value_loss:{metrics['value_loss']:.6f}",
+                flush=True,
+            )
             warmup_dashboard = {
                 "value_warmup/token_weighted_mse": metrics["value_loss"],
                 "value_warmup/prediction_mean": metrics["value_mean"],
@@ -5739,23 +6135,21 @@ def main() -> None:
                 if mixture_manifest is not None
                 else None
             )
-            if (
-                mixture_source_quotas is not None
-                and len(groups) == sum(mixture_source_quotas)
-            ):
+            allow_partial_final = (
+                args.consume_all_prompts and sampler.cursor == len(math_rows)
+            )
+            if mixture_sources is not None:
                 minibatch_orders = stratified_optimizer_minibatch_orders(
                     groups,
                     args.prompts_per_minibatch,
-                    mixture_source_quotas,
+                    len(mixture_sources),
+                    allow_partial_final=allow_partial_final,
                 )
             else:
                 minibatch_orders = optimizer_minibatch_orders(
                     len(groups),
                     args.prompts_per_minibatch,
-                    allow_partial_final=(
-                        args.consume_all_prompts
-                        and sampler.cursor == len(math_rows)
-                    ),
+                    allow_partial_final=allow_partial_final,
                 )
         if len(minibatch_orders) != pool_updates:
             raise RuntimeError("rollout pool did not produce the planned updates")
@@ -5800,6 +6194,18 @@ def main() -> None:
         # round-trip overhead. Retention is bounded: past the budget (streams
         # lengthen when thinking grows) the pre-retention path takes over —
         # scatter stats to the CPU groups and let update repack.
+        #
+        # A pool consumed by one optimizer minibatch is updated at behavior
+        # age 0, where the refresh forward would repeat the update's own
+        # forward on the same parameters. The update then derives the
+        # behavior statistics itself (``fused_behavior_statistics``) and
+        # this loop only packs and uploads. Latent thoughts and TPO log-odds
+        # have no fused form and keep the refresh.
+        fused_behavior_statistics = (
+            len(minibatch_orders) == 1
+            and args.reasoning_mode != "latent"
+            and not args.target_policy_optimization
+        )
         retained_device_batches: dict[int, LatentRolloutBatch] = {}
         device_replay_plans: dict[int, ReplayPlan] = {}
         replay_layout_tokens = {
@@ -5810,6 +6216,8 @@ def main() -> None:
         packed_batch_bytes_max = 0
         packed_real_slot_counts = []
         packed_capacity_slots = 0
+        replay_computed_slots = 0
+        replay_shards = 0
         pool_cpu_pack_seconds = 0.0
         # Transfer and replay are asynchronous, so these are event pairs read
         # after the single barrier at the end of collection. Wall clocks here
@@ -5886,24 +6294,25 @@ def main() -> None:
                     del cpu_batch
                     del cpu_replay_plan
                     device_replay_plans[age] = device_replay_plan
-                    with (
-                        profiler.phase("refresh"),
-                        device_timed(refresh_events),
-                        training_autocast(),
-                    ):
-                        refresh_old_statistics(
-                            wrapper,
-                            critic,
-                            device_batch,
-                            max_trajectories=args.replay_max_trajectories,
-                            attention_budget=args.replay_attention_budget,
-                            bucket_multiple=args.replay_bucket,
-                            slot_budget=args.replay_slot_budget,
-                            replay_plan=device_replay_plan,
-                            target_policy_optimization=(
-                                args.target_policy_optimization
-                            ),
-                        )
+                    if not fused_behavior_statistics:
+                        with (
+                            profiler.phase("refresh"),
+                            device_timed(refresh_events),
+                            training_autocast(),
+                        ):
+                            refresh_old_statistics(
+                                wrapper,
+                                critic,
+                                device_batch,
+                                max_trajectories=args.replay_max_trajectories,
+                                attention_budget=args.replay_attention_budget,
+                                bucket_multiple=args.replay_bucket,
+                                slot_budget=args.replay_slot_budget,
+                                replay_plan=device_replay_plan,
+                                target_policy_optimization=(
+                                    args.target_policy_optimization
+                                ),
+                            )
                     packed_batch_bytes = sum(
                         value.numel() * value.element_size()
                         for field in fields(device_batch)
@@ -5921,25 +6330,38 @@ def main() -> None:
                         (device_batch.kind != PAD_SLOT).sum()
                     )
                     packed_capacity_slots += device_batch.kind.numel()
-                    generated = device_batch.action_mask.bool()
-                    # masked_fill, not boolean indexing: the latter lowers to
-                    # masked_select, whose output size is data dependent, so
-                    # it blocks the host on every minibatch. masked_fill also
-                    # keeps a non-finite PAD slot out of the sum, which
-                    # multiplying by the mask would not.
-                    old_value_sums.append(
-                        device_batch.old_values.masked_fill(
-                            ~generated, 0.0
-                        ).sum()
+                    # What each replay pass actually computes: shards are
+                    # length-sorted and trimmed to their own bucketed width,
+                    # so this, not the packed width, is the update's waste.
+                    replay_computed_slots += sum(
+                        spec.row_count * spec.stream_length
+                        for spec in device_replay_plan.specs
                     )
-                    old_value_counts.append(generated.sum())
+                    replay_shards += len(device_replay_plan.specs)
+                    if not fused_behavior_statistics:
+                        generated = device_batch.action_mask.bool()
+                        # masked_fill, not boolean indexing: the latter lowers
+                        # to masked_select, whose output size is data
+                        # dependent, so it blocks the host on every minibatch.
+                        # masked_fill also keeps a non-finite PAD slot out of
+                        # the sum, which multiplying by the mask would not.
+                        old_value_sums.append(
+                            device_batch.old_values.masked_fill(
+                                ~generated, 0.0
+                            ).sum()
+                        )
+                        old_value_counts.append(generated.sum())
+                    # A fused pool is one minibatch that the update holds on
+                    # device regardless, so a repack would only upload it
+                    # twice.
                     if (
-                        retained_bytes_total + packed_batch_bytes
+                        fused_behavior_statistics
+                        or retained_bytes_total + packed_batch_bytes
                         <= RETAINED_MINIBATCH_BUDGET_BYTES
                     ):
                         retained_device_batches[age] = device_batch
                         retained_bytes_total += packed_batch_bytes
-                    else:
+                    elif not fused_behavior_statistics:
                         with (
                             profiler.phase("stat_scatter_d2h"),
                             device_timed(d2h_events),
@@ -5964,10 +6386,16 @@ def main() -> None:
             torch.cuda.synchronize()
         collect_seconds = time.perf_counter() - collect_started
         with profiler.phase("pool_reductions"):
-            old_value_sum = float(torch.stack(old_value_sums).sum())
-            old_value_count = int(torch.stack(old_value_counts).sum())
-            rollout_metrics["old_value_mean"] = (
-                old_value_sum / old_value_count if old_value_count else 0.0
+            if not fused_behavior_statistics:
+                # Fused pools have no pre-update value pass; the update's
+                # train/value_mean is the same quantity.
+                old_value_sum = float(torch.stack(old_value_sums).sum())
+                old_value_count = int(torch.stack(old_value_counts).sum())
+                rollout_metrics["old_value_mean"] = (
+                    old_value_sum / old_value_count if old_value_count else 0.0
+                )
+            rollout_metrics["fused_behavior_statistics"] = float(
+                fused_behavior_statistics
             )
             rollout_metrics["retained_minibatches"] = len(
                 retained_device_batches
@@ -5981,13 +6409,20 @@ def main() -> None:
                 if packed_capacity_slots
                 else 0.0
             )
+            rollout_metrics["replay_slot_utilization"] = (
+                packed_real_slots / replay_computed_slots
+                if replay_computed_slots
+                else 0.0
+            )
+            rollout_metrics["replay_shards"] = replay_shards
             rollout_metrics["pool_cpu_pack_seconds"] = pool_cpu_pack_seconds
             # Device time on the transfer and replay streams, not host wall
             # time.
             rollout_metrics["pool_h2d_seconds"] = elapsed_seconds(h2d_events)
-            rollout_metrics["pool_refresh_seconds"] = elapsed_seconds(
-                refresh_events
-            )
+            if not fused_behavior_statistics:
+                rollout_metrics["pool_refresh_seconds"] = elapsed_seconds(
+                    refresh_events
+                )
             rollout_metrics["pool_d2h_seconds"] = elapsed_seconds(d2h_events)
         rollout_peak_vram_bytes = torch.cuda.max_memory_allocated()
         # Restart the peak counter here so the train rows below report the
@@ -6023,6 +6458,8 @@ def main() -> None:
             for tag in (
                 "packed_batch_gib_max",
                 "packed_padding_utilization",
+                "replay_slot_utilization",
+                "replay_shards",
                 "decode_steps_per_chunk_mean",
                 "decode_step_utilization",
                 "decode_step_savings_fraction",
@@ -6135,6 +6572,7 @@ def main() -> None:
                         policy_action_denominator=policy_action_denominator,
                         value_action_denominator=value_action_denominator,
                         gae_lambda_alpha=args.gae_lambda_alpha,
+                        actor_gae_lambda=args.actor_gae_lambda,
                         replay_max_trajectories=args.replay_max_trajectories,
                         replay_attention_budget=args.replay_attention_budget,
                         replay_bucket=args.replay_bucket,
@@ -6150,6 +6588,7 @@ def main() -> None:
                         source_success_actor_gate=(
                             args.source_success_actor_gate
                         ),
+                        fused_behavior_statistics=fused_behavior_statistics,
                     )
                 # The first minibatch runs against refresh-computed behavior
                 # statistics with the actor untouched. Later disjoint minibatches
@@ -6352,6 +6791,7 @@ def main() -> None:
                             ),
                             tpo_eta=args.tpo_eta,
                             gae_lambda_alpha=args.gae_lambda_alpha,
+                            actor_gae_lambda=args.actor_gae_lambda,
                             source_success_actor_gate=(
                                 args.source_success_actor_gate
                             ),

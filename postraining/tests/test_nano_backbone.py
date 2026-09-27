@@ -9,7 +9,12 @@ import torch.nn.functional as F
 from pretraining.nanogpt_mini import nanogpt_mini_model
 from postraining.latent_thought import LatentThoughtModel
 from postraining.model_io import copy_trunk, fresh_trunk, load_model
-from postraining.nano_backbone import NanoGPTBackbone, NanoTiedDotBackbone
+from postraining.nano_backbone import (
+    NanoGPTBackbone,
+    NanoTiedDotBackbone,
+    SoftcappedTargetLogprobs,
+    rational_softcap,
+)
 from postraining.value_model import SeparateCritic
 
 # head_dim is fixed at 128, so the smallest multi-head trunk is model_dim 256.
@@ -658,3 +663,98 @@ def test_nano_critic_smoke():
         values = critic.values(batch)
     assert values.shape == (batch_size, stream)
     assert torch.equal(values, torch.zeros_like(values))
+
+
+def _composed_target_logprobs(raw, targets, cap=15.0):
+    """The readout tail as plain autograd composes it."""
+    logprobs = rational_softcap(raw.float(), cap).log_softmax(-1)
+    return logprobs.gather(-1, targets[:, None]).squeeze(-1)
+
+
+def test_softcapped_target_logprobs_gradcheck():
+    generator = torch.Generator().manual_seed(11)
+    # Spread well past the cap so the softcap derivative is far from 1.
+    raw = (40 * torch.randn(5, 13, generator=generator, dtype=torch.float64))
+    raw.requires_grad_(True)
+    targets = torch.randint(0, 13, (5,), generator=generator)
+    torch.autograd.gradcheck(
+        lambda x: SoftcappedTargetLogprobs.apply(x, targets, 15.0), (raw,)
+    )
+    torch.testing.assert_close(
+        SoftcappedTargetLogprobs.apply(raw, targets, 15.0),
+        rational_softcap(raw, 15.0)
+        .log_softmax(-1)
+        .gather(-1, targets[:, None])
+        .squeeze(-1),
+    )
+
+
+def test_softcapped_target_logprobs_matches_composed_bf16_readout():
+    """bf16 GEMM output: same fp32 value, and the gradient the composed
+    graph would have cast back to bf16 at the ``.float()`` boundary."""
+    generator = torch.Generator().manual_seed(12)
+    raw = (20 * torch.randn(64, 300, generator=generator)).bfloat16()
+    targets = torch.randint(0, 300, (64,), generator=generator)
+    upstream = torch.randn(64, generator=generator)
+    fused_raw = raw.clone().requires_grad_(True)
+    fused = SoftcappedTargetLogprobs.apply(fused_raw, targets, 15.0)
+    (fused * upstream).sum().backward()
+    composed_raw = raw.clone().requires_grad_(True)
+    composed = _composed_target_logprobs(composed_raw, targets)
+    (composed * upstream).sum().backward()
+    assert fused.dtype == torch.float32
+    assert fused_raw.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(fused, composed, rtol=1e-6, atol=1e-5)
+    torch.testing.assert_close(fused_raw.grad, composed_raw.grad)
+
+
+@pytest.mark.parametrize("cls", (NanoGPTBackbone, NanoTiedDotBackbone))
+def test_target_logprobs_from_features_matches_the_rendered_logits(cls):
+    backbone = _backbone(cls).train()
+    generator = torch.Generator().manual_seed(13)
+    features = torch.randn(9, 2 * KWARGS["model_dim"], generator=generator)
+    targets = torch.randint(0, KWARGS["vocab_size"], (9,), generator=generator)
+    upstream = torch.randn(9, generator=generator)
+
+    def gradients(function):
+        backbone.zero_grad(set_to_none=True)
+        value = function()
+        (value * upstream).sum().backward()
+        return value.detach(), {
+            name: parameter.grad.clone()
+            for name, parameter in backbone.named_parameters()
+            if parameter.grad is not None
+        }
+
+    fused, fused_grads = gradients(
+        lambda: backbone.target_logprobs_from_features(features, targets)
+    )
+    composed, composed_grads = gradients(
+        lambda: backbone.logits_from_features(features)
+        .log_softmax(-1)
+        .gather(-1, targets[:, None])
+        .squeeze(-1)
+    )
+    torch.testing.assert_close(fused, composed)
+    assert fused_grads.keys() == composed_grads.keys() and fused_grads
+    for name, gradient in fused_grads.items():
+        torch.testing.assert_close(gradient, composed_grads[name], msg=name)
+
+
+def test_target_logprobs_compile_as_one_graph_with_its_backward():
+    backbone = _backbone().train()
+    generator = torch.Generator().manual_seed(14)
+    features = torch.randn(11, 2 * KWARGS["model_dim"], generator=generator)
+    targets = torch.randint(0, KWARGS["vocab_size"], (11,), generator=generator)
+
+    def loss(features, targets):
+        return backbone.target_logprobs_from_features(features, targets).sum()
+
+    eager_features = features.clone().requires_grad_(True)
+    loss(eager_features, targets).backward()
+    torch._dynamo.reset()
+    compiled_features = features.clone().requires_grad_(True)
+    torch.compile(loss, fullgraph=True, dynamic=True)(
+        compiled_features, targets
+    ).backward()
+    torch.testing.assert_close(compiled_features.grad, eager_features.grad)

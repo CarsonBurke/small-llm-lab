@@ -201,20 +201,29 @@ def test_reasoning_mode_flags():
 
 
 def test_token_only_and_latent_schema_bytes_are_pinned():
-    """In-flight cot/none/latent runs resume against these exact bytes."""
+    """Runs resume against these exact bytes."""
     v29 = (
         "unique_prefix_compact_tail_broad_mixture_forced_initial_think_"
         "one_way_stop_vector_sigma_isotropic_trajectory_position_rng/v29"
     )
     refill = v29 + "+request_stable_gate_token_gaussian_refill_paged_flex/v3"
-    replay = "compact_emit_gate_raw_gaussian_next_slot_exact_replay/v4"
+    replay = (
+        "compact_emit_gate_raw_gaussian_next_slot_fused_softcap_readout_"
+        "exact_replay/v5"
+    )
     objectives = (
         "vapo_joint_gate_token_gaussian_clip_token_denominator/v4",
         "delightful_token_policy_plus_vapo_gate_gaussian/v2",
         "target_policy_token_odds_plus_vapo_gate_gaussian/v7",
     )
+    token_only = (
+        "unique_prefix_bucketed_graph_decode_broad_mixture_pinned_emit_"
+        "counter_gumbel_request_row_slot_token_rng/v32"
+    )
+    assert schemas.execution_schema_for("latent") == v29
     for mode in ("latent", "cot", "none"):
-        assert schemas.execution_schema_for(mode) == v29
+        if mode != "latent":
+            assert schemas.execution_schema_for(mode) == token_only
         assert schemas.execution_schema_for(mode, "continuous_refill") == refill
         assert schemas.replay_numerics_schema_for(mode) == replay
         assert (
@@ -237,11 +246,12 @@ def test_token_only_and_latent_schema_bytes_are_pinned():
 
 def test_carry_schemas_are_distinct_and_lockstep_only():
     assert schemas.execution_schema_for("carry") == (
-        "unique_prefix_compact_tail_broad_mixture_deterministic_hidden_carry_"
-        "token_only_generator_token_rng/v30"
+        "unique_prefix_bucketed_graph_decode_broad_mixture_deterministic_"
+        "hidden_carry_token_only_counter_gumbel_request_row_slot_token_rng/v32"
     )
     assert schemas.replay_numerics_schema_for("carry") == (
-        "compact_token_logprob_next_slot_hidden_carry_exact_replay/v5"
+        "compact_token_logprob_next_slot_hidden_carry_fused_softcap_readout_"
+        "exact_replay/v6"
     )
     assert (
         schemas.actor_objective_schema("carry"),
@@ -940,3 +950,20 @@ def test_stale_and_foreign_checkpoints_are_refused_as_carry():
         combiner_init_kwargs_from_checkpoint(
             {**base, "rollout_policy_schema": "deterministic_hidden_carry/v1"}
         )
+
+
+@pytest.mark.parametrize("delightful", [False, True])
+def test_fused_behavior_statistics_match_refresh_then_update_under_carry(
+    delightful,
+):
+    from postraining.tests.test_reasoning_modes import (
+        assert_fused_matches_refresh_then_update,
+    )
+
+    wrapper = _carry_wrapper()
+    critic = _critic()
+    batch = _roll(wrapper, _prompts("nano", 4, 5))
+    assign_terminal_rewards(batch, torch.tensor([1.0, 0.0, 1.0, 0.0]))
+    assert_fused_matches_refresh_then_update(
+        wrapper, critic, batch, delightful_policy_gradient=delightful
+    )

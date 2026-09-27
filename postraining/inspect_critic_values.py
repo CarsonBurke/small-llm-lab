@@ -19,6 +19,7 @@ import argparse
 import html
 import json
 import random
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -107,43 +108,52 @@ def token_display_text(tokenizer, token_id: int, unicode_to_byte) -> str:
         )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--wrapper-checkpoint",
-        default="postraining/runs/rl_gpt2vocab_cot_lr5e5/latent_vapo_checkpoint.pt",
-    )
-    parser.add_argument(
-        "--checkpoint", default=None,
-        help="base pretraining checkpoint; resolved from the run's "
-        "manifest.json when omitted",
-    )
-    parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
-    parser.add_argument("--rows", type=int, default=16)
-    parser.add_argument("--samples", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--out-dir", default=None)
-    args = parser.parse_args()
-    if args.rows < 1 or args.samples < 1:
-        parser.error("--rows and --samples must be positive")
+@dataclass(frozen=True)
+class LoadedRun:
+    """A latent-VAPO checkpoint's policy, critic, and exact reward contract."""
 
-    wrapper_path = Path(args.wrapper_checkpoint)
+    backbone: torch.nn.Module
+    wrapper: LatentThoughtModel
+    critic: SeparateCritic
+    payload: dict
+    saved_args: dict
+    step: int
+    reasoning_mode: str
+    tokenizer: object
+    stop_ids: tuple[int, ...]
+    think_fence_ids: tuple[int, int] | None
+    answer_fence_ids: tuple[int, int] | None
+    prompt_budget: int
+    pin_emit: bool
+    hidden_carry: bool
+    response_budget: int
+    stream_budget: int
+    solution_prefix_ids: tuple[int, ...]
+
+
+def load_run(
+    wrapper_path: Path, checkpoint: str | None, device: torch.device
+) -> LoadedRun:
+    """Load a run's policy and critic and rebuild its reward contract.
+
+    ``checkpoint`` is the base pretraining checkpoint, resolved from the
+    run's manifest.json when None.
+    """
     manifest_path = wrapper_path.parent / "manifest.json"
     manifest_payload = (
         json.loads(manifest_path.read_text())
         if manifest_path.exists()
         else {}
     )
-    if args.checkpoint is None:
+    if checkpoint is None:
         if not manifest_payload:
-            parser.error(
+            raise ValueError(
                 f"cannot resolve the base checkpoint: {manifest_path} not found"
             )
-        args.checkpoint = manifest_payload["base"]["checkpoint"]
-        print(f"base checkpoint (from manifest): {args.checkpoint}")
+        checkpoint = manifest_payload["base"]["checkpoint"]
+        print(f"base checkpoint (from manifest): {checkpoint}")
 
-    device = torch.device("cuda")
-    backbone = load_model(args.checkpoint, device)
+    backbone = load_model(checkpoint, device)
     backbone.eval()
     payload = torch.load(wrapper_path, map_location="cpu", weights_only=False)
     saved_args = payload.get("args", {})
@@ -223,6 +233,61 @@ def main() -> None:
     solution_prefix_ids: tuple[int, ...] = ()
     if reasoning_mode == "none":
         solution_prefix_ids = answer_prefix_token_ids(tokenizer)
+
+    return LoadedRun(
+        backbone=backbone,
+        wrapper=wrapper,
+        critic=critic,
+        payload=payload,
+        saved_args=saved_args,
+        step=step,
+        reasoning_mode=reasoning_mode,
+        tokenizer=tokenizer,
+        stop_ids=stop_ids,
+        think_fence_ids=think_fence_ids,
+        answer_fence_ids=answer_fence_ids,
+        prompt_budget=prompt_budget,
+        pin_emit=pin_emit,
+        hidden_carry=hidden_carry,
+        response_budget=response_budget,
+        stream_budget=stream_budget,
+        solution_prefix_ids=solution_prefix_ids,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--wrapper-checkpoint",
+        default="postraining/runs/rl_gpt2vocab_cot_lr5e5/latent_vapo_checkpoint.pt",
+    )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="base pretraining checkpoint; resolved from the run's "
+        "manifest.json when omitted",
+    )
+    parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
+    parser.add_argument("--rows", type=int, default=16)
+    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--out-dir", default=None)
+    args = parser.parse_args()
+    if args.rows < 1 or args.samples < 1:
+        parser.error("--rows and --samples must be positive")
+
+    wrapper_path = Path(args.wrapper_checkpoint)
+    device = torch.device("cuda")
+    run = load_run(wrapper_path, args.checkpoint, device)
+    backbone, wrapper, critic, tokenizer = (
+        run.backbone, run.wrapper, run.critic, run.tokenizer
+    )
+    saved_args, step = run.saved_args, run.step
+    stop_ids, solution_prefix_ids = run.stop_ids, run.solution_prefix_ids
+    think_fence_ids, answer_fence_ids = run.think_fence_ids, run.answer_fence_ids
+    prompt_budget = run.prompt_budget
+    pin_emit, hidden_carry = run.pin_emit, run.hidden_carry
+    response_budget, stream_budget = run.response_budget, run.stream_budget
+    run_answer_fence = answer_fence_ids is not None
 
     rows = load_unique_math_rows(args.math_data)
     if run_answer_fence:
@@ -382,8 +447,8 @@ def main() -> None:
         "code{background:#131924;padding:0 .3em;border-radius:3px}"
         f"</style></head><body><h1>Critic per-token values · step {step}</h1>"
         f"<p>value color scale: red {low:.3f} → green {high:.3f}; hover a "
-        "token for its exact V. Values are the critic's HL-Gauss expected "
-        "scalar at each action slot — what GAE uses as V(s).</p>"
+        "token for its exact V. Values are the critic's scalar estimate at "
+        "each action slot — what GAE uses as V(s).</p>"
         f"{''.join(sections)}</body></html>"
     )
     print(f"\nwrote {json_path}\nwrote {html_path}")

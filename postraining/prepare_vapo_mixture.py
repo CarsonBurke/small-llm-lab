@@ -1,20 +1,26 @@
 """Build immutable MBPP data and a VAPO mixture manifest.
 
-The default composition is the four-source math+code mixture. ``--sources``
-selects a subset, because a mixture is only usable by a policy whose SFT
-corpus taught every selected verifier's contract: pairing the code source
-with a math-only SFT base yields rollouts that emit no think fence, never
-terminate, and are format-ineligible for reward -- a whole quota of every
-pool spent on guaranteed zeros, and the longest rollouts at that.
+A mixture is exact-pass: one cycle serves every row of every selected source
+exactly once, interleaved in proportion to source size, so no prompt is
+revisited before every other prompt has been seen. Sources therefore carry
+no quota; composition is chosen by selecting (or rebuilding) sources.
+
+``--sources`` selects a subset, because a mixture is only usable by a policy
+whose SFT corpus taught every selected verifier's contract: pairing the code
+source with a math-only SFT base yields rollouts that emit no think fence,
+never terminate, and are format-ineligible for reward -- every code prompt
+spent on guaranteed zeros, and the longest rollouts at that.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -30,57 +36,95 @@ from postraining.math_prompt import (
     ANSWER_FENCE_PROMPT_SCHEMA,
     answer_fence_prompt,
 )
+from postraining.prepare_sft_corpus import refuse_evaluation_only
 from postraining.vapo.code_reward import PYTHON_REWARD_SCHEMA, python_tests_pass
 from postraining.vapo.mixture import VAPO_MIXTURE_SCHEMA, file_sha256
 
 
-DEFAULT_OUTPUT = Path("postraining/data/vapo_broad_v9_bare")
+DEFAULT_OUTPUT = Path("postraining/data/vapo_broad_v12_exact")
 
-# Quotas follow measured learnability, not source size.  A frozen-policy gate
-# on the post-SFT KDA8 policy (avg@512, 768-token budget) scored:
-#
-#   deepmind-interpolate (train pool and bench panel)   0.0000
-#   dapo-math-17k                                       0.0020
-#
-# VAPO's advantage is group-relative, so an all-zero group contributes exactly
-# no policy gradient -- weighting the hardest sources most, as the v7 mixture
-# did (dapo 28/64, deepmind 20/64), spent 87% of every rollout pool on prompts
-# that cannot teach anything.  ``deepmind_easy`` is the ``train-easy`` tier of
-# the same 18 modules: a disjoint training split at markedly easier surface
-# difficulty, which is where a 0.00 policy can first produce within-group
-# variance.  The harder tail is kept deliberately small -- enough to preserve
-# headroom and to stop the policy narrowing onto one templated prompt shape,
-# which is itself a documented failure mode -- and should be reweighted upward
-# as train-easy accuracy climbs.
+# Each spec is (name, path, verifier, default-on). A frozen-policy gate on the
+# post-SFT KDA8 policy (avg@512, 768-token budget) scored deepmind-interpolate
+# 0.0000 and dapo-math-17k 0.0020; the v11 PG run later measured dapo at 0.004
+# with within-group std 0.007. VAPO's advantage is group-relative, so an
+# all-zero group contributes no policy gradient. ``deepmind_easy`` is the
+# ``train-easy`` tier of the same 18 modules -- a disjoint training split at
+# markedly easier surface difficulty -- and dominates the default mixture by
+# size. The full-difficulty deepmind pool and MBPP are available but off by
+# default: the former is unlearnable at the current accuracy, the latter
+# needs a code-trained SFT base.
 SOURCE_SPECS = (
     (
         "deepmind_easy",
         Path("postraining/data/deepmind-train-easy-rl.parquet"),
-        48,
         "math",
+        True,
     ),
-    # v2 of this pool: dapo-overlapping prompts removed. UltraData-RL-2609
-    # and DAPO-Math-17K share upstream pools, and 664 prompts were reachable
-    # through both.
+    # v5: the whole UltraData-RL-2609 Math domain, decontaminated, within
+    # the 256-token prompt budget, near-duplicates collapsed and equation
+    # targets quarantined (scripts/build_ultradata_math_rl_prompts.py). It
+    # owns every problem it shares with DAPO-Math-17K.
     (
         "ultradata_math",
-        Path("postraining/data/ultradata-math-rl-v2.parquet"),
-        8,
+        Path("postraining/data/ultradata-math-rl-v5.parquet"),
         "math",
+        True,
     ),
+    # v2: DAPO-Math-17K less every problem that restates an UltraData Math
+    # problem (whitespace, LaTeX-skeleton, or near-duplicate match; 5,268
+    # rows), with the same screens (scripts/build_dapo_rl_prompts.py).
     (
         "dapo",
-        Path("postraining/data/dapo-math-17k.parquet"),
-        8,
+        Path("postraining/data/dapo-math-17k-v2-ud3dedup.parquet"),
         "math",
+        True,
     ),
     (
         "deepmind",
         Path("postraining/data/deepmind-interpolate-rl-full.parquet"),
-        0,
         "math",
+        False,
     ),
-    ("mbpp", None, 0, "python_mbpp"),
+    ("mbpp", None, "python_mbpp", False),
+    # openbmb/UltraData-Code L3/py exercises verified by
+    # ``prepare_ultradata_code build``: the prompt shows at most two example
+    # assertions and the reward runs every kept test statement. Off by
+    # default for the same reason as mbpp -- it needs a code-SFT'd base --
+    # and its SFT counterpart is the disjoint ``ultradata_code_l3`` pool.
+    (
+        "ultradata_code_l3",
+        Path("postraining/data/ultradata-code-l3-v3-rl.parquet"),
+        "python_mbpp",
+        False,
+    ),
+    # UltraData-RL-2609 Knowledge (STEM), built by
+    # ``scripts/build_ultradata_knowledge_rl_prompts.py``: single-choice rows
+    # re-rendered as "A. option" lines with the answer permuted to a uniform
+    # position and graded as one exact letter, plus numeric rows. Off by
+    # default: guessing earns 1/k per row (the ``choice_{k}`` module baselines
+    # report it), so it needs a gate showing accuracy above chance first, and
+    # a base whose SFT taught letter answers (``ultradata_sft_2605_knowledge``).
+    (
+        "ultradata_knowledge",
+        Path("postraining/data/ultradata-knowledge-rl-v2.parquet"),
+        "math",
+        False,
+    ),
+    # ARC-Challenge, ARC-Easy, OpenBookQA and SciQ train splits, built by
+    # ``scripts/build_science_mc_rl_prompts.py`` under the same single-choice
+    # contract (``{source}_choice_{k}`` modules, chance mostly 1/4). Off by
+    # default for the same reason as ``ultradata_knowledge``; SciQ rows are
+    # CC BY-NC 3.0. v5 is v2 less the question components the teacher-trace
+    # SFT source (``science_mc_traces``) distils, so SFT and RL share no
+    # question (v3 and v4 split reworded questions apart; neither was used);
+    # the job 9040 base scored 0.2% on v2 (job 9466), so it needs a base whose
+    # SFT included that source.
+    (
+        "science_mc",
+        Path("postraining/data/science-mc-rl-v5.parquet"),
+        "math",
+        False,
+    ),
 )
 
 # Selecting one of these is a mistake with a specific explanation, so name the
@@ -109,6 +153,59 @@ def atomic_bytes(payload: bytes, path: Path) -> None:
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
     temporary.write_bytes(payload)
     os.replace(temporary, path)
+
+
+def mbpp_entry_points(reference: str, test_sources: list[str]) -> list[str]:
+    """Reference definitions the fixture and tests read.
+
+    The v6 verifier shows the tests only these candidate bindings: names the
+    reference binds at module scope (imports excluded, since tests import
+    for themselves) that the test code reads but never binds.
+    """
+
+    def module_scope(tree: ast.Module, *, imports: bool) -> set[str]:
+        names: set[str] = set()
+        for statement in tree.body:
+            if isinstance(
+                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(statement.name)
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                if imports:
+                    names.update(
+                        (alias.asname or alias.name).split(".", 1)[0]
+                        for alias in statement.names
+                    )
+            else:
+                names.update(
+                    node.id
+                    for node in ast.walk(statement)
+                    if isinstance(node, ast.Name)
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                )
+        return names
+
+    def parse(source: str) -> ast.Module:
+        # MBPP sources carry non-raw regex escapes; the sandbox reports them.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            return ast.parse(source)
+
+    defined = module_scope(parse(reference), imports=False)
+    read: set[str] = set()
+    bound: set[str] = set()
+    for source in test_sources:
+        tree = parse(source)
+        read.update(
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        )
+        bound |= module_scope(tree, imports=True)
+    entry_points = sorted((defined & read) - bound)
+    if not entry_points:
+        raise ValueError("MBPP tests read no reference definition")
+    return entry_points
 
 
 def load_mbpp_train(path: Path) -> list[dict]:
@@ -153,6 +250,10 @@ def load_mbpp_train(path: Path) -> list[dict]:
                 },
                 "verification_info": {
                     "schema": PYTHON_REWARD_SCHEMA,
+                    "entry_points": mbpp_entry_points(
+                        str(source["code"]),
+                        ([setup] if setup else []) + visible_tests,
+                    ),
                     "test_setup": [setup] if setup else [],
                     "tests": visible_tests,
                 },
@@ -198,20 +299,11 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         default=",".join(
-            name for name, _, quota, _ in SOURCE_SPECS if quota
+            name for name, _, _, default_on in SOURCE_SPECS if default_on
         ),
         help="comma-separated subset of "
-        f"{','.join(name for name, _, _, _ in SOURCE_SPECS)}; quotas are the "
-        "shipped per-source values, so a subset changes groups_per_cycle. "
-        "Sources shipped at quota 0 are available but off by default and "
-        "must be given an explicit --quota override to contribute",
-    )
-    parser.add_argument(
-        "--quota",
-        action="append",
-        default=[],
-        metavar="SOURCE=N",
-        help="override a source's prompts-per-pool quota; repeatable",
+        f"{','.join(name for name, _, _, _ in SOURCE_SPECS)}; every row of "
+        "each selected source is served exactly once per mixture cycle",
     )
     args = parser.parse_args()
 
@@ -227,27 +319,11 @@ def main() -> None:
         parser.error("--sources selects no source")
     if len(selected) != len(set(selected)):
         parser.error("--sources repeats a source")
-    overrides = {}
-    for item in args.quota:
-        name, _, raw = item.partition("=")
-        if name not in known:
-            parser.error(f"--quota names unknown source {name!r}")
-        if name not in set(selected):
-            parser.error(f"--quota {name!r} is not in --sources")
-        if not raw.isdigit() or int(raw) < 1:
-            parser.error(f"--quota {item!r} needs a positive integer")
-        overrides[name] = int(raw)
     specs = [
-        (name, path, overrides.get(name, quota), reward)
-        for name, path, quota, reward in SOURCE_SPECS
+        (name, path, verifier)
+        for name, path, verifier, _ in SOURCE_SPECS
         if name in set(selected)
     ]
-    zero = sorted(name for name, _, quota, _ in specs if quota == 0)
-    if zero:
-        parser.error(
-            f"selected source(s) {', '.join(zero)} ship quota 0; give an "
-            "explicit --quota SOURCE=N to include them"
-        )
     wants_mbpp = any(spec[0] == "mbpp" for spec in specs)
     if wants_mbpp and not args.mbpp_jsonl:
         parser.error("--mbpp-jsonl is required when the mbpp source is selected")
@@ -274,8 +350,12 @@ def main() -> None:
 
     sources = []
     prompt_owners: dict[str, list[str]] = {}
-    for name, configured_path, quota, verifier in specs:
+    for name, configured_path, verifier in specs:
         path = mbpp_path if configured_path is None else configured_path
+        try:
+            refuse_evaluation_only(path)
+        except ValueError as error:
+            parser.error(str(error))
         corpus_audit = {}
         rows = load_unique_math_rows(path, audit=corpus_audit)
         for row in rows:
@@ -290,7 +370,6 @@ def main() -> None:
             {
                 "name": name,
                 "path": str(path),
-                "quota": quota,
                 "verifier": verifier,
                 "rows": len(rows),
                 "sha256": file_sha256(path),
@@ -300,8 +379,8 @@ def main() -> None:
         )
     # A prompt reachable through two sources is drawn under two names, counted
     # twice against the pool, and splits its own learnability telemetry. The
-    # pools must be made disjoint at build time (see the --exclude option on
-    # scripts/build_ultradata_math_rl_prompts.py) rather than reconciled here,
+    # pools must be made disjoint at build time (postraining/problem_overlap.py,
+    # scripts/build_dapo_rl_prompts.py) rather than reconciled here,
     # because dropping rows now would silently change a source's row count and
     # its math_corpus_identity.
     shared = {
@@ -327,7 +406,7 @@ def main() -> None:
     manifest = {
         "schema": VAPO_MIXTURE_SCHEMA,
         "math_corpus_policy_sha256": math_corpus_policy_sha256(),
-        "groups_per_cycle": sum(source["quota"] for source in sources),
+        "prompts_per_cycle": sum(source["rows"] for source in sources),
         "sources": sources,
         "answer_fence_prompt_schema": ANSWER_FENCE_PROMPT_SCHEMA,
         "python_reward_schema": PYTHON_REWARD_SCHEMA,

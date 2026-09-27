@@ -7,11 +7,12 @@ import math
 from pathlib import Path
 
 from postraining.benchmark_report import CAPTURE_SAMPLES_PER_PROBLEM
+from postraining.core import POSTTRAIN_PROMPT_TOKENS, POSTTRAIN_STREAM_TOKENS
 from postraining.latent_thought import (
     DEFAULT_INIT_STOP_THINKING_PROBABILITY,
     DEFAULT_THOUGHT_SIGMA,
 )
-from postraining.reasoning_modes import REASONING_MODES
+from postraining.reasoning_modes import REASONING_MODES, mode_pins_emit
 
 
 # One 8-row eval batch at the 1024-token guard sequence length. The guard is
@@ -24,6 +25,7 @@ from postraining.reasoning_modes import REASONING_MODES
 DEFAULT_BPB_GUARD_TOKENS = 8 * 1024
 DEFAULT_BPB_EVAL_EVERY = 150
 DEFAULT_MATH_EVAL_EVERY = 250
+DEFAULT_RL_RESPONSE_TOKENS = 2048
 
 # Restores the trunk step size that the Muon:AdamW rate ratio was chosen for,
 # after ``postraining.muon`` moved to Polar Express. It is a property of that
@@ -57,16 +59,48 @@ DEFAULT_MATH_EVAL_EVERY = 250
 POLAR_EXPRESS_STEP_COMPENSATION = 1.45
 
 
+def resolve_rollout_defaults(args, *, is_nano: bool, checkpoint_context_tokens: int,
+                             trained_context_tokens: int | None) -> int:
+    """Resolve response budgets and a runtime context that can contain them.
+
+    Runtime capacity is distinct from the checkpoint's trained window. Growing
+    the former does not rewrite training metadata or claim context training.
+    Explicit frozen-evaluation overrides remain hard limits checked downstream.
+    """
+    if args.prompt_tokens is None:
+        args.prompt_tokens = 512 if is_nano else POSTTRAIN_PROMPT_TOKENS
+    if args.continuation_tokens is None:
+        args.continuation_tokens = DEFAULT_RL_RESPONSE_TOKENS
+    if args.bench_max_tokens is None:
+        args.bench_max_tokens = args.continuation_tokens
+    if args.aime_max_tokens is None:
+        args.aime_max_tokens = args.continuation_tokens
+    if args.eval_context_tokens is not None:
+        if not is_nano:
+            raise ValueError("--eval-context-tokens is only supported for nano backbones")
+        return args.eval_context_tokens
+    context = max(checkpoint_context_tokens, trained_context_tokens or 0)
+    response = (args.answer_tokens if args.reasoning_mode == "none" else
+                max(args.continuation_tokens, args.bench_max_tokens, args.aime_max_tokens))
+    required_stream = response + (args.reasoning_mode == "latent")
+    if context < args.prompt_tokens + required_stream:
+        # Preserve room for latent actions rather than reducing a latent run
+        # to its mandatory first thought. CoT/carry need only emitted slots.
+        if args.reasoning_mode == "latent":
+            required_stream = max(required_stream, POSTTRAIN_STREAM_TOKENS)
+        context = args.prompt_tokens + required_stream
+    return context
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """The CLI surface, separate from main() so the shipped defaults
     and the argv-level guards are testable without running training."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
-    # The selected production regime is a 40K-update Delightful Policy
-    # Gradient campaign. Shorter runs remain explicit ablations rather than
-    # the behavior of an otherwise production-shaped invocation.
-    parser.add_argument("--steps", type=int, default=40_000)
+    # 950 joint updates + the default 50 critic warmup updates = 1000 total.
+    parser.add_argument("--steps", type=int, default=950,
+                        help="joint updates, excluding critic warmup (default: 950 + 50 warmup)")
     parser.add_argument(
         "--max-train-hours", type=float, default=None,
         help="stop training at the first pool boundary after this many hours "
@@ -77,10 +111,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--math-data", default="postraining/data/dapo-math-17k.parquet")
     parser.add_argument(
         "--rl-mixture-manifest",
-        default="postraining/data/vapo_broad_v9_bare.manifest.json",
-        help="immutable multi-source verifier manifest whose exact source "
-        "quotas replace --math-data (pass an empty string for a single "
-        "--math-data source)",
+        default="postraining/data/vapo_broad_v12_exact.manifest.json",
+        help="immutable multi-source verifier manifest, served exact-pass "
+        "(every row once per cycle), that replaces --math-data (pass an "
+        "empty string for a single --math-data source)",
+    )
+    parser.add_argument(
+        "--randomize-choice-options", action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fresh deterministic option order for screened MC rows on each "
+        "mixture presentation (default on in training, off in rollout-only "
+        "gates to preserve frozen prompt comparisons)",
     )
     parser.add_argument(
         "--exclude-modules", default="",
@@ -105,8 +146,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # question and answer-format instruction sit at the end). None derives a
     # backbone default after the checkpoint loads: fresh PoPE 1024, nano 512.
     parser.add_argument("--prompt-tokens", type=int, default=None)
-    parser.add_argument("--continuation-tokens", type=int, default=None)
-    # Selected DG topology: collect one fresh 24-prompt x 16-sample batch from
+    parser.add_argument(
+        "--python-reward-mode", choices=("binary", "test-fraction"),
+        default="test-fraction",
+        help="code reward: fraction of test cases passed, or all-tests-pass binary",
+    )
+    parser.add_argument("--continuation-tokens", type=int, default=None,
+                        help="generated response tokens (default 2048); benchmark and AIME budgets inherit this unless overridden")
+    parser.add_argument(
+        "--eval-context-tokens", type=int, default=None,
+        help="Explicit nano context extrapolation for frozen rollout/benchmark evaluation only; does not change checkpoint training metadata.",
+    )
+    # Default on-policy topology: collect one fresh 24-prompt x 16-sample batch from
     # the current policy and consume it in exactly one update. The equality of
     # rollout and minibatch prompt counts is an objective constraint for the
     # on-policy estimator, not merely a throughput setting. The opt-out VAPO
@@ -119,7 +170,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delightful-policy-gradient",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="replace the clipped VAPO/PPO actor objective with Delightful "
         "Policy Gradient (Osband, 2026), using eta=1 current-token "
         "surprisal and no importance ratios",
@@ -152,6 +203,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="explicitly allow an exact Delightful resume to change the "
         "equal prompts-per-rollout/prompts-per-minibatch topology; model, "
         "optimizer, RNG, step, and sampler state are still restored",
+    )
+    parser.add_argument(
+        "--allow-token-rng-migration",
+        action="store_true",
+        help="explicitly allow a resume to continue a lockstep cot/none run "
+        "saved under the v31 padded-slot token draw with the v32 unpadded-slot "
+        "draw; model, optimizer, RNG, step, and sampler state are still "
+        "restored, and later draws differ from what v31 would have drawn",
     )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -234,6 +293,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # whole-trajectory credit for short answers while keeping VAPO's
     # variance control for long ones.
     parser.add_argument("--gae-lambda-alpha", type=float, default=0.05)
+    # A fixed actor lambda replaces the length-adaptive rule for the actor's
+    # advantages; critic targets stay lambda-1 returns. Token-level
+    # Delightful PG needs each token's advantage to be its own, which over a
+    # calibrated critic is lambda 0 (core.actor_gae_lambdas).
+    parser.add_argument("--actor-gae-lambda", type=float, default=None)
     parser.add_argument(
         "--nearby-reward-max",
         type=float,
@@ -367,8 +431,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bench-max-tokens", type=int, default=None)
     # Batch multiple problem groups into the same left-padded GPU rollout.
     # This is a trajectory rather than prompt count so avg@8 and avg@32 use
-    # comparable memory; replay-free eval storage makes 128 rows practical.
-    parser.add_argument("--eval-batch-trajectories", type=int, default=128)
+    # comparable memory. Under pinned EMIT the panels decode through a graph
+    # arena of this many rows whose workspace exists only during an eval
+    # rollout, so a whole 960-sample AIME panel is one rollout: its ~2k-step
+    # tail is paid once instead of once per 128-row chunk.
+    parser.add_argument("--eval-batch-trajectories", type=int, default=1024)
     parser.add_argument(
         "--eval-tail-batch", type=int, default=16,
         help="single compiled survivor-batch size (0 disables compaction)",
@@ -376,7 +443,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rollout-tail-batch", type=int, default=16,
         help="single compiled training survivor-batch size "
-        "(0 disables compaction)",
+        "(0 disables compaction); latent lockstep only",
     )
     # Compile the dynamic-prefix one-token model step used only by eval.
     # Static full-cache CUDA graphs are intentionally avoided: measured
@@ -497,13 +564,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--replay-attention-budget", type=int, default=16 * 1024 * 1024
     )
-    # Bounds the LINEAR per-shard memory term: slots x 50257-wide emit
-    # logits (plus their autograd-retained log-softmax, ~6 bytes/element in
-    # the update path). 24576 slots ~= 7.4 GiB retained per shard worst
-    # case (every slot an action); realistic emit fractions retain ~half.
-    # Without this, raising --replay-attention-budget lets short-L shards
-    # grow their slot count unboundedly and the vocabulary head OOMs
-    # before attention.
+    # Bounds the LINEAR per-shard memory term: trunk activations plus the
+    # fused readout's retained bf16 emit logits (2 bytes/element). Measured
+    # on KDA8 (NOTES 2026-09-25): the update peaks at ~7.1 GiB here and
+    # ~18 GiB at 3x with the attention budget lifted, with no update-time
+    # gain from the fewer, larger shards. Without this, raising
+    # --replay-attention-budget lets short-L shards grow their slot count
+    # unboundedly.
     parser.add_argument("--replay-slot-budget", type=int, default=24576)
     # A chunk decodes at its longest row's length, so rows that finished
     # early keep stepping until the batch is narrowed. Compaction can only
@@ -517,7 +584,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rollout-compact-dead-ratio", type=float, default=0.25,
         help="compact once this fraction of the current rollout width has "
-        "finished (lower = compact sooner, more KV cache copies)",
+        "finished (lower = compact sooner, more KV cache copies); latent "
+        "lockstep only -- the cot/none/carry graph arena compacts whenever "
+        "survivors fit a smaller row bucket",
     )
     parser.add_argument(
         "--post-update-kl-every",
@@ -545,6 +614,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rollout-only", action="store_true")
     parser.add_argument(
+        "--gate-transcripts", action="store_true",
+        help="save every frozen-policy gate response and verifier verdict as JSONL",
+    )
+    parser.add_argument(
         "--rollout-only-repeats",
         type=int,
         default=1,
@@ -557,6 +630,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--actor-init", default=None,
         help="initialize only the actor from a latent-VAPO checkpoint, while "
         "resetting critic/optimizers and continuing its unused prompt stream",
+    )
+    parser.add_argument(
+        "--critic-only-init", default=None,
+        help="load only trained critic weights; actor comes from --checkpoint, "
+        "with fresh optimizers, RNG, and prompt stream (requires zero warmup)",
     )
     parser.add_argument(
         "--actor-critic-init", default=None,
@@ -680,6 +758,11 @@ def validate_args(
 ) -> None:
     """Argv-level guards that need no checkpoint. Backbone-dependent
     checks stay in main() because they need the loaded model."""
+    if args.eval_context_tokens is not None:
+        if args.eval_context_tokens < 1:
+            parser.error("--eval-context-tokens must be positive")
+        if not (args.rollout_only or args.bench_only):
+            parser.error("--eval-context-tokens requires --rollout-only or --bench-only")
     # TPO is an explicit replacement for the default DG estimator. Resolve
     # that precedence once so every downstream objective/schema check sees
     # exactly one actor mode, while ordinary invocations retain the shipped
@@ -788,6 +871,8 @@ def validate_args(
         parser.error("--reset-optimizers-on-resume requires --resume")
     if args.allow_dg_topology_migration and not args.resume:
         parser.error("--allow-dg-topology-migration requires --resume")
+    if args.allow_token_rng_migration and not args.resume:
+        parser.error("--allow-token-rng-migration requires --resume")
     if (
         not math.isfinite(args.nearby_reward_max)
         or args.nearby_reward_max < 0.0
@@ -833,6 +918,21 @@ def validate_args(
         parser.error("--eval-tail-batch must be nonnegative")
     if args.rollout_tail_batch < 0:
         parser.error("--rollout-tail-batch must be nonnegative")
+    if mode_pins_emit(args.reasoning_mode) and args.rollout_scheduler == "lockstep":
+        # Token-only lockstep modes decode through graph_decode's arena,
+        # which buckets rows and KV width itself; these flags configure the
+        # eager loop that only latent still runs, and would be silently inert.
+        for flag, value in (
+            ("--rollout-flex-decode", args.rollout_flex_decode),
+            ("--rollout-graph-decode", args.rollout_graph_decode),
+            ("--rollout-tail-graph", args.rollout_tail_graph),
+        ):
+            if value:
+                parser.error(
+                    f"{flag} configures the latent lockstep decode loop; "
+                    f"--reasoning-mode {args.reasoning_mode} decodes through "
+                    "the CUDA-graph arena"
+                )
     if args.rollout_tail_graph and args.rollout_tail_batch < 1:
         parser.error("--rollout-tail-graph requires --rollout-tail-batch >= 1")
     if args.rollout_flex_decode and not args.rollout_compile:
@@ -913,8 +1013,6 @@ def validate_args(
         parser.error("--prompts-per-rollout must be positive")
     if args.rl_mixture_manifest and args.exclude_modules:
         parser.error("--exclude-modules is not supported with an RL mixture")
-    if args.rl_mixture_manifest and args.consume_all_prompts:
-        parser.error("--consume-all-prompts is not defined for cyclic mixtures")
     if args.prompts_per_minibatch < 1:
         parser.error("--prompts-per-minibatch must be positive")
     if args.prompts_per_rollout % args.prompts_per_minibatch:
@@ -934,8 +1032,12 @@ def validate_args(
         parser.error("--ppo-epochs must be 1; trajectory reuse is disabled")
     if args.bpb_val_tokens < 0:
         parser.error("--bpb-val-tokens must be nonnegative")
+    if args.randomize_choice_options is None:
+        args.randomize_choice_options = not args.rollout_only
     if args.rollout_only_repeats < 1:
         parser.error("--rollout-only-repeats must be positive")
+    if args.gate_transcripts and not args.rollout_only:
+        parser.error("--gate-transcripts requires --rollout-only")
     if args.rollout_only_repeats != 1 and not args.rollout_only:
         parser.error("--rollout-only-repeats requires --rollout-only")
     exclusive_modes = sum(
@@ -959,15 +1061,21 @@ def validate_args(
         for option in (
             args.actor_init,
             args.actor_critic_init,
+            args.critic_only_init,
             args.curriculum_init,
             args.resume,
         )
     )
     if initialization_modes > 1:
         parser.error(
-            "--actor-init, --actor-critic-init, --curriculum-init, and "
+            "--actor-init, --actor-critic-init, --critic-only-init, --curriculum-init, and "
             "--resume are mutually exclusive"
         )
+    if args.critic_only_init:
+        if args.value_warmup_steps != 0:
+            parser.error("--critic-only-init requires --value-warmup-steps 0")
+        if args.critic_init == "actor":
+            parser.error("--critic-init actor conflicts with --critic-only-init")
     if args.critic_init == "actor" and args.actor_critic_init:
         parser.error(
             "--critic-init actor conflicts with --actor-critic-init, which "
@@ -975,6 +1083,8 @@ def validate_args(
         )
     if args.samples_per_prompt < 1:
         parser.error("--samples-per-prompt must be positive")
+    if args.actor_gae_lambda is not None and not 0.0 <= args.actor_gae_lambda <= 1.0:
+        parser.error("--actor-gae-lambda must lie in [0, 1]")
     # Replay is token-normalized and memory-sharded, so trajectory batch size
     # is an actual optimization choice rather than a shape invariant. The
     # selected DG regime uses 24 x 16 = 384 fresh trajectories per update.

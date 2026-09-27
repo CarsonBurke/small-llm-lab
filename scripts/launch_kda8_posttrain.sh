@@ -8,8 +8,9 @@
 #   GPT-2 padded vocab 50304, KDA mixers on layers 0-2/4-6 with full
 #   attention on 3 and 7, train_seq_len 1024.
 #
-# Stage 1 runs at --seq-len 5120 as of 2026-09-21; stage 2 still splits a
-# 1024-token window as 256 prompt + 768 response. The extension is deliberate
+# Stage 1 runs at --seq-len 5120 as of 2026-09-21. Stage 2 now requests
+# 256 prompt + 2048 response tokens; its older base therefore runs beyond
+# its 1024-token trained window, recorded in the run manifest. SFT extension is deliberate
 # and measured, not a default: UltraData's think split is reasoning traces,
 # and at 1024 only 36.6% of its math traces and 3.3% of its code traces fit,
 # against 71.0% and 33.4% at 5120. Layers 3 and 7 carry half-truncate RoPE
@@ -65,18 +66,15 @@
 # hash-bound to its base's corpus; a mismatch fails the run instead of
 # drifting it.
 #
-# That binding is why the mixture is v10: its sources and quotas are
-# byte-identical to v9, which stays bound to the job 9040 corpus
-# (sft_mix_omi2_drills_v2) and remains correct for that checkpoint. v10
-# differs only in sft_corpus/sft_corpus_sha256, pointing at the 5120-token
-# corpus below. v9 against this stage 1 checkpoint is refused at startup.
-#
-# The mixture weighting dates from v8: reweighted by measured learnability,
-# not by source size. v7 gave dapo 28/64 of every pool and DeepMind interpolate
-# 20/64 -- the two sources a frozen-policy gate scored at 0.20% and 0.00% --
-# so 87% of every rollout pool sat on prompts whose groups are uniformly
-# wrong. VAPO's advantage is group-relative, so a uniformly wrong group
-# contributes exactly no policy gradient.
+# The mixture is v12_exact (schema vapo_verifiable_mixture/v2, 2026-09-23):
+# deepmind_easy + the full UltraData Math pool (v5, 19,765) + DAPO deduplicated
+# against it (8,408), 99,917 prompts with no quotas. One mixture cycle serves
+# every prompt exactly once, sources interleaved by size, so no source loops
+# faster than another. The earlier v8/v9 quotas (48/8/8 per 64) reran the
+# 2,306-prompt ultradata pool ~31 times per pass over deepmind_easy.
+# The manifest is bound to the job 9040 corpus (sft_mix_omi2_drills_v2); a
+# stage 1 checkpoint from any other corpus is refused at startup and needs a
+# manifest rebuilt against its corpus.
 #
 # v8 leads with deepmind_easy: the train-easy tier of the same 18 modules,
 # a disjoint training split at markedly easier surface difficulty (compare
@@ -102,16 +100,15 @@ SUFFIX="${2:-}"
 BASE=logs/nanogpt_gpt2_kda8_kkkdkkkd_triton_mbs32_optimized_2k_final_model.pt
 TRACES=postraining/data/sft_mix_ud2605_omi2_drills_v2.parquet
 # Stage 2 starts from job 9040's checkpoint, not this script's stage 1, with
-# the v9 mixture that is hash-bound to its corpus. The 5120-token stage 1
+# the v12_exact mixture that is hash-bound to its corpus. The 5120-token stage 1
 # lost on every matched panel (2026-09-22): arithmetic probe 0.368 vs 0.516
 # over 1920 items (lower on 13 of 15 families, format and termination
 # unchanged), DeepMind interpolate 0.005 vs 0.018 with 550 vs 375 mean
 # emitted tokens. Its corpus cut drills from 28% to 6.8% of tokens, and two
 # thirds of it is 1.8k-2.5k-token think traces that the policy imitates
-# into a 768-token RL budget. v10 stays bound to that corpus if a later
-# stage 1 is chosen instead.
+# into a 768-token RL budget.
 RL_BASE_RUN=kda8_sft_omi2_drills_e1
-MIXTURE=postraining/data/vapo_broad_v9_bare.manifest.json
+MIXTURE=postraining/data/vapo_broad_v12_exact.manifest.json
 # _r2: the first attempt (kda8_sft_ud2605_5k_v2_e1, job 9132) was cancelled
 # at step 1,161 to optimize the step; its CANCELLED.md explains why.
 SFT_RUN="kda8_sft_ud2605_5k_v2_e1_r2${SUFFIX}"
@@ -119,7 +116,7 @@ RL_RUN="kda8_vapo_cot_v9${SUFFIX}"
 RL_CARRY_RUN="kda8_vapo_carry_v9${SUFFIX}"
 # AFTER_SUCCESS=<job id> holds the submission until that mlq job succeeds,
 # e.g. the CUDA tests gating a trainer change.
-QUEUE_ARGS=(--cwd "$PWD" --max-parallel-runs 1)
+QUEUE_ARGS=(--cwd "$PWD" --max-parallel-runs 1 --priority 1)
 if [ -n "${AFTER_SUCCESS:-}" ]; then
   QUEUE_ARGS+=(--after-success "$AFTER_SUCCESS")
 fi
@@ -188,22 +185,20 @@ rl | rl-carry)
   # --checkpoint-interval-seconds 300: the rolling exact-recovery checkpoint
   # at the trainer's floor, so a stop loses at most five minutes. Resume
   # with --resume on the run's latent_vapo_checkpoint.pt.
-  # --bench-max-tokens/--aime-max-tokens must be set explicitly: they do NOT
-  # follow --continuation-tokens. Left unset they resolve to
-  # min(1024, (context - 512) // 2), computed from the DEFAULT 512-token
-  # prompt, which is 256 here. The evaluations would then truncate every
-  # response at 256 tokens mid-reasoning while training generated 768, so the
-  # answer span is never emitted and held-out accuracy reads as ~0 for a
-  # reason that has nothing to do with the policy.
+  # All generated-response budgets are 2048 tokens. Benchmark/AIME defaults
+  # now inherit the rollout budget; explicit values here make launches legible.
+  # The runtime context expands to 256 + 2048 = 2304 tokens while preserving
+  # the checkpoint's actual 1024-token training metadata.
   #
   # 64 prompts, not the default 24: only mixed groups carry within-group
-  # advantage signal, and the SFT gate measured 39.84% mixed prompts. 64 is
-  # also the v9/v10 mixture's cycle length -- rollout_window_source_quotas refuses
-  # a window wider than the cycle -- so it is the most groups one frozen pool
-  # can hold. The default DG estimator requires --prompts-per-minibatch to
-  # equal --prompts-per-rollout, so both move together and one pool still
-  # produces exactly one update.
+  # advantage signal, and the SFT gate measured 39.84% mixed prompts.
+  # --prompts-per-minibatch equals --prompts-per-rollout, so one pool
+  # produces exactly one update at behavior age 0, which lets the update
+  # derive its behavior statistics from its own forward instead of a
+  # separate refresh pass.
   #
+  # Throughput/memory measurements below used the historical 768-token cap;
+  # the new 2048-token training configuration has not been benchmarked.
   # --rollout-groups 64 (default 32) makes that pool ONE 1024-row decode wave
   # instead of two 512-row waves. Measured on the RTX 5090 at 4 repeats per
   # config with the warmup repeat discarded (job 9086): 512 rows ~88k tok/s,
@@ -211,9 +206,13 @@ rl | rl-carry)
   # rows is the knee -- 6.3 GB peak, leaving room for actor, critic and
   # optimizer state.
   #
-  # The decode flags stay at their defaults. --rollout-flex-decode measured
-  # ~93k against the default ~113k (a regression, and a 93 s compile), and
-  # --rollout-tail-graph was indistinguishable from the default once warm.
+  # cot and carry decode through graph_decode's CUDA-graph arena (fused
+  # Triton KDA step, live-range decode attention); the --rollout-flex-decode,
+  # --rollout-graph-decode and --rollout-tail-graph flags configure only the
+  # latent loop and are refused here. The arena measured ~160k useful tok/s
+  # against the eager loop's ~92k on this pool shape (NOTES 2026-09-25). Its
+  # full-width caches (5.2 GiB at 1024 rows) raise the rollout peak to
+  # ~7.7 GB and are freed before the update.
   # --rollout-scheduler continuous_refill raises lane utilization to 0.83 from
   # 0.45 but collects in 258 s against ~3 s, so it is not viable here.
   # Single-repeat rollout benchmarks are warmup-dominated and misleading: the
@@ -241,14 +240,16 @@ rl | rl-carry)
     --checkpoint-interval-seconds 300 \
     --rl-mixture-manifest "$MIXTURE" \
     --reasoning-mode "$MODE" \
+    --no-delightful-policy-gradient \
     --think-tokens \
     --answer-fence \
     --prompt-tokens 256 \
-    --continuation-tokens 768 \
-    --bench-max-tokens 768 \
-    --aime-max-tokens 768 \
+    --continuation-tokens 2048 \
+    --bench-max-tokens 2048 \
+    --aime-max-tokens 2048 \
     --answer-tokens 24 \
-    --steps 40000 \
+    --steps 950 \
+    --value-warmup-steps 50 \
     --prompts-per-rollout 64 \
     --prompts-per-minibatch 64 \
     --samples-per-prompt 16 \

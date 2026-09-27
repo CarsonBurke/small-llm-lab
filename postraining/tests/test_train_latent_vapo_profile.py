@@ -786,3 +786,14 @@ def test_graph_decode_scheduler_gating() -> None:
     parser, args = _parse("--rollout-graph-decode")
     with pytest.raises(SystemExit):
         validate_args(parser, args)
+
+
+def test_constructing_the_profiler_leaves_a_fresh_output_empty(tmp_path) -> None:
+    """The trainer builds the profiler before refusing nonempty fresh output,
+    so construction must not create the profile directory."""
+    output = tmp_path / "run"
+    output.mkdir()
+    profiler = RunProfiler(output, torch.device("cpu"), _profile_args())
+    assert not any(output.iterdir())
+    profiler.close()
+    assert (output / "profile" / "profile_summary.json").exists()

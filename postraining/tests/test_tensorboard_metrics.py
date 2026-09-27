@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 import math
 from types import SimpleNamespace
 
@@ -59,29 +58,56 @@ def test_optimizer_minibatch_orders_allow_one_shuffled_terminal_partial() -> Non
     )
 
 
-def test_stratified_optimizer_minibatches_preserve_every_source_quota() -> None:
-    source_quotas = [28, 20, 8, 8]
-    groups = []
-    for source_id, quota in enumerate(source_quotas):
-        groups.extend(
-            SimpleNamespace(
-                kind=torch.zeros(16, 1),
-                source_id=torch.full((16,), source_id, dtype=torch.long),
-            )
-            for _ in range(quota)
+def _source_groups(counts: list[int]) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            kind=torch.zeros(16, 1),
+            source_id=torch.full((16,), source_id, dtype=torch.long),
         )
+        for source_id, count in enumerate(counts)
+        for _ in range(count)
+    ]
+
+
+def test_stratified_optimizer_minibatches_mirror_the_pool_composition() -> None:
+    # An exact-pass window: shares follow corpus size, not a divisible quota.
+    counts = [50, 1, 13]
+    groups = _source_groups(counts)
     batches = stratified_optimizer_minibatch_orders(
-        groups, 16, source_quotas, torch.Generator().manual_seed(9)
+        groups, 16, len(counts), torch.Generator().manual_seed(9)
     )
-    assert len(batches) == 4
-    for batch in batches:
-        assert Counter(int(groups[index].source_id[0]) for index in batch) == {
-            0: 7,
-            1: 5,
-            2: 2,
-            3: 2,
-        }
+    assert [len(batch) for batch in batches] == [16] * 4
     assert sorted(index for batch in batches for index in batch) == list(range(64))
+    for source_id, count in enumerate(counts):
+        per_batch = [
+            sum(int(groups[index].source_id[0]) == source_id for index in batch)
+            for batch in batches
+        ]
+        assert sum(per_batch) == count
+        assert max(per_batch) - min(per_batch) <= 1
+    assert batches == stratified_optimizer_minibatch_orders(
+        groups, 16, len(counts), torch.Generator().manual_seed(9)
+    )
+    with pytest.raises(ValueError, match="complete minibatches"):
+        stratified_optimizer_minibatch_orders(groups[:63], 16, len(counts))
+    with pytest.raises(ValueError, match="unknown source id"):
+        stratified_optimizer_minibatch_orders(groups, 16, 2)
+
+
+def test_stratified_optimizer_minibatches_allow_one_terminal_partial() -> None:
+    groups = _source_groups([30, 3, 7])
+    batches = stratified_optimizer_minibatch_orders(
+        groups,
+        16,
+        3,
+        torch.Generator().manual_seed(4),
+        allow_partial_final=True,
+    )
+    assert sorted(len(batch) for batch in batches) == [8, 16, 16]
+    assert sorted(index for batch in batches for index in batch) == list(range(40))
+    for batch in batches:
+        share = sum(int(groups[index].source_id[0]) == 0 for index in batch)
+        assert abs(share - len(batch) * 30 / 40) < 2
 
 
 def test_source_actor_mask_is_disabled_by_default_and_opt_in() -> None:
@@ -604,3 +630,91 @@ def test_resume_keeps_the_recorded_critic_init_and_refuses_a_contradiction() -> 
     assert resolve_critic_init_provenance(resumed, None, chained)[
         "init"
     ] == "actor_copy"
+
+
+def test_credit_assignment_checks_pool_groups_exactly() -> None:
+    from types import SimpleNamespace
+
+    from postraining.train_latent_vapo import (
+        credit_assignment_dashboard,
+        credit_assignment_moments,
+    )
+
+    generator = torch.Generator().manual_seed(11)
+
+    def batch(rows: int):
+        mask = torch.ones(rows, 5)
+        rewards = torch.zeros(rows, 5)
+        reward_scalar = (torch.rand(rows, generator=generator) < 0.3).float()
+        rewards[:, -1] = reward_scalar
+        return SimpleNamespace(
+            action_mask=mask,
+            emit_mask=mask,
+            rewards=rewards,
+            reward_scalar=reward_scalar,
+            old_values=torch.rand(rows, 5, generator=generator) * 0.3,
+            old_token_logprobs=-torch.rand(rows, 5, generator=generator) * 4,
+        )
+
+    groups = [batch(7), batch(9)]
+    metrics, td0, mc, advantage, surprisal = [], [], [], [], []
+    for group in groups:
+        # A source gate zeroes some rows' advantages; they must not enter the
+        # failed-row correlation as (0, surprisal) points.
+        signal = (torch.rand(len(group.rewards), generator=generator) < 0.7).float()
+        advantages = torch.randn(group.rewards.shape, generator=generator) * signal[:, None]
+        # Lambda-1, gamma-1 return: the sum of this and later rewards.
+        value_targets = torch.flip(torch.flip(group.rewards, [1]).cumsum(1), [1])
+        metrics.append(
+            {
+                key: float(value)
+                for key, value in credit_assignment_moments(
+                    group, advantages, value_targets, signal
+                ).items()
+            }
+        )
+        next_values = torch.cat((group.old_values[:, 1:], torch.zeros(len(group.rewards), 1)), 1)
+        # Non-terminal slots only: the last action's residuals coincide.
+        td0.append((group.rewards + next_values - group.old_values)[:, :-1].flatten())
+        mc.append((value_targets - group.old_values)[:, :-1].flatten())
+        failed = (group.reward_scalar <= 0) & (signal > 0)
+        advantage.append(advantages[failed].flatten())
+        surprisal.append(-group.old_token_logprobs[failed].flatten())
+    td0, mc = torch.cat(td0).double(), torch.cat(mc).double()
+    advantage, surprisal = torch.cat(advantage).double(), torch.cat(surprisal).double()
+    slope = ((td0 - td0.mean()) * (mc - mc.mean())).mean() / td0.var(unbiased=False)
+    correlation = torch.corrcoef(torch.stack((advantage, surprisal)))[0, 1]
+
+    dashboard = credit_assignment_dashboard(metrics)
+    assert dashboard["credit/td0_calibration_slope"] == pytest.approx(float(slope))
+    assert dashboard["credit/failed_advantage_surprisal_corr"] == pytest.approx(
+        float(correlation)
+    )
+
+    # No trained failed rows: the correlation is undefined and omitted.
+    group = groups[0]
+    moments = credit_assignment_moments(
+        group,
+        torch.randn(group.rewards.shape, generator=generator),
+        torch.flip(torch.flip(group.rewards, [1]).cumsum(1), [1]),
+        torch.zeros(len(group.rewards)),
+    )
+    dashboard = credit_assignment_dashboard([{k: float(v) for k, v in moments.items()}])
+    assert "credit/failed_advantage_surprisal_corr" not in dashboard
+    assert "credit/td0_calibration_slope" in dashboard
+
+
+def test_resume_contract_binds_the_actor_gae_lambda() -> None:
+    assert "actor_gae_lambda" in RESUME_EXACT_ARG_FIELDS
+
+
+@pytest.mark.parametrize("field", ["resolved_train_max_new_tokens", "resolved_train_max_stream_steps"])
+def test_exact_resume_rejects_changed_effective_rollout_budget(field):
+    saved = {name: 1 for name in RESUME_EXACT_ARG_FIELDS}
+    saved.update(prompts_per_rollout=16, prompts_per_minibatch=16,
+                 resolved_train_max_new_tokens=1024, resolved_train_max_stream_steps=2048)
+    current = SimpleNamespace(**saved)
+    validate_resume_arg_contract(saved, current)
+    setattr(current, field, getattr(current, field) * 2)
+    with pytest.raises(ValueError, match=field):
+        validate_resume_arg_contract(saved, current)

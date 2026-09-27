@@ -13,18 +13,21 @@ from postraining.core import (
     POSTTRAIN_RESPONSE_TOKENS,
     POSTTRAIN_STREAM_TOKENS,
     JsonlLogger,
+    actor_gae_lambdas,
     answer_style,
     clipped_policy_loss,
     deterministic_math_subset,
     encode_prompt,
     generalized_advantage_and_return_targets,
     generalized_advantage_estimate,
+    graded_answer_field,
     length_adaptive_lambda,
     modal_answer_baseline,
     module_answer_baselines,
     nearby_numeric_reward,
     normalize_final_answer,
     parse_numeric_answer,
+    temporal_difference_residuals,
     top_p_sample,
     validate_posttraining_context_budget,
     verify_answer,
@@ -195,10 +198,14 @@ def test_exact_style_grades_the_canonical_answer_string_only():
     assert verify_answer("Answer: a b", "b", "exact")[0] is False
     assert verify_answer("Answer: a b", "b", "minerva")[0] is True
     assert verify_answer("Answer: x = 5", "5", "exact")[0] is False
-    assert verify_answer("Answer: x = 5", "5", "minerva")[0] is False
+    # Minerva grades the value a single named equation states.
+    assert verify_answer("Answer: x = 5", "5", "minerva")[0] is True
     assert verify_answer("Answer: $2$ and $3$", "2", "exact")[0] is False
     assert verify_answer("Answer: 7, 6, 2, 2, 2, 1, 5", "762, 22, 15", "exact")[0] is False
-    assert verify_answer("Answer: 7, 6, 2, 2, 2, 1, 5", "762, 22, 15", "minerva")[0] is True
+    # Minerva deletes spaces, but commas collapse only as thousands grouping.
+    assert verify_answer("Answer: 7, 6, 2, 2, 2, 1, 5", "762, 22, 15", "minerva")[0] is False
+    assert verify_answer("Answer: 1,234", "1234", "minerva")[0] is True
+    assert verify_answer("Answer: 1, 234", "1234", "minerva")[0] is False
     # Booleans keep the canonical case.
     assert verify_answer("Answer: true", "True", "exact")[0] is False
     # Only the LAST Answer: line is graded — spamming candidates never
@@ -307,6 +314,102 @@ def test_combined_advantage_and_return_targets_match_two_gaes(gamma):
 def test_official_verifier_edge_normalization():
     assert normalize_final_answer(r"42\text{ minutes}") == "42"
     assert normalize_final_answer("7 childrentickets") == "7"
+
+
+@pytest.mark.parametrize(
+    ("prediction", "truth"),
+    [
+        (r"\frac{1}{8}", r"\dfrac{1}{8}"),
+        ("1/8", r"\dfrac{1}{8}"),
+        (r"\frac{5}{3}", r"\tfrac{5}{3}"),
+        ("-1/27", r"-\frac{1}{27}"),
+        (r"\frac{\sqrt{2}}{4}", r"\dfrac{\sqrt{2}}{4}"),
+        ("5183", r"\[ 5183 \]"),
+        (r"\( 782 \)", "782"),
+        ("197", r"\[\boxed{N=197}\]"),
+        (r"\boxed{y=\sqrt{2}}", r"\sqrt{2}"),
+        (r"\boxed{x=5}", "5"),
+        ("n = 25", "25"),
+        (r"x = \dfrac{1}{3}", r"\frac{1}{3}"),
+        (r"- \frac{1}{2}", r"-\frac{1}{2}"),
+        (r"-\frac12", r"-\dfrac{1}{2}"),
+        ("1/8", r"\dfrac{1}{8}"),
+        ("170", r"$\boxed{a=170}$"),
+        ("5183", r"x = \[5183\]"),
+        (r"\frac{7}{5}", r"\frac {7}{5}"),
+        (r"\sum_{k=1}^{100}\frac{1}{2k-1}", r"\sum_{k=1}^{100} \frac{1}{2k-1}"),
+        ("0", "a_{-1} = 0"),
+        ("5", "$5.$"),
+        (r"(\frac{2}{3}, 6)", r"\left( \dfrac{2}{3}, 6 \right)"),
+        (r"\{\frac{1}{2}\}", r"\left\{\dfrac{1}{2}\right\}"),
+        (r"\boxed{\frac{127}{924}}", r"$\frac{127}{924}$"),
+    ],
+)
+def test_minerva_grading_folds_typesetting_variants(prediction, truth):
+    assert verify_answer(f"Answer: {prediction}", truth, window=None)[0]
+
+
+@pytest.mark.parametrize(
+    ("prediction", "truth"),
+    [
+        # Values stay strict: unreduced, decimal and sign-flipped forms differ.
+        ("2/16", r"\frac{1}{8}"),
+        ("0.125", r"\dfrac{1}{8}"),
+        ("1/8", r"-\frac{1}{8}"),
+        # Only a wrapper spanning the whole answer is removed.
+        (r"\boxed{3} + \boxed{4}", "7"),
+        # \rightarrow is a command of its own, not \right sizing.
+        (r"a \rightarrow b", "ab"),
+        # A numeric truth still requires a single parseable number.
+        (r"\[ 3, 4 \]", "34"),
+        # Comma lists never collapse into a number, even against an
+        # ``=``-headed or wrapped truth.
+        ("2, 5", "n = 25"),
+        ("19,7", r"\[\boxed{N=197}\]"),
+        ("1, 9, 7", "197"),
+        # Several equations state no single value.
+        ("a = 7, b = 3", "3"),
+        # Digits joined only by whitespace are never one number.
+        ("4 0", r"40^\circ"),
+        ("1 008 016", r"1{,}008{,}016"),
+        # A decimal is still not the integer it rounds to.
+        ("5.00", "5"),
+        # Leading zeros are digits of "the last four digits" answers.
+        ("352", "0352"),
+    ],
+)
+def test_minerva_grading_keeps_distinct_answers_distinct(prediction, truth):
+    assert not verify_answer(f"Answer: {prediction}", truth, window=None)[0]
+
+
+def test_numeric_parse_accepts_wrappers_and_fraction_commands():
+    assert parse_numeric_answer(r"\dfrac{1}{8}") == Fraction(1, 8)
+    assert parse_numeric_answer(r"-\tfrac{3}{4}") == Fraction(-3, 4)
+    assert parse_numeric_answer(r"\[ 5183 \]") == 5183
+    assert parse_numeric_answer(r"\boxed{$\frac{1}{2}$}") == Fraction(1, 2)
+    assert parse_numeric_answer(r"\boxed{1} + \boxed{2}") is None
+    assert parse_numeric_answer(r"\[ 1 \] \[ 2 \]") is None
+    assert parse_numeric_answer(r"- \frac{1}{2}") == Fraction(-1, 2)
+    assert parse_numeric_answer(r"\frac{ 3 }{ 4 }") == Fraction(3, 4)
+    assert parse_numeric_answer(r"\frac34") == Fraction(3, 4)
+    assert parse_numeric_answer("1 / 2") == Fraction(1, 2)
+    assert parse_numeric_answer("- -5") is None
+    assert parse_numeric_answer("--5") is None
+    assert parse_numeric_answer("1 2") is None
+
+
+def test_graded_answer_field_reads_one_named_value():
+    assert graded_answer_field("n = 25") == "25"
+    assert graded_answer_field(r"\boxed{f(x) = x^2}") == "x^2"
+    assert graded_answer_field(r"$\theta = \frac{\pi}{2}$") == r"\frac{\pi}{2}"
+    assert graded_answer_field("7") == "7"
+    assert graded_answer_field("x + 2y - 5 = 0") is None
+    assert graded_answer_field("a = b = c") is None
+    assert graded_answer_field("a = 7, b = 3") is None
+    assert graded_answer_field("x_{1} = 2") == "2"
+    assert graded_answer_field(r"\sum_{k=1}^{n} k") == r"\sum_{k=1}^{n} k"
+    assert graded_answer_field(r"S = \sum_{k=1}^{n} k") == r"\sum_{k=1}^{n} k"
+    assert graded_answer_field("a_{-1} = 0") == "0"
 
 
 def test_asymmetric_clipping_uses_token_mean():
@@ -541,3 +644,47 @@ def test_single_fence_span_array_path_matches_the_list_path():
         for fence in fences:
             assert single_fence_span(array, fence) == single_fence_span(tokens, fence)
         assert structural_format_ok(array, *fences) == structural_format_ok(tokens, *fences)
+
+
+def test_actor_gae_lambdas_fixed_overrides_length_adaptive():
+    lengths = torch.tensor([5, 768])
+    torch.testing.assert_close(
+        actor_gae_lambdas(lengths, 0.05), length_adaptive_lambda(lengths, 0.05)
+    )
+    torch.testing.assert_close(
+        actor_gae_lambdas(lengths, 0.05, 0.0), torch.zeros(2)
+    )
+
+
+def test_temporal_difference_residuals_equal_lambda_zero_gae():
+    generator = torch.Generator().manual_seed(5)
+    values = torch.rand(3, 6, generator=generator)
+    rewards = torch.zeros(3, 6)
+    rewards[:, 3] = torch.tensor([1.0, 0.0, 1.0])
+    mask = torch.zeros(3, 6)
+    mask[:, :4] = 1
+    advantages, _ = generalized_advantage_and_return_targets(
+        rewards, values, mask, torch.zeros(3)
+    )
+    torch.testing.assert_close(
+        temporal_difference_residuals(rewards, values, mask), advantages
+    )
+
+
+@pytest.mark.parametrize("answer", [
+    "1e999999999999", "1e-999999999999", "-2E+999999999999",
+    "1e999999999999 / 2", "1 / 2e-999999999999",
+])
+def test_numeric_parser_rejects_resource_exhausting_exponents_before_fraction(answer, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("oversized exponent must be rejected before Fraction construction")
+    monkeypatch.setattr("postraining.core.Fraction", forbidden)
+    assert parse_numeric_answer(answer) is None
+
+
+def test_numeric_parser_retains_bounded_scientific_notation():
+    assert parse_numeric_answer("1e4096") == 10 ** 4096
+    assert parse_numeric_answer("1e-4096") == Fraction(1, 10 ** 4096)
+    assert parse_numeric_answer("2e3 / 4e-2") == 50000
+    assert parse_numeric_answer("1e4097") is None
+    assert parse_numeric_answer("1e-4097") is None

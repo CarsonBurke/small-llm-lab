@@ -1517,6 +1517,7 @@ class LatentThoughtModel(nn.Module):
         position: int | Tensor,
         key_mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
+        key_starts: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor]:
         """The compiled policy surface: belief, Gaussian parameters, logits.
 
@@ -1530,8 +1531,13 @@ class LatentThoughtModel(nn.Module):
         ``block_mask`` (see ``DecodeRangeMask``) expresses the same constant
         shapes as a flex-decoding block table instead, which is what keeps the
         step off the memory-efficient SDPA kernel. One mask serves every layer.
+        ``key_starts`` states the same per-row range as its start alone (the
+        write head is ``position``) for ``ranged_decode_attention``.
         """
         backbone = self.backbone
+        # Passed only when set: the ranged path exists on the nano and KDA
+        # trunks alone, and any other backbone must refuse it loudly.
+        key_range = {} if key_starts is None else {"key_starts": key_starts}
         x = input_latent
         skips: list[Tensor] = []
         for i in range(backbone.num_encoder_layers):
@@ -1547,6 +1553,7 @@ class LatentThoughtModel(nn.Module):
                 position,
                 key_mask,
                 block_mask,
+                **key_range,
             )
             skips.append(x)
         for j in range(backbone.num_decoder_layers):
@@ -1561,6 +1568,7 @@ class LatentThoughtModel(nn.Module):
                 position,
                 key_mask,
                 block_mask,
+                **key_range,
             )
         belief = backbone.final_norm(x)
         predicted, thought_log_sigma = self.thought_parameters(

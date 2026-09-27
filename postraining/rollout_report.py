@@ -438,7 +438,7 @@ def _render_sample(sample: Mapping[str, Any]) -> str:
         raise ValueError(f"unknown sample label {label!r}")
     segments = sample.get("emitted_segments") or []
     fence_broken = _fence_pairs_broken(segments)
-    badges = [f'<span class="badge {label}">{label}</span>']
+    badges = []
     if sample.get("reward") is not None:
         badges.append(f'<span class="badge">reward {float(sample["reward"]):g}</span>')
     if sample.get("terminated") is not None:
@@ -451,19 +451,21 @@ def _render_sample(sample: Mapping[str, Any]) -> str:
         badges.append('<span class="badge incorrect">format gate failed</span>')
     if fence_broken:
         badges.append('<span class="badge incorrect">broken fences</span>')
-    stats = [f"<div><dt>Emitted tokens</dt><dd>{int(sample['emitted_token_count']):,}</dd></div>"]
+    stats = [f"<div><dt>Tokens</dt><dd>{int(sample['emitted_token_count']):,}</dd></div>"]
     if sample.get("group_size"):
         stats.append(
             "<div><dt>Group correct</dt><dd>"
             f"{int(sample['group_correct'])}/{int(sample['group_size'])}"
             f" · mean reward {float(sample['group_mean_reward']):.3f}</dd></div>"
         )
-    if sample.get("terminated") is not None:
-        stats.append(
-            "<div><dt>Parsed answer</dt><dd>"
-            + _esc(sample.get("parsed_answer") if sample.get("parsed_answer") is not None else "none")
-            + "</dd></div>"
-        )
+    parsed = sample.get("parsed_answer")
+    parsed_answer = (
+        '<div><dt>Parsed answer</dt><dd><code>'
+        + _esc(parsed if parsed is not None else "none")
+        + "</code></dd></div>"
+        if sample.get("terminated") is not None
+        else ""
+    )
     note = (
         '<p class="note">The saved sample omitted its middle; the original '
         "omission marker is preserved.</p>"
@@ -473,9 +475,9 @@ def _render_sample(sample: Mapping[str, Any]) -> str:
     return f"""
         <article class="attempt {label}">
           <header><h3>{label.capitalize()}</h3><div class="badges">{''.join(badges)}</div></header>
-          <details class="prompt"><summary>Prompt</summary><pre>{_esc(sample['prompt'])}</pre></details>
-          <p class="truth">Ground truth: <code>{_esc(sample['ground_truth'])}</code></p>
-          <div class="stream">{_render_stream(sample, tint=not fence_broken)}</div>
+          <dl class="answers"><div><dt>Expected answer</dt><dd><code>{_esc(sample['ground_truth'])}</code></dd></div>{parsed_answer}</dl>
+          <details class="prompt" open><summary>Prompt</summary><pre>{_esc(sample['prompt'])}</pre></details>
+          <div class="response"><h4>Model response</h4><div class="stream">{_render_stream(sample, tint=not fence_broken)}</div></div>
           <dl class="stats">{''.join(stats)}</dl>{note}
         </article>"""
 
@@ -559,10 +561,10 @@ def render_rollout_report(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Training rollouts · {_esc(run.name)}</title>
   <style>
-    :root {{ color-scheme: dark; --bg:#0b0e14; --panel:#141a26; --panel-2:#0d121c; --line:#293246; --text:#e8edf7; --muted:#94a2b8; --good:#47d18c; --bad:#ff6b7a; --accent:#82aaff; --think:#c4a7ff; --answer:#6fe3ae; --eos:#ffab70; --think-bg:#c4a7ff1f; --answer-bg:#47d18c1f; }}
+    :root {{ color-scheme: dark; --bg:#0b0e14; --panel:#151c29; --panel-2:#101620; --line:#303b50; --text:#e8edf7; --muted:#9ca9bc; --good:#47d18c; --bad:#ff7885; --accent:#a6c4ff; --think:#c4a7ff; --answer:#6fe3ae; --eos:#ffab70; --think-bg:#c4a7ff12; --answer-bg:#47d18c12; }}
     * {{ box-sizing:border-box; }}
     body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; overflow-wrap:anywhere; }}
-    main {{ width:min(1500px,calc(100% - 2rem)); margin:0 auto; padding:2.5rem 0 5rem; }}
+    main {{ width:min(1100px,calc(100% - 2rem)); margin:0 auto; padding:2.5rem 0 5rem; }}
     h1 {{ margin:0 0 .4rem; font-size:clamp(1.8rem,4vw,2.8rem); letter-spacing:-.03em; }}
     h2 {{ margin:2.2rem 0 1rem; font-size:1.5rem; }}
     h3 {{ display:flex; flex-wrap:wrap; align-items:baseline; gap:.3rem .8rem; margin:0 0 .7rem; font-size:1rem; }}
@@ -570,36 +572,47 @@ def render_rollout_report(
     nav {{ display:flex; flex-wrap:wrap; gap:.5rem; margin:1.2rem 0; }}
     nav a {{ color:var(--accent); padding:.3rem .7rem; border:1px solid var(--line); border-radius:8px; background:var(--panel); text-decoration:none; }}
     {STREAM_CSS}
-    .source {{ margin:1.2rem 0; padding:1rem; border:1px solid var(--line); border-radius:14px; background:var(--panel); }}
-    .attempt-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1rem; }}
-    .attempt {{ min-width:0; padding:1rem; border:1px solid var(--line); border-left:4px solid var(--bad); border-radius:12px; background:var(--panel-2); display:flex; flex-direction:column; gap:.6rem; }}
+    .guide {{ margin:0 0 1.5rem; }}
+    .guide > summary {{ font-size:.85rem; }}
+    .guide .legend {{ margin-top:.75rem; }}
+    .source {{ margin:1.6rem 0 2.5rem; }}
+    .source > h3 {{ padding-bottom:.6rem; border-bottom:1px solid var(--line); font-size:1.15rem; }}
+    .attempt-grid {{ display:grid; gap:1rem; }}
+    .attempt {{ min-width:0; padding:1.3rem 1.5rem; border:1px solid var(--line); border-left:4px solid var(--bad); border-radius:12px; background:var(--panel); }}
     .attempt.correct {{ border-left-color:var(--good); }}
-    .attempt header {{ display:flex; justify-content:space-between; align-items:flex-start; gap:.8rem; }}
-    .attempt h3 {{ margin:0; }}
+    .attempt header {{ display:flex; justify-content:space-between; align-items:center; gap:.8rem; margin-bottom:1rem; }}
+    .attempt h3 {{ margin:0; font-size:1.1rem; }}
     .badges {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:.35rem; }}
     .badge {{ padding:.14rem .46rem; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:.72rem; white-space:nowrap; }}
-    .badge.correct {{ border-color:#47d18c88; color:var(--good); }}
     .badge.incorrect {{ border-color:#ff6b7a88; color:var(--bad); }}
-    .truth {{ margin:0; }}
     code {{ color:#c3e88d; }}
     summary {{ cursor:pointer; color:var(--accent); font-weight:650; }}
-    pre {{ margin:.6rem 0 0; padding:.8rem; white-space:pre-wrap; overflow-wrap:anywhere; border-radius:9px; background:var(--bg); color:#d7deec; font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }}
-    .stats {{ display:flex; flex-wrap:wrap; gap:.4rem 1.4rem; margin:0; }}
+    pre {{ margin:.55rem 0 0; padding:1rem 1.15rem; white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:9px; background:var(--panel-2); color:var(--text); font:14px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; }}
+    .answers {{ display:flex; flex-wrap:wrap; gap:.7rem 2rem; margin:0 0 1.1rem; padding:.8rem 1rem; border-radius:9px; background:var(--panel-2); }}
+    .answers > div {{ min-width:8rem; }}
+    .answers dd {{ font-size:1.05rem; }}
+    .prompt {{ margin:0 0 1.2rem; }}
+    h4 {{ margin:0 0 .55rem; color:var(--muted); font-size:.75rem; font-weight:650; text-transform:uppercase; letter-spacing:.07em; }}
+    .response .stream {{ padding:1.1rem 1.2rem; border:1px solid var(--line); background:var(--panel-2); font-size:14px; line-height:1.7; }}
+    .response .tok {{ margin:0 .1rem; }}
+    .stats {{ display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; margin:1rem 0 0; padding-top:.8rem; border-top:1px solid var(--line); }}
     dt {{ color:var(--muted); font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; }}
     dd {{ margin:0; font-variant-numeric:tabular-nums; }}
     details.earlier {{ margin:1rem 0; padding:.8rem 1rem; border:1px solid var(--line); border-radius:12px; }}
     footer {{ margin-top:2rem; color:var(--muted); font-size:.85rem; }}
-    @media (max-width:850px) {{ .attempt-grid {{ grid-template-columns:1fr; }} }}
-    @media (max-width:500px) {{ main {{ width:calc(100% - 2rem); padding-top:1.5rem; }} .attempt header {{ display:block; }} .badges {{ justify-content:flex-start; margin-top:.5rem; }} }}
+    @media (max-width:500px) {{ main {{ width:calc(100% - 1.5rem); padding-top:1.5rem; }} .attempt {{ padding:1rem; }} .attempt header {{ display:block; }} .badges {{ justify-content:flex-start; margin-top:.5rem; }} .response .stream {{ padding:.8rem; }} }}
   </style>
 </head>
 <body>
 <main>
   <h1>Training rollouts</h1>
   <p class="subtitle">{_esc(run.name)} · snapshot {timestamp}</p>
-  <p class="note">Per source, one correct and one incorrect trajectory from the pool the policy collected after each step's updates, picked uniformly by a hash of (step, prompt, row) so reruns choose the same ones. These are training prompts, so this is not held-out accuracy. Correct means exact verifier reward 1; bounded numeric proximity counts as incorrect. The parsed answer is the verifier's own prediction for the graded field.</p>
+  <p class="note">Up to one correct and one incorrect training example per source and step. These samples do not measure held-out accuracy.</p>
   <nav aria-label="Captured steps">{nav}</nav>
-  {_LEGEND if any_segments else ''}
+  <details class="guide"><summary>How samples are selected and graded</summary>
+    <p class="note">Each sample is selected uniformly by a hash of (step, prompt, row), so reruns choose the same one. Correct means exact verifier reward 1; bounded numeric proximity counts as incorrect. The parsed answer is the verifier's prediction for the graded field.</p>
+    {_LEGEND if any_segments else ''}
+  </details>
   {sections}
   <footer>Static snapshot of {_esc(run)}. Refresh with <code>python -m postraining.rollout_report --run {_esc(run)}</code>.</footer>
 </main>

@@ -557,11 +557,21 @@ def verifiable_reward_identity() -> str:
         extract_code,
         core.normalize_final_answer,
         core.parse_numeric_answer,
+        core.unwrap_math_answer,
+        core.fold_fraction_commands,
+        core._closing_brace,
+        core._unwrap_dollars,
+        core._split_top_level_equals,
     ):
         digest.update(inspect.getsource(function).encode())
     digest.update(
         json.dumps(
-            [core.SUBSTITUTIONS, core.REMOVED_EXPRESSIONS], ensure_ascii=False
+            [
+                core.SUBSTITUTIONS,
+                core.REMOVED_EXPRESSIONS,
+                list(core._MATH_DELIMITERS),
+            ],
+            ensure_ascii=False,
         ).encode()
     )
     return f"{VERIFIABLE_TASK_SCHEMA}:{digest.hexdigest()}"

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
+from torch.library import wrap_triton
 import triton
 import triton.language as tl
 from transformers.cache_utils import Cache, StaticLayer
@@ -634,7 +635,9 @@ def w8a16_linear(
     def grid(meta):
         return (triton.cdiv(out_features, meta["BLOCK_N"]), rows)
 
-    torch.library.wrap_triton(cast(Any, _w8a16_linear_kernel))[grid](
+    # A bare kernel name: AOTAutograd's cache key finds triton_op kernels by
+    # that spelling, and misses one hidden behind a cast.
+    wrap_triton(_w8a16_linear_kernel)[grid](
         inputs,
         weight,
         weight_scale,

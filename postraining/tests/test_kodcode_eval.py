@@ -40,6 +40,7 @@ def test_last_submitted_block_wins_without_trying_each_candidate():
 def test_scoring_executes_hidden_edge_cases_and_rejects_process_exit():
     verification = {
         "schema": PYTHON_REWARD_SCHEMA,
+        "entry_points": ["identity"],
         "test_setup": [],
         "tests": ["assert identity(0) == 0", "assert identity(-3) == -3"],
     }

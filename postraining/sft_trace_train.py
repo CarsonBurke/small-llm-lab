@@ -68,7 +68,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 import train_gpt as baseline  # noqa: F401  (import order: patches must load first)
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
@@ -210,6 +209,14 @@ def load_documents(path: Path, allow_unverified: bool = False) -> list[dict]:
         raise ValueError(
             f"{path} holds no verified documents; pass --allow-unverified to "
             "train on a corpus whose solutions were not re-verified here"
+        )
+    if len(kept) < len(rows):
+        # A mixed-domain build marks only its sandbox-verified code rows
+        # verified; filtering would silently train on that slice alone.
+        raise ValueError(
+            f"{path} mixes {len(kept)} verified and {len(rows) - len(kept)} "
+            "unverified documents; pass --allow-unverified to train on all of "
+            "them, or build a corpus from the verified sources alone"
         )
     return kept
 
@@ -586,10 +593,13 @@ def device_batch(
 def readout_ce_sum(
     backbone, features: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
-    """Summed CE of the renderer's softcapped logits at the given features."""
+    """Summed CE of the renderer's softcapped logits at the given features.
+
+    The backbone's fused readout keeps only the bf16 readout GEMM output and
+    a logsumexp per position for backward, not the [N, V] fp32 logits.
+    """
     with torch.autocast(features.device.type, dtype=torch.bfloat16):
-        logits = backbone.logits_from_features(features)
-    return F.cross_entropy(logits.float(), labels, reduction="sum")
+        return -backbone.target_logprobs_from_features(features, labels).sum()
 
 
 class SupervisedCE:
@@ -1267,6 +1277,11 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     backbone = load_model(args.checkpoint, device)
+    if not hasattr(backbone, "target_logprobs_from_features"):
+        parser.error(
+            f"{type(backbone).__name__} has no fused target readout; SFT "
+            "trains the nano/KDA post-training backbones"
+        )
     context_tokens = backbone.train_context_tokens
     if args.seq_len is None:
         args.seq_len = context_tokens

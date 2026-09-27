@@ -9,6 +9,29 @@ EXECUTION_SCHEMA = (
     "unique_prefix_compact_tail_broad_mixture_forced_initial_think_"
     "one_way_stop_vector_sigma_isotropic_trajectory_position_rng/v29"
 )
+# Lockstep cot/none: tokens are the only actions, drawn by a counter-keyed
+# Gumbel race whose key is (pool seed, request, sample, stream slot) rather
+# than the global generator's position. That makes a trajectory's tokens
+# independent of batch shape and compaction, which is what lets the
+# CUDA-graph decode arena replay them; it also changes every sampled token
+# for a given seed, so v29 checkpoints of these modes cannot resume here.
+# v32 keys the slot within the trajectory's own unpadded stream instead of
+# the chunk's left-padded one, so the draws no longer depend on which prompts
+# share a chunk; every draw changes, so a v31 checkpoint resumes exactly only
+# under v31.
+TOKEN_EXECUTION_SCHEMA = (
+    "unique_prefix_bucketed_graph_decode_broad_mixture_pinned_emit_"
+    "counter_gumbel_request_row_slot_token_rng/v32"
+)
+# v31 differs from v32 only in the slot its draws are keyed on. Its policy,
+# critic, optimizer state and prompt cursor mean exactly what v32's do and it
+# carries no sampler state, so an explicitly acknowledged resume
+# (--allow-token-rng-migration) may continue a v31 run under v32: every later
+# draw is a v32 draw, and nothing earlier is replayed.
+PADDED_SLOT_TOKEN_EXECUTION_SCHEMA = (
+    "unique_prefix_bucketed_graph_decode_broad_mixture_pinned_emit_"
+    "counter_gumbel_request_slot_token_rng/v31"
+)
 CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX = (
     "+request_stable_gate_token_gaussian_refill_paged_flex/v3"
 )
@@ -27,22 +50,26 @@ DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
 TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA = (
     "target_policy_token_odds_plus_vapo_gate_gaussian/v7"
 )
+# The nano readout tail is one fused op (softcapped target log-prob with a
+# single-pass backward), so replay log-probs round differently from v4.
 REPLAY_NUMERICS_SCHEMA = (
-    "compact_emit_gate_raw_gaussian_next_slot_exact_replay/v4"
+    "compact_emit_gate_raw_gaussian_next_slot_fused_softcap_readout_"
+    "exact_replay/v5"
 )
 # Deterministic hidden carry (``--reasoning-mode carry``) restores the v28
 # contract on the v29 trainer: tokens are the only actions, and each generated
 # token's input adds the detached belief that produced it. It shares neither
 # stream semantics nor objective terms with the gate/Gaussian family above,
-# so every schema is its own string. Its tokens are drawn from the ordinary
-# generator lane exactly like cot, which is what makes a zero-init carry
+# so every schema is its own string. Its tokens are drawn by the same
+# counter-keyed race as lockstep cot, which is what makes a zero-init carry
 # rollout bitwise the cot rollout.
 CARRY_EXECUTION_SCHEMA = (
-    "unique_prefix_compact_tail_broad_mixture_deterministic_hidden_carry_"
-    "token_only_generator_token_rng/v30"
+    "unique_prefix_bucketed_graph_decode_broad_mixture_deterministic_"
+    "hidden_carry_token_only_counter_gumbel_request_row_slot_token_rng/v32"
 )
 CARRY_REPLAY_NUMERICS_SCHEMA = (
-    "compact_token_logprob_next_slot_hidden_carry_exact_replay/v5"
+    "compact_token_logprob_next_slot_hidden_carry_fused_softcap_readout_"
+    "exact_replay/v6"
 )
 CARRY_ACTOR_OBJECTIVE_SCHEMA = "vapo_token_clip_hidden_carry_token_denominator/v4"
 CARRY_DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
@@ -61,9 +88,12 @@ def execution_schema_for(
 ) -> str:
     """Execution schema for a reasoning mode under a rollout scheduler.
 
-    latent, cot, and none share the v29 string (its bytes are a resume
-    invariant of in-flight runs). Carry has no continuous-refill variant:
-    the paged scheduler does not implement the hidden carry.
+    Lockstep latent keeps the v29 string (its bytes are a resume invariant
+    of in-flight runs); lockstep cot/none decode through the graph arena
+    under ``TOKEN_EXECUTION_SCHEMA``. Continuous refill keeps its own
+    request-stable sampler for every non-carry mode. Carry has no
+    continuous-refill variant: the paged scheduler does not implement the
+    hidden carry.
     """
     if reasoning_mode == "carry":
         if rollout_scheduler != "lockstep":
@@ -74,7 +104,9 @@ def execution_schema_for(
     if reasoning_mode not in ("latent", "cot", "none"):
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
     if rollout_scheduler == "lockstep":
-        return EXECUTION_SCHEMA
+        return EXECUTION_SCHEMA if reasoning_mode == "latent" else (
+            TOKEN_EXECUTION_SCHEMA
+        )
     if rollout_scheduler == "continuous_refill":
         return EXECUTION_SCHEMA + CONTINUOUS_REFILL_EXECUTION_SCHEMA_SUFFIX
     raise ValueError(f"unknown rollout scheduler {rollout_scheduler!r}")
@@ -126,14 +158,27 @@ def actor_objective_schema(
 
 
 def resume_execution_schema_compatible(
-    payload: dict, *, expected_execution_schema: str
+    payload: dict,
+    *,
+    expected_execution_schema: str,
+    allow_token_rng_migration: bool = False,
 ) -> bool:
-    """Require the exact execution contract; there are no migrations.
+    """Require the exact execution contract, bar one acknowledged migration.
 
-    The v29 stream, RNG, and policy semantics are incompatible with the v28
-    deterministic-carry checkpoints, and the v30 carry contract with both.
+    The v29 latent stream, RNG, and policy semantics are incompatible with
+    the v28 deterministic-carry checkpoints, and the v32 counter-keyed token
+    contracts with both and with the generator-drawn v29/v30 cot and carry
+    runs they replace. The single migration is lockstep cot/none from the
+    padded-slot-keyed v31 draw to v32, and only when the caller allows it.
     """
-    return payload.get("execution_schema") == expected_execution_schema
+    saved = payload.get("execution_schema")
+    if saved == expected_execution_schema:
+        return True
+    return (
+        allow_token_rng_migration
+        and saved == PADDED_SLOT_TOKEN_EXECUTION_SCHEMA
+        and expected_execution_schema == TOKEN_EXECUTION_SCHEMA
+    )
 
 
 def resume_replay_schema_compatible(payload: dict, reasoning_mode: str) -> bool:

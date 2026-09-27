@@ -51,6 +51,7 @@ class NanoTrunk(TrunkAdapter):
             "embed_tokens",
             "temporal_belief_from_token_latent",
             "logits_from_features",
+            "target_logprobs_from_features",
             "make_generation_cache",
             "prefill_belief",
         ):

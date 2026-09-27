@@ -52,6 +52,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
+from postraining.decode_attention import ranged_decode_attention
 from pretraining.nanogpt_mini import nanogpt_mini_model
 
 NANO_DEFAULT_MODEL_CONFIG = {
@@ -81,6 +82,59 @@ class _PrefillAttentionLayout:
     @property
     def is_varlen(self) -> bool:
         return self.cu_seqlens is not None
+
+
+def rational_softcap(raw: Tensor, cap: float) -> Tensor:
+    """The pretraining logit softcap, ``cap * x / sqrt(x^2 + cap^2)``."""
+    return cap * raw * (raw.square() + cap**2).rsqrt()
+
+
+class SoftcappedTargetLogprobs(torch.autograd.Function):
+    """Target log-probabilities of rationally softcapped logits.
+
+    Only one scalar per row of a (rows, vocab) readout is consumed, but the
+    composed autograd graph of softcap -> fp32 log-softmax -> gather keeps
+    vocabulary-wide fp32 tensors alive and runs its backward as zeros +
+    scatter-add + log-softmax backward + softcap backward: several fp32
+    passes over (rows, vocab). This function saves only the raw logits, in
+    the readout GEMM's own dtype, and the (rows,) logsumexp. Its backward is
+    a single elementwise pass that reforms the softmax from them::
+
+        d raw = (onehot(target) - softmax(capped)) * g * cap'(raw)
+        cap'(x) = cap^3 / (x^2 + cap^2)^(3/2)
+
+    and writes the gradient straight back in the GEMM's dtype. The softcap
+    and the softmax are evaluated in at least fp32, as in
+    ``logits_from_features``.
+    """
+
+    @staticmethod
+    def forward(ctx, raw: Tensor, targets: Tensor, cap: float) -> Tensor:
+        if raw.ndim != 2 or targets.shape != raw.shape[:1]:
+            raise ValueError("expected raw [rows, vocab] and targets [rows]")
+        compute_dtype = torch.promote_types(raw.dtype, torch.float32)
+        logsumexp = rational_softcap(raw.to(compute_dtype), cap).logsumexp(-1)
+        target_raw = raw.gather(-1, targets[:, None]).squeeze(-1)
+        target_raw = target_raw.to(compute_dtype)
+        ctx.save_for_backward(raw, targets, logsumexp)
+        ctx.cap = cap
+        return rational_softcap(target_raw, cap) - logsumexp
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad: Tensor):
+        # The saved logsumexp hides its dependence on raw from a
+        # create_graph backward, so a second derivative must refuse.
+        raw, targets, logsumexp = ctx.saved_tensors
+        cap = ctx.cap
+        x = raw.to(logsumexp.dtype)
+        inverse_norm = (x.square() + cap**2).rsqrt()
+        probabilities = (cap * x * inverse_norm - logsumexp[:, None]).exp()
+        vocabulary = torch.arange(raw.size(-1), device=raw.device)
+        is_target = vocabulary[None, :] == targets[:, None]
+        grad_capped = grad[:, None] * (is_target.to(x.dtype) - probabilities)
+        grad_raw = grad_capped * cap**3 * inverse_norm**3
+        return grad_raw.to(raw.dtype), None, None
 
 
 class _NanoPostrainingMixin:
@@ -143,8 +197,20 @@ class _NanoPostrainingMixin:
         # Standard renderer features are cat(input_latent, belief); the nano
         # readout is belief-only, so slice the contextual half.
         belief = features[..., -self.model_dim:]
-        raw = self._raw_logits(belief)
-        return 15 * raw * (raw.square() + 15**2).rsqrt()
+        return rational_softcap(self._raw_logits(belief).float(), self.logit_softcap)
+
+    def target_logprobs_from_features(
+        self, features: Tensor, targets: Tensor
+    ) -> Tensor:
+        """``logits_from_features(features).log_softmax(-1)`` at ``targets``.
+
+        The same value without materializing the vocabulary-wide fp32 logits
+        for autograd: see :class:`SoftcappedTargetLogprobs`.
+        """
+        belief = features[..., -self.model_dim:]
+        return SoftcappedTargetLogprobs.apply(
+            self._raw_logits(belief), targets, self.logit_softcap
+        )
 
     def policy_logits(self, input_ids: Tensor) -> Tensor:
         """Teacher-forced vocab logits — exactly the pretraining readout."""
@@ -178,6 +244,7 @@ class _NanoPostrainingMixin:
         position: "int | Tensor",
         key_mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
+        key_starts: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """One-token attention step; branch structure mirrors fresh_lejepa.
 
@@ -198,6 +265,11 @@ class _NanoPostrainingMixin:
         reaches flex decoding, measured 45-64% faster across L=128..2048 on the
         production shapes. One mask serves all layers, so it is built by the
         caller, not here.
+
+        ``key_starts`` (int64, (batch,)) is the same range without a table:
+        row ``b`` attends ``[key_starts[b], position]`` over the whole cache,
+        and ``ranged_decode_attention`` reads only those slots -- not the
+        left padding before them nor the cache past the write head.
         """
         batch, _, dim = x.shape
         num_heads, head_dim = attention.num_heads, attention.head_dim
@@ -223,6 +295,18 @@ class _NanoPostrainingMixin:
         q = q.to(cache[0].dtype)
         k = k.to(cache[0].dtype)
         v = v.to(cache[1].dtype)
+        if key_starts is not None:
+            if not torch.is_tensor(position):
+                raise ValueError("key_starts stepping requires a 0-dim tensor position")
+            if key_mask is not None or block_mask is not None:
+                raise ValueError("key_starts excludes key_mask and block_mask")
+            index = position.reshape(1)
+            cache[0].index_copy_(2, index, k)
+            cache[1].index_copy_(2, index, v)
+            y = ranged_decode_attention(
+                q.squeeze(2), cache[0], cache[1], key_starts, position, 0.12
+            )
+            return attention.proj(y.reshape(batch, 1, dim)), cache
         if block_mask is not None:
             if not torch.is_tensor(position):
                 raise ValueError("block_mask stepping requires a 0-dim tensor position")
@@ -289,10 +373,12 @@ class _NanoPostrainingMixin:
         position: "int | Tensor",
         key_mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
+        key_starts: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         del x0  # no encoder/decoder skip input in the nano trunk
         attn, cache = self._attention_step(
-            block.attn, block.norm1(x), cache, position, key_mask, block_mask
+            block.attn, block.norm1(x), cache, position, key_mask, block_mask,
+            key_starts,
         )
         x = x + attn
         x = x + block.mlp(block.norm2(x))
@@ -577,7 +663,7 @@ class NanoGPTBackbone(_NanoPostrainingMixin, nanogpt_mini_model.GPT):
         yield from self.proj.parameters()
 
     def _raw_logits(self, belief: Tensor) -> Tensor:
-        return self.proj(belief).float()
+        return self.proj(belief)
 
 
 class NanoTiedDotBackbone(_NanoPostrainingMixin, nanogpt_mini_model.TiedDotGPT):

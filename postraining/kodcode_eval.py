@@ -215,6 +215,8 @@ def _adapt_tests(test: str, target: str) -> dict:
         _reject("test_policy_rejected")
     return {
         "schema": PYTHON_REWARD_SCHEMA,
+        # The only solution import the adapter admits.
+        "entry_points": [target],
         "test_setup": [setup],
         "tests": [f"{function.name}()" for function in functions],
     }

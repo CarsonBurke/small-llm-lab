@@ -44,6 +44,7 @@ from postraining.train_latent_vapo import (
     renderer_parameters,
     rollout_diagnostics,
     score_math_rollout,
+    source_diagnostics,
     update_minibatch,
 )
 from postraining.value_model import SeparateCritic
@@ -561,3 +562,168 @@ def test_build_optimizers_nano_backbone_three_group_layout():
     latent_policy_ids = {id(p) for p in groups[1]["params"]}
     assert latent_policy_ids == {id(p) for p in wrapper.new_parameters()}
     assert all(len(group["params"]) > 0 for group in groups)
+
+
+def _rewarded_pinned_batch(wrapper, seed):
+    torch.manual_seed(seed)
+    batch = trim_stream(
+        rollout_continuations(
+            wrapper,
+            torch.randint(0, 32, (4, 3)),
+            max_new_tokens=5,
+            max_stream_steps=5,
+            temperature=1.0,
+            top_p=1.0,
+            pin_emit=True,
+        )
+    )
+    batch.reward_scalar.uniform_(0.0, 1.0)
+    positions = (
+        batch.action_mask.size(1) - 1 - batch.action_mask.flip(1).argmax(1)
+    ).long()
+    batch.rewards.zero_()
+    batch.rewards[torch.arange(batch.rewards.size(0)), positions] = (
+        batch.reward_scalar
+    )
+    return batch
+
+
+def assert_fused_matches_refresh_then_update(
+    wrapper, critic, batch, **update_kwargs
+):
+    """Fused behavior statistics against the refresh-then-update reference.
+
+    Shared with the hidden-carry tests. One trajectory per shard makes the
+    fused critic pass fill every shard's baseline before any shard's
+    advantages are formed.
+    """
+    import copy
+
+    runs = []
+    for fused in (False, True):
+        run_wrapper = copy.deepcopy(wrapper)
+        run_critic = copy.deepcopy(critic)
+        run_batch = copy.deepcopy(batch)
+        if not fused:
+            refresh_old_statistics(
+                run_wrapper, run_critic, run_batch, max_trajectories=1
+            )
+        metrics = update_minibatch(
+            run_wrapper,
+            run_critic,
+            run_batch,
+            build_optimizers(run_wrapper, run_critic, 1e-4, fused=False),
+            actor_step=False,
+            critic_step=False,
+            replay_max_trajectories=1,
+            fused_behavior_statistics=fused,
+            **update_kwargs,
+        )
+        grads = {
+            f"{prefix}.{name}": parameter.grad.clone()
+            for module, prefix in ((run_wrapper, "actor"), (run_critic, "critic"))
+            for name, parameter in module.named_parameters()
+            if parameter.grad is not None
+        }
+        runs.append((metrics, grads, run_batch))
+    (reference, reference_grads, reference_batch), (fused, fused_grads, fused_batch) = runs
+    assert fused_batch.statistics_refreshed
+    # Identical forwards give identical behavior statistics.
+    for field in ("old_values", "old_token_logprobs", "old_stop_logprobs"):
+        assert torch.equal(
+            getattr(fused_batch, field), getattr(reference_batch, field)
+        ), field
+    assert fused["token_abs_log_ratio_max"] == 0.0
+    assert fused["policy_clip_fraction"] == 0.0
+    assert reference_grads.keys() == fused_grads.keys()
+    assert any(
+        bool(grad.abs().sum())
+        for name, grad in fused_grads.items()
+        if name.startswith("actor.")
+    )
+    # The actor sees the same advantages and unit ratios, so its gradient is
+    # bit-identical. Only the value targets change association order
+    # (rewards alone versus the telescoped baseline), so the critic agrees to
+    # float rounding.
+    for name, grad in reference_grads.items():
+        if name.startswith("actor."):
+            assert torch.equal(fused_grads[name], grad), name
+        else:
+            torch.testing.assert_close(
+                fused_grads[name], grad, rtol=1e-5, atol=1e-7, msg=name
+            )
+    for key, value in reference.items():
+        assert fused[key] == pytest.approx(value, rel=1e-5, abs=1e-7), key
+
+
+@pytest.mark.parametrize("delightful", [False, True])
+@pytest.mark.parametrize("source_gate", [False, True])
+def test_fused_behavior_statistics_match_refresh_then_update(
+    delightful, source_gate
+):
+    wrapper = _wrapper()
+    critic = _fresh_critic(wrapper)
+    with torch.no_grad():
+        critic.head.weight.normal_(std=0.05)
+    batch = _rewarded_pinned_batch(wrapper, seed=41)
+    assert batch.thoughts.size(-1) == 0
+    if source_gate:
+        # Source 1 scores nothing, so the gate zeroes its rows' advantages.
+        batch.source_id = torch.tensor([0, 0, 1, 1])
+        batch.rewards[2:] = 0.0
+        batch.reward_scalar[2:] = 0.0
+    assert_fused_matches_refresh_then_update(
+        wrapper,
+        critic,
+        batch,
+        delightful_policy_gradient=delightful,
+        source_success_actor_gate=source_gate,
+    )
+
+
+def test_fused_behavior_statistics_reject_latent_thoughts_and_tpo():
+    wrapper = _wrapper()
+    critic = _fresh_critic(wrapper)
+    optimizers = build_optimizers(wrapper, critic, 1e-4, fused=False)
+    torch.manual_seed(43)
+    latent = trim_stream(_pinned_rollout(wrapper, pin_emit=False, max_stream_steps=8))
+    assert latent.thoughts.size(-1) and bool(
+        ((latent.kind != TOKEN_SLOT) & (latent.kind != PAD_SLOT)).any()
+    )
+    with pytest.raises(ValueError, match="latent thoughts"):
+        update_minibatch(
+            wrapper, critic, latent, optimizers,
+            fused_behavior_statistics=True,
+        )
+    pinned = _rewarded_pinned_batch(wrapper, seed=47)
+    with pytest.raises(ValueError, match="without TPO"):
+        update_minibatch(
+            wrapper, critic, pinned, optimizers,
+            target_policy_optimization=True,
+            fused_behavior_statistics=True,
+        )
+
+
+def test_source_diagnostics_omit_a_source_absent_from_the_pool():
+    # An exact-pass mixture gives a small source under one prompt per pool.
+    wrapper = _wrapper()
+    groups = []
+    for seed, source_id in ((53, 0), (59, 2)):
+        torch.manual_seed(seed)
+        group = trim_stream(_pinned_rollout(wrapper))
+        group.source_id = torch.full(
+            (group.token_ids.size(0),), source_id, dtype=torch.long
+        )
+        groups.append(group)
+    metrics = source_diagnostics(
+        groups, ["a", "b", "c"], samples_per_prompt=2,
+        refreshed_statistics=False,
+    )
+    assert list(metrics) == ["a", "c"]
+    assert metrics["a"]["trajectories"] == 2
+    groups[1].source_id.fill_(3)
+    with pytest.raises(ValueError, match="unknown source id 3"):
+        source_diagnostics(
+            groups, ["a", "b", "c"], samples_per_prompt=2,
+            refreshed_statistics=False,
+        )

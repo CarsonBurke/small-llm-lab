@@ -134,9 +134,10 @@ class TrunkRenderReadout:
 
     The nano renderer consumes ``cat(token_latent, belief)`` and applies a
     softcap, so its log-probabilities cannot be reproduced by a plain matmul
-    against an embedding matrix. Scoring therefore goes through the backbone
-    and, because the head is trainable, keeps its dense autograd graph. The
-    chunk argument still bounds peak activation memory.
+    against an embedding matrix. Scoring therefore goes through the
+    backbone's fused target readout, which keeps only the raw readout output
+    and a logsumexp per action for the trainable head's backward. The chunk
+    argument still bounds peak activation memory.
     """
 
     def __init__(self, backbone: Any) -> None:
@@ -159,9 +160,10 @@ class TrunkRenderReadout:
         if chunk_tokens < 1:
             raise ValueError("chunk size must be positive")
         parts = [
-            torch.log_softmax(self.logits(features[start : start + chunk_tokens]), dim=-1)
-            .gather(1, targets[start : start + chunk_tokens, None].long())
-            .squeeze(1)
+            self._backbone.target_logprobs_from_features(
+                features[start : start + chunk_tokens],
+                targets[start : start + chunk_tokens].long(),
+            )
             for start in range(0, features.shape[0], chunk_tokens)
         ]
         return torch.cat(parts, dim=0)

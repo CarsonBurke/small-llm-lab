@@ -25,7 +25,11 @@ from postraining.latent_rollout import (
     PAD_SLOT,
     THOUGHT_SLOT,
     TOKEN_SLOT,
+    UINT64_MASK,
     LatentRolloutBatch,
+    request_seed,
+    signed64,
+    splitmix64,
 )
 from postraining.latent_thought import EMIT, THINK, StepOutput
 
@@ -45,7 +49,6 @@ _STREAM_FIELD_NAMES = (
     "old_thought_log_sigmas",
     "old_values",
 )
-_UINT64_MASK = (1 << 64) - 1
 
 
 class ContinuousRefillModel(Protocol):
@@ -420,23 +423,6 @@ def _empty_record_values(
     return values
 
 
-def _splitmix64(value: int) -> int:
-    value = (value + 0x9E3779B97F4A7C15) & _UINT64_MASK
-    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
-    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
-    return value ^ (value >> 31)
-
-
-def _request_seed(pool_seed: int, request_id: int, sample_index: int) -> int:
-    seed = _splitmix64(pool_seed & _UINT64_MASK)
-    seed = _splitmix64(seed ^ (request_id & _UINT64_MASK))
-    return _splitmix64(seed ^ (sample_index & _UINT64_MASK))
-
-
-def _signed64(value: int) -> int:
-    return value if value < (1 << 63) else value - (1 << 64)
-
-
 def _decode_execution_width(
     active_rows: int,
     capacity_rows: int,
@@ -530,12 +516,12 @@ def _cpu_request_random(
     thought = torch.empty((rows, thought_dim), dtype=torch.float32)
     next_key_bits = key_bits.clone()
     for row in range(rows):
-        seed = int(key_bits[row, 0]) & _UINT64_MASK
-        counter = int(key_bits[row, 1]) & _UINT64_MASK
-        decision = _splitmix64(seed ^ _splitmix64(counter))
+        seed = int(key_bits[row, 0]) & UINT64_MASK
+        counter = int(key_bits[row, 1]) & UINT64_MASK
+        decision = splitmix64(seed ^ splitmix64(counter))
 
         def generator(domain: int) -> torch.Generator:
-            domain_seed = _splitmix64(decision ^ _splitmix64(domain))
+            domain_seed = splitmix64(decision ^ splitmix64(domain))
             return torch.Generator().manual_seed(domain_seed & ((1 << 63) - 1))
 
         gate[row] = torch.rand((), generator=generator(0))
@@ -544,8 +530,8 @@ def _cpu_request_random(
             thought[row] = torch.randn(
                 thought_dim, generator=generator(2)
             )
-        next_key_bits[row, 1] = _signed64(
-            (counter + 1) & _UINT64_MASK
+        next_key_bits[row, 1] = signed64(
+            (counter + 1) & UINT64_MASK
         )
     return gate, token, thought, next_key_bits
 
@@ -583,18 +569,18 @@ def _request_token_random(key_bits: Tensor) -> tuple[Tensor, Tensor]:
         token = torch.empty(rows, dtype=torch.float32)
         next_key_bits = key_bits.clone()
         for row in range(rows):
-            seed = int(key_bits[row, 0]) & _UINT64_MASK
-            counter = int(key_bits[row, 1]) & _UINT64_MASK
-            decision = _splitmix64(seed ^ _splitmix64(counter))
-            token_seed = _splitmix64(decision ^ _splitmix64(0))
+            seed = int(key_bits[row, 0]) & UINT64_MASK
+            counter = int(key_bits[row, 1]) & UINT64_MASK
+            decision = splitmix64(seed ^ splitmix64(counter))
+            token_seed = splitmix64(decision ^ splitmix64(0))
             token[row] = torch.rand(
                 (),
                 generator=torch.Generator().manual_seed(
                     token_seed & ((1 << 63) - 1)
                 ),
             )
-            next_key_bits[row, 1] = _signed64(
-                (counter + 1) & _UINT64_MASK
+            next_key_bits[row, 1] = signed64(
+                (counter + 1) & UINT64_MASK
             )
         return token, next_key_bits
     if key_bits.device.type != "cuda":
@@ -874,8 +860,8 @@ def rollout_continuous_refill_groups(
                 admitted_origin_rows.append(row)
                 admitted_keys.append(
                     [
-                        _signed64(
-                            _request_seed(seed, group.request_id, sample)
+                        signed64(
+                            request_seed(seed, group.request_id, sample)
                         ),
                         0,
                     ]

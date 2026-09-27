@@ -17,8 +17,16 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+# v4: Minerva normalization folds ``\dfrac``/``\tfrac``, ``\left``/``\right``,
+# whole-answer ``$``/``\[...\]``/``\(...\)``/``\boxed{...}`` wrappers and
+# plain ``p/q`` fractions, splits only at an ``=`` outside braces, and collapses
+# commas only as thousands grouping; the numeric parse accepts the same
+# wrappers, a spaced sign and ``\frac12`` shorthand; the single-number gate
+# reads ``graded_answer_field`` of truth and prediction, and digits separated
+# only by whitespace never grade as one number.
+# v5 bounds scientific-notation exponents before exact integer construction.
 POSTTRAIN_REWARD_SCHEMA = (
-    "terminated_final_answer_exact1_numeric_log1p_max01/v3"
+    "terminated_final_answer_exact1_numeric_log1p_max01/v5"
 )
 
 
@@ -63,9 +71,120 @@ REMOVED_EXPRESSIONS = [
 ]
 
 
+_MATH_DELIMITERS = ((r"\[", r"\]"), (r"\(", r"\)"))
+
+
+def _closing_brace(text: str, opening: int) -> int | None:
+    """Index of the brace closing ``text[opening]``, or None if unbalanced."""
+    depth = 0
+    for index in range(opening, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def unwrap_math_answer(answer: str) -> str:
+    r"""Remove whole-answer ``\[...\]``, ``\(...\)`` and ``\boxed{...}`` wrappers.
+
+    Only a wrapper spanning the entire answer is removed, so ``\boxed{a} +
+    \boxed{b}`` and a lone opener are left intact.
+    """
+    text = answer.strip()
+    while True:
+        for opener, closer in _MATH_DELIMITERS:
+            inner = text[len(opener):-len(closer)]
+            if (
+                text.startswith(opener)
+                and text.endswith(closer)
+                and len(text) >= len(opener) + len(closer)
+                and opener not in inner
+                and closer not in inner
+            ):
+                text = inner.strip()
+                break
+        else:
+            if (
+                text.startswith("\\boxed{")
+                and _closing_brace(text, len("\\boxed")) == len(text) - 1
+            ):
+                text = text[len("\\boxed{"):-1].strip()
+                continue
+            return text
+
+
+def fold_fraction_commands(answer: str) -> str:
+    r"""``\dfrac`` and ``\tfrac`` typeset the same value as ``\frac``."""
+    return re.sub(r"\\[dt]frac(?![a-zA-Z])", r"\\frac", answer)
+
+
+def _unwrap_dollars(answer: str) -> str:
+    """``unwrap_math_answer``, also through one whole-answer ``$...$`` pair."""
+    text = unwrap_math_answer(answer)
+    if text.startswith("$") and text.endswith("$") and text.count("$") == 2:
+        text = unwrap_math_answer(text[1:-1])
+    return text
+
+
+# The left side of an answer that names its value: ``n``, ``x_1``,
+# ``a_{-1}``, ``\\theta``, ``f(x)``.
+_ANSWER_HEAD = re.compile(
+    r"\\?[A-Za-z]+(?:_(?:\{-?[A-Za-z0-9]+\}|[A-Za-z0-9]))?(?:\([A-Za-z0-9, ]*\))?"
+)
+
+
+def _split_top_level_equals(text: str) -> list[str]:
+    r"""Split at each ``=`` outside braces; ``\sum_{k=1}^{n} k`` is one part."""
+    parts, depth, start = [], 0, 0
+    for index, character in enumerate(text):
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth = max(depth - 1, 0)
+        elif character == "=" and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return parts
+
+
+def graded_answer_field(answer: str) -> str | None:
+    r"""The value an answer states: unwrapped, after an optional ``head =``.
+
+    ``n = 25`` and ``\boxed{f(x) = x^2}`` state ``25`` and ``x^2``. An
+    equation between expressions (``x + 2y - 5 = 0``) or several equations
+    (``a = 7, b = 3``) state no single value, so the result is None.
+    Minerva's normalization splits at the last ``=`` regardless, so such a
+    truth would pay whatever follows it; RL pools quarantine them.
+    """
+    parts = _split_top_level_equals(_unwrap_dollars(answer))
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) > 2 or not _ANSWER_HEAD.fullmatch(parts[0].strip()):
+        return None
+    return _unwrap_dollars(parts[1])
+
+
 def normalize_final_answer(answer: str) -> str:
-    """DAPO/Minerva-compatible normalization used for train and AIME rewards."""
-    answer = answer.split("=")[-1]
+    r"""DAPO/Minerva-compatible normalization used for train and AIME rewards.
+
+    Before Minerva's rules it removes notation that changes typesetting but
+    not value: whole-answer ``$``/display/boxed wrappers (unwrapped before
+    and after the ``=`` split so ``\boxed{x=5}`` and ``x = \[5\]`` grade
+    ``5``), ``\dfrac``/``\tfrac`` and ``\left``/``\right`` sizing. The split
+    is at the last ``=`` outside braces, so ``\sum_{k=1}^{n} k`` survives. A
+    bare integer ``p/q`` is written as ``\frac{p}{q}``; unreduced and decimal
+    forms stay distinct, and so do leading zeros, which are digits of the
+    answer to "the last four digits" (``0352``).
+    """
+    # Minerva's ``.$`` rule drops a sentence period before the unwrap does.
+    answer = _unwrap_dollars(answer.strip().replace(".$", "$"))
+    answer = _unwrap_dollars(_split_top_level_equals(answer)[-1])
+    answer = fold_fraction_commands(answer)
+    answer = re.sub(r"\\(?:left|right)(?:\.|(?![a-zA-Z]))", "", answer)
     for before, after in SUBSTITUTIONS:
         answer = answer.replace(before, after)
     for expression in REMOVED_EXPRESSIONS:
@@ -78,9 +197,15 @@ def normalize_final_answer(answer: str) -> str:
     answer = re.sub(r"(frac)([^{])(.)", r"frac{\2}{\3}", answer)
     answer = re.sub(r"(sqrt)([^{])", r"sqrt{\2}", answer)
     answer = answer.replace("$", "")
-    if answer.replace(",", "").isdigit():
+    # Commas collapse only as thousands grouping: ``2,5`` is a list, not 25.
+    if re.fullmatch(r"\d{1,3}(?:,\d{3})+", answer):
         answer = answer.replace(",", "")
-    return answer.strip()
+    answer = answer.strip()
+    plain_fraction = re.fullmatch(r"(-?)(\d+)/(\d+)", answer)
+    if plain_fraction:
+        sign, numerator, denominator = plain_fraction.groups()
+        answer = f"{sign}\\frac{{{numerator}}}{{{denominator}}}"
+    return answer
 
 
 # ``reward_model.style`` -> grading style.  The DAPO and AIME parquets tag
@@ -122,17 +247,33 @@ def verify_answer(
         prediction = normalize_final_answer(
             "[INVALID]" if extracted is None else extracted
         )
-        # DAPO's ground truths are numeric.  Require its raw final Answer:
-        # field to contain one number before applying Minerva's canonical
-        # formatting, otherwise comma-separated candidate lists can collapse
-        # into an apparently correct integer (for example ``3, 4`` -> ``34``).
-        # Preserve Minerva behavior for genuinely nonnumeric datasets.
+        # When the truth's graded field is a number, the prediction's must
+        # be exactly one number before Minerva's rewrites, which delete
+        # spaces and could otherwise join a candidate list into an apparently
+        # correct integer (``3 4`` -> ``34``). Both fields are read after an
+        # optional ``head =``, so ``n = 25`` gates like ``25`` while
+        # ``a = 7, b = 3`` states no single number.
+        # Genuinely nonnumeric truths keep plain Minerva behavior.
+        truth_field = graded_answer_field(ground_truth)
+        predicted_field = (
+            None if extracted is None else graded_answer_field(extracted)
+        )
         if (
-            parse_numeric_answer(ground_truth) is not None
+            truth_field is not None
+            and parse_numeric_answer(truth_field) is not None
             and (
-                extracted is None
-                or parse_numeric_answer(extracted) is None
+                predicted_field is None
+                or parse_numeric_answer(predicted_field) is None
             )
+        ):
+            return False, prediction
+        # Minerva deletes spaces, so ``4 0`` would read as ``40`` against a
+        # truth the gate cannot parse (``40^\circ``). Digits separated only
+        # by whitespace are never one number.
+        if (
+            extracted is not None
+            and re.search(r"\d\s+\d", extracted)
+            and not re.search(r"\d\s+\d", ground_truth)
         ):
             return False, prediction
         return prediction == normalize_final_answer(ground_truth), prediction
@@ -164,6 +305,12 @@ def verify_answer(
     raise ValueError(f"unknown answer style {style!r}")
 
 
+# Generated scientific notation must not allocate arbitrarily large integers.
+# 4096 decimal places cover ordinary corpus answers while bounding exact
+# Fraction construction, including exponents inside plain fractions.
+MAX_NUMERIC_EXPONENT = 4096
+
+
 def parse_numeric_answer(answer: str) -> Fraction | None:
     """Parse one raw final-answer field as an exact finite number.
 
@@ -175,29 +322,44 @@ def parse_numeric_answer(answer: str) -> Fraction | None:
     text = answer.strip()
     if not text or len(text) > 128:
         return None
-    if text.startswith("$") and text.endswith("$") and text.count("$") == 2:
-        text = text[1:-1].strip()
-    boxed = re.fullmatch(r"\\boxed\{(.+)\}", text)
-    if boxed:
-        text = boxed.group(1).strip()
+    text = fold_fraction_commands(_unwrap_dollars(text))
+    if any(
+        abs(int(match.group(1))) > MAX_NUMERIC_EXPONENT
+        for match in re.finditer(r"[eE]([+-]?\d+)", text)
+    ):
+        return None
+    # One leading sign may be spaced from its magnitude (``- \frac{1}{2}``);
+    # a second sign is not a number.
+    signed = re.fullmatch(r"([+-]?)\s*([^+\-\s].*)", text)
+    if signed is None:
+        return None
+    sign, text = signed.groups()
+    unsigned = r"(?:\d+(?:\.\d*)?|\.\d+)"
     latex_fraction = re.fullmatch(
-        r"\\?frac\{([+-]?(?:\d+(?:\.\d*)?|\.\d+))\}"
-        r"\{([+-]?(?:\d+(?:\.\d*)?|\.\d+))\}",
+        rf"\\?frac\s*\{{\s*([+-]?{unsigned})\s*\}}\s*\{{\s*([+-]?{unsigned})\s*\}}"
+        # Minerva's single-digit shorthand, ``\frac12``.
+        r"|\\?frac(\d)(\d)",
         text,
     )
     number = r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    plain_fraction = re.fullmatch(rf"({number})\s*/\s*({number})", text)
     try:
         if latex_fraction:
-            denominator = Fraction(latex_fraction.group(2))
-            return Fraction(latex_fraction.group(1)) / denominator
-        plain_fraction = re.fullmatch(rf"({number})/({number})", text)
-        if plain_fraction:
+            numerator, denominator = (
+                latex_fraction.group(1, 2)
+                if latex_fraction.group(1) is not None
+                else latex_fraction.group(3, 4)
+            )
+            value = Fraction(numerator) / Fraction(denominator)
+        elif plain_fraction:
             numerator = Fraction(plain_fraction.group(1).replace(",", ""))
             denominator = Fraction(plain_fraction.group(2).replace(",", ""))
-            return numerator / denominator
-        if not re.fullmatch(number, text):
+            value = numerator / denominator
+        elif re.fullmatch(number, text):
+            value = Fraction(text.replace(",", ""))
+        else:
             return None
-        return Fraction(text.replace(",", ""))
+        return -value if sign == "-" else value
     except (ValueError, ZeroDivisionError):
         return None
 
@@ -1006,6 +1168,23 @@ def length_adaptive_lambda(lengths: Tensor, alpha: float = 0.05) -> Tensor:
     return (1.0 - 1.0 / horizon).clamp(0.0, 1.0)
 
 
+def actor_gae_lambdas(
+    lengths: Tensor, alpha: float, fixed: float | None = None
+) -> Tensor:
+    """Per-trajectory actor GAE lambda: ``fixed`` when given, else length-adaptive.
+
+    A fixed lambda sets the actor's credit horizon 1/(1 - lambda) in tokens,
+    independent of length. Token-level Delightful PG needs each token's
+    advantage to be its own: with an accurate critic, short horizons give a
+    non-causal token near-zero advantage, while long ones mix in later
+    tokens' luck, which the gate turns into an entropy push
+    (``postraining/sim_dg_sequence_credit.py``).
+    """
+    if fixed is None:
+        return length_adaptive_lambda(lengths, alpha)
+    return torch.full_like(lengths, fixed, dtype=torch.float32)
+
+
 def generalized_advantage_estimate(
     rewards: Tensor,
     values: Tensor,
@@ -1024,6 +1203,15 @@ def generalized_advantage_estimate(
         running = running * mask[:, t]
         advantage[:, t] = running
     return advantage, advantage + values
+
+
+def temporal_difference_residuals(
+    rewards: Tensor, values: Tensor, mask: Tensor
+) -> Tensor:
+    """Undiscounted one-step TD residuals: lambda-0 GAE advantages."""
+    next_values = torch.cat((values[:, 1:], torch.zeros_like(values[:, :1])), dim=1)
+    next_valids = torch.cat((mask[:, 1:], torch.zeros_like(mask[:, :1])), dim=1)
+    return (rewards + next_values * next_valids - values) * mask
 
 
 def generalized_advantage_and_return_targets(

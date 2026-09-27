@@ -117,6 +117,12 @@ CONTEXT_BUDGET_DEMAND = re.compile(
 # register: "请...输出...答案" / "请...输出...选项".
 CHINESE_OUTPUT_FORMAT_DEMAND = re.compile(r"请[^。]{0,40}输出[^。]{0,40}(答案|选项)")
 
+# UltraData's single-choice final-line templates ("The answer is $LETTER")
+# carry no ``Answer:`` colon in most variants, so neither check above sees
+# them. ``choice_prompt.strip_choice_framing`` removes the header that holds
+# them; one surviving anywhere else must fail closed.
+CHOICE_TEMPLATE_DEMAND = re.compile(r"\$LETTER\b")
+
 
 def require_answer_fence_prompt_schema(
     metadata: dict,
@@ -166,6 +172,11 @@ def strip_math_prompt_framing(content: str) -> tuple[str, int]:
             "answer-fence prompt canonicalization left a Chinese "
             "output-format instruction in place (unlisted template?): "
             f"{content[:200]!r}"
+        )
+    if CHOICE_TEMPLATE_DEMAND.search(content):
+        raise ValueError(
+            "answer-fence prompt canonicalization left a $LETTER "
+            f"answer-format template in place: {content[:200]!r}"
         )
     return content, removed
 

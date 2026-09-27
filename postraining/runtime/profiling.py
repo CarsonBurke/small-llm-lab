@@ -585,8 +585,10 @@ class RunProfiler:
         device: torch.device,
         args: argparse.Namespace,
     ):
-        self.directory = output / "profile"
-        self.directory.mkdir(parents=True, exist_ok=True)
+        # Created at the first write, not here: the profiler is built before
+        # the trainer's fresh-output check, which a directory made now would
+        # trip on every fresh profiled run.
+        self._directory = output / "profile"
         self.device = device
         self.args = args
         self._path: list[str] = []
@@ -769,7 +771,7 @@ class RunProfiler:
         trace = None
         exported = None
         if self.args.profile_trace:
-            trace = self.directory / f"trace_pool_{self.pool_index}.json"
+            trace = self.directory() / f"trace_pool_{self.pool_index}.json"
             try:
                 profile.export_chrome_trace(str(trace))
                 exported = trace.stat().st_size
@@ -991,7 +993,7 @@ class RunProfiler:
             ),
         }
         self.pools.append(pool)
-        (self.directory / f"pool_{self.pool_index}.json").write_text(
+        (self.directory() / f"pool_{self.pool_index}.json").write_text(
             json.dumps(pool, indent=2)
         )
         if not pool["reconciled"]:
@@ -1004,6 +1006,10 @@ class RunProfiler:
             )
         self.pool_index += 1
         return pool
+
+    def directory(self) -> Path:
+        self._directory.mkdir(parents=True, exist_ok=True)
+        return self._directory
 
     def close(self) -> dict:
         if self._closed:
@@ -1041,13 +1047,13 @@ class RunProfiler:
                 for field in DEVICE_SAMPLE_FIELDS
             },
         }
-        (self.directory / "profile_summary.json").write_text(
+        (self.directory() / "profile_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
         # The raw series, not just its per-phase digest. A periodic collapse
         # is defined by its period, and no summary statistic carries that;
         # at a quarter-second interval a whole run is a few thousand rows.
-        (self.directory / "device_samples.json").write_text(
+        (self.directory() / "device_samples.json").write_text(
             json.dumps(
                 {
                     "fields": ["perf_counter", *DEVICE_SAMPLE_FIELDS],

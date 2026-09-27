@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import warnings
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -22,16 +23,24 @@ from postraining.core import (
 )
 from postraining.latent_rollout import (
     emitted_token_rows,
+    request_seed,
     rollout_continuations,
+    signed64,
     trim_stream,
 )
 from postraining.latent_thought import THINK, LatentThoughtModel
 from postraining.train_vapo import prompt_text
 
-LATENT_EVAL_METRIC_SCHEMA = "forced_initial_isotropic_thought_policy/v6"
+if TYPE_CHECKING:
+    from postraining.graph_decode import PinnedDecodeArena
+
+LATENT_EVAL_METRIC_SCHEMA = "forced_initial_isotropic_thought_policy/v7"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
+# The VAPO AIME protocol's sampling settings, shared by every panel.
+EVAL_TEMPERATURE = 1.0
+EVAL_TOP_P = 0.7
 
 
 def verify_terminated_answer(
@@ -93,8 +102,8 @@ def evaluate_latent_math(
     answer_style_override: str | None = None,
     capture_problem_count: int = CAPTURE_PROBLEMS,
     capture_samples_per_problem: int = CAPTURE_SAMPLES_PER_PROBLEM,
-    temperature: float = 1.0,
-    top_p: float = 0.7,
+    temperature: float = EVAL_TEMPERATURE,
+    top_p: float = EVAL_TOP_P,
     top_k: int | None = None,
     compact_finished: bool = False,
     compiled_tail_batch: int | None = COMPILED_EVAL_TAIL_BATCH,
@@ -104,6 +113,7 @@ def evaluate_latent_math(
     think_fence_ids: tuple[int, int] | None = None,
     answer_fence_ids: tuple[int, int] | None = None,
     min_think_tokens: int = 1,
+    decode_arena: PinnedDecodeArena | None = None,
 ) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
 
@@ -139,6 +149,14 @@ def evaluate_latent_math(
     automatic benchmark keeps the default 4x4 panel; standalone inspection
     can capture an entire batched sample without a second model pass.
 
+    ``decode_arena`` (pinned-EMIT only) decodes through a CUDA-graph
+    ``PinnedDecodeArena`` built with this evaluation's temperature, ``top_p``
+    and carry contract; its row count replaces ``batch_trajectories``. Each
+    trajectory then draws from a counter-keyed stream seeded by (``seed``,
+    dataset row, sample index), so a sample's noise is independent of
+    batching, length ordering and compaction, and two checkpoints evaluated
+    with one seed share their noise sample for sample.
+
     Grading follows each row's ``answer_style`` unless
     ``answer_style_override`` forces one (AIME passes ``"aime"``: integer in
     [0, 999]).  Rows tagged with an ``extra_info.module`` additionally get a
@@ -156,6 +174,24 @@ def evaluate_latent_math(
         raise ValueError("batch_trajectories must be positive")
     if compiled_tail_batch is not None and compiled_tail_batch < 1:
         raise ValueError("compiled_tail_batch must be positive or None")
+    if decode_arena is not None:
+        if not pin_emit:
+            raise ValueError("a decode arena evaluates pinned-EMIT policies only")
+        if compiled_step_core is not None:
+            raise ValueError("a decode arena replaces the compiled step core")
+        if top_k is not None:
+            raise ValueError("a decode arena samples without top-k")
+        if (
+            decode_arena.wrapper is not wrapper
+            or decode_arena.hidden_carry != hidden_carry
+            or decode_arena.temperature != float(temperature)
+            or decode_arena.top_p != float(top_p)
+        ):
+            raise ValueError(
+                "the decode arena's policy, carry contract, temperature or "
+                "top_p differs from this evaluation's"
+            )
+        batch_trajectories = decode_arena.rows
     if captured_attempts is not None:
         if capture_problem_count < 1 or len(rows) < capture_problem_count:
             raise ValueError(
@@ -189,6 +225,10 @@ def evaluate_latent_math(
             "posttraining requires a valid BOS or EOS token for explicit "
             "trajectory termination"
         )
+    if decode_arena is not None and set(decode_arena.stop_ids.tolist()) != set(
+        stop_ids
+    ):
+        raise ValueError("the decode arena stops on different tokens")
     correct = 0
     contract_correct = 0
     structurally_valid = 0
@@ -234,9 +274,14 @@ def evaluate_latent_math(
         # preserving a deterministic evaluation order for a fixed dataset.
         encoded_rows.sort(key=lambda item: len(item[0]))
         member_start = 0
-        while member_start < samples:
+        while encoded_rows and member_start < samples:
             width = min(chunk, batch_trajectories, samples - member_start)
-            groups_per_rollout = max(1, batch_trajectories // width)
+            # Every rollout pays for its longest row, so the prompts are
+            # spread evenly over the fewest rollouts that fit rather than
+            # packed full with a short remainder paying a whole tail.
+            max_groups = max(1, batch_trajectories // width)
+            rollouts = math.ceil(len(encoded_rows) / max_groups)
+            groups_per_rollout = math.ceil(len(encoded_rows) / rollouts)
             for row_start in range(0, len(encoded_rows), groups_per_rollout):
                 row_chunk = encoded_rows[
                     row_start : row_start + groups_per_rollout
@@ -261,40 +306,63 @@ def evaluate_latent_math(
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    batch = trim_stream(
-                        rollout_continuations(
-                            wrapper, prompt_ids,
-                            max_new_tokens, max_stream_steps, temperature, top_p,
-                            stop_ids=stop_ids or None,
-                            prompt_lengths=prompt_lengths,
-                            tensor_positions=compiled_step_core is not None,
-                            replay_storage=False,
-                            record_likelihoods=False,
-                            cache_dtype=(
-                                torch.bfloat16 if device.type == "cuda" else None
-                            ),
-                            # Keep the full batch compiled until the survivors
-                            # fit one fixed B16 tail. Padding that tail with
-                            # inert finished rows bounds Inductor to one extra
-                            # specialization instead of arbitrary live counts.
-                            compact_finished=(
-                                compact_finished
-                                or (
-                                    compiled_step_core is not None
-                                    and compiled_tail_batch is not None
+                    if decode_arena is not None:
+                        token_seeds = torch.tensor(
+                            [
+                                signed64(request_seed(seed, item[2], member))
+                                for item in row_chunk
+                                for member in range(
+                                    member_start, member_start + width
                                 )
-                            ),
-                            finished_batch_size=(
-                                compiled_tail_batch
-                                if compiled_step_core is not None
-                                else None
-                            ),
-                            prompt_repeats=width,
-                            pin_emit=pin_emit,
-                            hidden_carry=hidden_carry,
-                            top_k=top_k,
+                            ],
+                            dtype=torch.int64,
+                            device=device,
                         )
-                    )
+                        batch = trim_stream(
+                            decode_arena.rollout(
+                                prompt_ids,
+                                prompt_lengths,
+                                prompt_repeats=width,
+                                max_new_tokens=max_new_tokens,
+                                max_stream_steps=max_stream_steps,
+                                token_seeds=token_seeds,
+                            )
+                        )
+                    else:
+                        batch = trim_stream(
+                            rollout_continuations(
+                                wrapper, prompt_ids,
+                                max_new_tokens, max_stream_steps, temperature, top_p,
+                                stop_ids=stop_ids or None,
+                                prompt_lengths=prompt_lengths,
+                                tensor_positions=compiled_step_core is not None,
+                                replay_storage=False,
+                                record_likelihoods=False,
+                                cache_dtype=(
+                                    torch.bfloat16 if device.type == "cuda" else None
+                                ),
+                                # Keep the full batch compiled until the survivors
+                                # fit one fixed B16 tail. Padding that tail with
+                                # inert finished rows bounds Inductor to one extra
+                                # specialization instead of arbitrary live counts.
+                                compact_finished=(
+                                    compact_finished
+                                    or (
+                                        compiled_step_core is not None
+                                        and compiled_tail_batch is not None
+                                    )
+                                ),
+                                finished_batch_size=(
+                                    compiled_tail_batch
+                                    if compiled_step_core is not None
+                                    else None
+                                ),
+                                prompt_repeats=width,
+                                pin_emit=pin_emit,
+                                hidden_carry=hidden_carry,
+                                top_k=top_k,
+                            )
+                        )
                 recurrent_steps_per_rollout.append(
                     batch.stream_length - batch.prompt_length
                 )
@@ -552,19 +620,23 @@ def evaluate_latent_math(
         "thought_component_std": (
             None if pin_emit else wrapper.thought_component_std
         ),
-        "compiled": compiled_step_core is not None,
+        "compiled": compiled_step_core is not None or decode_arena is not None,
         "compile_fallback": False,
         "pin_emit": pin_emit,
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
         "finished_compaction": (
-            f"compiled_tail_b{compiled_tail_batch}"
+            "graph_arena_row_buckets"
+            if decode_arena is not None
+            else f"compiled_tail_b{compiled_tail_batch}"
             if compiled_step_core is not None and compiled_tail_batch is not None
             else ("exact" if compact_finished else "none")
         ),
         "sampling_schema": (
-            "global_rng_compacted_tail/v1"
+            "counter_gumbel_row_sample_keys/v1"
+            if decode_arena is not None
+            else "global_rng_compacted_tail/v1"
             if (
                 compact_finished
                 or (
