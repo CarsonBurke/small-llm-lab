@@ -82,8 +82,10 @@ from postraining.vapo.schemas import (
     CRITIC_SCHEMA,
     DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA,
     EXECUTION_SCHEMA,
+    PADDED_SLOT_TOKEN_EXECUTION_SCHEMA,
     REPLAY_NUMERICS_SCHEMA,
     TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA,
+    TOKEN_EXECUTION_SCHEMA,
     actor_objective_schema,
     execution_schema_for,
     resume_execution_schema_compatible,
@@ -1242,7 +1244,7 @@ def test_default_cli_selects_current_delightful_broad_regime():
     assert cli.steps == 40_000
     assert (
         cli.rl_mixture_manifest
-        == "postraining/data/vapo_broad_v9_bare.manifest.json"
+        == "postraining/data/vapo_broad_v12_exact.manifest.json"
     )
     assert cli.reasoning_mode == "latent"
     assert cli.delightful_policy_gradient
@@ -1291,6 +1293,19 @@ def test_dg_topology_migration_requires_resume(capsys):
         validate_args(parser, cli)
     assert (
         "--allow-dg-topology-migration requires --resume"
+        in capsys.readouterr().err
+    )
+
+
+def test_token_rng_migration_requires_resume(capsys):
+    parser = build_arg_parser()
+    cli = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o", "--allow-token-rng-migration"]
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, cli)
+    assert (
+        "--allow-token-rng-migration requires --resume"
         in capsys.readouterr().err
     )
 
@@ -4997,3 +5012,68 @@ def test_resume_schema_compatibility_is_strict_equality():
     assert not resume_replay_schema_compatible({}, "latent")
     with pytest.raises(ValueError, match="unknown rollout scheduler"):
         execution_schema_for("latent", "tail_merge")
+
+
+def test_token_rng_migration_is_the_only_acknowledged_resume_migration():
+    """v31 -> v32 lockstep cot/none, and only when explicitly allowed."""
+    token = execution_schema_for("cot", "lockstep")
+    assert token == TOKEN_EXECUTION_SCHEMA == execution_schema_for("none", "lockstep")
+    v31 = {"execution_schema": PADDED_SLOT_TOKEN_EXECUTION_SCHEMA}
+    assert not resume_execution_schema_compatible(
+        v31, expected_execution_schema=token
+    )
+    assert resume_execution_schema_compatible(
+        v31, expected_execution_schema=token, allow_token_rng_migration=True
+    )
+    # Never into another contract, and never from anything but v31.
+    for target in (
+        EXECUTION_SCHEMA,
+        execution_schema_for("carry", "lockstep"),
+        execution_schema_for("cot", "continuous_refill"),
+    ):
+        assert not resume_execution_schema_compatible(
+            v31, expected_execution_schema=target, allow_token_rng_migration=True
+        )
+    for stale in (None, EXECUTION_SCHEMA, execution_schema_for("carry", "lockstep")):
+        assert not resume_execution_schema_compatible(
+            {"execution_schema": stale},
+            expected_execution_schema=token,
+            allow_token_rng_migration=True,
+        )
+
+
+def test_nano_emit_logprobs_take_the_fused_readout_and_agree_compiled():
+    """The production (nano) emit tail: fused readout == the rendered logits,
+    and the grad-enabled compiled artifact is bit-stable across calls — the
+    refresh and the update of the behavior-age-0 canary are two such calls."""
+    wrapper = _deterministic_nano_wrapper()
+    batch = _rollout(wrapper, batch=2, prompt=6, new_tokens=4)
+    emit_index = slot_index(batch.action_mask.bool())
+    with torch.no_grad():
+        stream_inputs, beliefs = replay_beliefs(wrapper, batch)
+    emit_inputs = compact_slots(stream_inputs, emit_index)
+    emit_beliefs = compact_slots(beliefs, emit_index)
+    targets = compact_next_slots(batch.token_ids, emit_index)
+    expected = (
+        wrapper.backbone.logits_from_features(
+            wrapper.renderer_features(emit_inputs, emit_beliefs)
+        )
+        .log_softmax(-1)
+        .gather(-1, targets[:, None])
+        .squeeze(-1)
+    )
+    eager = compact_emit_token_logprobs(
+        wrapper, emit_inputs, emit_beliefs, targets
+    )
+    torch.testing.assert_close(eager, expected)
+    assert eager.grad_fn is not None and "Softcapped" in type(eager.grad_fn).__name__
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        compact_emit_token_logprobs, fullgraph=True, dynamic=True
+    )
+    refresh = compiled(wrapper, emit_inputs, emit_beliefs, targets)
+    update = compiled(wrapper, emit_inputs, emit_beliefs, targets)
+    assert torch.equal(refresh, update)
+    torch.testing.assert_close(refresh, eager, rtol=1e-5, atol=1e-6)
+    update.sum().backward()
+    assert wrapper.backbone.proj.weight.grad is not None

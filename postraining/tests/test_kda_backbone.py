@@ -776,3 +776,23 @@ def test_kda_paged_step_core_is_one_full_graph_across_ragged_positions():
             )
             assert torch.isfinite(output[-1]).all()
     assert len(compiled_graphs) == 1
+
+
+def test_recurrent_step_contracts_in_fp32_under_autocast():
+    """The decode recurrence keeps its fp32 contract inside bf16 autocast:
+    einsum is on autocast's lower-precision list, so without the local
+    opt-out both contractions ran as bf16 GEMMs over a bf16 state copy."""
+    torch.manual_seed(0)
+    batch, heads, dim = 3, 2, 32
+    q, k = torch.randn(2, batch, heads, dim).bfloat16()
+    v = torch.randn(batch, heads, dim).bfloat16()
+    gate = -torch.rand(batch, heads, dim)
+    beta = torch.rand(batch, heads)
+    state = torch.randn(batch, heads, dim, dim)
+    expected_state = state.clone()
+    expected = kda_model.kda_recurrent_step(q, k, v, gate, beta, expected_state)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = kda_model.kda_recurrent_step(q, k, v, gate, beta, state)
+    assert out.dtype == torch.float32
+    assert torch.equal(out, expected)
+    assert torch.equal(state, expected_state)

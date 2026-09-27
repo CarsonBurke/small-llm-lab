@@ -197,7 +197,7 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
         yield from self.proj.parameters()
 
     def _raw_logits(self, belief: Tensor) -> Tensor:
-        return self.proj(belief).float()
+        return self.proj(belief)
 
     # -------------------------------------------------------------- caches
     def make_generation_cache(
@@ -259,15 +259,17 @@ class NanoKDABackbone(_NanoPostrainingMixin, kda_model.KDAGPT):
         position: "int | Tensor",
         key_mask: Tensor | None = None,
         block_mask=None,
+        key_starts: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, ...]]:
         del x0  # no encoder/decoder skip input in the nano trunks
         if block.use_kda:
-            # position/key_mask/block_mask are KV addressing; a recurrent
+            # position and the key range are KV addressing; a recurrent
             # step has no history to address. Caches mutate in place.
             x = x + block.attn.step(block.norm1(x), cache)
         else:
             attn, cache = self._attention_step(
-                block.attn, block.norm1(x), cache, position, key_mask, block_mask
+                block.attn, block.norm1(x), cache, position, key_mask,
+                block_mask, key_starts,
             )
             x = x + attn
         if block.use_mlp:

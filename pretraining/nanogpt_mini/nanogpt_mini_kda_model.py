@@ -48,6 +48,14 @@ import torch.nn.functional as F
 
 from pretraining.latent_moe import LatentMoEConfig, StableLatentMoE
 
+try:  # The fused CUDA decode step; the module stays importable without Triton.
+    from pretraining.nanogpt_mini.kda_decode_kernel import (
+        fused_decode_supported,
+        kda_decode_step,
+    )
+except ImportError:
+    kda_decode_step = None
+
 KDA_SAFE_GATE_LOWER_BOUND = -5.0
 
 
@@ -217,17 +225,48 @@ def kda_recurrent_step(
     q/k/v: ``[B, H, Dk|Dv]`` raw post-conv head projections; gate: log-space
     ``[B, H, Dk]``; beta: sigmoid write strength ``[B, H]``.
     """
+    q, k, v = _normalized_heads(q, k, v)
+    # einsum is on autocast's lower-precision list: left enabled, both
+    # contractions would run as bf16 GEMMs over a bf16 copy of the state.
+    with torch.autocast(state.device.type, enabled=False):
+        decayed = state * gate.exp()[:, :, None, :]
+        delta = v - torch.einsum("bhvk,bhk->bhv", decayed, k)
+        updated = decayed + (
+            beta.float()[:, :, None, None]
+            * delta[:, :, :, None]
+            * k[:, :, None, :]
+        )
+        state.copy_(updated)
+        return torch.einsum("bhvk,bhk->bhv", updated, q)
+
+
+def _normalized_heads(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     scale = q.size(-1) ** -0.5
-    q = _l2norm(q.float()) * scale
-    k = _l2norm(k.float())
-    v = v.float()
-    decayed = state * gate.exp()[:, :, None, :]
-    delta = v - torch.einsum("bhvk,bhk->bhv", decayed, k)
-    updated = decayed + (
-        beta.float()[:, :, None, None] * delta[:, :, :, None] * k[:, :, None, :]
+    return _l2norm(q.float()) * scale, _l2norm(k.float()), v.float()
+
+
+def kda_decode_recurrent_step(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    gate: Tensor,
+    beta: Tensor,
+    state: Tensor,
+) -> Tensor:
+    """``kda_recurrent_step`` as decode runs it: on CUDA one fused Triton
+    kernel (one read and one write of the fp32 state instead of several
+    passes; see ``kda_decode_kernel``), elsewhere the reference step."""
+    if kda_decode_step is None or not fused_decode_supported(state):
+        return kda_recurrent_step(q, k, v, gate, beta, state)
+    q, k, v = _normalized_heads(q, k, v)
+    return kda_decode_step(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        gate.float().contiguous(),
+        beta.float().contiguous(),
+        state,
     )
-    state.copy_(updated)
-    return torch.einsum("bhvk,bhk->bhv", updated, q)
 
 
 def reference_kda_recurrence(
@@ -266,8 +305,9 @@ class KimiDeltaAttention(nn.Module):
 
     Full-sequence forward dispatches to FLA's ``chunk_kda`` on CUDA (the
     training kernel, gradient-capable) and to the reference recurrence on
-    CPU. ``step`` is pure PyTorch on every device so the rollout decode step
-    stays inside one compiled graph (FLA kernels graph-break).
+    CPU. ``step`` runs the recurrence through a registered Triton op on CUDA
+    (``kda_decode_kernel``), which traces into the compiled rollout step
+    without a graph break, and the reference step elsewhere.
     """
 
     def __init__(
@@ -452,9 +492,8 @@ class KimiDeltaAttention(nn.Module):
     ) -> Tensor:
         """One-token decode step over ``[B, 1, dim]``; caches mutate in place.
 
-        Pure PyTorch by design: the recurrence is a handful of elementwise
-        ops and two tiny einsums, so keeping it in the compiled rollout step
-        graph beats calling a Triton kernel that would split the graph.
+        The recurrence is a registered custom op on CUDA, so the step stays
+        one compiled graph (FLA's kernels would split it).
         """
         x_flat = x.squeeze(1)
         conv_q, conv_k, conv_v, state = caches
@@ -465,7 +504,7 @@ class KimiDeltaAttention(nn.Module):
         decay_logits = self.f_b_proj(self.f_a_proj(x_flat)).view(heads)
         gate = kda_decay_gate(decay_logits, self.A_log, self.dt_bias)
         beta = torch.sigmoid(self.b_proj(x_flat).float())
-        o = kda_recurrent_step(
+        o = kda_decode_recurrent_step(
             q.view(heads), k.view(heads), v.view(heads), gate, beta, state
         ).to(x.dtype)
         y = self.o_norm(o, self._output_gate(x_flat))

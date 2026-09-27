@@ -38,6 +38,7 @@ from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
 from postraining.core import top_p_sample as _core_top_p_sample
+from postraining.nucleus_threshold import nucleus_threshold
 from postraining.latent_thought import (
     EMIT,
     THINK,
@@ -93,6 +94,191 @@ def _counter_uniform(seed: Tensor, width: int) -> Tensor:
         torch.finfo(torch.float32).eps,
         1.0 - torch.finfo(torch.float32).eps,
     )
+
+
+UINT64_MASK = (1 << 64) - 1
+
+
+def splitmix64(value: int) -> int:
+    value = (value + 0x9E3779B97F4A7C15) & UINT64_MASK
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & UINT64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & UINT64_MASK
+    return value ^ (value >> 31)
+
+
+def request_seed(pool_seed: int, request_id: int, sample_index: int) -> int:
+    """Unsigned 64-bit key of one sample of one request in a rollout pool."""
+    seed = splitmix64(pool_seed & UINT64_MASK)
+    seed = splitmix64(seed ^ (request_id & UINT64_MASK))
+    return splitmix64(seed ^ (sample_index & UINT64_MASK))
+
+
+def signed64(value: int) -> int:
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+def trajectory_token_seeds(
+    pool_seed: int,
+    request_ids: Sequence[int],
+    samples: int,
+    device: torch.device | str = "cpu",
+) -> Tensor:
+    """Prompt-major ``counter_gumbel_tokens`` seeds for a rollout chunk.
+
+    A trajectory's seed depends on the pool seed, its request's position in
+    the pool and its sample index -- never on chunking, batch width or the
+    global RNG -- so its sampling noise is a function of its identity alone
+    and resume needs no RNG state to reproduce it. (Its tokens also depend on
+    the logits, whose low bf16 bits can vary with the GEMM batch shape; a
+    resumed run replays the same shape sequence.)
+    """
+    return torch.tensor(
+        [
+            signed64(request_seed(pool_seed, request_id, sample))
+            for request_id in request_ids
+            for sample in range(samples)
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+
+
+_MASK32 = (1 << 32) - 1
+# Multipliers stay below 2**31 so every int64 product of a 32-bit lane is
+# exact (no signed overflow) on CPU and in generated Triton code alike.
+_MIX32 = 0x045D9F3B
+_SLOT_STRIDE = 0x2545F491
+_HIGH_LANE_SALT = 0x3C6EF372
+# The largest float32 below one. A 32-bit lane rounds to exactly 1.0 in its
+# top 128 values, which would make that token's race noise infinite and
+# veto it -- ~3e-8 per draw, i.e. hundreds of forced off-policy tokens over
+# a training run, each replacing a near-certain token.
+_UNIFORM_CEILING = 1.0 - 2.0**-24
+
+
+def _mix32(value: Tensor) -> Tensor:
+    """Bijective 32-bit avalanche mix (Mueller's hash) on int64 lanes."""
+    value = (((value >> 16) ^ value) * _MIX32) & _MASK32
+    value = (((value >> 16) ^ value) * _MIX32) & _MASK32
+    return (value >> 16) ^ value
+
+
+def counter_gumbel_scores(
+    logits: Tensor,
+    row_seeds: Tensor,
+    slot: int | Tensor,
+    temperature: float,
+) -> Tensor:
+    """Race scores ``logits / T - log E`` of ``counter_gumbel_tokens``."""
+    scores = logits.float()
+    if temperature != 1.0:
+        scores = scores / temperature
+    slot_key = _mix32((slot * _SLOT_STRIDE) & _MASK32)
+    low_lane = _mix32((row_seeds & _MASK32) ^ slot_key)
+    high_lane = _mix32(
+        ((row_seeds >> 32) & _MASK32) ^ _mix32(slot_key ^ _HIGH_LANE_SALT)
+    )
+    vocab = torch.arange(scores.size(-1), dtype=torch.int64, device=scores.device)
+    bits = _mix32(_mix32(low_lane[:, None] ^ vocab) ^ high_lane[:, None])
+    uniform = ((bits.float() + 0.5) * (1.0 / 2**32)).clamp_max(_UNIFORM_CEILING)
+    exponential = -torch.log1p(-uniform)
+    return scores - exponential.log()
+
+
+def nucleus_mask(logits: Tensor, temperature: float, top_p: float) -> Tensor:
+    """Vocabulary-order membership of the top-p nucleus of ``softmax(logits / T)``.
+
+    A token belongs to the nucleus when the probability mass ranked strictly
+    above it is at most ``top_p`` -- the rule ``_top_p_from_uniform`` applies
+    in sorted order. Membership is decided by a value threshold rather than
+    by sorted position, so tokens tied at the boundary are all kept and the
+    mask does not depend on how the sort orders equal logits (bf16 logits tie
+    often). The largest token always qualifies, so the mask is never empty.
+
+    On CUDA the threshold comes from ``nucleus_threshold``'s sort-free
+    search (a vocabulary sort costs ~60x the Gumbel draw at 1024 rows); the
+    sort below is the same rule for CPU and the kernel's test reference.
+    """
+    scores = logits.float()
+    if temperature != 1.0:
+        scores = scores / temperature
+    if logits.is_cuda:
+        # At unit temperature the kernel widens the logits itself, which
+        # skips materializing an fp32 copy of the vocabulary.
+        source = logits if temperature == 1.0 else scores
+        flat = source.reshape(-1, source.size(-1))
+        if flat.stride(-1) != 1:
+            flat = flat.contiguous()
+        threshold = nucleus_threshold(flat, top_p)
+        return scores >= threshold.view(*logits.shape[:-1], 1)
+    ranked = scores.sort(dim=-1, descending=True).values
+    probabilities = ranked.softmax(dim=-1)
+    kept = (probabilities.cumsum(dim=-1) - probabilities <= top_p).sum(
+        dim=-1, keepdim=True
+    )
+    return scores >= ranked.gather(-1, kept - 1)
+
+
+def counter_gumbel_tokens(
+    logits: Tensor,
+    row_seeds: Tensor,
+    slot: int | Tensor,
+    temperature: float,
+    top_p: float = 1.0,
+) -> Tensor:
+    """Sample one token per row by a counter-keyed Gumbel-max race.
+
+    Token ``v`` of row ``r`` at stream slot ``s`` draws its race noise from a
+    hash of ``(row_seeds[r], s, v)`` alone, so a trajectory's draws do not
+    depend on batch shape, compaction, filler rows or which kernel computed
+    them -- the eager and CUDA-graph decoders produce the same tokens from
+    the same logits. ``argmax(logits / T - log E)`` with ``E ~ Exp(1)`` is an
+    exact sample from ``softmax(logits / T)``, and it is one fused pass over
+    the vocabulary, where ``multinomial`` without replacement materializes
+    softmax, exponential noise and their quotient as separate full-vocab
+    tensors every decode step.
+
+    Both 32-bit halves of the int64 seed key the draw through separate lanes,
+    so two trajectories share noise only if their whole seeds match; a
+    single 32-bit key would give a 1024-row pool a colliding pair about once
+    in 8k pools. ``E = -log1p(-u)`` is taken from the fine end of a 32-bit
+    uniform, so the smallest ``E`` is ~1e-10 and the race truncates only
+    tokens more than ~22 nats below the leader.
+
+    ``top_p < 1`` runs the same race over the ``nucleus_mask`` tokens only.
+    Gumbel-max restricted to a subset samples the renormalized subset, so
+    this is exact nucleus sampling on the same per-token noise.
+    """
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError(f"top_p must lie in (0, 1], got {top_p}")
+    scores = counter_gumbel_scores(logits, row_seeds, slot, temperature)
+    if top_p < 1.0:
+        scores = scores.masked_fill(
+            ~nucleus_mask(logits, temperature, top_p), -torch.inf
+        )
+    return _race_winner(scores)
+
+
+# Vocabulary slices the race's argmax reduces separately. A one-stage row
+# argmax runs one program per row, so an 8-16 row decode tail hashes and
+# scans 50,304 tokens per program on a handful of SMs; slicing spreads that
+# across the GPU.
+_RACE_SLICES = 48
+
+
+def _race_winner(scores: Tensor) -> Tensor:
+    """``scores.argmax(dim=-1)`` as a per-slice then cross-slice reduction.
+
+    Both stages keep the first maximal index, so the winner, ties and NaN
+    included, is exactly ``argmax``'s.
+    """
+    vocab = scores.size(-1)
+    if vocab % _RACE_SLICES:
+        return scores.argmax(dim=-1)
+    width = vocab // _RACE_SLICES
+    best, within = scores.unflatten(-1, (_RACE_SLICES, width)).max(dim=-1)
+    winner = best.argmax(dim=-1, keepdim=True)
+    return (winner * width + within.gather(-1, winner)).squeeze(-1)
 
 
 def top_p_sample(
@@ -463,6 +649,7 @@ def rollout_continuations(
     decode_mask: DecodeRangeMask | None = None,
     tail_decode_mask: DecodeRangeMask | None = None,
     top_k: int | None = None,
+    token_seeds: Tensor | None = None,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
@@ -527,6 +714,13 @@ def rollout_continuations(
     when the caller will immediately recompute them through parallel replay.
     ``top_k`` optionally applies the authors' top-k filter before nucleus
     sampling; None preserves the existing full-vocabulary sampling path.
+    ``token_seeds`` (pinned-EMIT only, one int64 per output trajectory) draws
+    every token by ``counter_gumbel_tokens`` keyed on the trajectory's seed
+    and slot instead of from ``generator``: the training rollout contract that
+    ``graph_decode.PinnedDecodeArena`` replays under CUDA graphs. It races
+    over the whole tempered distribution, or over its ``top_p`` nucleus
+    (evaluation only; training samples the untruncated policy), and refuses
+    top-k.
     ``compact_finished`` removes completed rows and their KV cache entries at
     the existing 16-position synchronization points once at least 25% of the
     current rows have finished. With ``finished_batch_size``, compaction waits
@@ -615,6 +809,24 @@ def rollout_continuations(
             "a latent-thought rollout needs the stop gate and Gaussian "
             "transition; this wrapper was built without them"
         )
+    if token_seeds is not None:
+        if not pin_emit:
+            raise ValueError("token_seeds keys pinned-EMIT token draws only")
+        if top_k is not None or temperature <= 0.0:
+            raise ValueError(
+                "counter-Gumbel token draws race the tempered distribution "
+                "or its nucleus: top_k must be unset, temperature > 0"
+            )
+        if caches is not None:
+            raise ValueError(
+                "token_seeds rollouts on a static arena belong to "
+                "graph_decode.PinnedDecodeArena"
+            )
+        if token_seeds.shape != (prompt_ids.size(0) * prompt_repeats,) or (
+            token_seeds.dtype != torch.int64
+        ):
+            raise ValueError("token_seeds must be one int64 seed per trajectory")
+        token_seeds = token_seeds.to(prompt_ids.device)
     required_stream_steps = max_new_tokens + (0 if pin_emit else 1)
     if max_stream_steps < required_stream_steps:
         raise ValueError(
@@ -1308,14 +1520,25 @@ def rollout_continuations(
             token_uniform = (
                 None if policy_random is None else policy_random[:, 1]
             )
-            token = top_p_sample(
-                output.logits,
-                temperature,
-                top_p,
-                generator=generator,
-                top_k=top_k,
-                uniform=token_uniform,
-            )
+            if token_seeds is not None:
+                # Keyed on the row's own stream slot, not the padded
+                # one, so the draw does not depend on the chunk's width.
+                token = counter_gumbel_tokens(
+                    output.logits,
+                    token_seeds.index_select(0, live_rows),
+                    position if pad_lengths is None else position - pad_lengths,
+                    temperature,
+                    top_p,
+                )
+            else:
+                token = top_p_sample(
+                    output.logits,
+                    temperature,
+                    top_p,
+                    generator=generator,
+                    top_k=top_k,
+                    uniform=token_uniform,
+                )
             if record_likelihoods:
                 token_logprob = (
                     output.logits.float()
@@ -2002,31 +2225,29 @@ def replay_head_inputs(
 def compact_emit_token_logprobs(
     wrapper, emit_inputs: Tensor, emit_beliefs: Tensor, emit_targets: Tensor
 ) -> Tensor:
-    """log P(target token or token group) at each compact EMIT slot.
+    """log P(target token) at each compact EMIT slot.
 
     Refresh and the trainer's update step both come through this one helper
     so their forwards stay bit-identical (the behavior-age-0 zero-clip
     canary). Its vocabulary-wide temporaries scale with slots x vocab; the
     replay planner's slot budget bounds that, not this function.
 
-    The whole tail — renderer features, the readout GEMM, the logit softcap,
-    the fp32 log-softmax and the target gather — is deliberately ONE function
-    so the trainer can hand it to a single ``torch.compile`` artifact. Run
-    eagerly it is roughly eight separate passes over a (slots, vocab) fp32
-    tensor: ``_raw_logits`` already returns fp32, then the softcap spends a
-    pow, an add, an rsqrt and two multiplies, then log-softmax reads and
-    writes it again. Only the gathered (slots,) result is ever consumed, so
-    every one of those intermediates is bandwidth spent to produce something
-    immediately discarded.
+    Renderer features, the readout GEMM, the logit softcap, the fp32
+    log-softmax and the target gather are deliberately ONE function so the
+    trainer can hand them to a single ``torch.compile`` artifact: only the
+    gathered (slots,) result is consumed. Backbones that implement
+    ``target_logprobs_from_features`` also own the backward of that tail
+    (the nano family's softcapped readout saves only its raw GEMM output and
+    a logsumexp per slot); any other backbone renders the full logits.
     """
+    if emit_targets.ndim != 1:
+        raise ValueError("emit targets must be [actions]")
     features = wrapper.renderer_features(emit_inputs, emit_beliefs)
-    logits = wrapper.backbone.logits_from_features(features)
-    logprobs = logits.float().log_softmax(-1)
-    if emit_targets.ndim == 1:
-        return logprobs.gather(-1, emit_targets[:, None]).squeeze(-1)
-    if emit_targets.ndim == 2:
-        return logprobs.gather(-1, emit_targets)
-    raise ValueError("emit targets must be [actions] or [actions, candidates]")
+    backbone = wrapper.backbone
+    if hasattr(backbone, "target_logprobs_from_features"):
+        return backbone.target_logprobs_from_features(features, emit_targets)
+    logprobs = backbone.logits_from_features(features).float().log_softmax(-1)
+    return logprobs.gather(-1, emit_targets[:, None]).squeeze(-1)
 
 
 def compact_emit_token_log_odds(

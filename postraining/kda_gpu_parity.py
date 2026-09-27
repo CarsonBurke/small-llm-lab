@@ -4,7 +4,9 @@ Asserts, on CUDA, the agreements the CPU suite cannot check:
 
 1. FLA ``chunk_kda`` under the training flags == the pure-PyTorch reference
    recurrence (outputs and final state) — validates the derivation the decode
-   step and every CPU test stand on.
+   step and every CPU test stand on; and the fused Triton decode step
+   (``kda_decode_kernel``) == the reference step over 96 steps, eager and
+   inside a fullgraph compile.
 2. Teacher-forced logits == stepwise decode logits on a 986-configuration
    trunk (8 layers, KDA mixers at 0,1,2,4,5,6, 3 heads): fp32 tight for
    decode from an empty cache at every position, and bf16-autocast loose for
@@ -27,11 +29,12 @@ Asserts, on CUDA, the agreements the CPU suite cannot check:
    token-only rail; each stored carry == the replayed belief one slot
    earlier; and the compiled ``step_core`` (whose Gaussian outputs are None
    under carry) == the eager one, decoding the same carried stream.
-7. Whole rollouts collected the way the trainer collects them -- the
-   compiled lockstep step patched over ``step_core``, left-padded ragged
-   prompts, tensor positions, fixed-size tail compaction, with and without
-   the static CUDA-graph tail -- == eager parallel replay, for cot and the
-   live carry.
+7. Whole cot and live-carry rollouts collected the way the trainer collects
+   them -- ``PinnedDecodeArena``'s compiled tick replayed as CUDA graphs over
+   left-padded ragged prompts, with survivor compaction across captures and
+   attention through the ranged decode kernel -- == eager parallel replay:
+   each emitted token wins the counter-Gumbel race under the replay logits,
+   except at bf16 near-ties.
 
 Writes ``--output`` (default ``postraining/runs/kda_gpu_parity/result.json``)
 and exits nonzero on any failed bound, so an mlq failure IS a parity failure.
@@ -50,8 +53,11 @@ import torch
 
 from pretraining.nanogpt_mini import nanogpt_mini_kda_model as kda_model
 from postraining.kda_backbone import NanoKDABackbone
+from postraining.graph_decode import PinnedDecodeArena
 from postraining.latent_rollout import (
+    PAD_SLOT,
     LatentRolloutBatch,
+    counter_gumbel_scores,
     generated_slot_mask,
     replay_beliefs,
     rollout_continuations,
@@ -149,6 +155,51 @@ def main() -> None:
             decay.bfloat16(), beta.bfloat16().float(), A_log, dt_bias,
         )
     check("chunk_vs_reference_bf16", max_err(kernel_bf16, reference_bf16), 1e-1)
+
+    # ---- 1b. fused Triton decode step vs the reference step ---------------
+    # 96 consecutive steps from a nonzero state on bf16 head inputs (the
+    # production activation dtype), eager and inside a fullgraph compile --
+    # the op must trace into the rollout tick, not split it. Both sides are
+    # fp32 recurrences differing only in reduction order.
+    from pretraining.nanogpt_mini.kda_decode_kernel import fused_decode_supported
+
+    rows, steps = 40, 96
+    heads_in = torch.randn(steps, 3, rows, H, D, device=device).bfloat16()
+    step_gates = kda_model.kda_decay_gate(
+        torch.randn(steps, rows, H, D, device=device), A_log, dt_bias
+    )
+    step_betas = torch.rand(steps, rows, H, device=device)
+    initial = torch.randn(rows, H, D, D, device=device) * 0.1
+
+    def decode(step_fn, state):
+        outs = []
+        for t in range(steps):
+            q_t, k_t, v_t = heads_in[t]
+            outs.append(step_fn(q_t, k_t, v_t, step_gates[t], step_betas[t], state))
+        return torch.stack(outs)
+
+    compiled_step = torch.compile(
+        kda_model.kda_decode_recurrent_step, fullgraph=True, dynamic=False
+    )
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        reference_state = initial.clone()
+        reference_steps = decode(kda_model.kda_recurrent_step, reference_state)
+        fused_state = initial.clone()
+        fused_steps = decode(kda_model.kda_decode_recurrent_step, fused_state)
+        compiled_state = initial.clone()
+        compiled_steps = decode(compiled_step, compiled_state)
+    if not fused_decode_supported(initial):
+        failures.append("fused decode step does not cover the production shape")
+    if fused_steps.dtype != torch.float32:
+        failures.append(f"fused decode output dtype {fused_steps.dtype}")
+    check("fused_step_vs_reference_out", max_err(fused_steps, reference_steps), 1e-4)
+    check("fused_step_vs_reference_state", max_err(fused_state, reference_state), 1e-4)
+    check("compiled_fused_step_vs_eager_out", max_err(compiled_steps, fused_steps), 1e-5)
+    check(
+        "compiled_fused_step_vs_eager_state",
+        max_err(compiled_state, fused_state),
+        1e-5,
+    )
 
     # ---- 2. teacher-forced vs prefill+decode on the 986 layout ------------
     torch.manual_seed(1)
@@ -572,104 +623,155 @@ def main() -> None:
         2e-2,
     )
 
-    # ---- 7. full compiled rollout vs replay, cot and carry ----------------
-    # Section 6 drives the compiled step one position at a time from the
-    # eager rollout's stream. Here the whole rollout runs the way the trainer
-    # collects: the lockstep artifact patched over ``step_core`` (as
-    # ``collect`` does), tensor positions, and compaction that waits for the
-    # fixed tail size -- once on the dynamic-shape step alone (the production
-    # default) and once with the static CUDA-graph tail (--rollout-tail-graph),
-    # whose replay overwrites its outputs, so the carry must be copied out of
-    # ``belief`` before the next step. Each batch is graded against eager
-    # teacher-forced replay, the same replay the update trains on.
-    tail_rows = 4
-    # Left-padded ragged prompts with explicit lengths, as ``upload_chunk``
-    # builds them: the trainer's batched rollout always passes
-    # ``prompt_lengths``, which selects the key-masked decode attention. (The
-    # unmasked tensor-position path narrows the cache by a data-dependent
-    # length and cannot trace fullgraph; only the sequential
-    # --rollout-groups 0 branch would reach it.)
+    # ---- 7. graph-decode arena rollouts vs replay, cot and carry ----------
+    # Whole rollouts collected the way the trainer collects cot/none/carry:
+    # PinnedDecodeArena's compiled tick replayed as CUDA graphs, over
+    # left-padded ragged prompts with fan-out (so rows attend different key
+    # ranges), and row buckets small enough that survivors are compacted
+    # through several captures within one rollout. The arena records no likelihoods,
+    # so it is graded through its sampler instead: every emitted token must be
+    # the counter-Gumbel race winner under the trainer's own replay logits
+    # for the same (seed, slot). A disagreement is only admissible where the
+    # replay race is a near-tie that bf16 reduction order can flip; a stale
+    # graph buffer, a mis-compacted row, a wrong width mask or a mis-keyed
+    # slot changes the winner at ordinary margins.
     ragged_lengths = torch.tensor([64, 48, 57, 40], device=device)
     ragged_prompts = torch.zeros_like(carry_prompts)
     for row, length in enumerate(ragged_lengths.tolist()):
         ragged_prompts[row, -length:] = carry_prompts[row, :length]
+    arena_rows = ragged_prompts.size(0) * carry_repeats
+    arena_new_tokens = 64
 
-    def compiled_roll(
-        policy: LatentThoughtModel, hidden_carry: bool, tail_graph: bool
-    ) -> LatentRolloutBatch:
-        original_step_core = policy.step_core
-        rollout_core = torch.compile(
-            original_step_core,
-            mode="max-autotune-no-cudagraphs",
-            fullgraph=True,
-            dynamic=True,
+    def build_arena(
+        policy: LatentThoughtModel, hidden_carry: bool
+    ) -> PinnedDecodeArena:
+        return PinnedDecodeArena(
+            policy,
+            rows=arena_rows,
+            # Wider than any stream here so the attention kernel's split
+            # count (sized by cache width) exceeds one in the small buckets.
+            kv_width=1024,
+            temperature=1.0,
+            stop_ids=carry_stop_ids,
+            device=device,
+            hidden_carry=hidden_carry,
+            row_buckets=(8, 6, 4, 2),
+            sync_every=2,
         )
-        tail_caches = tail_core = None
-        if tail_graph:
-            tail_caches = policy.make_static_generation_cache(
-                tail_rows,
-                carry_prompts.size(1) + 64,
-                device,
-                dtype=torch.bfloat16,
-            )
-            tail_core = torch.compile(
-                original_step_core,
-                mode="reduce-overhead",
-                fullgraph=True,
-                dynamic=False,
-            )
-        policy.step_core = rollout_core
-        try:
-            torch.manual_seed(6)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                return trim_stream(
-                    rollout_continuations(
-                        policy,
-                        ragged_prompts,
-                        64,
-                        64,
-                        1.0,
-                        1.0,
-                        stop_ids=carry_stop_ids,
-                        prompt_lengths=ragged_lengths,
-                        prompt_repeats=carry_repeats,
-                        pin_emit=True,
-                        hidden_carry=hidden_carry,
-                        # The trainer skips these and refreshes them by
-                        # replay; recording them is what gives replay a
-                        # rollout-side reference to be graded against.
-                        cache_dtype=torch.bfloat16,
-                        tensor_positions=True,
-                        compact_finished=True,
-                        finished_batch_size=tail_rows,
-                        tail_caches=tail_caches,
-                        tail_step_core=tail_core,
-                    )
-                )
-        finally:
-            policy.step_core = original_step_core
 
-    for tail_graph, suffix in ((False, "compiled"), (True, "compiled_tail_graph")):
-        for policy, hidden_carry, mode in (
-            (wrapper, False, "cot"),
-            (carry_wrapper, True, "carry"),
-        ):
-            batch = compiled_roll(policy, hidden_carry, tail_graph)
-            error, beliefs = replay_error(policy, batch)
-            check(f"{mode}_bf16_{suffix}_rollout_vs_replay_logprob", error, 5e-1)
-            results[f"{mode}_{suffix}_rows_stopped_early"] = int(
-                (batch.action_mask.sum(1) < 64).sum()
+    def arena_roll(
+        arena: PinnedDecodeArena,
+        prompts: torch.Tensor,
+        lengths: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> LatentRolloutBatch:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            batch = arena.rollout(
+                prompts,
+                lengths,
+                prompt_repeats=carry_repeats,
+                max_new_tokens=arena_new_tokens,
+                max_stream_steps=arena_new_tokens,
+                token_seeds=seeds,
             )
-            if hidden_carry:
-                carried = generated_slot_mask(batch)[:, 1:]
-                check(
-                    f"carry_bf16_{suffix}_hidden_vs_replay_belief",
-                    max_err(
-                        batch.hiddens[:, 1:][carried],
-                        beliefs[:, :-1][carried],
-                    ),
-                    2.5e-1,
-                )
+        return trim_stream(batch)
+
+    def race_disagreement(
+        policy: LatentThoughtModel,
+        batch: LatentRolloutBatch,
+        seeds: torch.Tensor,
+    ) -> tuple[float, int, torch.Tensor]:
+        """Largest replay race margin at a token the arena did not pick."""
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            stream_inputs, beliefs = replay_beliefs(policy, batch)
+            logits = policy.backbone.logits_from_features(
+                policy.renderer_features(stream_inputs, beliefs)
+            ).float()
+        worst_margin, mismatches = 0.0, 0
+        emits = batch.emit_mask.bool()
+        # The race is keyed on each row's unpadded slot.
+        pads = (batch.kind != PAD_SLOT).long().argmax(1)
+        for slot in range(batch.kind.size(1) - 1):
+            rows = emits[:, slot].nonzero().squeeze(-1)
+            if rows.numel() == 0:
+                continue
+            scores = counter_gumbel_scores(
+                logits[rows, slot], seeds[rows], slot - pads[rows], 1.0
+            )
+            winner = scores.argmax(-1)
+            sampled = batch.token_ids[rows, slot + 1]
+            wrong = winner != sampled
+            if not bool(wrong.any()):
+                continue
+            margin = (
+                scores.gather(-1, winner[:, None])
+                - scores.gather(-1, sampled[:, None])
+            )[wrong]
+            worst_margin = max(worst_margin, float(margin.max()))
+            mismatches += int(wrong.sum())
+        return worst_margin, mismatches, beliefs
+
+    arena_seeds = torch.randint(
+        0, 2**62, (arena_rows,), device=device, dtype=torch.int64
+    )
+    # The second rollout reuses the captured arena the way the next training
+    # pool does: after an in-place parameter update (the optimizer's only
+    # kind of write), with a narrower prompt set, fewer rows and a smaller
+    # starting bucket. Stale KV, stale filler rows and replayed graphs that
+    # missed the update all fail the same race check.
+    narrow_lengths = torch.tensor([33, 21], device=device)
+    narrow_prompts = torch.zeros(
+        (2, int(narrow_lengths.max())), dtype=torch.long, device=device
+    )
+    for row, length in enumerate(narrow_lengths.tolist()):
+        narrow_prompts[row, -length:] = carry_prompts[row + 2, :length]
+    narrow_seeds = arena_seeds[: 2 * carry_repeats] ^ 0x5DEECE66D
+    for policy, hidden_carry, mode in (
+        (wrapper, False, "cot"),
+        (carry_wrapper, True, "carry"),
+    ):
+        arena = build_arena(policy, hidden_carry)
+        batch = arena_roll(arena, ragged_prompts, ragged_lengths, arena_seeds)
+        saved = [parameter.detach().clone() for parameter in policy.parameters()]
+        with torch.no_grad():
+            for parameter in policy.parameters():
+                parameter.mul_(1.03)
+        reused = arena_roll(arena, narrow_prompts, narrow_lengths, narrow_seeds)
+        reused_margin, reused_mismatches, _ = race_disagreement(
+            policy, reused, narrow_seeds
+        )
+        with torch.no_grad():
+            for parameter, value in zip(policy.parameters(), saved, strict=True):
+                parameter.copy_(value)
+        margin, mismatches, beliefs = race_disagreement(policy, batch, arena_seeds)
+        # bf16 logits of this trunk differ between decode and replay by
+        # ~1e-2 (section 2); a flip needs a race margin of that order.
+        check(f"{mode}_bf16_arena_rollout_vs_replay_race_margin", margin, 5e-2)
+        check(
+            f"{mode}_bf16_reused_arena_after_update_race_margin",
+            reused_margin,
+            5e-2,
+        )
+        results[f"{mode}_arena_emitted_tokens"] = int(batch.emit_mask.sum())
+        results[f"{mode}_arena_race_mismatches"] = mismatches
+        results[f"{mode}_reused_arena_emitted_tokens"] = int(
+            reused.emit_mask.sum()
+        )
+        results[f"{mode}_reused_arena_race_mismatches"] = reused_mismatches
+        results[f"{mode}_arena_rows_stopped_early"] = int(
+            (batch.action_mask.sum(1) < arena_new_tokens).sum()
+        )
+        results[f"{mode}_arena_row_buckets"] = len(arena.row_buckets)
+        if hidden_carry:
+            carried = generated_slot_mask(batch)[:, 1:]
+            check(
+                "carry_bf16_arena_hidden_vs_replay_belief",
+                max_err(
+                    batch.hiddens[:, 1:][carried],
+                    beliefs[:, :-1][carried],
+                ),
+                2.5e-1,
+            )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
