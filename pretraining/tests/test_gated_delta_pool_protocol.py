@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from pretraining.nanogpt_mini.gated_delta_pool import (
     BALANCE_COEFFICIENT, POOL_PASSES, POOL_READS, Z_COEFFICIENT, SharedPoolGatedDeltaGPT, balance_loss,
-    gather_events, pool_layout, pool_row_chunks, resolve_pool_options, scatter_events, z_loss,
+    dense_layer_layout, gather_events, pool_layout, pool_row_chunks, resolve_pool_options, scatter_events, z_loss,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -190,7 +190,7 @@ def test_pool_rejects_non_production_or_unchunked_configurations(bad):
 def test_pool_option_resolution_records_the_fixed_policy():
     routed = resolve_pool_options(None, "routed", 2, num_layers=6, head_dim=128)
     assert routed == dict(shared_pool=True, pool_banks=12, pool_writer="routed", pool_heads=2, pool_reads=POOL_READS,
-                          pool_passes=POOL_PASSES, pool_balance_coefficient=BALANCE_COEFFICIENT,
+                          pool_passes=POOL_PASSES, pool_readout="sum", pool_balance_coefficient=BALANCE_COEFFICIENT,
                           pool_z_coefficient=Z_COEFFICIENT)
     assert resolve_pool_options(None, "layer", 2, num_layers=6, head_dim=128)["pool_banks"] == 6
     assert resolve_pool_options(8, "routed", 4, num_layers=6, head_dim=128)["pool_banks"] == 8
@@ -220,7 +220,7 @@ def test_pool_configuration_initialization_and_parameter_ownership(writer):
     net = small(pool_writer=writer, pool_banks=3 if writer == "routed" else None)
     assert net.config["shared_pool"] and net.config["pool_banks"] == banks and net.config["pool_writer"] == writer
     assert net.config["pool_heads"] == 2 and net.config["pool_reads"] == POOL_READS == 2
-    assert net.config["pool_passes"] == POOL_PASSES == 2 and net.config["pool_balance_coefficient"] == BALANCE_COEFFICIENT
+    assert net.config["pool_passes"] == POOL_PASSES == 2 and net.config["pool_balance_coefficient"] == (0.0 if banks == POOL_READS else BALANCE_COEFFICIENT)
     assert net.config["pool_z_coefficient"] == Z_COEFFICIENT
     assert net.events_per_layer == (2 if writer == "routed" else 3)
     assert net.read_events == ([0, 1] if writer == "routed" else [1, 2])
@@ -406,3 +406,50 @@ def test_gate_reference_requires_a_matched_completed_run_with_one_update_400_val
               mutation.get("entries", base_entries))
         with pytest.raises(ValueError):
             trainer.load_gate_reference("control", args, data_path, tokenizer_path)
+
+
+@pytest.mark.parametrize("layers", [2, 3, 6])
+def test_dense_layout_preserves_every_event_in_causal_order_without_padding(layers):
+    batch, time, chunk = 2, 64, 64
+    layout = dense_layer_layout(batch, time, layers, chunk, "cpu")
+    slots = layout.slots.view(batch, time, layers, layers + 1)
+    routes = torch.empty_like(slots)
+    routes[..., 0] = torch.arange(layers)
+    routes[..., 1:] = torch.arange(layers)
+    for bank in range(layers):
+        for row in range(batch):
+            members = slots[row][routes[row] == bank]
+            start = (bank * batch + row) * time * (layers + 1)
+            assert members.tolist() == list(range(start, start + time * (layers + 1)))
+    assert slots.unique().numel() == layout.rows == slots.numel()
+    assert layout.cu_seqlens[-1] == layout.rows
+    assert torch.equal(layout.tile_bank, layout.chunk_indices[:, 0] // batch)
+    assert layout.bank_tiles[-1] == layout.chunks
+
+
+def test_dense_concat_config_roundtrip_and_independent_source_channels():
+    options = dict(vocab_size=32, num_layers=3, model_dim=128, head_dim=64, mixer_dim=128,
+                   pool_writer="layer", pool_reads=3, pool_readout="concat", **PRODUCTION)
+    net = SharedPoolGatedDeltaGPT(**options)
+    rebuilt = SharedPoolGatedDeltaGPT(**net.config)
+    rebuilt.load_state_dict(net.state_dict(), strict=True)
+    assert net.config["pool_balance_coefficient"] == 0
+    assert net.blocks[0].pool_o_proj.in_features == 3 * 2 * 64
+    # Routing alone runs on CPU without executing any model recurrence.
+    hidden = torch.randn(2, 5, 128)
+    _, probs, reads, weights, write = net.blocks[1].route(hidden)
+    assert torch.equal(reads, torch.arange(3).expand(2, 5, 3))
+    torch.testing.assert_close(weights, probs)
+    assert (write == 1).all()
+
+
+def test_readout_width_does_not_change_shared_memory_initialization():
+    options = dict(vocab_size=32, num_layers=3, model_dim=128, head_dim=64, mixer_dim=128,
+                   pool_writer="layer", **PRODUCTION)
+    torch.manual_seed(1337)
+    control = SharedPoolGatedDeltaGPT(pool_reads=2, pool_readout="sum", **options)
+    torch.manual_seed(1337)
+    candidate = SharedPoolGatedDeltaGPT(pool_reads=3, pool_readout="concat", **options)
+    for name, tensor in control.state_dict().items():
+        if ".pool_o_proj." not in name:
+            torch.testing.assert_close(tensor, candidate.state_dict()[name], rtol=0, atol=0)

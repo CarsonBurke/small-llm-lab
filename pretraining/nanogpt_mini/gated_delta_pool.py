@@ -142,6 +142,36 @@ def pool_layout(route: Tensor, banks: int, chunk: int) -> PoolLayout:
     return PoolLayout(slots, cu_seqlens, chunk_indices, tile_bank, bank_tiles, chunks * chunk, chunks)
 
 
+def dense_layer_layout(batch: int, time: int, layers: int, chunk: int, device) -> PoolLayout:
+    """Static single-writer/all-reader packing with no padding or routing search.
+
+    Bank j has one write plus L reads per token. Its write precedes read j;
+    reads below j see the previous-token state, reads at/above j the new one.
+    """
+    length = time * (layers + 1)
+    if length % chunk:
+        raise ValueError("Dense bank segments must contain whole kernel chunks")
+    bank = torch.arange(layers, device=device)
+    row = torch.arange(batch, device=device)
+    token = torch.arange(time, device=device)
+    base = (bank[:, None] * batch + row[None, :]) * length
+    write = base.t()[:, None, :] + token[None, :, None] * (layers + 1) + bank
+    # [batch, time, reader, bank], fixed source order.
+    reader = bank[:, None]
+    offset = reader + (bank[None, :] <= reader)
+    reads = base.t()[:, None, None, :] + token[None, :, None, None] * (layers + 1) + offset
+    slots = torch.cat((write.unsqueeze(-1), reads), -1).reshape(batch, -1)
+    per_segment = length // chunk
+    segments = batch * layers
+    chunks = segments * per_segment
+    local = torch.arange(chunks, device=device)
+    cu_seqlens = (torch.arange(segments + 1, device=device) * length).to(torch.int32)
+    chunk_indices = torch.stack((local // per_segment, local % per_segment), -1).to(torch.int32)
+    tile_bank = (local // (batch * per_segment)).to(torch.int32)
+    bank_tiles = (torch.arange(layers + 1, device=device) * batch * per_segment).to(torch.int32)
+    return PoolLayout(slots, cu_seqlens, chunk_indices, tile_bank, bank_tiles, chunks * chunk, chunks)
+
+
 class _ScatterRows(torch.autograd.Function):
     """Copy every field's events into their packed rows.
 
@@ -230,7 +260,7 @@ def z_loss(logits: Tensor) -> Tensor:
 
 
 def resolve_pool_options(pool_banks: int | None, pool_writer: str, pool_heads: int, *, num_layers: int,
-                         head_dim: int) -> dict:
+                         head_dim: int, pool_reads: int = POOL_READS, pool_readout: str = "sum") -> dict:
     """Validate the pool's free options and record them with the module's fixed policy.
 
     The layer writer owns one bank per layer, so its bank count is the layer
@@ -251,15 +281,24 @@ def resolve_pool_options(pool_banks: int | None, pool_writer: str, pool_heads: i
         pool_banks = 12
     if isinstance(pool_banks, bool) or not isinstance(pool_banks, int) or pool_banks < POOL_READS:
         raise ValueError(f"pool_banks must be an integer of at least {POOL_READS}")
+    if isinstance(pool_reads, bool) or not isinstance(pool_reads, int) or not 2 <= pool_reads <= pool_banks:
+        raise ValueError("pool_reads must lie between 2 and pool_banks")
+    if pool_readout not in ("sum", "concat"):
+        raise ValueError("pool_readout must be sum or concat")
+    if pool_readout == "concat" and (pool_reads != pool_banks or pool_writer != "layer"):
+        raise ValueError("concat readout requires all banks and layer-owned writers")
     return dict(shared_pool=True, pool_banks=pool_banks, pool_writer=pool_writer, pool_heads=pool_heads,
-                pool_reads=POOL_READS, pool_passes=POOL_PASSES, pool_balance_coefficient=BALANCE_COEFFICIENT,
+                pool_reads=pool_reads, pool_readout=pool_readout, pool_passes=POOL_PASSES,
+                pool_balance_coefficient=0.0 if pool_reads == pool_banks else BALANCE_COEFFICIENT,
                 pool_z_coefficient=Z_COEFFICIENT)
 
 
 def pool_policy(args, *, num_layers: int = 6) -> dict:
     """The pool configuration a training or benchmark command line records."""
     return resolve_pool_options(args.pool_banks, args.pool_writer, args.pool_heads, num_layers=num_layers,
-                                head_dim=args.memory_head_dim if hasattr(args, "memory_head_dim") else args.head_dim)
+                                head_dim=args.memory_head_dim if hasattr(args, "memory_head_dim") else args.head_dim,
+                                pool_reads=getattr(args, "pool_reads", POOL_READS),
+                                pool_readout=getattr(args, "pool_readout", "sum"))
 
 
 class PoolProjections(nn.Module):
@@ -351,7 +390,13 @@ class SharedPoolBlock(GatedDeltaBlock):
         self.router = nn.Linear(dim, config["pool_banks"], bias=False)
         self.pool_gate_proj = nn.Sequential(nn.Linear(dim, head_dim, bias=False), nn.Linear(head_dim, latent, bias=True))
         self.pool_norm = CustomOpRMSNormSwishGate(head_dim, elementwise_affine=True, eps=config["mixer_norm_eps"])
-        self.pool_o_proj = nn.Linear(latent, dim, bias=False)
+        self.pool_reads = config["pool_reads"]
+        self.pool_banks = config["pool_banks"]
+        self.pool_readout = config["pool_readout"]
+        # The readout is overwritten with zeros. Its shape must not perturb
+        # the random initialization of the other banks/projections in an ablation.
+        with torch.random.fork_rng(devices=[]):
+            self.pool_o_proj = nn.Linear(latent * (self.pool_banks if self.pool_readout == "concat" else 1), dim, bias=False)
 
     def route(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Router logits, probabilities, the top-k banks, their renormalized weights and the written bank."""
@@ -359,8 +404,13 @@ class SharedPoolBlock(GatedDeltaBlock):
         with torch.autocast("cuda", enabled=False):
             logits = F.linear(hidden.float(), self.router.weight.float())
             probs = logits.softmax(-1)
-            selected, reads = probs.topk(POOL_READS, -1)
-            weights = selected / selected.sum(-1, keepdim=True)
+            if self.pool_reads == self.pool_banks and self.pool_writer == "layer":
+                # Stable source order is essential for the concatenated readout.
+                reads = torch.arange(self.pool_banks, device=hidden.device).expand(*hidden.shape[:2], -1)
+                weights = probs
+            else:
+                selected, reads = probs.topk(self.pool_reads, -1)
+                weights = selected / selected.sum(-1, keepdim=True)
         write = reads[..., 0] if self.pool_writer == "routed" else torch.full_like(reads[..., 0], self.layer_index)
         return logits, probs, reads, weights, write
 
@@ -383,9 +433,15 @@ class SharedPoolBlock(GatedDeltaBlock):
         mixed = mixer if mixer is not None else self.attn(hidden)[0]
         gate = rearrange(self.pool_gate_proj(hidden), "... (h d) -> ... h d", d=self.pool_norm.hidden_size)
         # Each bank's read is normalized on its own, then the reads mix with the router's weights.
-        read = sum(self.pool_norm(output, gate) * weights[..., index, None, None].to(output.dtype)
-                   for index, output in enumerate(reads))
-        x = x + mixed + self.pool_o_proj(rearrange(read, "b t h d -> b t (h d)"))
+        normalized = [self.pool_norm(output, gate) * weights[..., index, None, None].to(output.dtype)
+                      for index, output in enumerate(reads)]
+        if self.pool_readout == "concat":
+            # Independent source channels survive until the learned output map.
+            # Unit-mean source weights preserve the private mixer's initial scale.
+            read = torch.cat([output.flatten(-2) for output in normalized], -1) * self.pool_banks
+        else:
+            read = sum(normalized).flatten(-2)
+        x = x + mixed + self.pool_o_proj(read)
         return x + self.mlp(self.norm2(x))
 
 
@@ -407,24 +463,23 @@ class SharedPoolGatedDeltaGPT(GatedDeltaGPT):
 
     def _configure(self, *, pool_banks: int | None, pool_writer: str, pool_heads: int, shared_pool: bool = True,
                    pool_reads: int = POOL_READS, pool_passes: int = POOL_PASSES,
-                   pool_balance_coefficient: float = BALANCE_COEFFICIENT,
-                   pool_z_coefficient: float = Z_COEFFICIENT, **options) -> dict:
-        # The recorded pool policy is accepted back so a checkpoint's config rebuilds the model,
-        # but it is a constant of this module rather than a free option.
-        if (shared_pool is not True or pool_reads != POOL_READS or pool_passes != POOL_PASSES
-                or pool_balance_coefficient != BALANCE_COEFFICIENT or pool_z_coefficient != Z_COEFFICIENT):
-            raise ValueError(f"The shared pool always reads {POOL_READS} banks over {POOL_PASSES} passes with balance "
-                             f"coefficient {BALANCE_COEFFICIENT} and z coefficient {Z_COEFFICIENT}; "
-                             "the recorded policy differs")
+                   pool_balance_coefficient: float | None = None,
+                   pool_z_coefficient: float = Z_COEFFICIENT, pool_readout: str = "sum", **options) -> dict:
         config = gated_delta_config(**options)
+        policy = resolve_pool_options(pool_banks, pool_writer, pool_heads,
+                                      num_layers=config["num_layers"], head_dim=config["head_dim"],
+                                      pool_reads=pool_reads, pool_readout=pool_readout)
+        if (shared_pool is not True or pool_passes != POOL_PASSES
+                or (pool_balance_coefficient is not None and pool_balance_coefficient != policy["pool_balance_coefficient"])
+                or pool_z_coefficient != Z_COEFFICIENT):
+            raise ValueError("The recorded shared-pool execution or regularization policy differs")
         if not config["custom_ops"] or not config["fused_projections"]:
             raise ValueError("The shared pool runs on the custom-operator, packed-projection execution")
         if config["gate_in_kernel"]:
             raise ValueError("Pool events mix layers, so the decay gate is computed before dispatch")
         if config["allow_neg_eigval"]:
             raise ValueError("The shared pool covers erase gates in [0, 1]")
-        return dict(config, **resolve_pool_options(pool_banks, pool_writer, pool_heads,
-                                                   num_layers=config["num_layers"], head_dim=config["head_dim"]))
+        return dict(config, **policy)
 
     @staticmethod
     def _pool_owns(name: str) -> bool:
@@ -438,11 +493,12 @@ class SharedPoolGatedDeltaGPT(GatedDeltaGPT):
     @property
     def events_per_layer(self) -> int:
         """Pool events per (token, layer): the routed write also reads; the layer writer's write does not."""
-        return POOL_READS if self.config["pool_writer"] == "routed" else POOL_READS + 1
+        return self.config["pool_reads"] if self.config["pool_writer"] == "routed" else self.config["pool_reads"] + 1
 
     @property
     def read_events(self) -> list[int]:
-        return list(range(POOL_READS)) if self.config["pool_writer"] == "routed" else list(range(1, POOL_READS + 1))
+        reads = self.config["pool_reads"]
+        return list(range(reads)) if self.config["pool_writer"] == "routed" else list(range(1, reads + 1))
 
     @torch.no_grad()
     def _initialize_pool(self):
@@ -468,12 +524,14 @@ class SharedPoolGatedDeltaGPT(GatedDeltaGPT):
         for port in ports:
             if config["pool_writer"] == "layer":
                 banks_of_events.append(port.write)
-            banks_of_events.extend(port.reads[..., index] for index in range(POOL_READS))
+            banks_of_events.extend(port.reads[..., index] for index in range(config["pool_reads"]))
         route = torch.stack(banks_of_events, 2)                                    # [batch, time, layers * events]
-        layout = pool_layout(route.reshape(batch, -1), banks, chunk)
+        dense = config["pool_writer"] == "layer" and config["pool_reads"] == banks
+        layout = (dense_layer_layout(batch, time, layers, chunk, route.device) if dense else
+                  pool_layout(route.reshape(batch, -1), banks, chunk))
         slots = layout.slots.view(batch, time, layers, events)
         write_slots = slots[..., 0]
-        read_slots = slots[..., read_events].reshape(batch, time, layers * POOL_READS)
+        read_slots = slots[..., read_events].reshape(batch, time, layers * config["pool_reads"])
 
         def written(field):
             return scatter_events(list(field), write_slots, layout.rows)
@@ -484,7 +542,7 @@ class SharedPoolGatedDeltaGPT(GatedDeltaGPT):
         def kernel_layout(packed):
             return packed.view(1, layout.rows, heads, head_dim)
 
-        queries = scatter_events([query[layer] for layer in range(layers) for _ in range(POOL_READS)],
+        queries = scatter_events([query[layer] for layer in range(layers) for _ in range(config["pool_reads"])],
                                  read_slots, layout.rows)
         output = gated_delta_ops.chunk_gdn2_training(
             kernel_layout(adapted(queries, self.adapters.query)),
@@ -493,12 +551,13 @@ class SharedPoolGatedDeltaGPT(GatedDeltaGPT):
             kernel_layout(written(decay)), kernel_layout(written(erase)), kernel_layout(written(write)),
             cu_seqlens=layout.cu_seqlens, chunk_indices=layout.chunk_indices, state_v_first=config["state_v_first"])
         output = adapted(output[0].view(layout.rows, heads * head_dim), self.adapters.output)
-        reads = gather_events(kernel_layout(output), read_slots)
-        load = F.one_hot(route.reshape(batch, -1), banks).float().mean(1)         # [batch, banks] share of events
+        reads = gather_events(output.view(layout.rows, heads, head_dim), read_slots)
+        load = (ports[0].probs.new_full((batch, banks), 1 / banks) if dense else
+                F.one_hot(route.reshape(batch, -1), banks).float().mean(1))
         stats = dict(balance=sum(balance_loss(port.probs, port.reads, banks) for port in ports),
                      z=sum(z_loss(port.logits) for port in ports),
                      load_max=load.amax())
-        return [reads[layer * POOL_READS:(layer + 1) * POOL_READS] for layer in range(layers)], stats
+        return [reads[layer * config["pool_reads"]:(layer + 1) * config["pool_reads"]] for layer in range(layers)], stats
 
     def forward_passes(self, inputs: Tensor) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """Both passes' final hidden states plus pool statistics.

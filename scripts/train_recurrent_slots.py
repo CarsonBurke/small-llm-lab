@@ -243,6 +243,8 @@ def parse_args(argv=None):
     parser.add_argument("--allow-slow-diagnostic", action="store_true",
                         help="Allow a GDN2 quality diagnostic with completed slower timing evidence; never waive promotion gates")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--pool-reads", type=int, default=2)
+    parser.add_argument("--pool-readout", choices=("sum", "concat"), default="sum")
     args = parser.parse_args(argv)
     if not args.name or Path(args.name).name != args.name or args.name in {".", ".."}:
         parser.error("--name must be one directory component")
@@ -282,7 +284,7 @@ def parse_args(argv=None):
 def validate_shared_pool_options(parser, args):
     """Shared-pool flags belong to the custom-operator, packed GDN2 execution."""
     if not args.shared_pool:
-        if args.pool_banks is not None or args.pool_writer != "routed" or args.pool_heads != 2:
+        if args.pool_banks is not None or args.pool_writer != "routed" or args.pool_heads != 2 or getattr(args, "pool_reads", 2) != 2 or getattr(args, "pool_readout", "sum") != "sum":
             parser.error("--pool-banks, --pool-writer and --pool-heads describe --shared-pool")
         return
     if args.architecture != "gdn2" or not args.custom_ops or not args.fused_projections or args.gate_in_kernel:
@@ -423,7 +425,8 @@ def main(argv=None):
         if args.shared_pool:
             from pretraining.nanogpt_mini.gated_delta_pool import SharedPoolGatedDeltaGPT
             model = SharedPoolGatedDeltaGPT(pool_banks=args.pool_banks, pool_writer=args.pool_writer,
-                                            pool_heads=args.pool_heads, **options).cuda()
+                                            pool_heads=args.pool_heads, pool_reads=args.pool_reads,
+                                                    pool_readout=args.pool_readout, **options).cuda()
             model_source = ROOT / "pretraining/nanogpt_mini/gated_delta_pool.py"
             architecture = "nanogpt_mini_gated_delta_v2_shared_pool"
         else:

@@ -98,7 +98,7 @@ def benchmark_candidate(model, inputs, targets, *, microbatch, chunk_size, repea
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--microbatch", type=int, choices=(16, 32, 64, 128), default=64)
+    parser.add_argument("--microbatch", type=int, choices=(4, 8, 16, 32, 64, 128), default=64)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seq-len", type=int, choices=(1024, 4096), default=1024)
     parser.add_argument("--head-dim", type=int, choices=(32, 64, 128), default=128)
@@ -118,6 +118,8 @@ def main(argv=None):
     parser.add_argument("--pool-banks", type=int, default=None)
     parser.add_argument("--pool-writer", choices=("routed", "layer"), default="routed")
     parser.add_argument("--pool-heads", type=int, default=2)
+    parser.add_argument("--pool-reads", type=int, default=2)
+    parser.add_argument("--pool-readout", choices=("sum", "concat"), default="sum")
     args = parser.parse_args(argv)
     if args.seq_len == 4096 and args.architecture != "gdn2":
         parser.error("4K contexts currently require --architecture gdn2")
@@ -203,7 +205,8 @@ def main(argv=None):
                                gate_in_kernel=args.gate_in_kernel)
                 if args.shared_pool:
                     model = SharedPoolGatedDeltaGPT(pool_banks=args.pool_banks, pool_writer=args.pool_writer,
-                                                    pool_heads=args.pool_heads, **options)
+                                                    pool_heads=args.pool_heads, pool_reads=args.pool_reads,
+                                                    pool_readout=args.pool_readout, **options)
                 else:
                     model = GatedDeltaGPT(**options)
             print(f"benchmarking {label}: full-update compiled CUDA graphs", flush=True)

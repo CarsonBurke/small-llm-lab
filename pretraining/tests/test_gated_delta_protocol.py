@@ -285,7 +285,7 @@ def test_shared_pool_gate_binds_pool_geometry(gate):
     args.shared_pool = True
     with pytest.raises(ValueError, match="configuration"):
         check()
-    policy = dict(shared_pool=True, pool_banks=12, pool_writer="routed", pool_heads=2, pool_reads=2, pool_passes=2,
+    policy = dict(shared_pool=True, pool_banks=12, pool_writer="routed", pool_heads=2, pool_reads=2, pool_passes=2, pool_readout="sum",
                   pool_balance_coefficient=0.01, pool_z_coefficient=0.001)
     report["candidate"]["model_config"].update(policy)
     assert check()["candidate_tokens_per_second"] == 655360

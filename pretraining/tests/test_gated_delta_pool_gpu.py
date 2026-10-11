@@ -37,11 +37,12 @@ def relative(actual, expected, tolerance, name):
     assert error < tolerance, (name, float(error))
 
 
-def small(*, banks=3, writer="routed", seed=733, readout=.05):
+def small(*, banks=3, writer="routed", seed=733, readout=.05, dense=False):
     """Two-layer pool model with a nonzero readout so the pool path carries gradient."""
     torch.manual_seed(seed)
     net = SharedPoolGatedDeltaGPT(vocab_size=32, num_layers=2, model_dim=128, head_dim=64, mixer_dim=128,
                                   pool_banks=None if writer == "layer" else banks, pool_writer=writer,
+                                  pool_reads=2, pool_readout="concat" if dense else "sum",
                                   **PRODUCTION).cuda()
     with torch.no_grad():
         for name, parameter in net.named_parameters():
@@ -92,7 +93,7 @@ def pool_events(net, ports):
     banks = []
     for port in ports:
         columns = ([port.write] if net.config["pool_writer"] == "layer" else [])
-        columns += [port.reads[..., index] for index in range(POOL_READS)]
+        columns += [port.reads[..., index] for index in range(net.config["pool_reads"])]
         banks.append(torch.stack(columns, -1))
     route = torch.stack(banks, 2).reshape(batch, -1)
     is_read = torch.zeros(batch, time, layers, events, dtype=torch.bool, device=route.device)
@@ -204,7 +205,9 @@ def test_pool_reads_follow_the_literal_adapted_bank_recurrence_in_event_order(wr
     layout = pool_layout(route, banks, 64)
     counts = F.one_hot(route, banks).sum(1)
     assert stats["load_max"].item() == pytest.approx(counts.max().item() / route.shape[1], abs=1e-6)
-    assert counts.min() > 0 and (counts % 64).any(), "banks are unequal and not chunk-aligned: real packing"
+    assert counts.min() > 0
+    if writer == "routed":
+        assert (counts % 64).any(), "exercise dynamic padding"
     for index, port in enumerate(ports):
         assert (port.reads[..., 0] != port.reads[..., 1]).all() and (port.weights.sum(-1) - 1).abs().max() < 1e-5
         if writer == "layer":
@@ -227,14 +230,15 @@ def test_pool_reads_follow_the_literal_adapted_bank_recurrence_in_event_order(wr
             read_members = is_read[b, members]
             relative(observed[b, members][read_members], expected[read_members], .02, f"sequence {b} bank {bank}")
             compared += int(read_members.sum())
-    assert compared == int(is_read.sum()) == batch * 192 * 2 * POOL_READS, "every read event is read"
+    assert compared == int(is_read.sum()) == batch * 192 * 2 * net.config["pool_reads"], "every read event is read"
 
 
-def test_packed_reads_and_gradients_match_one_kernel_call_per_bank():
+@pytest.mark.parametrize("dense", [False, True])
+def test_packed_reads_and_gradients_match_one_kernel_call_per_bank(dense):
     """The packed call with per-tile adapters equals dense per-bank calls with plain matmuls, forward and backward."""
     from pretraining.nanogpt_mini import gated_delta_ops as ops
     banks = 2
-    net = small(banks=banks).train()
+    net = small(banks=banks, writer="layer" if dense else "routed", dense=dense).train()
     tokens = torch.randint(32, (2, 128), device="cuda", dtype=torch.int32)
     with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
         ports = first_pass(net, tokens)
@@ -414,3 +418,25 @@ def test_production_layer_writer_compiles_whole_and_trains_every_parameter():
     del loss, net
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def test_dense_concat_is_causal_compiles_and_all_sources_receive_credit():
+    net = small(writer="layer", dense=True).train()
+    tokens = torch.randint(32, (2, 128), device="cuda", dtype=torch.int32)
+    changed = tokens.clone()
+    changed[0, 65:] = (changed[0, 65:] + 1) % 32
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        _, whole, _ = net.forward_passes(tokens)
+        _, other, _ = net.forward_passes(changed)
+    torch.testing.assert_close(whole[0, :65], other[0, :65], rtol=0, atol=0)
+    torch.testing.assert_close(whole[1], other[1], rtol=0, atol=0)
+    loss = compiled_gated_delta_loss(net, 64)
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        loss(tokens, torch.randint(32, tokens.shape, device="cuda")).backward()
+    assert loss.audit_graph_breaks() == {}
+    for name, parameter in net.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum() > 0, name
+    for block in net.blocks:
+        for source_grad in block.pool_o_proj.weight.grad.split(128, -1):
+            assert source_grad.abs().sum() > 0

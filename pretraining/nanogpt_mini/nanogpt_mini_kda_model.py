@@ -143,6 +143,8 @@ class ShortConv(nn.Module):
     current token.
     """
 
+    activation = staticmethod(F.silu)
+
     def __init__(self, hidden_size: int, kernel_size: int):
         super().__init__()
         self.hidden_size = hidden_size
@@ -157,7 +159,7 @@ class ShortConv(nn.Module):
             groups=self.hidden_size,
             padding=self.kernel_size - 1,
         )[..., : x.size(1)].transpose(1, 2)
-        return F.silu(y)
+        return self.activation(y)
 
     def final_state(self, x: Tensor) -> Tensor:
         """The ``[B, D, W]`` cache a decode continuation needs: the last W
@@ -173,7 +175,7 @@ class ShortConv(nn.Module):
         shifted = torch.cat((cache[:, :, 1:], x.to(cache.dtype)[:, :, None]), dim=-1)
         cache.copy_(shifted)
         y = (shifted * self.weight[:, 0, :].type_as(shifted)).sum(-1)
-        return F.silu(y).to(x.dtype)
+        return self.activation(y).to(x.dtype)
 
 
 class GatedRMSNorm(nn.Module):
@@ -210,20 +212,19 @@ def _l2norm(x: Tensor) -> Tensor:
     return x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)
 
 
-def kda_recurrent_step(
+def kda_delta_update(
     q: Tensor,
     k: Tensor,
     v: Tensor,
     gate: Tensor,
     beta: Tensor,
     state: Tensor,
-) -> Tensor:
-    """One fp32 delta-rule step. ``state`` is ``[B, H, Dv, Dk]`` (value-major,
-    FLA's ``state_v_first=True`` layout) and is updated IN PLACE so decode
-    caches behave like the KV caches the rest of the stack mutates.
+) -> tuple[Tensor, Tensor]:
+    """One fp32 delta-rule step, functional: returns ``(o, updated_state)``.
 
-    q/k/v: ``[B, H, Dk|Dv]`` raw post-conv head projections; gate: log-space
-    ``[B, H, Dk]``; beta: sigmoid write strength ``[B, H]``.
+    ``state`` is ``[B, H, Dv, Dk]`` (value-major, FLA's ``state_v_first=True``
+    layout). q/k/v: ``[B, H, Dk|Dv]`` raw post-conv head projections; gate:
+    log-space ``[B, H, Dk]``; beta: sigmoid write strength ``[B, H]``.
     """
     q, k, v = _normalized_heads(q, k, v)
     # einsum is on autocast's lower-precision list: left enabled, both
@@ -236,8 +237,22 @@ def kda_recurrent_step(
             * delta[:, :, :, None]
             * k[:, :, None, :]
         )
-        state.copy_(updated)
-        return torch.einsum("bhvk,bhk->bhv", updated, q)
+        return torch.einsum("bhvk,bhk->bhv", updated, q), updated
+
+
+def kda_recurrent_step(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    gate: Tensor,
+    beta: Tensor,
+    state: Tensor,
+) -> Tensor:
+    """``kda_delta_update`` with ``state`` updated IN PLACE, so decode caches
+    behave like the KV caches the rest of the stack mutates."""
+    o, updated = kda_delta_update(q, k, v, gate, beta, state)
+    state.copy_(updated)
+    return o
 
 
 def _normalized_heads(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -292,12 +307,14 @@ def reference_kda_recurrence(
     state = q.new_zeros(B, H, Dv, Dk, dtype=torch.float32)
     if initial_state is not None:
         state = state + initial_state.float()
-    outputs = torch.empty(B, T, H, Dv, dtype=torch.float32, device=q.device)
+    outputs = []
+    # Functional steps keep the oracle differentiable (gradient parity tests).
     for t in range(T):
-        outputs[:, t] = kda_recurrent_step(
+        o, state = kda_delta_update(
             q[:, t], k[:, t], v[:, t], gate[:, t], beta[:, t], state
         )
-    return outputs.to(v.dtype), state
+        outputs.append(o)
+    return torch.stack(outputs, dim=1).to(v.dtype), state
 
 
 class KimiDeltaAttention(nn.Module):
