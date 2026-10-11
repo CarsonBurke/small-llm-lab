@@ -5843,7 +5843,7 @@ propagated clean stream (per-level CE oscillation).
 
 The stopped step-203 MiniCPM5 VAPO checkpoint now has a consumable v6
 continuation at
-`postraining/runs/minicpm5_dapo_vapo_criticpretrain_fa4_batchedkv_8k_production/vapo_adapter_checkpoint_v6.pt`.
+`postraining/minicpm5_runs/minicpm5_dapo_vapo_criticpretrain_fa4_batchedkv_8k_production/vapo_adapter_checkpoint_v6.pt`.
 The migration preserves the actor adapter, actor NextLat head, value head,
 completed-boundary cursor/RNG state, and every existing optimizer moment. It
 initializes a separate critic adapter and separate critic NextLat head; the
@@ -10286,3 +10286,1648 @@ responses/partialcoderewards/all6sources. Budget50+420+530=1000. Initial estimat
 553usedsavedstep397; correctedto530usingactualcompletedstep420 beforestart
 (queued10264cancelledwithoutstarting). Queuepriority1,maxparallel1,12h limit.
 See corpus_quality_20260926/pg_critic_transfer_launch.json.
+
+## RL step throughput: g64, eval arena, nucleus kernel, cache keys (2026-09-26)
+
+Review of PG job 10265 (`kda8_pg_reviewed_v2_partial_2048_20260926`), whose
+GPU sat below 200 W of 550 W for long stretches. Baseline, from its
+metrics.jsonl: 8.16 s/step overall and 6.57 s/step over trained steps
+401-521. That is a pool of 4.6 s (collect 3.25 + update 1.43) plus bench and
+AIME evaluations of ~21 s each every 20 steps. Collect is tail-bound: a
+chunk runs until its longest row ends (up to 2,048 ticks), while the mean
+trajectory is ~99 tokens, so most ticks run in the 8-16-row buckets.
+
+Changes:
+
+- `--rollout-groups` now defaults to 64, so the 64x16 pool decodes as one
+  1,024-row chunk and pays the long tail once instead of twice. Measured from 10265's final checkpoint via
+  `--actor-init` (`perf_trained_g32/g64_20260926`, 16 steps each):
+  - collect 2.0 s at g64 against 2.9-3.0 s at g32;
+  - peak memory 13.5 GiB against 7.6 GiB;
+  - steady update ~1.1-1.2 s in both.
+  Early g64 update spikes (3-12 s) are one-time compiles of new shapes
+  after the cache-key change below. `scripts/launch_reviewed_rl.sh` now
+  passes 64.
+- Evaluation decodes through its own pinned arena, which holds the eval
+  nucleus as a tick constant. Bench dropped from ~21 s to 3.0 s and AIME
+  to 2.2 s.
+- `nucleus_threshold` (eval only; training enforces `--top-p 1`) searches
+  a half-open key bracket with rows-independent split counts. In CUDA
+  graphs it takes 2.19 ms at 1,024 rows (was 3.58), 58 us at 16 rows and
+  44 us at 8 rows (was 170 us). GPU tests cover the full fp32 range
+  (+-FLT_MAX, denormals) and require a symbolic-row compile to match
+  eager bitwise.
+- For rows <= 96, `counter_gumbel_tokens` finds the argmax in two stages:
+  the max over 48 vocab slices, then the argmax over those maxima. It
+  returns the exact row argmax, tie order included; tests cover ties, NaN
+  and masking. At 8 rows it takes 8.2 us against 26.0 us; above 96 rows
+  plain argmax is faster.
+- Execution schema v32 keys each counter-Gumbel draw on the row's own
+  unpadded slot; v31 keyed it on the chunk's left-padded slot.
+  - `--allow-token-rng-migration` resumes a v31 checkpoint under v32, and
+    no other schema change is allowed.
+  - `--allow-rollout-groups-migration` lets a resume change
+    `--rollout-groups`, and only for the counter-keyed lockstep
+    cot/none/carry draw.
+  - Both flags require `--resume`.
+  - Resume transitions now record `rollout_groups` in the manifest's
+    `topology_history`.
+- The arena and graph rows are sized to min(rollout groups, prompts per
+  rollout) x samples, because no pool is larger than that. A smaller pool
+  no longer allocates and captures a 1,024-row workspace under the new
+  default.
+- Evaluation noise breaks at the continuation. The source run evaluated
+  128 trajectories per batch with the compacted-tail global RNG. The eval
+  arena evaluates 1,024 per batch with counter-keyed per-row draws, so AIME
+  and bench evaluations after step 530 are not same-noise pairs with
+  earlier ones.
+
+Estimated steady state at g64: pool ~3.1-3.3 s plus amortised evaluations
+of ~0.3 s, about 3.5 s/step. That is ~1.9x faster than 10265's trained
+regime and ~2.3x faster than its overall rate.
+
+Compile-cache hazards found along the way (torch 2.13):
+
+- AOTAutogradCache finds a `triton_op`'s kernels only through the bare
+  `wrap_triton(Name)` spelling. `torch.library.wrap_triton` or a cast
+  hides the kernel, and editing the kernel then leaves the key unchanged.
+- The key never includes the op's Python body (grid, split count, scratch
+  buffers). A dynamic-shape compile of `nucleus_threshold` kept running a
+  superseded split rule from a warm cache: 1 of 300 rows differed from
+  eager by one bf16 step.
+  - Fix: `pretraining/nanogpt_mini/triton_op_cache.py` folds each op
+    module's SHA-256 into `torch.compiler.config.cache_key_tag`.
+    `test_triton_op_cache_keys.py` checks both hazards, and it fails if
+    a module defining a `triton_op` is missing from its registry. The tag
+    is process-wide, so any edit to an op module (including
+    `fast_inference.py`) invalidates every compile in processes that
+    import it. That costs time, never correctness. An op body that calls
+    a helper in another file would reopen the hazard.
+  - Earlier GPU measurements of edited `decode_attention` or KDA decode
+    op bodies may have run stale compiled graphs.
+
+Measured and rejected:
+
+- Fusing the KDA input projections saves ~5 us per tick.
+- Tail-tick profile (job 10323), ms per tick at positions 300/1200/2200:
+  - 1,024 rows: 4.16/6.78/9.61;
+  - 16 rows: 0.50/0.54/0.59;
+  - 8 rows: 0.43/0.50/0.53.
+- The 8-row tick is ~54 small GEMMs of ~3-7 us each, i.e. launch
+  latency. Its attention (~21 us per layer at position 2,200) is already
+  at HBM bandwidth.
+- Further tail gains need a persistent fused decode kernel.
+
+Pre-existing failures, not caused by these changes:
+
+- MoE parity bounds in `kda_gpu_parity` (they fail on baseline job 9962).
+  Every arena, race and carry bound passes:
+  `runs/kda_gpu_parity/result_v32_nucleus_20260926.json`.
+- `test_default_cli_selects_current_delightful_broad_regime` and
+  `test_delightful_cli_requires_one_on_policy_update_per_rollout` fail on
+  clean HEAD.
+
+## Abstention terminal reward: flag, exploration probe, eval fix (2026-09-27)
+
+Hypothesis: letting the policy say "no answer" gives it a calibrated
+choice. Right = 1, explicit abstention = 0, anything else = -λ. Answering
+beats abstaining exactly when the expected score exceeds λ/(1+λ), so the
+reward-optimal policy abstains only on prompts it cannot solve. Collapse
+into always abstaining costs every prompt it can solve.
+
+Implementation (`--abstention-penalty λ`, opt-in, requires
+`--answer-fence`):
+
+- An abstention is `core.structural_abstention`: the anchored think fence
+  (at least `--think-min-tokens` inside), then `<answer></answer>` with
+  nothing inside, then the stop token. Truncated, trailing-token and
+  otherwise malformed rows are never abstentions, so failing to finish
+  cannot earn the 0.
+- Other rows map score s in [0, 1] to s - λ(1 - s). Correct stays exactly
+  1.0, which `exact_accuracy` tests with `==`. Wrong, malformed and
+  truncated rows get -λ, and nearby partial credit keeps its place
+  between the two.
+- Math and Python scorers stamp `verifier_status = abstained` (code 6)
+  whether or not the flag is on. The rollout dashboard adds
+  `reward/abstained_fraction`, per-source `verifier_abstained_fraction`,
+  and eval adds `abstained_fraction` and `answered_accuracy`. A verdict's
+  `format_ok` stays `structural_format_ok`, which an empty span fails.
+- Contracts: `abstention_penalty` is an exact-resume field, critic-only
+  init refuses a different penalty, and so does `--actor-critic-init`,
+  because the critic fit a different terminal reward. Old checkpoints read
+  as None, so they still resume unpenalized.
+- The zero-reward actor freeze and the stop streak now test for a
+  constant reward (max == min) instead of an all-zero one. Under the
+  penalty, an all-wrong minibatch is a constant -λ with the same missing
+  contrast. An all-correct minibatch or pool now also counts: it has no
+  contrast either, and 32 such pools in a row mean nothing is left to
+  learn. Pool `reward_max`/`reward_min` are true pool extrema.
+  `aggregate_diagnostics` first averaged per-group extrema, which read
+  as constant whenever every group was internally constant; the
+  red-team caught this before any run used it.
+- `partial_reward_fraction` and the failed-row credit check measure
+  against `reward_floor` (-λ, else 0) and exclude abstentions. The modal
+  constant baseline is mapped onto the same scale as `reward/mean`.
+- The flag is refused with `--source-success-actor-gate`. That gate
+  silences a source until some row scores above 0, and a source of
+  wrong answers and abstentions is where the penalty's contrast teaches.
+- `diagnose_dg_entropy`, `inspect_critic_values` and
+  `carry_ablation_eval` rescore with the run's saved penalty.
+- The frozen learnability gate's `within_group_reward_std` threshold is
+  on the reward scale, which is up to (1 + λ) wider under the penalty.
+  Set it with that in mind.
+
+Eval bug fixed along the way: `verify_terminated_answer` graded an empty
+`<answer></answer>` by falling back to a plain-text parse of the whole
+decode, so an `Answer: 42` left inside the think counted as correct. An
+explicit empty span now returns `(False, "[NO ANSWER]")`. Captured bench
+attempts take `parsed_answer` from the grader itself instead of a
+re-derivation (unterminated rows now read `[UNTERMINATED]`).
+`LATENT_EVAL_METRIC_SCHEMA` is now v8. `answered_accuracy` is omitted
+when every sample abstained. Every other caller of
+`verify_terminated_answer` (SFT gate, sample_latent, OPSD gates,
+dapo_hit_rate_probe) inherits the fix.
+
+Exploration probe (job 10330, `abstain_probe.py` in the session
+scratchpad): the SFT actor
+(`kda8_sft_omi2_drills_code30k_science_v1_e1`) teacher-forced on 844
+recorded bench trajectories from the PG run, reading P(`</answer>`) at
+the `<answer>` position.
+
+- Median 5.4e-9, mean 6.9e-6, max 1.4e-3. The median rank of
+  `</answer>` is 3,245.
+- No empty span appears in any of the 1,266 recorded rollout and bench
+  samples from that run.
+- At 1,024 rows per step the expected rate is about 0.007 abstentions
+  per step, or about 7 across a 1,060-step run.
+- As things stand, the flag is therefore an affine shift of the old
+  reward that the critic absorbs. A run would not test abstention. The
+  prior must first be raised: for example, SFT on abstention
+  demonstrations (R-Tuning-style, labelled by the model's own failed
+  prompts, or label-free at a small uniform rate), or behavior-policy
+  forcing at the `<answer>` slot. Importance-correcting the forcing
+  scales the gradient by π/μ, about 1e-6, which erases the signal.
+- Parked on 2026-09-27: no abstention run launched. The flag and the
+  eval fix stay in.
+
+### Abstention run failure and reward normalization (2026-09-27)
+
+The later `kda8_pg_reviewed_v2_partial_2048_abstention1_20260927` run
+(mlq job 10372, λ=1) was cancelled by request after actor step 67, not by
+an exception. Only 3 of 68,608 rollout trajectories abstained. Across
+steps 0→60, bench accuracy fell 0.0113→0.0026 and bench ended fraction
+fell 0.753→0.360. Rollout ended fraction fell from 0.964 at step 1 to
+0.429 at step 67. Its 50-step critic warmup ended with value prediction
+−0.042 against target −0.964; at actor step 67 the prediction was still
+−0.087 against target −0.990. The signed reward made nearly every wrong
+trajectory −1, leaving large negative actor advantages while the scratch
+critic slowly fit the common offset. Every update had a few successes, so
+the constant-reward actor freeze did not engage. This reproduced the
+anti-termination failure mode seen with stale critic values.
+
+The abstention reward is now normalized by the positive affine transform
+`(signed_reward + λ) / (1 + λ)`: ordinary verifier scores stay in [0,1],
+wrong answers score 0, and a valid abstention scores `λ/(1+λ)` (0.5 for
+λ=1). This preserves the expected-reward decision threshold while putting
+the common wrong-answer outcome at the critic's zero initialization. A
+distinct reward schema blocks resuming the old signed-reward checkpoint
+or importing its critic into a normalized run. This removes the observed
+negative-offset mechanism by construction; it does not establish a
+measured BPB or abstention gain.
+
+The exploration problem remains: the SFT policy almost never emits an
+empty answer span. A normalized-reward run from that policy would mostly
+repeat the unpenalized baseline, so no further run was queued. Abstention
+needs a stronger prior (for example supervised empty-answer examples on
+prompts the model fails) before a full RL ablation can test it.
+
+### EOS abstention ablation (2026-09-28)
+
+The normalized empty-span run (mlq job 10515) was later cancelled by
+request after actor step 121. The replacement user-directed run is mlq
+job 10526, `kda8_pg_reviewed_v2_partial_2048_eos_abstention1_20260928`:
+50 critic warmup plus 950 actor updates, λ=1, priority -1. It starts
+from the same SFT checkpoint and reviewed mixture, with a fresh output
+directory and the distinct `normalized_eos_abstention/v3` reward schema.
+
+An abstention now requires an emitted EOS after an anchored, complete
+`<think>` section of at least 33 tokens, with no answer content. Between
+`</think>` and EOS the only allowed suffixes are empty, `<answer>`, or
+`<answer></answer>`. Truncation, an immediate EOS, and ordinary answer
+tokens earn no abstention reward. Math, Python, and evaluation share the
+definition; evaluation cannot grade an `Answer:` string inside the think
+as correct when the policy abstains. Submitted Python code still comes
+from `<answer>...</answer>` and may contain a Markdown code block, whose
+fence the Python verifier strips before testing.
+
+The return is undiscounted and has no explicit length cost: an EOS near
+the 2048-token cap earns the same abstention reward as an early EOS, while
+truncation earns zero. Rollout metrics now include the count, mean, and
+maximum emitted-token length of abstentions to expose late termination.
+This run tests the revised criterion; the length incentive is a material
+failure mode to watch rather than an established behavior.
+
+Code-source drift diagnosis behind the constant-reward generalization
+(run `kda8_pg_reviewed_v2_partial_2048_20260926*`): `ultradata_code_l3`
+earned partial credit on 68 of about 122k trajectories, all in steps
+2-187. A truncated row gets the same 0 as an ended wrong row, so an
+all-zero source's advantage is about -V on every token, whatever the
+policy did. That signal favors neither ending nor answering, and ended
+fraction and EV drifted down after the resume. The user later reported
+the run recovering.
+
+### EOS abstention run result: no abstentions, stopped (2026-09-29)
+
+Job 10526 never trained. It died with ENOSPC while `torch.save` wrote the
+critic-warmup checkpoint. It was requeued unchanged as job 10641
+(`kda8_pg_reviewed_v2_partial_2048_eos_abstention1_20260929_r2`,
+priority -1, 1 h limit). It was cancelled after actor step 132 because it
+had stopped producing information.
+
+- **No abstentions.** Across 132 actor steps × 1,024 trajectories, both
+  `abstained_fraction` and `verifier_abstained_fraction` were exactly 0
+  on every rollout, bench and AIME record. `abstained_emitted_tokens_count`
+  was also 0, so the late-EOS failure mode could not be observed either.
+- **The run matches the unpenalized baseline.** Bench accuracy was
+  0.0113, then 0.0139, 0.0200 and 0.0200 at steps 0/40/80/120. The
+  baseline `…_20260926` scored 0.0104, 0.0113, 0.0226 and 0.0260; the
+  normalized empty-span run scored 0.0113, 0.0095, 0.0156 and 0.0174.
+  The SE is about 0.004 on 1,152 items. Rollout ended fraction was
+  0.96–0.99, and decode utilization shortened from 0.26 to 0.11, as in
+  the baseline.
+- **Which run is the matched control.** The 09-26 run is not matched. It
+  started from a critic pretrained in an earlier run (`critic_only_init`,
+  no warmup), with 32 rollout groups and 530 planned steps. This run had
+  a fresh critic plus 50 warmup steps, with 64 groups and 950 steps. The
+  normalized run (09-28) has identical arguments and is the matched
+  control, and this run is marginally ahead of it at step 120.
+- **The penalty does not change rewards without abstentions.** A
+  non-abstaining row keeps its verifier score, and `think_min_tokens` is
+  33 in all three runs. So when no rows abstain, the rewards are
+  identical, and the 0.017–0.026 spread is ordinary run-to-run
+  variation.
+- **Why.** The EOS criterion did not change the exploration problem
+  recorded on 2026-09-27: the SFT policy never samples a complete think
+  followed by EOS with no answer. With no sampled abstentions, the
+  abstention reward never enters an advantage, so the run is the
+  baseline.
+- **Next.** Abstention still needs a prior before RL can test it, for
+  example SFT on empty-answer examples for prompts the SFT policy fails.
+  This recommendation is superseded by the detector correction below;
+  the old zero-abstention result does not establish that a new SFT prior
+  is necessary.
+
+### Post-think EOS abstention correction (2026-09-29)
+
+The user clarified that explanations and arbitrary output are allowed
+after thinking and before abstaining. The v3 detector incorrectly allowed
+only an immediate EOS or empty answer markers after `</think>`; even a
+newline disqualified abstention. Lambda was enabled at 1 in r2, but the
+qualification did not implement that intended behavior.
+
+`normalized_eos_abstention/v4` now accepts post-think content before EOS
+when no nonempty answer span has been closed. Closing a nonempty answer
+commits it: subsequent explanations, empty answers, or duplicate markers
+cannot turn a failed submission into abstention. The anchored complete
+think, minimum 33 think tokens, and emitted EOS requirements remain;
+truncation and EOS during thinking do not qualify. Math, Python, and
+evaluation share the detector, and explanation text is never graded as
+a submitted answer. The lambda equation is unchanged. The schema bump
+prevents old reward-state checkpoints from silently resuming as v4.
+
+Reclassified the retained r2 outputs: 0/59 training examples, 0/112 bench
+examples, and 0/112 AIME examples qualify under v4. The training captures
+retain hashed correct/incorrect examples per source at six snapshots,
+not all trajectories. Weighting each source's sampled incorrect-output
+abstention rate by its full-run incorrect count gives a point estimate of
+0 training abstentions, with weak precision because only six incorrect
+examples per source were retained. This is not evidence that the full
+138,240-trajectory count was exactly zero. Most saved outputs submit
+nonempty answers; removing the suffix restriction does not reclassify
+those as abstentions. The retrospective artifact is
+`postraining/runs/kda8_pg_reviewed_v2_partial_2048_eos_abstention1_20260929_r2/abstention_v4_reclassification.json`.
+
+Queue records show cancellation by request after about 23 minutes; the
+final metrics contain 135 actor updates (the earlier note recorded 132),
+plus 50 critic warmup updates. No new training or evaluation was launched
+for this correction; checks used synthetic CPU-only unit fixtures and
+saved outputs.
+
+## Hierarchical byte models: harness, learned patching, NextLat unembedder (2026-09-29)
+
+Code: `pretraining/hbyte/` (model, data, train), with tests in
+`pretraining/tests/test_hbyte.py` (CPU) and `test_hbyte_gpu.py` (mlq).
+Protocol: 1,000 steps of a 2,000-step cosine, compared with the matched
+token reference (1.3857 BPB at step 1,000). The recipe is the KDA8 token
+trainer's: Muon/AdamW, lr, wd and softcap as in that trainer, summed CE.
+
+**Comparisons on identical text.**
+- The byte and GPT-2 corpora hold the same documents in the same order.
+- Primary byte validation scores exactly the 9,266,876 bytes of the
+  reference's 2,097,152 validation tokens. Its rows are cut at the same
+  token-row boundaries, so every byte has the context start of the token
+  that contains it.
+- A fixed 8,192-byte-row panel and four domain panels are secondary.
+- The CPU test checks that every byte is scored once, in order, from its
+  true predecessor.
+
+**Model.**
+- Encoder: hashed n-gram byte embeddings (orders 3–8, 65k buckets each)
+  followed by a sliding-window local transformer (512 dim, window 512).
+- Trunk: the KDA8 trunk (KKKDKKKD) over patches.
+- Patchers:
+  - `static` uses a fixed stride.
+  - `entropy` uses a local next-byte head on the encoder states, trained
+    by its own CE. A patch ends after byte t when the predicted entropy of
+    byte t+1 exceeds a threshold, and a hard cap is enforced in closed form.
+  - The threshold is an EMA over past batches only, so boundaries depend
+    only on bytes ≤ t. `rate` mode bisects for the threshold whose
+    *realized* patch rate, including forced cap ends, is 1/L, which makes
+    it FLOP-matched to static-L. `mean` mode uses the mean predicted
+    entropy: continue while the next byte looks easier than average.
+- Decoders:
+  - `attention`: a windowed transformer with the routed trunk state
+    injected per block.
+  - `nextlat`: a recurrent unembedder. The state is lift(trunk_k) at a
+    patch end, then s += MLP(norm([a_t, s])) per consumed byte, with the
+    encoder state as the action a_t.
+  - The recurrence runs level by level over patches sorted by length. That
+    is one MLP step per non-end byte, with no padding to the cap.
+  - The first version padded each patch to the cap in a grid. That did
+    about 6× the work in mean mode (about 2.1 bytes/patch) and ran out of
+    memory at microbatch 12.
+
+**Causality findings.**
+- Exact causality holds bit for bit, with an attention-only trunk, for
+  hashing, the encoder, the patcher, routing, both decoders and the
+  global-knock-out diagnostic.
+- The chunked KDA kernel is causal only up to rounding. A later patch
+  moves an earlier patch's output by about 1e-4 in fp32 (by
+  2^-9 to 2^-5 in bf16) via gate-cumsum rescaling inside a 64-token
+  chunk. The token reference shares this. The fp32 probe showed that
+  SDPA blocks, ShortConvolution and the encoder are exact.
+- Learned patching adds one more rounding path. The bucket-padded patch
+  count is a batch-wide maximum, so a byte can change GEMM/SDPA shapes
+  for earlier positions. Neither is an information channel, but neither
+  is bit-exact either.
+- The first knock-out diagnostic rerouted every byte to BOS. Under
+  NextLat, that made grid slots collide and leaked future bytes. It now
+  replaces patch states with BOS content and keeps the real routes.
+
+**Infrastructure lessons.**
+- `FLA_TILELANG=0` must be pinned before fla is imported, as
+  `postraining/kda_backbone.py` already documents. Without it the first
+  KDA backward raises "TypeAttr `__ffi_repr__` is already registered" and
+  the process then hangs on exit. That cost about 47 minutes of GPU time
+  on a hung test job. `hbyte/model.py` now pins it and asserts that the
+  pin took. Probe jobs now carry `timeout` and an mlq time limit.
+- With learned patching, only the patch dimension is marked dynamic, via
+  `mark_dynamic` plus `mark_static`. With `dynamic=False` the attention
+  decoder would recompile for every new patch bucket and fall back to
+  eager flex_attention after 8 recompiles.
+
+**Throughput.** All figures are per step, 216 rows × 8,192 bytes, from
+probes (not evidence).
+
+| arm | step time | peak memory | per microbatch (enc/trunk/dec) |
+|---|---|---|---|
+| static-4, mb12 | 1.65 s | 11.3 GiB | 27 / 28 / 36 ms |
+| static-4, mb24 | 1.585 s | 20.5 GiB | |
+| entropy rate-4 + attention, mb12 | ~1.91 s steady | 17.5 GiB | |
+| entropy mean + NextLat, mb12 | ~2.2 s | 18.2 GiB | 28 / 67 / 18 ms |
+| GPT-2, mb16 | 1.14 s | 8.5 GiB | |
+
+- The learned-patching arms have occasional 3–6 s spikes as the patch
+  count moves.
+- In mean + NextLat, mean mode realizes about 0.47 patches per byte, so
+  the trunk costs twice static-4's. This arm is a 2× trunk-compute arm,
+  not a matched one.
+
+**Results at 1k steps (2k-step schedule), 2026-09-29.** One seed each;
+val is the token-aligned 9,266,876-byte panel.
+
+| run | val bpb @1000 | step time | train s | MFLOP/byte |
+|---|---|---|---|---|
+| GPT-2 token control (`hbyte_gpt2_ctrl_1k`) | 1.3562 | 1.14 s | 1,164 | 71 (trunk 26 + head 45) |
+| byte static-4, local 512 (`hbyte_static4_1k`) | 1.4180 | 1.62 s | 1,629 | 92 (trunk 22, enc 22, dec 48) |
+| byte static-4, local 256 (`hbyte_static4_local256_1k`) | 1.5059 | 1.01 s | 1,074 | 43 (trunk 22, enc 6, dec 15) |
+
+- **Static-4 at local 512 vs the token control.** The gap closed
+  steadily from +0.199 at step 100 to +0.062 at step 1000, but it was
+  still +0.11 at equal training time.
+  - The byte model spends more compute per byte of text than the token
+    model, not less.
+  - Dropping the 50k-vocab head saves 45 MFLOP/byte. The local layers,
+    as wide as the trunk and run on every byte, add 70.
+  - At this scale the trunk is too small for BLT's "the global model
+    dominates the FLOPs" regime to hold.
+- **Static-4 diagnostics at step 1000.**
+  - BPB is flat across patch offsets (1.415–1.423), so patch staleness
+    does not cost anything at stride 4.
+  - Global knock-out costs 0.378 bpb, up from 0.274 at step 500.
+- **Halving the local width is a wash, then a loss, at equal time.**
+  - It was ahead at equal time early on (+0.06 at around 225 s). The
+    runs were tied from about 530 s to 730 s. By 930 s it was about
+    0.01 behind.
+  - The step-matched penalty grew from +0.072 at step 500 to +0.088 at
+    step 1000.
+  - The penalty is uniform across offset and context. It is largest for
+    digits (+0.13), code (+0.13) and word-initial bytes (+0.12).
+  - The trunk partly compensates: global contribution rose to 0.464
+    from 0.378.
+  - Local width carries real byte-modelling capacity. Cheaper levers to
+    try instead are fewer decoder layers, a narrower window, larger
+    patches, or reinvesting the savings in the trunk.
+- **Diagnostics now live in the trainer; the separate inspector is
+  gone.** Each diagnostic eval logs:
+  - bucketed offset and patch-length BPB;
+  - gate-entropy calibration against realized loss;
+  - forced-end fraction and boundary samples (TensorBoard text);
+  - for learned gates, random and static boundaries at the gate's
+    realized rate, scored with the same weights;
+  - at the final eval, a threshold sweep.
+
+  TensorBoard also carries `time/{train,val}_bpb` against training
+  seconds, with eval excluded. The first two runs had these backfilled
+  from `metrics.jsonl`.
+- **`patch_pool=attn` was nondeterministic, not leaky (probe job
+  10666).**
+  - Rerunning an identical input moved scores by 0.012.
+  - Perturbation moved earlier scores by at most 0.015, which is the
+    same noise.
+  - `nextlat_local_reset` was exact.
+  - The cause was the scatter-add atomics in the segment sums. The pool
+    now takes segment sums as differences of float64 prefix sums at the
+    patch ends. That is deterministic, and the padding patches are
+    masked.
+
+## Hierarchical byte models: fixed chunk budget, learned gate, first fast run (2026-09-30)
+
+**GPU tests (jobs 10690, 10770, 10773).**
+- The first run (10690) stopped on its first failure: exact causality for
+  entropy + NextLat with the chunk architecture (`max_patch=64`, attention
+  pooling, no encoder layers).
+- Probe 10769 localized it. Layouts and trunk outputs of earlier patches
+  were bit-identical, and only the NextLat decoder moved (≤ 0.004 nats).
+- Cause: the level-batched recurrence steps only the patches still open at
+  each level. A later patch's length therefore changes the GEMM row count,
+  and with it cuBLAS's kernel choice, for earlier patches. That is rounding,
+  not an information channel; it is the same class as KDA's chunk rescaling.
+- The test now checks exact causality on a fixed-shape reference decoder
+  that steps every route through every level. A new test checks the fast
+  decoder against that reference (max < 0.02, mean < 1e-3).
+- The learned-gate compile test compared realized ends and reached only
+  94–96% agreement. Probe 10772 showed that compiled and eager gates agree
+  to < 7e-4, and only 0.1–0.3% of natural decisions flip, all within 3e-4
+  of the threshold.
+  - The low agreement was the chunk budget: at init about half of all bytes
+    are natural ends, so one early tie flip shifts which later ends
+    survive the budget.
+  - The test now compares the gate and its natural decisions.
+- After both changes, 35/35 pass. The CPU NextLat reference also now uses the
+  model's algebraic softcap instead of `15·tanh(x/15)`.
+
+**Step-time profile (job 10691 was cancelled; rerun as 10771).** 216 rows ×
+8,192 bytes per step, 4 steps without the LR schedule, mb12.
+
+| config | ms/step | trunk / dec ms per mb |
+|---|---|---|
+| static-4, local 256 (reference) | 976 | 28.3 / 14.6 |
+| learned p6, window 128, 1 attention dec layer | 812 | 26.0 / 6.7 |
+| same, 2 dec layers | 916 | 26.4 / 12.4 |
+| same, 0 encoder layers | 716 | 25.8 / 6.8 |
+| same, attention pooling | 875 | 30.1 / 6.9 |
+| learned p6, NextLat (proj 1.6 / 1.0) | 1144 / 1151 | 25.7 / 28.0 |
+
+- The trunk dominates: the 1,856-slot budget costs about as much as
+  static-4's 2,048 patches.
+- NextLat is the slowest decoder, at about 64 sequential small levels.
+- The p8 and mb54 OOMs come from running configs back to back in one
+  process (a 13 GiB peak followed them); they say nothing about those
+  configs.
+- Without warmup, every learned gate collapsed within 4 steps
+  (`mean_p` 0.12, 99.5% forced cap ends).
+
+**`hbyte_learned_p6_attn1_1k` (job 10774): negative, culled at step 300.**
+- Config: learned gate, target 6, cap 64, local 256, window 128, one
+  attention decoder layer, mb24. It ran at 788 ms/step, against
+  1,010–1,074 for the static-4 local-256 reference.
+- Under the real schedule the gate did not collapse. After a transient at
+  steps 10–40, it settled at 5.8–6.2 bytes/patch, with < 0.3% forced and
+  about 0% budget-dropped ends.
+- Val BPB was 2.008 / 1.890 / 1.809 at steps 100 / 200 / 300. The reference
+  had 1.992 / 1.789 / 1.691 at those steps and 1.882 / 1.756 at equal train
+  time (177 s and 257 s). The deficit at equal time grew from +0.008 to
+  +0.053, so the faster step does not pay for the quality lost.
+- Four changes are confounded: the gate, a longer target, window 128 and
+  one decoder layer. `hbyte_learned_p4_l256_1k` (job 10775) isolates the
+  gate on the reference's local stack.
+
+**`hbyte_learned_p4_l256_1k` (job 10775): wins at equal time, but drifted
+to a higher chunk rate.**
+- Config: learned gate, target 4, cap 64, on the reference's local stack
+  (local 256, window 512, 1 encoder and 2 decoder layers).
+- Val BPB at step 1000 was 1.4389, against 1.5059 for static-4 local 256.
+  At equal train time it led by 0.013 at 369 s, 0.031 at 729 s and 0.041
+  at 974 s.
+- The gate did not hold its target. Train patches per byte rose from 0.24
+  at step 100 to 0.30 at step 1000, and val was 2.90 bytes/patch. The
+  per-row budget of 2,688 slots was saturated and dropped 13% of natural
+  ends by step 1000. The ratio loss (weight 0.03) rose only to 1.03, which
+  is too weak to hold the rate as the LR decays.
+- This arm therefore ran about 31% more trunk slots per byte than static-4
+  (2,688 vs 2,048 per row), and its step time rose from 1.19 s to 1.38 s.
+  The win is confounded with extra global compute.
+- Boundary counterfactuals at equal rate, scored with the gate-trained
+  weights: random boundaries +0.192 and static +0.196 bpb. The gate
+  placement matters for this model, but that does not show it beats a
+  static model trained at equal compute.
+
+**Packed varlen trunk probe (job 10777).**
+- `chunk_kda` with 128-aligned `cu_seqlens` is bit-identical when a row
+  moves to another offset, but costs 2 host syncs per forward+backward.
+- With 16% fewer slots (54,016 vs 24 × 2,688), KDA forward+backward went
+  from 7.4 to 7.1 ms.
+- A document-causal flex attention whose mask is built from the block
+  structure has no syncs, matches SDPA to bf16, and is slower than batched
+  SDPA (4.8 vs 4.4 ms).
+- Packing therefore saves an estimated ~5% of step time, and only while the
+  gate leaves budget unused, which it currently does not.
+
+**Rate control and the 15-minute protocol (2026-09-30).**
+- Learned gate: `threshold_mode` now applies to both gates. `rate`, the
+  default, is the entropy patcher's controller: an EMA over past batches of
+  the threshold whose realized rate, after budget drops and forced ends,
+  is 1/target. `fixed` is H-Net's 0.5.
+  - Learned runs before this change used 0.5, whatever their manifest's
+    `threshold_mode` says.
+  - Under exact control, the ratio loss's gradient vanishes, since dL/dG
+    is 0 at F = 1/N.
+- `budgeted_ends`: forced ends no longer get a fixed reserve of T/cap slots
+  for the whole row. A natural end is kept while the count so far leaves
+  room for the forced ends the rest of the row could need, ceil((T − t)/cap).
+  It is still causal and bounded (proof in the docstring).
+  `chunk_budget` drops its reserve term (target 6, slack 1.25: 1,856 →
+  1,728 slots).
+- Per-row variance (probe 10780, p4 checkpoint, batch-level rate control,
+  480 rows):
+  - target 4: per-row chunks / nominal has std 0.24, p90 1.29, p99 1.91,
+    max 2.51. The worst microbatch-of-24 total is 1.088.
+  - target 6: std 0.16, p90 1.19, p99 1.66. The worst microbatch total is
+    1.037.
+  - A per-row budget at slack 1.25 therefore still drops ends in about 10%
+    of rows, the dense ones (code, digits). A budget shared per microbatch
+    at about 1.1 would almost never drop. Packing's case is quality, not
+    only the ~5% step time.
+- Protocol: every run is capped at 15 minutes. `--time-budget 600` trains
+  for 600 s, with eval and the first (compiling) step excluded; the first
+  step's time is logged as `compile`. The LR/momentum schedule is the
+  `--schedule-steps` schedule indexed by elapsed/budget, so every run ends
+  annealed. Use `--warmup-fraction 0.03` (about 18 steps).
+  - Train seconds from earlier runs include compile time, so they are not
+    directly comparable. Static-4, learned p4/p6 and the GPT-2 control are
+    being re-baselined under this protocol (jobs 10782–10785).
+  - `hbyte_learned_p6_l256_1k` (fixed 0.5, 1,856-slot budget) was cancelled
+    at step 800 for the cap. It had val 1.4812 at 824 train s, against about
+    1.505 for p4 and about 1.53 for static-4 at the same time.
+
+**Rate-controlled learned gate collapsed; ratio loss fixed (2026-09-30).**
+- `hbyte_learned_rate_p6_l256_t600` (job 10782, 600 s protocol, rate
+  control) ended at val 1.6260. The fixed-0.5 p6 run was about 1.52 at the
+  same train time.
+- The gate saturated: mean p 0.96, controller threshold 0.975.
+  - The decoder's trunk contribution fell to 0.04.
+  - Random and static boundaries at the same rate were within 0.0001 bpb of
+    the gate's, and the threshold sweep was flat.
+  - The boundaries were noise, and the decoder had learned to ignore the
+    trunk.
+- Cause: the ratio loss measured F on the realized ends. The controller
+  holds those at 1/N, and at F = 1/N, H-Net's loss is constant in G. With
+  nothing anchoring p, it drifted up, and the threshold followed it.
+- Fix: `ratio_loss` now takes F as the fraction with p > 0.5, H-Net's own
+  definition. That is the router's natural rate, so the loss keeps p
+  calibrated around a 0.5 crossing at 1/N. The controller only corrects the
+  residual drift and still guarantees the compute.
+  - New stat `router_end_rate` = mean(p > 0.5).
+  - CPU test: a saturated router gets a positive dL/dp, and invalid
+    positions count toward neither F nor G.
+- Requeued as `hbyte_learned_rate_p{6,4}_rl05_t600` (jobs 10788, 10789),
+  behind GPU tests 10787.
+
+**KDA local encoder bench (job 10786).** B 24, T 8,192, dim 256, bf16,
+compiled, one block forward+backward:
+
+| block | ms | peak GiB |
+|---|---:|---:|
+| window-512 attention + MLP (current) | 14.8 | 3.0 |
+| window-128 attention + MLP | 12.7 | 3.0 |
+| KDA, 2 heads + MLP | 22.2 | 4.2 |
+| KDA, 2 heads, no MLP | 17.4 | 3.9 |
+| KDA, 1 head + MLP | 16.7 | 3.3 |
+
+- At byte level, KDA's chunked scan costs more than a short window of flex
+  attention. A KDA encoder layer would have to earn its 1.5× cost in bpb at
+  equal time, so it ranks below rate control and slot sharing.
+- Window 128 is 14% cheaper than 512 and worth an equal-time quality check.
+
+**Where the byte-vs-token gap lives (analysis + three red-team passes, 2026-09-30).**
+- 600 s protocol baselines:
+
+  | arm | steps | s/step | val bpb |
+  |---|---:|---:|---:|
+  | GPT-2 token control (`hbyte_gpt2_ctrl_t600`) | 523 | 1.135 | 1.4179 |
+  | learned p6, rate control + fixed ratio loss (`..._rl05_t600`) | 612 | 1.027 | 1.5572 |
+  | static-4 local 256 (`hbyte_static4_l256_t600`) | 630 | 0.939 | 1.5762 |
+
+  - The learned gate is healthy: mean p 0.29, threshold 0.516,
+    router_end_rate 0.177, 5.9 bytes per patch. Random or static
+    boundaries at the same rate cost +0.135.
+  - p6 steps are *slower* than static-4's, despite 16% fewer slots.
+- **Parameter split.** Correcting the earlier "64M model" framing:
+
+  | | trunk | other compute | lookup |
+  |---|---:|---:|---:|
+  | token model (64.0M) | 12.5M | 25.8M untied head | 25.8M embedding |
+  | byte static-4 (116M) | 12.5M | 2.8M local stack | 100.7M hashed n-grams |
+
+  - At this scale the token model is mostly an output lexicon on a small
+    trunk. The trunk sees about 22 tokens per parameter in 600 s.
+  - The token control is 256 × 2,048 tokens per step (3.40 train bytes
+    per token), about 1.78 MB, the same text per step as the byte arms.
+- **Literature.** BLT, H-Net, AU-Net and SpaceByte all report BPE ahead at
+  low compute, with crossovers at 30B–200B bytes; these runs train about
+  1B bytes. Learned chunking beat whitespace only after about 100B bytes
+  (H-Net).
+- **Segmentation is no longer the main deficit.** The p6 gate already
+  ends blocks after spaces and merges short pairs.
+- **Where local width pays.** Of local width's 0.088 bpb (512 vs 256,
+  step 1000), about 0.052 is word-internal bytes (61% of bytes) and 0.020
+  is word-initial. Encoder and decoder width are confounded. The
+  remaining gap is mostly spelling completion: a token head gets it once
+  it has chosen the token. Word-initial bytes are 17% of bytes but 40%
+  of the loss.
+- **Causality traps found by the red teams.**
+  - A microbatch-shared slot budget leaks: rows are consecutive slices of
+    one stream (`ContiguousStream`). Dropped.
+  - Raw BPE boundaries are not causal: 74% of BPE ends are decided by
+    whether the next byte is whitespace.
+  - The causal analogue is "shifted BPE" (the leading space moved to the
+    end of the previous block). A 2-byte suffix table predicts it with
+    precision 0.985 and recall 0.81.
+- **New mechanisms (all off by default, and each starts exactly at the
+  baseline).**
+  - `--patcher space`: SpaceByte made causal. A patch ends after the first
+    spacelike byte of a run. It gives 5.9–6.1 train and 5.79 val bytes per
+    patch. Per-row counts reach p99 1.13–1.47× the mean; cap 16 forces
+    about 1% of ends.
+  - `--trunk-logits`: per-offset 512→257 logits read from the routed
+    trunk state. It is a diagnostic; the red team expects about 0, since
+    257 ≈ 256 is no rank bottleneck.
+  - `--prefix-bits B`: block-anchored prefix memory. `block_prefix_ids`
+    hashes the string since the last end. It is a polynomial hash mod
+    2^64 built from prefix sums, so any block length costs O(1) passes.
+    It feeds three gated lookups, each starting closed:
+    - the complete block's string, 512-wide, added to the trunk input (a
+      token-embedding analogue at full rank);
+    - the current prefix, added to the decoder input (anchored, unlike
+      n-grams that straddle words);
+    - the current prefix's 512-wide vector, multiplied into the routed
+      trunk state ahead of a 512→257 readout. The next byte becomes a
+      joint function of (trunk state, word so far), as a token head is.
+      This is a hashed-trie hierarchical softmax at a fraction of a
+      lexicon head's cost.
+- **Not built yet.** The exact trie-marginal lexicon head: a 16k mined
+  "word␣" lexicon whose product-of-experts telescopes to a token CE with
+  byte fallback. Cost is about 20–40 ms per microbatch (float64 cumsum
+  per slot). It waits on whether prefix memory shows output-side gains.
+- **Queued (600 s each).**
+  - seed-2 static-4 (noise);
+  - space6 and space6 + prefix 18;
+  - learned p6 + prefix 18;
+  - static-4 + trunk logits, and space6 + trunk logits;
+  - window 128;
+  - fixed-0.5 p6.
+
+**600 s results: noise, window, rate control, prefix memory (2026-09-30).**
+
+| run | steps | ms/step | val bpb |
+|---|---:|---:|---:|
+| GPT-2 token control | 523 | 1135 | 1.4179 |
+| **learned p6 rate + prefix 18** (`hbyte_learned_p6_prefix18_t600`) | 590 | 1019 | **1.4877** |
+| learned p6 fixed 0.5 (`hbyte_learned_fixed_p6_l256_t600`) | 660 | 912 | 1.5365 |
+| learned p6 rate (`..._rl05_t600`) | 612 | 1027 | 1.5572 |
+| static-4 seed 1337 / seed 2 | 630 / 639 | 939 / 937 | 1.5762 / 1.5802 |
+| learned p4 rate (`..._p4_rl05_t600`) | 491 | 1191 | 1.5950 |
+| static-4, window 128 | 681 | 881 | 1.6593 |
+
+- **Noise.** The seed pair differs by 0.004 (init only; the data order is
+  fixed). Treat ≥ 0.01 as signal.
+- **Window.** A local window of 128 costs +0.083 for 7% more steps. Local
+  attention range matters; window 1024 is queued.
+- **Rate control loses to the fixed 0.5 threshold** by 0.021, and is 12%
+  slower per step. The controller's 24-iteration eager bisection over
+  `budgeted_ends` runs on every microbatch. Fixed p6 held 5.3 bytes per
+  patch in 600 s. Prefer fixed at this horizon.
+  - Rate control is still useful as a guard on longer runs, where fixed
+    drifted (p4, 1k steps). If so, make its bisection cheap: run it every
+    N steps or on one microbatch.
+- **p4 loses to p6.** It ran 2,688 slots against 1,728, at 1.19 s/step
+  and worse per step.
+- **Prefix memory: −0.070** (1.4877 vs 1.5572, same rate-p6 arm) at no
+  step-time cost. Compile time is 17 s. The gap to tokens halves, from
+  0.139 to 0.070.
+  - The gate matters more: random/static boundaries now cost +0.30, up
+    from +0.135.
+  - The gate wants more boundaries: router_end_rate 0.225 at 0.5, against
+    the controller threshold of 0.88.
+  - Global contribution rose from 0.34 to 0.51.
+  - Which of the three paths (trunk input, decoder input, output
+    modulation) carries the gain is not yet ablated.
+- Queued:
+  - fixed p6 + prefix 18;
+  - fixed p6 + prefix 20;
+  - fixed p6 + prefix 18 at window 1024;
+  - fixed p8 + prefix 18;
+  - space6 ± prefix;
+  - trunk logits.
+
+**Word patcher + prefix memory: 0.018 from the token control (2026-09-30).**
+
+| run | steps | ms/step | val bpb |
+|---|---:|---:|---:|
+| GPT-2 token control | 523 | 1135 | 1.4179 |
+| **space6 + prefix 18** (`hbyte_space6_prefix18_t600`) | 650 | 925 | **1.4358** |
+| learned p6 rate + prefix 18 | 590 | 1019 | 1.4877 |
+| space6 (`hbyte_space6_l256_t600`) | 706 | 850 | 1.4994 |
+| learned p6 fixed + prefix 18 | 609 | 989 | 1.5209 |
+| learned p6 fixed + prefix 20 | 553 | 1086 | 1.5308 |
+
+- **The deterministic causal word patcher beats every learned gate** at
+  600 s (1.4994 vs 1.5365 for the best gate without memory), and it is the
+  fastest arm. This agrees with H-Net, where learned chunking beats
+  whitespace only after about 100B bytes.
+- **Prefix memory adds −0.064 on word blocks** (−0.070 on the rate gate).
+  The two compound: aligned blocks make the anchored prefix a real word
+  prefix.
+- **Fixed-threshold gate + prefix memory is unstable.** The gate drifted to
+  3.8 bytes per patch and saturated the 1,728-slot budget; val stalled
+  after 394 s. With memory, a learned gate needs rate control.
+- **20-bit tables are worse and slower than 18-bit** (1086 vs 989
+  ms/step).
+- Queued ablations on space6 + prefix 18:
+  - window 1024;
+  - prefix 16;
+  - embed_lr 0.3 and 1.5 (one LR now drives all lookup tables);
+  - local dim 384.
+
+**space6 + prefix 18 ablations: contaminated by GPU contention (2026-09-30).**
+
+All five ran after a reboot while a game (Valheim, about 1.9 GB) shared the
+GPU. Every component slowed by 25-30% at an identical source snapshot: the
+trunk went from 47 to 59-62 ms per microbatch on an unchanged trunk config.
+The fixed-time results are therefore not comparable with the 925 ms/step
+baseline. Val bpb at matched steps is still informative. The schedule is
+time-based, so a slower run sits deeper in warmdown at a given step, which
+flatters it.
+
+| run | ms/step (contended) | val s300 | val s400 | final (600 s) |
+|---|---:|---:|---:|---:|
+| baseline (clean, 925 ms) | 925 | 1.5252 | 1.4779 | 1.4358 |
+| window 1024 | 1260 | **1.4959** | **1.4648** | 1.4612 |
+| prefix 16 | 1142 | 1.5303 | 1.4885 | 1.4741 |
+| embed_lr 0.3 | 1180 | 1.5253 | 1.4870 | 1.4769 |
+| embed_lr 1.5 | 1197 | 1.5195 | 1.4799 | 1.4705 |
+| local dim 384 | 1623 | 1.5099 | — | 1.5015 |
+
+- **Prefix 16 and embed_lr 0.3 are worse per step**, even with the schedule
+  advantage. Keep 18 bits and LR 0.7.
+- **embed_lr 1.5 is neutral.**
+- **Window 1024 is clearly better per step** (−0.029 at s300, −0.013 at
+  s400). Contended component time was +12% over prefix 16 (148 vs 133 ms
+  per microbatch). It needs a clean rerun to price that trade.
+- **Local 384 is better early per step** but far slower.
+- Fixed-time protocols are fragile on a shared desktop GPU. Rerun window
+  1024 clean.
+
+**Speedrun protocol: train seconds to val 1.45 (2026-10-01).**
+
+- **Protocol** (`--target-bpb 1.45`):
+  - The step cosine is sized to 600 s at each arm's clean ms/step, so the
+    schedule cannot be skewed by GPU contention.
+  - The run stops at the first val at or below 1.45. Val is every 20 steps
+    once within 0.03 of the target.
+  - The score is train seconds to target, interpolated linearly in bpb
+    between the bracketing evals.
+  - Other GPU processes are logged at every val (`gpu_neighbors`). Only the
+    browser and launcher were resident for these runs.
+
+| run | ms/step | seconds to 1.45 | step | val s300 |
+|---|---:|---:|---:|---:|
+| GPT-2 token control | 1126 | **395** | 349 | 1.4710 |
+| space6 + prefix 18 (base) | 966 | 460 | 487 | 1.5258 |
+| base, 0 encoder layers | 842 | 566 | 680 | 1.5659 |
+| base, 1 decoder layer | 814 | 421 | 520 | 1.5390 |
+| base, window 1024 | 1023 | 420 | 412 | 1.4968 |
+| base + block bigram memory | 946 | 459 | 475 | 1.5185 |
+
+- **The encoder layer earns its cost.** Removing it saves 13% per step but
+  costs +106 s to target.
+- **The second decoder layer does not.** One layer is −39 s.
+- **Window 1024 is −40 s**, despite +6% per step.
+- **Block bigram memory is a small per-step gain** (s300 −0.007), but
+  neutral in time.
+- Queued:
+  - 1 decoder layer + window 1024;
+  - trigram, context-prefix and gated memory;
+  - KDA local mixers (H-Net style), after a clean timing bench.
+
+**KDA local layers (H-Net style) do not pay; the decoder needs attention (2026-10-01).**
+
+Speedrun protocol, space6 + prefix 18 base. Per-layer mixers: `a` is window-512
+attention, `k` is a KDA layer over the whole row (2 heads, trunk init).
+
+| encoder / decoder | ms/step | val s200 | val s300 | seconds to 1.45 |
+|---|---:|---:|---:|---:|
+| a / aa (base) | 966 | 1.6039 | 1.5258 | 460 |
+| k / aa | 1080 | 1.5969 | 1.5184 | not reached (1.4500 at 557) |
+| a / ka | 1056 | 1.5927 | 1.5167 | 504 |
+| a / kk | 1116 | 1.6793 | 1.5625 | not reached (1.4802) |
+| a / k (1 layer) | 893 | 1.6853 | 1.5736 | not reached (1.4556) |
+| k / kk | 1240 | 1.6927 | 1.5687 | not reached |
+| a / a, window 1024 (best) | 841 | 1.5988 | 1.5121 | **378** (token control 395) |
+
+- **Encoder KDA equals window attention per step** (train bpb within 0.01
+  throughout) but is 12% slower.
+- **A decoder with no attention layer is about 0.08 worse by step 200.**
+  One attention layer after KDA restores it.
+- **Probe of the trained layers** (4 val rows x 2048 bytes):
+  - Decoder KDA keys have consecutive-byte cosine 0.64 in-block and 0.49-0.56
+    across boundaries; encoder KDA keys have 0.35 / 0.30.
+  - Decoder layers learned long, weak memory: half-life 121-175 bytes, beta
+    0.28-0.36.
+  - The injected trunk state (norm about 8.6) is well below the encoder state
+    (about 22).
+  - So the keys do not collapse to the block-constant trunk term. The
+    decoder needs exact, position-indexed access to recent bytes (the open
+    word, copying), which RoPE softmax attention provides and a decaying
+    delta-rule memory with interfering keys does not.
+- **Gated DeltaNet v2 is not run.** It is the same delta-rule family at the
+  same cost per layer.
+- Next: window 2048 on the 1-decoder-layer arm.
+
+**Block n-gram and contextual prefix memory: neutral to negative (2026-10-01).**
+
+| arm (space6 + prefix 18 base) | ms/step | val s300 | val s400 | seconds to 1.45 |
+|---|---:|---:|---:|---:|
+| base | 966 | 1.5258 | 1.4763 | 460 |
+| + block bigram (`--block-ngram 2`) | 946 | 1.5185 | 1.4724 | 459 |
+| + block trigram (`--block-ngram 3`) | 960 | 1.5162 | 1.4716 | 455 |
+| + context prefix (`--prefix-context`) | 1018 | 1.5218 | 1.4749 | 502 |
+
+- **Block n-grams give −0.007 to −0.010 per step early**, fading by s400.
+  They are 1-5 s faster to target, within noise.
+- **The context prefix costs 5% per step with no per-step gain.**
+- Unlike the unigram block memory (−0.064), these extensions do not pay at
+  this horizon. Keep `--block-ngram` available and off by default.
+
+**Window width on the 1-decoder-layer arm; memory gate (2026-10-01).**
+
+Score: steps to 1.45 × the run's minimum step time. Minimum step time is a
+clean proxy, because desktop apps (cagents-ui, ceditor) shared the GPU and
+inflated median step times by up to 7%.
+
+| arm (space6 + prefix 18, 1 decoder layer) | min ms/step | steps to 1.45 | projected s | val s300 | val s400 |
+|---|---:|---:|---:|---:|---:|
+| window 1024 | 838 | 451 | **378** | 1.5121 | 1.4682 |
+| window 1536 | 895 | 426 | 381 | 1.5048 | 1.4593 |
+| window 2048 | 972 | 413 | 401 | 1.4986 | 1.4539 |
+| 2 decoder layers, window 512, + memory gate | ~1000 | 482 | ~480 | — | — |
+
+- **A wider window is better per step but costs as much as it gains.**
+  1536 ties 1024; 2048 loses. Keep 1024.
+- **The Engram memory gate** (`--memory-gate`) is neutral per step and
+  slower. Keep it off.
+- **Bytes seen per step differ.** A token step covers 256 × 2048 tokens,
+  about 2.32 MB of text. A byte step covers 216 × 8192 = 1.77 MB.
+  - Per byte of text seen, the best byte arm and the token control learn at
+    the same rate: each reaches 1.45 after about 800 MB.
+  - Throughput is also equal: about 475 ms/MB for bytes against 485 ms/MB
+    for tokens.
+  - Per MB, the trunk costs 239 ms for bytes and 276 ms for tokens.
+  - Per MB, the byte local stack (encoder + decoder, 234 ms) costs more
+    than the token head and embedding (about 172 ms).
+  - The local stack is therefore the main speed target.
+- **Offsets 0-2 in a block carry 76% of the bits**, from the val diagnostic
+  at step 460:
+  - offset 0: 3.33 bpb × 17% of bytes;
+  - offset 1: 1.84 bpb;
+  - offset 2: 1.28 bpb.
+- **A whole-block output lexicon would have poor coverage.** On 35 MB of
+  train, the top 16k blocks cover 72% of block occurrences and 63% of bytes;
+  the top 64k cover 83%. Trailing punctuation and case fragment the
+  vocabulary. The trie lexicon head stays unbuilt until a fallback design
+  exists.
+
+**Seed noise, slot budget, prefix-path knockouts, local attention kernels (2026-10-01).**
+
+Speedrun protocol; projected seconds = steps to 1.45 × clean ms/step.
+
+| arm | steps to 1.45 | val s300 | note |
+|---|---:|---:|---|
+| best (space6 + prefix 18, 1 decoder layer, window 1024), seed 1337 | 451 | 1.5121 | |
+| same, seed 2 | 441 | 1.5103 | ran at microbatch 12 |
+| GPT-2 token control, seed 1337 | 349 | 1.4710 | |
+| control, seed 2 | 355 | 1.4729 | |
+| best + `--chunk-slack 1.075` (1472 trunk slots, not 1728) | 458 | 1.5154 | ran at microbatch 12 |
+| best + slack 1.075 + `--prefix-local` | 469 | 1.5211 | min 797 ms/step |
+
+- **Seed noise is about ±1.5% in steps** (init only; data order is fixed).
+  Mean projected time: bytes 446 × 838 ms ≈ 374 s; tokens 352 × 1119 ms ≈
+  394 s. **The byte model leads by about 5%.**
+- **Slack 1.075** keeps 99.56% of natural ends (9% of rows drop some; per-row
+  patch counts: p50 1358, p90 1464, p99 1563, budget 1472). It is neutral
+  per step and about 35 ms/step faster. Adopted.
+- **Prefix-memory knockouts at eval** (zeroing one path of the trained best
+  checkpoint; upper bounds, since the rest co-adapted). Full model 1.4474.
+  - trunk input (block string): +0.080;
+  - decoder input (prefix): +0.015;
+  - output modulation (prefix-chosen 512-wide gate on the trunk readout):
+    **+0.369**.
+  The modulated readout is the decoder's main route from trunk to bytes.
+- **`--prefix-local` loses** (+11-18 steps, s300 +0.006 to +0.009): feeding
+  the decoder state into the modulated readout (zero-init 256→512) hurts.
+  Kept as a flag, off.
+- **Step profile (microbatch 24, 867 ms GPU):**
+  - GEMMs: 282 ms;
+  - trunk KDA kernels: about 136 ms;
+  - local flex attention: 124 ms (102 ms backward);
+  - lookup-table gradients: dense scatter 39 ms + bf16 accumulation 30 ms.
+- **FlashAttention-4 (CuTe, sm120) sliding window does not help.** Per local
+  layer per microbatch it is 8.2 ms fwd+bwd against 7.7 ms for flex, with a
+  4.3 ms forward against 1.3 ms. Gradients match flex to about 2e-3.
+- **Flex tile tuning:** 64×64 tiles, 8 warps, 2 stages take fwd+bwd from
+  7.40 to 6.40 ms per layer per microbatch, about −18 ms/step. Now the
+  default (`LOCAL_FLEX_OPTIONS`).
+- Added `--encoder-window` (0 = the local window).
+
+**Final state of the byte speedrun (2026-10-01).**
+
+Score: projected seconds to val 1.45 (steps × min ms/step).
+
+| arm | min ms/step | steps | projected s |
+|---|---:|---:|---:|
+| GPT-2 token control (mean of 2 seeds) | 1119 | 352 | ~394 |
+| `tt_best2`: space6 + prefix 18, 1 decoder layer, window 1024, slack 1.075, tuned flex tiles | 762 | 456 | **347** |
+| `tt_best2` + `--encoder-window 512` | 739 | 460 | **340** |
+| `tt_best2` + muon lr 0.035 | 760 | 457 | 347 (neutral) |
+
+- **The byte model leads the token control by about 12-14%** (340-347 s
+  against ~394 s). Seed noise is about ±1.5%.
+- **Encoder window 512 is neutral per step and 3% faster.**
+- **The muon 0.018 arm was cancelled.**
+- **Microbatch:** 24, 27 and 36 give 768, 759 and 751 ms/step (peak 13.7,
+  14.9 and 19.1 GiB), at most −2%.
+
+## CWM core throughput: bf16 state, gradient ring, split-K (2026-10-01)
+
+**Why.** `cwm_full_1k` (fp32 banks) ran 4,848 ms per 524k-token step, 4.3x
+KDA8. At step 200 it had val 1.4611 bpb against KDA8's 1.3998, with a
+feedback contribution of 0.189 bpb. It was stopped after that eval so the
+core could be made faster.
+
+**Where the time goes.** At microbatch 128, each token step is a chain of
+~130 dependent kernels, each 1-25 us and latency-bound. GEMMs run at
+27-98 TFLOPS.
+- Inside the captured graphs, kernels run back to back: the median gap is
+  0.10 us.
+- A grid barrier costs 0.57 us, against 0.74 us per graph kernel boundary.
+  A persistent megakernel therefore saves almost nothing, so it was
+  dropped.
+- Programmatic dependent launch: within 0.5%, removed.
+- Rows in flight are capped by L2 (96 MB). Per row, the bf16 bank state is
+  ~196 KB and the store window another ~196 KB. Microbatch 256 with bf16
+  banks is slower than 128, so 128 stays.
+
+**Changes** (seconds per 524k-token update, `cwm_bench`, microbatch 128):
+
+| change | s/update |
+|---|---|
+| fp32 banks (cwm_full_1k code) | 4.85 |
+| bf16 bank state (`--bank-dtype bfloat16`, now the trainer default) | 4.50 |
+| store-entry gradients in a W-slot ring instead of `[B, T, ...]` fp32 (-800 MB) | 4.28 |
+| bank-state gradient G stored in the bank dtype | 4.08 |
+| split-K for norm-consumed GEMMs + Wx/Wfc retune | ~2-3% more |
+
+The split-K row comes from a same-process interleaved A/B (1.067 -> 1.043 s
+per microbatch, median of 4). In separate jobs it did not show up above
+run-to-run variance.
+- In isolation it cut Wp from 5.9 to 3.8 us, dWfc 5.4 to 3.7, dWx 4.3 to
+  3.3, and dWE1-3 by 0.3-0.8 us.
+- In the graph, GEMM time fell 39 us/token. The read kernels and the norms
+  summing fp32 partials gave much of that back.
+
+Overall: ~1.2x over the fp32 core.
+
+**Numerics.**
+- **bf16 banks:** every commit computes in fp32 and rounds once. The module
+  path uses a straight-through `_RoundTo`, so its state gradient stays
+  fp32. Fused and module agree on GPU to well below what the bf16 state
+  itself changes. The CPU interpreter truncates fp32 -> bf16 instead of
+  rounding to nearest, so the bf16 parity test is CUDA-only.
+- **bf16 G (fused only):** compared on `cwm_full_fixture_120` with one real
+  128 x 1024 microbatch, against bf16 banks with fp32 G:
+  - full-gradient relative error 3.0e-3 (cosine 0.999995);
+  - the bf16-vs-fp32 bank effect is 7.5e-3;
+  - a different microbatch differs by 1.41 (cosine 0.04);
+  - worst parameter 9.4e-3 (`out_writer.bank_beta.bias`).
+  - Caveat: this was measured on a 120-step model. A trained model with
+    slower decays accumulates G over longer spans; re-check if decays
+    approach 1.
+
+**After the changes, per token at microbatch 128 (graph profile):**
+- Forward 253 us: GEMMs 112, reads 79, norms 24.
+- Backward 576 us: GEMMs 181, read backward 123, commit backward 70
+  (114 with fp32 G), store gradients 51, rebuild commits 20.
+- The rest is weight-gradient GEMMs per chunk.
+
+**Ceiling.** The core remains a serial chain of latency-bound kernels.
+- Remaining exact-semantics items are each worth a few percent: merging
+  the bank and store halves of the read backward, fusing the depth read
+  into the Wdo prologue, and folding Wlr into Wx.
+- Only a semantics change gives a large factor. One option is
+  chunk-lagged banks, where reads see the state as of the chunk start, so
+  all of a chunk's tokens batch through every GEMM. It is not
+  implemented.
+
+## Gated-delta memory carry on KDA8: implementation and pre-registration (2026-10-10)
+
+**Why.** The MiniCPM `--token-carry` analysis found that the deterministic
+hidden carry did not learn a conditioning signal. Its full-rank 1536x1536
+matrix grew like an untrained random walk at the actor learning rate
+(1.44e-5 measured against 1.3e-5 predicted at step 44; step-44/step-867
+overlap 0.23, noise 0.225). Its input was about 130x a token embedding's
+RMS, nothing bounded it, and its update saw only one step of its own
+effect. This was paired with a critic that never explained variance, which
+confounds the reading of those runs. `memory` is the replacement design: the
+carried information goes through a small, bounded, trained memory whose
+replay differentiates every read through every earlier write.
+
+**Mode `--reasoning-mode memory`** (`postraining/memory_carry.py`). It is
+token-only, lockstep and pinned-EMIT like `cot`, with its own schemas
+(execution `..._gated_delta_memory_carry_..._token_rng/v1`, replay
+`..._gated_delta_memory_chunk_scan_fp32_state_tf32_dot_..._exact_replay/v1`, rollout policy
+`gated_delta_memory_carry/v1`, input
+`gated_delta_memory_belief_write_token_read_zero_init_out/v1`).
+
+- **Write, at the network output.** The detached post-final-norm belief h
+  that produced a token is RMS-normalized. Per head (default 4 x 64) it
+  gives k = l2norm(W_k h), v = W_v h, a write strength
+  beta = sigmoid(w_b.h + b) and a decay alpha = sigmoid(w_a.h + b_a). The
+  heads start at geometric timescales 1/(1-alpha) of 16, 64, 256 and 1024
+  tokens, with beta = 0.5. The state update is
+  S = alpha S + k (beta (v - alpha S^T k))^T, in fp32.
+- **Read, at the network input of each generated token.**
+  q = l2norm(W_q [e(x)/rms, h_prev/rms]) and input = e(x) + W_o S^T q.
+  W_o is zero-initialized, so step 0 is bitwise `cot`; a test pins this on
+  nano and KDA.
+- **Prompt.** Every prompt belief is written; one scan after prefill folds
+  them into S. The prompt never reads, which keeps prefill parallel.
+- **Replay.** The recorded beliefs are sampled data, so the memory is
+  linear in S over them. One masked scan (fla `chunk_gated_delta_rule`,
+  varlen per row, on CUDA) backpropagates every read's loss into every
+  earlier write: W_k, W_v, both gates, W_q and W_o. The trunk's own path
+  through the memory (read -> trunk -> next belief -> write) stays cut, as
+  for any stored action.
+- **Critic.** It reads the actor's memory through its own zero-init reader.
+  The actor writer is borrowed, not owned: it is absent from the critic
+  state_dict and its terms are computed under no_grad, so the value loss
+  never trains it. The critic's input at a slot conditions on what the
+  actor will read next, so the TD error prices each write.
+- **Bound.** Each write maps the old state through alpha (I - beta k k^T),
+  whose operator norm is at most alpha, and adds at most beta |v|. So
+  ||S|| <= max(beta |v|) / (1 - max alpha) over any trajectory length. It
+  is not bounded by the largest value written: nearly parallel keys with
+  conflicting values can amplify it up to that decay bound. A test checks
+  the per-step inequality over 400 random writes. alpha = 0, beta = 1,
+  q = k reduces the read to W_o W_v h, the old carry restricted to rank 256.
+- **Scale.** On the SFT checkpoint the embedding RMS is 1.26, belief RMS
+  1.74, v RMS 1.01 and initial read RMS 0.25. The read lands at embedding
+  scale through W_o, under the actor AdamW at 2e-5 with no weight decay.
+  Fully coherent movement caps the read residual near 6% of the embedding
+  RMS by step 950; it is not the 130x lever of the MiniCPM carry. The
+  memory adds 659,464 actor parameters and a 393,216-parameter critic
+  reader.
+
+**Not implemented, deliberately: the read-drift trust region.** Discussed
+in this session as a per-token clip on ||W_o (S'_t - S_t) q||. Every update
+in this configuration is behavior-age 0: `--ppo-epochs 1`, one 64-prompt
+minibatch per 64-prompt rollout, and refresh recomputes the old statistics
+through the update's own compiled replay. The stored beliefs then are
+exactly what the current parameters produced, up to kernel noise, so the
+clip would act on noise only. It becomes meaningful only with reuse
+(several epochs or minibatches per rollout). Add it before running memory
+with reuse.
+
+**Red-team (independent subagent).** It found no decode/replay
+misalignment and no state leak across rollouts. It checked prompt writes,
+read/step/write order, the write mask over every reachable layout, left
+padding, repeats, split/pack, arena compaction, and four consecutive
+rollouts on one arena. Fixed from its report:
+
+- `--critic-only-init` is refused in memory mode. The loaded reader is fit
+  to the source run's writer, and this run draws a fresh one.
+- Replay and critic compile without fullgraph whenever the memory is on,
+  because the scan is a fenced FLA kernel on any trunk. Before, nano
+  trunks would have crashed.
+- Docstrings no longer claim bitwise decode/replay equality; both paths
+  are TF32 under the trainer's matmul precision.
+- Pad beliefs are zeroed before the prompt scan, since NaN times zero
+  survives a mask.
+- The decay telemetry was an arithmetic timescale mean, dominated by the
+  slow head and infinite at a saturated gate. It is now a clamped
+  log-timescale over response writes, with no host sync.
+
+**GPU validation (mlq jobs 12603, 12637).** Run on the SFT checkpoint with
+a live memory, through the production compiled, CUDA-graph bf16 arena.
+
+- **fla chunk scan vs float64 reference:** reads, final state and every
+  gradient within 2.1e-3 relative. That is fla's TF32 dot precision, and
+  the replay schema now says `fp32_state_tf32_dot`.
+- **Recorded vs replayed beliefs:** 1.14% relative RMS, against 1.11% for
+  the same arena with the read silenced (the cot floor).
+- **Compiled vs eager replay:** inputs agree to 2.4e-5. The compiled
+  critic's values are at 1.4% against a 1.0% floor.
+- **The memory is load-bearing:** the read moves inputs by 8% and values
+  by 10%.
+- **Trap found on the way:** a mixed-left-pad batch is not a valid replay
+  stream. Replay masks no padding, so pads run through the trunk (47% at
+  prompt slots). Measure on the trainer's unit (split, trim, pack), as the
+  test now does.
+
+**Decode cost (`bench_graph_decode --memory`, `--rollout-tokens 128`, job
+12638).** The 1024-row tick is 4.48 / 9.44 ms at positions 512 / 2300,
+against cot's 4.40 / 9.54. Kernel time is +2% (4.34 vs 4.24 ms per tick).
+A steady 128-token rollout takes 583 vs 562 ms. The arena workspace grows
+4.5 GiB (14.8 vs 10.2 GiB): that is the fp32 belief record that replay
+needs, which `carry` also pays. It is released before the update.
+
+Changes that got it there:
+
+- **The recall and the read are broadcast product-sums, not einsums.**
+  Inductor then fuses a column's recall with its update into one pass
+  over S, at 74 us per tick. Before, two cuBLAS GEMVs over S took 83-360
+  us per tick depending on contention.
+- **The benchmark now uses the trainer's TF32 settings.** The memory
+  projections run on tensor cores, about 45 us per tick.
+- **The four writer projections stay separate GEMMs.** Merging them let
+  Inductor fold a strided split into the state pass, which ran 6x slower.
+- **Unreliable numbers:** an earlier "+16%" from separate jobs was GPU
+  contention from a desktop game, not memory cost. Identical kernels
+  varied up to 6x between and within jobs.
+
+**Paired control.** The critic's random initialization now draws from its
+own stream (`CRITIC_INIT_SEED_OFFSET`), seeded by `--seed` alone. Before
+this change, what the actor wrapper consumed before it (cot, carry and
+memory each construct different heads) shifted the critic init. With one
+seed, `cot` and `memory` therefore start from the same critic and the
+same step-0 policy (bitwise on the CPU test path; the compiled arenas are
+different graphs, so on GPU only up to kernel order). Token sampling already used per-row
+Gumbel seeds, so the arms share random numbers until their policies
+diverge. r2 is not a usable control: it was cancelled at step 135, used
+reward v3 and older code. So a fresh cot arm runs under the same code and
+reward v4.
+
+**Pre-registration.**
+
+- **Runs.** `scripts/launch_reviewed_rl.sh` with r2's arguments (verified
+  identical to r2's manifest except the mode): `ABSTENTION_PENALTY=1.0`,
+  `REASONING_MODE=memory` and `REASONING_MODE=cot`, seed 1337, 950 actor
+  steps after 50 critic warmup steps. Names:
+  `kda8_pg_reviewed_v2_memory_20261010` and
+  `kda8_pg_reviewed_v2_cot_pair_20261010`.
+- **Hypothesis.** A trained, bounded memory over the policy's own beliefs
+  lets later tokens condition on earlier reasoning state beyond what
+  attention-free KDA layers keep, and improves held-out accuracy at the
+  same decode budget.
+- **Verifier.** The run's bench panel (1,152 items, SE about 0.004 per
+  evaluation) and AIME every 20 steps, through the same pinned evaluation
+  arena. Training reward is diagnostic only.
+- **Primary criterion.** The mean over the last five bench evaluations of
+  memory minus cot, with a per-item paired bootstrap 95% interval on the
+  final evaluation. A difference inside the interval is "no effect", not a
+  win.
+- **Mechanism checks.**
+  - The memory must be used: `memory/read_out_weight_rms` and the read
+    share (`carry_input_delta_rms_ratio`) must grow beyond the random-walk
+    level. The MiniCPM carry failed exactly this.
+  - The writer must move its gates off init: `memory/write_beta_mean` and
+    `memory/decay_log_timescale_mean`, both over response writes. The log
+    mean starts at log 128 (geometric mean of the head timescales). The
+    gate biases move only about 0.02 in 1,000 AdamW steps at 2e-5, so the
+    per-head base timescales are effectively fixed; only the
+    data-dependent gate weights can adapt.
+  - Compare with the critic's explained variance in both arms. A memory win
+    with a dead critic in both arms would be an actor-side effect only.
+- **Failure modes to look for in traces.** Repetition loops fed by the
+  memory reading its own echoes; termination rate falling; length ratchet
+  differences between arms; memory unused (W_o at noise level, which makes
+  the arms identical within noise); decode/replay drift (pinned by the
+  GPU parity tests below, not monitored in-run).
+
+**Launch, attempt 1 (job 12639, `kda8_pg_reviewed_v2_memory_20261010`):
+OOM at the step-20 AIME evaluation.** Training through step 20 was
+healthy:
+
+- Age-0 ratios were exactly 1.
+- `memory/read_out_weight_rms` grew from 0 to 1.2e-4; the read is 0.1% of
+  the input RMS.
+- The gates were still at init (beta 0.501, log timescale 4.858).
+
+The evaluation arena kept the replay record of every belief (960 x 2304 x
+512 fp32 = 4.2 GiB) and cloned it into the returned batch, while a
+desktop game held 3 GB of the card. Evaluation never replays, so
+`PinnedDecodeArena(replay_storage=False)` now drops the record, matching
+the eager rollout's flag. The trainer's evaluation arena uses it, and a
+test pins identical decoding without the record. The old `carry` arm had
+the same latent cost. The run directory is kept as the failed attempt.
+The relaunch is `kda8_pg_reviewed_v2_memory_20261010_r2` (job 12646). The
+cot pair (job 12640) is unaffected, because cot keeps no record.
+
+
+Step-0 parity between the arms, observed:
+
+- BPB is identical (2.33694).
+- AIME is identical (1/960).
+- The bench is 10/1152 for memory (attempt 1) against 13/1152 for cot,
+  under the same evaluation seed.
+
+The bench gap comes from the arenas' different compiled kernels, which
+make the bf16 rounding diverge and change the sampled tokens; it is the
+expected sampling noise, not a change of policy. The pre-registered
+comparison uses last-5 means for this reason.
+
+The memory r2 job queues behind the cot pair because there is one GPU, so
+the arms run one after the other, not side by side.
+
+**The cot pair is truncated by request (2026-10-10 16:02).** Its time limit
+was set to 45 minutes from spawn (about step 120 of 950), so the
+memory run can start sooner. The pre-registered paired comparison
+(last-5 bench means) has no full-length control as a result. The memory run
+can be compared with the cot pair only over the steps both completed, and
+over its own trajectory, with in-run and offline ablation of the read as
+the mechanism evidence.
+The cot pair was cancelled at 16:10, at about step 120, at the user's request;
+it keeps its periodic checkpoints. The memory r2 run (job 12646) started
+at once, with step-0 BPB of 2.3369, identical to the cot pair's.
+
+**r2, first attempt (job 12646): ran out of memory at RL step 1's rollout,
+after the critic warm-up had completed.**
+
+- **Cause:** the training arena returned its replay record (1024 x 2304 x
+  512 fp32, 4.48 GiB) as a device clone. The trainer then copied that
+  clone to the host. The process held 22.1 GiB with 4.5 GiB free, so the
+  clone fit or not depending on the other processes on the card.
+- **Fix:** `PinnedDecodeArena.rollout(offload_device=cpu)` copies straight
+  from the arena into pinned host memory, through
+  `compact_stream_to_device`, trimmed to the used stream prefix. No device
+  clone remains. The trainer's lockstep rollout passes it whenever the pool
+  is offloaded.
+- **Relaunch:** r2 resumes in place (job 12648) from its step-0
+  checkpoint, written after the 50-step warm-up. That checkpoint is the
+  same file as `critic_warmup_checkpoint.pt` (sha256 prefix
+  612d96616ae1e1d9), so the warm critic, the sampler cursor and the step-0
+  evaluations carry over.
+
+**Critic warm-up was 2.3x slower per update than a full RL update.**
+
+- **Measurement:** the warm-up critic update took 4.9-5.4 s, against 2.1 s
+  for a whole actor-and-critic RL update on the same pool size (cot pair).
+- **Cause:** the warm-up called `training_update` once per prompt group.
+  That is 64 small replays of 16 rows, each building its own replay plan,
+  while RL packs the pool into one minibatch with one plan.
+- **Fix:** the warm-up now collects with offload, packs with
+  `pack_rollout_groups_for_replay`, builds a value-only replay plan, and
+  runs one `training_update(value_only=True)`. That is the RL update's
+  path, and it also gives the warm-up the RL memory profile; the warm-up
+  previously kept 64 groups on the device.
+- **Expected effect:** the update falls to roughly the RL cost (about 2 s),
+  so a warm-up step goes from about 9 s to about 6 s. The rollout
+  dominates after that.
+- **Not yet validated on the GPU:** the r2 resume skips the warm-up. The
+  CPU suites are unchanged (the same 12 CUDA-only or stale-CLI failures as
+  before). The first fresh run, or a short full-size smoke, must confirm it.
+
+**Resume 1 (job 12648) ran out of memory after step 40, and the cause was
+in my offload fix.**
+
+- **Cause:** copying a non-contiguous CUDA tensor to the host first makes a
+  contiguous device copy of it. The arena's stream prefix
+  (`hiddens[:batch, :used]`) is strided, so the "direct" copy still
+  allocated 4.49 GiB on the device. It fit until it didn't: 4.60 GiB was
+  free and fragmented.
+- **Fix:** `compact_stream_to_device` copies strided sources row by row.
+  Each row of a stream prefix is contiguous, so no device staging is
+  needed.
+- **Test:** `test_offloading_a_strided_stream_prefix_stages_nothing_on_the_device`
+  (CUDA, job 12656) pins zero device staging and exact values.
+- **Relaunch:** job 12657 resumes r2 from its step-20 checkpoint. Steps
+  21-45 are repeated exactly, from the same cursor and RNG state.
+- **What the evaluations showed:** before it died, the run reached bench
+  0.0113 at step 40, AIME 0 at steps 20 and 40, and bench 0.0061 at step
+  20. The step-20 AIME evaluation running through confirms the evaluation
+  arena's `replay_storage=False` fix on the GPU.
+
+**Code review of the memory carry (subagent, 2026-10-10): no correctness
+bugs.** The review confirmed:
+
+- write/read alignment, including left-padding;
+- write-before-read order against fla;
+- detach boundaries;
+- arena compaction of the memory state;
+- that the packed warm-up equals the per-group accumulation up to
+  reduction order, now pinned by a CPU test;
+- that the row-wise host copy cannot race arena writes.
+
+Fixed after the review:
+
+- **Offload:** row copies are kept only for strided fields of at least
+  64 MiB. The small fields stage through one contiguous temporary rather
+  than about 1k row launches each.
+- **Combined-MLP flags in memory mode:** they were silently ignored. The
+  model now rejects them, the checkpoint kwargs no longer carry them, and
+  the CLI refuses non-default values. Actor-critic init also checks the
+  memory flag explicitly.
+- **Warm-up metrics:** the warm-up binds one update's metrics instead of
+  aggregating a list of one. Its JSONL and TensorBoard metrics are now
+  pooled over the packed minibatch rather than means of per-group values.
+- **Comments:** corrected on precision (decode recall and read are fp32
+  elementwise, not TF32), on when the writer first receives gradient
+  (only after the read-out leaves zero), on record size (4.5 GiB), and in
+  the schema error text.
+- **Bench script:** `bench_graph_decode --profile-rows` is validated
+  against the captured buckets.
+- **Borrowed writer:** the critic's reference to the actor's writer is
+  documented as a live reference that deepcopy does not carry along.
+- **New tests:** arena offload against a compacted clone, the packed
+  value update, and the combined-MLP refusals. The CPU suites are green
+  apart from the 12 long-standing failures (CUDA-only or stale CLI
+  defaults).
+
+Note: `CRITIC_INIT_SEED_OFFSET` changed critic initialization for every
+reasoning mode. Runs from 2026-10-10 on are not same-seed reproducible
+against earlier baselines; the cot pair was run for that reason.
+
+**r2 trajectory to step 180: think shortens, accuracy holds or rises.**
+Bench rose from 0.0148 at step 60 to 0.0278 at step 180, against 0.0243
+for the cot pair at step 180 (SE about 0.005, so suggestive only). AIME
+stayed 0. Mean think fell 222 → 146 → 93 → 75 → 65 tokens over 20-step
+windows, faster than the cot pair (134 at step 185). The 33-token
+`--think-min-tokens` floor began to bind: by steps 160-180, about 1.2% of
+trajectories were correct but zeroed by the think gate, roughly a fifth
+of all correct answers. The read/input RMS ratio kept doubling about
+every 20 steps (0.85% at step 80, 8.4% at step 180, 24% at step 220).
+Critic EV stayed at or below 0.03 throughout.
+
+**r2 then collapsed into an abstention template; it was stopped at step
+~222 (2026-10-10 17:30, by request).**
+
+- **Onset:** the abstained fraction was at most 0.016 through step 192,
+  then 0.03 at 194, 0.20 at 198, 0.50 at 203 and 0.73 at 210. The
+  per-source peaks were DAPO 0.75 and ultradata_math 0.80. Mean think fell
+  to 44 tokens.
+- **Outcome:** training exact accuracy fell from about 0.055 to 0.01-0.035,
+  while reward rose from 0.05 to 0.32, almost all of it abstention's 0.5.
+  Think-format compliance fell from 0.79 to 0.30. Bench at step 200 was
+  0.0269, with 35% abstained (answered accuracy 0.041); AIME abstained 75%.
+  At step 220, bench and AIME were both 0.0000. The post-update max
+  |log ratio| reached 2.39 (0.65 at step 100), and actor gradient norms
+  were about 10x their step-140 level.
+- **The detector is not at fault.** The abstentions are valid
+  `normalized_eos_abstention/v4` rows: a complete think of at least 33
+  tokens, an empty `<answer></answer>`, then EOS. The form is a template,
+  not a judgment: a short think ending in `\boxed{0}`, then an empty
+  answer. It appears even in groups where 6-7 of 16 samples were correct.
+- **The reward is what selects it.** With λ = 1 an abstention pays
+  λ/(1+λ) = 0.5, so answering pays only when P(correct) > 0.5. At about
+  5% policy accuracy that holds for almost no prompt (even the 6/16
+  science_mc group, at 0.375, is reward-optimal to abstain on). The
+  "abstain only where you cannot solve" premise of 2026-09-27 therefore
+  prescribes near-universal abstention for this model. A 64M policy also
+  cannot condition a 0.5 threshold on difficulty, so it learned one global
+  template. That ends exploration on exactly the hard prompts where rare
+  successes carry the signal. Earlier abstention runs never sampled an
+  abstention (no prior), and none got past about 185 steps.
+- **Attribution:** none of the cot runs with this setting got this far, so
+  whether cot would also find the template is unknown. The memory run
+  reached short thinks sooner, and short thinks make the template cheaper
+  to sample.
+- **Preserved:** `pre_abstention_spiral_checkpoint.pt` in the r2
+  directory is a hard link to the step-166 save (abstained fraction about
+  0.0004, bench 0.020 at step 160 and 0.0278 at step 180).
+
+**Branch without abstention (job 12663,
+`kda8_pg_reviewed_v2_memory_noabst_s166_20261010`).** It uses
+`--actor-init` from the step-166 checkpoint: the actor (including the
+memory writer and read-out) is loaded, the critic and optimizers are
+fresh, with a 50-step packed warm-up, and the step-166 prompt cursor and
+seed carry over. There is no `--abstention-penalty`, so an empty answer
+scores 0 like any wrong answer. `--steps 784` keeps the 950-step total.
+Every other flag matches r2. Non-abstained rewards are identical under the
+normalized schema (wrong 0, correct 1), so the reward change affects only
+the template. The fresh critic costs little: r2's EV never exceeded 0.03.
+This branch is also the first GPU run of the packed critic warm-up.
+
+**Result: branch without abstention (job 12663, finished 784 steps).**
+- **Comparator.** The cot run `kda8_pg_reviewed_v2_partial_2048_20260926`
+  (+`_cont`) has the same base, seed, mixture, reward (no abstention) and
+  budgets. It differs only in having no critic warmup and 32 rollout groups.
+  Memory "total step" below is 166 + branch step.
+- **Held-out bench, mean of the last five evaluations.**
+  - Memory, total steps 866-946: 0.0557. Cot, steps 860-940: 0.0519.
+  - Paired per-prompt bootstrap difference: +0.004, 95% CI -0.024 to
+    +0.032. No detectable effect.
+  - At total steps 366-446 the difference is +0.008, CI -0.008 to +0.025.
+  - AIME is 0 throughout.
+- **The bench is decided by about 20 prompts.** Only 15 of 144 prompts are
+  ever solved by memory, against 20 for cot. Memory concentrates its
+  accuracy on fewer prompts: comparison_closest 0.30 vs 0.13, gcd 0.29 vs
+  0.15, but place_value 0.10 vs 0.36. That concentration is the visible
+  step-to-step swing (0.035 to 0.061).
+- **Mechanism.** The memory is used:
+  - `carry/input_delta_rms_ratio` went 0.07 → 0.28;
+  - `read_out_weight_rms` went 0.0009 → 0.0017;
+  - write beta went 0.57 → 0.68;
+  - decay log-timescale went 5.12 → 5.52.
+  - Think length fell 73 → 38 tokens. It stayed above the 33-token floor,
+    and the gate zeroed 0% of correct answers.
+- **Other differences from cot.**
+  - Critic explained variance 0.12-0.21 vs 0.02-0.08.
+  - Training reward 0.11 vs about 0.06, with no held-out counterpart.
+  - Val BPB drifted less: 2.472 vs 2.558 at about 945 total steps, from
+    2.337.
+  - Code think-format collapsed in both (0.06 vs 0.08).
+- **Reading.** One seed per arm against an off-protocol comparator. The
+  memory carry trains stably and is read, but this run gives no evidence
+  that it improves held-out accuracy. The pre-registered paired cot arm
+  (`cot_pair`) was abstention-confounded and stopped at step 185.
+
+**Pre-registration: DG arm of the abstention-free memory branch (job 12672,
+`kda8_dg_reviewed_v2_memory_noabst_s166_20261010`).**
+- **Start.** `--actor-critic-init` from 12663's `critic_warmup_checkpoint.pt`:
+  the step-166 actor, the critic after 50 warm-up steps, critic optimizer
+  state, RNG and cursor 17024. This is 12663's exact post-warm-up state, so
+  the first rollout pool is the same in both arms.
+- **Only difference:** `--delightful-policy-gradient` (eta = 1, no
+  importance ratios) in place of the clipped VAPO actor. Every other flag,
+  `--steps 784` included, matches 12663.
+- **Why now.** DG was dropped on 2026-09-23 because the production critic's
+  explained variance was about 0.01. The decision said to revisit it "if
+  critic EV rises well above 0.01". The memory critic reached 0.12-0.21 in
+  12663.
+- **Criterion.**
+  - Primary: the bench mean over the last five evaluations versus 12663
+    (steps 700-780), with a paired per-prompt bootstrap 95% interval. A
+    difference inside the interval counts as no effect.
+  - Secondary: prompts ever solved (12663 solved 15), val BPB drift, and
+    think length.
+- **Failure modes from the 09-23 analysis.**
+  - DG raises the probability of sampled tokens in proportion to their
+    surprisal whatever the outcome. Watch for rising filler entropy,
+    repetition, and think length running away or collapsing toward the
+    33-token floor.
+  - The early critic is weaker than at 12663's end. Watch whether DG's
+    behaviour changes as the critic's explained variance rises.
+
+**12672 cancelled before start**, at the user's direction. The DG arm
+starts from the SFT actor instead (job 12673, below).
+
+### 2026-10-10 — Critic carry-over merged into the main tree
+
+Only the critic carry-over is merged. The device-resident `CarryStore`
+refactor stays in `.worktrees/carry-store` until its CUDA suite (12668) and
+throughput A/B (12670/12671) run.
+- `--actor-init` now carries the source checkpoint's critic weights and
+  critic optimizer state. The actor optimizer still starts fresh.
+  `--fresh-critic` opts out.
+- `--actor-critic-init` is removed. It was the step-0 special case of
+  this, and it also restored the source RNG.
+- A change to the carried critic's value target requires a refit with
+  `--value-warmup-steps > 0`. The target fields are reward schema,
+  `--abstention-penalty`, `--nearby-reward-max`, `--temperature`, `--top-p`
+  and the token budgets. Changed fields are recorded as
+  `critic.value_contract_changes`.
+- `--value-warmup-steps` defaults to 0 when a trained critic is loaded and
+  50 otherwise.
+- `--actor-init` refuses a source descended from a different base
+  checkpoint.
+- Reproducing 12663's fresh critic now needs `--fresh-critic`.
+- CPU suites show no new failures.
+
+**Pre-registration: DG memory run from the SFT actor with a warmed critic
+(job 12673, `kda8_dg_reviewed_v2_memory_noabst_warmcritic_20261010`).**
+- **Start.** `--actor-init` from r2's `critic_warmup_checkpoint.pt`:
+  - the SFT actor; the memory read-out is zero-initialized, so the policy
+    is exactly SFT;
+  - r2's critic after 50 warm-up steps, with its optimizer state;
+  - cursor 3200.
+- **Refit.** That critic fit the abstention reward (λ = 1). Abstention was
+  0-0.1% of rows in r2's first 30 pools, so its target is effectively the
+  abstention-free one. The reward change still requires a refit:
+  `--value-warmup-steps 10`.
+- **Arm.** `--delightful-policy-gradient`, no abstention, 950 steps.
+  Every other flag matches 12663 and r2.
+- **Comparators.**
+  - At matched total steps, PG-memory branch 12663 (whose first 166 steps
+    were under abstention).
+  - The cot PG run `kda8_pg_reviewed_v2_partial_2048_20260926(+_cont)`.
+  - Neither is a clean pair. The arm differences are the objective (vs
+    12663's late steps) and objective plus mode (vs cot).
+- **Criterion.** Bench mean of the last five evaluations, with a paired
+  per-prompt bootstrap 95% interval. Secondary: prompts ever solved, BPB
+  drift, think length.
+- **Failure modes.**
+  - DG's outcome-independent push on surprising tokens: filler entropy,
+    repetition, think length heading to the 33-token floor.
+  - The early critic is weak (warm-up EV about 0). That is the regime in
+    which DG lost on 2026-09-23.
+
+**Planned follow-up, not queued: DG-cot control for 12673.** The user's
+hypothesis is that the memory carry anchors the policy, so DG's entropy push
+stays bounded and the critic becomes strong enough to give signal. 12673
+alone cannot separate that effect from DG itself.
+- **Control run.** The same flags with `--reasoning-mode cot` and
+  `--actor-init` from `kda8_pg_reviewed_v2_cot_pair_20261010/
+  critic_warmup_checkpoint.pt`. That checkpoint holds the same SFT actor
+  and a cot critic warmed for 50 steps under abstention λ = 1. Use the same
+  10-step refit and 950 steps.
+- **Readout.**
+  - `delightful/surprisal_mean`, the sampled-token surprisal, an unbiased
+    estimate of policy entropy.
+  - `value/online_epoch_explained_variance`.
+  - Think length, and repetition/filler in the rollout samples.
+  - The paired bench, as in the main criterion.
+- **Supports the hypothesis:** DG-cot's surprisal rises and its critic
+  stays weak, while DG-memory's does not.
+- **Refutes it:** both arms behave alike.
+- **Telemetry gap.** PG runs log no sampled-token surprisal, so no entropy
+  comparison against 12663 is possible. A mode-independent surprisal mean
+  should be logged for every objective.
+
+**12673 stopped after its 10 refit steps, before any actor step; relaunched
+as job 12674 (`kda8_dg_reviewed_v2_memory_noabst_warmcritic_r2_20261010`).**
+- **Why.** The refit stacked 10 critic updates on r2's 50 and moved the
+  prompt cursor 640 prompts past r2's first actor step. That confounds the
+  run against every comparator.
+- **The fix.** `--actor-init` from r2's warm-up checkpoint with
+  `--value-warmup-steps 0` starts from r2's exact state at its first actor
+  step: the SFT actor, the 50-step critic with its optimizer state, and
+  cursor 3200. RNG is the exception; it is seeded from `--seed`.
+- **New flag.** The rule that a changed value contract must refit is now
+  explicitly overridable with `--accept-critic-value-change`. The manifest
+  records `critic.value_change_resolution` as `refit` or `accepted`.
+- **Why accepting is sound here.** The critic's reward differs from this
+  run's only on abstained rows, which were 0-0.1% of r2's first 30 pools
+  (warm-up abstention was not logged).
+- **Measured in 12673.** The carried critic predicted 0.010 against a
+  target mean of 0.009-0.023, with explained variance -0.003 to -0.007. It
+  carries a calibrated base rate, not state values.
+- The 12673 directory stays as the aborted record.
+
+**12674 interim (step 237, still running): DG entropy runaway, the 2026-09-22
+v9 failure again.**
+- **Phase 1, steps 0-185.** DG tracks r2 (PG, same start) closely. Think length
+  went 353 → 69 (r2: 345 → 65), ended fraction 0.98 → 1.00, bench 0.009 → 0.027,
+  sampled-token surprisal flat at 1.7-1.9. Advantage std rose 0.024 → 0.06.
+- **Phase 2, steps 185-237.**
+  - Surprisal 1.73 (175) → 2.26 (190) → 2.80 (200) → 5.46 (210) → 7.08 (237).
+  - Ended fraction 0.996 → 0.69; actions per trajectory 108 → 732; think-format
+    fraction 0.72 → 0.42; rollout accuracy about 0.035 → 0.016.
+  - Every source loses termination except science_mc; ultradata_math ends at
+    0.59.
+  - The unterminated rows are 2048-token word salad: numerals, fragments,
+    mixed tokens. Even at step 200 the terminated thinks are incoherent
+    filler around a guessed small integer, as in v9.
+- **Not the cause:**
+  - Val BPB improved 2.337 → 2.323, where PG drifted up to 2.38-2.42. So
+    teacher-forced modelling is intact, and the damage is in the sampled
+    distribution.
+  - Memory: `carry/input_delta_rms_ratio` plateaued at 0.09, while 12663 ran
+    to 0.28 with 0.98-1.00 termination for 784 steps.
+  - The critic itself: the failed-row advantage/surprisal correlation (0.08)
+    is the same in r2, 12663 and the cot pair.
+- **Mechanism (reading of the 09-22 analysis; not separately measured here).**
+  - DG's coefficient U·sigmoid(U·l/eta) weights surprising tokens more than
+    PG for either sign of U. That is an entropy bonus of about
+    E[U^2 Var(l)]/(4 eta), with nothing to counter it. Here the gate is
+    0.486-0.519, so DG is close to 0.5·PG without a trust region, plus that
+    bonus.
+  - It grows with U^2, and advantage std peaked at 0.06 just before the
+    take-off.
+  - Once salad rows dominate the token count, signal collapses (advantage
+    std 0.018; trunk gradient norm 0.0044 → 0.00066). Muon's orthogonalized
+    step keeps the update size fixed anyway, so the walk continues on a
+    mostly-noise direction. That is the open hypothesis from the step-683
+    entry, not yet measured.
+- **Reading.** Memory carry did not anchor DG; the entropy runaway arrived
+  at a similar think length to v9 (about 70-75 tokens). The DG-cot control
+  is still needed to say whether memory changed its timing.

@@ -89,9 +89,10 @@ mlq submit --name <name> --cwd "$PWD" --max-parallel-runs 1 --priority 1 -- pyth
 - Never modify `train_gpt.py` (upstream baseline); fork it for experiments
 - Pretraining metrics go in `ablation_results/<run_name>/metrics.jsonl`; summaries in `ablation_results/<run_name>/result.json`
 - `parameter-golf` TensorBoard (port 6101) is **pretraining only**, reading `tb_logs/<run_name>/`
-- Post-training runs go in `postraining/runs/<run_name>/`, including metrics, summaries, checkpoints, and `tensorboard/` events
+- Post-training runs go in `postraining/runs/<run_name>/`, except MiniCPM5 runs, which go in `postraining/minicpm5_runs/<run_name>/`; each includes metrics, summaries, checkpoints, and `tensorboard/` events
 - `parameter-golf-postraining` TensorBoard (port 6106) is **post-training only**, reading `postraining/runs/`; never link post-training events into `tb_logs/`
-- Before submitting a post-training job, choose its canonical output directory; MiniCPM trainer, observer wrapper, and resume preflight reject destinations outside `postraining/runs/`
+- `parameter-golf-minicpm5` TensorBoard (port 6110) is **MiniCPM5 only**, starts on demand, and reads `postraining/minicpm5_runs/`
+- Before submitting a post-training job, choose its canonical output directory; MiniCPM trainer, observer wrapper, and resume preflight reject destinations outside `postraining/minicpm5_runs/`
 - Historical post-training runs outside that tree may remain linked under `postraining/runs/` for viewing; do not move files being written by an active job
 
 ## Current Targets

@@ -15,3 +15,7 @@ logs/
 tb_logs/
 *.pt
 *.ptz
+/.worktrees/
+
+# MiniCPM5 post-training artifacts
+postraining/minicpm5_runs/
