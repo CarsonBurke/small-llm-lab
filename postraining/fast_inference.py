@@ -42,6 +42,11 @@ from postraining.vapo.rollout.results import (
     response_token_limits,
 )
 from postraining.thinking_budget import force_thinking_end_, validate_thinking_budget
+from pretraining.nanogpt_mini.triton_op_cache import key_compile_caches_on_source
+
+# The compile cache key omits the w8a16_linear triton_op's Python body; key
+# it on this file instead.
+key_compile_caches_on_source(__name__, __file__)
 
 
 FP8_DTYPE = torch.float8_e4m3fn

@@ -989,6 +989,33 @@ def single_fence_span(
     return opens[0], closes[0]
 
 
+def _anchored_answer_span(
+    tokens,
+    think_fence_ids: tuple[int, int],
+    answer_fence_ids: tuple[int, int],
+    min_think_tokens: int,
+) -> tuple[int, int] | None:
+    """The answer span of one anchored think/answer pair before terminal
+    EOS, empty or not; None when the structure is broken."""
+    if len(tokens) < 2:
+        return None
+    think_span = single_fence_span(tokens, think_fence_ids)
+    if think_span is None:
+        return None
+    think_open, think_close = think_span
+    if think_open != 0:
+        return None
+    if think_close - think_open - 1 < max(min_think_tokens, 1):
+        return None
+    answer_span = single_fence_span(tokens, answer_fence_ids)
+    if answer_span is None:
+        return None
+    answer_open, answer_close = answer_span
+    if think_close < answer_open and answer_close == len(tokens) - 2:
+        return answer_span
+    return None
+
+
 def structural_format_ok(
     tokens,
     think_fence_ids: tuple[int, int],
@@ -996,25 +1023,49 @@ def structural_format_ok(
     min_think_tokens: int = 1,
 ) -> bool:
     """Require one anchored, ordered think/answer pair before terminal EOS."""
-    if len(tokens) < 2:
+    span = _anchored_answer_span(
+        tokens, think_fence_ids, answer_fence_ids, min_think_tokens
+    )
+    return span is not None and span[1] - span[0] >= 2
+
+
+def structural_abstention(
+    tokens,
+    think_fence_ids: tuple[int, int],
+    answer_fence_ids: tuple[int, int],
+    eos_id: int,
+    min_think_tokens: int = 1,
+) -> bool:
+    """EOS after a completed think without a submitted nonempty answer.
+
+    Post-think content is unrestricted: explanations, whitespace, and
+    unfinished or empty answer spans may precede EOS. A closed nonempty
+    answer span commits an answer even if later content breaks the normal
+    answer-format contract. The caller passes the continuation through its
+    first stop token, so truncation and EOS inside thinking do not qualify.
+    """
+    if len(tokens) == 0 or tokens[-1] != eos_id or eos_id in tokens[:-1]:
         return False
     think_span = single_fence_span(tokens, think_fence_ids)
     if think_span is None:
         return False
     think_open, think_close = think_span
-    if think_open != 0:
+    if think_open != 0 or think_close - think_open - 1 < max(min_think_tokens, 1):
         return False
-    if think_close - think_open - 1 < max(min_think_tokens, 1):
+    answer_open, answer_close = answer_fence_ids
+    if any(token in answer_fence_ids for token in tokens[: think_close + 1]):
         return False
-    answer_span = single_fence_span(tokens, answer_fence_ids)
-    if answer_span is None:
-        return False
-    answer_open, answer_close = answer_span
-    return (
-        think_close < answer_open
-        and answer_close - answer_open >= 2
-        and answer_close == len(tokens) - 2
-    )
+    open_index = None
+    for index in range(think_close + 1, len(tokens) - 1):
+        token = tokens[index]
+        if token == answer_open:
+            if open_index is None:
+                open_index = index
+        elif token == answer_close and open_index is not None:
+            if index - open_index > 1:
+                return False
+            open_index = None
+    return True
 
 
 def fenced_answer_text(

@@ -2060,8 +2060,8 @@ def test_replay_checkpointing_selects_uniform_layer_subset() -> None:
         configure_replay_checkpointing(causal_lm, -1)
 
 
-@pytest.mark.parametrize("destination", ["tb_logs/run", "ablation_results/run", "postraining/runs"])
-def test_training_rejects_outputs_outside_posttraining_runs(
+@pytest.mark.parametrize("destination", ["tb_logs/run", "ablation_results/run", "postraining/runs", "postraining/runs/run", "postraining/minicpm5_runs"])
+def test_training_rejects_outputs_outside_minicpm_runs(
     tmp_path, monkeypatch, destination
 ) -> None:
     import postraining.train_minicpm_vapo as training
@@ -2078,7 +2078,7 @@ def test_training_output_cannot_escape_dashboard_through_symlink(tmp_path, monke
     import postraining.train_minicpm_vapo as training
 
     monkeypatch.setattr(training, "__file__", str(tmp_path / "postraining/train_minicpm_vapo.py"))
-    runs = tmp_path / "postraining/runs"
+    runs = tmp_path / "postraining/minicpm5_runs"
     runs.mkdir(parents=True)
     pretraining = tmp_path / "tb_logs"
     pretraining.mkdir()

@@ -520,6 +520,7 @@ def test_cuda_ragged_prefill_uses_varlen_and_matches_independent_rows(
             compiled_predicted,
             compiled_log_sigma,
             compiled_logits,
+            _,
         ) = compiled_prefill(
             wrapper.embed_tokens(ids), compiled_caches, key_valid
         )

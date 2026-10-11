@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rerun of ablation_results/minicpm_gate10_nora_mb4_v3_4k at 10k generation length.
+# Rerun of postraining/minicpm5_runs/minicpm_gate10_nora_mb4_v3_4k at 10k generation length.
 # Every value pinned explicitly (recovered from the 4k checkpoint args); nothing
 # rides argparse defaults, so future default changes cannot silently alter this.
 # Deliberate changes vs the 4k run: --output, --max-new-tokens 10000.
@@ -12,7 +12,7 @@ exec .venv/bin/python -u -m postraining.train_minicpm_vapo \
   --model openbmb/MiniCPM5-1B \
   --revision 87179e5c1f455ef22e6223592d2d61351b525bfc \
   --data postraining/data/dapo-math-17k.parquet \
-  --output postraining/runs/minicpm_gate10_nora_mb4_v3_10k \
+  --output postraining/minicpm5_runs/minicpm_gate10_nora_mb4_v3_10k \
   --steps 10 \
   --value-warmup-steps 10 \
   --prompts-per-rollout 4 \
@@ -56,7 +56,7 @@ exec .venv/bin/python -u -m postraining.train_minicpm_vapo \
   --device-telemetry-interval-ms 250 \
   --device-power-floor 400.0 \
   --checkpoint-interval-seconds 300 \
-  --resume postraining/runs/minicpm_gate10_nora_warmup_v3_4k/vapo_adapter_checkpoint.pt \
+  --resume postraining/minicpm5_runs/minicpm_gate10_nora_warmup_v3_4k/vapo_adapter_checkpoint.pt \
   --gate-min-positive-trajectories 1 \
   --gate-min-positive-groups 1 \
   --gate-max-truncation-fraction 0.5 \

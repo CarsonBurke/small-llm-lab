@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         required=True,
-        help="new or empty directory under postraining/runs",
+        help="new or empty directory under postraining/minicpm5_runs",
     )
     parser.add_argument(
         "--dataset-revision",
@@ -115,7 +115,7 @@ def load_metadata(args):
     if args.prepare_only and args.prepared_dir:
         raise ValueError("--prepare-only cannot reuse --prepared-dir")
     output = args.output.resolve()
-    runs_root = (ROOT / "postraining/runs").resolve()
+    runs_root = (ROOT / "postraining/minicpm5_runs").resolve()
     if output == runs_root or not output.is_relative_to(runs_root):
         raise ValueError(f"--output must be a run directory beneath {runs_root}")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):

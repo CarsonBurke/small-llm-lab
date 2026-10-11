@@ -52,7 +52,7 @@ training; never overwrite them beneath an existing run.
 
 ## Run locations and dashboards
 
-Post-training runs belong in `postraining/runs/<run_name>/`, with TensorBoard
+Small-model post-training runs belong in `postraining/runs/<run_name>/`, with TensorBoard
 events in its `tensorboard/` subdirectory. The **parameter-golf-postraining**
 dashboard at `http://127.0.0.1:6106/` watches this tree directly; no dashboard
 symlink is needed for new runs. Put metrics, summaries, and checkpoints in the
@@ -60,8 +60,13 @@ same run directory.
 
 The **parameter-golf** dashboard at `http://127.0.0.1:6101/` watches `tb_logs/`
 and is for **pretraining only**. Never link post-training runs there.
+MiniCPM5 RL runs and their evaluations belong in
+`postraining/minicpm5_runs/<run_name>/`. The **parameter-golf-minicpm5**
+TensorWatch entry at `http://127.0.0.1:6110/` starts on demand and watches this
+separate tree. Metrics, checkpoints, and `tensorboard/` events live together.
+Open it through TensorWatch or run `tensorwatch start parameter-golf-minicpm5`.
 MiniCPM training (including `scripts/run_minicpm_vapo.py`) and its resume
-preflight reject output directories outside `postraining/runs/`, including
+preflight reject output directories outside `postraining/minicpm5_runs/`, including
 symlinks that escape the tree, before loading a model or writing run artifacts.
 Historical external runs remain accessible through existing post-training
 dashboard links; active run files are not moved. Resume historical checkpoints
@@ -105,23 +110,23 @@ These local defaults are **not** claimed to reproduce the publisher's protocol.
 # Set CHECKPOINT to the selected trained checkpoint; metadata inspection runs
 # directly because --dry-run never loads a model or writes run artifacts.
 .venv/bin/python scripts/evaluate_minicpm_vapo.py \
-  --checkpoint "$CHECKPOINT" --output postraining/runs/minicpm_carry_aime26 \
+  --checkpoint "$CHECKPOINT" --output postraining/minicpm5_runs/minicpm_carry_aime26 \
   --dry-run
 
 # Run only when evaluation is wanted; neither command is part of training.
 mlq submit --name minicpm-carry-aime26 --cwd "$PWD" \
   --max-parallel-runs 1 --time-limit 4h --max-attempts 1 -- \
   .venv/bin/python scripts/evaluate_minicpm_vapo.py \
-  --checkpoint "$CHECKPOINT" --output postraining/runs/minicpm_carry_aime26
+  --checkpoint "$CHECKPOINT" --output postraining/minicpm5_runs/minicpm_carry_aime26
 
 # Same saved protocol, untouched base checkpoint, no learned adapter or carry.
 mlq submit --name minicpm-stock-aime26 --cwd "$PWD" \
   --max-parallel-runs 1 --time-limit 4h --max-attempts 1 -- \
   .venv/bin/python scripts/evaluate_minicpm_vapo.py \
-  --checkpoint "$CHECKPOINT" --stock --output postraining/runs/minicpm_stock_aime26
+  --checkpoint "$CHECKPOINT" --stock --output postraining/minicpm5_runs/minicpm_stock_aime26
 ```
 Select AIME25 by adding `--suite aime_2025` to the carry or stock command and
-choosing a separate output, such as `postraining/runs/minicpm_carry_aime25`.
+choosing a separate output, such as `postraining/minicpm5_runs/minicpm_carry_aime25`.
 AIME26 remains the default. Both full suites record the 40.42% Avg@16 reference;
 individual sittings do not inherit that combined-benchmark score.
 Acquire/rebuild the pinned AIME25 text files with
@@ -133,7 +138,7 @@ prepared training corpora are not retroactively rewritten.
 
 Outputs are `result.json` (resolved protocol, hashes, provenance and metrics),
 `attempts.jsonl` (every generated response), `metrics.jsonl` (cumulative batch
-metrics), and `tensorboard/` on **parameter-golf-postraining** only. Output
+metrics), and `tensorboard/` on **parameter-golf-minicpm5** only. Output
 directories must be new or empty. The primary `contract_content_accuracy` is
 mean per-attempt correctness, not pass@k, and accepts correct capped answers
 like training. EOS-required and relaxed/boxed-answer metrics are also reported
@@ -228,7 +233,7 @@ standard-LoRA control and severe 4K-response truncation; the named 2K comparison
 did not complete. The implementation/resume review and focused tests qualify a
 fresh experiment, not empirical default adoption under the longer-run criteria.
 Review evidence and the fresh 10K, v3-attention run:
-[NoRA readiness and fresh run](../ablation_results/minicpm5_vapo_nora_fresh_20m_20260910/result.json).
+[NoRA readiness and fresh run](../postraining/minicpm5_runs/minicpm5_vapo_nora_fresh_20m_20260910/result.json).
 That fresh 20-minute run completed ten critic-warmup cycles and saved actor step
 one (four actor and 44 critic optimizer steps) with finite checkpoint tensors.
 The two actor-phase rollouts measured 8,703 and 9,038 useful tokens/s, but 59.4%
@@ -363,7 +368,7 @@ After actor step one, both token and carry matrices had moved independently
 in the saved actor and critic; all four matrices were finite.
 
 Historical evidence:
-`ablation_results/minicpm_token_carry_stored_train_20260916/result.json`,
+`postraining/minicpm5_runs/minicpm_token_carry_stored_train_20260916/result.json`,
 `metrics.jsonl`, `packed_replay_kernels.txt`, and `vapo_adapter_checkpoint.pt`.
 
 That run collapsed: its last five recorded rollout accuracies were zero.
@@ -385,7 +390,7 @@ substantially; this is not a stable general throughput estimate.
 Gated run **7679** was stopped after the user reported 100% truncation with
 the answer reserve disabled. Its rolling checkpoint did not retain the critic
 warmup boundary; training/benchmark evidence remains in
-`ablation_results/minicpm_token_carry_gated_train_20260916/`.
+`postraining/minicpm5_runs/minicpm_token_carry_gated_train_20260916/`.
 
 Replacement job **7718** restored the 1,000-token answer reserve, then was
 externally cancelled during warmup. It retained actor step zero / critic warmup
@@ -403,9 +408,9 @@ prompt/checkpoint/evaluator host tests pass; the earlier carry/forcing checks
 passed separately. This prompt communicates a ceiling, not an exact counter.
 
 Evidence is written to
-`ablation_results/minicpm_token_carry_gated_budget9k_20260916/`.
-Its linked TensorBoard run remains available at
-`http://127.0.0.1:6106/?runFilter=minicpm_token_carry_gated_budget9k_20260916#timeseries`.
+`postraining/minicpm5_runs/minicpm_token_carry_gated_budget9k_20260916/`.
+Its TensorBoard run is available on demand at
+`http://127.0.0.1:6110/?runFilter=minicpm_token_carry_gated_budget9k_20260916#timeseries`.
 The run name has `/tensorboard` appended. The server rescans every 180 seconds.
 The historical sigmoid run's
 `carry/actor_gate` and `carry/critic_gate` report its scalar gates. Behavior refresh reports
@@ -428,9 +433,9 @@ passed 172 tests; a separate BF16 boundary check confirmed that FP32 scaling
 produces distinct outputs where rounding the scales first would erase their
 difference, with scale gradients preserved and carry-producer gradients absent.
 GPU/compiled execution is pending queue admission; no learning benefit is
-claimed. Artifacts: `ablation_results/minicpm_token_carry_layerscale_budget9k_20260916/`.
+claimed. Artifacts: `postraining/minicpm5_runs/minicpm_token_carry_layerscale_budget9k_20260916/`.
 TensorBoard:
-`http://127.0.0.1:6106/?runFilter=minicpm_token_carry_layerscale_budget9k_20260916#timeseries`.
+`http://127.0.0.1:6110/?runFilter=minicpm_token_carry_layerscale_budget9k_20260916#timeseries`.
 
 **Opt-in latent thinking:** add `--latent-thinking` to a fresh MiniCPM run.
 The default is false; `--no-latent-thinking` explicitly retains native token
@@ -801,7 +806,7 @@ Render saved rollout responses as a standalone HTML transcript:
 
 ```bash
 .venv/bin/python -m postraining.rollout_report \
-  --run postraining/runs/<run_name> --last 4 --compare-steps 44,64-84
+  --run postraining/minicpm5_runs/<run_name> --last 4 --compare-steps 44,64-84
 ```
 
 The same command serves the KDA trainer, which writes its own captures
@@ -969,9 +974,9 @@ Evaluate the untouched MiniCPM5-1B base on a reproducible KodCode coding sample:
 mlq submit --name minicpm-base-kodcode --cwd "$PWD" \
   --max-parallel-runs 1 --priority 1 --max-attempts 1 --time-limit 4h -- \
   .venv/bin/python -u scripts/evaluate_minicpm_kodcode.py \
-    --checkpoint postraining/runs/<preserved_run>/vapo_adapter_checkpoint.pt \
+    --checkpoint postraining/minicpm5_runs/<preserved_run>/vapo_adapter_checkpoint.pt \
     --dataset-revision dcf78a8bbba9a613b596ce993c4921a38687dfcc \
-    --output postraining/runs/<new_coding_eval>
+    --output postraining/minicpm5_runs/<new_coding_eval>
 ```
 
 The checkpoint supplies validated base identity/configuration only: `stock=True`
@@ -1016,13 +1021,13 @@ mlq submit --name minicpm5_native_aime_baseline --cwd "$PWD" \
     --prompt-tokens 1024 --max-new-tokens 4096 \
     --batch-trajectories 4 --no-autotune-batch-trajectories \
     --temperature 0.9 --top-p 0.95 \
-    --output postraining/runs/minicpm5_native_baseline
+    --output postraining/minicpm5_runs/minicpm5_native_baseline
 
 mlq submit --name minicpm5_vapo_gate --cwd "$PWD" \
   --max-parallel-runs 1 --time-limit 4h -- \
   python3 -m postraining.train_minicpm_vapo \
     --rollout-only \
-    --output postraining/runs/minicpm5_vapo_gate
+    --output postraining/minicpm5_runs/minicpm5_vapo_gate
 ```
 
 Before resuming, run the CPU-only preflight. It validates the v6 schema,
@@ -1033,8 +1038,8 @@ accepts the less error-prone additional-step form:
 
 ```bash
 python3 scripts/preflight_minicpm_vapo.py \
-  --resume postraining/runs/source/vapo_adapter_checkpoint.pt \
-  --output postraining/runs/minicpm5_vapo_continuation \
+  --resume postraining/minicpm5_runs/source/vapo_adapter_checkpoint.pt \
+  --output postraining/minicpm5_runs/minicpm5_vapo_continuation \
   --additional-steps 200
 ```
 
@@ -1101,14 +1106,14 @@ optimizer/RNG/cursor, and curriculum identity are pinned for exact recovery.
 # Point UNO_DATA at a real offline reasoning JSONL corpus.
 mlq submit --name minicpm-uno-prepare --cwd "$PWD" --max-parallel-runs 1 -- \
   .venv/bin/python scripts/train_minicpm_uno.py \
-  --data "$UNO_DATA" --output postraining/runs/minicpm_uno --prepare-only
+  --data "$UNO_DATA" --output postraining/minicpm5_runs/minicpm_uno --prepare-only
 
 # Start only after numerical/runtime feasibility checks; this is a 400M-token pilot.
 mlq submit --name minicpm-uno-distill --cwd "$PWD" --max-parallel-runs 1 -- \
   .venv/bin/python scripts/train_minicpm_uno.py \
-  --data "$UNO_DATA" --output postraining/runs/minicpm_uno
+  --data "$UNO_DATA" --output postraining/minicpm5_runs/minicpm_uno
 
-# Same immutable arguments plus --resume postraining/runs/minicpm_uno/latest.pt
+# Same immutable arguments plus --resume postraining/minicpm5_runs/minicpm_uno/latest.pt
 # recover training. A completed curriculum also exports adapter.pt.
 ```
 
@@ -1125,8 +1130,8 @@ Before enabling RL, compare Uno against all three AR controls on the same traine
 ```bash
 mlq submit --name minicpm-uno-compare --cwd "$PWD" --max-parallel-runs 1 -- \
   .venv/bin/python scripts/benchmark_minicpm_uno.py \
-  --uno-checkpoint postraining/runs/minicpm_uno/adapter.pt \
-  --output postraining/runs/minicpm_uno/comparison.json
+  --uno-checkpoint postraining/minicpm5_runs/minicpm_uno/adapter.pt \
+  --output postraining/minicpm5_runs/minicpm_uno/comparison.json
 ```
 
 The benchmark defaults to eight prompts × sixteen responses over 64 physical lanes,
@@ -1152,9 +1157,9 @@ Set `UNO_USEFUL_TPS_FLOOR` to a measured useful-token floor; do not copy the def
 ```bash
 mlq submit --name minicpm-vapo-uno --cwd "$PWD" --max-parallel-runs 1 -- \
   .venv/bin/python -m postraining.train_minicpm_vapo \
-  --uno-rollout --uno-checkpoint postraining/runs/minicpm_uno/adapter.pt \
+  --uno-rollout --uno-checkpoint postraining/minicpm5_runs/minicpm_uno/adapter.pt \
   --uno-block-size 4 --min-rollout-tokens-per-second "$UNO_USEFUL_TPS_FLOOR" \
-  --output postraining/runs/minicpm_vapo_uno
+  --output postraining/minicpm5_runs/minicpm_vapo_uno
 ```
 
 The inherited continuous scheduler commits only clean verified KV, keeps the final
@@ -1325,9 +1330,26 @@ the trunk from a random instance; `--critic-init actor` starts it from a
 storage-independent copy of the actor's weights as loaded at run start,
 matching VAPO's pretrained-LM critic init without its reward-model bias. The
 manifest's `critic.init` records `scratch`, `actor_copy`, or
-`warm_checkpoint` (`--actor-critic-init`). A resume carries that record forward
+`warm_checkpoint`. A resume carries that record forward
 from the resumed run's manifest (its own directory, or the checkpoint's when
 resuming into a new one) and refuses a contradicting `--critic-init`.
+
+`--actor-init` branches from any RL checkpoint of the same base (a finished
+critic warmup included): it loads the actor, continues the source's prompt
+cursor, starts a fresh actor optimizer, and by default carries the critic's
+weights and optimizer state (`warm_checkpoint`, `optimizer_state: carried`).
+`--fresh-critic` starts the critic per `--critic-init` instead, and is the
+only way to combine `--actor-init` with `--critic-init actor`. The carried
+critic fit the source's value target: the lambda-one return of its sampling
+policy under its terminal reward, truncated at its horizon. A branch that
+changes any of reward schema, `--abstention-penalty`, `--nearby-reward-max`,
+`--temperature`, `--top-p`, or the prompt/continuation/answer token budgets
+must refit the critic with `--value-warmup-steps > 0`; the changed fields are
+recorded as `critic.value_contract_changes`. A step-0 source whose critic never
+finished its warmup also needs one. `--value-warmup-steps` counts this run's
+own critic-only updates and defaults to 0 when the run loads a trained critic
+(`--actor-init` without `--fresh-critic`, `--critic-only-init`) and 50
+otherwise.
 
 Carry refuses `--thought-sigma`, `--init-stop-thinking-probability`, and
 `--rollout-scheduler continuous_refill`. Its checkpoints record rollout policy

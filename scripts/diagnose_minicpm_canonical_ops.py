@@ -16,7 +16,7 @@ from postraining.fast_inference import build_fused_rollout_replica
 
 p=argparse.ArgumentParser()
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--streams', type=Path, default=Path('ablation_results/minicpm_low_noise_20260911/canonical_attention_v1.streams.pt'))
+p.add_argument('--streams', type=Path, default=Path('postraining/minicpm5_runs/minicpm_low_noise_20260911/canonical_attention_v1.streams.pt'))
 p.add_argument('--position', type=int, default=157)
 a=p.parse_args()
 if a.output.exists():

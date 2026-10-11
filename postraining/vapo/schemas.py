@@ -78,6 +78,28 @@ CARRY_DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
 CARRY_TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA = (
     "target_policy_token_odds_hidden_carry/v7"
 )
+# The gated-delta memory carry (``postraining.memory_carry``): the carry's
+# token-only action space and counter-keyed draw, with the carried beliefs
+# (prompt beliefs included) written into a per-row fp32 memory that each
+# generated token's input reads. Replay adds one chunked memory scan per
+# actor and critic pass.
+MEMORY_EXECUTION_SCHEMA = (
+    "unique_prefix_bucketed_graph_decode_broad_mixture_gated_delta_memory_"
+    "carry_token_only_counter_gumbel_request_row_slot_token_rng/v1"
+)
+MEMORY_REPLAY_NUMERICS_SCHEMA = (
+    "compact_token_logprob_next_slot_gated_delta_memory_chunk_scan_"
+    "fp32_state_tf32_dot_fused_softcap_readout_exact_replay/v1"
+)
+MEMORY_ACTOR_OBJECTIVE_SCHEMA = (
+    "vapo_token_clip_gated_delta_memory_token_denominator/v1"
+)
+MEMORY_DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA = (
+    "delightful_token_policy_gated_delta_memory/v1"
+)
+MEMORY_TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA = (
+    "target_policy_token_odds_gated_delta_memory/v1"
+)
 ADAMW_ALGORITHM_SCHEMA = (
     "torch_adamw_betas0.9_0.999_eps1e-8_amsgrad_false_weight_decay0/v1"
 )
@@ -95,12 +117,16 @@ def execution_schema_for(
     continuous-refill variant: the paged scheduler does not implement the
     hidden carry.
     """
-    if reasoning_mode == "carry":
+    if reasoning_mode in ("carry", "memory"):
         if rollout_scheduler != "lockstep":
             raise ValueError(
                 "hidden carry is implemented by the lockstep scheduler only"
             )
-        return CARRY_EXECUTION_SCHEMA
+        return (
+            CARRY_EXECUTION_SCHEMA
+            if reasoning_mode == "carry"
+            else MEMORY_EXECUTION_SCHEMA
+        )
     if reasoning_mode not in ("latent", "cot", "none"):
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
     if rollout_scheduler == "lockstep":
@@ -116,6 +142,8 @@ def replay_numerics_schema_for(reasoning_mode: str) -> str:
     """Replay-numerics schema a reasoning mode refreshes and updates under."""
     if reasoning_mode == "carry":
         return CARRY_REPLAY_NUMERICS_SCHEMA
+    if reasoning_mode == "memory":
+        return MEMORY_REPLAY_NUMERICS_SCHEMA
     if reasoning_mode not in ("latent", "cot", "none"):
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
     return REPLAY_NUMERICS_SCHEMA
@@ -143,6 +171,12 @@ def actor_objective_schema(
             CARRY_ACTOR_OBJECTIVE_SCHEMA,
             CARRY_DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA,
             CARRY_TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA,
+        )
+    elif reasoning_mode == "memory":
+        vapo, delightful, target = (
+            MEMORY_ACTOR_OBJECTIVE_SCHEMA,
+            MEMORY_DELIGHTFUL_ACTOR_OBJECTIVE_SCHEMA,
+            MEMORY_TARGET_POLICY_ACTOR_OBJECTIVE_SCHEMA,
         )
     elif reasoning_mode in ("latent", "cot", "none"):
         vapo, delightful, target = (

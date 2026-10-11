@@ -56,7 +56,7 @@ from postraining.math_prompt import (
     require_answer_fence_prompt_schema,
 )
 from postraining.model_io import load_model
-from postraining.reasoning_modes import REASONING_MODES
+from postraining.reasoning_modes import REASONING_MODES, mode_carries_hidden
 from pretraining.fresh_lejepa.fresh_lejepa_train import FreshHyperparameters
 
 PROBE_RUN_SCHEMA = "arithmetic_probe_run/v1"
@@ -272,8 +272,8 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
     # The hidden carry is a property of the trained policy, never a decoding
-    # choice: it is on exactly when the wrapper was trained in carry mode.
-    hidden_carry = reasoning_mode == "carry"
+    # choice: it is on exactly when the wrapper was trained in a carry mode.
+    hidden_carry = mode_carries_hidden(reasoning_mode)
     device = torch.device("cuda")
     backbone = load_model(checkpoint_path, device, payload=payload)
     tokenizer = load_posttraining_tokenizer(

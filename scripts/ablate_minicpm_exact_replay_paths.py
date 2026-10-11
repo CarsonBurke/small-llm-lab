@@ -44,7 +44,7 @@ from postraining.train_minicpm_vapo import (
     update_step,
 )
 
-CHECKPOINT = ROOT / "postraining/runs/minicpm5_vapo_balanced_lr_cont200_v15/vapo_adapter_checkpoint.pt"
+CHECKPOINT = ROOT / "postraining/minicpm5_runs/minicpm5_vapo_balanced_lr_cont200_v15/vapo_adapter_checkpoint.pt"
 ROLLOUTS = ROOT / "ablation_results/minicpm_ar_production_20260908/optimized-ar.json"
 REPLAY = dict(replay_token_budget=11024, replay_max_trajectories=16)
 journal = (OUT / "metrics.jsonl").open("w", buffering=1)

@@ -12,8 +12,9 @@ tick's cost is set by the two Triton kernels it runs --
 
 ``PinnedDecodeArena`` removes the host from the step. One decode tick --
 record the pending token, embed it (plus the carried belief under
-``hidden_carry``), step every layer, sample the next token -- is one compiled
-function, captured as one CUDA graph per live-row bucket.
+``hidden_carry``, or a read of the row's memory under the memory carry), step
+every layer, write the new belief into the memory, sample the next token --
+is one compiled function, captured as one CUDA graph per live-row bucket.
 Everything a tick reads or writes lives in arena buffers, and an optimizer
 step, which updates parameters in place, is visible to the next replay. The
 large buffers -- decode caches and carry record -- and the graphs over them
@@ -59,6 +60,7 @@ from postraining.latent_rollout import (
     RECURRENT_CACHE_ARITY,
     TOKEN_SLOT,
     LatentRolloutBatch,
+    compact_stream_to_device,
     counter_gumbel_tokens,
 )
 from postraining.latent_thought import EMIT, LatentThoughtModel
@@ -123,6 +125,7 @@ def _decode_tick(
     actions: Tensor,
     action_mask: Tensor,
     hiddens: Tensor,
+    memory_state: Tensor,
     position: Tensor,
     budget: Tensor,
     stop_ids: Tensor,
@@ -130,6 +133,8 @@ def _decode_tick(
     temperature: float,
     top_p: float,
     hidden_carry: bool,
+    memory_carry: bool,
+    replay_storage: bool,
     autocast_dtype: torch.dtype | None,
 ) -> None:
     """Record slot ``position``'s pending token, step, and sample the next.
@@ -152,7 +157,7 @@ def _decode_tick(
     )
     token = torch.where(active, pending, 0)
     token_ids.index_put_((live_rows, next_slot), token)
-    if hidden_carry:
+    if hidden_carry and replay_storage:
         hiddens.index_put_(
             (live_rows, next_slot),
             torch.where(active[:, None], belief, 0).to(hiddens.dtype),
@@ -164,7 +169,9 @@ def _decode_tick(
         dtype=autocast_dtype or torch.bfloat16,
         enabled=autocast_dtype is not None,
     ):
-        if hidden_carry:
+        if memory_carry:
+            step_input = wrapper.memory_input(token, belief, memory_state)
+        elif hidden_carry:
             step_input = wrapper.combined_input(token, belief)
         else:
             step_input = wrapper.embed_tokens(token[:, None])
@@ -183,6 +190,9 @@ def _decode_tick(
                 f"carry record's {belief.dtype}"
             )
         belief.copy_(new_belief)
+    if memory_carry:
+        # The write, at the network output: the next tick's read sees it.
+        memory_state.copy_(wrapper.memory_write(memory_state, new_belief))
     pending.copy_(
         counter_gumbel_tokens(
             logits, seeds, next_position - starts, temperature, top_p
@@ -225,6 +235,7 @@ class PinnedDecodeArena:
         compile: bool = True,
         cuda_graphs: bool = True,
         cache_linear_weights: bool = True,
+        replay_storage: bool = True,
     ):
         if rows < 1 or kv_width < 2:
             raise ValueError("arena rows and kv width must be positive")
@@ -248,6 +259,11 @@ class PinnedDecodeArena:
         self.top_p = float(top_p)
         self.device = device
         self.hidden_carry = hidden_carry
+        self.memory_carry = hidden_carry and wrapper.memory_carry
+        # Evaluation never replays, so its carry arenas need no record:
+        # the record is rows x kv_width x dim (4.5 GiB at 1024 x 2304 fp32),
+        # plus the same again for the returned clone.
+        self.replay_storage = replay_storage
         self.cache_dtype = cache_dtype
         self.autocast_dtype = autocast_dtype
         self.sync_every = sync_every
@@ -281,6 +297,8 @@ class PinnedDecodeArena:
         self.caches: list[tuple[Tensor, ...]] | None = None
         self.belief: Tensor | None = None
         self.hiddens: Tensor | None = None
+        # The memory carry's per-row fp32 state (zero-width otherwise).
+        self.memory_state: Tensor | None = None
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._warm = False
 
@@ -304,6 +322,8 @@ class PinnedDecodeArena:
             temperature=self.temperature,
             top_p=self.top_p,
             hidden_carry=hidden_carry,
+            memory_carry=self.memory_carry,
+            replay_storage=replay_storage,
             autocast_dtype=autocast_dtype,
         )
         linear_copies = self._linear_copies
@@ -326,7 +346,12 @@ class PinnedDecodeArena:
         raise ValueError(f"{count} rows exceed the arena's {self.rows}")
 
     def _tick_args(self, rows: int) -> tuple:
-        if self.caches is None or self.belief is None or self.hiddens is None:
+        if (
+            self.caches is None
+            or self.belief is None
+            or self.hiddens is None
+            or self.memory_state is None
+        ):
             raise RuntimeError("decode ticks run only inside the arena workspace")
         caches = [tuple(tensor[:rows] for tensor in layer) for layer in self.caches]
         return (
@@ -343,6 +368,7 @@ class PinnedDecodeArena:
             self.actions,
             self.action_mask,
             self.hiddens,
+            self.memory_state[:rows],
             self.position,
             self.budget,
             self.stop_ids,
@@ -403,9 +429,18 @@ class PinnedDecodeArena:
                 (self.rows, dim), dtype=belief_dtype, device=self.device
             )
             self.hiddens = torch.zeros(
-                (self.rows, self.kv_width, dim if self.hidden_carry else 0),
+                (
+                    self.rows,
+                    self.kv_width,
+                    dim if self.hidden_carry and self.replay_storage else 0,
+                ),
                 dtype=belief_dtype,
                 device=self.device,
+            )
+            self.memory_state = (
+                self.wrapper.memory_initial_state(self.rows, self.device)
+                if self.memory_carry
+                else torch.zeros((self.rows, 0), device=self.device)
             )
             self._capture()
             yield
@@ -413,6 +448,7 @@ class PinnedDecodeArena:
             # Graphs first: they reference the buffers' memory.
             self._graphs = {}
             self.caches = self.belief = self.hiddens = None
+            self.memory_state = None
 
     def _capture(self) -> None:
         """Capture each bucket's tick as one graph, warming them the first time.
@@ -460,7 +496,7 @@ class PinnedDecodeArena:
         order = torch.sort(
             (~active).to(torch.uint8), stable=True
         ).indices[:keep_rows]
-        assert self.belief is not None
+        assert self.belief is not None and self.memory_state is not None
         for tensor in (
             self.live_rows,
             self.starts,
@@ -469,6 +505,7 @@ class PinnedDecodeArena:
             self.pending,
             self.seeds,
             self.belief,
+            self.memory_state,
         ):
             tensor[:keep_rows].copy_(tensor[:rows].index_select(0, order))
         for layer in self.caches:
@@ -490,6 +527,7 @@ class PinnedDecodeArena:
         max_new_tokens: int,
         max_stream_steps: int,
         token_seeds: Tensor,
+        offload_device: torch.device | None = None,
     ) -> LatentRolloutBatch:
         """Roll out ``prompt_repeats`` samples of each left-padded prompt.
 
@@ -498,6 +536,12 @@ class PinnedDecodeArena:
         per output trajectory (prompt-major). Each row emits at most
         ``max_new_tokens``. Returns the same stream layout as
         ``rollout_continuations`` over the same arguments.
+
+        ``offload_device`` (the host) returns the batch there as
+        ``compact_stream_to_device`` would, copied straight from the arena
+        and trimmed to the used stream prefix. The device-side clone it
+        skips is the whole replay record (rows x width x dim fp32, 4.5 GiB
+        at 1024 x 2304) on top of the arena itself.
         """
         device = self.device
         if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
@@ -582,8 +626,10 @@ class PinnedDecodeArena:
             self.seeds[:rows].zero_()
             self.seeds[:batch].copy_(token_seeds.to(device))
             assert self.belief is not None and self.hiddens is not None
+            assert self.memory_state is not None
             self.belief[batch:rows].zero_()
             self.belief[:batch].copy_(repeat(prefilled.belief))
+            self.memory_state[batch:rows].zero_()
             self.pending[:rows].zero_()
             self.pending[:batch].copy_(
                 counter_gumbel_tokens(
@@ -604,6 +650,25 @@ class PinnedDecodeArena:
             self.actions[:batch, :max_stream].zero_()
             self.action_mask[:batch, :max_stream].zero_()
             self.hiddens[:batch, :max_stream].zero_()
+            if self.memory_carry:
+                # Every real prompt belief, written once per unique prompt.
+                beliefs = prefilled.prefix_beliefs
+                self.memory_state[:batch].copy_(
+                    repeat(
+                        self.wrapper.memory_prompt_state(beliefs, prompt_valid)
+                    )
+                )
+                if self.replay_storage:
+                    # Recorded at the slot after the one that computed it,
+                    # as the tick records the beliefs it computes.
+                    self.hiddens[:batch, 1:width].copy_(
+                        repeat(
+                            torch.where(
+                                prompt_valid[:, :-1, None], beliefs[:, :-1], 0
+                            )
+                        )
+                    )
+                del beliefs
             self.position.fill_(width - 1)
             self.budget.fill_(max_new_tokens)
             del prefilled
@@ -623,18 +688,23 @@ class PinnedDecodeArena:
                 position += 1
 
             stream = (slice(0, batch), slice(0, max_stream))
-            kind = self.kind[stream].clone()
-            actions = self.actions[stream].clone()
-            action_mask = self.action_mask[stream].clone()
+            # Views when offloading: the compacting copy below is then the
+            # only one, and it completes before this returns.
+            def own(view: Tensor) -> Tensor:
+                return view if offload_device is not None else view.clone()
+
+            kind = own(self.kind[stream])
+            actions = own(self.actions[stream])
+            action_mask = own(self.action_mask[stream])
             thoughts = torch.zeros((batch, max_stream, 0), device=device)
             zeros = torch.zeros_like(action_mask)
-            return LatentRolloutBatch(
+            rolled = LatentRolloutBatch(
                 kind=kind,
-                token_ids=self.token_ids[stream].clone(),
+                token_ids=own(self.token_ids[stream]),
                 thoughts=thoughts,
                 hiddens=(
-                    self.hiddens[stream].clone()
-                    if self.hidden_carry
+                    own(self.hiddens[stream])
+                    if self.hidden_carry and self.replay_storage
                     else torch.zeros((batch, max_stream, 0), device=device)
                 ),
                 actions=actions,
@@ -652,4 +722,8 @@ class PinnedDecodeArena:
                 reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
                 prompt_length=width,
                 carry_injected=self.hidden_carry,
+                memory_carry=self.memory_carry,
             )
+            if offload_device is None:
+                return rolled
+            return compact_stream_to_device(rolled, offload_device)

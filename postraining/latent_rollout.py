@@ -23,6 +23,13 @@ generated token is stored at that token's slot (``hiddens``) and added through
 the combiner when the token is consumed. Prompt slots and the input of the
 first generation step carry nothing. Stored hiddens are behavior-time
 constants, so there is no BPTT through the carry.
+
+Gated-delta memory carry (a ``memory_carry`` wrapper rolled out with
+``hidden_carry=True``) stores the same record plus every prompt belief, at
+the slot after the one that computed it. Decode keeps one fp32 memory state
+per row: the prompt beliefs are written at prefill, each later belief right
+after the step that computes it, and every generated token's input reads the
+state. Replay rebuilds those reads with one parallel scan over the record.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
 from postraining.core import top_p_sample as _core_top_p_sample
+from postraining.memory_carry import memory_write_mask
 from postraining.nucleus_threshold import nucleus_threshold
 from postraining.latent_thought import (
     EMIT,
@@ -259,21 +267,24 @@ def counter_gumbel_tokens(
     return _race_winner(scores)
 
 
-# Vocabulary slices the race's argmax reduces separately. A one-stage row
-# argmax runs one program per row, so an 8-16 row decode tail hashes and
-# scans 50,304 tokens per program on a handful of SMs; slicing spreads that
-# across the GPU.
+# Vocabulary slices the race's argmax reduces separately at few rows. A
+# one-stage argmax over a small decode bucket leaves most of the GPU idle;
+# slicing spreads the hash and the scan across it. Graph-replayed draws over
+# the 50,304-token vocabulary (bench_race_buckets, 2026-09-26): 26.0 -> 8.2 us
+# at 8 rows, 25.6 -> 22.5 us at 96, but 26.0 -> 28.7 us at 128.
 _RACE_SLICES = 48
+_RACE_SLICED_MAX_ROWS = 96
 
 
 def _race_winner(scores: Tensor) -> Tensor:
-    """``scores.argmax(dim=-1)`` as a per-slice then cross-slice reduction.
+    """``scores.argmax(dim=-1)``, as a per-slice then cross-slice reduction
+    when that is faster.
 
     Both stages keep the first maximal index, so the winner, ties and NaN
     included, is exactly ``argmax``'s.
     """
     vocab = scores.size(-1)
-    if vocab % _RACE_SLICES:
+    if vocab % _RACE_SLICES or scores.numel() > _RACE_SLICED_MAX_ROWS * vocab:
         return scores.argmax(dim=-1)
     width = vocab // _RACE_SLICES
     best, within = scores.unflatten(-1, (_RACE_SLICES, width)).max(dim=-1)
@@ -319,7 +330,10 @@ class LatentRolloutBatch:
     the live belief dtype. A slot carries exactly where the previous slot
     took an action (``generated_slot_mask``); everything else is zero. It
     has a zero-width final dimension unless the rollout both injected the
-    carry and kept replay storage.
+    carry and kept replay storage. Under the memory carry (``memory_carry``)
+    every real prompt slot after the first real one also holds the belief
+    computed at the slot before it -- the memory's prompt writes -- and pad
+    slots and the first real slot hold zero.
     """
 
     kind: Tensor
@@ -364,6 +378,11 @@ class LatentRolloutBatch:
     # (``replay_storage=False``) cannot be replayed, because replay would
     # silently feed plain token embeddings where the rollout fed carries.
     carry_injected: bool = False
+    # True when the injected carry was the gated-delta memory read (reasoning
+    # mode ``memory``) rather than the direct hidden carry. Only meaningful
+    # with ``carry_injected``; the two carries consume the same record
+    # through different inputs, so neither may replay the other's stream.
+    memory_carry: bool = False
     # Plans are tied to a logical packed layout, not merely its shape. Device
     # copies preserve the token; structural transforms create a fresh one so
     # an unrelated same-shape batch cannot silently reuse stale indices.
@@ -549,6 +568,12 @@ def _dense_cache_width(caches: "list[tuple[Tensor, ...]]") -> "int | None":
     return None
 
 
+# Strided stream fields at least this large reach the host row by row
+# instead of through a full-size contiguous device temporary. Below it the
+# temporary is cheaper than one copy launch per row.
+ROW_COPY_MIN_BYTES = 64 * 2**20
+
+
 def compact_stream_to_device(
     batch: LatentRolloutBatch, device: torch.device
 ) -> LatentRolloutBatch:
@@ -577,9 +602,24 @@ def compact_stream_to_device(
         if isinstance(value, Tensor):
             if async_cuda_to_cpu:
                 target = torch.empty_like(
-                    value, device=device, pin_memory=True
+                    value,
+                    device=device,
+                    pin_memory=True,
+                    memory_format=torch.contiguous_format,
                 )
-                target.copy_(value, non_blocking=True)
+                if (
+                    value.is_contiguous()
+                    or value.nbytes < ROW_COPY_MIN_BYTES
+                ):
+                    target.copy_(value, non_blocking=True)
+                else:
+                    # A strided device source crosses to the host through
+                    # a contiguous device copy of its full size: for the
+                    # memory carry's replay record that is 4.5 GiB beside
+                    # the arena. A stream prefix is contiguous within each
+                    # row, so row copies need no staging.
+                    for target_row, source_row in zip(target, value):
+                        target_row.copy_(source_row, non_blocking=True)
                 value = target
             elif value.device == device:
                 value = value.clone()
@@ -797,6 +837,7 @@ def rollout_continuations(
             "hidden carry is a pinned-EMIT token policy: tokens are its only "
             "actions"
         )
+    memory_carry = hidden_carry and wrapper.memory_carry
     if hidden_carry and not wrapper.hidden_carry:
         # The reverse is allowed: a carry policy rolled out token-only is the
         # carry ablation's no-carry arm.
@@ -1194,6 +1235,15 @@ def rollout_continuations(
     )
     output = wrapper.prefill(prefix_prompt_ids, caches, prefix_key_valid)
     caches = output.caches
+    # The memory carry's per-row fp32 state. The prefill's beliefs are
+    # written once per UNIQUE prompt and fanned out with the caches; the row
+    # transforms below drop ``prefix_beliefs``, so take them now.
+    memory_state: Tensor | None = None
+    prefix_beliefs = output.prefix_beliefs if memory_carry else None
+    if memory_carry:
+        memory_state = wrapper.memory_prompt_state(
+            prefix_beliefs, prefix_key_valid
+        ).repeat_interleave(prompt_repeats, dim=0)
 
     if prompt_repeats > 1:
         expanded_caches = expansion_target
@@ -1241,6 +1291,20 @@ def rollout_continuations(
         dtype=output.belief.dtype if stored_hidden_dim else torch.float32,
         device=device,
     )
+    if memory_carry and stored_hidden_dim:
+        # The prompt writes, recorded like every later one: slot j holds the
+        # belief computed at slot j - 1. The last prompt belief lands at the
+        # first generated slot through the decode loop below. Nothing pins
+        # left-pad positions finite, so they must not be recorded.
+        recorded = prefix_beliefs[:, :-1]
+        if prefix_key_valid is not None:
+            recorded = torch.where(
+                prefix_key_valid[:, :-1, None], recorded, 0
+            )
+        hiddens[:, 1:prompt_length] = recorded.repeat_interleave(
+            prompt_repeats, dim=0
+        )
+    del prefix_beliefs
 
     emitted = torch.zeros(batch, dtype=torch.long, device=device)
     ended = torch.zeros(batch, dtype=torch.bool, device=device)
@@ -1351,6 +1415,8 @@ def rollout_continuations(
                 emitted = emitted.index_select(0, keep)
                 ended = ended.index_select(0, keep)
                 thinking_active = thinking_active.index_select(0, keep)
+                if memory_state is not None:
+                    memory_state = memory_state.index_select(0, keep)
                 if valid_slots is not None:
                     valid_slots = valid_slots.index_select(0, keep)
                     pad_lengths = pad_lengths.index_select(0, keep)
@@ -1650,7 +1716,13 @@ def rollout_continuations(
         # loss masks it); batched caches make per-row early exit impractical.
         next_kinds = kind[live_rows, next_position]
         next_token_ids = token_ids[live_rows, next_position]
-        if hidden_carry:
+        if memory_carry:
+            # The belief that produced this token is already in the memory
+            # (written after the step that computed it); the input reads it.
+            next_input = wrapper.memory_input(
+                next_token_ids, belief, memory_state
+            )
+        elif hidden_carry:
             # Every decode input carries the belief that produced its token.
             # Finished rows carry a stale belief onto token 0; nothing they
             # produce is recorded, exactly like their token embedding.
@@ -1685,6 +1757,10 @@ def rollout_continuations(
             output = wrapper.step(
                 next_input, caches, step_pos, key_mask, step_block_mask
             )
+        if memory_state is not None:
+            # The write, at the network output. Finished rows write stale
+            # beliefs into memories nothing reads again.
+            memory_state = wrapper.memory_write(memory_state, output.belief)
         caches = output.caches
         position = next_position
 
@@ -1726,6 +1802,7 @@ def rollout_continuations(
         reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
         prompt_length=prompt_length,
         carry_injected=hidden_carry,
+        memory_carry=memory_carry,
     )
     return rolled if not filler_rows else _drop_filler_rows(rolled, filler_rows)
 
@@ -1856,9 +1933,13 @@ def pack_rollout_groups_for_replay(
     # Checked before any field is packed: a carry stream and a token-only
     # stream differ in their hiddens width too, and the shape refusal that
     # would otherwise fire first names the symptom rather than the cause.
-    carry_flags = {group.carry_injected for group in groups}
+    carry_flags = {
+        (group.carry_injected, group.memory_carry) for group in groups
+    }
     if len(carry_flags) != 1:
-        raise ValueError("cannot pack carry-injected and token-only rollouts")
+        raise ValueError(
+            "cannot pack rollouts that injected different carries"
+        )
     devices = {group.kind.device for group in groups}
     if len(devices) != 1:
         raise ValueError("rollout groups must share one device")
@@ -1879,8 +1960,8 @@ def pack_rollout_groups_for_replay(
                 bool(getattr(group, field.name)) for group in groups
             )
             continue
-        if field.name == "carry_injected":
-            combined[field.name] = groups[0].carry_injected
+        if field.name in ("carry_injected", "memory_carry"):
+            combined[field.name] = getattr(groups[0], field.name)
             continue
         if field.name == "replay_layout_token":
             # Packing creates a new logical layout; callers that deliberately
@@ -2145,21 +2226,44 @@ def validate_hidden_carry_rollout(batch: LatentRolloutBatch) -> None:
         )
 
 
+def validate_carry_policy(
+    batch: LatentRolloutBatch, wrapper: LatentThoughtModel
+) -> None:
+    """Refuse to price a stream under a carry it was not rolled out with.
+
+    Replaying a carry stream through another policy's input path, or a
+    token-only stream through a carry policy, prices tokens under inputs the
+    rollout never consumed.
+    """
+    if (batch.carry_injected, batch.memory_carry) != (
+        wrapper.hidden_carry,
+        wrapper.memory_carry,
+    ):
+        raise ValueError(
+            "rollout carry does not match the policy: batch carry_injected="
+            f"{batch.carry_injected}/memory_carry={batch.memory_carry}, "
+            f"wrapper hidden_carry={wrapper.hidden_carry}/"
+            f"memory_carry={wrapper.memory_carry}"
+        )
+
+
 def assemble_stream_latents(
     wrapper: LatentThoughtModel, batch: LatentRolloutBatch
 ) -> Tensor:
     """Rebuild the exact (batch, stream, dim) inputs the rollout consumed."""
-    if batch.carry_injected != wrapper.hidden_carry:
-        # Replaying a carry stream through another policy's combiner, or a
-        # token-only stream through a carry policy, prices tokens under
-        # inputs the rollout never consumed.
-        raise ValueError(
-            "rollout carry does not match the policy: batch carry_injected="
-            f"{batch.carry_injected}, wrapper hidden_carry="
-            f"{wrapper.hidden_carry}"
-        )
+    validate_carry_policy(batch, wrapper)
     token_latent = wrapper.embed_tokens(batch.token_ids)
     pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+    if batch.memory_carry:
+        # Reads at generated slots, over every recorded write before them.
+        hiddens = carried_hiddens(batch)
+        inputs = wrapper.combiner.stream_inputs(
+            token_latent,
+            hiddens,
+            memory_write_mask(batch.kind, PAD_SLOT),
+            generated_slot_mask(batch),
+        )
+        return inputs * pad_scale
     if batch.carry_injected:
         # The dense combiner evaluation with a flag-select is value- and
         # gradient-equivalent to boolean-index assignment, but keeps static

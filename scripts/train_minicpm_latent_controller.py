@@ -458,7 +458,7 @@ def main():
         'sampling_contract': sampling_contract,
     }
     (args.output/'manifest.json').write_text(json.dumps(manifest, default=str, indent=2)+'\n')
-    tensorboard_dir = args.tensorboard_dir or Path('postraining/runs') / args.output.name / 'tensorboard'
+    tensorboard_dir = args.tensorboard_dir or args.output / 'tensorboard'
     tensorboard = SummaryWriter(str(tensorboard_dir), flush_secs=2)
     atexit.register(tensorboard.close)
     tensorboard.add_text('samples/configuration', json.dumps(manifest, default=str, indent=2), step)

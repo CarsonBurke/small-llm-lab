@@ -32,6 +32,10 @@ PYTHON_RESULT_CODES = {
     "policy_rejected": 3,
     "tests_failed": 4,
     "timeout": 5,
+    # Any source: EOS after a completed think without a submitted nonempty
+    # answer (``core.structural_abstention``), recorded whether or not the
+    # run rewards abstention.
+    "abstained": 6,
 }
 
 SAFE_IMPORT_ROOTS = {

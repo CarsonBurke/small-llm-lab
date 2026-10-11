@@ -1259,26 +1259,32 @@ def test_default_cli_selects_current_delightful_broad_regime():
     assert cli.think_min_tokens == 33
     assert cli.answer_fence
     assert cli.zero_reward_stop_pools == 0
-    assert cli.actor_critic_init is None
+    assert cli.actor_init is None and not cli.fresh_critic
     assert cli.critic_init == "scratch"
 
 
-def test_actor_critic_init_conflicts_with_actor_copied_critic(capsys):
+def test_actor_init_carries_its_critic_unless_asked_for_a_fresh_one(capsys):
     parser = build_arg_parser()
-    cli = parser.parse_args(
-        [
-            "--checkpoint", "c", "--output", "o",
-            "--critic-init", "actor",
-            "--actor-critic-init", "warm.pt",
-        ]
-    )
-    with pytest.raises(SystemExit):
+
+    def validate(*flags):
+        cli = parser.parse_args(["--checkpoint", "c", "--output", "o", *flags])
         validate_args(parser, cli)
+        return cli
+
+    # A carried critic is already trained, so it cannot also be an actor copy.
+    with pytest.raises(SystemExit):
+        validate("--critic-init", "actor", "--actor-init", "branch.pt")
     assert "--critic-init actor conflicts" in capsys.readouterr().err
-    actor_copy = parser.parse_args(
-        ["--checkpoint", "c", "--output", "o", "--critic-init", "actor"]
+    assert validate("--critic-init", "actor").critic_init == "actor"
+    fresh = validate(
+        "--critic-init", "actor", "--actor-init", "branch.pt", "--fresh-critic"
     )
-    validate_args(parser, actor_copy)
+    assert fresh.fresh_critic and fresh.critic_init == "actor"
+    # Only --actor-init has a critic to decline.
+    for flags in ((), ("--curriculum-init", "other.pt")):
+        with pytest.raises(SystemExit):
+            validate("--fresh-critic", *flags)
+        assert "--fresh-critic applies only" in capsys.readouterr().err
 
 
 def test_dg_topology_migration_requires_resume(capsys):
@@ -1295,6 +1301,37 @@ def test_dg_topology_migration_requires_resume(capsys):
         "--allow-dg-topology-migration requires --resume"
         in capsys.readouterr().err
     )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ([], "--allow-rollout-groups-migration requires --resume"),
+        (
+            ["--resume", "r.pt", "--reasoning-mode", "latent"],
+            "counter-keyed lockstep",
+        ),
+        (
+            [
+                "--resume", "r.pt", "--reasoning-mode", "cot",
+                "--rollout-scheduler", "continuous_refill",
+                "--rollout-groups", "8",
+            ],
+            "counter-keyed lockstep",
+        ),
+    ],
+)
+def test_rollout_groups_migration_needs_a_counter_keyed_resume(
+    capsys, extra, message
+):
+    parser = build_arg_parser()
+    cli = parser.parse_args(
+        ["--checkpoint", "c", "--output", "o", "--allow-rollout-groups-migration"]
+        + extra
+    )
+    with pytest.raises(SystemExit):
+        validate_args(parser, cli)
+    assert message in capsys.readouterr().err
 
 
 def test_token_rng_migration_requires_resume(capsys):
@@ -1773,6 +1810,9 @@ def test_continuous_refill_requires_multiple_compiled_chunks(capsys):
                 "--prompts-per-rollout", "64",
                 "--prompts-per-minibatch", "16",
                 "--rollout-scheduler", "continuous_refill",
+                # The lockstep default is one whole-pool chunk; refill needs
+                # several, so each case varies one flag from a valid config.
+                "--rollout-groups", "32",
                 *argv,
             ]
         )
@@ -4002,6 +4042,42 @@ def test_fenced_answer_window_and_relaxed_extraction(monkeypatch):
         ],
         long_piece, answer,
     ) == " " * 297 + "42"
+
+
+def test_rollout_diagnostics_partial_credit_under_abstention(monkeypatch):
+    import postraining.train_latent_vapo as trainer
+
+    eos, think, answer = 5, (7, 8), (20, 21)
+    batch = _rollout(_wrapper(), batch=4, prompt=4, new_tokens=10)
+    monkeypatch.setattr(
+        trainer,
+        "emitted_token_rows",
+        lambda _: [
+            [7, 1, 8, 20, 12, 21, eos],  # correct
+            [7, 1, 8, 20, 13, 21, eos],  # 37 for 42: nearby partial credit
+            [7, 1, 8, 20, 21, eos],  # abstention
+            [7, 1, 8, 20, 12, 21],  # truncated
+        ],
+    )
+    score_math_rollout(
+        batch, "42", _PositionalTokenizer(), (eos,), nearby_reward_max=0.1,
+        think_fence_ids=think, answer_fence_ids=answer, abstention_penalty=0.2,
+    )
+    partial = nearby_numeric_reward("37", "42", 0.1)
+    # Partial credit remains on its verifier scale, above wrong-answer zero.
+    assert 0.0 < batch.reward_scalar[1].item() < 0.1
+    assert batch.reward_scalar[1].item() == pytest.approx(partial)
+    metrics = trainer.rollout_diagnostics(
+        batch, samples_per_prompt=2, stop_ids=(eos,),
+        refreshed_statistics=False, reward_floor=0.0,
+    )
+    assert metrics["partial_reward_fraction"] == pytest.approx(0.25)
+    assert metrics["exact_accuracy"] == pytest.approx(0.25)
+    assert metrics["verifier_abstained_fraction"] == pytest.approx(0.25)
+    assert metrics["abstained_emitted_tokens_count"] == 1.0
+    assert metrics["abstained_emitted_tokens_sum"] == 6.0
+    assert metrics["abstained_emitted_tokens_max"] == 6.0
+    assert (metrics["reward_max"], metrics["reward_min"]) == (1.0, 0.0)
 
 
 def test_rollout_diagnostics_reports_think_format_fraction(monkeypatch):

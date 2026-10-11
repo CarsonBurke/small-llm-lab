@@ -177,7 +177,7 @@ workloads must use `mlq`; no further workloads are queued for this task.
 Evidence:
 - [GEMM choice](../ablation_results/minicpm_ar_gemm_choice_20260908/result.json)
 - [Production-length comparison and lifecycle checks](../ablation_results/minicpm_ar_production_20260908/result.json)
-- [Bounded full-cycle-path profile](../ablation_results/minicpm_rl_phase_profile_20260908/result.json)
+- [Bounded full-cycle-path profile](../postraining/minicpm5_runs/minicpm_rl_phase_profile_20260908/result.json)
 - [Rejected attention-layout experiment](../ablation_results/minicpm_replay_layout_20260908/result.json)
 - [Accepted checkpoint-recomputation tradeoff](../ablation_results/minicpm_replay_checkpoint_20260908/result.json)
 - [Rejected compiler backward and all-layer diagnosis](../ablation_results/minicpm_replay_compile_20260908/result.json)

@@ -775,7 +775,7 @@ def test_graph_decode_scheduler_gating() -> None:
     # continuous_refill captures its paged step directly: no extra flag.
     parser, args = _parse(
         "--no-delightful-policy-gradient", "--prompts-per-rollout", "64",
-        "--prompts-per-minibatch", "16",
+        "--prompts-per-minibatch", "16", "--rollout-groups", "32",
         "--rollout-scheduler", "continuous_refill", "--rollout-graph-decode"
     )
     validate_args(parser, args)

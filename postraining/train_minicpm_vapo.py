@@ -3138,8 +3138,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output",
-        default="postraining/runs/minicpm5_vapo",
-        help="run directory beneath postraining/runs/ (parameter-golf-postraining dashboard)",
+        default="postraining/minicpm5_runs/minicpm5_vapo",
+        help="run directory beneath postraining/minicpm5_runs/ (parameter-golf-minicpm5 dashboard)",
     )
     parser.add_argument("--steps", type=int, default=1_000)
     parser.add_argument("--value-warmup-steps", type=int, default=10)
@@ -3313,12 +3313,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_output_directory(output: str | Path) -> None:
-    runs_root = (Path(__file__).resolve().parent / "runs").resolve()
+    runs_root = (Path(__file__).resolve().parent / "minicpm5_runs").resolve()
     output = Path(output).resolve()
     if output == runs_root or not output.is_relative_to(runs_root):
         raise ValueError(
             f"--output must be a run directory beneath {runs_root}; "
-            "post-training belongs in parameter-golf-postraining, not parameter-golf"
+            "MiniCPM runs belong in the parameter-golf-minicpm5 dashboard"
         )
 
 

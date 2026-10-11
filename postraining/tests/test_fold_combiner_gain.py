@@ -2,7 +2,7 @@
 
 ``fold_combiner_gain`` performs state-dict surgery on live training
 checkpoints (the k3 10h run, and any v1 warmup checkpoint reused later via
-``--actor-critic-init``), so its index arithmetic gets a synthetic
+``--actor-init``), so its index arithmetic gets a synthetic
 round-trip here: build a v1-shaped model, train one step so the optimizer
 state is populated, fold, and demand (1) the folded weights load strictly
 into the v2 layout, (2) the forward is preserved, (3) the remapped

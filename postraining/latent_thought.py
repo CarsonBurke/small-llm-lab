@@ -11,6 +11,11 @@ Deterministic hidden carry (``hidden_carry=True``, reasoning mode ``carry``)
 is a pinned-EMIT token policy whose generated-token inputs add, through the
 zero-initialized combiner, the detached belief that produced that token. It
 builds no Gaussian transition or stop gate: tokens are its only actions.
+Gated-delta memory carry (``memory_carry=True``, reasoning mode ``memory``)
+is the same kind of policy with the carried beliefs routed through a bounded,
+trained memory instead (``postraining.memory_carry``): beliefs are written at
+the network output, each generated token's input reads the memory, and the
+decode loop owns one fp32 memory state per row.
 
 ``thought_sigma`` is the expected isotropic vector-magnitude scale. For a
 runtime hidden width ``d`` the Gaussian component standard deviation is
@@ -27,6 +32,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 
+from postraining.memory_carry import GatedDeltaMemory
 from pretraining.nanogpt_mini import nanogpt_mini_model
 
 THINK, EMIT = 0, 1
@@ -45,6 +51,13 @@ HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA = "deterministic_hidden_carry/v2"
 # The v28 carry input path, unchanged: a zero-initialized full-width carry
 # map plus type bias behind the prenorm relu^2 residual stack.
 HIDDEN_CARRY_INPUT_SCHEMA = "zero_init_hidden_residual_prenorm_mlp/v2"
+# The gated-delta memory carry (``postraining.memory_carry``): token policy
+# whose generated-token inputs read a per-row fp32 gated-delta memory that
+# every real belief, prompt included, is written into.
+MEMORY_CARRY_ROLLOUT_POLICY_SCHEMA = "gated_delta_memory_carry/v1"
+MEMORY_CARRY_INPUT_SCHEMA = (
+    "gated_delta_memory_belief_write_token_read_zero_init_out/v1"
+)
 
 
 def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
@@ -53,6 +66,8 @@ def rollout_policy_schema_for_mode(reasoning_mode: str) -> str:
         return ROLLOUT_POLICY_SCHEMA
     if reasoning_mode == "carry":
         return HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA
+    if reasoning_mode == "memory":
+        return MEMORY_CARRY_ROLLOUT_POLICY_SCHEMA
     try:
         return PINNED_EMIT_ROLLOUT_POLICY_SCHEMAS[reasoning_mode]
     except KeyError:
@@ -74,6 +89,20 @@ def combiner_init_kwargs_from_checkpoint(payload: dict) -> dict:
     presence) has no stochastic heads and records no sigma or stop prior.
     """
     saved_args = payload.get("args", {})
+    if payload.get("rollout_policy_schema") == MEMORY_CARRY_ROLLOUT_POLICY_SCHEMA:
+        try:
+            heads = int(saved_args["memory_heads"])
+            head_dim = int(saved_args["memory_head_dim"])
+        except KeyError as error:
+            raise ValueError(
+                "memory-carry checkpoint lacks its memory geometry"
+            ) from error
+        return {
+            "hidden_carry": True,
+            "memory_carry": True,
+            "memory_heads": heads,
+            "memory_head_dim": head_dim,
+        }
     if payload.get("rollout_policy_schema") == HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA:
         return {
             "mlp_hidden": saved_args.get("combined_mlp_hidden"),
@@ -119,13 +148,18 @@ def validate_renderer_checkpoint(
             "under a different reasoning mode or deployed policy and cannot "
             "be resumed or evaluated as this policy."
         )
-    if expected_rollout_policy_schema == HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA:
+    carry_input_schemas = {
+        HIDDEN_CARRY_ROLLOUT_POLICY_SCHEMA: HIDDEN_CARRY_INPUT_SCHEMA,
+        MEMORY_CARRY_ROLLOUT_POLICY_SCHEMA: MEMORY_CARRY_INPUT_SCHEMA,
+    }
+    if expected_rollout_policy_schema in carry_input_schemas:
+        expected_input = carry_input_schemas[expected_rollout_policy_schema]
         carry_input = payload.get("thought_input_schema")
-        if carry_input != HIDDEN_CARRY_INPUT_SCHEMA:
+        if carry_input != expected_input:
             raise ValueError(
                 f"incompatible latent-policy checkpoint {checkpoint!r}: "
-                f"hidden-carry input schema is {carry_input!r}, expected "
-                f"{HIDDEN_CARRY_INPUT_SCHEMA!r}."
+                f"carry input schema is {carry_input!r}, expected "
+                f"{expected_input!r}."
             )
         distribution = payload.get("thought_distribution_schema")
         if distribution is not None:
@@ -656,6 +690,10 @@ class StepOutput:
     input_latent: Tensor
     logits: Tensor
     caches: list[tuple[Tensor, ...]]
+    # Every prompt position's belief, set by ``prefill`` for a memory-carry
+    # wrapper only: the rollout writes them into the memory and records them
+    # for replay. Row transforms drop it; consume it straight after prefill.
+    prefix_beliefs: Tensor | None = None
 
 
 @dataclass
@@ -863,6 +901,11 @@ class LatentThoughtModel(nn.Module):
     their checkpoints carry those (unused) keys and must load strictly.
     ``thought_sigma``/``init_stop_thinking_probability`` default to the
     stochastic policy's priors and are refused outright under carry.
+
+    ``memory_carry`` (with ``hidden_carry``) swaps the combiner for a
+    ``GatedDeltaMemory``: the decode loop then owns a per-row memory state
+    (``memory_initial_state``/``memory_prompt_state``), feeds tokens through
+    ``memory_input`` and writes each new belief with ``memory_write``.
     """
 
     def __init__(
@@ -874,14 +917,36 @@ class LatentThoughtModel(nn.Module):
         thought_sigma: float | None = None,
         init_stop_thinking_probability: float | None = None,
         hidden_carry: bool = False,
+        memory_carry: bool = False,
+        memory_heads: int | None = None,
+        memory_head_dim: int | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         model_dim = backbone.tok_emb.embedding_dim
         self.hidden_carry = bool(hidden_carry)
-        self.combiner = CombinedEmbedding(
-            model_dim, mlp_hidden=mlp_hidden, num_blocks=num_blocks
-        )
+        self.memory_carry = bool(memory_carry)
+        if self.memory_carry and not self.hidden_carry:
+            raise ValueError(
+                "a memory carry is a hidden-carry policy: pass hidden_carry"
+            )
+        if not self.memory_carry and (
+            memory_heads is not None or memory_head_dim is not None
+        ):
+            raise ValueError("memory geometry configures the memory carry only")
+        self.combiner: CombinedEmbedding | GatedDeltaMemory
+        if self.memory_carry:
+            if memory_heads is None or memory_head_dim is None:
+                raise ValueError("a memory carry needs its heads and head dim")
+            if mlp_hidden is not None or num_blocks != 1:
+                raise ValueError("the memory carry has no combined MLP")
+            self.combiner = GatedDeltaMemory(
+                model_dim, heads=memory_heads, head_dim=memory_head_dim
+            )
+        else:
+            self.combiner = CombinedEmbedding(
+                model_dim, mlp_hidden=mlp_hidden, num_blocks=num_blocks
+            )
         self.transition: GaussianTransitionHead | None
         self.gate: StopThinkingGate | None
         if self.hidden_carry:
@@ -892,7 +957,11 @@ class LatentThoughtModel(nn.Module):
                 raise ValueError(
                     "a hidden-carry policy has no thought sigma or stop gate"
                 )
-            self.thought_input_schema = HIDDEN_CARRY_INPUT_SCHEMA
+            self.thought_input_schema = (
+                MEMORY_CARRY_INPUT_SCHEMA
+                if self.memory_carry
+                else HIDDEN_CARRY_INPUT_SCHEMA
+            )
             self.transition = None
             self.gate = None
             self.thought_sigma = None
@@ -1583,11 +1652,13 @@ class LatentThoughtModel(nn.Module):
         input_latent: Tensor,
         caches: list[tuple[Tensor, ...]],
         key_valid: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor]:
-        """Densely ingest a deterministic prefix and expose its final state."""
-        belief = self.backbone.prefill_belief(
-            input_latent, caches, key_valid
-        )[:, -1:]
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor, Tensor]:
+        """Densely ingest a deterministic prefix and expose its final state.
+
+        Also returns every prefix position's belief (a view; free).
+        """
+        beliefs = self.backbone.prefill_belief(input_latent, caches, key_valid)
+        belief = beliefs[:, -1:]
         final_input = input_latent[:, -1:]
         predicted, thought_log_sigma = self.thought_parameters(
             belief.squeeze(1)
@@ -1595,7 +1666,7 @@ class LatentThoughtModel(nn.Module):
         logits = self.backbone.logits_from_features(
             self.renderer_features(final_input, belief)
         ).squeeze(1)
-        return belief.squeeze(1), predicted, thought_log_sigma, logits
+        return belief.squeeze(1), predicted, thought_log_sigma, logits, beliefs
 
     def prefill(
         self,
@@ -1605,8 +1676,8 @@ class LatentThoughtModel(nn.Module):
     ) -> StepOutput:
         """Populate prefix caches without running policy heads per token."""
         input_latent = self.embed_tokens(token_ids)
-        belief, predicted, thought_log_sigma, logits = self.prefill_core(
-            input_latent, caches, key_valid
+        belief, predicted, thought_log_sigma, logits, beliefs = (
+            self.prefill_core(input_latent, caches, key_valid)
         )
         return StepOutput(
             belief=belief,
@@ -1615,6 +1686,7 @@ class LatentThoughtModel(nn.Module):
             input_latent=input_latent[:, -1],
             logits=logits,
             caches=list(caches),
+            prefix_beliefs=beliefs if self.memory_carry else None,
         )
 
     def step(
@@ -1673,8 +1745,40 @@ class LatentThoughtModel(nn.Module):
         no flag is needed; replay reaches bitwise the same values at
         ``generated_slot_mask`` positions through the flag-select.
         """
+        if self.memory_carry:
+            raise RuntimeError(
+                "a memory carry reads its memory state: use memory_input"
+            )
         base = self.embed_tokens(token_ids[:, None])
         return self.combiner(base, hidden[:, None])
+
+    # ------------------------------------------------------- memory carry
+    def memory_initial_state(self, rows: int, device: torch.device) -> Tensor:
+        """An empty fp32 ``(rows, H, K, V)`` memory."""
+        return self.combiner.initial_state(rows, device)
+
+    def memory_prompt_state(
+        self, prefix_beliefs: Tensor, key_valid: Tensor | None
+    ) -> Tensor:
+        """The memory after writing every real prompt belief."""
+        return self.combiner.prompt_state(prefix_beliefs, key_valid)
+
+    def memory_input(
+        self, token_ids: Tensor, hidden: Tensor, state: Tensor
+    ) -> Tensor:
+        """(batch, 1, dim) decode input: token embedding plus memory read.
+
+        ``hidden`` is the belief that produced ``token_ids`` and must already
+        be written into ``state``; replay recomputes these inputs, to kernel
+        precision, at ``generated_slot_mask`` positions.
+        """
+        return self.combiner.read_input(
+            self.embed_tokens(token_ids[:, None]), hidden, state
+        )
+
+    def memory_write(self, state: Tensor, belief: Tensor) -> Tensor:
+        """``state`` with one new belief per row written in (functional)."""
+        return self.combiner.write(state, belief)
 
     def new_parameters(self):
         """Post-training parameters absent from the pretrained checkpoint."""

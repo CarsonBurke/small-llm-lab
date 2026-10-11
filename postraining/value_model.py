@@ -5,7 +5,13 @@ fully trainable) reads the identical token/thought stream. Raw fp32 Gaussian
 actions stored by the actor are adapted by the critic's own combined-embedding
 stack; they are never redrawn. Under the deterministic hidden carry the critic
 reads the actor's stored beliefs through that same separate combiner, at the
-same generated-token slots. No parameters are shared with the policy.
+same generated-token slots. Under the gated-delta memory carry the critic
+reads the actor's memory -- the same scan over the same stored beliefs,
+through the actor's writer held as a constant -- with its own zero-init
+reader, at every slot with a recorded belief behind it, so the value at a
+slot conditions on what the actor will read next and the TD error carries
+the value of each write. No parameters are shared with the policy, and the
+value loss never trains the actor's writer.
 
 The value head is one zero-initialized linear readout trained by unclipped
 squared error (``CRITIC_SCHEMA``). Under Adam a zero head's output moves by
@@ -29,6 +35,13 @@ from postraining.latent_rollout import (
     generated_slot_mask,
 )
 from postraining.latent_thought import CombinedEmbedding
+from postraining.memory_carry import (
+    GatedDeltaMemory,
+    MemoryReader,
+    borrowed_write_terms,
+    memory_write_mask,
+    read_stream,
+)
 
 
 class SeparateCritic(nn.Module):
@@ -37,14 +50,32 @@ class SeparateCritic(nn.Module):
         trunk: nn.Module,
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
+        actor_memory: GatedDeltaMemory | None = None,
     ):
         super().__init__()
         model_dim = trunk.tok_emb.embedding_dim
         self.trunk = trunk
-        self.combiner = CombinedEmbedding(
-            model_dim,
-            mlp_hidden=mlp_hidden,
-            num_blocks=num_blocks,
+        self.combiner: CombinedEmbedding | MemoryReader
+        if actor_memory is None:
+            self.combiner = CombinedEmbedding(
+                model_dim,
+                mlp_hidden=mlp_hidden,
+                num_blocks=num_blocks,
+            )
+        else:
+            self.combiner = MemoryReader(
+                model_dim, actor_memory.heads, actor_memory.head_dim
+            )
+        # Borrowed, not owned: assigned around nn.Module registration so the
+        # actor's writer is in neither the critic's parameters (its optimizer)
+        # nor its state dict. It is a live reference, so the critic always
+        # reads the memory the current actor writes -- the rollout's own, as
+        # actor and critic step once per pool after the same forwards. A
+        # deepcopy or ``.to()`` of the critic alone does not carry it along.
+        object.__setattr__(
+            self,
+            "actor_memory_writer",
+            None if actor_memory is None else actor_memory.writer,
         )
         self.head = nn.Linear(model_dim, 1)
         with torch.no_grad():
@@ -57,6 +88,26 @@ class SeparateCritic(nn.Module):
         """Rebuild the exact token/thought stream in the critic's latent space."""
         token_latent = self.trunk.embed_tokens(batch.token_ids)
         pad_scale = (batch.kind != PAD_SLOT)[..., None].to(token_latent.dtype)
+        if (batch.carry_injected and batch.memory_carry) != (
+            self.actor_memory_writer is not None
+        ):
+            raise ValueError(
+                "the critic reads the actor's memory exactly when the batch "
+                "was rolled out with the memory carry"
+            )
+        if self.actor_memory_writer is not None:
+            hiddens = carried_hiddens(batch)
+            write_mask = memory_write_mask(batch.kind, PAD_SLOT)
+            inputs = read_stream(
+                self.combiner,
+                borrowed_write_terms(
+                    self.actor_memory_writer, hiddens, write_mask
+                ),
+                token_latent,
+                hiddens,
+                write_mask,
+            )
+            return inputs * pad_scale
         if batch.carry_injected:
             # The actor's recorded carry, projected by the critic's own
             # combiner: the value sees what the policy consumed, while the

@@ -29,6 +29,7 @@ _EXCLUDED_TOP_LEVEL = {
     "data",
     "postraining/data",
     "postraining/runs",
+    "postraining/minicpm5_runs",
     "runs",
     "tb_logs",
 }

@@ -52,6 +52,7 @@ from postraining.latent_thought import (
 )
 from postraining.math_prompt import require_answer_fence_prompt_schema
 from postraining.model_io import load_model
+from postraining.reasoning_modes import mode_carries_hidden
 from postraining.train_latent_vapo import rewrite_prompts_for_answer_fence
 from postraining.train_vapo import prompt_text
 
@@ -192,7 +193,7 @@ def main() -> None:
                 f"checkpoint was trained in reasoning mode {saved_mode!r}; "
                 "sample it with --emit-only"
             )
-        hidden_carry = saved_mode == "carry"
+        hidden_carry = mode_carries_hidden(saved_mode)
     else:
         wrapper = LatentThoughtModel(
             backbone,

@@ -170,11 +170,29 @@ def test_exact_resume_rejects_vapo_rollout_topology_change() -> None:
         validate_resume_arg_contract(saved, current)
 
 
+def test_rollout_groups_change_needs_its_explicit_migration() -> None:
+    values = {name: 1 for name in RESUME_EXACT_ARG_FIELDS}
+    saved = {**values, "prompts_per_rollout": 64, "prompts_per_minibatch": 64}
+    current = SimpleNamespace(**saved)
+    current.rollout_groups = 64
+    with pytest.raises(ValueError, match="rollout_groups"):
+        validate_resume_arg_contract(saved, current)
+    current.allow_rollout_groups_migration = True
+    validate_resume_arg_contract(saved, current)
+    # The flag relaxes rollout_groups only.
+    current.seed = 2
+    with pytest.raises(ValueError, match="seed"):
+        validate_resume_arg_contract(saved, current)
+
+
 def test_resume_topology_history_preserves_and_appends_transition() -> None:
     prior = {"topology_history": [{"source_step": 100}]}
-    saved = {"prompts_per_rollout": 16, "prompts_per_minibatch": 16}
+    saved = {
+        "prompts_per_rollout": 16, "prompts_per_minibatch": 16,
+        "rollout_groups": 32,
+    }
     current = SimpleNamespace(
-        prompts_per_rollout=24, prompts_per_minibatch=24
+        prompts_per_rollout=24, prompts_per_minibatch=24, rollout_groups=32
     )
     history = resume_topology_history(
         prior,
@@ -194,10 +212,12 @@ def test_resume_topology_history_preserves_and_appends_transition() -> None:
         "before": {
             "prompts_per_rollout": 16,
             "prompts_per_minibatch": 16,
+            "rollout_groups": 32,
         },
         "after": {
             "prompts_per_rollout": 24,
             "prompts_per_minibatch": 24,
+            "rollout_groups": 32,
         },
     }
     assert resume_topology_history(
@@ -209,6 +229,27 @@ def test_resume_topology_history_preserves_and_appends_transition() -> None:
         step=774,
         sampler_cursor=13_184,
     ) == history
+
+
+def test_resume_topology_history_records_a_rollout_groups_migration() -> None:
+    saved = {
+        "prompts_per_rollout": 64, "prompts_per_minibatch": 64,
+        "rollout_groups": 32,
+    }
+    current = SimpleNamespace(
+        prompts_per_rollout=64, prompts_per_minibatch=64, rollout_groups=64
+    )
+    (transition,) = resume_topology_history(
+        None,
+        saved,
+        current,
+        checkpoint="run/latent_vapo_checkpoint.pt",
+        checkpoint_sha256="sha256:checkpoint",
+        step=530,
+        sampler_cursor=33_920,
+    )
+    assert transition["before"]["rollout_groups"] == 32
+    assert transition["after"]["rollout_groups"] == 64
 
 
 def test_one_pass_plan_consumes_all_dapo_rows_once_including_tail() -> None:
@@ -564,7 +605,8 @@ def _critic_init_args(**overrides) -> SimpleNamespace:
     return SimpleNamespace(
         **{
             "critic_init": "scratch",
-            "actor_critic_init": None,
+            "actor_init": None,
+            "fresh_critic": False,
             "resume": None,
             **overrides,
         }
@@ -580,34 +622,59 @@ def test_fresh_critic_init_provenance_names_its_start() -> None:
     assert resolve_critic_init_provenance(
         _critic_init_args(critic_init="actor"), None, None
     )["init"] == "actor_copy"
-    assert resolve_critic_init_provenance(
-        _critic_init_args(actor_critic_init="warm.pt"),
-        {"execution_schema": "exec/v30"},
-        None,
-    ) == {
-        "init": "warm_checkpoint",
-        "checkpoint": "warm.pt",
-        "source_execution_schema": "exec/v30",
+    branch = _critic_init_args(
+        actor_init="branch.pt",
+        initialization_checkpoint_sha256="hash",
+        carried_critic_value_changes=["reward_schema"],
+        value_warmup_steps=10,
+    )
+    source = {
+        "execution_schema": "exec/v30",
+        "step": 166,
+        "value_warmup_step": 50,
+        "reward_schema": "abstention/v4",
     }
+    assert resolve_critic_init_provenance(branch, source, None) == {
+        "init": "warm_checkpoint",
+        "checkpoint": "branch.pt",
+        "checkpoint_sha256": "hash",
+        "source_execution_schema": "exec/v30",
+        "source_actor_step": 166,
+        "source_value_warmup_step": 50,
+        "optimizer_state": "carried",
+        "source_reward_schema": "abstention/v4",
+        "value_contract_changes": ["reward_schema"],
+        "value_change_resolution": "refit",
+    }
+    branch.value_warmup_steps = 0
+    assert resolve_critic_init_provenance(branch, source, None)[
+        "value_change_resolution"
+    ] == "accepted"
+    branch.carried_critic_value_changes = []
+    assert resolve_critic_init_provenance(branch, source, None)[
+        "value_change_resolution"
+    ] is None
+    branch.fresh_critic = True
+    assert resolve_critic_init_provenance(branch, source, None)["init"] == (
+        "scratch"
+    )
 
 
 def test_resume_keeps_the_recorded_critic_init_and_refuses_a_contradiction() -> None:
-    warm = {
-        "critic": {
-            "init": "warm_checkpoint",
-            "checkpoint": "warm.pt",
-            "source_execution_schema": "exec/v30",
-            "parameters": 7,
-        }
-    }
-    resumed = _critic_init_args(resume="run/latent_vapo_checkpoint.pt")
-    # A resume carries no --actor-critic-init, yet the run's critic still
-    # started from that warm checkpoint: the record survives the resume.
-    assert resolve_critic_init_provenance(resumed, None, warm) == {
+    carried = {
         "init": "warm_checkpoint",
         "checkpoint": "warm.pt",
         "source_execution_schema": "exec/v30",
+        "optimizer_state": "carried",
+        "source_reward_schema": "abstention/v4",
+        "value_contract_changes": ["reward_schema"],
+        "value_change_resolution": "accepted",
     }
+    warm = {"critic": {**carried, "parameters": 7}}
+    resumed = _critic_init_args(resume="run/latent_vapo_checkpoint.pt")
+    # A resume carries no --actor-init, yet the run's critic still started
+    # from that warm checkpoint: the record survives the resume.
+    assert resolve_critic_init_provenance(resumed, None, warm) == carried
     actor_copy = {"critic": {"init": "actor_copy"}}
     with pytest.raises(ValueError, match="--critic-init actor"):
         resolve_critic_init_provenance(resumed, None, actor_copy)
@@ -654,6 +721,7 @@ def test_credit_assignment_checks_pool_groups_exactly() -> None:
             reward_scalar=reward_scalar,
             old_values=torch.rand(rows, 5, generator=generator) * 0.3,
             old_token_logprobs=-torch.rand(rows, 5, generator=generator) * 4,
+            verifier_status=None,
         )
 
     groups = [batch(7), batch(9)]
@@ -702,6 +770,55 @@ def test_credit_assignment_checks_pool_groups_exactly() -> None:
     dashboard = credit_assignment_dashboard([{k: float(v) for k, v in moments.items()}])
     assert "credit/failed_advantage_surprisal_corr" not in dashboard
     assert "credit/td0_calibration_slope" in dashboard
+
+
+def test_failed_rows_are_zero_score_rows_never_abstentions() -> None:
+    from postraining.train_latent_vapo import credit_assignment_moments
+    from postraining.vapo.code_reward import PYTHON_RESULT_CODES
+
+    # Correct, wrong (-penalty), abstained (0), partial above the floor.
+    reward_scalar = torch.tensor([1.0, -0.2, 0.0, -0.1])
+    mask = torch.ones(4, 3)
+    batch = SimpleNamespace(
+        action_mask=mask,
+        emit_mask=mask,
+        rewards=torch.zeros(4, 3),
+        reward_scalar=reward_scalar,
+        old_values=torch.zeros(4, 3),
+        old_token_logprobs=-torch.ones(4, 3),
+        verifier_status=torch.tensor(
+            [PYTHON_RESULT_CODES["not_applicable"]] * 2
+            + [PYTHON_RESULT_CODES["abstained"]]
+            + [PYTHON_RESULT_CODES["not_applicable"]]
+        ),
+    )
+    advantages = torch.zeros(4, 3)
+    moments = credit_assignment_moments(
+        batch, advantages, torch.zeros(4, 3), torch.ones(4), reward_floor=-0.2
+    )
+    # Only the wrong row's three emitted tokens.
+    assert float(moments["failed_count"]) == 3.0
+    unpenalized = credit_assignment_moments(
+        batch, advantages, torch.zeros(4, 3), torch.ones(4)
+    )
+    # A zero floor still excludes the abstention.
+    assert float(unpenalized["failed_count"]) == 6.0
+
+
+def test_pooled_reward_extrema_are_pool_extrema(monkeypatch) -> None:
+    import postraining.train_latent_vapo as trainer
+
+    per_group = iter(
+        [
+            {"trajectories": 2, "reward_mean": 1.0, "reward_max": 1.0, "reward_min": 1.0},
+            {"trajectories": 2, "reward_mean": -0.2, "reward_max": -0.2, "reward_min": -0.2},
+        ]
+    )
+    monkeypatch.setattr(trainer, "rollout_diagnostics", lambda *a, **k: next(per_group))
+    pooled = trainer.aggregate_diagnostics([None, None], 2)
+    # Internally constant groups that differ are not a constant pool.
+    assert (pooled["reward_max"], pooled["reward_min"]) == (1.0, -0.2)
+    assert pooled["reward_mean"] == pytest.approx(0.4)
 
 
 def test_resume_contract_binds_the_actor_gae_lambda() -> None:

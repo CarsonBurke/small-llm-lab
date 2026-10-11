@@ -255,6 +255,7 @@ def main() -> None:
                 think_fence_ids=run.think_fence_ids,
                 min_think_tokens=int(saved.get("think_min_tokens", 1)),
                 answer_fence_ids=run.answer_fence_ids,
+                abstention_penalty=saved.get("abstention_penalty"),
             )
             # The trainer's exact statistics path: critic values for GAE and
             # replayed sampled-token log-probs for the gate's surprisal.

@@ -76,7 +76,7 @@ def main() -> None:
     parser.add_argument("--revision", default=MINICPM5_SPEC.revision)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument(
-        "--output", default="postraining/runs/minicpm5_vapo_parity.json"
+        "--output", default="postraining/minicpm5_runs/minicpm5_vapo_parity.json"
     )
     args = parser.parse_args()
     if args.max_new_tokens < 1:

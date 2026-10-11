@@ -110,6 +110,7 @@ from postraining.core import (
     deterministic_math_subset,
     fenced_answer_text,
     single_fence_span,
+    structural_abstention,
     structural_format_ok,
     generalized_advantage_and_return_targets,
     actor_gae_lambdas,
@@ -151,6 +152,7 @@ from postraining.latent_rollout import (
     think_slot_mask,
     trajectory_token_seeds,
     trim_stream,
+    validate_carry_policy,
     validate_hidden_carry_rollout,
 )
 from postraining.graph_decode import PinnedDecodeArena
@@ -174,9 +176,11 @@ from postraining.rollout_scheduler import (
     warmup_decode_width_buckets,
 )
 from postraining.model_io import copy_trunk, fresh_trunk, load_model
+from postraining.memory_carry import memory_write_mask
 from postraining.muon import Muon
 from postraining.reasoning_modes import (
     mode_carries_hidden,
+    mode_carries_memory,
     mode_pins_emit,
     mode_rollout_budget,
     training_rollout_budget,
@@ -191,7 +195,12 @@ from postraining.runtime.profiling import (
 )
 from postraining.train_vapo import prompt_text
 from postraining.value_model import SeparateCritic
-from postraining.vapo.config import build_arg_parser, resolve_rollout_defaults, validate_args
+from postraining.vapo.config import (
+    build_arg_parser,
+    normalized_abstention_reward,
+    resolve_rollout_defaults,
+    validate_args,
+)
 from postraining.vapo.code_reward import (
     PYTHON_REWARD_SCHEMA,
     PYTHON_PARTIAL_REWARD_SCHEMA,
@@ -226,10 +235,20 @@ from postraining.vapo.schemas import (
 # VRAM-resident only between a pool's refresh and its last update — never
 # across a collection.
 RETAINED_MINIBATCH_BUDGET_BYTES = 8 << 30
+# The critic initializes from its own RNG stream, --seed plus this offset,
+# so every reasoning mode starts from the same critic at one seed (main).
+CRITIC_INIT_SEED_OFFSET = 0x5EED_C817
 # v2: the grading style follows each row's reward_model.style (Minerva for
 # DAPO/AIME lineage data, official exact match for mathematics_dataset rows)
 # instead of Minerva-normalizing everything.
 REWARD_SCHEMA = POSTTRAIN_REWARD_SCHEMA
+ABSTENTION_REWARD_SCHEMA = f"{REWARD_SCHEMA}+normalized_eos_abstention/v4"
+
+
+def reward_schema_for_abstention(penalty: float | None) -> str:
+    return REWARD_SCHEMA if penalty is None else ABSTENTION_REWARD_SCHEMA
+
+
 SOURCE_SIGNAL_MASK_SCHEMA = "per_source_zero_reward_actor_mask/v1"
 RESUME_ARG_CONTRACT_SCHEMA = "vapo_exact_environment_objective_args/v3"
 RESUME_EXACT_ARG_FIELDS = (
@@ -243,11 +262,14 @@ RESUME_EXACT_ARG_FIELDS = (
     "top_p",
     "combined_mlp_blocks",
     "combined_mlp_hidden",
+    "memory_heads",
+    "memory_head_dim",
     "thought_sigma",
     "init_stop_thinking_probability",
     "gae_lambda_alpha",
     "actor_gae_lambda",
     "nearby_reward_max",
+    "abstention_penalty",
     "think_tokens",
     "think_min_tokens",
     "answer_fence",
@@ -276,6 +298,28 @@ TPO_RESUME_EXACT_ARG_FIELDS = (
     "target_policy_optimization",
     "tpo_eta",
 )
+
+
+def combiner_weight_telemetry(wrapper: LatentThoughtModel) -> dict:
+    """RMS of the fresh input module's zero-initialized outputs.
+
+    Leaving zero is the first sign the carried information is being used:
+    the carry map and type bias of the hidden carry, the read projection of
+    the memory carry (with its query and write projections for scale).
+    """
+    rms = lambda tensor: tensor.detach().square().mean().sqrt()
+    combiner = wrapper.combiner
+    if wrapper.memory_carry:
+        return {
+            "memory/read_out_weight_rms": rms(combiner.reader.out.weight),
+            "memory/query_weight_rms": rms(combiner.reader.query.weight),
+            "memory/key_weight_rms": rms(combiner.writer.key.weight),
+            "memory/value_weight_rms": rms(combiner.writer.value.weight),
+        }
+    return {
+        "combiner/carry_weight_rms": rms(combiner.carry.weight),
+        "combiner/type_bias_rms": rms(combiner.type_bias),
+    }
 
 
 def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> None:
@@ -314,6 +358,12 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
                 "--allow-dg-topology-migration to acknowledge the change"
             )
     exact_fields = RESUME_EXACT_ARG_FIELDS
+    if getattr(current, "allow_rollout_groups_migration", False):
+        # validate_args admits the flag only for counter-keyed draws, whose
+        # sampling law does not depend on chunking.
+        exact_fields = tuple(
+            name for name in exact_fields if name != "rollout_groups"
+        )
     if (
         bool(saved.get("target_policy_optimization"))
         or bool(getattr(current, "target_policy_optimization", False))
@@ -340,6 +390,8 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
 CRITIC_INIT_PROVENANCE_FIELDS = (
     "init", "checkpoint", "source_execution_schema", "checkpoint_sha256",
     "source_actor_step", "source_value_warmup_step", "optimizer_state",
+    "source_reward_schema", "value_contract_changes",
+    "value_change_resolution",
 )
 
 
@@ -348,11 +400,21 @@ def validate_critic_only_init(payload: dict, args: argparse.Namespace,
     """Accept critic weights with the same value task, independent of actor loss."""
     if args.value_warmup_steps != 0:
         raise ValueError("--critic-only-init requires --value-warmup-steps 0")
+    if mode_carries_memory(args.reasoning_mode):
+        # The critic's reader is fit to the memory its source run's actor
+        # writer built; this run's writer is a fresh draw, so the loaded
+        # reader would read an unrelated basis at the same scale.
+        raise ValueError(
+            "--critic-only-init cannot carry a memory critic: its reader is "
+            "bound to the source run's actor writer"
+        )
     if not resume_critic_schema_compatible(payload):
         raise ValueError("critic-only checkpoint uses an incompatible critic schema")
     expected = {
         "base_checkpoint_sha256": args.base_checkpoint_sha256,
-        "reward_schema": REWARD_SCHEMA,
+        "reward_schema": reward_schema_for_abstention(
+            getattr(args, "abstention_penalty", None)
+        ),
         "python_reward_schema": getattr(args, "python_reward_schema", None),
         "math_data_identity": data_identity,
         "answer_fence_prompt_schema": (
@@ -364,7 +426,8 @@ def validate_critic_only_init(payload: dict, args: argparse.Namespace,
             raise ValueError(f"critic-only checkpoint changed {name}")
     saved = payload.get("args", {})
     for name in ("reasoning_mode", "think_tokens", "answer_fence",
-                 "think_min_tokens", "nearby_reward_max", "combined_mlp_hidden",
+                 "think_min_tokens", "nearby_reward_max", "abstention_penalty",
+                 "combined_mlp_hidden",
                  "combined_mlp_blocks", "prompt_tokens", "continuation_tokens",
                  "resolved_train_max_new_tokens", "resolved_train_max_stream_steps"):
         if saved.get(name) != getattr(args, name, None):
@@ -375,6 +438,152 @@ def validate_critic_only_init(payload: dict, args: argparse.Namespace,
         raise ValueError("critic-only checkpoint has no critic weights")
 
 
+
+def carries_init_critic(args: argparse.Namespace) -> bool:
+    """Whether this run carries its --actor-init checkpoint's critic.
+
+    Branching from an RL checkpoint keeps the critic by default: a fresh
+    one spends its warmup relearning values the source critic already fit,
+    and advantages computed against it are noise until it has.
+    """
+    return bool(getattr(args, "actor_init", None)) and not getattr(
+        args, "fresh_critic", False
+    )
+
+
+# Arguments that, with the checkpoint's reward schema, define a carried
+# critic's value target: the lambda-one return of the sampling policy under
+# the terminal reward, truncated at the response horizon. The actor
+# objective (DG/TPO, GAE lambda for the actor, source gates) moves no target.
+CARRIED_CRITIC_VALUE_ARGS = (
+    "abstention_penalty",
+    "nearby_reward_max",
+    "temperature",
+    "top_p",
+    "prompt_tokens",
+    "continuation_tokens",
+    "answer_tokens",
+    "resolved_train_max_new_tokens",
+    "resolved_train_max_stream_steps",
+)
+
+
+def source_trained_critic_without_warmup(source_args: dict) -> bool:
+    """Whether a source run's critic started trained, so it needed no
+    warmup of its own: it was carried or transferred into that run."""
+    return bool(
+        source_args.get("critic_only_init")
+        or source_args.get("actor_critic_init")
+        or (source_args.get("actor_init") and not source_args.get("fresh_critic"))
+    )
+
+
+def validate_carried_critic(payload: dict, args: argparse.Namespace) -> list[str]:
+    """Refuse an --actor-init critic that cannot be carried; name the value
+    contract fields this run changes from the one it fit.
+
+    The critic's value task is the return under the terminal reward, policy
+    temperature and horizon it fit. A change leaves it a biased start
+    exactly where the two contracts value a trajectory differently, so one
+    is accepted only together with a critic refit (--value-warmup-steps > 0)
+    before the first actor step, or an explicit --accept-critic-value-change
+    (for instance when the changed reward never applied to a row the critic
+    was fit on, which this check cannot see). The changed fields and how
+    they were resolved are recorded in its provenance. A field an older checkpoint never recorded reads as its
+    parser default. The reasoning mode, fences, think floor, data identity
+    and Python reward schema are held fixed on every initialization path.
+    """
+    if "critic" not in payload:
+        raise ValueError(
+            "--actor-init checkpoint has no critic to carry; pass --fresh-critic"
+        )
+    if not resume_critic_schema_compatible(payload):
+        raise ValueError(
+            f"--actor-init critic schema is {payload.get('critic_schema')!r}, "
+            f"expected {CRITIC_SCHEMA!r}; pass --fresh-critic"
+        )
+    expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
+        args.trunk_optimizer
+    )
+    if payload.get("optimizer_schema") != expected_optimizer_schema:
+        raise ValueError(
+            "--actor-init optimizer schema is "
+            f"{payload.get('optimizer_schema')!r}, expected "
+            f"{expected_optimizer_schema!r}; pass the source run's "
+            "--trunk-optimizer or --fresh-critic"
+        )
+    source_args = payload.get("args", {})
+    if hasattr(source_args, "__dict__"):
+        source_args = vars(source_args)
+    unfit = (
+        int(payload.get("step", 0)) == 0
+        and int(payload.get("value_warmup_step", 0))
+        < int(source_args.get("value_warmup_steps") or 0)
+    ) or (
+        int(payload.get("step", 0)) == 0
+        and int(payload.get("value_warmup_step", 0)) == 0
+        and not source_trained_critic_without_warmup(source_args)
+    )
+    if unfit and args.value_warmup_steps == 0:
+        raise ValueError(
+            "--actor-init checkpoint's critic stopped before its warmup "
+            "finished; finish it with --value-warmup-steps > 0 or pass "
+            "--fresh-critic"
+        )
+    changes = []
+    if payload.get("reward_schema") != reward_schema_for_abstention(
+        args.abstention_penalty
+    ):
+        changes.append("reward_schema")
+    defaults = build_arg_parser()
+    changes.extend(
+        name
+        for name in CARRIED_CRITIC_VALUE_ARGS
+        if source_args.get(name, defaults.get_default(name))
+        != getattr(args, name)
+    )
+    if (
+        changes
+        and args.value_warmup_steps == 0
+        and not getattr(args, "accept_critic_value_change", False)
+    ):
+        raise ValueError(
+            "--actor-init critic fit a different value target "
+            f"({', '.join(changes)} changed); refit it with "
+            "--value-warmup-steps > 0, carry it as-is with "
+            "--accept-critic-value-change, or pass --fresh-critic"
+        )
+    return changes
+
+
+def carry_init_critic(
+    critic: SeparateCritic,
+    optimizers: dict[str, torch.optim.Optimizer],
+    payload: dict,
+    args: argparse.Namespace,
+) -> None:
+    """Load an --actor-init checkpoint's critic and its optimizer state.
+
+    The critic keeps its optimizer state with its weights. The actor's
+    optimizers are left as built, empty: a branch should not inherit
+    momentum along the objective it departs from.
+    """
+    critic.load_state_dict(payload["critic"], strict=True)
+    source_optimizers = payload["optimizers"]
+    critic_names = [name for name in optimizers if name.startswith("critic")]
+    source_critic_names = sorted(
+        name for name in source_optimizers if name.startswith("critic")
+    )
+    if sorted(critic_names) != source_critic_names:
+        raise ValueError(
+            "--actor-init checkpoint critic optimizer layout "
+            f"{source_critic_names} does not match the --trunk-optimizer "
+            f"{args.trunk_optimizer} layout {sorted(critic_names)}; pass the "
+            "matching --trunk-optimizer or --fresh-critic"
+        )
+    for name in critic_names:
+        optimizers[name].load_state_dict(source_optimizers[name])
+    reassert_learning_rates({name: optimizers[name] for name in critic_names}, args)
 
 def resolve_critic_init_provenance(
     args: argparse.Namespace,
@@ -410,11 +619,28 @@ def resolve_critic_init_provenance(
                 if name in recorded}
     if getattr(args, "critic_only_init", None):
         return dict(args.critic_only_init_provenance)
-    if args.actor_critic_init:
+    if carries_init_critic(args):
         return {
             "init": "warm_checkpoint",
-            "checkpoint": str(args.actor_critic_init),
+            "checkpoint": str(args.actor_init),
+            "checkpoint_sha256": args.initialization_checkpoint_sha256,
             "source_execution_schema": actor_init_payload.get("execution_schema"),
+            "source_actor_step": int(actor_init_payload.get("step", 0)),
+            "source_value_warmup_step": int(
+                actor_init_payload.get("value_warmup_step", 0)
+            ),
+            "optimizer_state": "carried",
+            "source_reward_schema": actor_init_payload.get("reward_schema"),
+            "value_contract_changes": list(args.carried_critic_value_changes),
+            # How a changed contract was answered: a refit before the first
+            # actor step, or an explicit acceptance of the critic as-is.
+            "value_change_resolution": (
+                None
+                if not args.carried_critic_value_changes
+                else "refit"
+                if args.value_warmup_steps > 0
+                else "accepted"
+            ),
         }
     return {
         "init": "actor_copy" if args.critic_init == "actor" else "scratch",
@@ -442,10 +668,12 @@ def resume_topology_history(
         "prompts_per_minibatch": int(
             saved_args.get("prompts_per_minibatch", -1)
         ),
+        "rollout_groups": int(saved_args.get("rollout_groups", -1)),
     }
     after = {
         "prompts_per_rollout": int(current.prompts_per_rollout),
         "prompts_per_minibatch": int(current.prompts_per_minibatch),
+        "rollout_groups": int(current.rollout_groups),
     }
     if before == after:
         return history
@@ -790,6 +1018,30 @@ def relaxed_fenced_answer_text(
     return tokenizer.decode(list(tokens[open_index + 1:close_index]))
 
 
+def abstention_terminal_scores(
+    scores: list[float], abstained: list[bool], penalty: float | None
+) -> list[float]:
+    """Terminal rewards with explicit abstention (``--abstention-penalty``).
+
+    A verifier score ``s`` retains its [0, 1] value; an explicit abstention
+    scores ``penalty / (1 + penalty)``. This is the positive affine transform
+    of the signed objective (correct 1, abstain 0, wrong -penalty). It keeps
+    the same optimal decision threshold while putting common wrong answers
+    at the zero baseline of the freshly initialized critic. ``None``
+    leaves the scores unchanged, abstentions included (they already score
+    0 as format failures).
+    """
+    if len(scores) != len(abstained):
+        raise ValueError("one abstention flag per score is required")
+    if penalty is None:
+        return list(scores)
+    abstention_reward = normalized_abstention_reward(penalty)
+    return [
+        abstention_reward if abstain else score
+        for score, abstain in zip(scores, abstained, strict=True)
+    ]
+
+
 def score_math_rollout(
     batch: LatentRolloutBatch,
     truth: str,
@@ -801,6 +1053,7 @@ def score_math_rollout(
     think_fence_ids: tuple[int, int] | None = None,
     min_think_tokens: int = 1,
     answer_fence_ids: tuple[int, int] | None = None,
+    abstention_penalty: float | None = None,
 ) -> list[RowVerdict]:
     """Exact verifier reward plus bounded final-answer numeric proximity.
 
@@ -832,10 +1085,14 @@ def score_math_rollout(
     """
     if answer_fence_ids is not None and think_fence_ids is None:
         raise ValueError("answer_fence_ids requires think_fence_ids")
+    if abstention_penalty is not None and answer_fence_ids is None:
+        raise ValueError("abstention_penalty requires answer_fence_ids")
     scores = []
     verdicts = []
+    abstained: list[bool] = []
     gate_zeroed_correct = 0
     for emitted in emitted_token_rows(batch):
+        abstained.append(False)
         stop_cut = next(
             (index for index, token in enumerate(emitted) if token in stop_ids),
             None,
@@ -848,6 +1105,16 @@ def score_math_rollout(
         solution = tokenizer.decode(list(solution_prefix_ids) + visible)
         correct, prediction = verify_answer(solution, truth, style)
         if answer_fence_ids is not None:
+            if structural_abstention(
+                visible, think_fence_ids, answer_fence_ids,
+                stop_ids[0], min_think_tokens,
+            ):
+                # Reported in verifier_status; the verdict's format_ok is
+                # structural_format_ok, which no abstention meets.
+                abstained[-1] = True
+                scores.append(0.0)
+                verdicts.append(RowVerdict(format_ok=False, parsed_answer=None))
+                continue
             if not structural_format_ok(
                 visible, think_fence_ids, answer_fence_ids, min_think_tokens
             ):
@@ -917,14 +1184,21 @@ def score_math_rollout(
     batch.think_gate_zeroed_correct = (
         gate_zeroed_correct if think_fence_ids is not None else None
     )
-    batch.verifier_status = torch.full(
-        (batch.kind.size(0),),
-        PYTHON_RESULT_CODES["not_applicable"],
+    batch.verifier_status = torch.tensor(
+        [
+            PYTHON_RESULT_CODES["abstained" if abstain else "not_applicable"]
+            for abstain in abstained
+        ],
         dtype=torch.long,
         device=batch.rewards.device,
     )
     assign_terminal_rewards(
-        batch, torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device)
+        batch,
+        torch.tensor(
+            abstention_terminal_scores(scores, abstained, abstention_penalty),
+            dtype=torch.float32,
+            device=batch.rewards.device,
+        ),
     )
     return verdicts
 
@@ -938,6 +1212,7 @@ def score_python_rollout(
     answer_fence_ids: tuple[int, int],
     min_think_tokens: int,
     reward_mode: str = "binary",
+    abstention_penalty: float | None = None,
 ) -> list[RowVerdict]:
     """Test-based reward over the strict fenced code span.
 
@@ -956,6 +1231,7 @@ def score_python_rollout(
     verdicts = [
         RowVerdict(format_ok=False, parsed_answer=None) for _ in emitted_rows
     ]
+    abstained = [False] * len(emitted_rows)
     for index, emitted in enumerate(emitted_rows):
         stop_cut = next(
             (position for position, token in enumerate(emitted) if token in stop_ids),
@@ -964,6 +1240,13 @@ def score_python_rollout(
         if stop_cut is None:
             continue
         visible = emitted[: stop_cut + 1]
+        if structural_abstention(
+            visible, think_fence_ids, answer_fence_ids,
+            stop_ids[0], min_think_tokens,
+        ):
+            abstained[index] = True
+            statuses[index] = PYTHON_RESULT_CODES["abstained"]
+            continue
         if not structural_format_ok(
             visible,
             think_fence_ids,
@@ -995,7 +1278,11 @@ def score_python_rollout(
     batch.think_gate_zeroed_correct = 0
     assign_terminal_rewards(
         batch,
-        torch.tensor(scores, dtype=torch.float32, device=batch.rewards.device),
+        torch.tensor(
+            abstention_terminal_scores(scores, abstained, abstention_penalty),
+            dtype=torch.float32,
+            device=batch.rewards.device,
+        ),
     )
     return verdicts
 
@@ -1013,8 +1300,12 @@ def rollout_diagnostics(
     tokenizer=None,
     min_think_tokens: int = 1,
     answer_fence_ids: tuple[int, int] | None = None,
+    reward_floor: float = 0.0,
 ) -> dict[str, float | int]:
     """Pool-level rollout metrics.
+
+    ``reward_floor`` is the terminal reward of a zero verifier score (0).
+    A partial reward lies strictly between it and 1.
 
     ``refreshed_statistics`` says whether ``refresh_old_statistics`` filled
     ``batch.old_values``. It has no default meaning worth guessing: an
@@ -1062,6 +1353,18 @@ def rollout_diagnostics(
     grouped = batch.reward_scalar.reshape(-1, samples_per_prompt)
     exact = batch.reward_scalar == 1.0
     grouped_exact = exact.reshape(-1, samples_per_prompt).float()
+    abstained = (
+        batch.verifier_status == PYTHON_RESULT_CODES["abstained"]
+        if batch.verifier_status is not None
+        else torch.zeros_like(exact)
+    )
+    abstained_lengths = [
+        len(row)
+        for row, is_abstained in zip(
+            emitted_rows, abstained.to(device="cpu").tolist(), strict=True
+        )
+        if is_abstained
+    ]
     thought_actions = think_slot_mask(batch)
     continued_thoughts = thought_actions & batch.stop_mask.bool()
     forced_thoughts = thought_actions & ~batch.stop_mask.bool()
@@ -1107,6 +1410,8 @@ def rollout_diagnostics(
         "trajectories": batch.reward_scalar.numel(),
         "stream_length": batch.stream_length,
         "reward_mean": float(batch.reward_scalar.mean()),
+        "reward_max": float(batch.reward_scalar.max()),
+        "reward_min": float(batch.reward_scalar.min()),
         "reward_std": float(batch.reward_scalar.std(unbiased=False)),
         "within_group_reward_std": float(grouped.std(dim=1, unbiased=False).mean()),
         "exact_accuracy": float(exact.float().mean()),
@@ -1114,9 +1419,14 @@ def rollout_diagnostics(
             grouped_exact.std(dim=1, unbiased=False).mean()
         ),
         "partial_reward_fraction": float(
-            ((batch.reward_scalar > 0.0) & ~exact).float().mean()
+            ((batch.reward_scalar > reward_floor) & ~exact & ~abstained)
+            .float()
+            .mean()
         ),
         "actions_per_trajectory": float(batch.action_mask.sum(1).mean()),
+        "abstained_emitted_tokens_sum": float(sum(abstained_lengths)),
+        "abstained_emitted_tokens_count": float(len(abstained_lengths)),
+        "abstained_emitted_tokens_max": float(max(abstained_lengths, default=0)),
         **thought_metrics,
         "ended_fraction": sum(ended) / max(len(ended), 1),
         **(
@@ -1196,8 +1506,10 @@ def aggregate_diagnostics(
     tokenizer=None,
     min_think_tokens: int = 1,
     answer_fence_ids: tuple[int, int] | None = None,
+    reward_floor: float = 0.0,
 ) -> dict[str, float | int]:
-    """Mean of per-group rollout diagnostics; trajectory counts are summed."""
+    """Mean of per-group rollout diagnostics; trajectory counts are summed
+    and reward extrema pooled."""
     per_group = [
         rollout_diagnostics(
             group,
@@ -1208,6 +1520,7 @@ def aggregate_diagnostics(
             tokenizer=tokenizer,
             min_think_tokens=min_think_tokens,
             answer_fence_ids=answer_fence_ids,
+            reward_floor=reward_floor,
         )
         for group in groups
     ]
@@ -1215,7 +1528,7 @@ def aggregate_diagnostics(
     # Derived per-group keys (currently the conditional think mean) can
     # be present in some groups and absent in others; they are rebuilt
     # from their pooled numerators below, never averaged group-wise.
-    derived = {"think_tokens_mean"}
+    derived = {"think_tokens_mean", "abstained_emitted_tokens_mean"}
     # Intersection, not per_group[0]'s keys: conditional keys (the
     # gate-zeroed fraction depends on per-batch scoring state) may be
     # present in some groups only, and indexing them into every group
@@ -1229,13 +1542,29 @@ def aggregate_diagnostics(
         values = [metrics[key] for metrics in per_group]
         if key == "trajectories":
             aggregated[key] = int(sum(values))
-        elif key in ("think_tokens_sum", "think_tokens_count"):
+        elif key in (
+            "think_tokens_sum", "think_tokens_count",
+            "abstained_emitted_tokens_sum", "abstained_emitted_tokens_count",
+        ):
             aggregated[key] = float(sum(values))
+        elif key == "abstained_emitted_tokens_max":
+            aggregated[key] = float(max(values))
+        elif key == "reward_max":
+            # A mean of per-group extrema reads max == min whenever every
+            # group is internally constant, though groups differ.
+            aggregated[key] = float(max(values))
+        elif key == "reward_min":
+            aggregated[key] = float(min(values))
         else:
             aggregated[key] = float(sum(values) / len(values))
     if aggregated.get("think_tokens_count"):
         aggregated["think_tokens_mean"] = float(
             aggregated["think_tokens_sum"] / aggregated["think_tokens_count"]
+        )
+    if aggregated.get("abstained_emitted_tokens_count"):
+        aggregated["abstained_emitted_tokens_mean"] = float(
+            aggregated["abstained_emitted_tokens_sum"]
+            / aggregated["abstained_emitted_tokens_count"]
         )
     return aggregated
 
@@ -1261,6 +1590,7 @@ def source_diagnostics(
     tokenizer=None,
     min_think_tokens: int = 1,
     answer_fence_ids: tuple[int, int] | None = None,
+    reward_floor: float = 0.0,
 ) -> dict[str, dict[str, float | int]]:
     """Compute the same rollout diagnostics independently for every source.
 
@@ -1284,6 +1614,7 @@ def source_diagnostics(
             tokenizer=tokenizer,
             min_think_tokens=min_think_tokens,
             answer_fence_ids=answer_fence_ids,
+            reward_floor=reward_floor,
         )
         for source_id, source_groups in sorted(by_source.items())
     }
@@ -1409,6 +1740,7 @@ def credit_assignment_moments(
     advantages: torch.Tensor,
     value_targets: torch.Tensor,
     actor_signal_rows: torch.Tensor,
+    reward_floor: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Raw token moments for two credit-assignment health checks.
 
@@ -1421,9 +1753,10 @@ def credit_assignment_moments(
       are R - V exactly, and those identical points would pull a pure-noise
       critic's slope from 1/2 toward 1.
     - Advantage versus sampled-token surprisal on failed rows the actor
-      trains on (rows a source gate zeroed carry no pseudo-reward): a critic
-      whose differences reward rare tokens regardless of outcome is a
-      pseudo-reward that Delightful PG amplifies into entropy growth.
+      trains on (rows a source gate zeroed carry no pseudo-reward; failed
+      means the zero-score reward ``reward_floor``, never an abstention):
+      a critic whose differences reward rare tokens regardless of outcome
+      is a pseudo-reward that Delightful PG amplifies into entropy growth.
 
     Sums, not ratios, so groups pool exactly in the dashboard. Masked
     products rather than boolean indexing keep the update free of host syncs.
@@ -1435,8 +1768,11 @@ def credit_assignment_moments(
         batch.rewards, batch.old_values, batch.action_mask
     ).double() * actions
     mc = (value_targets - batch.old_values).double() * actions
+    failed_rows = batch.reward_scalar <= reward_floor
+    if batch.verifier_status is not None:
+        failed_rows &= batch.verifier_status != PYTHON_RESULT_CODES["abstained"]
     failed = batch.emit_mask.double() * (
-        (batch.reward_scalar <= 0) * actor_signal_rows
+        failed_rows * actor_signal_rows
     )[:, None].double()
     failed_advantage = advantages.double() * failed
     failed_surprisal = -batch.old_token_logprobs.double() * failed
@@ -1579,6 +1915,15 @@ def aggregate_actor_tensorboard_metrics(
         dashboard["carry/input_delta_rms_ratio"] = _weighted_metric_mean(
             metrics, "carry_input_delta_rms_ratio", "action_count"
         )
+        if "memory_write_beta_mean" in last:
+            dashboard["memory/write_beta_mean"] = _weighted_metric_mean(
+                metrics, "memory_write_beta_mean", "action_count"
+            )
+            dashboard["memory/decay_log_timescale_mean"] = (
+                _weighted_metric_mean(
+                    metrics, "memory_decay_log_timescale_mean", "action_count"
+                )
+            )
     else:
         dashboard["grad/gate"] = last["gate_grad_norm"]
         dashboard["grad/thought_mean"] = last["thought_mean_grad_norm"]
@@ -1713,6 +2058,27 @@ def rollout_tensorboard_metrics(metrics: dict[str, float | int]) -> dict[str, fl
         ),
         "reward/partial_fraction": float(metrics["partial_reward_fraction"]),
         "reward/ended_fraction": float(metrics["ended_fraction"]),
+        **(
+            {
+                "reward/abstained_fraction": float(
+                    metrics["verifier_abstained_fraction"]
+                ),
+            }
+            if "verifier_abstained_fraction" in metrics
+            else {}
+        ),
+        **(
+            {
+                "behavior/abstained_emitted_tokens_mean": float(
+                    metrics["abstained_emitted_tokens_mean"]
+                ),
+                "behavior/abstained_emitted_tokens_max": float(
+                    metrics["abstained_emitted_tokens_max"]
+                ),
+            }
+            if "abstained_emitted_tokens_mean" in metrics
+            else {}
+        ),
         "behavior/actions_per_trajectory": float(
             metrics["actions_per_trajectory"]
         ),
@@ -2294,6 +2660,7 @@ def update_minibatch(
     tpo_eta: float = 2.0,
     source_success_actor_gate: bool = False,
     fused_behavior_statistics: bool = False,
+    reward_floor: float = 0.0,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -2333,13 +2700,9 @@ def update_minibatch(
     if delightful_policy_gradient and target_policy_optimization:
         raise ValueError("actor objectives are mutually exclusive")
     hidden_carry = wrapper.hidden_carry
-    if batch.carry_injected != hidden_carry:
-        # A carry policy must be optimized on its own carried streams, and a
-        # stochastic or token-only policy never on them.
-        raise ValueError(
-            "rollout carry does not match the policy: batch carry_injected="
-            f"{batch.carry_injected}, wrapper hidden_carry={hidden_carry}"
-        )
+    # A carry policy must be optimized on its own carried streams, and a
+    # stochastic or token-only policy never on them.
+    validate_carry_policy(batch, wrapper)
     if fused_behavior_statistics and (
         value_only or target_policy_optimization
     ):
@@ -2402,6 +2765,8 @@ def update_minibatch(
             "tpo_positive_target_probability_sum",
             "tpo_negative_target_probability_sum",
             "carry_input_delta_square_sum", "carry_token_square_sum",
+            "memory_write_beta_sum", "memory_decay_log_timescale_sum",
+            "memory_write_count",
         )
     }
 
@@ -2613,6 +2978,33 @@ def update_minibatch(
                 )
                 totals["carry_input_delta_square_sum"] += injected.square().sum()
                 totals["carry_token_square_sum"] += token_latent.square().sum()
+                if wrapper.memory_carry:
+                    # What the writer does with the response's beliefs: mean
+                    # write strength and mean log decay timescale
+                    # log 1/(1 - alpha) over heads, so every head counts
+                    # alike (the arithmetic timescale is the slowest head's)
+                    # and a saturated gate stays finite. Dense and masked:
+                    # no host sync for a telemetry gather.
+                    with torch.no_grad():
+                        _, _, log_decay, beta = wrapper.combiner.writer(
+                            microbatch.hiddens
+                        )
+                        response = (
+                            memory_write_mask(microbatch.kind, PAD_SLOT)
+                            & generated_slot_mask(microbatch)
+                        ).to(beta.dtype)[..., None]
+                        log_timescale = -torch.log(
+                            (-torch.expm1(log_decay)).clamp_min(1e-12)
+                        )
+                        totals["memory_write_beta_sum"] += (
+                            beta * response
+                        ).sum()
+                        totals["memory_decay_log_timescale_sum"] += (
+                            log_timescale * response
+                        ).sum()
+                        totals["memory_write_count"] += (
+                            response.sum() * beta.size(-1)
+                        )
         else:
             new_stop_logprobs = -F.binary_cross_entropy_with_logits(
                 wrapper.gate.stop_logit(beliefs),
@@ -2932,7 +3324,7 @@ def update_minibatch(
         return scalar_tensors_to_floats(metric_tensors)
     metric_tensors.update(
         credit_assignment_moments(
-            batch, advantages, value_targets, actor_signal_rows
+            batch, advantages, value_targets, actor_signal_rows, reward_floor
         )
     )
 
@@ -2980,6 +3372,8 @@ def update_minibatch(
             totals["harmful_positive_log_ratio_max"]
         ),
         reward=batch.reward_scalar.mean(),
+        reward_max=batch.reward_scalar.amax(),
+        reward_min=batch.reward_scalar.amin(),
         **grad_norms,
     )
     if hidden_carry:
@@ -2991,6 +3385,17 @@ def update_minibatch(
                 / totals["carry_token_square_sum"].clamp_min(1e-30)
             ).sqrt(),
         )
+        if wrapper.memory_carry:
+            # Means over every head of every response write in the minibatch.
+            write_count = totals["memory_write_count"].clamp_min(1)
+            metric_tensors.update(
+                memory_write_beta_mean=(
+                    totals["memory_write_beta_sum"] / write_count
+                ),
+                memory_decay_log_timescale_mean=(
+                    totals["memory_decay_log_timescale_sum"] / write_count
+                ),
+            )
     else:
         metric_tensors.update(
             stochastic_policy_loss=totals["stochastic_policy_loss"],
@@ -3292,10 +3697,14 @@ def save_checkpoint(
     # from the wrapper. A mismatch would label one policy with another's
     # contract, and `combiner_init_kwargs_from_checkpoint` would rebuild it
     # with the wrong heads.
-    if wrapper.hidden_carry != mode_carries_hidden(reasoning_mode):
+    if (wrapper.hidden_carry, wrapper.memory_carry) != (
+        mode_carries_hidden(reasoning_mode),
+        mode_carries_memory(reasoning_mode),
+    ):
         raise ValueError(
             f"reasoning mode {reasoning_mode!r} does not match a wrapper with "
-            f"hidden_carry={wrapper.hidden_carry}"
+            f"hidden_carry={wrapper.hidden_carry}, "
+            f"memory_carry={wrapper.memory_carry}"
         )
     payload = {
         "step": step,
@@ -3334,7 +3743,9 @@ def save_checkpoint(
         "initialization_checkpoint_sha256": getattr(
             args, "initialization_checkpoint_sha256", None
         ),
-        "reward_schema": REWARD_SCHEMA,
+        "reward_schema": reward_schema_for_abstention(
+            getattr(args, "abstention_penalty", None)
+        ),
         "reasoning_mode": reasoning_mode,
         "renderer_features_schema": RENDERER_FEATURES_SCHEMA,
         "rollout_policy_schema": rollout_policy_schema_for_mode(reasoning_mode),
@@ -3532,8 +3943,12 @@ def main() -> None:
     # a pure-PyTorch recurrence, so the rollout step artifacts keep fullgraph
     # — including paged_step_core, whose recurrent layers are lane-indexed
     # gather/step/scatter (see kda_backbone._block_paged_step).
+    # The memory carry's replay scan is the same fenced FLA kernel, on any
+    # trunk.
     is_recurrent_trunk = "_kda_" in backbone.architecture
-    trunk_fullgraph = not is_recurrent_trunk
+    trunk_fullgraph = not (
+        is_recurrent_trunk or mode_carries_memory(args.reasoning_mode)
+    )
 
     # Runtime rollout capacity follows the requested response budget; record
     # checkpoint/training windows separately so extension is never mislabeled.
@@ -3627,15 +4042,26 @@ def main() -> None:
     # continuation gate all train. Noise scale is a strict policy hyperparameter.
     # The hidden-carry policy builds only the combiner: it has no Gaussian or
     # gate to train, and its sigma/stop arguments are None.
+    memory_carry = mode_carries_memory(args.reasoning_mode)
+    combined_mlp = (
+        {}
+        if memory_carry
+        else {
+            "mlp_hidden": args.combined_mlp_hidden,
+            "num_blocks": args.combined_mlp_blocks,
+        }
+    )
     wrapper = LatentThoughtModel(
         backbone,
-        mlp_hidden=args.combined_mlp_hidden,
-        num_blocks=args.combined_mlp_blocks,
+        **combined_mlp,
         thought_sigma=args.thought_sigma,
         init_stop_thinking_probability=(
             args.init_stop_thinking_probability
         ),
         hidden_carry=hidden_carry,
+        memory_carry=memory_carry,
+        memory_heads=args.memory_heads,
+        memory_head_dim=args.memory_head_dim,
     ).to(device)
     # No module here behaves differently under train(): pin eval mode once so
     # the training flag (a dynamo guard) never flips between the step-0 evals
@@ -3643,9 +4069,8 @@ def main() -> None:
     wrapper.eval()
     actor_init_payload = None
     actor_init_provenance = None
-    initialization_path = (
-        args.actor_critic_init or args.actor_init or args.curriculum_init
-    )
+    initialization_path = args.actor_init or args.curriculum_init
+    carry_critic = carries_init_critic(args)
     args.initialization_checkpoint_sha256 = (
         file_sha256(initialization_path) if initialization_path else None
     )
@@ -3668,27 +4093,32 @@ def main() -> None:
                 "prompt schema; start from a checkpoint trained with "
                 f"{ANSWER_FENCE_PROMPT_SCHEMA!r}"
             )
-        if args.actor_critic_init:
-            if int(actor_init_payload.get("step", -1)) != 0:
-                raise ValueError(
-                    "--actor-critic-init requires a pre-policy critic-warmup checkpoint"
-                )
-            if (
-                int(actor_init_payload.get("value_warmup_step", -1))
-                < args.value_warmup_steps
-            ):
-                raise ValueError(
-                    "--actor-critic-init checkpoint has incomplete critic warmup"
-                )
-            if actor_init_payload.get("reward_schema") != REWARD_SCHEMA:
-                raise ValueError(
-                    "--actor-critic-init checkpoint uses an incompatible reward schema"
-                )
+        if (
+            args.actor_init
+            and actor_init_payload.get("base_checkpoint_sha256")
+            != args.base_checkpoint_sha256
+        ):
+            # A branch continues its source's lineage; the manifest's base
+            # block must name the checkpoint the branch actually descends from.
+            raise ValueError(
+                "--actor-init checkpoint descends from a different base "
+                "checkpoint than --checkpoint"
+            )
+        if carry_critic:
+            args.carried_critic_value_changes = validate_carried_critic(
+                actor_init_payload, args
+            )
         # The combiner's tensor shapes are fixed by the saved CLI arguments;
         # a geometry mismatch would otherwise surface as an opaque strict-load
         # shape error (or, for the loaded gain scalar, not at all).
         saved_combiner = combiner_init_kwargs_from_checkpoint(actor_init_payload)
-        if (
+        if saved_combiner.get("memory_carry", False) != wrapper.memory_carry:
+            raise ValueError(
+                f"{initialization_path} memory_carry="
+                f"{saved_combiner.get('memory_carry', False)} does not match "
+                f"--reasoning-mode {args.reasoning_mode}"
+            )
+        if not wrapper.memory_carry and (
             saved_combiner["mlp_hidden"],
             saved_combiner["num_blocks"],
         ) != (args.combined_mlp_hidden, args.combined_mlp_blocks):
@@ -3700,6 +4130,16 @@ def main() -> None:
                 "pass the checkpoint's --combined-mlp-hidden and "
                 "--combined-mlp-blocks"
             )
+        saved_memory = (
+            saved_combiner.get("memory_heads"),
+            saved_combiner.get("memory_head_dim"),
+        )
+        if saved_memory != (args.memory_heads, args.memory_head_dim):
+            raise ValueError(
+                f"{initialization_path} was trained with memory geometry "
+                f"heads/head_dim={saved_memory}, not "
+                f"{(args.memory_heads, args.memory_head_dim)}"
+            )
         validate_renderer_checkpoint(
             actor_init_payload,
             initialization_path,
@@ -3709,7 +4149,7 @@ def main() -> None:
         actor_init_provenance = {
             "checkpoint": str(initialization_path),
             "checkpoint_sha256": args.initialization_checkpoint_sha256,
-            "critic_initialized": bool(args.actor_critic_init),
+            "critic_initialized": carry_critic,
             "curriculum_transition": bool(args.curriculum_init),
             "source_step": actor_init_payload.get("step"),
             "source_reward_schema": actor_init_payload.get("reward_schema"),
@@ -3751,39 +4191,47 @@ def main() -> None:
     critic_uses_dense_trunk = bool(
         getattr(backbone, "model_config", {}).get("moe_num_experts", 0)
     )
-    if args.critic_init == "actor":
-        if critic_uses_dense_trunk:
-            raise ValueError(
-                "--critic-init actor copies the actor trunk, but a LatentMoE "
-                "actor's critic is a dense trunk with no matching weights"
+    # The critic's random initialization draws from a stream of its own,
+    # seeded by --seed alone, not from whatever the actor wrapper consumed
+    # before it (cot, carry and memory construct different heads): one
+    # seed starts every reasoning mode from the same critic, so a mode
+    # comparison is paired rather than confounded by critic init.
+    with torch.random.fork_rng(devices=[device]):
+        torch.manual_seed(args.seed + CRITIC_INIT_SEED_OFFSET)
+        if args.critic_init == "actor":
+            if critic_uses_dense_trunk:
+                raise ValueError(
+                    "--critic-init actor copies the actor trunk, but a LatentMoE "
+                    "actor's critic is a dense trunk with no matching weights"
+                )
+            # The actor as loaded at this point (base checkpoint, or the
+            # --actor-init/--curriculum-init weights), in storage of its own:
+            # pretrained features without sharing a single tensor. The critic
+            # head stays zero-initialized, so the copy starts at value 0 and gets
+            # no trunk gradient until the head has learned a readout.
+            critic_trunk = copy_trunk(backbone, device)
+        else:
+            critic_trunk = fresh_trunk(
+                backbone,
+                device,
+                model_config_overrides=(
+                    {"moe_num_experts": 0, "moe_layer_indices": []}
+                    if critic_uses_dense_trunk
+                    else None
+                ),
+                architecture_override=(
+                    backbone.architecture.replace("_stable_latentmoe_v1", "")
+                    + "_dense_critic"
+                    if critic_uses_dense_trunk
+                    else None
+                ),
             )
-        # The actor as loaded at this point (base checkpoint, or the
-        # --actor-init/--curriculum-init weights), in storage of its own:
-        # pretrained features without sharing a single tensor. The critic
-        # head stays zero-initialized, so the copy starts at value 0 and gets
-        # no trunk gradient until the head has learned a readout.
-        critic_trunk = copy_trunk(backbone, device)
-    else:
-        critic_trunk = fresh_trunk(
-            backbone,
-            device,
-            model_config_overrides=(
-                {"moe_num_experts": 0, "moe_layer_indices": []}
-                if critic_uses_dense_trunk
-                else None
-            ),
-            architecture_override=(
-                backbone.architecture.replace("_stable_latentmoe_v1", "")
-                + "_dense_critic"
-                if critic_uses_dense_trunk
-                else None
-            ),
-        )
-    critic = SeparateCritic(
-        critic_trunk,
-        mlp_hidden=args.combined_mlp_hidden,
-        num_blocks=args.combined_mlp_blocks,
-    ).to(device)
+        critic = SeparateCritic(
+            critic_trunk,
+            mlp_hidden=args.combined_mlp_hidden,
+            num_blocks=args.combined_mlp_blocks,
+            actor_memory=wrapper.combiner if wrapper.memory_carry else None,
+        ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if actor_init_payload is not None:
         # These three apply on EVERY initialization path (--actor-init and
@@ -3791,8 +4239,8 @@ def main() -> None:
         # mismatch means the loaded policy either never trained the fence
         # rows (all-zero structurally-gated reward) or emits fence ids the
         # tokenizer silently drops (no gate at all). Red-team round 2: the
-        # guards originally lived under --actor-critic-init only, whose
-        # own error text recommended --actor-init — the unguarded path.
+        # guards once covered only the retired warm-critic init, whose own
+        # error text recommended --actor-init — then the unguarded path.
         init_args = actor_init_payload.get("args", {})
         if bool(init_args.get("think_tokens")) != bool(args.think_tokens):
             raise ValueError(
@@ -3821,30 +4269,6 @@ def main() -> None:
                 f"{bool(init_args.get('answer_fence'))}, got "
                 f"{bool(args.answer_fence)})"
             )
-    if args.actor_critic_init:
-        init_args = actor_init_payload.get("args", {})
-        if not resume_critic_schema_compatible(actor_init_payload):
-            raise ValueError(
-                "--actor-critic-init warm critic schema is "
-                f"{actor_init_payload.get('critic_schema')!r}, expected "
-                f"{CRITIC_SCHEMA!r}; rerun critic warmup or start with "
-                "--actor-init"
-            )
-        expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
-            args.trunk_optimizer
-        )
-        if (
-            actor_init_payload.get("optimizer_schema")
-            != expected_optimizer_schema
-        ):
-            raise ValueError(
-                "--actor-critic-init optimizer schema is "
-                f"{actor_init_payload.get('optimizer_schema')!r}, expected "
-                f"{expected_optimizer_schema!r}; rerun critic warmup under "
-                "the current optimizer implementation"
-            )
-        critic.load_state_dict(actor_init_payload["critic"], strict=True)
-
     optimizers = build_optimizers(
         wrapper,
         critic,
@@ -3854,37 +4278,8 @@ def main() -> None:
         muon_learning_rate=args.muon_learning_rate,
         critic_muon_learning_rate=args.critic_muon_learning_rate,
     )
-    if args.actor_critic_init:
-        # A step-0 critic-warm checkpoint has never stepped its actor. Its
-        # optimizer state is therefore empty and carries no momentum to
-        # preserve. Preserve the trained critic's optimizer state and start
-        # the untouched actor optimizer in the current three-group layout.
-        source_optimizers = actor_init_payload["optimizers"]
-        for name, source in source_optimizers.items():
-            if name.startswith("actor") and source["state"]:
-                raise ValueError(
-                    "--actor-critic-init requires a pristine actor optimizer"
-                )
-        critic_names = [name for name in optimizers if name.startswith("critic")]
-        missing = [name for name in critic_names if name not in source_optimizers]
-        extra = [
-            name
-            for name in source_optimizers
-            if name.startswith("critic") and name not in optimizers
-        ]
-        if missing or extra:
-            raise ValueError(
-                "--actor-critic-init checkpoint optimizer layout "
-                f"{sorted(n for n in source_optimizers if n.startswith('critic'))} "
-                f"does not match the --trunk-optimizer {args.trunk_optimizer} "
-                f"layout {sorted(critic_names)}; rerun the critic warmup or "
-                "pass the matching --trunk-optimizer"
-            )
-        for name in critic_names:
-            optimizers[name].load_state_dict(source_optimizers[name])
-        reassert_learning_rates(
-            {name: optimizers[name] for name in critic_names}, args
-        )
+    if carry_critic:
+        carry_init_critic(critic, optimizers, actor_init_payload, args)
 
     tokenizer = load_posttraining_tokenizer(
         backbone.architecture,
@@ -3902,6 +4297,8 @@ def main() -> None:
         answer_fence_ids = (
             tokenizer.answer_open_id, tokenizer.answer_close_id
         )
+    # The terminal reward of a zero verifier score.
+    reward_floor = abstention_terminal_scores([0.0], [False], args.abstention_penalty)[0]
     # dict.fromkeys dedupes while keeping order: GPT-2's single
     # <|endoftext|> token reports as both EOS and BOS.
     stop_ids = tuple(
@@ -3978,8 +4375,8 @@ def main() -> None:
             and actor_init_payload.get("python_reward_schema") != args.python_reward_schema
         ):
             raise ValueError(
-                "actor-critic initialization uses a different Python reward objective; "
-                "start a fresh critic for the selected code reward mode"
+                "initialization checkpoint was trained under a different "
+                "Python reward objective than the selected code reward mode"
             )
         if (
             sft_provenance.get("traces_sha256")
@@ -4054,6 +4451,12 @@ def main() -> None:
                 args.nearby_reward_max,
             )
         )
+    # On the trained reward scale, beside reward/mean.
+    modal_shaped_rewards = abstention_terminal_scores(
+        modal_shaped_rewards,
+        [False] * len(modal_shaped_rewards),
+        args.abstention_penalty,
+    )
     math_modal_baseline["shaped_reward"] = (
         sum(modal_shaped_rewards) / len(modal_shaped_rewards)
         if modal_shaped_rewards
@@ -4137,9 +4540,11 @@ def main() -> None:
                 )
             sampler.cursor = actor_cursor
             print(
-                f"actor{' and critic' if args.actor_critic_init else ''} initialized "
+                f"actor{' and critic' if carry_critic else ''} initialized "
                 f"from {initialization_path} at source step "
-                f"{actor_init_payload.get('step')} and sampler cursor {actor_cursor}",
+                f"{actor_init_payload.get('step')} and sampler cursor "
+                f"{actor_cursor}; {args.value_warmup_steps} critic warmup "
+                "updates before the first actor step",
                 flush=True,
             )
     seq_len = FreshHyperparameters.train_seq_len
@@ -4216,7 +4621,7 @@ def main() -> None:
             raise ValueError("custom-tokenizer validation has no bytes")
 
     start_step = 0
-    warmup_step = args.value_warmup_steps if args.actor_critic_init else 0
+    warmup_step = 0
     resume_args = None
     resumed_zero_reward_frozen_updates = None
     if args.resume:
@@ -4277,9 +4682,12 @@ def main() -> None:
                 f"{payload.get('replay_numerics_schema')!r}; old replay "
                 "layouts are never migrated"
             )
-        if payload.get("reward_schema") != REWARD_SCHEMA:
+        expected_reward_schema = reward_schema_for_abstention(
+            args.abstention_penalty
+        )
+        if payload.get("reward_schema") != expected_reward_schema:
             raise ValueError(
-                f"resume checkpoint reward schema must be {REWARD_SCHEMA!r}; "
+                f"resume checkpoint reward schema must be {expected_reward_schema!r}; "
                 f"got {payload.get('reward_schema')!r}"
             )
         expected_actor_objective_schema = actor_objective_schema(
@@ -4428,11 +4836,6 @@ def main() -> None:
         random.setstate(payload["python_rng"])
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
-
-    if args.actor_critic_init:
-        torch.set_rng_state(actor_init_payload["cpu_rng"])
-        torch.cuda.set_rng_state_all(actor_init_payload["cuda_rng"])
-        random.setstate(actor_init_payload["python_rng"])
 
     if args.bpb_only or args.bench_only:
         planned_prompt_count = 0
@@ -4730,7 +5133,13 @@ def main() -> None:
         -(-args.prompt_tokens // (2 * decode_block_size)) * decode_block_size,
     )
     rollout_decode_masks: dict[int, DecodeRangeMask] = {}
-    rollout_graph_rows = max(args.rollout_groups, 1) * args.samples_per_prompt
+    # No pool holds more than prompts_per_rollout prompts, so a chunk never
+    # needs more rows than that: a smaller pool must not pay for (and
+    # capture every bucket of) a full --rollout-groups workspace.
+    rollout_chunk_groups = min(
+        max(args.rollout_groups, 1), args.prompts_per_rollout
+    )
+    rollout_graph_rows = rollout_chunk_groups * args.samples_per_prompt
 
     def decode_mask_for(prompt_width: int) -> DecodeRangeMask | None:
         """Main-loop mask sized for a chunk left-padded to ``prompt_width``."""
@@ -4790,7 +5199,7 @@ def main() -> None:
     ):
         decode_arena = PinnedDecodeArena(
             wrapper,
-            rows=max(args.rollout_groups, 1) * args.samples_per_prompt,
+            rows=rollout_graph_rows,
             kv_width=args.prompt_tokens + max_stream_steps,
             temperature=args.temperature,
             stop_ids=stop_ids,
@@ -4828,6 +5237,7 @@ def main() -> None:
             device=device,
             hidden_carry=hidden_carry,
             sync_every=args.rollout_sync_every,
+            replay_storage=False,
         )
 
     if args.rollout_flex_decode and rollout_tail_caches is not None:
@@ -5089,7 +5499,9 @@ def main() -> None:
                 "rl_mixture_manifest": mixture_manifest,
                 "rl_source_ids": source_ids,
                 "python_reward_schema": getattr(args, "python_reward_schema", None),
-                "reward_schema": REWARD_SCHEMA,
+                "reward_schema": reward_schema_for_abstention(
+                    args.abstention_penalty
+                ),
                 "reasoning_mode": args.reasoning_mode,
                 "context_tokens": context_tokens,
                 "checkpoint_context_limit": checkpoint_context_limit,
@@ -5178,6 +5590,7 @@ def main() -> None:
                 think_fence_ids=think_fence_ids,
                 min_think_tokens=args.think_min_tokens,
                 answer_fence_ids=answer_fence_ids,
+                abstention_penalty=args.abstention_penalty,
             )
         elif verifier_kind == "python_mbpp":
             assert think_fence_ids is not None and answer_fence_ids is not None
@@ -5190,6 +5603,7 @@ def main() -> None:
                 answer_fence_ids,
                 args.think_min_tokens,
                 reward_mode=args.python_reward_mode,
+                abstention_penalty=args.abstention_penalty,
             )
         else:
             raise ValueError(f"unsupported verifier kind {verifier_kind!r}")
@@ -5304,6 +5718,10 @@ def main() -> None:
                         args.samples_per_prompt,
                         device,
                     ),
+                    # Straight from the arena to the host: a device copy of
+                    # the memory carry's replay record does not fit beside
+                    # the arena on a 32 GB card.
+                    offload_device=cpu if offload_to_cpu else None,
                 )
             return rollout_continuations(
                 wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
@@ -5350,7 +5768,7 @@ def main() -> None:
                 )
                 with profiler.phase("decode"):
                     batch = lockstep_rollout(prompt_ids[None], None, request_id)
-                if offload_to_cpu:
+                if offload_to_cpu and decode_arena is None:
                     with profiler.phase("stream_d2h"):
                         batch = compact_stream_to_device(batch, cpu)
                 with profiler.phase("score_inline"):
@@ -5440,8 +5858,8 @@ def main() -> None:
             )
 
         encoded_chunks = [
-            encoded_rows[start : start + args.rollout_groups]
-            for start in range(0, len(encoded_rows), args.rollout_groups)
+            encoded_rows[start : start + rollout_chunk_groups]
+            for start in range(0, len(encoded_rows), rollout_chunk_groups)
         ]
 
         def upload_chunk(
@@ -5567,9 +5985,14 @@ def main() -> None:
                 batched = lockstep_rollout(
                     prompt_ids,
                     prompt_lengths_cpu,
-                    chunk_index * args.rollout_groups,
+                    chunk_index * rollout_chunk_groups,
                 )
-            complete_chunk(batched, prompt_lengths_cpu, chunk)
+            complete_chunk(
+                batched,
+                prompt_lengths_cpu,
+                chunk,
+                already_offloaded=offload_to_cpu and decode_arena is not None,
+            )
             del batched
         drain_scored()
         return groups
@@ -5679,12 +6102,15 @@ def main() -> None:
             step,
             metrics,
             captured_attempts,
-            reward_schema=REWARD_SCHEMA,
+            reward_schema=reward_schema_for_abstention(args.abstention_penalty),
         )
         tensorboard.add_scalar("aime/accuracy", metrics["accuracy"], step)
         tensorboard.add_scalar(
             "aime/policy_accuracy", metrics["policy_accuracy"], step
         )
+        for key in ("abstained_fraction", "answered_accuracy"):
+            if key in metrics:
+                tensorboard.add_scalar(f"aime/{key}", metrics[key], step)
         print(
             f"step:{step} "
             f"aime_policy_avg@{metrics['policy_samples']}:"
@@ -5737,7 +6163,7 @@ def main() -> None:
             step,
             metrics,
             captured_attempts,
-            reward_schema=REWARD_SCHEMA,
+            reward_schema=reward_schema_for_abstention(args.abstention_penalty),
         )
         logger.log(
             type="bench",
@@ -5751,6 +6177,9 @@ def main() -> None:
         tensorboard.add_scalar(
             "bench/policy_accuracy", metrics["policy_accuracy"], step
         )
+        for key in ("abstained_fraction", "answered_accuracy"):
+            if key in metrics:
+                tensorboard.add_scalar(f"bench/{key}", metrics[key], step)
         print(
             f"step:{step} "
             f"bench_policy_avg@{metrics['policy_samples']}:"
@@ -5813,11 +6242,12 @@ def main() -> None:
                 tokenizer=tokenizer,
                 min_think_tokens=args.think_min_tokens,
                 answer_fence_ids=answer_fence_ids,
+                reward_floor=reward_floor,
             )
             if last_decode_schedule_metrics is None:
                 metrics.update(
                     lockstep_decode_metrics(
-                        groups, max(args.rollout_groups, 1)
+                        groups, rollout_chunk_groups
                     )
                 )
             else:
@@ -5840,6 +6270,7 @@ def main() -> None:
                     tokenizer=tokenizer,
                     min_think_tokens=args.think_min_tokens,
                     answer_fence_ids=answer_fence_ids,
+                    reward_floor=reward_floor,
                 )
                 if mixture_manifest is not None
                 else None
@@ -5873,7 +6304,7 @@ def main() -> None:
         tensorboard.close()
         raise SystemExit(0 if all_passed else 2)
 
-    if start_step == 0 and (warmup_step == 0 or args.actor_critic_init):
+    if start_step == 0 and warmup_step == 0:
         bpb = teacher_forced_bpb()
         logger.log(type="bpb", step=0, val_bpb=bpb)
         tensorboard.add_scalar("guard/val_bpb", bpb, 0)
@@ -5889,46 +6320,54 @@ def main() -> None:
         for warmup in range(warmup_step + 1, args.value_warmup_steps + 1):
             warmup_started = time.perf_counter()
             collect_started = warmup_started
+            # The warmup pool takes the actor update's path: offloaded at
+            # collection, packed into one minibatch with one replay plan,
+            # and fit in a single sharded pass. Updating prompt group by
+            # prompt group instead ran one small replay per group, at more
+            # than twice the cost of a whole actor-and-critic update.
             groups = collect(
                 refresh_statistics=False,
                 prompt_count=args.prompts_per_minibatch,
+                offload_to_cpu=True,
             )
             torch.cuda.synchronize()
             collect_seconds = time.perf_counter() - collect_started
             update_started = time.perf_counter()
-            value_action_denominator = torch.stack(
-                [group.action_mask.sum() for group in groups]
-            ).sum()
-            zero_optimizers(optimizers, "critic")
-            group_metrics = [
-                training_update(
-                    wrapper,
-                    critic,
-                    group,
-                    optimizers,
-                    value_only=True,
-                    critic_step=False,
-                    value_action_denominator=value_action_denominator,
-                    replay_max_trajectories=args.replay_max_trajectories,
-                    replay_attention_budget=args.replay_attention_budget,
-                    replay_bucket=args.replay_bucket,
-                    replay_slot_budget=args.replay_slot_budget,
-                )
-                for group in groups
-            ]
-            step_optimizers(optimizers, "critic")
+            packed = pack_rollout_groups_for_replay(groups, pin_memory=True)
             del groups
+            replay_plan = build_replay_plan(
+                packed,
+                args.replay_max_trajectories,
+                args.replay_attention_budget,
+                args.replay_bucket,
+                args.replay_slot_budget,
+                include_action_indices=False,
+            )
+            device_batch = packed.to(device, non_blocking=True)
+            device_replay_plan = replay_plan.to(device, non_blocking=True)
+            del packed, replay_plan
+            zero_optimizers(optimizers, "critic")
+            metrics = training_update(
+                wrapper,
+                critic,
+                device_batch,
+                optimizers,
+                value_only=True,
+                critic_step=False,
+                replay_max_trajectories=args.replay_max_trajectories,
+                replay_attention_budget=args.replay_attention_budget,
+                replay_bucket=args.replay_bucket,
+                replay_slot_budget=args.replay_slot_budget,
+                replay_plan=device_replay_plan,
+            )
+            step_optimizers(optimizers, "critic")
+            del device_batch, device_replay_plan
             update_seconds = time.perf_counter() - update_started
-            metrics = {
-                key: float(sum(m[key] for m in group_metrics) / len(group_metrics))
-                for key in group_metrics[0]
-            }
-            value_metrics = aggregate_value_diagnostics(group_metrics)
+            value_metrics = aggregate_value_diagnostics([metrics])
             metrics.update(
                 seconds=time.perf_counter() - warmup_started,
                 collect_seconds=collect_seconds,
                 update_seconds=update_seconds,
-                action_count=sum(m["action_count"] for m in group_metrics),
                 value_mean=value_metrics["prediction_mean"],
                 value_target_mean=value_metrics["target_mean"],
                 value_target_variance=value_metrics["target_variance"],
@@ -5936,10 +6375,6 @@ def main() -> None:
                 value_residual_variance=value_metrics["residual_variance"],
                 explained_variance=value_metrics["explained_variance"],
                 value_loss=value_metrics["loss"],
-                critic_grad_norm=group_metrics[-1]["critic_grad_norm"],
-                advantage_mean=_weighted_metric_mean(
-                    group_metrics, "advantage_mean", "action_count"
-                ),
             )
             logger.log(type="value_warmup", step=warmup, **metrics)
             print(
@@ -6032,14 +6467,14 @@ def main() -> None:
             args.zero_reward_stop_pools > 0
             and zero_reward_pool_streak >= args.zero_reward_stop_pools
         ):
-            # A sustained all-zero-reward streak is a dead run: with the
+            # A sustained constant-reward streak is a dead run: with the
             # actor frozen it cannot recover, and with the freeze disabled
             # it is re-entering the round-4 spiral. Pool-boundary stop —
             # the loop tail below saves the final checkpoint, so the run
             # truncates resumably instead of burning the remaining budget
             # on signal-free rollouts.
             print(
-                f"{zero_reward_pool_streak} consecutive all-zero-reward "
+                f"{zero_reward_pool_streak} consecutive constant-reward "
                 f"pools at step {step}/{args.steps}; stopping at the pool "
                 "boundary",
                 flush=True,
@@ -6108,10 +6543,11 @@ def main() -> None:
                 tokenizer=tokenizer,
                 min_think_tokens=args.think_min_tokens,
                 answer_fence_ids=answer_fence_ids,
+                reward_floor=reward_floor,
             )
             if last_decode_schedule_metrics is None:
                 rollout_metrics.update(
-                    lockstep_decode_metrics(groups, max(args.rollout_groups, 1))
+                    lockstep_decode_metrics(groups, rollout_chunk_groups)
                 )
             else:
                 rollout_metrics.update(last_decode_schedule_metrics)
@@ -6131,6 +6567,7 @@ def main() -> None:
                     tokenizer=tokenizer,
                     min_think_tokens=args.think_min_tokens,
                     answer_fence_ids=answer_fence_ids,
+                    reward_floor=reward_floor,
                 )
                 if mixture_manifest is not None
                 else None
@@ -6153,20 +6590,23 @@ def main() -> None:
                 )
         if len(minibatch_orders) != pool_updates:
             raise RuntimeError("rollout pool did not produce the planned updates")
-        # Rewards are non-negative (exact 1.0, nearby-numeric partial, else
-        # 0), so a zero reward mean means every trajectory in the window
-        # scored zero. The actual freeze decision is made per optimizer
-        # MINIBATCH below (an update over an all-zero minibatch is the
-        # harmful unit — a single rewarded trajectory elsewhere in the pool
-        # must not unfreeze it); the pool-level statistic here feeds the
-        # rollout log and the consecutive-desert stop. NaN fails closed:
-        # a non-finite mean is a broken pool, not a licence to update.
+        # A pool whose every trajectory scored the same reward carries no
+        # reward signal: every advantage is critic error. All-wrong and
+        # all-abstain pools are constant too. The actual freeze decision is
+        # made per optimizer
+        # MINIBATCH below (an update over a constant-reward minibatch is the
+        # harmful unit — a single differently rewarded trajectory elsewhere
+        # in the pool must not unfreeze it); the pool-level statistic here
+        # feeds the rollout log and the consecutive-desert stop. NaN fails
+        # closed: a non-finite mean is a broken pool, not a licence to update.
         if not math.isfinite(rollout_metrics["reward_mean"]):
             raise RuntimeError(
                 f"non-finite pool reward_mean "
                 f"{rollout_metrics['reward_mean']} at step {step}"
             )
-        pool_reward_zero = rollout_metrics["reward_mean"] == 0.0
+        pool_reward_zero = (
+            rollout_metrics["reward_max"] == rollout_metrics["reward_min"]
+        )
         rollout_metrics["zero_reward_actor_frozen"] = float(
             args.zero_reward_actor_freeze and pool_reward_zero
         )
@@ -6179,7 +6619,7 @@ def main() -> None:
                 else "freeze disabled by --no-zero-reward-actor-freeze"
             )
             print(
-                f"steps {step + 1}..{step + pool_updates}: all-zero-reward "
+                f"steps {step + 1}..{step + pool_updates}: constant-reward "
                 f"pool — {frozen_note}; streak {zero_reward_pool_streak}",
                 flush=True,
             )
@@ -6491,6 +6931,7 @@ def main() -> None:
                         "exact_accuracy",
                         "within_group_reward_std",
                         "ended_fraction",
+                        "verifier_abstained_fraction",
                         "think_format_fraction",
                         "actions_per_trajectory",
                     ):
@@ -6589,6 +7030,7 @@ def main() -> None:
                             args.source_success_actor_gate
                         ),
                         fused_behavior_statistics=fused_behavior_statistics,
+                        reward_floor=reward_floor,
                     )
                 # The first minibatch runs against refresh-computed behavior
                 # statistics with the actor untouched. Later disjoint minibatches
@@ -6615,7 +7057,8 @@ def main() -> None:
                             "refresh/update code paths diverged)",
                             flush=True,
                         )
-                # An update whose every trajectory scored zero is the
+                # An update whose every trajectory scored the same reward
+                # (all wrong, all abstaining, or all correct) is the
                 # harmful unit from the round-4 postmortem: its advantages
                 # are pure critic error whose only coherent direction is
                 # anti-termination. The decision is per MINIBATCH — a
@@ -6626,12 +7069,12 @@ def main() -> None:
                 # non-finite checks stay uniform, and skipping the step is
                 # required because Adam momentum from earlier updates moves
                 # weights even on a zero-signal gradient. The critic always
-                # steps so value predictions catch down to the zero
+                # steps so value predictions catch up to the reward
                 # targets. (Rewards are finite here: the pool-level
                 # isfinite raise above covers the same tensors.)
                 minibatch_actor_frozen = (
                     args.zero_reward_actor_freeze
-                    and metrics["reward"] == 0.0
+                    and metrics["reward_max"] == metrics["reward_min"]
                 )
                 if minibatch_actor_frozen:
                     zero_reward_frozen_updates += 1
@@ -6710,14 +7153,7 @@ def main() -> None:
                             "combiner/update_abs_max": torch.stack(
                                 [delta.abs().max() for delta in combiner_deltas]
                             ).max(),
-                            "combiner/carry_weight_rms": (
-                                wrapper.combiner.carry.weight.detach()
-                                .square().mean().sqrt()
-                            ),
-                            "combiner/type_bias_rms": (
-                                wrapper.combiner.type_bias.detach()
-                                .square().mean().sqrt()
-                            ),
+                            **combiner_weight_telemetry(wrapper),
                         }
                     )
                 if not all(

@@ -25,7 +25,7 @@ WORKER_TOKEN_ENV = "PARAMETER_GOLF_SAMPLER_BENCHMARK_TOKEN"
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--logits', type=Path, default=ROOT / 'ablation_results/minicpm_low_noise_20260911/official_inference_parity_logits.pt')
+    p.add_argument('--logits', type=Path, default=ROOT / 'postraining/minicpm5_runs/minicpm_low_noise_20260911/official_inference_parity_logits.pt')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--iterations', type=int, default=100)
     p.add_argument('--repeats', type=int, default=3)

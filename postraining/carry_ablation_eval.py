@@ -300,6 +300,7 @@ def hidden_probes(
             think_fence_ids=think_fence_ids,
             min_think_tokens=int(saved_args.get("think_min_tokens", 1)),
             answer_fence_ids=answer_fence_ids,
+            abstention_penalty=saved_args.get("abstention_penalty"),
         )
         action = batch.action_mask.bool()
         with torch.no_grad():

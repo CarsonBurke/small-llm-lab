@@ -1,4 +1,4 @@
-"""Shared rollout semantics for latent, carry, CoT, and answer-only policies."""
+"""Shared rollout semantics for latent, carry, memory, CoT, and answer-only policies."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from postraining.core import (
 )
 
 
-REASONING_MODES = ("latent", "carry", "cot", "none")
+REASONING_MODES = ("latent", "carry", "memory", "cot", "none")
 
 
 def mode_pins_emit(reasoning_mode: str) -> bool:
@@ -22,10 +22,21 @@ def mode_pins_emit(reasoning_mode: str) -> bool:
 
 
 def mode_carries_hidden(reasoning_mode: str) -> bool:
-    """Whether generated-token inputs add the belief that produced them."""
+    """Whether generated-token inputs depend on carried beliefs.
+
+    True for the direct hidden carry and for the gated-delta memory carry,
+    which share the carried-belief record and the token-only action space.
+    """
     if reasoning_mode not in REASONING_MODES:
         raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
-    return reasoning_mode == "carry"
+    return reasoning_mode in ("carry", "memory")
+
+
+def mode_carries_memory(reasoning_mode: str) -> bool:
+    """Whether carried beliefs pass through the gated-delta memory."""
+    if reasoning_mode not in REASONING_MODES:
+        raise ValueError(f"unknown reasoning mode {reasoning_mode!r}")
+    return reasoning_mode == "memory"
 
 
 def mode_rollout_budget(
@@ -39,8 +50,8 @@ def mode_rollout_budget(
     """Return ``(emitted-token cap, stream-slot cap)`` for one evaluation."""
     if reasoning_mode == "none":
         return answer_tokens, answer_tokens
-    if reasoning_mode in ("cot", "carry"):
-        # Carry adds no stream slots: its stream is prompt plus emitted
+    if reasoning_mode in ("cot", "carry", "memory"):
+        # Carries add no stream slots: their stream is prompt plus emitted
         # tokens, exactly like cot.
         return max_tokens, max_tokens
     if reasoning_mode != "latent":

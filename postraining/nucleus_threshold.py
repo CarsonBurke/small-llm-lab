@@ -37,9 +37,10 @@ comparison against it agrees with ``key > lo`` except that it ties -0 with
 a buffer written by the step that chose them, so the partial and combining
 kernels compare against identical values.
 
-The decode tail runs this on 8-16 rows, where one program per row would be a
-serial chain. Every statistics and cut pass instead splits the vocabulary
-across enough programs to fill the GPU. Each program accumulates its slice
+One program per row would be a serial chain of latency-bound loads: at 8-16
+tail rows it leaves the GPU idle, and at 1024 rows each program still walks
+the whole vocabulary. Every statistics and cut pass instead splits each row
+into a fixed number of short slices. Each program accumulates its slice
 elementwise and reduces once. A one-program-per-row kernel then combines
 the partials and moves the bracket. The launch count is fixed and there is
 no host synchronisation, so the whole search captures into a CUDA graph.
@@ -60,8 +61,6 @@ land an ulp away.
 
 from __future__ import annotations
 
-import functools
-
 import torch
 import triton
 import triton.language as tl
@@ -72,6 +71,11 @@ from torch import Tensor
 # kernel it misses is absent from the cache key, so an edited kernel would be
 # served its stale compiled graph.
 from torch.library import wrap_triton
+
+from pretraining.nanogpt_mini.triton_op_cache import key_compile_caches_on_source
+
+# The cache key omits the op's Python body; key it on this file instead.
+key_compile_caches_on_source(__name__, __file__)
 
 
 @triton.jit
@@ -299,8 +303,10 @@ _BLOCK = 128
 _NUM_WARPS = 4
 # Largest split count; the combine kernels tile it statically.
 _MAX_SPLITS = 64
-# Programs per SM a pass aims for when rows alone cannot fill the GPU.
-_PROGRAMS_PER_SM = 2
+# Blocks each program scans per pass. A program's loop is bound by load
+# latency, one block in flight per iteration, so short loops over many
+# programs beat long ones at every row count.
+_BLOCKS_PER_PROGRAM = 8
 
 
 def _passes_to_close(cuts: int) -> int:
@@ -316,29 +322,16 @@ def _passes_to_close(cuts: int) -> int:
 _PASSES = _passes_to_close(_K)
 
 
-@functools.cache
-def _multiprocessors(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def _split_count(rows, vocab: int, device: torch.device):
-    """Splits per row; symbolic in, symbolic out.
-
-    ``torch.sym_min``/``sym_max`` keep a symbolic row count symbolic where
-    the builtins would guard on it and recompile per row bucket.
-    """
-    target = _PROGRAMS_PER_SM * _multiprocessors(device.index or 0)
-    wanted = torch.sym_min(
-        -(-target // torch.sym_max(rows, 1)), -(-vocab // (4 * _BLOCK))
-    )
-    return torch.sym_max(1, torch.sym_min(wanted, _MAX_SPLITS))
+def _split_count(vocab: int) -> int:
+    """Splits per row, independent of the row count."""
+    return max(1, min(-(-vocab // (_BLOCKS_PER_PROGRAM * _BLOCK)), _MAX_SPLITS))
 
 
 @torch.library.triton_op("nanogpt_sampling::nucleus_threshold", mutates_args={})
 def _nucleus_threshold(scores: Tensor, top_p: float) -> Tensor:
     rows, vocab = scores.shape
     device = scores.device
-    splits = _split_count(rows, vocab, device)
+    splits = _split_count(vocab)
     # Whole blocks per split; trailing splits may own none.
     per_split = -(-vocab // (splits * _BLOCK)) * _BLOCK
     float32 = dict(device=device, dtype=torch.float32)

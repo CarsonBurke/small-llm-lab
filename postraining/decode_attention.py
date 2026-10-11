@@ -42,6 +42,11 @@ from torch import Tensor
 # served its stale compiled graph.
 from torch.library import wrap_triton
 
+from pretraining.nanogpt_mini.triton_op_cache import key_compile_caches_on_source
+
+# The cache key omits the op's Python body; key it on this file instead.
+key_compile_caches_on_source(__name__, __file__)
+
 
 @triton.jit
 def _ranged_decode_kernel(

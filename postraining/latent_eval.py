@@ -18,6 +18,8 @@ from postraining.core import (
     emitted_display_segments,
     encode_prompt,
     fenced_answer_text,
+    single_fence_span,
+    structural_abstention,
     structural_format_ok,
     verify_answer,
 )
@@ -34,7 +36,7 @@ from postraining.train_vapo import prompt_text
 if TYPE_CHECKING:
     from postraining.graph_decode import PinnedDecodeArena
 
-LATENT_EVAL_METRIC_SCHEMA = "forced_initial_isotropic_thought_policy/v7"
+LATENT_EVAL_METRIC_SCHEMA = "forced_initial_isotropic_thought_policy/v9"
 
 
 COMPILED_EVAL_TAIL_BATCH = 16
@@ -51,6 +53,8 @@ def verify_terminated_answer(
     style: str = "minerva",
     prefix_ids: tuple[int, ...] = (),
     answer_fence_ids: tuple[int, int] | None = None,
+    think_fence_ids: tuple[int, int] | None = None,
+    min_think_tokens: int = 1,
 ) -> tuple[bool, str]:
     """Verify a response only when it emitted BOS/EOS itself.
 
@@ -60,16 +64,36 @@ def verify_terminated_answer(
 
     ``answer_fence_ids`` grades the decoded content of the single
     ``<answer>`` span when one exists — matching what the structural RL
-    gate grades. A fenceless completion falls back to the plain-text
-    parse: accuracy keeps meaning "raw correctness" (structure is the RL
-    gate's job, tracked separately by the format fraction), so a policy
-    that answers correctly without the fence still registers here.
+    gate grades. A completion without a valid think may fall back to the
+    plain-text parse: accuracy then reports raw correctness separately
+    from the structural RL gate. With a valid think, EOS without a
+    submitted nonempty answer is abstention, even when post-think text
+    contains a parseable answer. Abstentions and explicitly empty answer
+    spans never fall back.
     """
     stop_set = set(stop_ids)
     cut = next((i for i, token in enumerate(emitted) if token in stop_set), None)
     if cut is None:
         return False, "[UNTERMINATED]"
+    if (
+        answer_fence_ids is not None
+        and think_fence_ids is not None
+        and structural_abstention(
+            emitted[: cut + 1], think_fence_ids, answer_fence_ids,
+            stop_ids[0], min_think_tokens,
+        )
+    ):
+        # The reasoning trace can contain a parseable "Answer: ..." line.
+        # Post-think explanations can contain one too. Without a submitted
+        # answer, neither text region is eligible for correctness credit.
+        return False, "[NO ANSWER]"
     if answer_fence_ids is not None:
+        span = single_fence_span(emitted[: cut + 1], answer_fence_ids)
+        if span is not None and span[1] - span[0] == 1:
+            # An explicit empty answer is no answer. The plain-text
+            # fallback below would otherwise grade a value left in the
+            # think text, crediting an abstention as correct.
+            return False, "[NO ANSWER]"
         fenced = fenced_answer_text(
             emitted[: cut + 1], tokenizer, answer_fence_ids
         )
@@ -232,6 +256,7 @@ def evaluate_latent_math(
     correct = 0
     contract_correct = 0
     structurally_valid = 0
+    abstained_total = 0
     total = 0
     prompt_correct = [0] * len(rows)
     prompt_contract_correct = [0] * len(rows)
@@ -399,11 +424,6 @@ def evaluate_latent_math(
                     truth = row_chunk[group][1]
                     style = row_chunk[group][5]
                     module = row_chunk[group][6]
-                    is_correct, _ = verify_terminated_answer(
-                        emitted, truth, tokenizer, stop_ids, style,
-                        prefix_ids=prompt_suffix_ids,
-                        answer_fence_ids=answer_fence_ids,
-                    )
                     stop_cut = next(
                         (
                             index
@@ -412,13 +432,31 @@ def evaluate_latent_math(
                         ),
                         None,
                     )
+                    visible = emitted[: stop_cut + 1] if stop_cut is not None else emitted
+                    abstained = (
+                        stop_cut is not None
+                        and think_fence_ids is not None
+                        and answer_fence_ids is not None
+                        and structural_abstention(
+                            visible, think_fence_ids, answer_fence_ids,
+                            stop_ids[0], min_think_tokens,
+                        )
+                    )
+                    is_correct, parsed_answer = verify_terminated_answer(
+                        emitted, truth, tokenizer, stop_ids, style,
+                        prefix_ids=prompt_suffix_ids,
+                        answer_fence_ids=answer_fence_ids,
+                        think_fence_ids=think_fence_ids,
+                        min_think_tokens=min_think_tokens,
+                    )
                     if think_fence_ids is not None and answer_fence_ids is not None:
                         format_ok = stop_cut is not None and structural_format_ok(
-                            emitted[: stop_cut + 1],
+                            visible,
                             think_fence_ids,
                             answer_fence_ids,
                             min_think_tokens,
                         )
+                        abstained_total += int(abstained)
                     else:
                         format_ok = True
                     is_contract_correct = is_correct and format_ok
@@ -444,25 +482,6 @@ def evaluate_latent_math(
                     ):
                         emitted_text = tokenizer.decode(
                             list(prompt_suffix_ids) + emitted
-                        )
-                        # Mirror the grading path so parsed_answer shows
-                        # what verify_terminated_answer actually graded.
-                        fenced = (
-                            fenced_answer_text(
-                                emitted[: stop_cut + 1], tokenizer,
-                                answer_fence_ids,
-                            )
-                            if answer_fence_ids is not None
-                            and stop_cut is not None
-                            else None
-                        )
-                        _, parsed_answer = verify_answer(
-                            "Answer: " + fenced
-                            if fenced is not None
-                            else emitted_text,
-                            truth,
-                            style,
-                            window=None if fenced is not None else 300,
                         )
                         captured_attempts.append(
                             {
@@ -581,6 +600,9 @@ def evaluate_latent_math(
         "accuracy": correct / max(total, 1),
         "contract_accuracy": contract_correct / max(total, 1),
         "structural_format_fraction": structurally_valid / max(total, 1),
+        # Explicit EOS-without-answer abstentions; answered_accuracy (below) is
+        # accuracy over the rest: coverage and selective accuracy.
+        "abstained_fraction": abstained_total / max(total, 1),
         "policy_accuracy": policy_accuracy,
         "policy_samples": total,
         "samples": total,
@@ -651,6 +673,9 @@ def evaluate_latent_math(
         # Added only when set, so token-only and latent reports keep their
         # exact key set and stay comparable with earlier runs.
         metrics["hidden_carry"] = True
+    if abstained_total < total:
+        # Undefined, so absent, when every sample abstained.
+        metrics["answered_accuracy"] = correct / (total - abstained_total)
     if module_total:
         metrics["module_accuracy"] = {
             module: module_correct.get(module, 0) / count

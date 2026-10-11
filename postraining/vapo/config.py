@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import struct
 from pathlib import Path
 
 from postraining.benchmark_report import CAPTURE_SAMPLES_PER_PROBLEM
@@ -12,7 +13,16 @@ from postraining.latent_thought import (
     DEFAULT_INIT_STOP_THINKING_PROBABILITY,
     DEFAULT_THOUGHT_SIGMA,
 )
-from postraining.reasoning_modes import REASONING_MODES, mode_pins_emit
+from postraining.memory_carry import (
+    DEFAULT_MEMORY_HEAD_DIM,
+    DEFAULT_MEMORY_HEADS,
+)
+from postraining.reasoning_modes import (
+    REASONING_MODES,
+    mode_carries_hidden,
+    mode_carries_memory,
+    mode_pins_emit,
+)
 
 
 # One 8-row eval batch at the 1024-token guard sequence length. The guard is
@@ -26,6 +36,15 @@ DEFAULT_BPB_GUARD_TOKENS = 8 * 1024
 DEFAULT_BPB_EVAL_EVERY = 150
 DEFAULT_MATH_EVAL_EVERY = 250
 DEFAULT_RL_RESPONSE_TOKENS = 2048
+
+
+def normalized_abstention_reward(penalty: float) -> float:
+    """The abstention threshold on the nonnegative verifier reward scale."""
+    return (
+        penalty / (1.0 + penalty)
+        if penalty <= 1.0
+        else 1.0 - 1.0 / (1.0 + penalty)
+    )
 
 # Restores the trunk step size that the Muon:AdamW rate ratio was chosen for,
 # after ``postraining.muon`` moved to Polar Express. It is a property of that
@@ -134,7 +153,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # token-only controls that bypass the entire gate/noise/thought path;
     # "carry" is the deterministic hidden carry: a token-only policy whose
     # generated-token inputs add, through a zero-init combiner, the detached
-    # belief that produced each token.
+    # belief that produced each token; "memory" is the gated-delta memory
+    # carry: the same token-only policy whose carried beliefs (prompt beliefs
+    # included) are written into a bounded per-trajectory memory that each
+    # generated token's input reads (postraining/memory_carry.py).
     parser.add_argument(
         "--reasoning-mode",
         choices=REASONING_MODES,
@@ -205,6 +227,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "optimizer, RNG, step, and sampler state are still restored",
     )
     parser.add_argument(
+        "--allow-rollout-groups-migration",
+        action="store_true",
+        help="explicitly allow a resume of a counter-keyed lockstep "
+        "cot/none/carry run to change --rollout-groups; every draw is keyed "
+        "on its own trajectory, so chunking changes floating-point rounding "
+        "but not the sampling law, and the resume is no longer bit-exact",
+    )
+    parser.add_argument(
         "--allow-token-rng-migration",
         action="store_true",
         help="explicitly allow a resume to continue a lockstep cot/none run "
@@ -214,8 +244,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    # One general rate for actor and critic. The fresh-policy experiment starts
-    # every actor-side optimizer state empty from the critic-warm checkpoint;
+    # One general rate for actor and critic. A branch starts every
+    # actor-side optimizer state empty, even when it carries the critic's;
     # using the critic's 3e-4 rate also removes the prior hand-tuned split
     # between trunk, renderer, and combiner.
     # 2e-5 is the lower-drift rate selected after round 5: 5e-5 drove the
@@ -285,6 +315,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Combined-embedding geometry used to adapt raw Gaussian thought slots.
     parser.add_argument("--combined-mlp-blocks", type=int, default=1)
     parser.add_argument("--combined-mlp-hidden", type=int, default=2048)
+    # Gated-delta memory geometry (--reasoning-mode memory only): heads of
+    # head_dim x head_dim fp32 state per trajectory. Defaults 4 x 64.
+    parser.add_argument("--memory-heads", type=int, default=None)
+    parser.add_argument("--memory-head-dim", type=int, default=None)
     # Length-adaptive GAE lambda (core.length_adaptive_lambda): VAPO's
     # horizon alpha*l with a floor of min(l, 1/alpha).  The raw alpha=0.05
     # formula clamps lambda to 0 at this run's 12-23-action trajectories
@@ -303,6 +337,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="maximum reward for a wrong, terminated numeric final answer",
+    )
+    # EOS after a valid think with no answer content earns penalty / (1 + penalty).
+    # Verifier scores remain in [0, 1], so answering pays only above that
+    # confidence. This is an affine normalization of signed [−penalty, 1]
+    # rewards that puts wrong answers at the critic's initial zero baseline.
+    parser.add_argument(
+        "--abstention-penalty",
+        type=float,
+        default=None,
+        help="enable abstention: EOS after a valid think with no answer scores "
+        "PENALTY/(1+PENALTY), while wrong or malformed answers score 0",
     )
     # Requires a base checkpoint whose SFT stage trained the fence rows
     # (sft_trace_train --think-tokens); enforced at startup. Gating ALL
@@ -352,8 +397,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="skip actor optimizer steps for optimizer minibatches whose "
-        "every trajectory earned zero reward; the critic still updates so "
-        "value predictions catch down to the zero targets",
+        "every trajectory earned the same reward (including all wrong or "
+        "all abstaining); the critic still updates toward those targets",
     )
     # The actor freeze is the actual safety intervention. A stop based only on
     # consecutive zero-reward prompt windows is unsound for a heterogeneous
@@ -365,11 +410,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="stop at the pool boundary (saving the final checkpoint) "
-        "after this many consecutive all-zero-reward rollout pools; "
+        "after this many consecutive constant-reward rollout pools; "
         "applies regardless of --zero-reward-actor-freeze; 0 disables",
     )
     # VAPO paper: 50 value-pretraining steps before policy updates.
-    parser.add_argument("--value-warmup-steps", type=int, default=50)
+    parser.add_argument(
+        "--value-warmup-steps",
+        type=int,
+        default=None,
+        help="critic-only updates this run makes before its first actor "
+        "step; default 50, or 0 when the run loads a trained critic "
+        "(--actor-init without --fresh-critic, --critic-only-init). A "
+        "carried critic whose value contract changed must refit with a "
+        "positive count, or be carried as-is with "
+        "--accept-critic-value-change",
+    )
     # The BPB guard is a do-no-harm regression check, not an optimization
     # target. A deterministic 2M-token prefix takes ~2.5s on the 5090 versus
     # ~75s for all 62M validation tokens, while still giving the guard ample
@@ -595,15 +650,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="read-only same-batch policy-drift replay cadence; step 1 is "
         "always measured, 0 disables later measurements",
     )
-    # Prompt groups rolled out together as one left-padded batch (measured:
-    # the sequential per-group rollout is launch-bound at ~140 W, so stepping
-    # groups*samples rows per launch is the utilization lever. Measured on
-    # the v28 rollout gate (jobs 969/978/979, 1024 trajectories each):
-    # 16 groups 13.2k useful actions/s at 5.5 GiB, 32 groups 42.4k at
-    # 10.4 GiB, 64 groups 41.1k at 20.0 GiB — width saturates at 32.
-    # continuous_refill measured 6.4k/s (job 980): 0.92 step utilization
-    # cannot buy back its per-step paged overhead at this model scale.
-    parser.add_argument("--rollout-groups", type=int, default=32)
+    # Prompt groups rolled out together as one left-padded batch. Under the
+    # CUDA-graph decode arena a chunk's wall time is set by its longest
+    # trajectory: a trained 2048-token-cap policy ends 99.7% of trajectories
+    # in ~100 tokens, yet each chunk still runs ~2048 ticks, most of them on
+    # 8-16 live rows. One 1024-row chunk (64 groups x 16 samples) pays that
+    # tail once instead of twice: collect 2.0 s vs 2.9 s per pool, update
+    # unchanged, 13.5 vs 7.6 GiB peak (perf_trained_g64/g32_20260926). The
+    # v28 eager-rollout measurement that chose 32 (jobs 969/978/979: width
+    # saturated at 32 groups) predates the arena. continuous_refill measured
+    # 6.4k actions/s (job 980): 0.92 step utilization cannot buy back its
+    # per-step paged overhead at this model scale.
+    parser.add_argument("--rollout-groups", type=int, default=64)
     parser.add_argument(
         "--rollout-scheduler",
         choices=("lockstep", "continuous_refill"),
@@ -628,18 +686,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-min-within-group-reward-std", type=float, default=0.01)
     parser.add_argument(
         "--actor-init", default=None,
-        help="initialize only the actor from a latent-VAPO checkpoint, while "
-        "resetting critic/optimizers and continuing its unused prompt stream",
+        help="branch from a latent-VAPO checkpoint: load its actor, carry its "
+        "critic and critic optimizer state (unless --fresh-critic), start a "
+        "fresh actor optimizer, and continue its unused prompt stream",
+    )
+    parser.add_argument(
+        "--fresh-critic", action="store_true",
+        help="with --actor-init, start the critic and its optimizer fresh "
+        "(per --critic-init) instead of carrying the checkpoint's",
+    )
+    parser.add_argument(
+        "--accept-critic-value-change", action="store_true",
+        help="carry an --actor-init critic whose value contract changed "
+        "without refitting it, e.g. when the changed reward never applied "
+        "to a row the critic saw; the changed fields and this acceptance "
+        "are recorded in the manifest",
     )
     parser.add_argument(
         "--critic-only-init", default=None,
         help="load only trained critic weights; actor comes from --checkpoint, "
         "with fresh optimizers, RNG, and prompt stream (requires zero warmup)",
-    )
-    parser.add_argument(
-        "--actor-critic-init", default=None,
-        help="initialize actor and pretrained critic weights from a warmup "
-        "checkpoint, preserve optimizer state, and continue its unused prompt stream",
     )
     parser.add_argument(
         "--curriculum-init",
@@ -758,15 +824,23 @@ def validate_args(
 ) -> None:
     """Argv-level guards that need no checkpoint. Backbone-dependent
     checks stay in main() because they need the loaded model."""
+    if args.value_warmup_steps is None:
+        # A loaded critic is already fit: warming it again by default would
+        # spend 50 pools of prompts refitting values it has. A resume
+        # restores its run's count through the exact-resume check, which
+        # names this field when the two disagree.
+        loads_trained_critic = bool(args.critic_only_init) or bool(
+            args.actor_init and not args.fresh_critic
+        )
+        args.value_warmup_steps = 0 if loads_trained_critic else 50
     if args.eval_context_tokens is not None:
         if args.eval_context_tokens < 1:
             parser.error("--eval-context-tokens must be positive")
         if not (args.rollout_only or args.bench_only):
             parser.error("--eval-context-tokens requires --rollout-only or --bench-only")
-    # TPO is an explicit replacement for the default DG estimator. Resolve
-    # that precedence once so every downstream objective/schema check sees
-    # exactly one actor mode, while ordinary invocations retain the shipped
-    # DG default.
+    # TPO replaces the actor objective outright. Resolve that precedence once
+    # so every downstream objective/schema check sees exactly one actor mode,
+    # even when --delightful-policy-gradient was also passed.
     if args.target_policy_optimization:
         args.delightful_policy_gradient = False
     if not math.isfinite(args.tpo_eta) or args.tpo_eta <= 0.0:
@@ -784,10 +858,33 @@ def validate_args(
         parser.error("--combined-mlp-blocks must be nonnegative")
     if args.combined_mlp_hidden < 1:
         parser.error("--combined-mlp-hidden must be positive")
+    carries_hidden = mode_carries_hidden(args.reasoning_mode)
+    if mode_carries_memory(args.reasoning_mode) and (
+        args.combined_mlp_hidden != parser.get_default("combined_mlp_hidden")
+        or args.combined_mlp_blocks != parser.get_default("combined_mlp_blocks")
+    ):
+        parser.error(
+            "--combined-mlp-hidden/--combined-mlp-blocks configure the "
+            "hidden carry's combiner; the memory carry has none"
+        )
+    if mode_carries_memory(args.reasoning_mode):
+        if args.memory_heads is None:
+            args.memory_heads = DEFAULT_MEMORY_HEADS
+        if args.memory_head_dim is None:
+            args.memory_head_dim = DEFAULT_MEMORY_HEAD_DIM
+        if args.memory_heads < 1 or args.memory_head_dim < 1:
+            parser.error("--memory-heads and --memory-head-dim must be positive")
+    else:
+        for flag, value in (
+            ("--memory-heads", args.memory_heads),
+            ("--memory-head-dim", args.memory_head_dim),
+        ):
+            if value is not None:
+                parser.error(f"{flag} configures --reasoning-mode memory only")
     # cot/none build (unused) Gaussian and gate heads whose priors are resume
-    # fields, so they keep accepting the flags exactly as before; only carry,
-    # which builds no such head, refuses them.
-    if args.reasoning_mode == "carry":
+    # fields, so they keep accepting the flags exactly as before; only the
+    # carries, which build no such head, refuse them.
+    if carries_hidden:
         for flag, value in (
             ("--thought-sigma", args.thought_sigma),
             (
@@ -798,23 +895,23 @@ def validate_args(
             if value is not None:
                 parser.error(
                     f"{flag} configures the latent-thought policy; "
-                    "--reasoning-mode carry samples no thought or stop gate"
+                    f"--reasoning-mode {args.reasoning_mode} samples no "
+                    "thought or stop gate"
                 )
-    if args.reasoning_mode != "carry":
+    if not carries_hidden:
         if args.thought_sigma is None:
             args.thought_sigma = DEFAULT_THOUGHT_SIGMA
         if args.init_stop_thinking_probability is None:
             args.init_stop_thinking_probability = (
                 DEFAULT_INIT_STOP_THINKING_PROBABILITY
             )
-    if args.reasoning_mode == "carry" and (
-        args.rollout_scheduler != "lockstep"
-    ):
+    if carries_hidden and args.rollout_scheduler != "lockstep":
         parser.error(
-            "--reasoning-mode carry requires --rollout-scheduler lockstep: "
-            "continuous refill does not implement the hidden carry"
+            f"--reasoning-mode {args.reasoning_mode} requires "
+            "--rollout-scheduler lockstep: continuous refill does not "
+            "implement the hidden carry"
         )
-    if args.reasoning_mode != "carry":
+    if not carries_hidden:
         if (
             not math.isfinite(args.thought_sigma)
             or args.thought_sigma <= 0.0
@@ -873,6 +970,18 @@ def validate_args(
         parser.error("--allow-dg-topology-migration requires --resume")
     if args.allow_token_rng_migration and not args.resume:
         parser.error("--allow-token-rng-migration requires --resume")
+    if args.allow_rollout_groups_migration:
+        if not args.resume:
+            parser.error("--allow-rollout-groups-migration requires --resume")
+        if (
+            args.reasoning_mode not in ("cot", "none", "carry", "memory")
+            or args.rollout_scheduler != "lockstep"
+        ):
+            parser.error(
+                "--allow-rollout-groups-migration needs the counter-keyed "
+                "lockstep cot/none/carry/memory draw; other schedulers and latent "
+                "mode sample with chunk-dependent state"
+            )
     if (
         not math.isfinite(args.nearby_reward_max)
         or args.nearby_reward_max < 0.0
@@ -898,6 +1007,26 @@ def validate_args(
         parser.error("--think-min-tokens above 1 requires --think-tokens")
     if args.answer_fence and not args.think_tokens:
         parser.error("--answer-fence requires --think-tokens")
+    if args.abstention_penalty is not None:
+        if not math.isfinite(args.abstention_penalty) or args.abstention_penalty <= 0.0:
+            parser.error("--abstention-penalty must be finite and positive")
+        threshold = normalized_abstention_reward(args.abstention_penalty)
+        threshold_f32 = struct.unpack("f", struct.pack("f", threshold))[0]
+        if not 0.0 < threshold_f32 < 1.0:
+            parser.error(
+                "--abstention-penalty must give a float32 reward strictly "
+                "between wrong (0) and correct (1)"
+            )
+        if not args.answer_fence:
+            # Code and math answers still use the trained answer fence.
+            parser.error("--abstention-penalty requires --answer-fence")
+        if args.source_success_actor_gate:
+            # The gate silences a source until some row scores above 0, but
+            # a source of wrong answers and abstentions is exactly where
+            # the penalty's contrast teaches when to abstain.
+            parser.error(
+                "--abstention-penalty conflicts with --source-success-actor-gate"
+            )
     if args.zero_reward_stop_pools < 0:
         parser.error("--zero-reward-stop-pools must be nonnegative")
     if args.replay_attention_budget < 1:
@@ -1060,7 +1189,6 @@ def validate_args(
         option is not None
         for option in (
             args.actor_init,
-            args.actor_critic_init,
             args.critic_only_init,
             args.curriculum_init,
             args.resume,
@@ -1068,7 +1196,7 @@ def validate_args(
     )
     if initialization_modes > 1:
         parser.error(
-            "--actor-init, --actor-critic-init, --critic-only-init, --curriculum-init, and "
+            "--actor-init, --critic-only-init, --curriculum-init, and "
             "--resume are mutually exclusive"
         )
     if args.critic_only_init:
@@ -1076,10 +1204,23 @@ def validate_args(
             parser.error("--critic-only-init requires --value-warmup-steps 0")
         if args.critic_init == "actor":
             parser.error("--critic-init actor conflicts with --critic-only-init")
-    if args.critic_init == "actor" and args.actor_critic_init:
+    if args.fresh_critic and not args.actor_init:
         parser.error(
-            "--critic-init actor conflicts with --actor-critic-init, which "
-            "loads an already-trained critic"
+            "--fresh-critic applies only to --actor-init, the one "
+            "initialization that otherwise carries a trained critic"
+        )
+    if args.accept_critic_value_change and not (
+        args.actor_init and not args.fresh_critic
+    ):
+        parser.error(
+            "--accept-critic-value-change applies only to a critic carried "
+            "by --actor-init"
+        )
+    if args.critic_init == "actor" and args.actor_init and not args.fresh_critic:
+        parser.error(
+            "--critic-init actor conflicts with --actor-init, which carries "
+            "the checkpoint's trained critic; add --fresh-critic to start "
+            "one from the actor instead"
         )
     if args.samples_per_prompt < 1:
         parser.error("--samples-per-prompt must be positive")

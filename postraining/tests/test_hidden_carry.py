@@ -189,12 +189,14 @@ def _cot_args(**overrides):
 
 
 def test_reasoning_mode_flags():
-    assert REASONING_MODES == ("latent", "carry", "cot", "none")
+    assert REASONING_MODES == ("latent", "carry", "memory", "cot", "none")
     assert [mode_pins_emit(mode) for mode in REASONING_MODES] == [
-        False, True, True, True,
+        False, True, True, True, True,
     ]
+    # The memory carry shares the carried-belief record and token-only
+    # action space; only its input path differs.
     assert [mode_carries_hidden(mode) for mode in REASONING_MODES] == [
-        False, True, False, False,
+        False, True, True, False, False,
     ]
     # Carry spends its whole stream budget on tokens, exactly like cot.
     assert mode_rollout_budget("carry", 700, answer_tokens=8) == (700, 700)
@@ -717,7 +719,7 @@ def test_carry_refuses_stochastic_execution_and_mixed_streams():
 
     carried = _roll(carry, prompt_ids)
     token_only = _roll(cot, prompt_ids, hidden_carry=False)
-    with pytest.raises(ValueError, match="cannot pack carry-injected"):
+    with pytest.raises(ValueError, match="cannot pack rollouts that injected different carries"):
         pack_rollout_groups_for_replay([carried, token_only])
     # Evaluation-shaped rollouts drop the record and cannot be replayed.
     discarded = _roll(carry, prompt_ids, replay_storage=False)
@@ -932,7 +934,7 @@ def test_stale_and_foreign_checkpoints_are_refused_as_carry():
         ({"rollout_policy_schema": "deterministic_hidden_carry/v1"}, "rollout"),
         # A v29 latent-thought checkpoint.
         ({"rollout_policy_schema": ROLLOUT_POLICY_SCHEMA}, "rollout"),
-        ({"thought_input_schema": THOUGHT_INPUT_SCHEMA}, "hidden-carry input"),
+        ({"thought_input_schema": THOUGHT_INPUT_SCHEMA}, "carry input schema"),
         (
             {"thought_distribution_schema": THOUGHT_DISTRIBUTION_SCHEMA},
             "samples no thought distribution",

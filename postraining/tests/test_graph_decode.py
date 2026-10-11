@@ -540,9 +540,12 @@ def test_counter_gumbel_winner_is_exactly_the_row_argmax():
         compiled = torch.compile(_race_winner, fullgraph=True, dynamic=False)
         for case in (scores, coarse, tied, poisoned):
             assert torch.equal(compiled(case), case.argmax(dim=-1))
-    # A vocabulary the slices do not divide falls back to one stage.
+    # A vocabulary the slices do not divide, and a wide batch, take the
+    # one-stage argmax.
     odd = torch.randn(3, 1201, generator=generator)
     assert torch.equal(_race_winner(odd), odd.argmax(dim=-1))
+    wide = torch.randn(200, vocab, generator=generator).round()
+    assert torch.equal(_race_winner(wide), wide.argmax(dim=-1))
 
 
 def test_counter_gumbel_lanes_are_uniform_and_never_veto_a_token():

@@ -199,7 +199,7 @@ rl | rl-carry)
   #
   # Throughput/memory measurements below used the historical 768-token cap;
   # the new 2048-token training configuration has not been benchmarked.
-  # --rollout-groups 64 (default 32) makes that pool ONE 1024-row decode wave
+  # --rollout-groups 64 (now the default) makes that pool ONE 1024-row decode wave
   # instead of two 512-row waves. Measured on the RTX 5090 at 4 repeats per
   # config with the warmup repeat discarded (job 9086): 512 rows ~88k tok/s,
   # 1024 rows ~113k, and 2048/4096 rows also ~111k for 2-4x the VRAM. 1024

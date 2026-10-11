@@ -25,6 +25,7 @@ import torch
 
 from postraining.graph_decode import PinnedDecodeArena
 from postraining.latent_thought import LatentThoughtModel
+from postraining.memory_carry import DEFAULT_MEMORY_HEAD_DIM, DEFAULT_MEMORY_HEADS
 from postraining.model_io import load_model
 
 
@@ -59,9 +60,21 @@ def time_buckets(
 
 
 def profile_tick(arena: PinnedDecodeArena, rows: int, position: int) -> None:
-    """Kernel table of the compiled tick at one bucket and position."""
-    arena.position.fill_(position)
-    arena._call_tick(rows)
+    """Kernel table of one bucket's tick at one write-head position.
+
+    It profiles what a rollout runs: the captured graph's replay when the
+    arena captures (CUPTI reports the kernels inside a graph launch), else
+    the compiled tick. Kernel times sum per name; the eager tick's are not
+    the graph's, since capture fixes allocation and launch order.
+    """
+    def tick():
+        arena.position.fill_(position)
+        if arena.cuda_graphs:
+            arena._graphs[rows].replay()
+        else:
+            arena._call_tick(rows)
+
+    tick()
     torch.cuda.synchronize()
     with torch.profiler.profile(
         activities=[
@@ -70,12 +83,12 @@ def profile_tick(arena: PinnedDecodeArena, rows: int, position: int) -> None:
         ]
     ) as profile:
         for _ in range(5):
-            arena.position.fill_(position)
-            arena._call_tick(rows)
+            tick()
         torch.cuda.synchronize()
     print(
-        profile.key_averages().table(
-            sort_by="cuda_time_total", row_limit=30, max_name_column_width=70
+        f"kernels per 5 ticks, rows {rows} at position {position}:\n"
+        + profile.key_averages().table(
+            sort_by="cuda_time_total", row_limit=40, max_name_column_width=90
         ),
         flush=True,
     )
@@ -89,20 +102,47 @@ def main() -> None:
     parser.add_argument("--prompt-width", type=int, default=160)
     parser.add_argument("--carry", action="store_true")
     parser.add_argument(
+        "--memory", action="store_true",
+        help="gated-delta memory carry (implies --carry), default geometry",
+    )
+    parser.add_argument(
         "--no-cache-linear-weights", dest="cache_linear_weights",
         action="store_false",
     )
     parser.add_argument("--replays", type=int, default=50)
+    parser.add_argument(
+        "--rollout-tokens", type=int, default=None,
+        help="tokens per timed rollout (default: the whole KV budget)",
+    )
     parser.add_argument("--positions", type=int, nargs="+", default=[256, 512, 1022])
     parser.add_argument("--profile-rows", type=int, default=1024)
-    parser.add_argument("--profile-position", type=int, default=512)
+    parser.add_argument(
+        "--profile-positions", type=int, nargs="+", default=[512],
+    )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     device = torch.device("cuda")
     torch.fx.experimental._config.use_duck_shape = False
+    # The trainer's matmul precision (train_latent_vapo.main): fp32 GEMMs
+    # -- the memory carry's projections -- run as TF32 there.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
+    args.carry = args.carry or args.memory
+    memory_geometry = (
+        dict(
+            memory_carry=True,
+            memory_heads=DEFAULT_MEMORY_HEADS,
+            memory_head_dim=DEFAULT_MEMORY_HEAD_DIM,
+        )
+        if args.memory
+        else {}
+    )
     wrapper = LatentThoughtModel(
-        load_model(args.checkpoint, device), hidden_carry=args.carry
+        load_model(args.checkpoint, device),
+        hidden_carry=args.carry,
+        **memory_geometry,
     ).to(device).eval()
     arena = PinnedDecodeArena(
         wrapper,
@@ -114,6 +154,11 @@ def main() -> None:
         hidden_carry=args.carry,
         cache_linear_weights=args.cache_linear_weights,
     )
+    if args.profile_positions and args.profile_rows not in arena.row_buckets:
+        parser.error(
+            f"--profile-rows {args.profile_rows} is not a captured row "
+            f"bucket {arena.row_buckets}"
+        )
     prompts = args.rows // 16
     prompt_ids = torch.randint(
         1, 50000, (prompts, args.prompt_width), device=device
@@ -123,13 +168,16 @@ def main() -> None:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
-    # One real rollout captures every graph (and times the first pool).
+    # One real rollout captures every graph (and times the first pool). The
+    # per-bucket timings below set the write head themselves, so a short
+    # rollout is enough to capture; the full budget times a whole pool.
+    rollout_tokens = args.rollout_tokens or args.kv_width - args.prompt_width
     start.record()
     with torch.autocast("cuda", dtype=torch.bfloat16):
         arena.rollout(
             prompt_ids, lengths, prompt_repeats=16,
-            max_new_tokens=args.kv_width - args.prompt_width,
-            max_stream_steps=args.kv_width - args.prompt_width,
+            max_new_tokens=rollout_tokens,
+            max_stream_steps=rollout_tokens,
             token_seeds=seeds,
         )
     end.record()
@@ -139,15 +187,15 @@ def main() -> None:
     with torch.autocast("cuda", dtype=torch.bfloat16):
         arena.rollout(
             prompt_ids, lengths, prompt_repeats=16,
-            max_new_tokens=args.kv_width - args.prompt_width,
-            max_stream_steps=args.kv_width - args.prompt_width,
+            max_new_tokens=rollout_tokens,
+            max_stream_steps=rollout_tokens,
             token_seeds=seeds,
         )
     end.record()
     torch.cuda.synchronize()
     steady_ms = start.elapsed_time(end)
     print(
-        f"full-budget rollout (no stops, {arena.ticks} ticks total): "
+        f"{rollout_tokens}-token rollout (no stops, {arena.ticks} ticks total): "
         f"first {first_ms:.0f} ms, steady {steady_ms:.0f} ms", flush=True
     )
 
@@ -166,7 +214,8 @@ def main() -> None:
             flush=True,
         )
         timings = time_buckets(arena, args.positions, args.replays)
-        profile_tick(arena, args.profile_rows, args.profile_position)
+        for position in args.profile_positions:
+            profile_tick(arena, args.profile_rows, position)
     retained_bytes = torch.cuda.memory_allocated() - idle_bytes
     print(
         f"allocated after closing it: {retained_bytes / 2**20:+.1f} MiB",
@@ -177,6 +226,7 @@ def main() -> None:
         args.output.write_text(
             json.dumps(
                 {
+                    "rollout_tokens": rollout_tokens,
                     "first_rollout_ms": first_ms,
                     "steady_rollout_ms": steady_ms,
                     "workspace_reopen_ms": reopen_ms,
@@ -184,6 +234,8 @@ def main() -> None:
                     "retained_bytes_after_close": retained_bytes,
                     "ms_per_tick": timings,
                     "cache_linear_weights": args.cache_linear_weights,
+                    "carry": args.carry,
+                    "memory": args.memory,
                 },
                 indent=2,
             )
