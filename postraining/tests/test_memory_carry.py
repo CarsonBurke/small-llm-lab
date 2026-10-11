@@ -80,6 +80,7 @@ from postraining.train_latent_vapo import (
     combiner_weight_telemetry,
     save_checkpoint,
     update_minibatch,
+    validate_combiner_geometry,
     validate_critic_only_init,
 )
 from postraining.value_model import SeparateCritic
@@ -722,6 +723,16 @@ def test_memory_checkpoint_round_trips_under_its_own_contract(tmp_path):
             assert left == right, field.name
     with torch.no_grad():
         assert torch.equal(critic.values(expected), restored_critic.values(actual))
+    # Resume and --actor-init check memory geometry, never the MLP geometry
+    # a memory combiner does not have.
+    validate_combiner_geometry(payload, args, True, path)
+    with pytest.raises(ValueError, match="memory geometry"):
+        validate_combiner_geometry(
+            payload, _cot_args(reasoning_mode="memory", memory_heads=HEADS + 1,
+                               memory_head_dim=HEAD_DIM), True, path,
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        validate_combiner_geometry(payload, _cot_args(reasoning_mode="carry"), False, path)
     # A memory checkpoint without its geometry is refused, not guessed.
     stripped = copy.deepcopy(payload)
     del stripped["args"]["memory_heads"]

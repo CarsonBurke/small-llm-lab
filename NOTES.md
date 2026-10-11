@@ -11912,7 +11912,9 @@ v9 failure again.**
     teacher-forced modelling is intact, and the damage is in the sampled
     distribution.
   - Memory: `carry/input_delta_rms_ratio` plateaued at 0.09, while 12663 ran
-    to 0.28 with 0.98-1.00 termination for 784 steps.
+    to 0.28 with 0.98-1.00 termination for 784 steps. **Superseded by the
+    step-259 diagnostic below:** the memory read does not start
+    derailment, but it is a large part of why derailed rows never recover.
   - The critic itself: the failed-row advantage/surprisal correlation (0.08)
     is the same in r2, 12663 and the cot pair.
 - **Mechanism (reading of the 09-22 analysis; not separately measured here).**
@@ -11931,3 +11933,122 @@ v9 failure again.**
 - **Reading.** Memory carry did not anchor DG; the entropy runaway arrived
   at a similar think length to v9 (about 70-75 tokens). The DG-cot control
   is still needed to say whether memory changed its timing.
+
+**12674 crash, resume, and step-259 mechanism measurements (2026-10-10).**
+- **Crash.** 12674 died at about step 280, during a checkpoint save, because
+  /home was full. Disk was freed and the run was resubmitted as 12684, a
+  `--resume` from the step-259 checkpoint. Resume purges the metrics and
+  captures logged after step 259.
+- **Derailment diagnostic** (`postraining/diagnose_tail_derailment.py`;
+  output in `postraining/runs/dg_derail_diag_20261010/derailment/`).
+  - Setup: 64 mixture prompts x 16 samples, temperature 1, the training
+    decode contract.
+  - "Derailed" means a 16-token window with mean surprisal above 5 nats.
+
+  | Arm | Accuracy | Ended | Derailed | Derailed rows that end | Mean tokens |
+  |---|---|---|---|---|---|
+  | SFT | 0.023 | 0.98 | 0.28 | 0.98 | 484 |
+  | PG step 166 | 0.054 | 1.00 | 0.03 | 1.00 | 101 |
+  | PG step 950 | 0.084 | 1.00 | 0.00 | – | 56 |
+  | DG step 259 | 0.019 | 0.69 | 0.67 | 0.54 | 717 |
+  | DG 259, memory read zeroed | 0.038 | 0.96 | 0.40 | 0.91 | 333 |
+  | DG 259, top_p 0.95 | 0.034 | 0.86 | 0.47 | 0.74 | 374 |
+
+  - **Not global flattening.**
+    - DG 259 rows that never derail have SFT-like entropy (about 1.3-1.7).
+    - Step-0 statistics match SFT and PG 166: P(`<think>`) is 0.88, the
+      same as theirs.
+    - Onset median is 33 tokens; under 1% of onsets fall after position
+      1024.
+  - **Derailment is a trap under DG.** In derailed rows with at least 48
+    tokens of tail:
+    - SFT: 30% of later 16-token windows are back under 2 nats; the final
+      window averages 1.6 nats.
+    - DG 259: 6% of later windows recover; the final window averages 5.9
+      nats.
+    - DG 259 with the memory read zeroed: 16% recover; the final window
+      averages 2.9 nats.
+  - **Credit by surprisal level, failed rows at DG 259.**
+    - The advantage is near zero-mean noise: about -0.0002 ± 0.008. With
+      lambda near 1, A_t ≈ -V(s_t), and V wobbles around 0 from token to
+      token.
+    - At 8-10 nats the summed weight is DG +9.7 against PG -50.9. DG's net
+      weight turns positive above about 6 nats.
+    - The cause is DG's expansion sigmoid(A·s)·A ≈ A/2 + s·A²/4. The second
+      term is positive whatever the sign of A, so DG rectifies advantage
+      noise into a push toward rare sampled tokens.
+    - At PG 166, the failed-row mean is -0.003 to -0.008, which still
+      outweighs that term.
+    - In correct rows DG gives less weight than PG at every surprisal level,
+      so the earlier "lucky correct rows hitchhike" hypothesis is not the
+      driver.
+- **One-step update probe** (`postraining/probe_actor_update_direction.py`;
+  output in `update_direction_dg259*.json`).
+  - Setup: from DG 259, one actor update per estimator through the
+    trainer's own update path, with fresh Muon at 4x the run's learning
+    rate. 4 pools of 16 prompts x 16 samples; deterministic teacher-forced
+    evaluation.
+  - Results, as mean ± SE over pools (dH is the change in entropy; "> 10
+    nats" is the change in sampled log-prob for tokens above 10 nats):
+
+  | Estimator | dH | > 10 nats |
+  |---|---|---|
+  | PG | -0.015 ± 0.004 | -0.009 ± 0.004 |
+  | DG | +0.006 ± 0.004 | +0.007 ± 0.004 |
+  | DG extra term alone (DG - PG/2) | +0.039 ± 0.005 | +0.030 ± 0.004 |
+  | DG, shuffled advantages | +0.014 ± 0.006 | +0.008 ± 0.006 |
+  | PG, shuffled advantages | -0.001 ± 0.008 | -0.002 ± 0.006 |
+  | DG, surprisal capped at 4 | -0.008 ± 0.003 | -0.004 ± 0.003 |
+  | DG, eta 4 | -0.005 ± 0.003 | -0.002 ± 0.004 |
+  | DG, lambda 0 | -0.060 ± 0.003 | -0.041 ± 0.002 |
+  | PG, lambda 0 | -0.067 ± 0.002 | -0.047 ± 0.001 |
+
+  - The paired DG - PG entropy difference is +0.021 ± 0.002 per step. With
+    shuffled advantages it is still +0.015 ± 0.002.
+  - About 70% of DG's flattening therefore needs no advantage signal: it is
+    rectified noise. PG with shuffled advantages is entropy-neutral.
+  - The surprisal cap and eta 4 remove most of it, but still leave +0.007 to
+    +0.010 relative to PG.
+  - Lambda-0 advantages (V(s')-V(s), the critic's own action-value estimate)
+    push salad tokens down hard under either estimator. The critic does
+    assign lower value after a junk token.
+  - Whether that lambda-0 push is correctness-directed or just an
+    entropy-correlated critic bias is not established; critic explained
+    variance is about 0.02.
+- **Reading.**
+  - DG's runaway is noise rectification, made into a trap by the memory
+    read.
+  - The noise term scales with s·Var(A) in failed rows. It wins once the
+    critic stops assigning failed rows a clearly negative mean, plausibly
+    the phase-2 onset around step 185 (untested).
+  - Candidate fixes are tested in the follow-up probe below.
+- **Follow-up probe** (`update_direction_dg259_rowdebias.json`).
+  - Setup: 3 pools, seed 900, same settings as above.
+  - New variants:
+    - `_row`: every token gets its row's mean advantage.
+    - `dg_debias`: DG minus l·sigma²/4, with sigma² the shard's pooled
+      within-row advantage variance.
+  - Paired entropy differences:
+
+  | Comparison | Entropy difference |
+  |---|---|
+  | DG - PG | +0.023 ± 0.001 |
+  | DG debiased - PG | -0.008 ± 0.001 |
+  | DG, shuffled advantages - PG | +0.026 ± 0.005 |
+  | DG debiased, shuffled advantages - PG | +0.005 ± 0.006 |
+  | DG row-mean - PG row-mean | +0.015 ± 0.005 |
+  | DG debiased, lambda 0 - DG, lambda 0 | -0.006 ± 0.001 |
+
+  - The second-order noise term accounts for all of DG's excess flattening;
+    removing it slightly over-corrects. DG debiased lowers the log-prob of
+    tokens above 10 nats by 0.016, against PG's 0.012.
+  - Row-mean advantages do **not** fix it. DG rectifies any variance of A at
+    a token, whether it comes from per-token critic noise or from
+    row-to-row variation, so "sequence-level advantages" is withdrawn as a
+    fix.
+  - Remaining candidates:
+    - debiased DG (the gate keeps its first-order behaviour, minus the noise
+      term);
+    - lambda-0 credit, i.e. Q(s,a)-V(s) from the shifted critic, where the
+      signal outweighs the term;
+    - eta or a surprisal cap, as partial patches.

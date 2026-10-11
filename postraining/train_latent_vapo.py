@@ -2414,6 +2414,64 @@ def non_trunk_parameter_ids(backbone) -> set[int]:
     return excluded
 
 
+def validate_combiner_geometry(
+    payload: dict, args, memory_carry: bool, source: object
+) -> None:
+    """Reject a checkpoint whose combiner shapes differ from the CLI's.
+
+    The shapes are fixed by the saved CLI arguments; a mismatch would
+    otherwise surface as an opaque strict-load shape error (or, for the
+    loaded gain scalar, not at all). A memory-carry combiner has memory
+    geometry and no MLP; every other combiner has an MLP and no memory.
+    """
+    saved = combiner_init_kwargs_from_checkpoint(payload)
+    if saved.get("memory_carry", False) != memory_carry:
+        raise ValueError(
+            f"{source} memory_carry={saved.get('memory_carry', False)} "
+            f"does not match --reasoning-mode {args.reasoning_mode}"
+        )
+    if memory_carry:
+        saved_memory = (saved["memory_heads"], saved["memory_head_dim"])
+        if saved_memory != (args.memory_heads, args.memory_head_dim):
+            raise ValueError(
+                f"{source} was trained with memory geometry "
+                f"heads/head_dim={saved_memory}, not "
+                f"{(args.memory_heads, args.memory_head_dim)}"
+            )
+        return
+    if (saved["mlp_hidden"], saved["num_blocks"]) != (
+        args.combined_mlp_hidden,
+        args.combined_mlp_blocks,
+    ):
+        raise ValueError(
+            f"{source} was trained with combiner geometry "
+            f"mlp_hidden={saved['mlp_hidden']}/blocks={saved['num_blocks']}, "
+            f"not {args.combined_mlp_hidden}/{args.combined_mlp_blocks}; pass "
+            "the checkpoint's --combined-mlp-hidden and --combined-mlp-blocks"
+        )
+
+
+def make_actor_trainable(wrapper: LatentThoughtModel) -> int:
+    """Set the actor's trainable-parameter contract; return frozen router count.
+
+    Every wrapper parameter trains except the MoE routing (frozen by the
+    backbone's own rule) and the fresh lineage's critic probe, which stays
+    checkpointed but has no graph edge. Nano backbones carry no probes.
+    """
+    backbone = wrapper.backbone
+    for parameter in wrapper.parameters():
+        parameter.requires_grad_(True)
+    frozen_moe_router_parameters = (
+        backbone.freeze_moe_routing_()
+        if hasattr(backbone, "freeze_moe_routing_")
+        else 0
+    )
+    if hasattr(backbone, "critic_probe"):
+        for parameter in backbone.critic_probe.parameters():
+            parameter.requires_grad_(False)
+    return frozen_moe_router_parameters
+
+
 def muon_matrix_parameters(
     blocks: torch.nn.Module, excluded_parameter_ids: set[int]
 ) -> list[torch.nn.Parameter]:
@@ -4108,38 +4166,9 @@ def main() -> None:
             args.carried_critic_value_changes = validate_carried_critic(
                 actor_init_payload, args
             )
-        # The combiner's tensor shapes are fixed by the saved CLI arguments;
-        # a geometry mismatch would otherwise surface as an opaque strict-load
-        # shape error (or, for the loaded gain scalar, not at all).
-        saved_combiner = combiner_init_kwargs_from_checkpoint(actor_init_payload)
-        if saved_combiner.get("memory_carry", False) != wrapper.memory_carry:
-            raise ValueError(
-                f"{initialization_path} memory_carry="
-                f"{saved_combiner.get('memory_carry', False)} does not match "
-                f"--reasoning-mode {args.reasoning_mode}"
-            )
-        if not wrapper.memory_carry and (
-            saved_combiner["mlp_hidden"],
-            saved_combiner["num_blocks"],
-        ) != (args.combined_mlp_hidden, args.combined_mlp_blocks):
-            raise ValueError(
-                f"{initialization_path} was trained with combiner geometry "
-                f"mlp_hidden={saved_combiner['mlp_hidden']}/"
-                f"blocks={saved_combiner['num_blocks']}, not "
-                f"{args.combined_mlp_hidden}/{args.combined_mlp_blocks}; "
-                "pass the checkpoint's --combined-mlp-hidden and "
-                "--combined-mlp-blocks"
-            )
-        saved_memory = (
-            saved_combiner.get("memory_heads"),
-            saved_combiner.get("memory_head_dim"),
+        validate_combiner_geometry(
+            actor_init_payload, args, wrapper.memory_carry, initialization_path
         )
-        if saved_memory != (args.memory_heads, args.memory_head_dim):
-            raise ValueError(
-                f"{initialization_path} was trained with memory geometry "
-                f"heads/head_dim={saved_memory}, not "
-                f"{(args.memory_heads, args.memory_head_dim)}"
-            )
         validate_renderer_checkpoint(
             actor_init_payload,
             initialization_path,
@@ -4167,13 +4196,7 @@ def main() -> None:
             "combined_mlp_hidden": args.combined_mlp_hidden,
             "combined_mlp_blocks": args.combined_mlp_blocks,
         }
-    for parameter in wrapper.parameters():
-        parameter.requires_grad_(True)
-    frozen_moe_router_parameters = (
-        backbone.freeze_moe_routing_()
-        if hasattr(backbone, "freeze_moe_routing_")
-        else 0
-    )
+    frozen_moe_router_parameters = make_actor_trainable(wrapper)
     if frozen_moe_router_parameters:
         # This trainer deliberately stays in eval mode to keep one compiled
         # graph family. Collection is enabled for those eval-mode replay
@@ -4182,11 +4205,6 @@ def main() -> None:
         enable_quantile_balance_collection(
             backbone, num_bins=1000, collect_in_eval=True
         )
-    if hasattr(backbone, "critic_probe"):
-        # Fresh lineage only: the pretrained critic probe stays checkpointed
-        # but has no graph edge. Nano backbones carry no probes.
-        for parameter in backbone.critic_probe.parameters():
-            parameter.requires_grad_(False)
 
     critic_uses_dense_trunk = bool(
         getattr(backbone, "model_config", {}).get("moe_num_experts", 0)
@@ -4640,18 +4658,12 @@ def main() -> None:
             raise ValueError(
                 "resume uses different base checkpoint bytes than the saved run"
             )
-        saved_combiner = combiner_init_kwargs_from_checkpoint(payload)
-        if (
-            saved_combiner["mlp_hidden"],
-            saved_combiner["num_blocks"],
-        ) != (args.combined_mlp_hidden, args.combined_mlp_blocks):
-            raise ValueError(
-                "resume checkpoint was trained with combiner geometry "
-                f"mlp_hidden={saved_combiner['mlp_hidden']}/"
-                f"blocks={saved_combiner['num_blocks']}, not "
-                f"{args.combined_mlp_hidden}/{args.combined_mlp_blocks}; "
-                "resume with the checkpoint's combiner flags"
-            )
+        validate_combiner_geometry(
+            payload,
+            args,
+            mode_carries_memory(args.reasoning_mode),
+            "resume checkpoint",
+        )
         validate_renderer_checkpoint(
             payload,
             args.resume,
