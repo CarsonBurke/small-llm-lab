@@ -333,6 +333,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # calibrated critic is lambda 0 (core.actor_gae_lambdas).
     parser.add_argument("--actor-gae-lambda", type=float, default=None)
     parser.add_argument(
+        "--critic-action-head-hidden",
+        type=int,
+        default=None,
+        help="width of a dueling Q(s_t, a_t) action head on the critic; the "
+        "actor's advantages then bootstrap from Q instead of V(s_{t+1}) "
+        "(core.action_value_advantages). Default: no action head",
+    )
+    parser.add_argument(
+        "--critic-action-head-learning-rate",
+        type=float,
+        default=None,
+        help="AdamW rate of the action head; default --critic-learning-rate",
+    )
+    parser.add_argument(
         "--nearby-reward-max",
         type=float,
         default=0.0,
@@ -424,6 +438,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "carried critic whose value contract changed must refit with a "
         "positive count, or be carried as-is with "
         "--accept-critic-value-change",
+    )
+    parser.add_argument(
+        "--value-warmup-scope",
+        choices=("critic", "action-head"),
+        default="critic",
+        help="what --value-warmup-steps fit: the whole critic, or only a "
+        "fresh action head on a carried critic whose values are fit; an "
+        "action-head warmup then rewinds the prompt cursor, so the first "
+        "actor step matches a run that starts acting at the same checkpoint",
     )
     # The BPB guard is a do-no-harm regression check, not an optimization
     # target. A deterministic 2M-token prefix takes ~2.5s on the 5090 versus
@@ -933,6 +956,22 @@ def validate_args(
         or args.critic_learning_rate <= 0.0
     ):
         parser.error("--critic-learning-rate must be finite and positive")
+    if args.critic_action_head_hidden is None:
+        if args.critic_action_head_learning_rate is not None:
+            parser.error(
+                "--critic-action-head-learning-rate needs "
+                "--critic-action-head-hidden"
+            )
+    else:
+        if args.critic_action_head_learning_rate is None:
+            args.critic_action_head_learning_rate = args.critic_learning_rate
+        if (
+            not math.isfinite(args.critic_action_head_learning_rate)
+            or args.critic_action_head_learning_rate <= 0.0
+        ):
+            parser.error(
+                "--critic-action-head-learning-rate must be finite and positive"
+            )
     if args.muon_learning_rate is None:
         # Pretraining ran Muon at 0.025 beside the generic AdamW groups at
         # 0.015; carrying that ratio onto the RL rate is the "proportionate"
@@ -1226,6 +1265,29 @@ def validate_args(
         parser.error("--samples-per-prompt must be positive")
     if args.actor_gae_lambda is not None and not 0.0 <= args.actor_gae_lambda <= 1.0:
         parser.error("--actor-gae-lambda must lie in [0, 1]")
+    if args.critic_action_head_hidden is not None:
+        if args.critic_action_head_hidden < 1:
+            parser.error("--critic-action-head-hidden must be positive")
+        if args.target_policy_optimization:
+            parser.error(
+                "--critic-action-head-hidden needs an actor objective that "
+                "consumes its advantages; TPO does not"
+            )
+    if args.value_warmup_scope == "action-head":
+        if args.critic_action_head_hidden is None:
+            parser.error(
+                "--value-warmup-scope action-head needs "
+                "--critic-action-head-hidden"
+            )
+        if args.value_warmup_steps < 1:
+            parser.error(
+                "--value-warmup-scope action-head needs --value-warmup-steps > 0"
+            )
+        if not (args.resume or (args.actor_init and not args.fresh_critic)):
+            parser.error(
+                "--value-warmup-scope action-head warms a head against "
+                "values already fit: carry a critic with --actor-init"
+            )
     # Replay is token-normalized and memory-sharded, so trajectory batch size
     # is an actual optimization choice rather than a shape invariant. The
     # selected DG regime uses 24 x 16 = 384 fresh trajectories per update.

@@ -718,6 +718,7 @@ class PinnedDecodeArena:
                 old_thought_means=torch.zeros_like(thoughts),
                 old_thought_log_sigmas=torch.zeros_like(thoughts),
                 old_values=zeros.clone(),
+                old_action_values=zeros.clone(),
                 rewards=zeros.clone(),
                 reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
                 prompt_length=width,

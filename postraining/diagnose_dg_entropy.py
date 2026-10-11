@@ -61,6 +61,7 @@ from postraining.core import (
     answer_style,
     encode_prompt,
     generalized_advantage_and_return_targets,
+    action_value_advantages,
     actor_gae_lambdas,
 )
 from postraining.inspect_critic_values import load_run
@@ -297,9 +298,19 @@ def main() -> None:
             saved["gae_lambda_alpha"],
             saved.get("actor_gae_lambda"),
         )
-        critic_advantages, _ = generalized_advantage_and_return_targets(
-            batch.rewards, batch.old_values, batch.action_mask, lambdas
-        )
+        def actor_advantages(lambdas: Tensor) -> Tensor:
+            # The trainer's credit: bootstrapped from the critic's action
+            # head when it has one, else GAE.
+            if saved.get("critic_action_head_hidden") is not None:
+                return action_value_advantages(
+                    batch.rewards, batch.old_values, batch.old_action_values,
+                    batch.action_mask, lambdas,
+                )
+            return generalized_advantage_and_return_targets(
+                batch.rewards, batch.old_values, batch.action_mask, lambdas
+            )[0]
+
+        critic_advantages = actor_advantages(lambdas)
         _, returns = generalized_advantage_and_return_targets(
             batch.rewards, batch.old_values, batch.action_mask,
             torch.ones_like(lambdas),
@@ -313,10 +324,7 @@ def main() -> None:
             (targets - batch.old_values[actions].float()).square().sum()
         )
         fixed_advantages = [
-            generalized_advantage_and_return_targets(
-                batch.rewards, batch.old_values, batch.action_mask,
-                torch.full_like(lambdas, value),
-            )[0].float()
+            actor_advantages(torch.full_like(lambdas, value)).float()
             for value in fixed_lambdas
         ]
         rewards = batch.reward_scalar.float()

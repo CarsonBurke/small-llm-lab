@@ -360,6 +360,10 @@ class LatentRolloutBatch:
     old_thought_means: Tensor
     old_thought_log_sigmas: Tensor
     old_values: Tensor
+    # The critic's Q(s_t, a_t) at action slots, from its action head; zero
+    # when the critic has none. Filled by refresh_old_statistics with
+    # ``old_values``.
+    old_action_values: Tensor
     rewards: Tensor
     reward_scalar: Tensor  # (batch,)
     prompt_length: int
@@ -1211,6 +1215,7 @@ def rollout_continuations(
     old_thought_means = torch.zeros_like(thoughts)
     old_thought_log_sigmas = torch.zeros_like(thoughts)
     old_values = torch.zeros_like(action_mask)
+    old_action_values = torch.zeros_like(action_mask)
     if valid_slots is None:
         kind[:, :prompt_length] = TOKEN_SLOT
         token_ids[:, :prompt_length] = prompt_ids.repeat_interleave(
@@ -1798,6 +1803,7 @@ def rollout_continuations(
         old_thought_means=old_thought_means,
         old_thought_log_sigmas=old_thought_log_sigmas,
         old_values=old_values,
+        old_action_values=old_action_values,
         rewards=torch.zeros_like(action_mask),
         reward_scalar=torch.zeros(batch, dtype=torch.float32, device=device),
         prompt_length=prompt_length,
@@ -2060,6 +2066,7 @@ def scatter_replay_statistics(
         "old_thought_means",
         "old_thought_log_sigmas",
         "old_values",
+        "old_action_values",
     )
     row_start = 0
     for group in groups:
@@ -2873,7 +2880,8 @@ def refresh_old_statistics(
         beliefs, stream_inputs = replay_head_inputs(
             wrapper, microbatch
         )
-        values = critic.values(microbatch).float()
+        values, action_values = critic.estimates(microbatch)
+        values = values.float()
         with torch.no_grad():
             # A hidden-carry wrapper has no gate, and its stop mask is empty
             # by construction: there is no gate decision to score.
@@ -2965,6 +2973,8 @@ def refresh_old_statistics(
             # target the parent explicitly (``view.copy_`` would update only
             # the temporary).
             batch.old_values[rows, :stream_length] = values
+            if action_values is not None:
+                batch.old_action_values[rows, :stream_length] = action_values
             batch.old_stop_logprobs[rows, :stream_length] = stop_logprobs
             batch.old_token_logprobs[rows, :stream_length] = token_logprobs
             if target_policy_optimization:

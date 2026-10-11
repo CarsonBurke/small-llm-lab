@@ -48,6 +48,7 @@ _STREAM_FIELD_NAMES = (
     "old_thought_means",
     "old_thought_log_sigmas",
     "old_values",
+    "old_action_values",
 )
 
 
@@ -419,6 +420,7 @@ def _empty_record_values(
         "old_thought_means": torch.zeros_like(thoughts),
         "old_thought_log_sigmas": torch.zeros_like(thoughts),
         "old_values": torch.zeros_like(action_mask),
+        "old_action_values": torch.zeros_like(action_mask),
     }
     return values
 

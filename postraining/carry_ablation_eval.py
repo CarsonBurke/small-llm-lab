@@ -503,6 +503,9 @@ def main() -> None:
             ).items()
             if key in {"mlp_hidden", "num_blocks"}
         },
+        action_head_hidden=payload.get("args", {}).get(
+            "critic_action_head_hidden"
+        ),
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()

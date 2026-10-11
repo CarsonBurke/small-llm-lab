@@ -193,6 +193,9 @@ def load_run(
             if key in {"mlp_hidden", "num_blocks"}
         },
         actor_memory=wrapper.combiner if wrapper.memory_carry else None,
+        action_head_hidden=payload.get("args", {}).get(
+            "critic_action_head_hidden"
+        ),
     ).to(device)
     critic.load_state_dict(payload["critic"], strict=True)
     critic.eval()

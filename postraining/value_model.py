@@ -20,11 +20,21 @@ verifier success marginal within a few updates; the HL-Gauss categorical head
 it replaced started every off-prior bin ~14 nats down and moved them only by
 lr per step through the bias, which pinned its decoded value at 6e-5 through
 a whole run (NOTES 2026-09-22).
+
+The optional action head (``CRITIC_ACTION_HEAD_SCHEMA``) adds a dueling
+Q(s_t, a_t) = V(s_t) + Adv(b_t, x_{t+1}): the critic's belief at the action
+slot and its own input at the next slot -- the sampled token's embedding plus,
+under the memory carry, the read that includes the write of the belief that
+sampled it. V's trunk already consumes x_{t+1} at t+1, so V(s_{t+1}) is a
+Q estimate too; the head makes Q - V one direct residual instead of the
+difference of two trunk evaluations. Its inputs and V are detached, so the
+value fit is exactly the plain critic's.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from postraining.latent_rollout import (
@@ -44,6 +54,30 @@ from postraining.memory_carry import (
 )
 
 
+class ActionAdvantageHead(nn.Module):
+    """Adv(b_t, x_{t+1}): a relu^2 MLP over the belief and the next input.
+
+    The squared activation of a sum carries the belief-action products a
+    sum of separate features cannot. The zero-initialized output makes a
+    fresh head's Q exactly V.
+    """
+
+    def __init__(self, model_dim: int, hidden: int):
+        super().__init__()
+        self.belief = nn.Linear(model_dim, hidden, bias=False)
+        self.action = nn.Linear(model_dim, hidden, bias=False)
+        self.out = nn.Linear(hidden, 1)
+        with torch.no_grad():
+            self.out.weight.zero_()
+            self.out.bias.zero_()
+
+    def forward(self, beliefs: Tensor, next_inputs: Tensor) -> Tensor:
+        hidden = self.belief(beliefs) + self.action(F.rms_norm(
+            next_inputs, (next_inputs.size(-1),)
+        ))
+        return self.out(F.relu(hidden).square()).squeeze(-1)
+
+
 class SeparateCritic(nn.Module):
     def __init__(
         self,
@@ -51,6 +85,7 @@ class SeparateCritic(nn.Module):
         mlp_hidden: int | None = None,
         num_blocks: int = 1,
         actor_memory: GatedDeltaMemory | None = None,
+        action_head_hidden: int | None = None,
     ):
         super().__init__()
         model_dim = trunk.tok_emb.embedding_dim
@@ -83,6 +118,11 @@ class SeparateCritic(nn.Module):
             # say, and the head learns the marginal before anything finer.
             self.head.weight.zero_()
             self.head.bias.zero_()
+        self.action_head = (
+            None
+            if action_head_hidden is None
+            else ActionAdvantageHead(model_dim, action_head_hidden)
+        )
 
     def assemble_inputs(self, batch: LatentRolloutBatch) -> Tensor:
         """Rebuild the exact token/thought stream in the critic's latent space."""
@@ -136,10 +176,27 @@ class SeparateCritic(nn.Module):
 
     def values(self, batch: LatentRolloutBatch) -> Tensor:
         """(batch, stream) scalar value estimates, fp32."""
-        beliefs = self.trunk.temporal_belief_from_token_latent(
-            self.assemble_inputs(batch)
-        )
+        return self.estimates(batch)[0]
+
+    def estimates(self, batch: LatentRolloutBatch) -> tuple[Tensor, Tensor | None]:
+        """(V, Q) over the stream, fp32; Q is None without an action head.
+
+        Q at slot t values the action taken there, whose consequence is the
+        critic's input at t + 1; the stream always holds the slot after an
+        action, so Q is defined at every action slot.
+        """
+        inputs = self.assemble_inputs(batch)
+        beliefs = self.trunk.temporal_belief_from_token_latent(inputs)
         # The value is an fp32 regression output even under autocast: bf16's
         # 8-bit mantissa cannot resolve a ~0.02 marginal's residuals.
         with torch.autocast(device_type=beliefs.device.type, enabled=False):
-            return self.head(beliefs.float()).squeeze(-1)
+            values = self.head(beliefs.float()).squeeze(-1)
+            if self.action_head is None:
+                return values, None
+            next_inputs = torch.cat(
+                (inputs[:, 1:], torch.zeros_like(inputs[:, :1])), dim=1
+            )
+            action_values = values.detach() + self.action_head(
+                beliefs.detach().float(), next_inputs.detach().float()
+            )
+        return values, action_values

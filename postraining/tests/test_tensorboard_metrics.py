@@ -645,7 +645,21 @@ def test_fresh_critic_init_provenance_names_its_start() -> None:
         "source_reward_schema": "abstention/v4",
         "value_contract_changes": ["reward_schema"],
         "value_change_resolution": "refit",
+        "action_head_init": None,
     }
+    # A fresh action head on the carried critic; a head-only warmup leaves
+    # the carried values unrefit.
+    headed = _critic_init_args(**{
+        **vars(branch),
+        "critic_action_head_hidden": 8,
+        "value_warmup_scope": "action-head",
+    })
+    headed_provenance = resolve_critic_init_provenance(headed, source, None)
+    assert headed_provenance["action_head_init"] == "fresh"
+    assert headed_provenance["value_change_resolution"] == "accepted"
+    assert resolve_critic_init_provenance(
+        headed, {**source, "critic_action_head_schema": "head/v1"}, None
+    )["action_head_init"] == "carried"
     branch.value_warmup_steps = 0
     assert resolve_critic_init_provenance(branch, source, None)[
         "value_change_resolution"

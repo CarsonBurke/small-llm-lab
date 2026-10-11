@@ -1265,6 +1265,51 @@ def temporal_difference_residuals(
     return (rewards + next_values * next_valids - values) * mask
 
 
+def action_value_advantages(
+    rewards: Tensor,
+    values: Tensor,
+    action_values: Tensor,
+    mask: Tensor,
+    lambdas: Tensor,
+) -> Tensor:
+    """Undiscounted lambda advantages bootstrapped from Q(s_t, a_t).
+
+    GAE's lambda-return bootstraps from V(s_{t+1}) after the transition;
+    this one bootstraps from the critic's Q(s_t, a_t) before it:
+
+        G_t = (1 - lambda) Q_t + lambda (r_t + G_{t+1}),  A_t = G_t - V_t,
+
+    with G zero past a row's last action. Since G_{t+1} = V_{t+1} + A_{t+1},
+
+        A_t = (Q_t - V_t) + lambda [(r_t + V_{t+1} - Q_t) + A_{t+1}],
+
+    an action residual Q - V plus the lambda-weighted surprise of the
+    realized continuation. Lambda one telescopes to the Monte-Carlo
+    advantage R - V_t, exactly GAE's; lambda zero is the critic's own
+    Q_t - V_t. Under deterministic transitions with exact critics
+    Q_t = r_t + V_{t+1}, so the two estimators differ only in whose
+    approximation error the advantage carries: the action head's direct
+    residual, or the difference of two separate trunk evaluations.
+    """
+    zero_column = torch.zeros_like(values[:, :1])
+    next_values = torch.cat((values[:, 1:], zero_column), dim=1)
+    next_valids = torch.cat((mask[:, 1:], torch.zeros_like(mask[:, :1])), dim=1)
+    action_residuals = action_values - values
+    transition_residuals = rewards + next_values * next_valids - action_values
+    running = torch.zeros(values.size(0), device=values.device, dtype=values.dtype)
+    columns: list[Tensor] = []
+    for t in range(values.size(1) - 1, -1, -1):
+        running = (
+            action_residuals[:, t]
+            + lambdas
+            * (transition_residuals[:, t] + running * next_valids[:, t])
+        ) * mask[:, t]
+        columns.append(running)
+    if not columns:
+        return torch.zeros_like(values)
+    return torch.stack(columns[::-1], dim=1).to(values.dtype)
+
+
 def generalized_advantage_and_return_targets(
     rewards: Tensor,
     values: Tensor,

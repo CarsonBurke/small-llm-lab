@@ -346,7 +346,8 @@ def test_offloading_a_strided_stream_prefix_stages_nothing_on_the_device():
     }
     scalar_stream = (
         "action_mask", "stop_mask", "emit_mask", "old_stop_logprobs",
-        "old_token_logprobs", "old_token_log_odds", "old_values", "rewards",
+        "old_token_logprobs", "old_token_log_odds", "old_values",
+        "old_action_values", "rewards",
     )
     for name in scalar_stream:
         stream_fields[name] = buffer()

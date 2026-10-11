@@ -807,6 +807,7 @@ def _decode_group(row_actions: list[int], prompt: int, bucket: int = 1):
         old_thought_means=torch.zeros(rows, stream, 0),
         old_thought_log_sigmas=torch.zeros(rows, stream, 0),
         old_values=zeros.clone(),
+        old_action_values=zeros.clone(),
         rewards=zeros.clone(),
         reward_scalar=torch.zeros(rows),
         prompt_length=prompt,

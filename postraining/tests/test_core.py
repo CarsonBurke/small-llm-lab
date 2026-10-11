@@ -13,6 +13,7 @@ from postraining.core import (
     POSTTRAIN_RESPONSE_TOKENS,
     POSTTRAIN_STREAM_TOKENS,
     JsonlLogger,
+    action_value_advantages,
     actor_gae_lambdas,
     answer_style,
     clipped_policy_loss,
@@ -669,6 +670,76 @@ def test_temporal_difference_residuals_equal_lambda_zero_gae():
     torch.testing.assert_close(
         temporal_difference_residuals(rewards, values, mask), advantages
     )
+
+
+def _ragged_episode(seed: int):
+    generator = torch.Generator().manual_seed(seed)
+    values = torch.rand(3, 7, generator=generator)
+    action_values = torch.rand(3, 7, generator=generator)
+    mask = torch.zeros(3, 7)
+    mask[0, 1:6] = 1
+    mask[1, 2:4] = 1
+    mask[2, 1:7] = 1
+    rewards = torch.zeros(3, 7)
+    rewards[0, 5], rewards[1, 3], rewards[2, 6] = 1.0, 0.0, 0.7
+    return rewards, values, action_values, mask
+
+
+def test_action_value_advantages_lambda_one_is_monte_carlo_gae():
+    rewards, values, action_values, mask = _ragged_episode(11)
+    expected, _ = generalized_advantage_and_return_targets(
+        rewards, values, mask, torch.ones(3)
+    )
+    torch.testing.assert_close(
+        action_value_advantages(rewards, values, action_values, mask, torch.ones(3)),
+        expected,
+    )
+
+
+def test_action_value_advantages_lambda_zero_is_the_action_residual():
+    rewards, values, action_values, mask = _ragged_episode(12)
+    torch.testing.assert_close(
+        action_value_advantages(rewards, values, action_values, mask, torch.zeros(3)),
+        (action_values - values) * mask,
+    )
+
+
+def test_action_value_advantages_are_the_q_bootstrapped_lambda_return():
+    rewards, values, action_values, mask = _ragged_episode(13)
+    lambdas = torch.tensor([0.9, 0.5, 0.95])
+    expected = torch.zeros_like(values)
+    for row in range(3):
+        following = 0.0  # G past the row's last action
+        for t in range(6, -1, -1):
+            if not mask[row, t]:
+                continue
+            lam = lambdas[row]
+            following = (1 - lam) * action_values[row, t] + lam * (
+                rewards[row, t] + following
+            )
+            expected[row, t] = following - values[row, t]
+    torch.testing.assert_close(
+        action_value_advantages(rewards, values, action_values, mask, lambdas),
+        expected,
+    )
+
+
+def test_exact_action_values_make_every_lambda_agree_with_gae():
+    # Deterministic transitions: an exact Q is r_t + V_{t+1}, and then the
+    # Q bootstrap is GAE's bootstrap at every lambda.
+    rewards, values, _, mask = _ragged_episode(14)
+    next_values = torch.cat((values[:, 1:], torch.zeros(3, 1)), dim=1)
+    next_valids = torch.cat((mask[:, 1:], torch.zeros(3, 1)), dim=1)
+    exact = rewards + next_values * next_valids
+    for lam in (0.0, 0.3, 0.95):
+        lambdas = torch.full((3,), lam)
+        expected, _ = generalized_advantage_and_return_targets(
+            rewards, values, mask, lambdas
+        )
+        torch.testing.assert_close(
+            action_value_advantages(rewards, values, exact, mask, lambdas),
+            expected,
+        )
 
 
 @pytest.mark.parametrize("answer", [

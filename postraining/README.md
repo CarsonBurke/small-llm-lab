@@ -1344,12 +1344,33 @@ critic fit the source's value target: the lambda-one return of its sampling
 policy under its terminal reward, truncated at its horizon. A branch that
 changes any of reward schema, `--abstention-penalty`, `--nearby-reward-max`,
 `--temperature`, `--top-p`, or the prompt/continuation/answer token budgets
-must refit the critic with `--value-warmup-steps > 0`; the changed fields are
-recorded as `critic.value_contract_changes`. A step-0 source whose critic never
-finished its warmup also needs one. `--value-warmup-steps` counts this run's
-own critic-only updates and defaults to 0 when the run loads a trained critic
-(`--actor-init` without `--fresh-critic`, `--critic-only-init`) and 50
-otherwise.
+must refit the critic with `--value-warmup-steps > 0` or carry it as-is with
+`--accept-critic-value-change`; the changed fields are recorded as
+`critic.value_contract_changes` and the answer as
+`critic.value_change_resolution` (`refit` or `accepted`). A step-0 source
+whose critic never finished its warmup also needs one. `--value-warmup-steps`
+counts this run's own critic-only updates and defaults to 0 when the run loads
+a trained critic (`--actor-init` without `--fresh-critic`,
+`--critic-only-init`) and 50 otherwise.
+
+`--critic-action-head-hidden N` adds a dueling action head to the critic
+(`CRITIC_ACTION_HEAD_SCHEMA`): Q_t = V_t + Adv(b_t, x_{t+1}), where b_t is the
+critic's belief at the action slot and x_{t+1} its input at the next slot, the
+one that holds the sampled token and the memory write. V, the belief and the
+input are detached, so the head's MSE against the same lambda-one return
+trains only the head, with its own AdamW (`--critic-action-head-learning-rate`,
+default `--critic-learning-rate`). Its zero-initialized output makes a fresh
+head's Q exactly V. The actor's advantages then come from
+`core.action_value_advantages`, the lambda-return
+G_t = (1 - lambda) Q_t + lambda (r_t + G_{t+1}) less V_t: lambda one is the
+Monte Carlo advantage, lambda zero is Q - V, and an exact Q reproduces GAE at
+every lambda. Expanded, a Q - V offset shared along a row enters the advantage
+at nearly full weight while its token-specific part enters at 1 - lambda, so
+an uncentered head passes V's calibration error to the actor (NOTES
+2026-10-11). `--value-warmup-scope action-head` fits only a fresh head on a
+carried critic before the first actor step, then rewinds the prompt cursor so
+that step draws the prompts, and the rollout keys, of a run that starts acting
+at the same checkpoint. TPO refuses the head.
 
 Carry refuses `--thought-sigma`, `--init-stop-thinking-probability`, and
 `--rollout-scheduler continuous_refill`. Its checkpoints record rollout policy

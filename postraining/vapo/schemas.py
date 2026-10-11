@@ -41,6 +41,11 @@ PROMPT_ORDER_SCHEMA = "sequential_one_pass/v1"
 # squared error against the lambda-one (Monte Carlo) return. Replaces the HL-Gauss
 # categorical head, whose point prior pinned the decoded value near 0.
 CRITIC_SCHEMA = "scalar_zero_init_linear_unclipped_mse/v1"
+# The optional dueling action head: Q(s_t, a_t) = V(s_t) + a zero-initialized
+# relu^2 MLP of the critic belief at t and its input at t + 1, with V and both
+# inputs detached, trained by unclipped squared error against the same
+# lambda-one return; the actor bootstraps its advantages from Q.
+CRITIC_ACTION_HEAD_SCHEMA = "dueling_detached_relu2_mlp_q_lambda_one_mse/v1"
 ACTOR_OBJECTIVE_SCHEMA = (
     "vapo_joint_gate_token_gaussian_clip_token_denominator/v4"
 )

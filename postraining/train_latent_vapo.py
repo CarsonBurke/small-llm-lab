@@ -113,6 +113,7 @@ from postraining.core import (
     structural_abstention,
     structural_format_ok,
     generalized_advantage_and_return_targets,
+    action_value_advantages,
     actor_gae_lambdas,
     temporal_difference_residuals,
     load_posttraining_tokenizer,
@@ -215,6 +216,7 @@ from postraining.vapo.mixture import (
     mixture_identity,
 )
 from postraining.vapo.schemas import (
+    CRITIC_ACTION_HEAD_SCHEMA,
     CRITIC_SCHEMA,
     PROMPT_ORDER_SCHEMA,
     actor_objective_schema,
@@ -298,6 +300,12 @@ TPO_RESUME_EXACT_ARG_FIELDS = (
     "target_policy_optimization",
     "tpo_eta",
 )
+# Checked only when either side has an action head, so runs from before the
+# head resume unchanged.
+ACTION_HEAD_RESUME_EXACT_ARG_FIELDS = (
+    "critic_action_head_hidden",
+    "value_warmup_scope",
+)
 
 
 def combiner_weight_telemetry(wrapper: LatentThoughtModel) -> dict:
@@ -369,6 +377,11 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
         or bool(getattr(current, "target_policy_optimization", False))
     ):
         exact_fields += TPO_RESUME_EXACT_ARG_FIELDS
+    if (
+        saved.get("critic_action_head_hidden") is not None
+        or getattr(current, "critic_action_head_hidden", None) is not None
+    ):
+        exact_fields += ACTION_HEAD_RESUME_EXACT_ARG_FIELDS
     mismatches = [
         (name, saved.get(name), getattr(current, name))
         for name in exact_fields
@@ -391,7 +404,7 @@ CRITIC_INIT_PROVENANCE_FIELDS = (
     "init", "checkpoint", "source_execution_schema", "checkpoint_sha256",
     "source_actor_step", "source_value_warmup_step", "optimizer_state",
     "source_reward_schema", "value_contract_changes",
-    "value_change_resolution",
+    "value_change_resolution", "action_head_init",
 )
 
 
@@ -478,6 +491,31 @@ def source_trained_critic_without_warmup(source_args: dict) -> bool:
     )
 
 
+def critic_action_head_schema(critic: SeparateCritic) -> str | None:
+    return None if critic.action_head is None else CRITIC_ACTION_HEAD_SCHEMA
+
+
+def refits_critic_values(args: argparse.Namespace) -> bool:
+    """Whether this run's warmup refits the critic's values before the first
+    actor step; an action-head-only warmup leaves them as carried."""
+    return args.value_warmup_steps > 0 and (
+        getattr(args, "value_warmup_scope", "critic") == "critic"
+    )
+
+
+def rewinds_warmup_prompts(args: argparse.Namespace) -> bool:
+    """Whether the warmup returns the prompt cursor to where it began.
+
+    An action-head warmup changes neither the actor nor the carried values,
+    so rewinding leaves the head as the run's only difference from one that
+    starts acting at the same checkpoint: the first actor step draws the same
+    prompts under the same rollout keys, which derive from the cursor.
+    """
+    return args.value_warmup_steps > 0 and (
+        getattr(args, "value_warmup_scope", "critic") == "action-head"
+    )
+
+
 def validate_carried_critic(payload: dict, args: argparse.Namespace) -> list[str]:
     """Refuse an --actor-init critic that cannot be carried; name the value
     contract fields this run changes from the one it fit.
@@ -485,7 +523,7 @@ def validate_carried_critic(payload: dict, args: argparse.Namespace) -> list[str
     The critic's value task is the return under the terminal reward, policy
     temperature and horizon it fit. A change leaves it a biased start
     exactly where the two contracts value a trajectory differently, so one
-    is accepted only together with a critic refit (--value-warmup-steps > 0)
+    is accepted only together with a critic refit (``refits_critic_values``)
     before the first actor step, or an explicit --accept-critic-value-change
     (for instance when the changed reward never applied to a row the critic
     was fit on, which this check cannot see). The changed fields and how
@@ -524,7 +562,7 @@ def validate_carried_critic(payload: dict, args: argparse.Namespace) -> list[str
         and int(payload.get("value_warmup_step", 0)) == 0
         and not source_trained_critic_without_warmup(source_args)
     )
-    if unfit and args.value_warmup_steps == 0:
+    if unfit and not refits_critic_values(args):
         raise ValueError(
             "--actor-init checkpoint's critic stopped before its warmup "
             "finished; finish it with --value-warmup-steps > 0 or pass "
@@ -544,13 +582,14 @@ def validate_carried_critic(payload: dict, args: argparse.Namespace) -> list[str
     )
     if (
         changes
-        and args.value_warmup_steps == 0
+        and not refits_critic_values(args)
         and not getattr(args, "accept_critic_value_change", False)
     ):
         raise ValueError(
             "--actor-init critic fit a different value target "
             f"({', '.join(changes)} changed); refit it with "
-            "--value-warmup-steps > 0, carry it as-is with "
+            "--value-warmup-steps > 0 under --value-warmup-scope critic, "
+            "carry it as-is with "
             "--accept-critic-value-change, or pass --fresh-critic"
         )
     return changes
@@ -566,11 +605,41 @@ def carry_init_critic(
 
     The critic keeps its optimizer state with its weights. The actor's
     optimizers are left as built, empty: a branch should not inherit
-    momentum along the objective it departs from.
+    momentum along the objective it departs from. An action head the source
+    critic never had starts fresh -- zero output, empty optimizer -- beside
+    the carried values; one it had must be this run's head.
     """
-    critic.load_state_dict(payload["critic"], strict=True)
+    source_head = payload.get("critic_action_head_schema")
+    fresh_head = source_head is None and critic.action_head is not None
+    if source_head is not None and source_head != critic_action_head_schema(
+        critic
+    ):
+        raise ValueError(
+            f"--actor-init critic has action head {source_head!r}; this run's "
+            f"is {critic_action_head_schema(critic)!r}"
+        )
+    if fresh_head:
+        missing, unexpected = critic.load_state_dict(
+            payload["critic"], strict=False
+        )
+        head_keys = {
+            f"action_head.{name}" for name in critic.action_head.state_dict()
+        }
+        if unexpected or set(missing) != head_keys:
+            raise ValueError(
+                "--actor-init critic does not match this critic outside its "
+                f"action head: missing {sorted(set(missing) - head_keys)}, "
+                f"unexpected {sorted(unexpected)}"
+            )
+    else:
+        critic.load_state_dict(payload["critic"], strict=True)
     source_optimizers = payload["optimizers"]
-    critic_names = [name for name in optimizers if name.startswith("critic")]
+    critic_names = [
+        name
+        for name in optimizers
+        if name.startswith("critic")
+        and not (fresh_head and name == "critic_action")
+    ]
     source_critic_names = sorted(
         name for name in source_optimizers if name.startswith("critic")
     )
@@ -638,8 +707,15 @@ def resolve_critic_init_provenance(
                 None
                 if not args.carried_critic_value_changes
                 else "refit"
-                if args.value_warmup_steps > 0
+                if refits_critic_values(args)
                 else "accepted"
+            ),
+            "action_head_init": (
+                None
+                if getattr(args, "critic_action_head_hidden", None) is None
+                else "carried"
+                if actor_init_payload.get("critic_action_head_schema")
+                else "fresh"
             ),
         }
     return {
@@ -1735,14 +1811,35 @@ def aggregate_value_diagnostics(
     }
 
 
+def aggregate_action_value_diagnostics(
+    metrics: list[dict[str, float]],
+) -> dict[str, float]:
+    """``aggregate_value_diagnostics`` for the action head's Q, which fits
+    the same targets."""
+    return aggregate_value_diagnostics(
+        [
+            {
+                **metric,
+                "value_residual_mean": metric["action_value_residual_mean"],
+                "value_residual_variance": metric[
+                    "action_value_residual_variance"
+                ],
+                "value_loss": metric["action_value_loss"],
+            }
+            for metric in metrics
+        ]
+    )
+
+
 def credit_assignment_moments(
     batch: LatentRolloutBatch,
     advantages: torch.Tensor,
     value_targets: torch.Tensor,
     actor_signal_rows: torch.Tensor,
     reward_floor: float = 0.0,
+    action_values: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Raw token moments for two credit-assignment health checks.
+    """Raw token moments for the credit-assignment health checks.
 
     - Calibration of the critic's one-step differences: regressing the
       Monte-Carlo advantage (lambda-1 return minus value) on the TD(0)
@@ -1757,6 +1854,9 @@ def credit_assignment_moments(
       means the zero-score reward ``reward_floor``, never an abstention):
       a critic whose differences reward rare tokens regardless of outcome
       is a pseudo-reward that Delightful PG amplifies into entropy growth.
+    - With ``action_values``, the same calibration for the action head's
+      residual Q - V, over every action slot: its terminal residual is a
+      prediction, not R - V, so no slot is degenerate.
 
     Sums, not ratios, so groups pool exactly in the dashboard. Masked
     products rather than boolean indexing keep the update free of host syncs.
@@ -1776,7 +1876,25 @@ def credit_assignment_moments(
     )[:, None].double()
     failed_advantage = advantages.double() * failed
     failed_surprisal = -batch.old_token_logprobs.double() * failed
+    action_moments = {}
+    if action_values is not None:
+        every_action = (
+            batch.action_mask * actor_signal_rows[:, None]
+        ).double()
+        action_residual = (
+            action_values - batch.old_values
+        ).double() * every_action
+        every_mc = (value_targets - batch.old_values).double() * every_action
+        action_moments = {
+            "credit_action_count": every_action.sum(),
+            "credit_action_residual_sum": action_residual.sum(),
+            "credit_action_residual_square_sum": action_residual.square().sum(),
+            "credit_action_mc_sum": every_mc.sum(),
+            "credit_action_mc_square_sum": every_mc.square().sum(),
+            "credit_action_residual_mc_sum": (action_residual * every_mc).sum(),
+        }
     return {
+        **action_moments,
         "credit_count": actions.sum(),
         "credit_td0_sum": td0.sum(),
         "credit_mc_sum": mc.sum(),
@@ -1826,6 +1944,30 @@ def credit_assignment_dashboard(
         dashboard["credit/td0_calibration_slope"] = covariance(
             "credit_td0_sum", "credit_mc_sum", "credit_td0_mc_sum", "credit_count"
         ) / td0_variance
+    if "credit_action_count" in total:
+        residual_variance = covariance(
+            "credit_action_residual_sum", "credit_action_residual_sum",
+            "credit_action_residual_square_sum", "credit_action_count",
+        )
+        mc_variance = covariance(
+            "credit_action_mc_sum", "credit_action_mc_sum",
+            "credit_action_mc_square_sum", "credit_action_count",
+        )
+        residual_mc = covariance(
+            "credit_action_residual_sum", "credit_action_mc_sum",
+            "credit_action_residual_mc_sum", "credit_action_count",
+        )
+        dashboard["credit/action_residual_std"] = math.sqrt(
+            max(residual_variance, 0.0)
+        )
+        if residual_variance > 1e-18:
+            dashboard["credit/action_residual_calibration_slope"] = (
+                residual_mc / residual_variance
+            )
+        if residual_variance > 1e-18 and mc_variance > 1e-18:
+            dashboard["credit/action_residual_mc_corr"] = residual_mc / math.sqrt(
+                residual_variance * mc_variance
+            )
     if scale > 1e-18:
         dashboard["credit/failed_advantage_surprisal_corr"] = covariance(
             "failed_advantage_sum", "failed_surprisal_sum",
@@ -1908,6 +2050,16 @@ def aggregate_actor_tensorboard_metrics(
     }
     if "credit_count" in last:
         dashboard.update(credit_assignment_dashboard(metrics))
+    if "action_value_loss" in last:
+        action_value = aggregate_action_value_diagnostics(metrics)
+        dashboard["value/action_value_mse"] = action_value["loss"]
+        dashboard["value/action_value_residual_mean"] = action_value[
+            "residual_mean"
+        ]
+        dashboard["value/action_value_online_explained_variance"] = (
+            action_value["explained_variance"]
+        )
+        dashboard["grad/action_head"] = last["action_head_grad_norm"]
     if "carry_input_delta_rms_ratio" in last:
         # The hidden carry has no stochastic factor or head to report.
         dashboard.pop("loss/stochastic_policy")
@@ -2245,13 +2397,18 @@ def plan_one_pass_training(
     warmup_updates: int,
     remaining_actor_steps: int,
     prompts_per_minibatch: int,
+    actor_start_cursor: int | None = None,
 ) -> tuple[int, int]:
     """Validate exact one-pass consumption and return prompts and actor steps.
 
     Warmup consumes one complete prompt minibatch per critic update. Actor
     training then consumes every remaining row, with at most one terminal
-    partial minibatch. This helper is deliberately pure so fresh curriculum
-    starts and checkpoint resumes share testable no-reuse arithmetic.
+    partial minibatch. A rewinding warmup (``rewinds_warmup_prompts``) reads
+    the actor's first prompts instead of preceding them: the actor then
+    starts at ``actor_start_cursor``, at or before a mid-warmup resume's
+    cursor, and consumes every row from there. This helper is deliberately pure so fresh
+    curriculum starts and checkpoint resumes share testable no-reuse
+    arithmetic.
     """
     if not 0 <= sampler_cursor <= dataset_rows:
         raise ValueError("sampler cursor must lie within the dataset")
@@ -2263,7 +2420,12 @@ def plan_one_pass_training(
     warmup_prompts = prompts_per_minibatch * warmup_updates
     if warmup_prompts > available:
         raise ValueError("critic warmup alone exceeds the unused target dataset")
-    actor_prompts = available - warmup_prompts
+    if actor_start_cursor is None:
+        actor_prompts = available - warmup_prompts
+    elif not 0 <= actor_start_cursor <= sampler_cursor:
+        raise ValueError("a rewound actor cannot start past the warmup cursor")
+    else:
+        actor_prompts = dataset_rows - actor_start_cursor
     required_actor_steps = math.ceil(actor_prompts / prompts_per_minibatch)
     if remaining_actor_steps != required_actor_steps:
         raise ValueError(
@@ -2536,6 +2698,7 @@ def optimizer_learning_rates(args) -> dict[str, float]:
         "critic": args.critic_learning_rate,
         "actor_muon": args.muon_learning_rate,
         "critic_muon": args.critic_muon_learning_rate,
+        "critic_action": getattr(args, "critic_action_head_learning_rate", None),
     }
 
 
@@ -2558,6 +2721,7 @@ def build_optimizers(
     muon_learning_rate: float | None = None,
     critic_muon_learning_rate: float | None = None,
     fused: bool = True,
+    critic_action_learning_rate: float | None = None,
 ) -> dict[str, torch.optim.Optimizer]:
     """The actor/critic optimizer layout.
 
@@ -2575,6 +2739,10 @@ def build_optimizers(
     0 everywhere: pretraining's Muon decay (0.05) regularizes a from-scratch
     run, but over a long RL schedule it would only shrink the pretrained
     weights.
+
+    A critic action head has its own ``critic_action`` AdamW, so a carried
+    critic's optimizer state loads unchanged beside a fresh head and an
+    action-head warmup can step the head alone.
     """
     if trunk_optimizer not in ("adamw", "muon"):
         raise ValueError(f"unknown trunk optimizer {trunk_optimizer!r}")
@@ -2591,6 +2759,12 @@ def build_optimizers(
         critic_muon_parameters = muon_matrix_parameters(critic.trunk.blocks, set())
     actor_muon_ids = {id(parameter) for parameter in actor_muon_parameters}
     critic_muon_ids = {id(parameter) for parameter in critic_muon_parameters}
+    critic_action_parameters = (
+        []
+        if critic.action_head is None
+        else list(critic.action_head.parameters())
+    )
+    critic_action_ids = {id(parameter) for parameter in critic_action_parameters}
     trunk_parameters = [
         parameter
         for parameter in backbone.parameters()
@@ -2603,6 +2777,7 @@ def build_optimizers(
         for parameter in critic.parameters()
         if parameter.requires_grad
         if id(parameter) not in critic_muon_ids
+        and id(parameter) not in critic_action_ids
     ]
     optimizers = {
         "actor": torch.optim.AdamW(
@@ -2621,6 +2796,17 @@ def build_optimizers(
             fused=fused,
         ),
     }
+    if critic_action_parameters:
+        optimizers["critic_action"] = torch.optim.AdamW(
+            critic_action_parameters,
+            lr=(
+                critic_learning_rate
+                if critic_action_learning_rate is None
+                else critic_action_learning_rate
+            ),
+            weight_decay=0.0,
+            fused=fused,
+        )
     if trunk_optimizer == "muon":
         if muon_learning_rate is None or critic_muon_learning_rate is None:
             raise ValueError("the muon trunk optimizer requires its learning rates")
@@ -2719,6 +2905,7 @@ def update_minibatch(
     source_success_actor_gate: bool = False,
     fused_behavior_statistics: bool = False,
     reward_floor: float = 0.0,
+    value_scope: str = "critic",
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -2745,10 +2932,27 @@ def update_minibatch(
     update's. The lambda-one value targets come from rewards alone, which
     they equal in exact arithmetic without the telescoped baseline terms.
     Latent thoughts and TPO log-odds have no fused form.
+
+    A critic with an action head also fits Q(s_t, a_t) to the same
+    lambda-one targets, and the actor's advantages bootstrap from it
+    (``action_value_advantages``). ``value_scope="action_head"`` is a
+    value-only update of that head alone, for warming it against a critic
+    whose values are already fit; it steps only the ``critic_action``
+    optimizer.
     """
     backbone = wrapper.backbone
+    action_head = critic.action_head is not None
+    if value_scope not in ("critic", "action_head"):
+        raise ValueError(f"unknown value scope {value_scope!r}")
+    if value_scope == "action_head" and not (value_only and action_head):
+        raise ValueError(
+            "an action-head-only update is value-only on a critic with one"
+        )
+    if action_head and target_policy_optimization:
+        raise ValueError("TPO does not consume action-value advantages")
+    critic_role = "critic_action" if value_scope == "action_head" else "critic"
     if critic_step:
-        zero_optimizers(optimizers, "critic")
+        zero_optimizers(optimizers, critic_role)
     if actor_step and "actor" in optimizers:
         zero_optimizers(optimizers, "actor")
     if replay_max_trajectories < 1:
@@ -2825,6 +3029,8 @@ def update_minibatch(
             "carry_input_delta_square_sum", "carry_token_square_sum",
             "memory_write_beta_sum", "memory_decay_log_timescale_sum",
             "memory_write_count",
+            "action_value_loss", "action_residual_sum",
+            "action_residual_square_sum",
         )
     }
 
@@ -2841,12 +3047,21 @@ def update_minibatch(
     )
 
     def actor_advantages() -> torch.Tensor:
-        advantages, _ = generalized_advantage_and_return_targets(
-            batch.rewards,
-            batch.old_values,
-            batch.action_mask,
-            lambdas,
-        )
+        if action_head:
+            advantages = action_value_advantages(
+                batch.rewards,
+                batch.old_values,
+                batch.old_action_values,
+                batch.action_mask,
+                lambdas,
+            )
+        else:
+            advantages, _ = generalized_advantage_and_return_targets(
+                batch.rewards,
+                batch.old_values,
+                batch.action_mask,
+                lambdas,
+            )
         return advantages.detach() * actor_signal_rows[:, None]
 
     if fused_behavior_statistics:
@@ -2866,9 +3081,12 @@ def update_minibatch(
             batch.action_mask,
             lambdas,
         )
-        advantages = advantages.detach()
-        if not value_only:
-            advantages = advantages * actor_signal_rows[:, None]
+        if value_only:
+            advantages = advantages.detach()
+        elif action_head:
+            advantages = actor_advantages()
+        else:
+            advantages = advantages.detach() * actor_signal_rows[:, None]
     value_targets = value_targets.detach()
     actor_active_mask = (
         batch.action_mask * actor_signal_rows[:, None]
@@ -2906,12 +3124,12 @@ def update_minibatch(
 
     def critic_shard(
         shard_index: int, microbatch: LatentRolloutBatch, shard
-    ) -> torch.Tensor:
-        """Critic forward/backward for one shard; returns detached values."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Critic forward/backward for one shard; returns detached (V, Q)."""
         rows = shard.rows
         stream_length = shard.stream_length
         micro_value_targets = value_targets[rows, :stream_length]
-        values = critic.values(microbatch)
+        values, action_values = critic.estimates(microbatch)
         # Unclipped squared error: the regression target is the lambda-one
         # return, independent of the old values, so there is no old-value
         # trust region to enforce.
@@ -2919,7 +3137,30 @@ def update_minibatch(
         local_value_numerator = (value_error * microbatch.action_mask).sum()
         weighted_critic_loss = (
             local_value_numerator / value_action_denominator.clamp_min(1)
+            if value_scope == "critic"
+            # V is fit already; only the head's loss reaches a gradient.
+            else local_value_numerator.new_zeros(())
         )
+        if action_values is not None:
+            # Q regresses on the same lambda-one return: the head sees V
+            # detached, so it fits the residual R - V from the action alone.
+            local_action_numerator = (
+                (action_values - micro_value_targets).square()
+                * microbatch.action_mask
+            ).sum()
+            weighted_critic_loss = weighted_critic_loss + (
+                local_action_numerator / value_action_denominator.clamp_min(1)
+            )
+            with torch.no_grad():
+                action_residuals = micro_value_targets - action_values.detach()
+                totals["action_value_loss"] += local_action_numerator.detach()
+                totals["action_residual_sum"] += (
+                    action_residuals * microbatch.action_mask
+                ).sum()
+                totals["action_residual_square_sum"] += (
+                    action_residuals.square() * microbatch.action_mask
+                ).sum()
+            action_values = action_values.detach()
         finite_guards.append(
             (
                 shard_index,
@@ -2959,7 +3200,7 @@ def update_minibatch(
                 totals["advantage_square_sum"] += (
                     residuals.square() * microbatch.action_mask
                 ).sum()
-        return values
+        return values, action_values
 
     def actor_shard(
         shard_index: int, microbatch: LatentRolloutBatch, shard
@@ -3283,13 +3524,17 @@ def update_minibatch(
         for shard_index, (microbatch, shard) in enumerate(
             iter_planned_replay_microbatches(batch, replay_plan)
         ):
-            values = critic_shard(shard_index, microbatch, shard)
+            values, action_values = critic_shard(shard_index, microbatch, shard)
             with torch.no_grad():
                 # Advanced row indexing materializes a copy, so assignment
                 # targets the parent, as in refresh_old_statistics.
                 batch.old_values[shard.rows, : shard.stream_length] = (
                     values.float()
                 )
+                if action_values is not None:
+                    batch.old_action_values[
+                        shard.rows, : shard.stream_length
+                    ] = action_values
         advantages = actor_advantages()
         for shard_index, (microbatch, shard) in enumerate(
             iter_planned_replay_microbatches(batch, replay_plan)
@@ -3373,16 +3618,42 @@ def update_minibatch(
         "emit_action_count": batch.emit_mask.sum(),
         "actor_active_trajectory_fraction": actor_signal_rows.float().mean(),
     }
+    if action_head:
+        # Same moments as V's, against the same targets: the head's own fit,
+        # and how much of V's residual the sampled action explains.
+        action_residual_mean = totals["action_residual_sum"] / action_denom
+        action_residual_variance = (
+            totals["action_residual_square_sum"] / action_denom
+            - action_residual_mean.square()
+        ).clamp_min(0)
+        metric_tensors.update(
+            action_value_loss=totals["action_value_loss"] / action_denom,
+            action_value_residual_mean=action_residual_mean,
+            action_value_residual_variance=action_residual_variance,
+            action_value_explained_variance=torch.where(
+                target_variance > 1e-12,
+                1.0 - action_residual_variance / target_variance.clamp_min(1e-12),
+                torch.zeros_like(target_variance),
+            ),
+            action_head_grad_norm=gradient_norm_tensor(
+                critic.action_head.parameters()
+            ),
+        )
     if value_only:
         metric_tensors["critic_grad_norm"] = gradient_norm_tensor(
             critic.parameters()
         )
         if critic_step:
-            step_optimizers(optimizers, "critic")
+            step_optimizers(optimizers, critic_role)
         return scalar_tensors_to_floats(metric_tensors)
     metric_tensors.update(
         credit_assignment_moments(
-            batch, advantages, value_targets, actor_signal_rows, reward_floor
+            batch,
+            advantages,
+            value_targets,
+            actor_signal_rows,
+            reward_floor,
+            action_values=batch.old_action_values if action_head else None,
         )
     )
 
@@ -3777,6 +4048,7 @@ def save_checkpoint(
         ),
         "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
         "critic_schema": CRITIC_SCHEMA,
+        "critic_action_head_schema": critic_action_head_schema(critic),
         "source_signal_mask_schema": (
             SOURCE_SIGNAL_MASK_SCHEMA
             if (
@@ -4249,6 +4521,7 @@ def main() -> None:
             mlp_hidden=args.combined_mlp_hidden,
             num_blocks=args.combined_mlp_blocks,
             actor_memory=wrapper.combiner if wrapper.memory_carry else None,
+            action_head_hidden=args.critic_action_head_hidden,
         ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if actor_init_payload is not None:
@@ -4295,6 +4568,7 @@ def main() -> None:
         trunk_optimizer=args.trunk_optimizer,
         muon_learning_rate=args.muon_learning_rate,
         critic_muon_learning_rate=args.critic_muon_learning_rate,
+        critic_action_learning_rate=args.critic_action_head_learning_rate,
     )
     if carry_critic:
         carry_init_critic(critic, optimizers, actor_init_payload, args)
@@ -4792,6 +5066,14 @@ def main() -> None:
                 f"{CRITIC_SCHEMA!r}; got {payload.get('critic_schema')!r}; "
                 "old critic heads are never migrated"
             )
+        if payload.get("critic_action_head_schema") != (
+            critic_action_head_schema(critic)
+        ):
+            raise ValueError(
+                "resume checkpoint critic action head schema is "
+                f"{payload.get('critic_action_head_schema')!r}, expected "
+                f"{critic_action_head_schema(critic)!r}"
+            )
         critic.load_state_dict(payload["critic"], strict=True)
         expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
             args.trunk_optimizer
@@ -4861,6 +5143,13 @@ def main() -> None:
         )
         remaining_actor_steps = max(args.steps - start_step, 0)
         warmup_prompt_count = args.prompts_per_minibatch * warmup_updates
+        # An action-head warmup rewinds the cursor (see the warmup loop), so
+        # its prompts overlap the actor's instead of preceding them.
+        actor_start_cursor = (
+            actor_init_provenance["target_sampler_cursor"]
+            if warmup_updates and rewinds_warmup_prompts(args)
+            else None
+        )
         if args.consume_all_prompts:
             planned_prompt_count, _ = plan_one_pass_training(
                 dataset_rows=len(math_rows),
@@ -4868,6 +5157,14 @@ def main() -> None:
                 warmup_updates=warmup_updates,
                 remaining_actor_steps=remaining_actor_steps,
                 prompts_per_minibatch=args.prompts_per_minibatch,
+                actor_start_cursor=actor_start_cursor,
+            )
+        elif actor_start_cursor is not None:
+            planned_prompt_count = max(
+                warmup_prompt_count,
+                actor_start_cursor
+                + args.prompts_per_minibatch * remaining_actor_steps
+                - sampler.cursor,
             )
         else:
             planned_prompt_count = args.prompts_per_minibatch * (
@@ -5308,10 +5605,12 @@ def main() -> None:
     trim_multiple = args.replay_bucket if args.compile_replay else 1
     if args.compile_replay:
         torch._dynamo.config.cache_size_limit = 64
-        critic.values = profiler.register_artifact(
-            "critic_values",
+        # ``values`` reads the instance's ``estimates``, so rebinding that one
+        # method compiles both the value and the action-value paths.
+        critic.estimates = profiler.register_artifact(
+            "critic_estimates",
             torch.compile(
-                critic.values,
+                critic.estimates,
                 # Length buckets still span many GEMM shapes. Max-autotune
                 # repeatedly stalls training to benchmark each new regime;
                 # default Inductor dispatches them to stable cuBLAS kernels.
@@ -5553,6 +5852,8 @@ def main() -> None:
                         frozen_moe_router_parameters
                     ),
                     "critic_schema": CRITIC_SCHEMA,
+                    "action_head_schema": critic_action_head_schema(critic),
+                    "action_head_hidden": args.critic_action_head_hidden,
                     "combined_mlp_hidden": args.combined_mlp_hidden,
                     "combined_mlp_blocks": args.combined_mlp_blocks,
                     "parameters": sum(p.numel() for p in critic.parameters()),
@@ -6328,6 +6629,9 @@ def main() -> None:
     checkpoint_policy = RecoveryCheckpointPolicy(
         args.checkpoint_interval_seconds
     )
+    # An action-head warmup fits only the head, against the carried values.
+    warmup_scope = args.value_warmup_scope.replace("-", "_")
+    warmup_role = "critic_action" if warmup_scope == "action_head" else "critic"
     if start_step == 0 and warmup_step < args.value_warmup_steps:
         for warmup in range(warmup_step + 1, args.value_warmup_steps + 1):
             warmup_started = time.perf_counter()
@@ -6358,7 +6662,7 @@ def main() -> None:
             device_batch = packed.to(device, non_blocking=True)
             device_replay_plan = replay_plan.to(device, non_blocking=True)
             del packed, replay_plan
-            zero_optimizers(optimizers, "critic")
+            zero_optimizers(optimizers, warmup_role)
             metrics = training_update(
                 wrapper,
                 critic,
@@ -6371,8 +6675,9 @@ def main() -> None:
                 replay_bucket=args.replay_bucket,
                 replay_slot_budget=args.replay_slot_budget,
                 replay_plan=device_replay_plan,
+                value_scope=warmup_scope,
             )
-            step_optimizers(optimizers, "critic")
+            step_optimizers(optimizers, warmup_role)
             del device_batch, device_replay_plan
             update_seconds = time.perf_counter() - update_started
             value_metrics = aggregate_value_diagnostics([metrics])
@@ -6388,11 +6693,19 @@ def main() -> None:
                 explained_variance=value_metrics["explained_variance"],
                 value_loss=value_metrics["loss"],
             )
-            logger.log(type="value_warmup", step=warmup, **metrics)
+            logger.log(
+                type="value_warmup", step=warmup, scope=warmup_scope, **metrics
+            )
             print(
                 f"critic warmup:{warmup}/{args.value_warmup_steps} "
                 f"collect:{collect_seconds:.2f}s update:{update_seconds:.2f}s "
-                f"value_loss:{metrics['value_loss']:.6f}",
+                f"value_loss:{metrics['value_loss']:.6f}"
+                + (
+                    ""
+                    if critic.action_head is None
+                    else f" action_value_loss:{metrics['action_value_loss']:.6f}"
+                    f" action_ev:{metrics['action_value_explained_variance']:.4f}"
+                ),
                 flush=True,
             )
             warmup_dashboard = {
@@ -6410,13 +6723,37 @@ def main() -> None:
                     "critic_grad_norm"
                 ],
             }
+            if critic.action_head is not None:
+                warmup_dashboard.update(
+                    {
+                        "value_warmup/action_value_mse": metrics[
+                            "action_value_loss"
+                        ],
+                        "value_warmup/action_value_online_explained_variance": (
+                            metrics["action_value_explained_variance"]
+                        ),
+                        "value_warmup/action_head_grad_norm": metrics[
+                            "action_head_grad_norm"
+                        ],
+                    }
+                )
             for tag, value in warmup_dashboard.items():
                 tensorboard.add_scalar(tag, value, warmup)
             # The optimizer state is sufficient for the next update and for
             # checkpoints. Keeping the accumulated gradient buffers alive
             # overlaps them with the next rollout's KV cache for no benefit.
-            zero_optimizers(optimizers, "critic")
+            zero_optimizers(optimizers, warmup_role)
             warmup_step = warmup
+            if warmup == args.value_warmup_steps and rewinds_warmup_prompts(args):
+                # Recovery checkpoints inside the warmup keep the advanced
+                # cursor so a resumed warmup draws fresh prompts; only the
+                # boundary hands the actor the stream it started from.
+                sampler.cursor = actor_init_provenance["target_sampler_cursor"]
+                print(
+                    f"critic warmup: prompt cursor rewound to {sampler.cursor} "
+                    "for the first actor step",
+                    flush=True,
+                )
             checkpoint_state = (start_step, warmup_step, sampler.cursor)
             checkpoint_due = checkpoint_policy.due()
             if warmup == args.value_warmup_steps:
