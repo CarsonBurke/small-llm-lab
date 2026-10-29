@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -108,3 +110,94 @@ def test_unknown_estimator_is_rejected():
 
     with pytest.raises(ValueError, match="unknown estimator"):
         simulate(TASKS["lottery"], ["dgfoo_group"], argparse.Namespace())
+
+
+def test_oracle_action_values_match_state_values_and_substitution():
+    """Q(s_t, a) = V(s_{t+1}) with token t set to a; V(s_t) = pi_t . Q(s_t, .)."""
+    from postraining.sim_dg_sequence_credit import oracle_action_values
+
+    for name, task in TASKS.items():
+        probs, tokens, context = _sample(task, seed=5, samples=32)
+        values = oracle_values(task, probs, tokens, context)
+        alpha, beta, feature = oracle_action_values(task, probs, tokens, context)
+        expected_pi = (probs * feature).sum(-1)[:, :, None]
+        torch.testing.assert_close(alpha + beta * expected_pi, values, msg=name)
+        # Substitute a random token at every position in turn.
+        generator = torch.Generator().manual_seed(6)
+        length = tokens.shape[-1]
+        for t in range(length):
+            swapped = tokens.clone()
+            swapped[..., t] = torch.randint(0, task.vocab, tokens.shape[:-1], generator=generator)
+            q = alpha[..., t] + beta[..., t] * feature[:, :, t].gather(-1, swapped[..., t])
+            if t + 1 < length:
+                target = oracle_values(task, probs, swapped, context)[..., t + 1]
+            else:
+                target = _expected_reward(task, swapped, context)
+            torch.testing.assert_close(q, target, msg=f"{name} position {t}")
+
+
+def test_exact_token_q_advantage_is_lambda_zero_oracle():
+    """Q(s, a_t) - pi . Q(s, .) equals TD(0) on exact values against the
+    expected reward (the realized reward differs only by the coherence draw)."""
+    from postraining.sim_dg_sequence_credit import oracle_action_values
+
+    for name, task in TASKS.items():
+        probs, tokens, context = _sample(task, seed=7, samples=16)
+        alpha, beta, feature = oracle_action_values(task, probs, tokens, context)
+        taken = feature.gather(-1, tokens.transpose(2, 3)).transpose(2, 3)
+        token_q = beta * (taken - (probs * feature).sum(-1)[:, :, None])
+        values = oracle_values(task, probs, tokens, context)
+        td0 = gae_advantages(values, _expected_reward(task, tokens, context), 0.0)
+        torch.testing.assert_close(token_q, td0, msg=name)
+
+
+def test_entropy_drift_is_first_order_entropy_change():
+    from postraining.sim_dg_sequence_credit import entropy, entropy_drift
+
+    task = TASKS["lottery"]
+    generator = torch.Generator().manual_seed(8)
+    logits = torch.randn(2, 3, task.filler + 1, task.vocab, generator=generator, dtype=torch.float64)
+    grad = torch.randn(logits.shape, generator=generator, dtype=torch.float64)
+    noncausal = torch.ones(task.filler, dtype=torch.bool)
+    drift = entropy_drift(F.log_softmax(logits, -1), grad, task, noncausal)
+    eps = 1e-6
+    change = (entropy(logits - eps * grad) - entropy(logits + eps * grad)) / (2 * eps)
+    torch.testing.assert_close(drift, change[:, :, : task.filler].mean((1, 2)))
+
+
+def test_new_estimators_run_and_existing_ones_are_unchanged():
+    import argparse
+
+    from postraining.sim_dg_sequence_credit import simulate
+
+    args = argparse.Namespace(
+        policy="mlp", features=8, hidden=16, optimizer="adam", lr=1e-3, eta=1.0, value_noise=0.01,
+        oracle_lambda=0.0, oracle_value_noise=0.01, oracle_shrink=0.3, steps=2, samples=4, seeds=1, log_every=1,
+    )
+    task = TASKS["chain_coherence"]
+    old = ["pg_group", "dg_oracle"]
+    new = ["pg_qprop", "dg_qprop", "pg_tokenq", "dg_tokenq", "dgquad_group", "dgexact_group", "dgprefix_group", "dg_loo", "pg_groupnorm", "dg_split", "pg_split"]
+    alone = simulate(task, old, args)["history"]
+    mixed = simulate(task, new, args)["history"]
+    for row in mixed:
+        for key, values in row.items():
+            if key not in ("step", "gate_pos_mean", "gate_neg_mean"):
+                assert all(math.isfinite(v) for v in values), key
+    # Same estimators, same draws: rerunning reproduces the history exactly.
+    assert simulate(task, old, args)["history"] == alone
+
+
+def test_exact_centring_zeroes_a_null_token_within_its_group():
+    """Given the group's rewards, a token whose surprisal is the same in every
+    sample gets mean DG coefficient exactly the null coefficient at p_hat."""
+    from postraining.sim_dg_sequence_credit import null_coefficient
+
+    rewards = torch.tensor([1.0] + [0.0] * 15, dtype=torch.float64)
+    p_hat = rewards.mean()
+    for scale in (0.5, 3.0, 10.0):
+        u = rewards - p_hat
+        mean = (u * torch.sigmoid(u * scale)).mean()
+        torch.testing.assert_close(null_coefficient(p_hat, p_hat, torch.tensor(scale, dtype=torch.float64)), mean)
+    # Small delight: the quadratic approximation s Var(U) / 4.
+    s = torch.tensor(1e-3, dtype=torch.float64)
+    torch.testing.assert_close(null_coefficient(p_hat, p_hat, s), s * p_hat * (1 - p_hat) / 4, rtol=1e-3, atol=0)

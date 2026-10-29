@@ -352,6 +352,10 @@ def main() -> None:
                         trunk_optimizer=saved["trunk_optimizer"],
                         muon_learning_rate=(saved.get("muon_learning_rate") or 0.0) * multiplier or None,
                         critic_muon_learning_rate=saved.get("critic_muon_learning_rate"),
+                        # The fresh modules are actor parameters: their
+                        # rates scale with the probed actor step too.
+                        fresh_learning_rate=(saved.get("fresh_learning_rate") or 0.0) * multiplier or None,
+                        fresh_muon_learning_rate=(saved.get("fresh_muon_learning_rate") or 0.0) * multiplier or None,
                     )
                     tlv.delightful_policy_loss = patched_actor_loss(
                         estimator, torch.Generator().manual_seed(pool_seed)

@@ -60,6 +60,27 @@ advantage scale, keeping the raw advantage as the magnitude:
 ``dgrms`` includes the zero advantages of all-equal groups, so its scale
 also tracks the fraction of mixed groups.
 
+Three DG gates subtract the coefficient a token with no effect on R expects,
+removing DG's rectification of advantage spread into a rarity bonus:
+``dgquad`` its second-order value l Var(A) / (4 eta) (Var over the group's
+samples at the position), ``dgexact`` the exact value for binary group
+advantages at the group's success rate, and ``dgprefix`` the same with the
+exact prefix success probability E[R | h_t] in place of the group's.
+
+Advantages beyond ``group``, ``gae`` and ``oracle`` (lambda-``--oracle-
+lambda`` GAE over exact values): ``loo`` (leave-one-out baseline),
+``groupnorm`` (divided by the group's reward std), and three built on the
+exact action values Q(s_t, a) = E[R | prefix, a] for every token, corrupted
+like the oracle critic (shrink toward the running mean, iid error per
+(state, action) entry):
+
+- ``tokenq``: Q(s_t, a_t) - pi . Q(s_t, .), the production trainer's
+  policy-centred token advantage; with an exact Q it is lambda-0 credit.
+- ``qprop``: Q-Prop, (R - Q(s_t, a_t)) on the sampled token (gated for DG)
+  plus the ungated analytic term sum_a pi(a) Q(s_t, a).
+- ``split``: 0.5 (R - b_loo - A_t) + g A_t with A_t the ``tokenq`` advantage
+  and g the DG gate, or 1/2 for PG, which then is (R - b_loo) / 2.
+
 ``expected_success`` is the exact expected reward for the answer tasks and
 the mean per-position target probability for ``graded``/``sequential``.
 
@@ -90,8 +111,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-ADVANTAGES = ("group", "gae", "oracle")
-GATES = ("pg", "dg", "dgrms", "dgbase")
+ADVANTAGES = ("group", "loo", "groupnorm", "gae", "oracle", "tokenq", "qprop", "split")
+GATES = ("pg", "dg", "dgrms", "dgbase", "dgquad", "dgexact", "dgprefix")
+# DG gates that subtract an estimate of the coefficient a null token gets.
+CENTRED = ("dgquad", "dgexact", "dgprefix")
+GROUP_KINDS = ("group", "loo", "groupnorm")
 ESTIMATORS = tuple(f"{g}_{a}" for a in ADVANTAGES for g in ("pg", "dg"))
 
 
@@ -115,6 +139,8 @@ TASKS = {
     "lottery": Task("lottery", 64, 48, 256, 5, 1.0, (0.002, 0.2)),
     "coherence": Task("coherence", 64, 48, 256, 5, 1.0, (0.004, 0.4), junk_penalty=True),
     "chain": Task("chain", 64, 48, 256, 5, 1.0, (0.05, 0.5), causal=3),
+    # Our regime: about 3% initial success.
+    "coherence_low": Task("coherence_low", 64, 48, 256, 5, 1.0, (0.003, 0.1), junk_penalty=True),
     "chain_rare": Task(
         "chain_rare", 64, 48, 256, 5, 1.0, (0.1, 0.6), causal=1, causal_success=(0.01, 0.1)
     ),
@@ -279,6 +305,80 @@ def oracle_values(task: Task, probs, tokens, context) -> torch.Tensor:
     return value
 
 
+def oracle_action_values(task: Task, probs, tokens, context) -> tuple[torch.Tensor, ...]:
+    """Exact Q(s_t, a) = E[R | prefix, a_t = a] for every token, in factored form.
+
+    In every task the token at position t moves the expected reward through
+    one 0/1 feature of that token (its target, the causal target, or
+    coherent-set membership), so Q(s_t, a) = alpha_t + beta_t * f_t(a).
+    Returns ``alpha`` and ``beta`` (runs, prompts, samples, length) and
+    ``feature`` (runs, prompts, length, vocab); the feature depends only on
+    the position, never on the sampled prefix. At the answer position Q is the
+    expected reward of the complete response, without the coherence draw.
+    Consistency with ``oracle_values``: V(s_t) = alpha_t + beta_t * pi_t . f_t,
+    and Q(s_t, a_t) = V(s_{t+1}).
+    """
+    runs, prompts, samples, length = tokens.shape
+    vocab = probs.shape[-1]
+    dtype = probs.dtype
+    filler_probs = probs[:, :, : task.filler]
+    filler_tokens = tokens[..., : task.filler]
+    feature = torch.zeros(runs, prompts, length, vocab, dtype=dtype)
+    if task.answer_success is None:
+        target = context["target"]
+        feature.scatter_(-1, target[..., None], 1.0)
+        p = filler_probs.gather(-1, target[..., None]).squeeze(-1)[:, :, None]
+        correct = (filler_tokens == target[:, :, None]).to(dtype)
+        if task.name != "sequential":
+            alpha = (exclusive_prefix(correct, "sum")[..., :-1] + inclusive_suffix(p, "sum")[..., 1:]) / task.filler
+            return alpha, torch.full_like(alpha, 1 / task.filler), feature
+        tails = [torch.zeros_like(p[..., :1])]
+        for j in range(task.filler - 1, -1, -1):
+            tails.append(p[..., j : j + 1] * (1 + tails[-1]))
+        tail = torch.cat(tails[::-1], -1)  # tail[j]: expected credit from position j on
+        alpha = exclusive_prefix(correct.cumprod(-1), "sum")[..., :-1] / task.filler
+        beta = exclusive_prefix(correct, "prod")[..., :-1] * (1 + tail[..., 1:]) / task.filler
+        return alpha, beta, feature
+    target = context["target"]
+    answer = probs[:, :, -1].gather(-1, target[..., None]).squeeze(-1)[:, :, None, None]
+    feature[:, :, -1].scatter_(-1, target[..., None], 1.0)
+    # Causal product with position t left out: realized before t, expected after.
+    realized = torch.ones_like(filler_tokens, dtype=dtype)
+    expected = torch.ones_like(filler_probs[..., 0])
+    causal = torch.zeros(task.filler, dtype=torch.bool)
+    if task.causal:
+        positions, causal_target = context["causal_positions"], context["causal_target"]
+        causal[positions] = True
+        realized[..., positions] = (filler_tokens[..., positions] == causal_target[:, :, None]).to(dtype)
+        expected[..., positions] = filler_probs[:, :, positions].gather(-1, causal_target[..., None]).squeeze(-1)
+        feature[:, :, positions] = feature[:, :, positions].scatter(-1, causal_target[..., None], 1.0)
+    chain_out = exclusive_prefix(realized, "prod")[..., :-1] * inclusive_suffix(expected, "prod")[..., 1:][:, :, None]
+    # Junk fraction with position t left out, and the weight of t's own token.
+    junk_out = torch.ones_like(chain_out)
+    junk_weight = torch.zeros(task.filler, dtype=dtype)
+    junk_realized = torch.ones_like(filler_tokens[..., 0], dtype=dtype)
+    if task.junk_penalty:
+        noncausal = context["noncausal"].to(dtype)
+        in_set = (filler_tokens[..., None] == context["coherent"][:, :, None]).any(-1).to(dtype)
+        mass = filler_probs.gather(-1, context["coherent"]).sum(-1)
+        junk_out = (
+            exclusive_prefix(in_set * noncausal, "sum")[..., :-1]
+            + inclusive_suffix(mass * noncausal, "sum")[..., 1:][:, :, None]
+        ) / noncausal.sum()
+        junk_weight = noncausal / noncausal.sum()
+        junk_realized = (in_set * noncausal).sum(-1) / noncausal.sum()
+        coherent = torch.zeros_like(feature[:, :, : task.filler]).scatter_(-1, context["coherent"], 1.0)
+        feature[:, :, : task.filler] = torch.where(causal[:, None], feature[:, :, : task.filler], coherent)
+    base = answer * chain_out
+    alpha = torch.where(causal, 0.0, base * junk_out)
+    beta = torch.where(causal, base * junk_out, base * junk_weight)
+    # Answer position: Q = 1[a = target] * realized chain * realized junk fraction.
+    final = realized.prod(-1) * junk_realized
+    alpha = torch.cat((alpha, torch.zeros_like(final[..., None])), -1)
+    beta = torch.cat((beta, final[..., None]), -1)
+    return alpha, beta, feature
+
+
 def gate_temperature(
     advantage: torch.Tensor,
     rewards: torch.Tensor,
@@ -304,9 +404,73 @@ def gate_temperature(
     return eta * torch.where(scale > 0, scale, one)
 
 
+def null_coefficient(success, p_hat, delight_scale) -> torch.Tensor:
+    """E[U sigmoid(U s)] for U = R - p_hat, R ~ Bernoulli(success), s = l / eta.
+
+    The DG coefficient a token with no effect on R expects; with
+    ``success = p_hat`` it is p(1-p)[sigmoid((1-p)s) - sigmoid(-p s)], whose
+    second-order expansion is s p(1-p) / 4 = s Var(U) / 4.
+    """
+    rise = (1 - p_hat) * torch.sigmoid((1 - p_hat) * delight_scale)
+    fall = -p_hat * torch.sigmoid(-p_hat * delight_scale)
+    return success * rise + (1 - success) * fall
+
+
 def entropy(logits: torch.Tensor) -> torch.Tensor:
     logp = F.log_softmax(logits, -1)
     return -(logp.exp() * logp).sum(-1)
+
+
+def entropy_gradient(logp: torch.Tensor) -> torch.Tensor:
+    """dH/dz for a softmax over logits z: -pi_k (log pi_k + H)."""
+    probs = logp.exp()
+    return -probs * (logp - (probs * logp).sum(-1, keepdim=True))
+
+
+def entropy_drift(logp, logit_grad, task: Task, noncausal) -> torch.Tensor:
+    """First-order entropy change of one plain gradient step on the logits.
+
+    ``logit_grad`` is the loss gradient on the logits scaled to a per-sample
+    mean, so the result is in coefficient units per state: what a tabular
+    policy's entropy would do per unit learning rate. Averaged over prompts
+    and the non-causal filler positions; returns (runs,).
+    """
+    drift = -(entropy_gradient(logp) * logit_grad).sum(-1)[:, :, : task.filler]
+    return drift[..., noncausal].mean((1, 2))
+
+
+def noncausal_credit(task: Task, logp, token_logp, advantage, coefficient, temperature, noncausal) -> dict:
+    """Sampled-term credit on non-causal filler tokens, per run.
+
+    ``coef_surprisal_corr``: Pearson correlation of the sampled coefficient
+    with the token's surprisal. ``excess_drift``: the first-order (softmax,
+    per token) entropy change of the coefficient's excess over half the
+    advantage, the part by which DG differs from PG/2. ``rectified``: the
+    second-order prediction of that excess's mean, l Var(A) / (4 eta), with
+    Var(A) over the group's samples at the position.
+    """
+    pick = lambda x: x[..., : task.filler][..., noncausal]  # (runs, prompts, samples, n)
+    surprisal = pick(-token_logp)
+    # Per state: H and sum_k pi_k^2 (log pi_k + H), broadcast over samples.
+    state_logp = logp[:, :, : task.filler][:, :, noncausal][:, :, None]
+    state_probs = state_logp.exp()
+    h = -(state_probs * state_logp).sum(-1)
+    curvature = (state_probs.square() * (state_logp + h[..., None])).sum(-1)
+    # <dH/dz, e_a - pi> = pi_a (l - H) + sum_k pi_k^2 (log pi_k + H).
+    direction = (-surprisal).exp() * (surprisal - h) + curvature
+    coef, adv = pick(coefficient), pick(advantage)
+    excess = coef - adv / 2
+    c, l = coef.flatten(1), surprisal.flatten(1)
+    c, l = c - c.mean(1, keepdim=True), l - l.mean(1, keepdim=True)
+    corr = (c * l).sum(1) / (c.square().sum(1) * l.square().sum(1)).sqrt().clamp_min(1e-30)
+    spread = pick(advantage.var(2, unbiased=False, keepdim=True).expand_as(advantage))
+    return {
+        "noncausal_coef_surprisal_corr": corr.tolist(),
+        "noncausal_excess_drift": (excess * direction).mean((1, 2, 3)).tolist(),
+        "noncausal_rectified": (surprisal * spread / (4 * temperature)).mean((1, 2, 3)).tolist(),
+        "noncausal_excess_mean": excess.mean((1, 2, 3)).tolist(),
+        "noncausal_advantage_var": spread.mean((1, 2, 3)).tolist(),
+    }
 
 
 def simulate(task: Task, estimators: list[str], args) -> dict:
@@ -314,6 +478,11 @@ def simulate(task: Task, estimators: list[str], args) -> dict:
         gate, _, kind = estimator.partition("_")
         if gate not in GATES or kind not in ADVANTAGES:
             raise ValueError(f"unknown estimator {estimator!r}")
+        # The exact null coefficient assumes U = R - group mean with R in {0, 1}.
+        if gate in ("dgexact", "dgprefix") and (kind != "group" or task.answer_success is None):
+            raise ValueError(f"{estimator!r} needs group advantages over a binary-reward task")
+        if kind == "split" and gate not in ("pg", "dg"):
+            raise ValueError(f"{estimator!r}: split is defined for the pg and dg gates only")
     runs = [(estimator, seed) for estimator in estimators for seed in range(args.seeds)]
     inits = [initial_policy(task, seed) for seed in range(args.seeds)]
     stack = lambda key: torch.stack([inits[seed][key] for _, seed in runs])
@@ -353,7 +522,8 @@ def simulate(task: Task, estimators: list[str], args) -> dict:
     generator = torch.Generator().manual_seed(10_000)
     history = []
     for step in range(args.steps + 1):
-        logp = F.log_softmax(policy.logits(), -1)  # (runs, prompts, length, vocab)
+        logits = policy.logits()
+        logp = F.log_softmax(logits, -1)  # (runs, prompts, length, vocab)
         with torch.no_grad():
             drawn = torch.multinomial(
                 logp.exp().flatten(0, 2), samples, replacement=True, generator=generator
@@ -376,11 +546,19 @@ def simulate(task: Task, estimators: list[str], args) -> dict:
                     in_set = (filler_tokens[..., None] == coherent[:, :, None]).any(-1)
                     fraction = in_set[..., noncausal].float().mean(-1)
                     rewards = rewards * (torch.rand(rewards.shape, generator=generator) < fraction)
-            group = (rewards - rewards.mean(-1, keepdim=True))[..., None].expand_as(token_logp)
+            centred = rewards - rewards.mean(-1, keepdim=True)
+            group = centred[..., None].expand_as(token_logp)
+            # R minus the mean of the group's other samples.
+            loo = group * samples / (samples - 1)
             noise = lambda std: std * torch.randn(token_logp.shape, generator=generator)
             advantage = torch.zeros_like(token_logp)
             if kind_mask["group"].any():
                 advantage = torch.where(kind_mask["group"], group, advantage)
+            if kind_mask["loo"].any():
+                advantage = torch.where(kind_mask["loo"], loo, advantage)
+            if kind_mask["groupnorm"].any():
+                normalized = centred / (rewards.std(-1, keepdim=True) + 1e-4)
+                advantage = torch.where(kind_mask["groupnorm"], normalized[..., None].expand_as(token_logp), advantage)
             if kind_mask["gae"].any():
                 values = running_mean[:, None, None, None] + noise(args.value_noise)
                 advantage = torch.where(kind_mask["gae"], gae_advantages(values, rewards, lam), advantage)
@@ -393,17 +571,94 @@ def simulate(task: Task, estimators: list[str], args) -> dict:
                 advantage = torch.where(
                     kind_mask["oracle"], gae_advantages(values, rewards, args.oracle_lambda), advantage
                 )
+            expected_q = None
+            token_q = kind_mask["tokenq"] | kind_mask["split"]
+            if token_q.any() or kind_mask["qprop"].any():
+                # The same partial critic over actions: Q~(s, a) = mean +
+                # shrink * (Q(s, a) - mean) + an iid error per (state, action)
+                # entry. Each sample's prefix is its own state.
+                alpha, beta, feature = oracle_action_values(task, logp.exp(), tokens, context)
+                mean = running_mean[:, None, None, None]
+                taken = feature.gather(-1, drawn).transpose(2, 3)
+                error = noise(args.oracle_value_noise)  # the error of the sampled entry
+                q_taken = mean + args.oracle_shrink * (alpha + beta * taken - mean) + error
+                if token_q.any():
+                    # sum_a pi(a) Q~(s, a). Given the sampled entry's error,
+                    # the other entries' errors are independent of it.
+                    probs = logp.exp()
+                    p_taken = token_logp.exp()
+                    covered = (probs.square().sum(-1)[:, :, None] - p_taken.square()).clamp_min(0)
+                    q_policy = (
+                        mean
+                        + args.oracle_shrink * (alpha + beta * (probs * feature).sum(-1)[:, :, None] - mean)
+                        + p_taken * error
+                        + covered.sqrt() * noise(args.oracle_value_noise)
+                    )
+                    advantage = torch.where(token_q, q_taken - q_policy, advantage)
+                if kind_mask["qprop"].any():
+                    advantage = torch.where(kind_mask["qprop"], rewards[..., None] - q_taken, advantage)
+                    # Sum over samples of Q~_s(s_t, a) for every a, dropping
+                    # a-independent terms (no gradient, since sum_a pi = 1).
+                    # Sampled entries carry the errors drawn above; the
+                    # samples - n_a unsampled ones are fresh.
+                    counts = torch.zeros_like(feature).scatter_add_(-1, drawn, torch.ones_like(drawn, dtype=feature.dtype))
+                    errors = torch.zeros_like(feature).scatter_add_(-1, drawn, error.transpose(2, 3))
+                    fresh = args.oracle_value_noise * (samples - counts).sqrt()
+                    fresh = fresh * torch.randn(feature.shape, generator=generator)
+                    expected_q = args.oracle_shrink * beta.sum(2)[..., None] * feature + errors + fresh
+                    expected_q = expected_q * kind_mask["qprop"]
             surprisal = -token_logp.detach()
             temperature = gate_temperature(
-                advantage, rewards, running_mean, gate_mask, kind_mask["group"], args.eta
+                advantage,
+                rewards,
+                running_mean,
+                gate_mask,
+                kind_mask["group"] | kind_mask["loo"] | kind_mask["groupnorm"],
+                args.eta,
             )
             gate = torch.where(
                 is_dg, torch.sigmoid(advantage * surprisal / temperature), torch.ones_like(advantage)
             )
+            # ``split``: the token's own credit A_t through the gate, plus the
+            # outcome luck left over, R - b_loo - A_t, ungated at the gate's
+            # small-signal weight 1/2. PG then reduces to (R - b_loo) / 2.
+            gate = torch.where(kind_mask["split"] & ~is_dg, torch.full_like(gate, 0.5), gate)
+            coefficient = gate * advantage
+            if kind_mask["split"].any():
+                residual = 0.5 * (loo - advantage)
+                coefficient = coefficient + torch.where(kind_mask["split"], residual, torch.zeros_like(residual))
+            # Centring: subtract the expected coefficient of a token with no
+            # effect on R, so DG's even-in-U term no longer pays for rarity.
+            centring = torch.zeros_like(advantage)
+            if gate_mask["dgquad"].any():
+                # Second order: l * Var(A) / (4 eta), with Var(A) over the
+                # group's samples at each position (for ``group``, the
+                # group's reward variance).
+                spread = advantage.var(2, unbiased=False, keepdim=True)
+                centring = torch.where(gate_mask["dgquad"], surprisal * spread / (4 * temperature), centring)
+            if gate_mask["dgexact"].any() or gate_mask["dgprefix"].any():
+                # U = R - p_hat is 1 - p_hat or -p_hat. A null token at
+                # prefix h succeeds with probability p(h): the prompt's p_hat
+                # (``dgexact``) or the exact E[R | h] (``dgprefix``).
+                p_hat = rewards.mean(-1)[..., None, None]
+                null = lambda success: null_coefficient(success, p_hat, surprisal / temperature)
+                centring = torch.where(gate_mask["dgexact"], null(p_hat), centring)
+                if gate_mask["dgprefix"].any():
+                    prefix = oracle_values(task, logp.exp(), tokens, context)
+                    centring = torch.where(gate_mask["dgprefix"], null(prefix), centring)
+            coefficient = coefficient - centring
             running_mean = 0.99 * running_mean + 0.01 * rewards.mean((1, 2))
+        log_step = step % args.log_every == 0
+        if log_step:
+            logits.retain_grad()
         # Token-mean loss per run, summed across runs (disjoint parameters).
-        loss = -(gate * advantage * token_logp).sum() / (prompts * samples * length)
-        if step % args.log_every == 0:
+        loss = -(coefficient * token_logp).sum() / (prompts * samples * length)
+        if expected_q is not None:
+            # Q-Prop's analytic term sum_a pi(a|s_t) Q(s_t, a), ungated, over
+            # every sampled state; the policy is prefix-independent, so the
+            # sum over samples folds into ``expected_q``.
+            loss = loss - (logp.exp() * expected_q).sum() / (prompts * samples * length)
+        if log_step:
             with torch.no_grad():
                 probs = logp.exp()
                 filler_probs = probs[:, :, : task.filler]
@@ -433,10 +688,15 @@ def simulate(task: Task, estimators: list[str], args) -> dict:
                         "filler_surprisal": surprisal[..., : task.filler].mean((1, 2, 3)).tolist(),
                         "mixed_group_fraction": mixed.tolist(),
                         "reward_mean": rewards.mean((1, 2)).tolist(),
+                        **noncausal_credit(task, logp.detach(), token_logp.detach(), advantage, coefficient, temperature, noncausal),
                     }
                 )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if log_step:
+            history[-1]["noncausal_entropy_drift"] = entropy_drift(
+                logp.detach(), logits.grad * (prompts * length), task, noncausal
+            ).tolist()
         optimizer.step()
     return {"runs": runs, "history": history}
 
