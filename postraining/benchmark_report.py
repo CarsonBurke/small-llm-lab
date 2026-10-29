@@ -362,8 +362,14 @@ def write_benchmark_report(
     attempts: Sequence[Mapping[str, Any]],
     reward_schema: str = "unspecified",
     schema: str | None = None,
+    problem_count: int = CAPTURE_PROBLEMS,
+    samples_per_problem: int = CAPTURE_SAMPLES_PER_PROBLEM,
 ) -> dict[str, Path]:
     """Atomically persist JSON history/latest and the latest HTML report.
+
+    ``attempts`` must be the complete leading ``problem_count`` by
+    ``samples_per_problem`` grid; the periodic benchmark keeps the 4x4
+    default, standalone inspection may capture more.
 
     ``schema`` defaults to the current answers schema; a rewrite of an
     older stored payload (the resume purge path) passes the source's own
@@ -374,13 +380,16 @@ def write_benchmark_report(
         (dict(attempt) for attempt in attempts),
         key=lambda item: (int(item["problem_index"]), int(item["sample_index"])),
     )
-    _validate_attempts(ordered)
+    _validate_attempts(
+        ordered, problem_count=problem_count,
+        samples_per_problem=samples_per_problem,
+    )
     payload = {
         "schema": schema or BENCHMARK_ANSWER_SCHEMA,
         "step": int(step),
         "reward_schema": reward_schema,
-        "problem_count": CAPTURE_PROBLEMS,
-        "samples_per_problem": CAPTURE_SAMPLES_PER_PROBLEM,
+        "problem_count": int(problem_count),
+        "samples_per_problem": int(samples_per_problem),
         "metrics": dict(metrics),
         "attempts": ordered,
     }

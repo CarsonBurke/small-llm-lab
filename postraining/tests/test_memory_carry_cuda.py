@@ -140,12 +140,14 @@ def _make_live(wrapper, seed):
             )
 
 
-def _rollout(arena, prompts, lengths, seeds, new_tokens):
+def _rollout(arena, prompts, lengths, seeds, new_tokens, write_noise_scale=None):
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         return arena.rollout(
             prompts, lengths, prompt_repeats=4,
             max_new_tokens=new_tokens, max_stream_steps=new_tokens,
             token_seeds=seeds,
+            write_noise_seeds=None if write_noise_scale is None else seeds + 7,
+            write_noise_scale=write_noise_scale,
         )
 
 
@@ -238,6 +240,67 @@ def test_compiled_arena_records_what_the_compiled_replay_recomputes():
     assert report["compiled_vs_eager_inputs"] < 1e-2, report
     assert report["decode_vs_replay"] < 0.1, report
     assert report["decode_vs_replay"] < 2 * report["cot_floor_decode_vs_replay"] + 1e-3, report
+
+
+@pytest.mark.skipif(not CHECKPOINT.exists(), reason="needs the SFT checkpoint")
+def test_compiled_write_noise_arena_records_what_the_replay_regenerates():
+    """The graph-captured tick's write noise is the replay's, to the same
+    bf16 decode/replay floor as the noiseless arena, and it is load-bearing:
+    replaying the record without it misses by far more."""
+    device = torch.device("cuda")
+    torch.fx.experimental._config.use_duck_shape = False
+    wrapper = _wrapper(device)
+    _make_live(wrapper, seed=1)
+    generator = torch.Generator(device="cuda").manual_seed(2)
+    prompts, samples, width, new_tokens = 16, 4, 96, 384
+    lengths = torch.randint(
+        24, width + 1, (prompts,), device=device, generator=generator
+    ).cpu()
+    prompt_ids = torch.zeros((prompts, width), dtype=torch.long, device=device)
+    for row, length in enumerate(lengths.tolist()):
+        prompt_ids[row, width - length :] = torch.randint(
+            1, 50000, (length,), device=device, generator=generator
+        )
+    seeds = torch.arange(prompts * samples, device=device, dtype=torch.int64)
+    row_lengths = lengths.repeat_interleave(samples)
+    # Per prompt: noiseless, an antithetic pair, and a large draw.
+    scales = torch.tensor([0.0, 0.5, -0.5, 2.0], device=device).repeat(prompts)
+
+    def arena_for(write_noise):
+        return PinnedDecodeArena(
+            wrapper, rows=prompts * samples, kv_width=width + new_tokens,
+            temperature=1.0, stop_ids=(50256,), device=device, hidden_carry=True,
+            write_noise=write_noise,
+        )
+
+    noisy = _rollout(arena_for(True), prompt_ids, lengths, seeds, new_tokens, scales)
+    noiseless = _rollout(arena_for(False), prompt_ids, lengths, seeds, new_tokens)
+    assert torch.equal(noisy.write_noise_scale, scales)
+    packed = _replay_unit(noisy, row_lengths, samples)
+    stripped = copy.copy(packed)
+    stripped.write_noise_seeds = stripped.write_noise_scale = None
+    zero_rows = scales == 0
+    report = {
+        "decode_vs_replay": _decode_vs_replay(wrapper, packed),
+        "decode_vs_replay_without_noise": _decode_vs_replay(wrapper, stripped),
+        "noiseless_floor": _decode_vs_replay(
+            wrapper, _replay_unit(noiseless, row_lengths, samples)
+        ),
+        # bf16 tick kernels may differ between the two captures, so a zero
+        # row agrees with the noiseless arena to decode precision, not bits.
+        "zero_rows_token_agreement": float(
+            (noisy.token_ids[zero_rows] == noiseless.token_ids[zero_rows])
+            .float().mean()
+        ),
+        "noised_rows_token_agreement": float(
+            (noisy.token_ids[~zero_rows] == noiseless.token_ids[~zero_rows])
+            .float().mean()
+        ),
+    }
+    print(report)
+    assert report["decode_vs_replay"] < 2 * report["noiseless_floor"] + 1e-3, report
+    assert report["decode_vs_replay_without_noise"] > 5 * report["decode_vs_replay"], report
+    assert report["noised_rows_token_agreement"] < report["zero_rows_token_agreement"], report
 
 
 @pytest.mark.skipif(not CHECKPOINT.exists(), reason="needs the SFT checkpoint")

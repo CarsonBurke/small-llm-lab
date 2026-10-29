@@ -13,10 +13,15 @@ from postraining import muon as muon_module
 from postraining.latent_thought import LatentThoughtModel
 from postraining.muon import MUON_ALGORITHM_SCHEMA, Muon, _polar_express
 from postraining.nano_backbone import NanoGPTBackbone
+from types import SimpleNamespace
+
 from postraining.train_latent_vapo import (
+    build_arg_parser,
     build_optimizers,
+    reassert_learning_rates,
     renderer_parameters,
     step_optimizers,
+    validate_args,
     zero_optimizers,
 )
 from postraining.vapo.schemas import optimizer_schema_for_trunk_optimizer
@@ -704,3 +709,126 @@ def test_role_helpers_drive_muon_optimizers():
     zero_optimizers(optimizers, "critic")
     assert block_weight.grad is None
     assert critic_block_weight.grad is None
+
+
+def test_fresh_modules_train_from_scratch_in_their_own_optimizers():
+    from postraining.tests.test_memory_carry import _memory_critic, _memory_wrapper
+
+    wrapper = _memory_wrapper(live=False)
+    critic = _memory_critic(wrapper)
+    for parameter in wrapper.parameters():
+        parameter.requires_grad_(True)
+    optimizers = build_optimizers(
+        wrapper, critic, learning_rate=1e-5, trunk_optimizer="muon",
+        muon_learning_rate=2e-5, critic_muon_learning_rate=2e-5,
+        fresh_learning_rate=3e-3, fresh_muon_learning_rate=7e-3, fused=False,
+    )
+    assert set(optimizers) == {
+        "actor", "actor_muon", "actor_fresh", "actor_fresh_muon",
+        "critic", "critic_muon", "critic_fresh_muon",
+    }
+
+    def members(name):
+        return {id(p) for group in optimizers[name].param_groups for p in group["params"]}
+
+    combiner = list(wrapper.combiner.parameters())
+    # Pretraining's partition: every matrix (the gate projections too) under
+    # Muon, the gate biases under AdamW.
+    assert members("actor_fresh_muon") == {id(p) for p in combiner if p.ndim >= 2}
+    assert members("actor_fresh") == {id(p) for p in combiner if p.ndim < 2} != set()
+    assert not members("actor") & {id(p) for p in combiner}
+    # The critic's memory reader is bias-free: matrices only.
+    assert members("critic_fresh_muon") == {id(p) for p in critic.combiner.parameters()}
+    assert not members("critic") & members("critic_fresh_muon")
+    assert {group["lr"] for group in optimizers["actor_fresh"].param_groups} == {3e-3}
+    assert {group["lr"] for name in ("actor_fresh_muon", "critic_fresh_muon")
+            for group in optimizers[name].param_groups} == {7e-3}
+
+    # The role helpers step them, and the resume path reasserts their rates.
+    out = wrapper.combiner.reader.out.weight
+    out.grad = torch.randn_like(out)
+    step_optimizers(optimizers, "actor")
+    assert out.detach().abs().max() > 0
+    for optimizer in optimizers.values():
+        for group in optimizer.param_groups:
+            group["lr"] = 1.0
+    reassert_learning_rates(optimizers, SimpleNamespace(
+        learning_rate=1e-5, critic_learning_rate=1e-5, muon_learning_rate=2e-5,
+        critic_muon_learning_rate=2e-5, critic_action_head_learning_rate=None,
+        critic_q_direction_learning_rate=None,
+        fresh_learning_rate=3e-3, fresh_muon_learning_rate=7e-3,
+    ))
+    assert optimizers["actor_fresh_muon"].param_groups[0]["lr"] == 7e-3
+    assert optimizers["critic_fresh_muon"].param_groups[0]["lr"] == 7e-3
+
+    with pytest.raises(ValueError, match="both"):
+        build_optimizers(wrapper, critic, learning_rate=1e-5,
+                         fresh_learning_rate=3e-3, fused=False)
+
+
+def test_fresh_learning_rate_flags():
+    from postraining.tests.test_perturbation_sweep import BASE_ARGV
+    from postraining.vapo.config import (
+        MEMORY_FRESH_LEARNING_RATE, POLAR_EXPRESS_STEP_COMPENSATION,
+    )
+
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [*BASE_ARGV, "--reasoning-mode", "memory", "--fresh-learning-rate", "3e-3"])
+    validate_args(parser, args)
+    assert args.fresh_muon_learning_rate == pytest.approx(
+        3e-3 * (0.025 / 0.015) * POLAR_EXPRESS_STEP_COMPENSATION)
+    # Memory trains its fresh modules at MEMORY_FRESH_LEARNING_RATE unless
+    # told otherwise; the Muon rate alone may still be overridden.
+    args = parser.parse_args([*BASE_ARGV, "--reasoning-mode", "memory"])
+    validate_args(parser, args)
+    assert args.fresh_learning_rate == MEMORY_FRESH_LEARNING_RATE
+    assert args.fresh_muon_learning_rate == pytest.approx(
+        MEMORY_FRESH_LEARNING_RATE * (0.025 / 0.015) * POLAR_EXPRESS_STEP_COMPENSATION)
+    args = parser.parse_args(
+        [*BASE_ARGV, "--reasoning-mode", "memory", "--fresh-muon-learning-rate", "5e-3"])
+    validate_args(parser, args)
+    assert (args.fresh_learning_rate, args.fresh_muon_learning_rate) == (
+        MEMORY_FRESH_LEARNING_RATE, 5e-3)
+    # The other modes keep their fresh modules in the shared AdamW.
+    args = parser.parse_args([*BASE_ARGV, "--reasoning-mode", "carry"])
+    validate_args(parser, args)
+    assert args.fresh_learning_rate is None and args.fresh_muon_learning_rate is None
+    for argv in (
+        ["--reasoning-mode", "cot", "--fresh-learning-rate", "3e-3"],
+        ["--reasoning-mode", "carry", "--fresh-muon-learning-rate", "3e-3"],
+        ["--reasoning-mode", "memory", "--fresh-learning-rate", "0"],
+    ):
+        args = parser.parse_args([*BASE_ARGV, *argv])
+        with pytest.raises(SystemExit):
+            validate_args(parser, args)
+
+
+def test_fresh_muon_names_its_algorithm_whatever_the_trunk_optimizer():
+    both = optimizer_schema_for_trunk_optimizer("muon")
+    assert optimizer_schema_for_trunk_optimizer("adamw", fresh_muon=True) == both
+    assert optimizer_schema_for_trunk_optimizer("muon", fresh_muon=True) == both
+    assert optimizer_schema_for_trunk_optimizer("adamw") != both
+
+
+def test_the_critic_s_actor_belief_inputs_are_fresh_beside_its_memory_reader():
+    from postraining.tests.test_hidden_carry import BACKBONES
+    from postraining.tests.test_memory_carry import _memory_wrapper
+
+    wrapper = _memory_wrapper(live=False)
+    for parameter in wrapper.parameters():
+        parameter.requires_grad_(True)
+    critic = SeparateCritic(
+        BACKBONES["nano"][0](11), actor_memory=wrapper.combiner,
+        q_head_hidden=32, q_twin=True, q_head_reads_actor_belief=True,
+    )
+    optimizers = build_optimizers(
+        wrapper, critic, learning_rate=1e-5, fresh_learning_rate=3e-3,
+        fresh_muon_learning_rate=7e-3, critic_action_learning_rate=1e-4, fused=False,
+    )
+    fresh = {id(p) for p in critic.combiner.parameters()} | {
+        id(head.actor_belief.weight) for head in critic.q_heads}
+    assert {id(p) for group in optimizers["critic_fresh_muon"].param_groups
+            for p in group["params"]} == fresh
+    action = {id(p) for group in optimizers["critic_action"].param_groups for p in group["params"]}
+    assert not action & fresh and id(critic.q_head.belief.weight) in action

@@ -39,6 +39,15 @@ rollout re-captures its buckets on fresh buffers.
   tick.
 - Budget. The emitted-token budget is a device scalar read by the tick, so
   one arena serves panels with different budgets up to its KV width.
+- Write noise. A ``write_noise`` arena explores a memory carry's writes: a
+  per-row signed scale, set per rollout, multiplies noise keyed on a per-row
+  noise seed and the unpadded slot (``memory_carry.write_noise``), so one
+  capture serves noiseless, positive and antithetic rollouts.
+- Foreign memory reads. A ``memory_read_ablation`` of ``foreign_state``
+  (or ``foreign_sample``) evaluation arena makes every row read another
+  prompt's (or another sample's) memory state at the same tick (``memory_eval_ablation``): a side buffer holds each
+  original row's latest state, indexed by original row, so the donor map
+  survives compaction, and finished rows' entries stay frozen.
 
 Contract: given the same prompts, seeds and parameters, a rollout here is the
 pinned-EMIT ``rollout_continuations`` rollout with ``token_seeds``; the only
@@ -62,8 +71,15 @@ from postraining.latent_rollout import (
     LatentRolloutBatch,
     compact_stream_to_device,
     counter_gumbel_tokens,
+    validated_write_noise,
 )
 from postraining.latent_thought import EMIT, LatentThoughtModel
+from postraining.memory_eval_ablation import (
+    FOREIGN_READ_ABLATIONS,
+    foreign_donor_rows,
+    foreign_read_state,
+    record_foreign_state,
+)
 from pretraining.nanogpt_mini import nanogpt_mini_kda_model, nanogpt_mini_model
 
 # Live-row buckets. Above ~256 rows a step is GPU-bound and padding costs
@@ -129,6 +145,11 @@ def _decode_tick(
     position: Tensor,
     budget: Tensor,
     stop_ids: Tensor,
+    policy_logits: Tensor | None = None,
+    write_noise_seeds: Tensor | None = None,
+    write_noise_scale: Tensor | None = None,
+    foreign_states: Tensor | None = None,
+    foreign_donors: Tensor | None = None,
     *,
     temperature: float,
     top_p: float,
@@ -170,7 +191,12 @@ def _decode_tick(
         enabled=autocast_dtype is not None,
     ):
         if memory_carry:
-            step_input = wrapper.memory_input(token, belief, memory_state)
+            read_state = (
+                memory_state
+                if foreign_states is None
+                else foreign_read_state(foreign_states, foreign_donors, live_rows)
+            )
+            step_input = wrapper.memory_input(token, belief, read_state)
         elif hidden_carry:
             step_input = wrapper.combined_input(token, belief)
         else:
@@ -192,7 +218,22 @@ def _decode_tick(
         belief.copy_(new_belief)
     if memory_carry:
         # The write, at the network output: the next tick's read sees it.
-        memory_state.copy_(wrapper.memory_write(memory_state, new_belief))
+        # Its noise is keyed on the slot that computed the belief.
+        noise = (
+            None
+            if write_noise_scale is None
+            else wrapper.memory_write_noise(
+                write_noise_seeds, next_position - starts, write_noise_scale
+            )
+        )
+        memory_state.copy_(
+            wrapper.memory_write(memory_state, new_belief, noise)
+        )
+        if foreign_states is not None:
+            # After every row's read: the next tick's donors see this write.
+            record_foreign_state(foreign_states, live_rows, memory_state, active)
+    if policy_logits is not None:
+        policy_logits.copy_(logits.float())
     pending.copy_(
         counter_gumbel_tokens(
             logits, seeds, next_position - starts, temperature, top_p
@@ -211,6 +252,11 @@ class PinnedDecodeArena:
     ``kv_width`` the longest prompt plus generated stream it may hold.
     ``top_p`` below one makes an evaluation arena: the policy gradient needs
     samples from the untruncated policy, so training arenas keep it at one.
+    ``write_noise`` makes a memory-carry arena whose rollouts take one write
+    noise scale per trajectory; evaluation arenas never explore.
+    ``memory_read_ablation`` ``foreign_state``/``foreign_sample`` makes a
+    memory-carry evaluation arena whose rows read another prompt's/sample's
+    memory (``memory_eval_ablation``).
 
     On CPU (tests) or with ``cuda_graphs=False`` the same tick runs as an
     ordinary call, optionally compiled, which is the reference the graph
@@ -236,6 +282,9 @@ class PinnedDecodeArena:
         cuda_graphs: bool = True,
         cache_linear_weights: bool = True,
         replay_storage: bool = True,
+        record_policy_logits: bool = False,
+        write_noise: bool = False,
+        memory_read_ablation: str = "none",
     ):
         if rows < 1 or kv_width < 2:
             raise ValueError("arena rows and kv width must be positive")
@@ -252,6 +301,24 @@ class PinnedDecodeArena:
             )
         if cuda_graphs and device.type != "cuda":
             raise ValueError("CUDA graphs need a CUDA arena")
+        if write_noise and not (hidden_carry and wrapper.memory_carry):
+            raise ValueError("write noise explores a memory carry's writes")
+        if memory_read_ablation not in ("none", *FOREIGN_READ_ABLATIONS):
+            raise ValueError(
+                "a decode arena ablates the memory read only by foreign "
+                f"reads {FOREIGN_READ_ABLATIONS}, not {memory_read_ablation!r}"
+            )
+        # The foreign-read ablation's name, or None.
+        self.foreign_reads = (
+            None if memory_read_ablation == "none" else memory_read_ablation
+        )
+        if self.foreign_reads and not (hidden_carry and wrapper.memory_carry):
+            raise ValueError("foreign memory reads need a memory-carry arena")
+        if self.foreign_reads and (write_noise or replay_storage):
+            raise ValueError(
+                "foreign memory reads are an evaluation ablation: no write "
+                "noise, no replay record"
+            )
         self.wrapper = wrapper
         self.rows = rows
         self.kv_width = kv_width
@@ -280,7 +347,24 @@ class PinnedDecodeArena:
         self.emitted = torch.zeros(rows, **long)
         self.ended = torch.ones(rows, dtype=torch.bool, device=device)
         self.pending = torch.zeros(rows, **long)
+        self.policy_logits = (
+            torch.empty((rows, wrapper.backbone.tok_emb.num_embeddings),
+                        dtype=torch.float32, device=device)
+            if record_policy_logits else None
+        )
         self.seeds = torch.zeros(rows, **long)
+        self.write_noise_seeds = torch.zeros(rows, **long) if write_noise else None
+        self.write_noise_scale = (
+            torch.zeros(rows, dtype=torch.float32, device=device)
+            if write_noise else None
+        )
+        # Foreign reads: each original row's donor (persistent, so captures
+        # keep its address) and, inside the workspace, every original row's
+        # latest memory state.
+        self.foreign_donors = (
+            torch.zeros(rows, **long) if self.foreign_reads else None
+        )
+        self.foreign_states: Tensor | None = None
         self.position = torch.zeros((), **long)
         self.budget = torch.zeros((), **long)
         self.kind = torch.full((rows, kv_width), PAD_SLOT, **long)
@@ -372,6 +456,15 @@ class PinnedDecodeArena:
             self.position,
             self.budget,
             self.stop_ids,
+            None if self.policy_logits is None else self.policy_logits[:rows],
+            *(
+                (None, None)
+                if self.write_noise_scale is None
+                else (self.write_noise_seeds[:rows], self.write_noise_scale[:rows])
+            ),
+            # Indexed by original row: never sliced to the live bucket.
+            self.foreign_states,
+            self.foreign_donors,
         )
 
     def _run(self, rows: int) -> None:
@@ -442,6 +535,10 @@ class PinnedDecodeArena:
                 if self.memory_carry
                 else torch.zeros((self.rows, 0), device=self.device)
             )
+            if self.foreign_reads:
+                self.foreign_states = self.wrapper.memory_initial_state(
+                    self.rows, self.device
+                )
             self._capture()
             yield
         finally:
@@ -449,6 +546,7 @@ class PinnedDecodeArena:
             self._graphs = {}
             self.caches = self.belief = self.hiddens = None
             self.memory_state = None
+            self.foreign_states = None
 
     def _capture(self) -> None:
         """Capture each bucket's tick as one graph, warming them the first time.
@@ -508,6 +606,11 @@ class PinnedDecodeArena:
             self.memory_state,
         ):
             tensor[:keep_rows].copy_(tensor[:rows].index_select(0, order))
+        for tensor in (
+            self.policy_logits, self.write_noise_seeds, self.write_noise_scale
+        ):
+            if tensor is not None:
+                tensor[:keep_rows].copy_(tensor[:rows].index_select(0, order))
         for layer in self.caches:
             for tensor in layer:
                 if len(layer) == RECURRENT_CACHE_ARITY:
@@ -527,6 +630,8 @@ class PinnedDecodeArena:
         max_new_tokens: int,
         max_stream_steps: int,
         token_seeds: Tensor,
+        write_noise_seeds: Tensor | None = None,
+        write_noise_scale: Tensor | None = None,
         offload_device: torch.device | None = None,
     ) -> LatentRolloutBatch:
         """Roll out ``prompt_repeats`` samples of each left-padded prompt.
@@ -536,6 +641,8 @@ class PinnedDecodeArena:
         per output trajectory (prompt-major). Each row emits at most
         ``max_new_tokens``. Returns the same stream layout as
         ``rollout_continuations`` over the same arguments.
+        ``write_noise_seeds``/``write_noise_scale`` (one int64 and one fp32
+        per trajectory) are required exactly by a ``write_noise`` arena.
 
         ``offload_device`` (the host) returns the batch there as
         ``compact_stream_to_device`` would, copied straight from the arena
@@ -563,6 +670,16 @@ class PinnedDecodeArena:
             raise ValueError("max_stream_steps must fit the token budget")
         if token_seeds.shape != (batch,) or token_seeds.dtype != torch.int64:
             raise ValueError("token_seeds must be one int64 seed per trajectory")
+        noise_given = {write_noise_seeds is not None, write_noise_scale is not None}
+        if noise_given != {self.write_noise_scale is not None}:
+            raise ValueError(
+                "a write-noise arena takes write noise seeds and scales per "
+                "trajectory, and only it does"
+            )
+        if write_noise_scale is not None:
+            write_noise_seeds, write_noise_scale = validated_write_noise(
+                write_noise_seeds, write_noise_scale, batch, device
+            )
         prompt_ids = prompt_ids.to(device)
         prompt_lengths = prompt_lengths.to(device=device, dtype=torch.long)
         if prompt_lengths.shape != (prefix_batch,):
@@ -625,12 +742,19 @@ class PinnedDecodeArena:
             self.ended[:batch].fill_(False)
             self.seeds[:rows].zero_()
             self.seeds[:batch].copy_(token_seeds.to(device))
+            if self.write_noise_scale is not None:
+                self.write_noise_seeds[:rows].zero_()
+                self.write_noise_seeds[:batch].copy_(write_noise_seeds)
+                self.write_noise_scale[:rows].zero_()
+                self.write_noise_scale[:batch].copy_(write_noise_scale)
             assert self.belief is not None and self.hiddens is not None
             assert self.memory_state is not None
             self.belief[batch:rows].zero_()
             self.belief[:batch].copy_(repeat(prefilled.belief))
             self.memory_state[batch:rows].zero_()
             self.pending[:rows].zero_()
+            if self.policy_logits is not None:
+                self.policy_logits[:batch].copy_(repeat(prefilled.logits).float())
             self.pending[:batch].copy_(
                 counter_gumbel_tokens(
                     repeat(prefilled.logits),
@@ -669,6 +793,15 @@ class PinnedDecodeArena:
                         )
                     )
                 del beliefs
+            if self.foreign_reads:
+                self.foreign_states.zero_()
+                self.foreign_states[:batch].copy_(self.memory_state[:batch])
+                self.foreign_donors[:rows].copy_(torch.arange(rows, device=device))
+                self.foreign_donors[:batch].copy_(
+                    foreign_donor_rows(
+                        prefix_batch, prompt_repeats, self.foreign_reads, device
+                    )
+                )
             self.position.fill_(width - 1)
             self.budget.fill_(max_new_tokens)
             del prefilled
@@ -724,6 +857,14 @@ class PinnedDecodeArena:
                 prompt_length=width,
                 carry_injected=self.hidden_carry,
                 memory_carry=self.memory_carry,
+                # The arguments, not the arena buffers: compaction
+                # reorders those, while the stream rows keep prompt order.
+                write_noise_seeds=(
+                    None if write_noise_seeds is None else own(write_noise_seeds)
+                ),
+                write_noise_scale=(
+                    None if write_noise_scale is None else own(write_noise_scale)
+                ),
             )
             if offload_device is None:
                 return rolled

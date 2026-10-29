@@ -79,13 +79,10 @@ from pretraining.latent_moe_training import (
     reset_quantile_balance_accumulators,
 )
 import postraining.latent_rollout
-from postraining.latent_eval import (
-    EVAL_TEMPERATURE,
-    EVAL_TOP_P,
-    evaluate_latent_math,
-)
+from postraining.latent_eval import evaluate_latent_math
 from postraining.benchmark_report import write_benchmark_report
 from postraining.gate_transcripts import GateTranscriptWriter
+from postraining.rollout_dataset import RolloutDatasetWriter
 from postraining.rollout_report import (
     RolloutSampleRecorder,
     RowVerdict,
@@ -113,6 +110,7 @@ from postraining.core import (
     structural_abstention,
     structural_format_ok,
     generalized_advantage_and_return_targets,
+    generalized_value_estimate_targets,
     action_value_advantages,
     actor_gae_lambdas,
     temporal_difference_residuals,
@@ -126,15 +124,23 @@ from postraining.core import (
     validate_posttraining_context_budget,
     verify_answer,
 )
+from postraining.vapo.reppo import (
+    EntropyTemperature,
+    enforce_kl_bound,
+    snapshot_parameters,
+)
 from postraining.latent_rollout import (
     PAD_SLOT,
     THOUGHT_SLOT,
     LatentRolloutBatch,
     ReplayPlan,
+    WriteNoisePlan,
     assign_terminal_rewards,
     build_replay_plan,
     compact_emit_token_log_odds,
     compact_emit_token_logprobs,
+    compact_emit_token_logprobs_and_entropy,
+    compact_emit_token_logprobs_entropy_and_advantages,
     compact_next_slots,
     compact_slots,
     compact_stream_to_device,
@@ -143,20 +149,40 @@ from postraining.latent_rollout import (
     generated_slot_mask,
     pack_rollout_groups_for_replay,
     iter_planned_replay_microbatches,
+    recorded_write_noise,
     refresh_old_statistics,
     replay_head_inputs,
+    replay_policy_action_offsets,
     scatter_replay_statistics,
+    select_trajectory_rows,
     scatter_slots,
     slot_index,
     rollout_continuations,
     split_rollout_groups,
     think_slot_mask,
     trajectory_token_seeds,
+    trajectory_used_lengths,
     trim_stream,
     validate_carry_policy,
     validate_hidden_carry_rollout,
 )
 from postraining.graph_decode import PinnedDecodeArena
+from postraining.memory_eval_ablation import (
+    FOREIGN_READ_ABLATIONS,
+    MEMORY_EVAL_ABLATION_SCHEMA,
+    memory_eval_ablation,
+)
+from postraining.perturbation_sweep import (
+    PERTURBATION_SWEEP_SCHEMA,
+    WRITE_NOISE_SWEEP_SCHEMA,
+    SweepConfig,
+    SweepWriter,
+    WriteNoiseSweepConfig,
+    run_sweep,
+    run_write_noise_sweep,
+    target_parameters,
+    tensor_rms,
+)
 from postraining.latent_thought import (
     EMIT,
     THINK,
@@ -177,7 +203,7 @@ from postraining.rollout_scheduler import (
     warmup_decode_width_buckets,
 )
 from postraining.model_io import copy_trunk, fresh_trunk, load_model
-from postraining.memory_carry import memory_write_mask
+from postraining.memory_carry import MemoryReader, memory_write_mask
 from postraining.muon import Muon
 from postraining.reasoning_modes import (
     mode_carries_hidden,
@@ -195,7 +221,20 @@ from postraining.runtime.profiling import (
     elapsed_seconds,
 )
 from postraining.train_vapo import prompt_text
-from postraining.value_model import SeparateCritic
+from postraining.choice_prompt import RENDERED_LABELS
+from postraining.binary_q import (
+    binary_q_delightful_policy_loss, exact_prefix_success_constraints,
+)
+from postraining.value_model import SeparateCritic, next_slot_tokens, policy_centered_q
+from postraining.mean_actor_critic import (
+    CRITIC_GATED_ESTIMATORS, DELIGHTFUL_MAC_ESTIMATORS, SAMPLED_ONLY_ESTIMATORS,
+    SEQUENCE_ESTIMATORS, SUPPORT_CENSUS_FIELDS, answer_cluster_labels,
+    answer_cluster_surprisal, answer_gate, delight_gate, delight_inputs,
+    gate_shuffle_strata, leave_one_out_advantages, nano_mean_actor_critic,
+    nano_target_logprobs_and_advantages, sampled_coefficients, sequence_coefficients,
+    shuffle_within_strata, validate_mac_estimator, validate_softcap,
+)
+from postraining.pessimistic_q import nano_pessimistic_q_prior
 from postraining.vapo.config import (
     build_arg_parser,
     normalized_abstention_reward,
@@ -218,6 +257,7 @@ from postraining.vapo.mixture import (
 from postraining.vapo.schemas import (
     CRITIC_ACTION_HEAD_SCHEMA,
     CRITIC_SCHEMA,
+    critic_schema_for,
     PROMPT_ORDER_SCHEMA,
     actor_objective_schema,
     execution_schema_for,
@@ -306,24 +346,61 @@ ACTION_HEAD_RESUME_EXACT_ARG_FIELDS = (
     "critic_action_head_hidden",
     "value_warmup_scope",
 )
+# Checked only when either side uses one, likewise. The temperature's own
+# state resumes from the checkpoint; its target and rate are the contract.
+POST_ACTION_Q_RESUME_EXACT_ARG_FIELDS = (
+    "critic_post_action_q_hidden", "critic_post_action_q_prior",
+    "q_critic_lambda", "actor_gae_lambda",
+)
+Q_CRITIC_RESUME_EXACT_ARG_FIELDS = (
+    "critic_q_head_hidden",
+    "q_critic_lambda",
+)
+ENTROPY_TEMPERATURE_RESUME_EXACT_ARG_FIELDS = (
+    "entropy_target",
+    "entropy_temperature_init",
+    "entropy_temperature_learning_rate",
+)
+KL_TRUST_REGION_RESUME_EXACT_ARG_FIELDS = (
+    "actor_kl_bound",
+    "actor_kl_backtracks",
+    "actor_kl_shard_stride",
+)
 
 
-def combiner_weight_telemetry(wrapper: LatentThoughtModel) -> dict:
+def combiner_weight_telemetry(
+    wrapper: LatentThoughtModel, critic: SeparateCritic | None = None
+) -> dict:
     """RMS of the fresh input module's zero-initialized outputs.
 
     Leaving zero is the first sign the carried information is being used:
     the carry map and type bias of the hidden carry, the read projection of
-    the memory carry (with its query and write projections for scale).
+    the memory carry (with its query, write and gate projections for scale,
+    and the critic's own memory reader and Q-head belief inputs).
     """
     rms = lambda tensor: tensor.detach().square().mean().sqrt()
     combiner = wrapper.combiner
     if wrapper.memory_carry:
-        return {
+        values = {
             "memory/read_out_weight_rms": rms(combiner.reader.out.weight),
             "memory/query_weight_rms": rms(combiner.reader.query.weight),
             "memory/key_weight_rms": rms(combiner.writer.key.weight),
             "memory/value_weight_rms": rms(combiner.writer.value.weight),
+            "memory/write_gate_weight_rms": rms(combiner.writer.write_gate.weight),
+            "memory/decay_gate_weight_rms": rms(combiner.writer.decay_gate.weight),
         }
+        if critic is not None and isinstance(critic.combiner, MemoryReader):
+            values["memory/critic_read_out_weight_rms"] = rms(critic.combiner.out.weight)
+            values["memory/critic_query_weight_rms"] = rms(critic.combiner.query.weight)
+        beliefs = [] if critic is None or critic.q_head is None else [
+            head.actor_belief.weight for head in critic.q_heads
+            if head.actor_belief is not None
+        ]
+        if beliefs:
+            values["memory/critic_q_actor_belief_weight_rms"] = torch.stack(
+                [rms(weight) for weight in beliefs]
+            ).mean()
+        return values
     return {
         "combiner/carry_weight_rms": rms(combiner.carry.weight),
         "combiner/type_bias_rms": rms(combiner.type_bias),
@@ -331,6 +408,10 @@ def combiner_weight_telemetry(wrapper: LatentThoughtModel) -> dict:
 
 
 def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> None:
+    saved_exclusions = set(filter(None, saved.get("exclude_rl_sources", "").split(",")))
+    current_exclusions = set(filter(None, getattr(current, "exclude_rl_sources", "").split(",")))
+    if not saved_exclusions <= current_exclusions:
+        raise ValueError("resume cannot re-enable excluded RL sources")
     saved_rollout = int(saved.get("prompts_per_rollout", -1))
     saved_minibatch = int(saved.get("prompts_per_minibatch", -1))
     current_rollout = int(current.prompts_per_rollout)
@@ -382,6 +463,33 @@ def validate_resume_arg_contract(saved: dict, current: argparse.Namespace) -> No
         or getattr(current, "critic_action_head_hidden", None) is not None
     ):
         exact_fields += ACTION_HEAD_RESUME_EXACT_ARG_FIELDS
+    if saved.get("value_warmup_rewind") or getattr(
+        current, "value_warmup_rewind", False
+    ):
+        # Where the first actor step starts in the prompt stream.
+        exact_fields += ("value_warmup_rewind",)
+    if saved.get("mean_actor_critic") or getattr(current, "mean_actor_critic", False):
+        exact_fields += ("mean_actor_critic", "mac_estimator")
+    if saved.get("critic_q_twin") or getattr(current, "critic_q_twin", False):
+        exact_fields += ("critic_q_twin",)
+    if saved.get("critic_q_pessimism") or getattr(current, "critic_q_pessimism", 0.0):
+        exact_fields += ("critic_q_pessimism",)
+    if "eval_top_p" in saved:
+        # The periodic evaluation protocol, which a bench stop also compares;
+        # runs from before the flags evaluated at the then-constant defaults.
+        exact_fields += ("eval_temperature", "eval_top_p")
+    for trigger, fields in (
+        ("critic_q_direction_learning_rate", ("critic_q_direction_learning_rate",)),
+        ("critic_q_head_hidden", Q_CRITIC_RESUME_EXACT_ARG_FIELDS),
+        ("critic_post_action_q_hidden", POST_ACTION_Q_RESUME_EXACT_ARG_FIELDS),
+        ("entropy_target", ENTROPY_TEMPERATURE_RESUME_EXACT_ARG_FIELDS),
+        ("actor_kl_bound", KL_TRUST_REGION_RESUME_EXACT_ARG_FIELDS),
+    ):
+        if (
+            saved.get(trigger) is not None
+            or getattr(current, trigger, None) is not None
+        ):
+            exact_fields += fields
     mismatches = [
         (name, saved.get(name), getattr(current, name))
         for name in exact_fields
@@ -408,12 +516,141 @@ CRITIC_INIT_PROVENANCE_FIELDS = (
 )
 
 
+STUDY_CRITIC_SCHEMA = "token_q_critic_study_checkpoint/v2"
+
+
+STUDY_COLLECTION_CONTRACT = (
+    "reasoning_mode", "temperature", "top_p", "python_reward_mode",
+    "nearby_reward_max", "abstention_penalty", "think_min_tokens",
+    "answer_fence", "prompt_tokens", "continuation_tokens",
+)
+
+
+def validate_study_critic_init(payload: dict, critic: SeparateCritic,
+                               args: argparse.Namespace,
+                               data_identity: str | None = None) -> None:
+    """Accept a token Q critic fit by ``critic_study`` against this base actor.
+
+    The study fits a token-weighted, prompt-context, actor-initialized critic
+    whose direction readout steps at the head rate over its width
+    (``inverse_dim``); this run continues those rates. With
+    ``data_identity`` the study's rollout collection must also share this
+    run's prompts, sampler and reward contract, so its Q values the same
+    returns.
+    """
+    if payload.get("schema") != STUDY_CRITIC_SCHEMA:
+        raise ValueError(f"--study-critic-init needs a {STUDY_CRITIC_SCHEMA} checkpoint")
+    if payload.get("checkpoint_sha256") != args.base_checkpoint_sha256:
+        raise ValueError("study critic was fit against another base checkpoint")
+    arm = payload["arm"]
+    if (arm.get("context"), arm.get("critic_init"), arm.get("direction_scale"),
+            arm.get("weighting")) != ("prompt", "actor", "inverse_dim", "token"):
+        raise ValueError(
+            "study critic must be a token-weighted, prompt-context, "
+            "actor-initialized, inverse_dim arm"
+        )
+    if bool(arm.get("q_twin", False)) != args.critic_q_twin:
+        raise ValueError(
+            "a twin study critic initializes exactly a --critic-q-twin run, "
+            "and a single-head one exactly a single-head run"
+        )
+    if payload.get("critic_schema") != critic_schema_for(True, twin_q=args.critic_q_twin):
+        raise ValueError(
+            "study critic was fit under another token Q contract, such as the "
+            "input-latent action table; its directions do not transfer"
+        )
+    if arm["train_belief_gain"] is not True:
+        raise ValueError(
+            "study critic froze the token Q's belief gain, which this run trains"
+        )
+    if args.critic_init != "actor":
+        raise ValueError("an actor-initialized study critic requires --critic-init actor")
+    if payload["config"]["q_head_hidden"] != args.critic_q_head_hidden:
+        raise ValueError("study critic head width differs from --critic-q-head-hidden")
+    if int(payload["step"]) < 1:
+        raise ValueError("study checkpoint holds an untrained critic")
+    if not all(bool(torch.isfinite(tensor).all()) for tensor in payload["critic"].values()
+               if tensor.is_floating_point()):
+        raise ValueError("study critic has non-finite parameters")
+    head_rate = (args.critic_action_head_learning_rate
+                 if args.critic_action_head_learning_rate is not None
+                 else args.critic_learning_rate)
+    direction_rate = arm["head_learning_rate"] / critic.q_head.direction.out_features
+    if head_rate != arm["head_learning_rate"] or (
+        args.critic_q_direction_learning_rate != direction_rate
+    ) or args.critic_learning_rate != arm["trunk_learning_rate"] or (
+        args.critic_muon_learning_rate != arm["muon_learning_rate"]
+    ):
+        raise ValueError(
+            "a study critic continues at its study's rates: head "
+            f"{arm['head_learning_rate']}, direction {direction_rate}, trunk "
+            f"{arm['trunk_learning_rate']}, muon {arm['muon_learning_rate']}"
+        )
+    if data_identity is None:
+        return
+    collection = json.loads(
+        (Path(payload["config"]["train_dataset"]).parent / "manifest.json").read_text()
+    )
+    if collection.get("math_data_identity") != data_identity:
+        raise ValueError("study critic was fit on rollouts of other prompts")
+    # A memory policy's read is zero-initialized, so at step 0 it is bitwise
+    # the cot policy whose rollouts a cot study critic valued.
+    expected = {name: getattr(args, name, None) for name in STUDY_COLLECTION_CONTRACT}
+    if mode_carries_memory(args.reasoning_mode):
+        expected["reasoning_mode"] = "cot"
+    changed = [
+        name for name in STUDY_COLLECTION_CONTRACT
+        if collection["args"].get(name) != expected[name]
+    ]
+    if changed:
+        raise ValueError(f"study critic's rollouts used another contract: {changed}")
+
+
+def load_study_critic(critic: SeparateCritic, state: dict[str, torch.Tensor]) -> None:
+    """Load a study critic's weights, which a study fits on cot rollouts.
+
+    A memory run's critic adds two inputs the cot critic lacks: its own
+    reader of the actor's memory, and each Q head's projection of the
+    actor's belief. The reader's output starts at zero by construction and
+    the projections are zeroed here, so the loaded critic values every cot
+    stream exactly as the study's did, which a memory policy is at step 0.
+    The study's combiner is the cot critic's unused carry module and is
+    dropped.
+    """
+    if critic.actor_memory_writer is None:
+        critic.load_state_dict(state, strict=True)
+        return
+    memory_only = {name for name in critic.state_dict()
+                   if name.startswith("combiner.") or ".actor_belief." in name}
+    missing, unexpected = critic.load_state_dict(
+        {name: value for name, value in state.items() if not name.startswith("combiner.")},
+        strict=False,
+    )
+    if unexpected or set(missing) != memory_only:
+        raise ValueError(
+            "a study critic initializes a memory critic outside its memory inputs: "
+            f"missing {sorted(set(missing) - memory_only)}, unexpected {sorted(unexpected)}"
+        )
+    with torch.no_grad():
+        for head in critic.q_heads:
+            if head.actor_belief is not None:
+                head.actor_belief.weight.zero_()
+    if bool(critic.combiner.out.weight.any()):
+        raise ValueError("the memory critic's reader must start at zero output")
+
+
 def validate_critic_only_init(payload: dict, args: argparse.Namespace,
                               data_identity: str) -> None:
     """Accept critic weights with the same value task, independent of actor loss."""
     if args.value_warmup_steps != 0:
         raise ValueError("--critic-only-init requires --value-warmup-steps 0")
-    if mode_carries_memory(args.reasoning_mode):
+    if (float(payload.get("args", {}).get("critic_q_pessimism", 0.0))
+            > getattr(args, "critic_q_pessimism", 0.0)):
+        raise ValueError(
+            "a critic fit under a Q prior initializes only a run with at "
+            "least that --critic-q-pessimism"
+        )
+    if mode_carries_memory(args.reasoning_mode) and not uses_post_action_q(args):
         # The critic's reader is fit to the memory its source run's actor
         # writer built; this run's writer is a fresh draw, so the loaded
         # reader would read an unrelated basis at the same scale.
@@ -421,7 +658,10 @@ def validate_critic_only_init(payload: dict, args: argparse.Namespace,
             "--critic-only-init cannot carry a memory critic: its reader is "
             "bound to the source run's actor writer"
         )
-    if not resume_critic_schema_compatible(payload):
+    if not resume_critic_schema_compatible(
+        payload, uses_q_critic(args), post_action_q=uses_post_action_q(args),
+        twin_q=getattr(args, "critic_q_twin", False),
+    ):
         raise ValueError("critic-only checkpoint uses an incompatible critic schema")
     expected = {
         "base_checkpoint_sha256": args.base_checkpoint_sha256,
@@ -470,6 +710,8 @@ def carries_init_critic(args: argparse.Namespace) -> bool:
 # objective (DG/TPO, GAE lambda for the actor, source gates) moves no target.
 CARRIED_CRITIC_VALUE_ARGS = (
     "abstention_penalty",
+    # The pessimistic prior shrinks the fit at rarely taken tokens.
+    "critic_q_pessimism",
     "nearby_reward_max",
     "temperature",
     "top_p",
@@ -495,6 +737,70 @@ def critic_action_head_schema(critic: SeparateCritic) -> str | None:
     return None if critic.action_head is None else CRITIC_ACTION_HEAD_SCHEMA
 
 
+def uses_post_action_q(args: argparse.Namespace) -> bool:
+    return getattr(args, "critic_post_action_q_hidden", None) is not None
+
+
+def mixture_python_reward_schema(args, sources) -> str | None:
+    """Bind the new binary-Q mode to verifiers its sampler actually uses.
+
+    Historical modes retain their manifest-wide checkpoint contract. New
+    post-action Q excludes disabled sources before defining the reward task.
+    """
+    excluded = (
+        set(filter(None, args.exclude_rl_sources.split(",")))
+        if uses_post_action_q(args) else set()
+    )
+    if not any(source.verifier == "python_mbpp" and source.name not in excluded
+               for source in sources):
+        return None
+    return (PYTHON_PARTIAL_REWARD_SCHEMA if args.python_reward_mode == "test-fraction"
+            else PYTHON_REWARD_SCHEMA)
+
+
+def validate_actor_init_python_reward(payload, expected, *, carries_critic: bool) -> None:
+    """A fresh math-only critic inherits no Python reward objective.
+
+    A carried critic still requires its exact value task; active Python
+    rewards retain the existing objective compatibility check.
+    """
+    if payload is None or (expected is None and not carries_critic):
+        return
+    if payload.get("python_reward_schema") != expected:
+        raise ValueError(
+            "initialization checkpoint was trained under a different "
+            "Python reward objective than the selected code reward mode"
+        )
+
+
+def critic_run_schema(critic: SeparateCritic) -> str:
+    return critic_schema_for(
+        critic.values_actions,
+        post_action_q=getattr(critic, "post_action_q_head", None) is not None,
+        twin_q=getattr(critic, "q_twin", None) is not None,
+    )
+
+
+def uses_q_critic(args: argparse.Namespace) -> bool:
+    return getattr(args, "critic_q_head_hidden", None) is not None
+
+
+def run_actor_objective_schema(args: argparse.Namespace) -> str:
+    """This run's actor objective schema, every component included."""
+    return actor_objective_schema(
+        getattr(args, "reasoning_mode", "latent"),
+        getattr(args, "delightful_policy_gradient", False),
+        getattr(args, "target_policy_optimization", False),
+        q_advantage=uses_q_critic(args),
+        post_action_binary_q=uses_post_action_q(args),
+        entropy_temperature=getattr(args, "entropy_target", None) is not None,
+        kl_trust_region=getattr(args, "actor_kl_bound", None) is not None,
+        mac_estimator=(
+            args.mac_estimator if getattr(args, "mean_actor_critic", False) else None
+        ),
+    )
+
+
 def refits_critic_values(args: argparse.Namespace) -> bool:
     """Whether this run's warmup refits the critic's values before the first
     actor step; an action-head-only warmup leaves them as carried."""
@@ -509,10 +815,15 @@ def rewinds_warmup_prompts(args: argparse.Namespace) -> bool:
     An action-head warmup changes neither the actor nor the carried values,
     so rewinding leaves the head as the run's only difference from one that
     starts acting at the same checkpoint: the first actor step draws the same
-    prompts under the same rollout keys, which derive from the cursor.
+    prompts under the same rollout keys, which derive from the cursor. A
+    whole-critic warmup leaves the actor untouched too, and rewinds under
+    --value-warmup-rewind: a fresh critic warmed from an --actor-init
+    checkpoint then starts acting on the prompts that checkpoint's own
+    continuation would.
     """
     return args.value_warmup_steps > 0 and (
         getattr(args, "value_warmup_scope", "critic") == "action-head"
+        or bool(getattr(args, "value_warmup_rewind", False))
     )
 
 
@@ -541,14 +852,15 @@ def validate_carried_critic(payload: dict, args: argparse.Namespace) -> list[str
             f"expected {CRITIC_SCHEMA!r}; pass --fresh-critic"
         )
     expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
-        args.trunk_optimizer
+        args.trunk_optimizer,
+        fresh_muon=args.fresh_learning_rate is not None,
     )
     if payload.get("optimizer_schema") != expected_optimizer_schema:
         raise ValueError(
             "--actor-init optimizer schema is "
             f"{payload.get('optimizer_schema')!r}, expected "
             f"{expected_optimizer_schema!r}; pass the source run's "
-            "--trunk-optimizer or --fresh-critic"
+            "--trunk-optimizer and --fresh-learning-rate, or --fresh-critic"
         )
     source_args = payload.get("args", {})
     if hasattr(source_args, "__dict__"):
@@ -648,7 +960,8 @@ def carry_init_critic(
             "--actor-init checkpoint critic optimizer layout "
             f"{source_critic_names} does not match the --trunk-optimizer "
             f"{args.trunk_optimizer} layout {sorted(critic_names)}; pass the "
-            "matching --trunk-optimizer or --fresh-critic"
+            "matching --trunk-optimizer and --fresh-learning-rate, or "
+            "--fresh-critic"
         )
     for name in critic_names:
         optimizers[name].load_state_dict(source_optimizers[name])
@@ -675,19 +988,22 @@ def resolve_critic_init_provenance(
             )
         recorded = resumed_manifest.get("critic") or {}
         init = recorded.get("init")
-        if init not in ("scratch", "actor_copy", "warm_checkpoint", "critic_only_checkpoint"):
+        if init not in ("scratch", "actor_copy", "warm_checkpoint", "critic_only_checkpoint",
+                        "study_checkpoint"):
             raise ValueError(
                 f"resume manifest records an unknown critic init {init!r}"
             )
-        if (init == "actor_copy") != (args.critic_init == "actor"):
+        if (init in ("actor_copy", "study_checkpoint")) != (args.critic_init == "actor"):
             raise ValueError(
                 f"resume run's critic started as {init!r}; resume it with "
-                f"--critic-init {'actor' if init == 'actor_copy' else 'scratch'}"
+                f"--critic-init {'actor' if init in ('actor_copy', 'study_checkpoint') else 'scratch'}"
             )
         return {name: recorded.get(name) for name in CRITIC_INIT_PROVENANCE_FIELDS
                 if name in recorded}
     if getattr(args, "critic_only_init", None):
         return dict(args.critic_only_init_provenance)
+    if getattr(args, "study_critic_init", None):
+        return dict(args.study_critic_init_provenance)
     if carries_init_critic(args):
         return {
             "init": "warm_checkpoint",
@@ -1279,6 +1595,50 @@ def score_math_rollout(
     return verdicts
 
 
+def graded_answer_keys(
+    verdicts: Sequence[RowVerdict], rewards: Sequence[float]
+) -> list[tuple[str, float] | None]:
+    """Each row's answer-cluster key: the verifier's own canonical prediction
+    for the field it graded paired with the reward that grading earned, or
+    None where the reward gate graded nothing (unterminated, malformed,
+    abstaining, or no ``Answer:`` field). A gate-zeroed row's verdict carries
+    a counterfactual prediction that earned no reward; it is not that
+    answer, so it keys None too.
+
+    The reward is part of the key because canonicalization is coarser than
+    grading: ``verify_answer`` normalizes "3 4" and "34" to one string yet
+    grades them differently, so the string alone would let a wrong row join
+    the correct cluster. ``latent_eval.majority_vote_score`` votes on the
+    same (answer, correct) pairs. The sequence estimators refuse shaped
+    rewards (``vapo.config``), so the reward here is the verifier's grade.
+    """
+    if len(verdicts) != len(rewards):
+        raise ValueError("one verdict per group row is required")
+    return [
+        (verdict.parsed_answer, float(reward))
+        if verdict.format_ok and verdict.parsed_answer not in (None, "[INVALID]")
+        else None
+        for verdict, reward in zip(verdicts, rewards)
+    ]
+
+
+def stamp_group_terms(batch: LatentRolloutBatch, verdicts: Sequence[RowVerdict]) -> None:
+    """Stamp one scored prompt group's answer-level estimator terms
+    (``LatentRolloutBatch.group_advantage``/``answer_surprisal``): the
+    leave-one-out advantage of each terminal reward, and the surprisal of
+    each row's graded (answer, reward) cluster, rows without a graded answer
+    forming one shared cluster (``mean_actor_critic.answer_cluster_labels``)."""
+    if len(verdicts) != batch.kind.size(0):
+        raise ValueError("one verdict per group row is required")
+    rewards = batch.reward_scalar.float()
+    labels = torch.tensor(
+        answer_cluster_labels(graded_answer_keys(verdicts, rewards.tolist())),
+        device=batch.kind.device,
+    )
+    batch.group_advantage = leave_one_out_advantages(rewards)
+    batch.answer_surprisal = answer_cluster_surprisal(labels).float()
+
+
 def score_python_rollout(
     batch: LatentRolloutBatch,
     verification_info: dict,
@@ -1427,6 +1787,9 @@ def rollout_diagnostics(
             format_ok.append(float(compliant))
     generated = batch.action_mask.bool()
     grouped = batch.reward_scalar.reshape(-1, samples_per_prompt)
+    grouped_lengths = batch.action_mask.sum(1).to(grouped.dtype).reshape(
+        -1, samples_per_prompt
+    )
     exact = batch.reward_scalar == 1.0
     grouped_exact = exact.reshape(-1, samples_per_prompt).float()
     abstained = (
@@ -1500,6 +1863,17 @@ def rollout_diagnostics(
             .mean()
         ),
         "actions_per_trajectory": float(batch.action_mask.sum(1).mean()),
+        # Within-prompt covariance of reward and action count, averaged
+        # over prompt groups: the direction in which the reward itself
+        # pulls length under a group-mean baseline. Its sign separates a
+        # reward-driven length trend from one the critic or optimizer
+        # introduces.
+        "length_reward_covariance": float(
+            (
+                (grouped - grouped.mean(1, keepdim=True))
+                * (grouped_lengths - grouped_lengths.mean(1, keepdim=True))
+            ).mean()
+        ),
         "abstained_emitted_tokens_sum": float(sum(abstained_lengths)),
         "abstained_emitted_tokens_count": float(len(abstained_lengths)),
         "abstained_emitted_tokens_max": float(max(abstained_lengths, default=0)),
@@ -1831,6 +2205,42 @@ def aggregate_action_value_diagnostics(
     )
 
 
+def aggregate_mc_value_diagnostics(
+    metrics: list[dict[str, float]],
+) -> dict[str, float]:
+    """``aggregate_value_diagnostics`` for a Q critic's fit against the
+    Monte-Carlo return rather than its own bootstrapped targets."""
+    return aggregate_value_diagnostics(
+        [
+            {
+                **metric,
+                "value_target_mean": metric["mc_target_mean"],
+                "value_target_variance": metric["mc_target_variance"],
+                "value_residual_mean": metric["mc_residual_mean"],
+                "value_residual_variance": metric["mc_residual_variance"],
+            }
+            for metric in metrics
+        ]
+    )
+
+
+def post_think_state_mask(
+    token_ids: torch.Tensor, emit_mask: torch.Tensor, think_close_id: int
+) -> torch.Tensor:
+    """Emit slots whose state has consumed a completion's closing think fence.
+
+    The token at a slot is already consumed, so the slot that emits the
+    fence is still a think state and the one holding it is the first answer
+    state. Only fences after the first emit slot count: the prompt is not
+    the completion.
+    """
+    emits = emit_mask.bool()
+    in_completion = torch.zeros_like(emits)
+    in_completion[:, 1:] = emits[:, :-1].cumsum(1) > 0
+    closed = ((token_ids == think_close_id) & in_completion).cumsum(1) > 0
+    return closed & emits
+
+
 def credit_assignment_moments(
     batch: LatentRolloutBatch,
     advantages: torch.Tensor,
@@ -1976,6 +2386,254 @@ def credit_assignment_dashboard(
     return dashboard
 
 
+def advantage_group_dashboard(
+    metrics: list[dict[str, float]], source_names: Sequence[str]
+) -> dict[str, float]:
+    """Mean and RMS advantage per ``update_minibatch`` advantage group,
+    pooled over prompt groups, with source ids named."""
+    totals: dict[str, dict[str, float]] = {}
+    for metric in metrics:
+        for key, value in metric.items():
+            if key.startswith("advantage_group/"):
+                _, name, moment = key.split("/")
+                group = totals.setdefault(name, {})
+                group[moment] = group.get(moment, 0.0) + value
+    dashboard = {}
+    for name, group in totals.items():
+        if name.startswith("source_"):
+            label = f"advantage/source/{source_names[int(name[7:])]}"
+        else:
+            label = f"advantage/token/{name}"
+        count = group["count"]
+        dashboard[f"{label}/tokens"] = count
+        if count:
+            dashboard[f"{label}/mean"] = group["sum"] / count
+            dashboard[f"{label}/rms"] = math.sqrt(group["square_sum"] / count)
+    return dashboard
+
+
+ANSWER_GATE_QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+
+def sequence_estimator_moments(estimator: str, advantages: torch.Tensor,
+                               surprisal: torch.Tensor, coefficients: torch.Tensor,
+                               tokens: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Row sums of a sequence estimator's group terms, as device scalars:
+    rows; the answer-cluster surprisal l, whose row mean is the mean
+    per-group plug-in answer entropy (every group has G rows); rows of a
+    unanimous group (l = 0); the squares of U and of the coefficient; and
+    both weighted by the row's emitted tokens |.| T, the share of the
+    token-normalized update each row carries. The answer gate adds its sum
+    and count over rows with U != 0, split by the sign of U, and its
+    quantiles there (``ANSWER_GATE_QUANTILES``, NaN if no row has U != 0).
+    """
+    moments = {
+        "mac/sequence/rows": torch.tensor(float(advantages.numel()), device=advantages.device),
+        "mac/sequence/surprisal_sum": surprisal.sum(),
+        "mac/sequence/unanimous_rows": (surprisal == 0).sum(),
+        "mac/sequence/advantage_square_sum": advantages.square().sum(),
+        "mac/sequence/coefficient_square_sum": coefficients.square().sum(),
+        "mac/sequence/advantage_token_abs_sum": (advantages.abs() * tokens).sum(),
+        "mac/sequence/coefficient_token_abs_sum": (coefficients.abs() * tokens).sum(),
+    }
+    if estimator == "delightful_answer_gate":
+        gate = answer_gate(advantages, surprisal)
+        for sign, mask in (("positive", advantages > 0), ("negative", advantages < 0)):
+            moments[f"mac/answer_gate_{sign}_sum"] = (gate * mask).sum()
+            moments[f"mac/answer_gate_{sign}_count"] = mask.sum()
+        active = torch.where(advantages != 0, gate, torch.full_like(gate, math.nan))
+        for quantile, value in zip(ANSWER_GATE_QUANTILES, torch.nanquantile(
+                active, torch.tensor(ANSWER_GATE_QUANTILES, device=gate.device))):
+            moments[f"mac/answer_gate_q{round(quantile * 100):02d}"] = value
+    return moments
+
+
+def mac_dashboard(metrics: list[dict[str, float]]) -> dict[str, float]:
+    """Per span: MAC's policy variance of Q, sum_a pi(a) A(a)^2 per state,
+    the critic's action contrast on the policy's support (a gain only for a
+    logit step along A, not for MAC's update along pi*A); and the mean
+    and RMS of the sampled log-probability's return coefficient, the scale
+    of the estimator's sampled term. Spans are counted by
+    ``advantage_group/span_*``. Under the delightful sampled baseline, also
+    its delight gate's mean by span and by the sign of G - c."""
+    dashboard = {}
+    for span in ("think", "answer"):
+        key = f"mac/{span}/q_variance_sum"
+        if not any(key in metric for metric in metrics):
+            continue
+        count = sum(metric[f"advantage_group/span_{span}/count"] for metric in metrics)
+        dashboard[f"mac/{span}_states"] = count
+        if count:
+            def total(name: str, span: str = span) -> float:
+                return sum(metric[f"mac/{span}/{name}_sum"] for metric in metrics)
+
+            dashboard[f"mac/{span}_policy_q_variance"] = total("q_variance") / count
+            dashboard[f"mac/{span}_coefficient_mean"] = total("coefficient") / count
+            dashboard[f"mac/{span}_coefficient_rms"] = math.sqrt(
+                total("coefficient_square") / count)
+            if any(f"mac/{span}/gate_sum" in metric for metric in metrics):
+                dashboard[f"mac/{span}_delight_gate_mean"] = total("gate") / count
+    for sign in ("positive", "negative"):
+        if any(f"mac/gate_{sign}_count" in metric for metric in metrics):
+            count = sum(metric[f"mac/gate_{sign}_count"] for metric in metrics)
+            if count:
+                # The gate where G - c has this sign: DG's asymmetry between
+                # reinforcing and suppressing a surprising token.
+                dashboard[f"mac/delight_gate_{sign}_mean"] = sum(
+                    metric[f"mac/gate_{sign}_sum"] for metric in metrics) / count
+            mass = sum(metric[f"mac/gate_{sign}_mass_sum"] for metric in metrics)
+            if mass:
+                # The same gate weighted by |r| (1 - pi(a_t)), the size of
+                # the term it scales, and that mass's share with
+                # |r * surprisal| > 1.
+                dashboard[f"mac/delight_gate_{sign}_mass_mean"] = sum(
+                    metric[f"mac/gate_{sign}_weighted_sum"] for metric in metrics) / mass
+                dashboard[f"mac/delight_{sign}_active_mass_share"] = sum(
+                    metric[f"mac/gate_{sign}_active_mass_sum"] for metric in metrics) / mass
+
+    def total(name: str) -> float:
+        return sum(metric[f"mac/{name}_sum"] for metric in metrics)
+
+    # A critic gate's advantage over non-terminal generated states: its
+    # RMS; its correlation with r = G - c, how much of the outcome the
+    # critic attributes to the tokens it gates; and the slope of r on A,
+    # 1 for a calibrated critic. For the TD residual (r_t - A_t = r_{t+1}
+    # has zero mean given s_{t+1}) it is about 1/2 when critic noise
+    # dominates A. ``head`` is the action head's A(a_t); ``shuffled_head``
+    # is it after the shuffled gate's within-stratum permutation, whose
+    # slope keeps only what the strata carry.
+    for source, label in (("gate", "td"), ("head", "head"), ("shuffled", "shuffled_head")):
+        if not any(f"mac/{source}_advantage_square_sum" in metric for metric in metrics):
+            continue
+        states = total(f"{source}_advantage_states")
+        square, residual = total(f"{source}_advantage_square"), total("residual_square")
+        if states:
+            dashboard[f"mac/{label}_advantage_rms"] = math.sqrt(square / states)
+        if square and residual:
+            dashboard[f"mac/{label}_advantage_residual_correlation"] = total(
+                f"{source}_advantage_residual") / math.sqrt(square * residual)
+        if square:
+            dashboard[f"mac/{label}_advantage_calibration_slope"] = total(
+                f"{source}_advantage_residual") / square
+    if any("mac/shuffle_head_cross_sum" in metric for metric in metrics):
+        head, shuffled = total("head_advantage_square"), total("shuffled_advantage_square")
+        if head and shuffled:
+            dashboard["mac/shuffle_head_correlation"] = total(
+                "shuffle_head_cross") / math.sqrt(head * shuffled)
+        mass = total("shuffle_mass")
+        if mass:
+            dashboard["mac/shuffle_fixed_mass_share"] = total("shuffle_fixed_mass") / mass
+    if any("mac/gate_nonterminal_mass_sum" in metric for metric in metrics):
+        mass = total("gate_nonterminal_mass")
+        if mass:
+            dashboard["mac/delight_gate_nonterminal_mass_mean"] = total(
+                "gate_nonterminal_weighted") / mass
+            dashboard["mac/delight_nonterminal_active_mass_share"] = total(
+                "gate_nonterminal_active_mass") / mass
+    for span in ("think", "answer"):
+        # The sampled baseline's G - c on the same states, beside a sequence
+        # estimator's coefficient RMS: the two arms' scales, step for step.
+        key = f"mac/{span}/sb_coefficient_square_sum"
+        count = dashboard.get(f"mac/{span}_states")
+        if count and any(key in metric for metric in metrics):
+            dashboard[f"mac/{span}_sb_coefficient_rms"] = math.sqrt(
+                sum(metric[key] for metric in metrics) / count)
+    if any("mac/sequence/rows" in metric for metric in metrics):
+        def rows_total(name: str) -> float:
+            return sum(metric[f"mac/sequence/{name}"] for metric in metrics)
+
+        rows = rows_total("rows")
+        dashboard["mac/answer_cluster_entropy_mean"] = rows_total("surprisal_sum") / rows
+        dashboard["mac/answer_unanimous_share"] = rows_total("unanimous_rows") / rows
+        dashboard["mac/sequence_advantage_rms"] = math.sqrt(
+            rows_total("advantage_square_sum") / rows)
+        dashboard["mac/sequence_coefficient_rms"] = math.sqrt(
+            rows_total("coefficient_square_sum") / rows)
+        mass = rows_total("advantage_token_abs_sum")
+        if mass:
+            # |omega| over |U| where the token-normalized update puts its
+            # weight: the gate's mean weighted by |U| T (1 for RLOO).
+            dashboard["mac/answer_gate_token_mass_mean"] = rows_total(
+                "coefficient_token_abs_sum") / mass
+    for sign in ("positive", "negative"):
+        if any(f"mac/answer_gate_{sign}_count" in metric for metric in metrics):
+            count = sum(metric[f"mac/answer_gate_{sign}_count"] for metric in metrics)
+            if count:
+                dashboard[f"mac/answer_gate_{sign}_mean"] = sum(
+                    metric[f"mac/answer_gate_{sign}_sum"] for metric in metrics) / count
+    for quantile in ANSWER_GATE_QUANTILES:
+        key = f"mac/answer_gate_q{round(quantile * 100):02d}"
+        values = [metric[key] for metric in metrics if math.isfinite(metric.get(key, math.nan))]
+        if values:
+            # One optimizer minibatch per step in the drills; a mean of
+            # minibatch quantiles otherwise.
+            dashboard[key] = sum(values) / len(values)
+    return dashboard
+
+
+def support_dashboard(metrics: list[dict[str, float]]) -> dict[str, float]:
+    """The critic's policy-centered Q that MAC read this update, by the
+    policy's support: its mean and positive fraction at tokens with
+    pi < 1e-4 (no regression data), at ranks 2-8, and its mean at the top
+    token (``mean_actor_critic.SUPPORT_CENSUS_FIELDS``)."""
+    if not any("support/top_count_sum" in metric for metric in metrics):
+        return {}
+    total = {name: sum(metric[f"support/{name}_sum"] for metric in metrics)
+             for name in SUPPORT_CENSUS_FIELDS}
+    dashboard = {}
+    for span in ("offsupport", "rank2to8"):
+        count = total[f"{span}_count"]
+        if count:
+            dashboard[f"support/{span}_advantage_mean"] = total[f"{span}_advantage"] / count
+            dashboard[f"support/{span}_positive_fraction"] = total[f"{span}_positive"] / count
+    if total["top_count"]:
+        dashboard["support/offsupport_tokens_per_state"] = total["offsupport_count"] / total["top_count"]
+        dashboard["support/top_advantage_mean"] = total["top_advantage"] / total["top_count"]
+    return dashboard
+
+
+def q_prior_dashboard(metrics: list[dict[str, float]]) -> dict[str, float]:
+    """The pessimistic Q prior per head and state: its unweighted term,
+    sum_a relu(A_h)^2 under the current policy, and how many tokens read
+    better than the policy's value (``postraining.pessimistic_q``)."""
+    count = sum(metric.get("q_prior/count", 0.0) for metric in metrics)
+    if not count:
+        return {}
+    return {
+        "q_prior/penalty_per_state": sum(metric["q_prior/penalty_sum"] for metric in metrics) / count,
+        "q_prior/positive_tokens_per_state": (
+            sum(metric["q_prior/positive_sum"] for metric in metrics) / count),
+    }
+
+
+def twin_dashboard(metrics: list[dict[str, float]]) -> dict[str, float]:
+    """The twin Q heads' disagreement on the taken token: the RMS of
+    Q1 - Q2, and the mean of their mean minus their min, by how much the
+    clipped double-Q bootstrap sits below the Q the actor reads."""
+    if not any("twin/action_count" in metric for metric in metrics):
+        return {}
+    count = sum(metric["twin/action_count"] for metric in metrics)
+    if not count:
+        return {}
+    return {
+        "twin/gap_rms": math.sqrt(
+            sum(metric["twin/gap_square_sum"] for metric in metrics) / count),
+        "twin/min_shift_mean": sum(
+            metric["twin/min_shift_sum"] for metric in metrics) / count,
+    }
+
+
+def belief_gain_dashboard(critic) -> dict[str, float]:
+    """Each token Q head's belief gain g before the step: u . (x - xbar)
+    holds (g / r)(z - zbar), so g is how much Q follows the critic trunk's
+    own centred logit and how hard MAC sharpens the actor toward it."""
+    if getattr(critic, "q_head", None) is None:
+        return {}
+    names = ("critic_q/belief_gain", "critic_q/belief_gain_twin")
+    return {name: float(head.belief_gain.detach())
+            for name, head in zip(names, critic.q_heads, strict=False)}
+
+
 def aggregate_actor_tensorboard_metrics(
     metrics: list[dict[str, float]],
 ) -> dict[str, float]:
@@ -2012,7 +2670,8 @@ def aggregate_actor_tensorboard_metrics(
     dashboard = {
         "loss/policy": policy_contribution,
         "loss/actor_total": policy_contribution,
-        "value/token_weighted_mse": value["loss"],
+        ("value/token_weighted_bce" if "binary_success_bce" in last
+         else "value/token_weighted_mse"): value["loss"],
         "value/prediction_mean": value["prediction_mean"],
         "value/target_mean": value["target_mean"],
         "value/residual_mean": value["residual_mean"],
@@ -2050,6 +2709,39 @@ def aggregate_actor_tensorboard_metrics(
     }
     if "credit_count" in last:
         dashboard.update(credit_assignment_dashboard(metrics))
+    if "mc_explained_variance" in last:
+        # A Q critic's ``value/*`` rows fit its generalized value estimates;
+        # these are the same predictions against the Monte-Carlo return.
+        mc_value = aggregate_mc_value_diagnostics(metrics)
+        dashboard["value/mc_target_mean"] = mc_value["target_mean"]
+        dashboard["value/mc_residual_mean"] = mc_value["residual_mean"]
+        dashboard["value/mc_explained_variance"] = mc_value[
+            "explained_variance"
+        ]
+    if "entropy_loss" in last:
+        entropy_loss = sum(metric["entropy_loss"] for metric in metrics)
+        dashboard["loss/entropy"] = entropy_loss
+        dashboard["loss/actor_total"] += entropy_loss
+    if "policy_entropy_sum" in last:
+        entropy_count = sum(metric["policy_entropy_count"] for metric in metrics)
+        # Undefined without an active emit slot, so omitted rather than 0.
+        if entropy_count > 0:
+            dashboard["entropy/policy_mean"] = sum(
+                metric["policy_entropy_sum"] for metric in metrics
+            ) / entropy_count
+    if "binary_success_bce" in last:
+        dashboard["value/token_weighted_brier"] = _weighted_metric_mean(
+            metrics, "binary_success_brier", "action_count"
+        )
+        dashboard["value/binary_success_r_squared"] = 1.0 - (
+            _weighted_metric_mean(metrics, "binary_success_brier", "action_count")
+            / max(value["target_variance"], 1e-12)
+        ) if value["target_variance"] > 1e-12 else 0.0
+        dashboard["q/actor_success_probability_mean"] = advantage_mean
+        dashboard["q/actor_success_probability_std"] = advantage_std
+        dashboard["q/binary_dg_coefficient_mean"] = _weighted_metric_mean(
+            metrics, "binary_dg_coefficient_mean", "action_count"
+        )
     if "action_value_loss" in last:
         action_value = aggregate_action_value_diagnostics(metrics)
         dashboard["value/action_value_mse"] = action_value["loss"]
@@ -2233,6 +2925,15 @@ def rollout_tensorboard_metrics(metrics: dict[str, float | int]) -> dict[str, fl
         ),
         "behavior/actions_per_trajectory": float(
             metrics["actions_per_trajectory"]
+        ),
+        **(
+            {
+                "behavior/length_reward_covariance": float(
+                    metrics["length_reward_covariance"]
+                )
+            }
+            if "length_reward_covariance" in metrics
+            else {}
         ),
         "behavior/thoughts_per_trajectory": float(
             metrics.get("thoughts_per_trajectory", 0.0)
@@ -2699,6 +3400,10 @@ def optimizer_learning_rates(args) -> dict[str, float]:
         "actor_muon": args.muon_learning_rate,
         "critic_muon": args.critic_muon_learning_rate,
         "critic_action": getattr(args, "critic_action_head_learning_rate", None),
+        "actor_fresh": getattr(args, "fresh_learning_rate", None),
+        "actor_fresh_muon": getattr(args, "fresh_muon_learning_rate", None),
+        "critic_fresh": getattr(args, "fresh_learning_rate", None),
+        "critic_fresh_muon": getattr(args, "fresh_muon_learning_rate", None),
     }
 
 
@@ -2709,7 +3414,11 @@ def reassert_learning_rates(
     rates = optimizer_learning_rates(args)
     for name, optimizer in optimizers.items():
         for group in optimizer.param_groups:
-            group["lr"] = rates[name]
+            group["lr"] = (
+                args.critic_q_direction_learning_rate
+                if group.get("token_q_direction", False)
+                else rates[name]
+            )
 
 
 def build_optimizers(
@@ -2722,6 +3431,9 @@ def build_optimizers(
     critic_muon_learning_rate: float | None = None,
     fused: bool = True,
     critic_action_learning_rate: float | None = None,
+    critic_q_direction_learning_rate: float | None = None,
+    fresh_learning_rate: float | None = None,
+    fresh_muon_learning_rate: float | None = None,
 ) -> dict[str, torch.optim.Optimizer]:
     """The actor/critic optimizer layout.
 
@@ -2742,7 +3454,19 @@ def build_optimizers(
 
     A critic action head has its own ``critic_action`` AdamW, so a carried
     critic's optimizer state loads unchanged beside a fresh head and an
-    action-head warmup can step the head alone.
+    action-head warmup can step the head alone. A standalone Q critic's
+    token head takes the same optimizer and rate: a relu^2 layer and
+    zero-initialized readouts like the action head, whose measured fit
+    wanted the head rate, not the trunk's. ``critic_q_direction_learning_rate``
+    moves that head's direction readout u(s) into its own group: u is dotted
+    with every action latent, so its effective step scales with their width.
+
+    ``fresh_learning_rate`` gives the from-scratch modules -- the actor's
+    ``new_parameters()`` and the critic's ``fresh_parameters()`` -- their own
+    ``<role>_fresh`` AdamW (ndim < 2) and ``<role>_fresh_muon`` Muon
+    (ndim >= 2), pretraining's partition, instead of the fine-tuning rate
+    of the role's AdamW. The optimizer names are the resume layout, so a
+    run cannot resume across the change.
     """
     if trunk_optimizer not in ("adamw", "muon"):
         raise ValueError(f"unknown trunk optimizer {trunk_optimizer!r}")
@@ -2759,11 +3483,22 @@ def build_optimizers(
         critic_muon_parameters = muon_matrix_parameters(critic.trunk.blocks, set())
     actor_muon_ids = {id(parameter) for parameter in actor_muon_parameters}
     critic_muon_ids = {id(parameter) for parameter in critic_muon_parameters}
-    critic_action_parameters = (
-        []
-        if critic.action_head is None
-        else list(critic.action_head.parameters())
-    )
+    if (fresh_learning_rate is None) != (fresh_muon_learning_rate is None):
+        raise ValueError("fresh modules need both their AdamW and Muon rates")
+    fresh = {} if fresh_learning_rate is None else {
+        "actor": [p for p in wrapper.new_parameters() if p.requires_grad],
+        "critic": [p for p in critic.fresh_parameters() if p.requires_grad],
+    }
+    critic_fresh_ids = {id(parameter) for parameter in fresh.get("critic", ())}
+    critic_action_parameters = [
+        parameter
+        for head in (critic.action_head, critic.q_head,
+                     getattr(critic, "q_twin", None),
+                     getattr(critic, "post_action_q_head", None))
+        if head is not None
+        for parameter in head.parameters()
+        if id(parameter) not in critic_fresh_ids
+    ]
     critic_action_ids = {id(parameter) for parameter in critic_action_parameters}
     trunk_parameters = [
         parameter
@@ -2778,12 +3513,17 @@ def build_optimizers(
         if parameter.requires_grad
         if id(parameter) not in critic_muon_ids
         and id(parameter) not in critic_action_ids
+        and id(parameter) not in critic_fresh_ids
     ]
     optimizers = {
         "actor": torch.optim.AdamW(
             [
                 {"params": trunk_parameters, "lr": learning_rate},
-                {"params": list(wrapper.new_parameters()), "lr": learning_rate},
+                *(
+                    [{"params": list(wrapper.new_parameters()), "lr": learning_rate}]
+                    if fresh_learning_rate is None
+                    else []
+                ),
                 {"params": renderer_parameters(backbone), "lr": learning_rate},
             ],
             weight_decay=0.0,
@@ -2797,15 +3537,25 @@ def build_optimizers(
         ),
     }
     if critic_action_parameters:
+        head_rate = (
+            critic_learning_rate
+            if critic_action_learning_rate is None
+            else critic_action_learning_rate
+        )
+        action_groups = [{"params": critic_action_parameters, "lr": head_rate}]
+        if critic_q_direction_learning_rate is not None:
+            if critic.q_head is None:
+                raise ValueError("a direction learning rate needs a token Q critic")
+            directions = [weight for head in critic.q_heads for weight in head.direction_weights]
+            direction_ids = {id(direction) for direction in directions}
+            action_groups = [
+                {"params": [p for p in critic_action_parameters if id(p) not in direction_ids],
+                 "lr": head_rate},
+                {"params": directions, "lr": critic_q_direction_learning_rate,
+                 "token_q_direction": True},
+            ]
         optimizers["critic_action"] = torch.optim.AdamW(
-            critic_action_parameters,
-            lr=(
-                critic_learning_rate
-                if critic_action_learning_rate is None
-                else critic_action_learning_rate
-            ),
-            weight_decay=0.0,
-            fused=fused,
+            action_groups, lr=head_rate, weight_decay=0.0, fused=fused,
         )
     if trunk_optimizer == "muon":
         if muon_learning_rate is None or critic_muon_learning_rate is None:
@@ -2816,6 +3566,17 @@ def build_optimizers(
         optimizers["critic_muon"] = Muon(
             critic_muon_parameters, lr=critic_muon_learning_rate, weight_decay=0.0
         )
+    for role, parameters in fresh.items():
+        vectors = [parameter for parameter in parameters if parameter.ndim < 2]
+        matrices = [parameter for parameter in parameters if parameter.ndim >= 2]
+        if vectors:
+            optimizers[f"{role}_fresh"] = torch.optim.AdamW(
+                vectors, lr=fresh_learning_rate, weight_decay=0.0, fused=fused
+            )
+        if matrices:
+            optimizers[f"{role}_fresh_muon"] = Muon(
+                matrices, lr=fresh_muon_learning_rate, weight_decay=0.0
+            )
     # Exact-partition guard (pretraining's optimizer assertion): every critic
     # parameter in exactly one optimizer, and the Muon split disjoint from
     # the actor's semantic groups.
@@ -2882,6 +3643,28 @@ def build_optimizers(
     return optimizers
 
 
+def post_action_q_loss_and_predictions(
+    critic: SeparateCritic,
+    batch: LatentRolloutBatch,
+    mc_targets: torch.Tensor,
+    contract: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Proper binary fit and exact-prefix actor credit, with separate units.
+
+    Critic diagnostics use the raw sigmoid prediction. Only the actor's
+    detached success probability receives deterministic prefix overrides.
+    No preterminal realized continuation outcome enters that probability.
+    """
+    success_logits = critic.action_success_logits(batch).float()
+    raw_probabilities = success_logits.sigmoid()
+    known, exact_probabilities = exact_prefix_success_constraints(batch, **contract)
+    actor_probabilities = torch.where(known, exact_probabilities, raw_probabilities).detach()
+    errors = F.binary_cross_entropy_with_logits(
+        success_logits, mc_targets, reduction="none"
+    )
+    return raw_probabilities, actor_probabilities, errors
+
+
 def update_minibatch(
     wrapper: LatentThoughtModel,
     critic: SeparateCritic,
@@ -2906,6 +3689,20 @@ def update_minibatch(
     fused_behavior_statistics: bool = False,
     reward_floor: float = 0.0,
     value_scope: str = "critic",
+    critic_lambda: float | None = None,
+    post_action_q_contract: dict | None = None,
+    entropy_temperature: float | None = None,
+    advantage_source_count: int = 0,
+    advantage_token_classes: (
+        dict[str, tuple[torch.Tensor, torch.Tensor | None]] | None
+    ) = None,
+    mean_actor_critic: bool = False,
+    mac_estimator: str | None = None,
+    mac_vocab_chunk: int = 512,
+    mac_gate_shuffle_seed: int | None = None,
+    think_close_id: int | None = None,
+    critic_q_pessimism: float = 0.0,
+    policy_batch: LatentRolloutBatch | None = None,
 ) -> dict[str, float]:
     """One minibatch update.
 
@@ -2939,9 +3736,136 @@ def update_minibatch(
     value-only update of that head alone, for warming it against a critic
     whose values are already fit; it steps only the ``critic_action``
     optimizer.
+
+    A standalone Q critic (``critic.values_actions``) is REPPO's: its
+    values are Q(s_t, a_t), regressed on generalized value estimates
+    (``generalized_value_estimate_targets``) with lambda
+    ``critic_lambda`` -- length-adaptive when None, one in a value-only
+    update -- bootstrapped from this update's own Q. It values every token
+    at once, so the actor's advantage is Q centered exactly under the
+    policy, A_t = Q(s_t, a_t) - sum_a pi(a | s_t) Q(s_t, a), formed in the
+    actor's own readout from the critic's direction u_t at the same slot
+    (``compact_emit_token_logprobs_entropy_and_advantages``). Both come
+    from the update's critic pass, so it needs fused behavior statistics:
+    the targets REPPO forms at collection, from the same parameters. Each
+    shard's critic pass runs just before its actor pass, so u lives for
+    one shard; A_t needs nothing from other rows.
+
+    ``entropy_temperature`` adds REPPO's entropy term to the Delightful
+    objective, -temperature times the policy entropy summed over the
+    actor's active emit slots and divided by ``policy_action_denominator``,
+    the policy loss's own normalizer, so the temperature trades against the
+    per-token Delightful loss. It uses the exact vocabulary entropy rather
+    than a sampled log-probability, and Q stays the plain task value
+    (``postraining.vapo.reppo``).
+
+    ``advantage_source_count`` and ``advantage_token_classes`` break the
+    actor's advantages down over emit slots: by the row's source id, and by
+    the class of the token taken -- name to (token ids, and the ids the
+    previous token must be, or None for any) -- with every slot no class
+    claims in ``other``. Classes should not overlap. They report as
+    ``advantage_group/<name>/{sum,square_sum,count}``, sums that pool
+    across groups (``advantage_group_dashboard``).
+
+    ``mean_actor_critic`` replaces the actor estimator with a token Q
+    estimator (``postraining.mean_actor_critic``) at every emit slot, each
+    weighted by one over ``policy_action_denominator``, read from this
+    pass's critic before its step. ``mac_estimator`` selects it: all-action
+    MAC, the full-vocabulary expectation of the critic's detached
+    policy-centered Q; MAC plus the sampled token's Monte Carlo residual
+    G - Q(s_t, a_t) as a score-function control variate; or that sampled
+    term alone with G - E_pi Q. Its readout chunks of ``mac_vocab_chunk``
+    states also return the behavior log-probs, entropy and sampled-token
+    advantages. ``think_close_id`` splits the advantage report into think
+    and post-think spans. The ``SEQUENCE_ESTIMATORS`` replace G - c with one
+    coefficient per trajectory from the group terms its scorer stamped
+    (``stamp_group_terms``): RLOO's U, or U under the answer gate. They keep
+    the same token weights 1 / ``policy_action_denominator`` as the sampled
+    baseline, so the two differ only in the coefficient; the critic still
+    trains on the same pass, for telemetry.
+
+    ``mac_gate_shuffle_seed`` seeds, and is required by, the measurement
+    control ``delightful_shuffled_head_gate``: each shard first reads every
+    emit state's head advantage A(a_t) without a loss, permutes it within
+    surprisal-and-span strata (``mean_actor_critic.shuffle_within_strata``)
+    from one generator seeded per call, and gates on the result. Shards run
+    in plan order, so the permutation is a function of the seed, the batch
+    and the plan; give each call its own seed.
+
+    ``critic_q_pessimism`` beta > 0 adds a pessimistic prior to every token
+    Q head's loss (``postraining.pessimistic_q``): beta times the sum over
+    the vocabulary of relu(A_h)^2 at each generated state, A_h the head's Q
+    centered under the current policy, normalized as the squared error is.
+    MAC reads Q at tokens the critic never regressed; the prior keeps those
+    from reading better than the policy's value. It needs the policy MAC
+    reads, so it runs in MAC actor updates only: each shard's critic
+    backward waits for the actor pass, whose readout chunks also form the
+    prior's gradients.
+
+    A token Q critic's Q is centred under the policy that sampled the
+    batch, Q(s, a_t) = c + u . (x(a_t) - sum_a pi(a) x(a))
+    (``value_model.policy_centered_q``), so each shard's critic loss waits
+    for the taken tokens' offsets from the policy's mean action rows: from
+    the actor pass's own readout in an actor update, from a replay of the
+    policy in a value-only one.
+    ``policy_batch``, value-only, is the policy's view of the same
+    trajectories when the critic's context differs, row for row and action
+    for action; the default is ``batch``.
     """
     backbone = wrapper.backbone
     action_head = critic.action_head is not None
+    q_critic = critic.values_actions
+    post_action_q = getattr(critic, "post_action_q_head", None) is not None
+    bilinear_q = q_critic and not post_action_q
+    twin_q = getattr(critic, "q_twin", None) is not None
+    if critic_q_pessimism < 0 or not math.isfinite(critic_q_pessimism):
+        raise ValueError("the Q prior weight must be finite and nonnegative")
+    if critic_q_pessimism and (value_only or not mean_actor_critic):
+        raise ValueError("the Q prior reads the policy from a MAC actor update")
+    if critic_q_pessimism and value_scope != "critic":
+        raise ValueError("the Q prior trains the critic's token Q heads")
+    if policy_batch is not None and not (value_only and bilinear_q):
+        raise ValueError("a separate policy view centres a token Q critic's value-only fit")
+    if policy_batch is not None and policy_batch.kind.size(0) != batch.kind.size(0):
+        raise ValueError("the policy view must hold the critic batch's trajectories")
+    if mean_actor_critic and not value_only:
+        if (not bilinear_q or (wrapper.hidden_carry and not wrapper.memory_carry)
+                or think_close_id is None):
+            raise ValueError(
+                "MAC needs a token Q critic, a cot or memory policy and the think fence")
+        if (delightful_policy_gradient or target_policy_optimization
+                or source_success_actor_gate or entropy_temperature is not None):
+            raise ValueError("MAC is a standalone actor objective without outcome masks")
+        if mac_vocab_chunk < 1:
+            raise ValueError("MAC needs a positive vocabulary chunk")
+        validate_mac_estimator(mac_estimator, controls=True)
+        if mac_estimator in SEQUENCE_ESTIMATORS and (
+                batch.group_advantage is None or batch.answer_surprisal is None):
+            raise ValueError(
+                f"{mac_estimator} needs every row's group terms, stamped when its "
+                "prompt group is scored (stamp_group_terms)")
+    if (mac_gate_shuffle_seed is not None) != (
+            mean_actor_critic and not value_only
+            and mac_estimator == "delightful_shuffled_head_gate"):
+        raise ValueError("a gate shuffle seed comes with, and only with, the shuffled head gate")
+    if post_action_q:
+        if actor_gae_lambda not in (None, 0.0) or critic_lambda not in (None, 1.0):
+            raise ValueError("post-action binary Q requires actor lambda 0 and critic lambda 1")
+        if post_action_q_contract is None:
+            raise ValueError("post-action binary Q requires its exact prefix reward contract")
+        if source_success_actor_gate:
+            raise ValueError("post-action Q forbids sampled-future source masking")
+        if entropy_temperature is not None or target_policy_optimization or reward_floor != 0:
+            raise ValueError("post-action binary Q forbids non-binary rewards or extra actor objectives")
+    if q_critic and not value_only and not fused_behavior_statistics:
+        raise ValueError(
+            "a standalone Q critic's targets and advantages come from the "
+            "update's own critic pass; it needs fused behavior statistics"
+        )
+    if q_critic and not value_only and not (delightful_policy_gradient or mean_actor_critic):
+        raise ValueError("a standalone Q critic drives Delightful PG only")
+    if entropy_temperature is not None and not delightful_policy_gradient:
+        raise ValueError("the entropy temperature is a Delightful PG term")
     if value_scope not in ("critic", "action_head"):
         raise ValueError(f"unknown value scope {value_scope!r}")
     if value_scope == "action_head" and not (value_only and action_head):
@@ -2995,7 +3919,7 @@ def update_minibatch(
     if policy_action_denominator is None:
         policy_action_denominator = (
             batch.emit_mask.sum()
-            if delightful_policy_gradient or target_policy_optimization
+            if delightful_policy_gradient or target_policy_optimization or mean_actor_critic
             else batch.action_mask.sum()
         )
     zero = batch.action_mask.new_zeros(())
@@ -3013,7 +3937,7 @@ def update_minibatch(
             "delightful_positive_count", "delightful_negative_gate_sum",
             "delightful_negative_count", "delightful_delight_sum",
             "delightful_surprisal_sum", "delightful_positive_loss_sum",
-            "delightful_negative_loss_sum",
+            "delightful_negative_loss_sum", "binary_q_coefficient_sum",
             "tpo_active_count", "tpo_loss_sum", "tpo_fit_kl_sum",
             "tpo_target_behavior_kl_sum", "tpo_old_probability_sum",
             "tpo_current_probability_sum", "tpo_target_probability_sum",
@@ -3031,14 +3955,56 @@ def update_minibatch(
             "memory_write_count",
             "action_value_loss", "action_residual_sum",
             "action_residual_square_sum",
+            "mc_target_sum", "mc_target_square_sum", "mc_residual_sum",
+            "mc_residual_square_sum", "entropy_sum", "entropy_count",
+            "entropy_loss", "mac_q_variance_think_sum",
+            "mac_q_variance_answer_sum", "mac_coefficient_think_sum",
+            "mac_coefficient_answer_sum", "mac_coefficient_square_think_sum",
+            "mac_coefficient_square_answer_sum", "mac_gate_think_sum",
+            "mac_gate_answer_sum", "mac_gate_positive_sum", "mac_gate_positive_count",
+            "mac_gate_negative_sum", "mac_gate_negative_count",
+            "mac_gate_positive_mass_sum", "mac_gate_positive_weighted_sum",
+            "mac_gate_positive_active_mass_sum", "mac_gate_negative_mass_sum",
+            "mac_gate_negative_weighted_sum", "mac_gate_negative_active_mass_sum",
+            "mac_gate_advantage_states_sum", "mac_gate_advantage_square_sum",
+            "mac_gate_advantage_residual_sum", "mac_residual_square_sum",
+            "mac_head_advantage_states_sum", "mac_head_advantage_square_sum",
+            "mac_head_advantage_residual_sum", "mac_shuffled_advantage_states_sum",
+            "mac_shuffled_advantage_square_sum", "mac_shuffled_advantage_residual_sum",
+            "mac_shuffle_head_cross_sum", "mac_shuffle_fixed_mass_sum", "mac_shuffle_mass_sum",
+            "mac_gate_nonterminal_mass_sum", "mac_gate_nonterminal_weighted_sum",
+            "mac_gate_nonterminal_active_mass_sum",
+            "mac_sb_coefficient_square_think_sum", "mac_sb_coefficient_square_answer_sum",
+            "twin_gap_square_sum",
+            "twin_min_shift_sum", "q_prior_penalty_sum", "q_prior_positive_sum",
+            "q_prior_count",
         )
     }
+    totals["mac_support_census"] = torch.zeros(
+        len(SUPPORT_CENSUS_FIELDS), dtype=torch.float64, device=zero.device)
+    shuffle_generator = None
+    if mac_gate_shuffle_seed is not None:
+        # One stream for the whole call, drawn shard by shard in plan order.
+        shuffle_generator = torch.Generator(device=zero.device).manual_seed(
+            mac_gate_shuffle_seed)
+    # A sequence estimator's coefficient, one per trajectory, from the group
+    # terms alone: no critic value enters it.
+    sequence_rows = (
+        sequence_coefficients(mac_estimator, batch.group_advantage.float(),
+                              batch.answer_surprisal.float())
+        if mean_actor_critic and not value_only and mac_estimator in SEQUENCE_ESTIMATORS
+        else None
+    )
 
     action_counts = batch.action_mask.sum(1)
     lambdas = (
         torch.ones_like(action_counts)
         if value_only
-        else actor_gae_lambdas(action_counts, gae_lambda_alpha, actor_gae_lambda)
+        else actor_gae_lambdas(
+            action_counts,
+            gae_lambda_alpha,
+            (1.0 if post_action_q else critic_lambda) if q_critic else actor_gae_lambda,
+        )
     )
     actor_signal_rows = source_actor_signal_mask(
         batch.source_id,
@@ -3064,7 +4030,32 @@ def update_minibatch(
             )
         return advantages.detach() * actor_signal_rows[:, None]
 
-    if fused_behavior_statistics:
+    mc_targets = None
+    if q_critic:
+        # The Monte-Carlo return, against which Q's fit is also reported, so
+        # its explained variance compares with a V critic's. Each shard
+        # regresses on its own GVE targets, formed once its Q exists; at
+        # lambda one they are this return exactly.
+        _, mc_targets = generalized_advantage_and_return_targets(
+            batch.rewards,
+            torch.zeros_like(batch.old_values),
+            batch.action_mask,
+            torch.ones_like(lambdas),
+        )
+        mc_targets = mc_targets.detach()
+        if post_action_q:
+            torch._assert_async(
+                (~batch.action_mask.bool() | ((mc_targets == 0) | (mc_targets == 1))).all(),
+                "post-action Q requires exact binary Monte Carlo labels",
+            )
+        value_targets = mc_targets.clone()
+        # Filled shard by shard from the actor's readout.
+        advantages = torch.zeros_like(batch.old_values)
+        if bilinear_q:
+            with torch.no_grad():
+                # One action table serves every shard before the critic step.
+                action_latents = critic.action_latents()
+    elif fused_behavior_statistics:
         # The baseline does not exist until the critic pass below; the
         # lambda-one targets never needed it.
         _, value_targets = generalized_advantage_and_return_targets(
@@ -3122,18 +4113,128 @@ def update_minibatch(
         tuple[int, str, torch.Tensor, dict[str, torch.Tensor]]
     ] = []
 
+    if value_only and bilinear_q and policy_batch is not None:
+        # One host read of the policy view's lengths serves every shard.
+        policy_lengths = trajectory_used_lengths(policy_batch).cpu().tolist()
+        # The views hold the same trajectories action for action: equal
+        # per-row counts keep each policy row on its critic slot.
+        torch._assert_async(
+            (policy_batch.emit_mask.sum(1) == batch.action_mask.sum(1)).all(),
+            "the policy and critic views disagree on a trajectory's action count")
+        torch._assert_async(
+            (compact_next_slots(policy_batch.token_ids, slot_index(policy_batch.emit_mask.bool()))
+             == compact_next_slots(batch.token_ids, slot_index(batch.action_mask.bool()))).all(),
+            "the policy and critic views took different tokens")
+
+    def policy_view(shard, microbatch: LatentRolloutBatch) -> LatentRolloutBatch:
+        """The policy's own view of a value-only shard's trajectories."""
+        if policy_batch is None:
+            return microbatch
+        return select_trajectory_rows(
+            policy_batch, shard.rows, max(policy_lengths[row] for row in shard.host_rows))
+
     def critic_shard(
-        shard_index: int, microbatch: LatentRolloutBatch, shard
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Critic forward/backward for one shard; returns detached (V, Q)."""
+        shard_index: int, microbatch: LatentRolloutBatch, shard, actor=None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Critic forward/backward for one shard; returns detached (V, Q)
+        and, for a token Q critic, its direction u at every slot.
+
+        ``actor``, in a token Q critic's actor update, runs the shard's
+        actor pass between the critic's forward and backward: given the
+        detached mean directions, mean state values and per-head
+        directions, it returns the Q prior's gradients for each head's
+        compact emit directions (None without the prior), which join the
+        value loss's single backward, and the taken token's offset from the
+        policy's mean action row at every compact emit slot, which centres Q
+        before its loss forms.
+        """
         rows = shard.rows
         stream_length = shard.stream_length
-        micro_value_targets = value_targets[rows, :stream_length]
-        values, action_values = critic.estimates(microbatch)
+        directions = None
+        prior_directions = None
+        binary_errors = None
+        if post_action_q:
+            values, constrained_probabilities, binary_errors = post_action_q_loss_and_predictions(
+                critic, microbatch, mc_targets[rows, :stream_length],
+                post_action_q_contract,
+            )
+            action_values = None
+        elif bilinear_q:
+            states, member_directions = critic.token_q_parts(microbatch)
+            # The actor reads the twins' mean, TD7's actor objective; Q is
+            # linear in (c, u), so that is the mean head's.
+            directions = member_directions.mean(0).detach()
+            # Every action is an EMIT, so the actor's compact emit slots are
+            # the critic's action slots, in the same order.
+            torch._assert_async(
+                (microbatch.action_mask.bool() == microbatch.emit_mask.bool()).all(),
+                "a token Q critic's actions are the policy's emits",
+            )
+            if actor is not None:
+                prior_directions, emit_offsets = actor(
+                    directions, states.mean(0).detach(), member_directions.detach())
+                emit_index = shard.emit_index
+            else:
+                if not value_only:
+                    raise ValueError("a token Q actor update centres Q in its actor pass")
+                emit_index = slot_index(microbatch.emit_mask.bool())
+                emit_offsets = replay_policy_action_offsets(
+                    wrapper, policy_view(shard, microbatch), action_latents, mac_vocab_chunk)
+            offsets = scatter_slots(directions.new_zeros(directions.shape), emit_index, emit_offsets)
+            member_values = policy_centered_q(states, member_directions, offsets)
+            values = member_values.mean(0)
+            action_values = None
+        else:
+            values, action_values = critic.estimates(microbatch)
+        if q_critic:
+            # Bootstrapped from this pass's own Q, before any step: the
+            # parameters that would have produced it at collection. Twin
+            # heads bootstrap from the smaller of their two Q values of the
+            # next taken token, clipped double Q.
+            micro_value_targets = (
+                mc_targets[rows, :stream_length]
+                if post_action_q else generalized_value_estimate_targets(
+                    microbatch.rewards,
+                    member_values.amin(0) if twin_q else values,
+                    microbatch.action_mask, lambdas[rows],
+                )
+            )
+            with torch.no_grad():
+                micro_mc_targets = mc_targets[rows, :stream_length]
+                mc_residuals = micro_mc_targets - values.detach()
+                totals["mc_target_sum"] += (
+                    micro_mc_targets * microbatch.action_mask
+                ).sum()
+                totals["mc_target_square_sum"] += (
+                    micro_mc_targets.square() * microbatch.action_mask
+                ).sum()
+                totals["mc_residual_sum"] += (
+                    mc_residuals * microbatch.action_mask
+                ).sum()
+                totals["mc_residual_square_sum"] += (
+                    mc_residuals.square() * microbatch.action_mask
+                ).sum()
+        else:
+            micro_value_targets = value_targets[rows, :stream_length]
         # Unclipped squared error: the regression target is the lambda-one
         # return, independent of the old values, so there is no old-value
         # trust region to enforce.
-        value_error = (values - micro_value_targets).square()
+        if post_action_q:
+            # Probability-domain metrics stay comparable; optimize the strictly
+            # proper binary log loss, using logits for numerical stability.
+            value_error = binary_errors
+        elif twin_q:
+            # Each twin regresses the shared target on its own; their losses
+            # add, as TD7's do.
+            value_error = (member_values - micro_value_targets).square().sum(0)
+            with torch.no_grad():
+                gap = member_values[0].detach() - member_values[1].detach()
+                totals["twin_gap_square_sum"] += (gap.square() * microbatch.action_mask).sum()
+                totals["twin_min_shift_sum"] += (
+                    (values.detach() - member_values.detach().amin(0)) * microbatch.action_mask
+                ).sum()
+        else:
+            value_error = (values - micro_value_targets).square()
         local_value_numerator = (value_error * microbatch.action_mask).sum()
         weighted_critic_loss = (
             local_value_numerator / value_action_denominator.clamp_min(1)
@@ -3141,6 +4242,10 @@ def update_minibatch(
             # V is fit already; only the head's loss reaches a gradient.
             else local_value_numerator.new_zeros(())
         )
+        if actor is not None and prior_directions is not None:
+            compact = torch.stack([
+                compact_slots(head, shard.emit_index) for head in member_directions])
+            weighted_critic_loss = weighted_critic_loss + (compact * prior_directions).sum()
         if action_values is not None:
             # Q regresses on the same lambda-one return: the head sees V
             # detached, so it fits the residual R - V from the action alone.
@@ -3200,16 +4305,84 @@ def update_minibatch(
                 totals["advantage_square_sum"] += (
                     residuals.square() * microbatch.action_mask
                 ).sum()
-        return values, action_values
+        if post_action_q:
+            # Advanced indexing makes shard copies: write current Q directly
+            # to the parent array, never reuse stale microbatch.old_values.
+            advantages[rows, :stream_length] = (
+                constrained_probabilities.detach() * actor_signal_rows[rows, None]
+            )
+        return values, action_values, directions
+
+    def carry_telemetry(microbatch: LatentRolloutBatch, stream_inputs: torch.Tensor) -> None:
+        """Accumulate a carry policy's input and memory-write diagnostics."""
+        with torch.no_grad():
+            # The combiner's whole input delta (carry projection, type
+            # bias and MLP stack) against the token embedding it rides
+            # on, over generated slots only: zero at initialization, and
+            # the first sign the carry is being used.
+            # Compacted to the generated slots first, so the diagnostic
+            # costs (slots, dim) rather than two dense stream temporaries.
+            generated_index = slot_index(generated_slot_mask(microbatch))
+            token_latent = wrapper.embed_tokens(
+                compact_slots(microbatch.token_ids, generated_index)
+            ).float()
+            injected = (
+                compact_slots(stream_inputs, generated_index).float()
+                - token_latent
+            )
+            totals["carry_input_delta_square_sum"] += injected.square().sum()
+            totals["carry_token_square_sum"] += token_latent.square().sum()
+            if wrapper.memory_carry:
+                # What the writer does with the response's beliefs: mean
+                # write strength and mean log decay timescale
+                # log 1/(1 - alpha) over heads, so every head counts
+                # alike (the arithmetic timescale is the slowest head's)
+                # and a saturated gate stays finite. Dense and masked:
+                # no host sync for a telemetry gather. Explored writes are
+                # reported as made, noise included.
+                _, _, log_decay, beta = wrapper.combiner.writer(
+                    microbatch.hiddens,
+                    recorded_write_noise(microbatch, wrapper.combiner.writer),
+                )
+                response = (
+                    memory_write_mask(microbatch.kind, PAD_SLOT)
+                    & generated_slot_mask(microbatch)
+                ).to(beta.dtype)[..., None]
+                log_timescale = -torch.log(
+                    (-torch.expm1(log_decay)).clamp_min(1e-12)
+                )
+                totals["memory_write_beta_sum"] += (
+                    beta * response
+                ).sum()
+                totals["memory_decay_log_timescale_sum"] += (
+                    log_timescale * response
+                ).sum()
+                totals["memory_write_count"] += (
+                    response.sum() * beta.size(-1)
+                )
 
     def actor_shard(
-        shard_index: int, microbatch: LatentRolloutBatch, shard
-    ) -> None:
-        """Actor forward/backward for one shard at the current advantages."""
+        shard_index: int,
+        microbatch: LatentRolloutBatch,
+        shard,
+        directions: torch.Tensor | None = None,
+        state_values: torch.Tensor | None = None,
+        member_directions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor] | None:
+        """Actor forward/backward for one shard at the current advantages;
+        a token Q critic's are formed here from its ``directions`` u and
+        its detached ``state_values`` c(s_t). Given each head's detached
+        ``member_directions``, MAC's readout chunks also form the Q prior's
+        gradients for each head's compact emit directions. A token Q
+        critic's pass returns those gradients (None without them) and the
+        taken token's offset from the policy's mean action row at every
+        compact emit slot."""
         rows = shard.rows
         stream_length = shard.stream_length
-        micro_advantages = advantages[rows, :stream_length]
         emit_index = shard.emit_index
+        if (directions is None) == bilinear_q:
+            raise ValueError("token Q directions come with a token Q critic")
+        micro_advantages = None if bilinear_q else advantages[rows, :stream_length]
         # Each stream position is an MDP action. THINK is a stored raw
         # Gaussian vector (plus an optional continuation gate); EMIT is a
         # token (plus the one-way STOP gate only while thinking is active).
@@ -3226,11 +4399,225 @@ def update_minibatch(
         emit_inputs = compact_slots(stream_inputs, emit_index)
         emit_beliefs = compact_slots(beliefs, emit_index)
         emit_targets = compact_next_slots(microbatch.token_ids, emit_index)
-        if target_policy_optimization:
+        compact_entropy = None
+        if mean_actor_critic:
+            # Each chunk's vocabulary readout backpropagates into its own
+            # detached belief leaf at once, then the temporal graph runs
+            # backward a single time; the tied readout's parameter gradients
+            # add to it.
+            compact_directions = compact_slots(directions, emit_index)
+            weights = torch.ones_like(emit_targets, dtype=torch.float32) / (
+                policy_action_denominator.clamp_min(1)
+            )
+            answer = compact_slots(
+                post_think_state_mask(microbatch.token_ids, microbatch.emit_mask, think_close_id),
+                emit_index,
+            ).float()
+            # The sampled continuation's return against the critic's state
+            # value; the readout subtracts A(a_t) for the control variate's
+            # G - Q(a_t).
+            dense_residuals = mc_targets[rows, :stream_length] - state_values
+            residuals = compact_slots(dense_residuals, emit_index).float()
+            baseline_residuals = None
+            if sequence_rows is not None:
+                # The trajectory's constant coefficient on each of its
+                # tokens. The critic's G - c is kept only to report SB's
+                # coefficient scale beside it.
+                baseline_residuals = residuals
+                residuals = sequence_rows[rows][
+                    torch.div(emit_index, stream_length, rounding_mode="floor")]
+            gate_advantages = None
+            # Telemetry of a critic gate reads non-terminal slots only.
+            nonterminal = compact_next_slots(microbatch.action_mask, emit_index).float()
+            if mac_estimator == "delightful_td_gate":
+                # The critic's advantage of the sampled token. Transitions
+                # are deterministic, so Q(s_t, a_t) = V(s_{t+1}), and with
+                # undiscounted returns r_t + c(s_{t+1}) - c(s_t) is
+                # (G_t - c_t) - (G_{t+1} - c_{t+1}): the residual minus the
+                # next state's, zero past the last action (the outcome R
+                # itself is the terminal value).
+                next_residuals = compact_next_slots(dense_residuals, emit_index) * nonterminal
+                gate_advantages = residuals - next_residuals.float()
+            head_advantages = None
+            if mac_estimator == "delightful_shuffled_head_gate":
+                # Every state's head advantage before any loss, from the
+                # MAC readout's own arithmetic, then permuted within its
+                # surprisal-and-span stratum.
+                with torch.no_grad():
+                    head_logprobs, head_advantages = (
+                        torch.cat(parts) for parts in zip(*(
+                            nano_target_logprobs_and_advantages(
+                                backbone, emit_beliefs[start:start + mac_vocab_chunk],
+                                emit_targets[start:start + mac_vocab_chunk],
+                                compact_directions[start:start + mac_vocab_chunk],
+                                action_latents)
+                            for start in range(0, emit_targets.numel(), mac_vocab_chunk))))
+                    gate_advantages = shuffle_within_strata(
+                        head_advantages, gate_shuffle_strata(head_logprobs, answer),
+                        shuffle_generator)
+            prior = member_directions is not None
+            if prior:
+                compact_members = torch.stack([
+                    compact_slots(head, emit_index) for head in member_directions])
+                # Normalized as the critic's squared error is.
+                prior_weights = torch.full_like(
+                    weights, critic_q_pessimism) / value_action_denominator.clamp_min(1)
+                prior_directions = []
+            leaves, statistics, losses, offsets = [], [], [], []
+            for start in range(0, emit_targets.numel(), mac_vocab_chunk):
+                end = start + mac_vocab_chunk
+                leaf = emit_beliefs[start:end].detach().requires_grad_(True)
+                if prior:
+                    chunk_directions, penalty, positive = nano_pessimistic_q_prior(
+                        backbone, leaf.detach(), compact_members[:, start:end], action_latents,
+                        prior_weights[start:end],
+                    )
+                    prior_directions.append(chunk_directions)
+                    with torch.no_grad():
+                        totals["q_prior_penalty_sum"] += penalty.sum()
+                        totals["q_prior_positive_sum"] += positive.sum()
+                        totals["q_prior_count"] += penalty.numel() * (leaf.size(0))
+                loss, *chunk_statistics = nano_mean_actor_critic(
+                    backbone, leaf, emit_targets[start:end],
+                    compact_directions[start:end], action_latents, weights[start:end],
+                    residuals[start:end], mac_estimator,
+                    None if gate_advantages is None else gate_advantages[start:end],
+                )
+                loss.backward()
+                leaves.append(leaf)
+                losses.append(loss.detach())
+                *chunk_statistics, chunk_census, chunk_offsets = chunk_statistics
+                with torch.no_grad():
+                    totals["mac_support_census"] += chunk_census
+                statistics.append(chunk_statistics)
+                offsets.append(chunk_offsets)
+            emit_beliefs.backward(torch.cat([leaf.grad for leaf in leaves]))
+            compact_token_logprobs, compact_entropy, compact_advantages, q_variance = (
+                torch.cat(values) for values in zip(*statistics)
+            )
+            shard_loss = torch.stack(losses).sum()
+            finite_guards.append((shard_index, "mac_actor", shard_loss, {}))
+            with torch.no_grad():
+                totals["policy_loss"] += shard_loss
+                local = torch.zeros_like(microbatch.old_token_logprobs)
+                scatter_slots(local, emit_index, compact_token_logprobs)
+                batch.old_token_logprobs[rows, :stream_length] = local
+                # The sampled log-probability's return coefficient, as the
+                # estimator formed it from G - c: G - Q(a_t), G - E_pi Q, or
+                # that times its delight gate.
+                coefficients = sampled_coefficients(
+                    mac_estimator, residuals, compact_advantages.float(),
+                    compact_token_logprobs, gate_advantages)
+                # The reported advantage is the one the policy gradient
+                # weights: the sampled coefficient for the sampled-only
+                # estimators, the critic's centered Q of the taken token
+                # otherwise.
+                local = torch.zeros_like(microbatch.old_values)
+                scatter_slots(
+                    local, emit_index,
+                    coefficients if mac_estimator in SAMPLED_ONLY_ESTIMATORS
+                    else compact_advantages,
+                )
+                if mac_estimator in DELIGHTFUL_MAC_ESTIMATORS:
+                    delight_advantages = delight_inputs(
+                        mac_estimator, residuals, compact_advantages.float(), gate_advantages)
+                    gate = delight_gate(delight_advantages, compact_token_logprobs)
+                    for span, mask in (("answer", answer), ("think", 1 - answer)):
+                        totals[f"mac_gate_{span}_sum"] += (gate * mask).sum()
+                    # Most sampled tokens are near-certain, so their gate is
+                    # 1/2 and their score e_a - pi is near zero. Weighting by
+                    # the policy-gradient term's sampled-logit magnitude
+                    # |r| (1 - pi(a_t)) reads the gate where the gradient is;
+                    # |U * surprisal| > 1 puts it outside [0.27, 0.73].
+                    mass = residuals.abs() * -torch.expm1(compact_token_logprobs.float())
+                    active = (delight_advantages * compact_token_logprobs).abs() > 1
+                    if mac_estimator in CRITIC_GATED_ESTIMATORS:
+                        # How much of the outcome a critic advantage tracks:
+                        # its scale, and its correlation with r = G - c.
+                        # Non-terminal slots only: at a row's last action
+                        # the TD residual is r exactly, and those points
+                        # would pull a pure-noise critic toward perfect
+                        # tracking. ``gate``: the TD residual; ``head``:
+                        # the action head's A(a_t), the shuffled gate's
+                        # before its permutation; ``shuffled``: what that
+                        # gate reads.
+                        moments = {
+                            "delightful_td_gate": {"gate": gate_advantages},
+                            "delightful_head_gate": {"head": delight_advantages},
+                            "delightful_shuffled_head_gate": {
+                                "head": head_advantages, "shuffled": gate_advantages},
+                        }[mac_estimator]
+                        for source, values in moments.items():
+                            totals[f"mac_{source}_advantage_states_sum"] += nonterminal.sum()
+                            totals[f"mac_{source}_advantage_square_sum"] += (
+                                values.square() * nonterminal).sum()
+                            totals[f"mac_{source}_advantage_residual_sum"] += (
+                                values * residuals * nonterminal).sum()
+                        totals["mac_residual_square_sum"] += (
+                            residuals.square() * nonterminal).sum()
+                        if head_advantages is not None:
+                            # What the permutation leaves of A: its overlap
+                            # with the original, and the gradient mass
+                            # |r| (1 - pi) at states it did not move
+                            # (singleton strata, or fixed points); by mass,
+                            # since near-certain states fill the strata
+                            # that matter least.
+                            totals["mac_shuffle_head_cross_sum"] += (
+                                head_advantages * gate_advantages * nonterminal).sum()
+                            totals["mac_shuffle_fixed_mass_sum"] += (
+                                mass * (head_advantages == gate_advantages)).sum()
+                            totals["mac_shuffle_mass_sum"] += mass.sum()
+                        # The gate where A is the critic's alone, not R - c.
+                        totals["mac_gate_nonterminal_mass_sum"] += (mass * nonterminal).sum()
+                        totals["mac_gate_nonterminal_weighted_sum"] += (
+                            gate * mass * nonterminal).sum()
+                        totals["mac_gate_nonterminal_active_mass_sum"] += (
+                            mass * active * nonterminal).sum()
+                    for sign, mask in (("positive", residuals > 0), ("negative", residuals < 0)):
+                        totals[f"mac_gate_{sign}_sum"] += (gate * mask).sum()
+                        totals[f"mac_gate_{sign}_count"] += mask.sum()
+                        totals[f"mac_gate_{sign}_mass_sum"] += (mass * mask).sum()
+                        totals[f"mac_gate_{sign}_weighted_sum"] += (gate * mass * mask).sum()
+                        totals[f"mac_gate_{sign}_active_mass_sum"] += (
+                            mass * (mask & active)).sum()
+                advantages[rows, :stream_length] = local
+                totals["entropy_sum"] += compact_entropy.sum()
+                totals["entropy_count"] += compact_entropy.numel()
+                totals["mac_q_variance_answer_sum"] += (q_variance * answer).sum()
+                totals["mac_q_variance_think_sum"] += (q_variance * (1 - answer)).sum()
+                for span, mask in (("answer", answer), ("think", 1 - answer)):
+                    totals[f"mac_coefficient_{span}_sum"] += (coefficients * mask).sum()
+                    totals[f"mac_coefficient_square_{span}_sum"] += (
+                        coefficients.square() * mask).sum()
+                    if baseline_residuals is not None:
+                        totals[f"mac_sb_coefficient_square_{span}_sum"] += (
+                            baseline_residuals.square() * mask).sum()
+            if hidden_carry:
+                carry_telemetry(microbatch, stream_inputs)
+            return (torch.cat(prior_directions, dim=1) if prior else None,
+                    torch.cat(offsets))
+        if bilinear_q:
+            compact_token_logprobs, compact_entropy, compact_advantages, emit_offsets = (
+                compact_emit_token_logprobs_entropy_and_advantages(
+                    wrapper, emit_inputs, emit_beliefs, emit_targets,
+                    compact_slots(directions, emit_index), action_latents,
+                )
+            )
+            micro_advantages = torch.zeros_like(microbatch.old_values)
+            scatter_slots(micro_advantages, emit_index, compact_advantages)
+            micro_advantages = micro_advantages * actor_signal_rows[rows, None]
+            advantages[rows, :stream_length] = micro_advantages
+        elif target_policy_optimization:
             compact_token_log_odds = compact_emit_token_log_odds(
                 wrapper, emit_inputs, emit_beliefs, emit_targets
             )
             compact_token_logprobs = F.logsigmoid(compact_token_log_odds)
+        elif entropy_temperature is not None:
+            compact_token_logprobs, compact_entropy = (
+                compact_emit_token_logprobs_and_entropy(
+                    wrapper, emit_inputs, emit_beliefs, emit_targets
+                )
+            )
         else:
             compact_token_logprobs = compact_emit_token_logprobs(
                 wrapper, emit_inputs, emit_beliefs, emit_targets
@@ -3260,50 +4647,7 @@ def update_minibatch(
             old_stochastic_logprobs = None
             weighted_stochastic_loss = new_token_logprobs.new_zeros(())
             weighted_stochastic_clip = new_token_logprobs.new_zeros(())
-            with torch.no_grad():
-                # The combiner's whole input delta (carry projection, type
-                # bias and MLP stack) against the token embedding it rides
-                # on, over generated slots only: zero at initialization, and
-                # the first sign the carry is being used.
-                # Compacted to the generated slots first, so the diagnostic
-                # costs (slots, dim) rather than two dense stream temporaries.
-                generated_index = slot_index(generated_slot_mask(microbatch))
-                token_latent = wrapper.embed_tokens(
-                    compact_slots(microbatch.token_ids, generated_index)
-                ).float()
-                injected = (
-                    compact_slots(stream_inputs, generated_index).float()
-                    - token_latent
-                )
-                totals["carry_input_delta_square_sum"] += injected.square().sum()
-                totals["carry_token_square_sum"] += token_latent.square().sum()
-                if wrapper.memory_carry:
-                    # What the writer does with the response's beliefs: mean
-                    # write strength and mean log decay timescale
-                    # log 1/(1 - alpha) over heads, so every head counts
-                    # alike (the arithmetic timescale is the slowest head's)
-                    # and a saturated gate stays finite. Dense and masked:
-                    # no host sync for a telemetry gather.
-                    with torch.no_grad():
-                        _, _, log_decay, beta = wrapper.combiner.writer(
-                            microbatch.hiddens
-                        )
-                        response = (
-                            memory_write_mask(microbatch.kind, PAD_SLOT)
-                            & generated_slot_mask(microbatch)
-                        ).to(beta.dtype)[..., None]
-                        log_timescale = -torch.log(
-                            (-torch.expm1(log_decay)).clamp_min(1e-12)
-                        )
-                        totals["memory_write_beta_sum"] += (
-                            beta * response
-                        ).sum()
-                        totals["memory_decay_log_timescale_sum"] += (
-                            log_timescale * response
-                        ).sum()
-                        totals["memory_write_count"] += (
-                            response.sum() * beta.size(-1)
-                        )
+            carry_telemetry(microbatch, stream_inputs)
         else:
             new_stop_logprobs = -F.binary_cross_entropy_with_logits(
                 wrapper.gate.stop_logit(beliefs),
@@ -3424,13 +4768,19 @@ def update_minibatch(
             ):
                 totals[total_name] += tpo[source_name]
         elif delightful_policy_gradient:
-            weighted_policy_loss, delightful = delightful_policy_loss(
+            policy_loss_function = (
+                binary_q_delightful_policy_loss if post_action_q
+                else delightful_policy_loss
+            )
+            weighted_policy_loss, delightful = policy_loss_function(
                 new_token_logprobs,
                 micro_advantages,
                 active_emit_mask,
                 denominator=policy_action_denominator,
             )
             weighted_policy_clip = weighted_policy_loss.detach().new_zeros(())
+            if post_action_q:
+                totals["binary_q_coefficient_sum"] += delightful["coefficient_sum"]
             totals["delightful_gate_sum"] += delightful["gate_sum"]
             totals["delightful_positive_gate_sum"] += delightful[
                 "positive_gate_sum"
@@ -3483,6 +4833,38 @@ def update_minibatch(
         totals["stochastic_policy_loss"] += weighted_stochastic_loss.detach()
         totals["stochastic_policy_clip"] += weighted_stochastic_clip.detach()
         actor_total = weighted_policy_loss
+        if compact_entropy is not None:
+            # The token Q's fused readout yields the exact entropy at no
+            # extra cost, so it is reported whether or not an entropy term
+            # consumes it; without the term it stays a diagnostic.
+            compact_active = compact_slots(active_emit_mask, emit_index).to(
+                compact_entropy.dtype
+            )
+            active_entropy = compact_entropy * compact_active
+            if entropy_temperature is not None:
+                # REPPO's temperature * log pi, in expectation: the entropy
+                # term over the same emit slots and denominator as the
+                # policy loss.
+                entropy_loss = -(
+                    entropy_temperature
+                    * active_entropy.sum()
+                    / policy_action_denominator.clamp_min(1)
+                )
+                actor_total = actor_total + entropy_loss
+                totals["entropy_loss"] += entropy_loss.detach()
+            with torch.no_grad():
+                totals["entropy_sum"] += active_entropy.detach().sum()
+                totals["entropy_count"] += compact_active.sum()
+        if post_action_q:
+            domain_valid = delightful["valid_logprobs"] & delightful["valid_q"]
+            finite_guards.append((
+                shard_index, "binary_q_input_domain",
+                torch.where(domain_valid, actor_total.detach().new_zeros(()),
+                            actor_total.detach().new_full((), float("nan"))),
+                {name: delightful[name] for name in (
+                    "positive_logprob_count", "nonfinite_logprob_count", "positive_logprob_max",
+                )},
+            ))
         finite_guards.append(
             (
                 shard_index,
@@ -3518,13 +4900,37 @@ def update_minibatch(
                 (torch.expm1(token_log_ratio) - token_log_ratio)
                 * microbatch.action_mask
             ).sum()
+        if bilinear_q:
+            return None, emit_offsets
+        return None
 
-
-    if fused_behavior_statistics:
+    if fused_behavior_statistics and q_critic:
         for shard_index, (microbatch, shard) in enumerate(
             iter_planned_replay_microbatches(batch, replay_plan)
         ):
-            values, action_values = critic_shard(shard_index, microbatch, shard)
+            if bilinear_q:
+                # The critic's loss waits for the actor pass: Q is centred
+                # under the policy its readout forms.
+                def actor(directions, states, members, microbatch=microbatch, shard=shard,
+                          shard_index=shard_index):
+                    return actor_shard(shard_index, microbatch, shard, directions, states,
+                                       members if critic_q_pessimism else None)
+                values, _, directions = critic_shard(shard_index, microbatch, shard, actor)
+            else:
+                values, _, directions = critic_shard(shard_index, microbatch, shard)
+            with torch.no_grad():
+                batch.old_values[shard.rows, : shard.stream_length] = values
+            if not bilinear_q:
+                actor_shard(shard_index, microbatch, shard)
+            del directions
+        batch.statistics_refreshed = True
+    elif fused_behavior_statistics:
+        for shard_index, (microbatch, shard) in enumerate(
+            iter_planned_replay_microbatches(batch, replay_plan)
+        ):
+            values, action_values, _ = critic_shard(
+                shard_index, microbatch, shard
+            )
             with torch.no_grad():
                 # Advanced row indexing materializes a copy, so assignment
                 # targets the parent, as in refresh_old_statistics.
@@ -3548,12 +4954,39 @@ def update_minibatch(
             critic_shard(shard_index, microbatch, shard)
             if not value_only:
                 actor_shard(shard_index, microbatch, shard)
+    advantage_groups: dict[str, torch.Tensor] = {}
     if not value_only:
         with torch.no_grad():
             totals["advantage_sum"] = (advantages * batch.action_mask).sum()
             totals["advantage_square_sum"] = (
                 advantages.square() * batch.action_mask
             ).sum()
+            emit = batch.emit_mask.to(advantages.dtype)
+            if advantage_source_count and batch.source_id is None:
+                raise ValueError("a source breakdown needs the batch's source ids")
+            for source_id in range(advantage_source_count):
+                advantage_groups[f"source_{source_id}"] = emit * (
+                    batch.source_id == source_id
+                ).to(emit.dtype)[:, None]
+            if advantage_token_classes:
+                taken = next_slot_tokens(batch.token_ids)
+                unlisted = emit
+                for name, (token_ids, previous_ids) in (
+                    advantage_token_classes.items()
+                ):
+                    member = torch.isin(taken, token_ids)
+                    if previous_ids is not None:
+                        # The token at a slot precedes the one taken there.
+                        member &= torch.isin(batch.token_ids, previous_ids)
+                    advantage_groups[name] = emit * member.to(emit.dtype)
+                    unlisted = unlisted - advantage_groups[name]
+                advantage_groups["other"] = unlisted
+            if think_close_id is not None:
+                answer = post_think_state_mask(
+                    batch.token_ids, batch.emit_mask, think_close_id
+                ).to(emit.dtype)
+                advantage_groups["span_think"] = emit - answer
+                advantage_groups["span_answer"] = answer
 
     if finite_guards:
         # One host sync resolves every shard's loss guard, after all backward
@@ -3618,6 +5051,114 @@ def update_minibatch(
         "emit_action_count": batch.emit_mask.sum(),
         "actor_active_trajectory_fraction": actor_signal_rows.float().mean(),
     }
+    if post_action_q:
+        metric_tensors["binary_success_bce"] = totals["value_loss"] / action_denom
+        metric_tensors["binary_success_brier"] = totals["residual_square_sum"] / action_denom
+        metric_tensors["binary_success_r_squared"] = torch.where(
+            target_variance > 1e-12,
+            1.0 - metric_tensors["binary_success_brier"] / target_variance.clamp_min(1e-12),
+            torch.zeros_like(target_variance),
+        )
+        if not value_only:
+            metric_tensors["actor_success_probability_mean"] = advantage_mean
+            metric_tensors["actor_success_probability_std"] = advantage_variance.sqrt()
+            metric_tensors["binary_dg_coefficient_mean"] = totals["binary_q_coefficient_sum"] / action_denom
+    for name, mask in advantage_groups.items():
+        metric_tensors[f"advantage_group/{name}/sum"] = (
+            advantages * mask
+        ).sum()
+        metric_tensors[f"advantage_group/{name}/square_sum"] = (
+            advantages.square() * mask
+        ).sum()
+        metric_tensors[f"advantage_group/{name}/count"] = mask.sum()
+    if q_critic:
+        # Q's fit against the Monte-Carlo return: the explained variance a
+        # V critic reports, beside ``explained_variance`` against Q's own
+        # generalized value estimates.
+        mc_target_mean = totals["mc_target_sum"] / action_denom
+        mc_target_variance = (
+            totals["mc_target_square_sum"] / action_denom
+            - mc_target_mean.square()
+        ).clamp_min(0)
+        mc_residual_mean = totals["mc_residual_sum"] / action_denom
+        mc_residual_variance = (
+            totals["mc_residual_square_sum"] / action_denom
+            - mc_residual_mean.square()
+        ).clamp_min(0)
+        metric_tensors.update(
+            mc_target_mean=mc_target_mean,
+            mc_target_variance=mc_target_variance,
+            mc_residual_mean=mc_residual_mean,
+            mc_residual_variance=mc_residual_variance,
+            mc_explained_variance=torch.where(
+                mc_target_variance > 1e-12,
+                1.0 - mc_residual_variance / mc_target_variance.clamp_min(1e-12),
+                torch.zeros_like(mc_target_variance),
+            ),
+        )
+    if critic_q_pessimism:
+        metric_tensors.update({
+            "q_prior/penalty_sum": totals["q_prior_penalty_sum"],
+            "q_prior/positive_sum": totals["q_prior_positive_sum"],
+            "q_prior/count": totals["q_prior_count"],
+        })
+    if twin_q:
+        metric_tensors.update({
+            "twin/gap_square_sum": totals["twin_gap_square_sum"],
+            "twin/min_shift_sum": totals["twin_min_shift_sum"],
+            "twin/action_count": batch.action_mask.sum(),
+        })
+    if (entropy_temperature is not None or q_critic) and not value_only:
+        metric_tensors.update(
+            policy_entropy_sum=totals["entropy_sum"],
+            policy_entropy_count=totals["entropy_count"],
+        )
+    if mean_actor_critic and not value_only:
+        metric_tensors.update({
+            f"support/{name}_sum": totals["mac_support_census"][index]
+            for index, name in enumerate(SUPPORT_CENSUS_FIELDS)
+        })
+        metric_tensors.update({
+            f"mac/{span}/{name}_sum": totals[f"mac_{name}_{span}_sum"]
+            for span in ("think", "answer")
+            for name in ("q_variance", "coefficient", "coefficient_square")
+        })
+        if mac_estimator in CRITIC_GATED_ESTIMATORS:
+            sources = {"delightful_td_gate": ("gate",), "delightful_head_gate": ("head",),
+                       "delightful_shuffled_head_gate": ("head", "shuffled")}[mac_estimator]
+            metric_tensors.update({
+                f"mac/{name}_sum": totals[f"mac_{name}_sum"]
+                for name in (
+                    *(f"{source}_advantage_{moment}" for source in sources
+                      for moment in ("states", "square", "residual")),
+                    "residual_square", "gate_nonterminal_mass", "gate_nonterminal_weighted",
+                    "gate_nonterminal_active_mass",
+                    *(("shuffle_head_cross", "shuffle_fixed_mass", "shuffle_mass")
+                      if "shuffled" in sources else ()))
+            })
+        if sequence_rows is not None:
+            metric_tensors.update({
+                f"mac/{span}/sb_coefficient_square_sum":
+                    totals[f"mac_sb_coefficient_square_{span}_sum"]
+                for span in ("think", "answer")
+            })
+            metric_tensors.update(sequence_estimator_moments(
+                mac_estimator, batch.group_advantage.float(), batch.answer_surprisal.float(),
+                sequence_rows, batch.emit_mask.sum(1).float()))
+        if mac_estimator in DELIGHTFUL_MAC_ESTIMATORS:
+            metric_tensors.update({
+                f"mac/{span}/gate_sum": totals[f"mac_gate_{span}_sum"]
+                for span in ("think", "answer")
+            })
+            metric_tensors.update({
+                f"mac/gate_{sign}_{name}": totals[f"mac_gate_{sign}_{name}"]
+                for sign in ("positive", "negative")
+                for name in ("sum", "count", "mass_sum", "weighted_sum", "active_mass_sum")
+            })
+    if entropy_temperature is not None and not value_only:
+        # Already over the complete minibatch's policy denominator, a
+        # contribution to sum across groups like ``policy_loss``.
+        metric_tensors.update(entropy_loss=totals["entropy_loss"])
     if action_head:
         # Same moments as V's, against the same targets: the head's own fit,
         # and how much of V's residual the sampled action explains.
@@ -3646,16 +5187,19 @@ def update_minibatch(
         if critic_step:
             step_optimizers(optimizers, critic_role)
         return scalar_tensors_to_floats(metric_tensors)
-    metric_tensors.update(
-        credit_assignment_moments(
-            batch,
-            advantages,
-            value_targets,
-            actor_signal_rows,
-            reward_floor,
-            action_values=batch.old_action_values if action_head else None,
+    if not post_action_q:
+        metric_tensors.update(
+            credit_assignment_moments(
+                batch,
+                advantages,
+                # A Q critic's TD(0) and Monte-Carlo residuals are Q's own:
+                # r_t + Q_{t+1} - Q_t against R - Q_t.
+                mc_targets if q_critic else value_targets,
+                actor_signal_rows,
+                reward_floor,
+                action_values=batch.old_action_values if action_head else None,
+            )
         )
-    )
 
     # Norms are cumulative across prompt groups; the final group reports the
     # complete pre-step norm. Fresh probes are registered
@@ -3823,6 +5367,72 @@ def update_minibatch(
 
 
 @torch.no_grad()
+def trust_region_token_logprobs(
+    wrapper: LatentThoughtModel,
+    batch: LatentRolloutBatch,
+    replay_plan: ReplayPlan,
+    *,
+    shard_stride: int,
+    replay_function: Callable = replay_head_inputs,
+    emit_logprob_function: Callable = compact_emit_token_logprobs,
+) -> Tensor:
+    """Emitted-token log-probs on every ``shard_stride``-th shard, in fp32.
+
+    The trust region's view of the policy. Under bf16 autocast any parameter
+    change -- one weight element moved by 1/16 of its step -- re-rolls the
+    model's rounding through the recurrence to a token KL of 2-3e-4 against
+    the unmoved policy, while the systematic step at 12892's rates is about
+    6e-5 (NOTES 2026-10-12). Autocast off, the matmuls run in the trainer's
+    TF32, whose floor is about 3e-6, and KL is quadratic in the step. Both
+    ends of a measured step must come from here: the update's bf16 behavior
+    log-probs differ from these by the bf16 floor. Whole shards keep their
+    planned shapes; the length-sorted plan makes a stride a sample across
+    lengths. Returns the compact log-probs of the sampled shards, in plan
+    order.
+    """
+    if shard_stride < 1:
+        raise ValueError("shard stride must be positive")
+    compact_logprobs = []
+    with torch.autocast(batch.kind.device.type, enabled=False):
+        for shard_index, (microbatch, shard) in enumerate(
+            iter_planned_replay_microbatches(batch, replay_plan)
+        ):
+            if shard_index % shard_stride:
+                continue
+            beliefs, stream_inputs = replay_function(wrapper, microbatch)
+            emit_index = shard.emit_index
+            compact_logprobs.append(
+                emit_logprob_function(
+                    wrapper,
+                    compact_slots(stream_inputs, emit_index),
+                    compact_slots(beliefs, emit_index),
+                    compact_next_slots(microbatch.token_ids, emit_index),
+                ).float()
+            )
+            del beliefs, stream_inputs
+    return torch.cat(compact_logprobs)
+
+
+@torch.no_grad()
+def step_token_kl(reference: Tensor, current: Tensor) -> dict[str, float]:
+    """The k3 token KL(reference || current) of two trust-region readouts."""
+    if reference.shape != current.shape:
+        raise ValueError("step KL compares readouts of the same tokens")
+    log_ratio = current - reference
+    return scalar_tensors_to_floats(
+        {
+            "kl/post_update_token_pre_step": (
+                torch.expm1(log_ratio) - log_ratio
+            ).mean(),
+            "ratio/post_update_token_pre_step_abs_log_max": (
+                log_ratio.abs().max()
+            ),
+            "trust/measured_tokens": log_ratio.new_tensor(log_ratio.numel()),
+        }
+    )
+
+
+@torch.no_grad()
 def measure_post_update_policy_drift(
     wrapper: LatentThoughtModel,
     batches: list[LatentRolloutBatch],
@@ -3853,6 +5463,10 @@ def measure_post_update_policy_drift(
     a full replay graph and can exceed peak memory. Both are parameters
     rather than module lookups precisely because the trainer rebinds those
     globals to its grad-enabled training artifacts.
+
+    The KL to the behavior log-probs mixes the step's drift with bf16
+    rounding, which any parameter change re-rolls to a token KL of 2-3e-4;
+    ``trust_region_token_logprobs`` measures the step alone.
     """
     if not batches:
         raise ValueError("post-update drift requires at least one rollout batch")
@@ -4020,6 +5634,7 @@ def save_checkpoint(
     warmup_step: int,
     actor_init_provenance: dict | None = None,
     zero_reward_frozen_updates: int = 0,
+    entropy_temperature: EntropyTemperature | None = None,
 ) -> None:
     reasoning_mode = getattr(args, "reasoning_mode", "latent")
     # The schema tags below are derived from the mode; the parameters come
@@ -4041,13 +5656,9 @@ def save_checkpoint(
         "execution_schema": execution_schema_for(
             reasoning_mode, getattr(args, "rollout_scheduler", "lockstep")
         ),
-        "actor_objective_schema": actor_objective_schema(
-            reasoning_mode,
-            getattr(args, "delightful_policy_gradient", False),
-            getattr(args, "target_policy_optimization", False),
-        ),
+        "actor_objective_schema": run_actor_objective_schema(args),
         "resume_arg_contract_schema": RESUME_ARG_CONTRACT_SCHEMA,
-        "critic_schema": CRITIC_SCHEMA,
+        "critic_schema": critic_run_schema(critic),
         "critic_action_head_schema": critic_action_head_schema(critic),
         "source_signal_mask_schema": (
             SOURCE_SIGNAL_MASK_SCHEMA
@@ -4082,7 +5693,8 @@ def save_checkpoint(
         "thought_input_schema": wrapper.thought_input_schema,
         "thought_distribution_schema": wrapper.thought_distribution_schema,
         "optimizer_schema": optimizer_schema_for_trunk_optimizer(
-            getattr(args, "trunk_optimizer", "adamw")
+            getattr(args, "trunk_optimizer", "adamw"),
+            fresh_muon=getattr(args, "fresh_learning_rate", None) is not None,
         ),
         "model": wrapper.state_dict(),
         "critic": critic.state_dict(),
@@ -4090,6 +5702,11 @@ def save_checkpoint(
         "args": vars(args),
         "sampler_cursor": sampler.cursor,
         "zero_reward_frozen_updates": int(zero_reward_frozen_updates),
+        "entropy_temperature_state": (
+            None
+            if entropy_temperature is None
+            else entropy_temperature.state_dict()
+        ),
         "cpu_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
         "python_rng": random.getstate(),
@@ -4258,6 +5875,11 @@ def main() -> None:
         )
     check_think_floor_against_corpus(sft_provenance, args.think_min_tokens)
     is_nano = backbone.architecture.startswith("nanogpt_mini")
+    if args.mean_actor_critic:
+        # MAC renders the policy through nano's raw readout and softcap.
+        if not is_nano:
+            raise ValueError("--mean-actor-critic needs the nano rational-softcap readout")
+        validate_softcap(backbone.logit_softcap)
     if not is_nano and not backbone.architecture.endswith(
         "probes_pope_belief_attached_ce_onepass_2k"
     ):
@@ -4520,8 +6142,17 @@ def main() -> None:
             critic_trunk,
             mlp_hidden=args.combined_mlp_hidden,
             num_blocks=args.combined_mlp_blocks,
-            actor_memory=wrapper.combiner if wrapper.memory_carry else None,
+            actor_memory=(wrapper.combiner
+                          if wrapper.memory_carry and not uses_post_action_q(args)
+                          else None),
             action_head_hidden=args.critic_action_head_hidden,
+            q_head_hidden=args.critic_q_head_hidden,
+            post_action_q_hidden=args.critic_post_action_q_hidden,
+            post_action_q_prior=args.critic_post_action_q_prior,
+            q_head_reads_actor_belief=(
+                args.critic_q_head_hidden is not None and wrapper.hidden_carry
+            ),
+            q_twin=args.critic_q_twin,
         ).to(device)
     critic.eval()  # no dropout in this architecture; keep norms deterministic
     if actor_init_payload is not None:
@@ -4560,6 +6191,17 @@ def main() -> None:
                 f"{bool(init_args.get('answer_fence'))}, got "
                 f"{bool(args.answer_fence)})"
             )
+        if (
+            args.fresh_learning_rate is not None
+            and init_args.get("fresh_learning_rate") != args.fresh_learning_rate
+        ):
+            # The loaded fresh modules are trained, so a from-scratch rate
+            # would restart them -- unless it is the rate they trained at.
+            raise ValueError(
+                "--fresh-learning-rate trains modules from scratch; the "
+                "initialization checkpoint's were trained at "
+                f"--fresh-learning-rate {init_args.get('fresh_learning_rate')}"
+            )
     optimizers = build_optimizers(
         wrapper,
         critic,
@@ -4569,9 +6211,41 @@ def main() -> None:
         muon_learning_rate=args.muon_learning_rate,
         critic_muon_learning_rate=args.critic_muon_learning_rate,
         critic_action_learning_rate=args.critic_action_head_learning_rate,
+        critic_q_direction_learning_rate=args.critic_q_direction_learning_rate,
+        fresh_learning_rate=args.fresh_learning_rate,
+        fresh_muon_learning_rate=args.fresh_muon_learning_rate,
     )
     if carry_critic:
         carry_init_critic(critic, optimizers, actor_init_payload, args)
+    if args.perturbation_gradient_direction:
+        # The sweep never steps: the snapshot's own critic is only the
+        # sampled-baseline estimator's state value for the policy it fit.
+        if actor_init_payload.get("critic_schema") != critic_run_schema(critic):
+            raise ValueError(
+                f"--curriculum-init critic schema {actor_init_payload.get('critic_schema')!r} "
+                f"is not this run's {critic_run_schema(critic)!r}; it cannot be the "
+                "sweep's baseline"
+            )
+        critic.load_state_dict(actor_init_payload["critic"], strict=True)
+        print(f"perturbation sweep: baseline critic from {initialization_path} "
+              f"(step {actor_init_payload.get('step')})", flush=True)
+    # Every parameter an actor step moves, for the KL trust region.
+    actor_step_parameters = [
+        parameter
+        for name, optimizer in optimizers.items()
+        if name == "actor" or name.startswith("actor_")
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    entropy_temperature = (
+        None
+        if args.entropy_target is None
+        else EntropyTemperature(
+            args.entropy_target,
+            args.entropy_temperature_init,
+            args.entropy_temperature_learning_rate,
+        )
+    )
 
     tokenizer = load_posttraining_tokenizer(
         backbone.architecture,
@@ -4602,6 +6276,32 @@ def main() -> None:
         raise RuntimeError(
             "posttraining requires a valid BOS or EOS token for explicit "
             "trajectory termination"
+        )
+    # The token classes the actor's advantages are broken down over: the
+    # option label that opens an answer span is where a multiple-choice prior
+    # would leak into other sources' rows, and fences and stops carry the
+    # format.
+    def token_id_tensor(ids):
+        return torch.tensor(sorted(ids), dtype=torch.long, device=device)
+
+    label_ids = {
+        encoded[0]
+        for encoded in (tokenizer.encode(label) for label in RENDERED_LABELS)
+        if len(encoded) == 1
+    }
+    fence_ids = {
+        token
+        for fence in (think_fence_ids, answer_fence_ids)
+        if fence is not None
+        for token in fence
+    }
+    advantage_token_classes = {"stop": (token_id_tensor(stop_ids), None)}
+    if fence_ids:
+        advantage_token_classes["fence"] = (token_id_tensor(fence_ids), None)
+    if answer_fence_ids is not None:
+        advantage_token_classes["answer_label"] = (
+            token_id_tensor(label_ids),
+            token_id_tensor([answer_fence_ids[0]]),
         )
     answer_prefix_ids: tuple[int, ...] = ()
     if args.reasoning_mode == "none":
@@ -4651,25 +6351,15 @@ def main() -> None:
             raise ValueError("mixture uses a different answer-fence prompt schema")
         # Only a mixture that executes Python rewards is bound to the Python
         # verifier; a math-only mixture's rewards never touch it.
-        args.python_reward_schema = (
-            (PYTHON_PARTIAL_REWARD_SCHEMA if args.python_reward_mode == "test-fraction"
-             else PYTHON_REWARD_SCHEMA)
-            if any(source.verifier == "python_mbpp" for source in mixture_sources)
-            else None
-        )
+        args.python_reward_schema = mixture_python_reward_schema(args, mixture_sources)
         if (
             args.python_reward_schema is not None
             and mixture_manifest.get("python_reward_schema") != PYTHON_REWARD_SCHEMA
         ):
             raise ValueError("mixture uses a different Python reward schema")
-        if (
-            actor_init_payload is not None
-            and actor_init_payload.get("python_reward_schema") != args.python_reward_schema
-        ):
-            raise ValueError(
-                "initialization checkpoint was trained under a different "
-                "Python reward objective than the selected code reward mode"
-            )
+        validate_actor_init_python_reward(
+            actor_init_payload, args.python_reward_schema, carries_critic=carry_critic,
+        )
         if (
             sft_provenance.get("traces_sha256")
             != mixture_manifest.get("sft_corpus_sha256")
@@ -4772,6 +6462,13 @@ def main() -> None:
             args.seed,
             dataset_identity=data_identity,
             randomize_choice_options=args.randomize_choice_options,
+            excluded_sources=tuple(filter(None, args.exclude_rl_sources.split(","))),
+        )
+    if args.exclude_rl_sources:
+        print(
+            f"RL source exclusions: {args.exclude_rl_sources}; original manifest, "
+            "source IDs, cursor coordinates and retained prompt RNG are preserved",
+            flush=True,
         )
     if getattr(args, "critic_only_init", None):
         critic_source = Path(args.critic_only_init)
@@ -4792,6 +6489,27 @@ def main() -> None:
         del critic_payload
         print("Loaded critic-only weights; actor remains base SFT, with fresh "
               "optimizers, RNG, sampler, and actor step", flush=True)
+    if getattr(args, "study_critic_init", None):
+        study_source = Path(args.study_critic_init)
+        study_payload = torch.load(study_source, map_location="cpu", weights_only=False)
+        validate_study_critic_init(study_payload, critic, args, data_identity)
+        load_study_critic(critic, study_payload["critic"])
+        args.study_critic_init_provenance = {
+            "init": "study_checkpoint",
+            "checkpoint": str(study_source),
+            "checkpoint_sha256": file_sha256(study_source),
+            "source_execution_schema": STUDY_CRITIC_SCHEMA,
+            "source_actor_step": 0,
+            "source_value_warmup_step": int(study_payload["step"]),
+            "optimizer_state": "fresh",
+        }
+        print(
+            f"Loaded study critic ({study_payload['step']} updates, final EV "
+            f"{study_payload['final_evaluation']['ev_all_actions']:.3f}) from "
+            f"{study_source}; fresh critic optimizer state",
+            flush=True,
+        )
+        del study_payload
     if actor_init_payload is not None:
         if args.curriculum_init:
             print(
@@ -4976,11 +6694,7 @@ def main() -> None:
                 f"resume checkpoint reward schema must be {expected_reward_schema!r}; "
                 f"got {payload.get('reward_schema')!r}"
             )
-        expected_actor_objective_schema = actor_objective_schema(
-            args.reasoning_mode,
-            args.delightful_policy_gradient,
-            args.target_policy_optimization,
-        )
+        expected_actor_objective_schema = run_actor_objective_schema(args)
         if (
             payload.get("actor_objective_schema")
             != expected_actor_objective_schema
@@ -5060,11 +6774,15 @@ def main() -> None:
                 f"got {args.seed})"
             )
         wrapper.load_state_dict(payload["model"], strict=True)
-        if not resume_critic_schema_compatible(payload):
+        if not resume_critic_schema_compatible(
+            payload, critic.values_actions, post_action_q=uses_post_action_q(args),
+            twin_q=critic.q_twin is not None,
+        ):
             raise ValueError(
                 "resume checkpoint critic schema must be "
-                f"{CRITIC_SCHEMA!r}; got {payload.get('critic_schema')!r}; "
-                "old critic heads are never migrated"
+                f"{critic_run_schema(critic)!r}; got "
+                f"{payload.get('critic_schema')!r}; old critic heads are "
+                "never migrated"
             )
         if payload.get("critic_action_head_schema") != (
             critic_action_head_schema(critic)
@@ -5076,7 +6794,8 @@ def main() -> None:
             )
         critic.load_state_dict(payload["critic"], strict=True)
         expected_optimizer_schema = optimizer_schema_for_trunk_optimizer(
-            args.trunk_optimizer
+            args.trunk_optimizer,
+            fresh_muon=args.fresh_learning_rate is not None,
         )
         if (
             not args.reset_optimizers_on_resume
@@ -5116,6 +6835,16 @@ def main() -> None:
         # reasserted over the loaded optimizer state.
         reassert_learning_rates(optimizers, args)
         start_step = int(payload["step"])
+        if entropy_temperature is not None:
+            # The actor objective schema already bound the entropy term, so
+            # a checkpoint without its state is not this run's.
+            if payload.get("entropy_temperature_state") is None:
+                raise ValueError(
+                    "resume checkpoint has no entropy temperature state"
+                )
+            entropy_temperature.load_state_dict(
+                payload["entropy_temperature_state"]
+            )
         resumed_zero_reward_frozen_updates = payload.get(
             "zero_reward_frozen_updates"
         )
@@ -5130,6 +6859,16 @@ def main() -> None:
         random.setstate(payload["python_rng"])
         sampler.cursor = int(payload["sampler_cursor"])
         actor_init_provenance = payload.get("actor_init_provenance")
+        if (
+            start_step == 0
+            and warmup_step < args.value_warmup_steps
+            and rewinds_warmup_prompts(args)
+            and "target_sampler_cursor" not in (actor_init_provenance or {})
+        ):
+            raise RuntimeError(
+                "a resumed warmup rewinds to its --actor-init cursor, which "
+                "this checkpoint does not record"
+            )
 
     if args.bpb_only or args.bench_only:
         planned_prompt_count = 0
@@ -5170,15 +6909,23 @@ def main() -> None:
             planned_prompt_count = args.prompts_per_minibatch * (
                 warmup_updates + remaining_actor_steps
             )
-    if sampler.cursor + planned_prompt_count > len(math_rows):
-        if args.consume_all_prompts:
+    projected_end_cursor = (
+        sampler.cursor_after(sampler.cursor, planned_prompt_count)
+        if isinstance(sampler, MixedPromptSampler)
+        else sampler.cursor + planned_prompt_count
+    )
+    if projected_end_cursor > len(math_rows):
+        # A recorded rollout dataset treats every group as a distinct
+        # prompt (held-out clusters, train/held-out disjointness), so it
+        # refuses a second epoch as a one-pass run does.
+        if args.consume_all_prompts or args.rollout_dataset:
             raise ValueError(
                 "one-pass run would cross the dataset's first epoch and "
                 "reuse prompts: cursor "
                 f"{sampler.cursor} + planned {planned_prompt_count} > "
                 f"{len(math_rows)} rows"
             )
-        final_epoch = (sampler.cursor + planned_prompt_count - 1) // len(
+        final_epoch = (projected_end_cursor - 1) // len(
             math_rows
         )
         print(
@@ -5517,6 +7264,7 @@ def main() -> None:
             sync_every=args.rollout_sync_every,
             compile=args.rollout_compile,
             cuda_graphs=args.rollout_compile and device.type == "cuda",
+            write_noise=args.write_noise_sweep is not None,
         )
     # Pinned-EMIT evaluation decodes through its own arena: the eval
     # protocol's nucleus is a compile-time constant of the tick, which the
@@ -5540,13 +7288,18 @@ def main() -> None:
             wrapper,
             rows=args.eval_batch_trajectories,
             kv_width=args.prompt_tokens + eval_stream_steps,
-            temperature=EVAL_TEMPERATURE,
-            top_p=EVAL_TOP_P,
+            temperature=args.eval_temperature,
+            top_p=args.eval_top_p,
             stop_ids=stop_ids,
             device=device,
             hidden_carry=hidden_carry,
             sync_every=args.rollout_sync_every,
             replay_storage=False,
+            memory_read_ablation=(
+                args.memory_eval_ablation
+                if args.memory_eval_ablation in FOREIGN_READ_ABLATIONS
+                else "none"
+            ),
         )
 
     if args.rollout_flex_decode and rollout_tail_caches is not None:
@@ -5607,6 +7360,14 @@ def main() -> None:
         torch._dynamo.config.cache_size_limit = 64
         # ``values`` reads the instance's ``estimates``, so rebinding that one
         # method compiles both the value and the action-value paths.
+        if uses_post_action_q(args):
+            critic.action_success_logits = profiler.register_artifact(
+                "critic_action_success_logits",
+                torch.compile(
+                    critic.action_success_logits, mode="default",
+                    fullgraph=trunk_fullgraph, dynamic=True,
+                ),
+            )
         critic.estimates = profiler.register_artifact(
             "critic_estimates",
             torch.compile(
@@ -5663,6 +7424,66 @@ def main() -> None:
         postraining.latent_rollout.compact_emit_token_logprobs = (
             compiled_emit_logprobs
         )
+        if args.entropy_target is not None:
+            # The entropy objective's readout tail, compiled for the same
+            # reason: eagerly its forward holds (slots, vocab) fp32
+            # temporaries. Only the update consumes it; under fused
+            # statistics its log-probs are also the behavior log-probs.
+            globals()["compact_emit_token_logprobs_and_entropy"] = (
+                profiler.register_artifact(
+                    "compact_emit_token_logprobs_and_entropy",
+                    torch.compile(
+                        compact_emit_token_logprobs_and_entropy,
+                        mode="default",
+                        fullgraph=True,
+                        dynamic=True,
+                    ),
+                )
+            )
+        if args.critic_q_head_hidden is not None:
+            # The token Q critic's readout tail: the same fused log-probs
+            # and entropy, plus the policy-centered Q from the same raw
+            # logits. It is the update's only readout under that critic.
+            globals()["compact_emit_token_logprobs_entropy_and_advantages"] = (
+                profiler.register_artifact(
+                    "compact_emit_token_logprobs_entropy_and_advantages",
+                    torch.compile(
+                        compact_emit_token_logprobs_entropy_and_advantages,
+                        mode="default",
+                        fullgraph=True,
+                        dynamic=True,
+                    ),
+                )
+            )
+        if args.critic_q_head_hidden is not None:
+            # critic_shard reads a token Q critic's trunk pass directly, not
+            # through the rebound ``estimates``; centring Q under the policy
+            # is elementwise and follows the actor pass.
+            critic.token_q_parts = profiler.register_artifact(
+                "critic_token_q_parts",
+                torch.compile(
+                    critic.token_q_parts, mode="default",
+                    fullgraph=trunk_fullgraph, dynamic=True,
+                ),
+            )
+        if args.mean_actor_critic:
+            # One artifact per readout chunk shape class; the custom function
+            # keeps the vocabulary axis out of autograd either way.
+            globals()["nano_mean_actor_critic"] = profiler.register_artifact(
+                "nano_mean_actor_critic",
+                torch.compile(
+                    nano_mean_actor_critic, mode="default",
+                    fullgraph=True, dynamic=True,
+                ),
+            )
+        if args.critic_q_pessimism:
+            globals()["nano_pessimistic_q_prior"] = profiler.register_artifact(
+                "nano_pessimistic_q_prior",
+                torch.compile(
+                    nano_pessimistic_q_prior, mode="default",
+                    fullgraph=True, dynamic=True,
+                ),
+            )
         if args.target_policy_optimization:
             compiled_emit_log_odds = profiler.register_artifact(
                 "compact_emit_token_log_odds",
@@ -5780,16 +7601,17 @@ def main() -> None:
                 # configuration's cost.
                 "profiled": bool(args.profile),
                 "profile_schema": PROFILE_SCHEMA if args.profile else None,
+                # Top level too: an ablated bench is not the policy's bench.
+                "memory_eval_ablation": {
+                    "mode": args.memory_eval_ablation,
+                    "schema": MEMORY_EVAL_ABLATION_SCHEMA,
+                },
                 "source_provenance": source_provenance,
                 "topology_history": topology_history,
                 "execution_schema": execution_schema_for(
                     args.reasoning_mode, args.rollout_scheduler
                 ),
-                "actor_objective_schema": actor_objective_schema(
-                    args.reasoning_mode,
-                    args.delightful_policy_gradient,
-                    args.target_policy_optimization,
-                ),
+                "actor_objective_schema": run_actor_objective_schema(args),
                 "source_signal_mask_schema": (
                     SOURCE_SIGNAL_MASK_SCHEMA
                     if args.rl_mixture_manifest
@@ -5808,6 +7630,21 @@ def main() -> None:
                 "math_corpus_identity": math_corpus_identity(math_rows),
                 "math_corpus_audit": corpus_audit,
                 "rl_mixture_manifest": mixture_manifest,
+                "excluded_rl_sources": list(filter(None, args.exclude_rl_sources.split(","))),
+                "source_exclusion_history": (
+                    list((resumed_manifest or {}).get("source_exclusion_history", []))
+                    + ([{
+                        "checkpoint": args.resume,
+                        "checkpoint_sha256": args.resume_checkpoint_sha256,
+                        "step": start_step,
+                        "original_sampler_cursor": sampler.cursor,
+                        "before": (resume_args or {}).get("exclude_rl_sources", ""),
+                        "after": args.exclude_rl_sources,
+                        "schema": "original_mixture_position_skip/v1",
+                    }] if args.resume and (resume_args or {}).get(
+                        "exclude_rl_sources", ""
+                    ) != args.exclude_rl_sources else [])
+                ),
                 "rl_source_ids": source_ids,
                 "python_reward_schema": getattr(args, "python_reward_schema", None),
                 "reward_schema": reward_schema_for_abstention(
@@ -5829,7 +7666,8 @@ def main() -> None:
                     wrapper.thought_distribution_schema
                 ),
                 "optimizer_schema": optimizer_schema_for_trunk_optimizer(
-                    args.trunk_optimizer
+                    args.trunk_optimizer,
+                    fresh_muon=args.fresh_learning_rate is not None,
                 ),
                 "args": vars(args),
                 "base": {
@@ -5851,9 +7689,27 @@ def main() -> None:
                     "frozen_actor_moe_router_parameters": (
                         frozen_moe_router_parameters
                     ),
-                    "critic_schema": CRITIC_SCHEMA,
+                    "critic_schema": critic_run_schema(critic),
                     "action_head_schema": critic_action_head_schema(critic),
                     "action_head_hidden": args.critic_action_head_hidden,
+                    "q_head_hidden": args.critic_q_head_hidden,
+                    "q_twin": args.critic_q_twin,
+                    "q_pessimism": args.critic_q_pessimism,
+                    "post_action_q_hidden": args.critic_post_action_q_hidden,
+                    "post_action_q_prior": args.critic_post_action_q_prior,
+                    "q_metrics": ("raw_sigmoid_predictions_before_exact_prefix_override"
+                                  if uses_post_action_q(args) else None),
+                    "q_head_reads_actor_belief": (
+                        critic.q_head is not None
+                        and critic.q_head.actor_belief is not None
+                    ),
+                    "q_lambda": (
+                        None
+                        if args.critic_q_head_hidden is None and not uses_post_action_q(args)
+                        else "length_adaptive"
+                        if args.q_critic_lambda is None
+                        else args.q_critic_lambda
+                    ),
                     "combined_mlp_hidden": args.combined_mlp_hidden,
                     "combined_mlp_blocks": args.combined_mlp_blocks,
                     "parameters": sum(p.numel() for p in critic.parameters()),
@@ -5883,6 +7739,41 @@ def main() -> None:
     gate_transcripts = (
         GateTranscriptWriter(output / "gate_transcripts.jsonl", tokenizer, stop_ids)
         if args.rollout_only and args.gate_transcripts else None
+    )
+    rollout_dataset = (
+        RolloutDatasetWriter(
+            output / "rollout_dataset",
+            {
+                # The run manifest pins everything a reward depended on:
+                # checkpoint, data, prompt and reward schemas, sampling.
+                "run_manifest_sha256": file_sha256(output / "manifest.json"),
+                "checkpoint_sha256": args.base_checkpoint_sha256,
+                # The --curriculum-init snapshot whose actor sampled the
+                # trajectories, or None for the --checkpoint policy itself.
+                # Readers that replay --checkpoint refuse any other policy.
+                "policy_state_sha256": args.initialization_checkpoint_sha256,
+                "math_data_identity": data_identity,
+                "reasoning_mode": args.reasoning_mode,
+                "reward_schema": reward_schema_for_abstention(
+                    args.abstention_penalty
+                ),
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "samples_per_prompt": args.samples_per_prompt,
+                "seed": args.seed,
+                "max_new_tokens": args.resolved_train_max_new_tokens,
+                "think_min_tokens": args.think_min_tokens,
+                "nearby_reward_max": args.nearby_reward_max,
+                # Trainer order: stop_ids[0] is the EOS that abstention
+                # detection keys on.
+                "stop_ids": [int(token) for token in stop_ids],
+                "trim_multiple": trim_multiple,
+                "prompts_per_rollout": args.prompts_per_rollout,
+            },
+            stop_ids,
+            planned_pools=args.rollout_only_repeats,
+        )
+        if args.rollout_only and args.rollout_dataset else None
     )
 
     def finish_group(
@@ -5923,6 +7814,8 @@ def main() -> None:
         source_name = str(row.get("_rl_source", "math"))
         if gate_transcripts is not None:
             gate_transcripts.write(batch, verdicts, row)
+        if rollout_dataset is not None:
+            rollout_dataset.write(batch, verdicts, row, prompt_text(row))
         if rollout_recorder.armed:
             rollout_recorder.offer(
                 batch,
@@ -5941,6 +7834,16 @@ def main() -> None:
             dtype=torch.long,
             device=batch.kind.device,
         )
+        if args.mean_actor_critic and args.mac_estimator in SEQUENCE_ESTIMATORS:
+            if verifier_kind != "math":
+                # Test results are not answers: two programs passing the
+                # same tests are not one cluster, and their source text
+                # has no canonical form.
+                raise ValueError(
+                    f"--mac-estimator {args.mac_estimator} clusters graded math "
+                    f"answers; source {source_name!r} is verified by {verifier_kind}"
+                )
+            stamp_group_terms(batch, verdicts)
         # Stepwise rollout and parallel replay disagree numerically at
         # bf16 scale; recompute the stored PPO statistics through the
         # update-step replay path so fresh-behavior ratios are exactly one.
@@ -5967,8 +7870,12 @@ def main() -> None:
         prompt_count: int,
         offload_to_cpu: bool,
         scoring_pool: ThreadPoolExecutor | None,
+        write_noise: WriteNoisePlan | None,
     ) -> list[LatentRolloutBatch]:
-        """One rollout: a scored prompt group per sampled DAPO problem."""
+        """One rollout: a scored prompt group per sampled DAPO problem.
+
+        ``write_noise`` explores the memory writes of every trajectory.
+        """
         nonlocal last_decode_schedule_metrics, rollout_paged_cache
         last_decode_schedule_metrics = None
         pool_start_cursor = sampler.cursor
@@ -6011,10 +7918,15 @@ def main() -> None:
 
             ``prompt_lengths_cpu`` is None for an unpadded single prompt.
             """
-            if decode_arena is not None:
-                request_ids = range(
-                    first_request, first_request + prompt_ids.size(0)
+            request_ids = range(first_request, first_request + prompt_ids.size(0))
+            noise = {}
+            if write_noise is not None:
+                noise["write_noise_seeds"], noise["write_noise_scale"] = (
+                    write_noise.inputs(
+                        pool_seed, request_ids, args.samples_per_prompt, device
+                    )
                 )
+            if decode_arena is not None:
                 return decode_arena.rollout(
                     prompt_ids,
                     (
@@ -6035,6 +7947,7 @@ def main() -> None:
                     # the memory carry's replay record does not fit beside
                     # the arena on a 32 GB card.
                     offload_device=cpu if offload_to_cpu else None,
+                    **noise,
                 )
             return rollout_continuations(
                 wrapper, prompt_ids, train_max_new_tokens, max_stream_steps,
@@ -6071,6 +7984,7 @@ def main() -> None:
                 tail_step_core=rollout_tail_step_core,
                 decode_mask=decode_mask_for(prompt_ids.size(1)),
                 tail_decode_mask=rollout_tail_decode_mask,
+                **noise,
             )
 
         if args.rollout_groups <= 1:
@@ -6319,6 +8233,7 @@ def main() -> None:
         refresh_statistics: bool = True,
         prompt_count: int | None = None,
         offload_to_cpu: bool = False,
+        write_noise: WriteNoisePlan | None = None,
     ) -> list[LatentRolloutBatch]:
         if offload_to_cpu and refresh_statistics:
             raise ValueError(
@@ -6351,6 +8266,7 @@ def main() -> None:
                     else prompt_count,
                     offload_to_cpu,
                     scoring_pool,
+                    write_noise,
                 )
         finally:
             if scoring_pool is not None:
@@ -6359,6 +8275,26 @@ def main() -> None:
             wrapper.paged_step_core = original_paged_step_core
 
     def training_update(*update_args, **update_kwargs):
+        if args.mean_actor_critic:
+            update_kwargs.update(
+                mean_actor_critic=True,
+                mac_estimator=args.mac_estimator,
+                mac_vocab_chunk=args.mac_vocab_chunk,
+                think_close_id=think_fence_ids[1],
+            )
+        if args.critic_q_pessimism and not update_kwargs.get("value_only", False):
+            # The prior reads the policy from the actor's MAC pass, which a
+            # value-only update does not run.
+            update_kwargs["critic_q_pessimism"] = args.critic_q_pessimism
+        if uses_post_action_q(args):
+            update_kwargs["post_action_q_contract"] = {
+                "think_fence_ids": think_fence_ids,
+                "answer_fence_ids": answer_fence_ids,
+                "eos_id": tokenizer.eos_id(),
+                "stop_ids": stop_ids,
+                "min_think_tokens": args.think_min_tokens,
+                "max_new_tokens": train_max_new_tokens,
+            }
         with training_autocast():
             return update_minibatch(*update_args, **update_kwargs)
 
@@ -6399,6 +8335,8 @@ def main() -> None:
             think_fence_ids=think_fence_ids,
             answer_fence_ids=answer_fence_ids,
             min_think_tokens=args.think_min_tokens,
+            temperature=args.eval_temperature,
+            top_p=args.eval_top_p,
         )
         metrics["dataset_modal_answer"] = aime_modal_baseline["answer"]
         metrics["dataset_modal_answer_style"] = "aime"
@@ -6436,7 +8374,7 @@ def main() -> None:
         *,
         eval_seed: int | None = None,
         repeat: int | None = None,
-    ) -> None:
+    ) -> dict:
         nonlocal rollout_step_core
         wrapper.eval()
         if eval_seed is None:
@@ -6451,13 +8389,22 @@ def main() -> None:
             compiled_step_core=None if eval_arena is not None else eval_step_core,
             compiled_tail_batch=args.eval_tail_batch or None,
             decode_arena=eval_arena,
+            foreign_memory_reads=(
+                args.memory_eval_ablation
+                if args.memory_eval_ablation in FOREIGN_READ_ABLATIONS
+                else None
+            ),
             captured_attempts=captured_attempts,
+            capture_problem_count=args.bench_capture_problems,
+            capture_samples_per_problem=args.bench_capture_samples,
             pin_emit=pin_emit,
             hidden_carry=hidden_carry,
             prompt_suffix_ids=answer_prefix_ids,
             think_fence_ids=think_fence_ids,
             answer_fence_ids=answer_fence_ids,
             min_think_tokens=args.think_min_tokens,
+            temperature=args.eval_temperature,
+            top_p=args.eval_top_p,
         )
         metrics["dataset_modal_answer"] = bench_dataset_baseline["answer"]
         metrics["dataset_modal_answer_style"] = bench_dataset_baseline["style"]
@@ -6477,6 +8424,8 @@ def main() -> None:
             metrics,
             captured_attempts,
             reward_schema=reward_schema_for_abstention(args.abstention_penalty),
+            problem_count=args.bench_capture_problems,
+            samples_per_problem=args.bench_capture_samples,
         )
         logger.log(
             type="bench",
@@ -6484,6 +8433,7 @@ def main() -> None:
             seconds=eval_seconds,
             eval_seed=eval_seed,
             repeat=repeat,
+            memory_eval_ablation=args.memory_eval_ablation,
             **metrics,
         )
         tensorboard.add_scalar("bench/accuracy", metrics["accuracy"], step)
@@ -6493,23 +8443,38 @@ def main() -> None:
         for key in ("abstained_fraction", "answered_accuracy"):
             if key in metrics:
                 tensorboard.add_scalar(f"bench/{key}", metrics[key], step)
+        for key, tag in (("contract_majority_accuracy", "majority_accuracy"),
+                         ("contract_pass_at_samples", "pass_at_samples"),
+                         ("contract_mean_log_kt_success", "mean_log_kt_success")):
+            tensorboard.add_scalar(f"bench/{tag}", metrics[key], step)
+        tensorboard.add_scalar(
+            "bench/answer_cluster_entropy_mean",
+            sum(metrics["prompt_answer_cluster_entropy"])
+            / max(len(metrics["prompt_answer_cluster_entropy"]), 1),
+            step,
+        )
         print(
             f"step:{step} "
             f"bench_policy_avg@{metrics['policy_samples']}:"
             f"{metrics['policy_accuracy']:.4f}",
             flush=True,
         )
+        return metrics
 
     if args.bench_only:
-        for repeat in range(args.bench_only_repeats):
-            # Repeat zero warms the compiled decoder. Subsequent repeats use
-            # matched but distinct workloads across evaluator modes, avoiding
-            # a single stochastic tail being mistaken for expected speed.
-            bench_eval(
-                start_step,
-                eval_seed=args.seed + repeat,
-                repeat=repeat,
-            )
+        wrapper.eval()
+        # Restored bitwise on exit; nothing trains or saves in this branch.
+        with memory_eval_ablation(wrapper, args.memory_eval_ablation):
+            for repeat in range(args.bench_only_repeats):
+                # Repeat zero warms the compiled decoder. Subsequent repeats
+                # use matched but distinct workloads across evaluator modes,
+                # avoiding a single stochastic tail being mistaken for
+                # expected speed.
+                bench_eval(
+                    start_step,
+                    eval_seed=args.seed + repeat,
+                    repeat=repeat,
+                )
         tensorboard.close()
         return
 
@@ -6533,6 +8498,235 @@ def main() -> None:
         tensorboard.close()
         return
 
+    if args.rollout_only and args.perturbation_sweep:
+        sweep_config = SweepConfig(
+            targets=tuple(args.perturbation_sweep),
+            scales=tuple(args.perturbation_scales),
+            random_directions=args.perturbation_random_directions,
+            gradient_direction=args.perturbation_gradient_direction,
+            radial_direction=args.perturbation_radial_direction,
+            seed=args.seed,
+            gradient_warmup_pools=args.perturbation_gradient_warmup_pools,
+        )
+        named_parameters = dict(wrapper.named_parameters())
+        sweep_targets = {
+            target: target_parameters(named_parameters, target)
+            for target in sweep_config.targets
+        }
+        gradient_names = [
+            name for parameters in sweep_targets.values() for name in parameters
+        ]
+
+        def collect_at(cursor: int) -> list[LatentRolloutBatch]:
+            # Rewinding the cursor replays the pool's prompts and its
+            # counter-keyed token noise (pool_seed is seed ^ cursor).
+            sampler.cursor = cursor
+            groups = collect(refresh_statistics=False, offload_to_cpu=True)
+            torch.cuda.synchronize()
+            return groups
+
+        def token_gradient(
+            groups: list[LatentRolloutBatch],
+        ) -> tuple[dict[str, torch.Tensor], dict]:
+            """The trainer's sampled-baseline actor gradient on one fresh
+            pool, as a per-trajectory estimate of grad J at the targets.
+
+            The actor loss is sum over emit slots of -(G - c) log pi divided
+            by the emit-slot count, so grad J's REINFORCE estimate (mean over
+            trajectories of sum over slots) is -emits / trajectories times
+            the loss gradient. No optimizer steps.
+            """
+            packed = pack_rollout_groups_for_replay(groups, pin_memory=True)
+            plan = build_replay_plan(
+                packed,
+                args.replay_max_trajectories,
+                args.replay_attention_budget,
+                args.replay_bucket,
+                args.replay_slot_budget,
+            )
+            batch = packed.to(device, non_blocking=True)
+            device_plan = plan.to(device, non_blocking=True)
+            del packed, plan
+            zero_optimizers(optimizers, "actor")
+            zero_optimizers(optimizers, "critic")
+            policy_denominator = batch.emit_mask.sum()
+            metrics = training_update(
+                wrapper, critic, batch, optimizers,
+                actor_step=False,
+                critic_step=False,
+                policy_action_denominator=policy_denominator,
+                value_action_denominator=actor_minibatch_action_denominator(
+                    [batch], [0]
+                ),
+                gae_lambda_alpha=args.gae_lambda_alpha,
+                actor_gae_lambda=args.actor_gae_lambda,
+                replay_max_trajectories=args.replay_max_trajectories,
+                replay_attention_budget=args.replay_attention_budget,
+                replay_bucket=args.replay_bucket,
+                replay_slot_budget=args.replay_slot_budget,
+                replay_plan=device_plan,
+                fused_behavior_statistics=True,
+                reward_floor=reward_floor,
+                critic_lambda=args.q_critic_lambda,
+            )
+            trajectories = batch.kind.size(0)
+            emits = int(policy_denominator)
+            scale = -emits / trajectories
+            gradient = {}
+            for name in gradient_names:
+                grad = named_parameters[name].grad
+                if grad is None:
+                    raise RuntimeError(f"the actor update left no gradient at {name}")
+                gradient[name] = grad.detach().double().cpu() * scale
+            zero_optimizers(optimizers, "actor")
+            zero_optimizers(optimizers, "critic")
+            del batch, device_plan
+            stats = {
+                "trajectories": trajectories,
+                "emit_slots": emits,
+                "loss_to_grad_j_scale": scale,
+                "gradient_norms": {
+                    name: float(value.norm()) for name, value in gradient.items()
+                },
+                **{
+                    key: float(value)
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                    or (torch.is_tensor(value) and value.numel() == 1)
+                },
+            }
+            return gradient, stats
+
+        def sweep_log(values: dict) -> None:
+            logger.log(**values)
+            print(json.dumps(values, sort_keys=True), flush=True)
+
+        sweep_writer = SweepWriter(output / "perturbation_sweep", {
+            "schema": PERTURBATION_SWEEP_SCHEMA,
+            "run_manifest_sha256": file_sha256(output / "manifest.json"),
+            "checkpoint": str(args.checkpoint),
+            "checkpoint_sha256": args.base_checkpoint_sha256,
+            "policy_state": args.curriculum_init,
+            "policy_state_sha256": args.initialization_checkpoint_sha256,
+            "math_data_identity": data_identity,
+            "reasoning_mode": args.reasoning_mode,
+            "seed": args.seed,
+            "start_cursor": sampler.cursor,
+            "pools_planned": args.rollout_only_repeats,
+            "prompts_per_rollout": args.prompts_per_rollout,
+            "samples_per_prompt": args.samples_per_prompt,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "reward_schema": reward_schema_for_abstention(args.abstention_penalty),
+            "config": {
+                "targets": list(sweep_config.targets),
+                "scales": list(sweep_config.scales),
+                "random_directions": sweep_config.random_directions,
+                "gradient_direction": sweep_config.gradient_direction,
+                "radial_direction": sweep_config.radial_direction,
+                "gradient_warmup_pools": sweep_config.gradient_warmup_pools,
+            },
+            "token_gradient_estimator": (
+                f"mac_{args.mac_estimator}" if sweep_config.gradient_direction else None
+            ),
+            "targets": {
+                target: {
+                    name: {
+                        "shape": list(value.shape),
+                        "rms": rms,
+                    }
+                    for (name, value), rms in zip(
+                        parameters.items(), tensor_rms(parameters).values()
+                    )
+                }
+                for target, parameters in sweep_targets.items()
+            },
+        })
+        # --max-train-hours bounds the whole process: the sweep stops at the
+        # last pool boundary its predicted next pool still fits before.
+        deadline = (
+            None if args.max_train_hours is None else args.max_train_hours * 3600
+        )
+        completed = run_sweep(
+            sweep_config,
+            sweep_targets,
+            args.rollout_only_repeats,
+            cursor=lambda: sampler.cursor,
+            collect_at=collect_at,
+            token_gradient=(
+                token_gradient if sweep_config.gradient_direction else None
+            ),
+            writer=sweep_writer,
+            out_of_time=lambda estimate: deadline is not None
+            and time.monotonic() - run_started + estimate > deadline,
+            log=sweep_log,
+        )
+        sweep_log({"type": "perturbation_sweep_done", "pools": completed})
+        tensorboard.close()
+        raise SystemExit(0 if completed else 2)
+
+    if args.write_noise_sweep is not None:
+        noise_config = WriteNoiseSweepConfig(scales=tuple(args.write_noise_sweep))
+
+        def collect_with_noise(
+            cursor: int, plan: WriteNoisePlan
+        ) -> list[LatentRolloutBatch]:
+            # Rewinding the cursor replays the pool's prompts, its token
+            # noise and its write noise, all keyed on (seed, cursor).
+            sampler.cursor = cursor
+            groups = collect(
+                refresh_statistics=False, offload_to_cpu=True, write_noise=plan
+            )
+            torch.cuda.synchronize()
+            return groups
+
+        def noise_log(values: dict) -> None:
+            logger.log(**values)
+            print(json.dumps(values, sort_keys=True), flush=True)
+
+        noise_writer = SweepWriter(output / "write_noise_sweep", {
+            "schema": WRITE_NOISE_SWEEP_SCHEMA,
+            "run_manifest_sha256": file_sha256(output / "manifest.json"),
+            "checkpoint": str(args.checkpoint),
+            "checkpoint_sha256": args.base_checkpoint_sha256,
+            "policy_state": args.curriculum_init,
+            "policy_state_sha256": args.initialization_checkpoint_sha256,
+            "math_data_identity": data_identity,
+            "reasoning_mode": args.reasoning_mode,
+            "seed": args.seed,
+            "start_cursor": sampler.cursor,
+            "pools_planned": args.rollout_only_repeats,
+            "prompts_per_rollout": args.prompts_per_rollout,
+            "samples_per_prompt": args.samples_per_prompt,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "reward_schema": reward_schema_for_abstention(args.abstention_penalty),
+            "scales": list(noise_config.scales),
+            "noise": {
+                "space": "absolute on writer pre-activations: pre-norm key, "
+                "value, decay logit, write logit",
+                "shared_per_prompt": True,
+                "memory_heads": wrapper.combiner.heads,
+                "memory_head_dim": wrapper.combiner.head_dim,
+            },
+        })
+        deadline = (
+            None if args.max_train_hours is None else args.max_train_hours * 3600
+        )
+        completed = run_write_noise_sweep(
+            noise_config,
+            args.rollout_only_repeats,
+            cursor=lambda: sampler.cursor,
+            collect_at=collect_with_noise,
+            writer=noise_writer,
+            out_of_time=lambda estimate: deadline is not None
+            and time.monotonic() - run_started + estimate > deadline,
+            log=noise_log,
+        )
+        noise_log({"type": "write_noise_sweep_done", "pools": completed})
+        tensorboard.close()
+        raise SystemExit(0 if completed else 2)
+
     if args.rollout_only:
         all_passed = True
         for repeat in range(args.rollout_only_repeats):
@@ -6545,6 +8739,8 @@ def main() -> None:
                 offload_to_cpu=True,
             )
             torch.cuda.synchronize()
+            if rollout_dataset is not None:
+                rollout_dataset.finish_pool()
             # collect(refresh_statistics=False) above: no old_values exist.
             metrics = aggregate_diagnostics(
                 groups,
@@ -6709,7 +8905,8 @@ def main() -> None:
                 flush=True,
             )
             warmup_dashboard = {
-                "value_warmup/token_weighted_mse": metrics["value_loss"],
+                ("value_warmup/token_weighted_bce" if uses_post_action_q(args)
+                 else "value_warmup/token_weighted_mse"): metrics["value_loss"],
                 "value_warmup/prediction_mean": metrics["value_mean"],
                 "value_warmup/target_mean": metrics["value_target_mean"],
                 "value_warmup/residual_mean": metrics["value_residual_mean"],
@@ -6723,6 +8920,10 @@ def main() -> None:
                     "critic_grad_norm"
                 ],
             }
+            warmup_dashboard.update({
+                f"value_warmup/{tag}": value
+                for tag, value in twin_dashboard([metrics]).items()
+            })
             if critic.action_head is not None:
                 warmup_dashboard.update(
                     {
@@ -6771,6 +8972,7 @@ def main() -> None:
                     sampler,
                     warmup_step,
                     actor_init_provenance,
+                    entropy_temperature=entropy_temperature,
                 )
                 atomic_link_or_copy(
                     critic_warm_path,
@@ -6788,6 +8990,7 @@ def main() -> None:
                     sampler,
                     warmup_step,
                     actor_init_provenance,
+                    entropy_temperature=entropy_temperature,
                 )
                 checkpoint_policy.committed(checkpoint_state)
 
@@ -6811,7 +9014,23 @@ def main() -> None:
                 f"{zero_reward_frozen_updates} at actor step {start_step}"
             )
     stopped_at_pool_boundary = False
+    # Session-local, like the constant-reward streak.
+    bench_below_floor_evals = 0
     while step < args.steps:
+        if (
+            args.bench_stop_floor is not None
+            and bench_below_floor_evals >= args.bench_stop_evals
+        ):
+            print(
+                f"{bench_below_floor_evals} consecutive benchmark evaluations "
+                f"below contract accuracy {args.bench_stop_floor} at step "
+                f"{step}/{args.steps}; stopping at the pool boundary",
+                flush=True,
+            )
+            logger.log(type="bench_stop", step=step, floor=args.bench_stop_floor,
+                       evaluations=bench_below_floor_evals)
+            stopped_at_pool_boundary = True
+            break
         if (
             args.zero_reward_stop_pools > 0
             and zero_reward_pool_streak >= args.zero_reward_stop_pools
@@ -7283,6 +9502,8 @@ def main() -> None:
                         "verifier_abstained_fraction",
                         "think_format_fraction",
                         "actions_per_trajectory",
+                        "length_reward_covariance",
+                        "think_gate_zeroed_correct_fraction",
                     ):
                         if metric_name in source_metrics:
                             tensorboard.add_scalar(
@@ -7306,15 +9527,17 @@ def main() -> None:
                     for parameter in combiner_parameters
                 ]
                 selected_groups = [groups[index] for index in minibatch_order]
-                retained_minibatch = retained_device_batches.pop(
+                # Popped straight into the one name the update releases: an
+                # alias would keep the packed device batch (4.25 GiB on the
+                # memory drill) alive through the next pool's rollout.
+                device_minibatch = retained_device_batches.pop(
                     behavior_age, None
                 )
                 device_replay_plan = device_replay_plans.pop(behavior_age)
                 minibatch_h2d_events = []
-                if retained_minibatch is not None:
+                if device_minibatch is not None:
                     # Refreshed on-device in the pool loop above; identical to
                     # what repacking selected_groups would rebuild.
-                    device_minibatch = retained_minibatch
                     minibatch_pack_seconds = 0.0
                 else:
                     with profiler.phase("minibatch_pack"):
@@ -7349,6 +9572,7 @@ def main() -> None:
                     if (
                         args.delightful_policy_gradient
                         or args.target_policy_optimization
+                        or args.mean_actor_critic
                     )
                     else value_action_denominator
                 )
@@ -7380,6 +9604,14 @@ def main() -> None:
                         ),
                         fused_behavior_statistics=fused_behavior_statistics,
                         reward_floor=reward_floor,
+                        critic_lambda=args.q_critic_lambda,
+                        entropy_temperature=(
+                            None
+                            if entropy_temperature is None
+                            else entropy_temperature.temperature
+                        ),
+                        advantage_source_count=len(source_names),
+                        advantage_token_classes=advantage_token_classes,
                     )
                 # The first minibatch runs against refresh-computed behavior
                 # statistics with the actor untouched. Later disjoint minibatches
@@ -7436,6 +9668,16 @@ def main() -> None:
                     actor_dashboard = aggregate_actor_tensorboard_metrics(
                         minibatch_metrics
                     )
+                    actor_dashboard.update(
+                        advantage_group_dashboard(
+                            minibatch_metrics, source_names
+                        )
+                    )
+                    actor_dashboard.update(mac_dashboard(minibatch_metrics))
+                    actor_dashboard.update(twin_dashboard(minibatch_metrics))
+                    actor_dashboard.update(belief_gain_dashboard(critic))
+                    actor_dashboard.update(q_prior_dashboard(minibatch_metrics))
+                    actor_dashboard.update(support_dashboard(minibatch_metrics))
                     nonfinite_gradients = {
                         name: actor_dashboard[name]
                         for name in (
@@ -7454,7 +9696,66 @@ def main() -> None:
                         "non-finite gradients before optimizer step: "
                         f"{nonfinite_gradients}"
                     )
+
+                def measure_drift() -> dict[str, float]:
+                    with profiler.phase("post_update_drift"), training_autocast():
+                        drift = measure_post_update_policy_drift(
+                            wrapper,
+                            [device_minibatch],
+                            replay_max_trajectories=args.replay_max_trajectories,
+                            replay_attention_budget=args.replay_attention_budget,
+                            replay_bucket=args.replay_bucket,
+                            replay_slot_budget=args.replay_slot_budget,
+                            replay_function=diagnostic_replay_head_inputs,
+                            emit_logprob_function=diagnostic_emit_token_logprobs,
+                            emit_log_odds_function=diagnostic_emit_token_log_odds,
+                            replay_plans=[device_replay_plan],
+                            target_policy_optimization=(
+                                args.target_policy_optimization
+                            ),
+                            tpo_eta=args.tpo_eta,
+                            gae_lambda_alpha=args.gae_lambda_alpha,
+                            actor_gae_lambda=args.actor_gae_lambda,
+                            source_success_actor_gate=(
+                                args.source_success_actor_gate
+                            ),
+                        )
+                    if not all(math.isfinite(value) for value in drift.values()):
+                        raise RuntimeError(
+                            "non-finite post-update policy drift at step "
+                            f"{next_step}: {drift}"
+                        )
+                    return drift
+
+                def trust_region_readout() -> torch.Tensor:
+                    with profiler.phase("trust_region_kl"):
+                        return trust_region_token_logprobs(
+                            wrapper,
+                            device_minibatch,
+                            device_replay_plan,
+                            shard_stride=args.actor_kl_shard_stride,
+                            replay_function=diagnostic_replay_head_inputs,
+                            emit_logprob_function=diagnostic_emit_token_logprobs,
+                        )
+
+                def measure_step_kl() -> dict[str, float]:
+                    step_kl = step_token_kl(
+                        pre_step_logprobs, trust_region_readout()
+                    )
+                    if not all(math.isfinite(value) for value in step_kl.values()):
+                        raise RuntimeError(
+                            f"non-finite step KL at step {next_step}: {step_kl}"
+                        )
+                    return step_kl
+
+                actor_parameters_before = None
+                pre_step_logprobs = None
                 with profiler.phase("optimizer_step"):
+                    # The critic steps first: the trust region's reference
+                    # read below then runs over the actor's gradients alone.
+                    # The two own disjoint parameters, so order is free.
+                    step_optimizers(optimizers, "critic")
+                    zero_optimizers(optimizers, "critic")
                     if not minibatch_actor_frozen:
                         if frozen_moe_router_parameters:
                             moe_load_cv, moe_max_load = (
@@ -7466,15 +9767,24 @@ def main() -> None:
                                     "moe/max_load": float(moe_max_load),
                                 }
                             )
+                        if args.actor_kl_bound is not None:
+                            # The point a KL-overshooting step backtracks
+                            # to, and the policy there, read in the same
+                            # fp32 as every post-step readout.
+                            actor_parameters_before = snapshot_parameters(
+                                actor_step_parameters
+                            )
+                            trust_started = time.perf_counter()
+                            pre_step_logprobs = trust_region_readout()
+                            torch.cuda.synchronize(device)
+                            trust_seconds = time.perf_counter() - trust_started
                         step_optimizers(optimizers, "actor")
-                    step_optimizers(optimizers, "critic")
                     # Gradient buffers have already been reduced to scalar
                     # telemetry. Release them before the optional second
                     # replay so this read-only diagnostic cannot stack an
                     # inference forward on top of the training step's peak
                     # allocation.
                     zero_optimizers(optimizers, "actor")
-                    zero_optimizers(optimizers, "critic")
                 with torch.no_grad():
                     combiner_deltas = [
                         parameter.detach() - before
@@ -7502,7 +9812,7 @@ def main() -> None:
                             "combiner/update_abs_max": torch.stack(
                                 [delta.abs().max() for delta in combiner_deltas]
                             ).max(),
-                            **combiner_weight_telemetry(wrapper),
+                            **combiner_weight_telemetry(wrapper, critic),
                         }
                     )
                 if not all(
@@ -7552,46 +9862,51 @@ def main() -> None:
                 actor_dashboard["guard/zero_reward_frozen_updates_total"] = (
                     float(zero_reward_frozen_updates)
                 )
+                if actor_parameters_before is not None:
+                    # The trust region on the realized token KL to the
+                    # pre-step policy. combiner/update_* above measured the
+                    # whole step; the kept update is trust/step_fraction of
+                    # it (a lerp).
+                    trust_started = time.perf_counter()
+                    step_kl, trust = enforce_kl_bound(
+                        actor_step_parameters,
+                        actor_parameters_before,
+                        measure_step_kl(),
+                        measure_step_kl,
+                        bound=args.actor_kl_bound,
+                        max_backtracks=args.actor_kl_backtracks,
+                        kl_key="kl/post_update_token_pre_step",
+                    )
+                    del actor_parameters_before, pre_step_logprobs
+                    actor_dashboard.update(step_kl)
+                    actor_dashboard.update(trust)
+                    actor_dashboard["perf/trust_region_seconds"] = (
+                        trust_seconds + time.perf_counter() - trust_started
+                    )
                 if next_step == 1 or (
                     args.post_update_kl_every > 0
                     and next_step % args.post_update_kl_every == 0
                 ):
                     drift_started = time.perf_counter()
-                    with profiler.phase("post_update_drift"), training_autocast():
-                        post_update_drift = measure_post_update_policy_drift(
-                            wrapper,
-                            [device_minibatch],
-                            replay_max_trajectories=args.replay_max_trajectories,
-                            replay_attention_budget=args.replay_attention_budget,
-                            replay_bucket=args.replay_bucket,
-                            replay_slot_budget=args.replay_slot_budget,
-                            replay_function=diagnostic_replay_head_inputs,
-                            emit_logprob_function=diagnostic_emit_token_logprobs,
-                            emit_log_odds_function=(
-                                diagnostic_emit_token_log_odds
-                            ),
-                            replay_plans=[device_replay_plan],
-                            target_policy_optimization=(
-                                args.target_policy_optimization
-                            ),
-                            tpo_eta=args.tpo_eta,
-                            gae_lambda_alpha=args.gae_lambda_alpha,
-                            actor_gae_lambda=args.actor_gae_lambda,
-                            source_success_actor_gate=(
-                                args.source_success_actor_gate
-                            ),
-                        )
-                    if not all(
-                        math.isfinite(value) for value in post_update_drift.values()
-                    ):
-                        raise RuntimeError(
-                            f"non-finite post-update policy drift at step {next_step}: "
-                            f"{post_update_drift}"
-                        )
-                    actor_dashboard.update(post_update_drift)
+                    actor_dashboard.update(measure_drift())
                     actor_dashboard["perf/post_update_kl_seconds"] = (
                         time.perf_counter() - drift_started
                     )
+                if entropy_temperature is not None:
+                    # The temperature this step's objective used, then one
+                    # dual step on the entropy it saw -- only when an actor
+                    # step consumed it and some emit slot was active.
+                    actor_dashboard["entropy/temperature"] = (
+                        entropy_temperature.temperature
+                    )
+                    actor_dashboard["entropy/target"] = entropy_temperature.target
+                    if (
+                        not minibatch_actor_frozen
+                        and "entropy/policy_mean" in actor_dashboard
+                    ):
+                        entropy_temperature.update(
+                            actor_dashboard["entropy/policy_mean"]
+                        )
                 # One PPO epoch uses every behavior group exactly once. Release
                 # the compact host sources and packed device batch after its
                 # update and optional drift.
@@ -7649,7 +9964,13 @@ def main() -> None:
                 aime_eval(step)
         if bench_rows and crossed_interval(previous_step, step, args.bench_every):
             with profiler.phase("bench_eval"):
-                bench_eval(step)
+                bench_metrics = bench_eval(step)
+            if args.bench_stop_floor is not None:
+                bench_below_floor_evals = (
+                    bench_below_floor_evals + 1
+                    if bench_metrics["contract_accuracy"] < args.bench_stop_floor
+                    else 0
+                )
         checkpoint_state = (step, warmup_step, sampler.cursor)
         if checkpoint_policy.due():
             with profiler.phase("checkpoint_save"):
@@ -7658,12 +9979,22 @@ def main() -> None:
                     output / "latent_vapo_checkpoint.pt", wrapper, critic,
                     optimizers, step, args, sampler, warmup_step,
                     actor_init_provenance, zero_reward_frozen_updates,
+                    entropy_temperature,
                 )
                 checkpoint_policy.committed(checkpoint_state)
                 save_seconds = time.perf_counter() - save_started
                 logger.log(type="checkpoint", step=step, seconds=save_seconds)
                 tensorboard.add_scalar(
                     "perf/checkpoint_seconds", save_seconds, step
+                )
+        if crossed_interval(previous_step, step, args.snapshot_every):
+            with profiler.phase("checkpoint_save"):
+                (output / "snapshots").mkdir(exist_ok=True)
+                save_checkpoint(
+                    output / "snapshots" / f"step_{step:06d}.pt", wrapper,
+                    critic, optimizers, step, args, sampler, warmup_step,
+                    actor_init_provenance, zero_reward_frozen_updates,
+                    entropy_temperature,
                 )
         profiler.pool_finished(step, time.perf_counter() - started)
     if args.consume_all_prompts and sampler.cursor != len(math_rows):
@@ -7687,6 +10018,7 @@ def main() -> None:
             output / "latent_vapo_checkpoint.pt", wrapper, critic,
             optimizers, step, args, sampler, warmup_step,
             actor_init_provenance, zero_reward_frozen_updates,
+            entropy_temperature,
         )
         checkpoint_policy.committed(terminal_checkpoint_state)
     if (

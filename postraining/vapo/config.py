@@ -7,8 +7,11 @@ import math
 import struct
 from pathlib import Path
 
-from postraining.benchmark_report import CAPTURE_SAMPLES_PER_PROBLEM
+from postraining.benchmark_report import CAPTURE_PROBLEMS, CAPTURE_SAMPLES_PER_PROBLEM
 from postraining.core import POSTTRAIN_PROMPT_TOKENS, POSTTRAIN_STREAM_TOKENS
+from postraining.latent_eval import EVAL_TEMPERATURE, EVAL_TOP_P
+from postraining.mean_actor_critic import MAC_ESTIMATORS, SEQUENCE_ESTIMATORS
+from postraining.memory_eval_ablation import MEMORY_EVAL_ABLATIONS
 from postraining.latent_thought import (
     DEFAULT_INIT_STOP_THINKING_PROBABILITY,
     DEFAULT_THOUGHT_SIGMA,
@@ -76,6 +79,11 @@ def normalized_abstention_reward(penalty: float) -> float:
 # blocked on the momentum-aliasing bug in ``Muon._momenta`` (keyed by
 # (shape, device) but bucketed per param group). Left as future work.
 POLAR_EXPRESS_STEP_COMPENSATION = 1.45
+# --fresh-learning-rate under --reasoning-mode memory when unset: a fifth of
+# pretraining's from-scratch AdamW rate. The fresh-rate memory drill led the
+# shared-AdamW memory drill and 14165 by +0.05 to +0.08 bench accuracy from
+# step 20 (NOTES.md 2026-10-21).
+MEMORY_FRESH_LEARNING_RATE = 3e-3
 
 
 def resolve_rollout_defaults(args, *, is_nano: bool, checkpoint_context_tokens: int,
@@ -134,6 +142,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="immutable multi-source verifier manifest, served exact-pass "
         "(every row once per cycle), that replaces --math-data (pass an "
         "empty string for a single --math-data source)",
+    )
+    parser.add_argument(
+        "--exclude-rl-sources", default="",
+        help="comma-separated mixture source names to skip while preserving the "
+        "original stream cursor and retained row order; resume may only add exclusions",
     )
     parser.add_argument(
         "--randomize-choice-options", action=argparse.BooleanOptionalAction,
@@ -196,6 +209,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="replace the clipped VAPO/PPO actor objective with Delightful "
         "Policy Gradient (Osband, 2026), using eta=1 current-token "
         "surprisal and no importance ratios",
+    )
+    parser.add_argument(
+        "--mean-actor-critic",
+        action="store_true",
+        help="replace the actor objective with all-action Mean Actor-Critic: "
+        "at every generated state, the policy expectation of the token Q "
+        "critic's detached policy-centered Q over the full vocabulary",
+    )
+    parser.add_argument(
+        "--mac-estimator",
+        choices=MAC_ESTIMATORS,
+        default=None,
+        help="the --mean-actor-critic estimator (required with it): all_action "
+        "MAC; control_variate, MAC plus the sampled token's Monte Carlo "
+        "residual G - Q(s,a_t), unbiased for any critic; sampled_baseline, "
+        "that sampled term alone with G - E_pi Q; delightful_sampled_baseline, "
+        "that term under the DG gate sigmoid((G - E_pi Q) * surprisal), eta=1; "
+        "delightful_td_gate, that term under the DG gate of the critic's "
+        "TD advantage sigmoid((r_t + c(s_t+1) - c(s_t)) * surprisal); or "
+        "delightful_head_gate, under the DG gate of the action head's advantage "
+        "of the sampled token sigmoid(A(a_t) * surprisal); or, with no critic "
+        "in the coefficient, one per trajectory: rloo_sequence, the "
+        "leave-one-out group advantage U = R - mean of the group's other "
+        "rewards; delightful_answer_gate, U under the answer-level DG gate "
+        "sigmoid(U * -log(n_k / G)), n_k the group's count of the trajectory's "
+        "graded-answer cluster (math sources with --answer-fence only)",
+    )
+    parser.add_argument(
+        "--mac-vocab-chunk",
+        type=int,
+        default=512,
+        help="states per full-vocabulary MAC readout chunk (memory bound only)",
     )
     parser.add_argument(
         "--target-policy-optimization",
@@ -276,6 +321,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # as the actor. The critic trunk is from scratch, so its constant rate can
     # be ablated independently without changing the actor.
     parser.add_argument("--critic-muon-learning-rate", type=float, default=None)
+    # Fresh modules -- every parameter absent from the pretrained checkpoint:
+    # the actor's combiner/transition/gate and the critic's input combiner
+    # (the memory reader under --reasoning-mode memory) -- train from
+    # scratch, not as a fine-tune. Set, they get their own optimizers in
+    # pretraining's partition: matrices (ndim >= 2) under Muon at
+    # --fresh-muon-learning-rate, the rest under AdamW at this rate, for
+    # both roles. Unset, --reasoning-mode memory uses
+    # MEMORY_FRESH_LEARNING_RATE; other modes share their role's AdamW at
+    # --learning-rate / --critic-learning-rate, which a zero-initialized
+    # module cannot leave in a few hundred steps (the memory drill's writer
+    # moved 3% of its init by step 340).
+    parser.add_argument("--fresh-learning-rate", type=float, default=None)
+    # Default: --fresh-learning-rate through the same Muon:AdamW geometry
+    # as --muon-learning-rate.
+    parser.add_argument("--fresh-muon-learning-rate", type=float, default=None)
     # The critic trunk's starting weights. "scratch" is a random instance of
     # the actor's architecture; "actor" is a storage-independent copy of the
     # actor's weights at run start (VAPO initializes its critic from a
@@ -341,10 +401,117 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(core.action_value_advantages). Default: no action head",
     )
     parser.add_argument(
+        "--critic-q-head-hidden",
+        type=int,
+        default=None,
+        help="hidden width of a standalone token Q critic, REPPO's critic "
+        "with no V: Q(s, a) = c + u . x(a) for every token at once. It fits "
+        "generalized value estimates (--q-critic-lambda) and the Delightful "
+        "actor's advantage is Q centered exactly under the policy, "
+        "A_t = Q(s_t, a_t) - sum_a pi(a | s_t) Q(s_t, a). Default: a V critic",
+    )
+    parser.add_argument(
+        "--critic-q-twin", action="store_true",
+        help="TD3/TD7 twin critics on the token Q critic: a second, "
+        "independently initialized Q head on the same trunk. Both regress "
+        "the same generalized value estimates, bootstrapped from the "
+        "smaller of their Q of the next taken token (clipped double Q); "
+        "the actor reads their mean",
+    )
+    parser.add_argument(
+        "--critic-q-pessimism", type=float, default=0.0,
+        help="Pessimistic prior weight beta on every token Q head: beta "
+        "times sum_a relu(A(s, a))^2 at each generated state, A the head's "
+        "Q centered under the current policy, so a token the policy all "
+        "but never takes cannot read better than its value; a positive "
+        "advantage shrinks by pi/(pi + beta) at the tabular fixed point "
+        "(postraining.pessimistic_q). Applied in MAC actor updates. "
+        "0 disables it",
+    )
+    parser.add_argument(
+        "--critic-post-action-q-hidden", type=int, default=None,
+        help="opt-in binary success Q from the independent critic's causal "
+        "post-action prefix; no state baseline, policy mean, or actor memory",
+    )
+    parser.add_argument(
+        "--critic-post-action-q-prior", type=float, default=0.02,
+        help="initial binary-success probability for the post-action Q head; "
+        "an explicit initialization choice, not an empirically optimal prior",
+    )
+    parser.add_argument(
+        "--q-critic-lambda",
+        type=float,
+        default=None,
+        help="lambda of a Q critic's generalized value estimates; 1 is the "
+        "Monte-Carlo return. Default: VAPO's length-adaptive lambda "
+        "(--gae-lambda-alpha). Value warmup always fits lambda one",
+    )
+    parser.add_argument(
+        "--critic-q-direction-learning-rate",
+        type=float,
+        default=None,
+        help="separate AdamW rate for the token Q head's direction readout "
+        "u(s); default the head's rate. A --study-critic-init critic "
+        "requires its study's rate, head rate over the direction width",
+    )
+    parser.add_argument(
         "--critic-action-head-learning-rate",
         type=float,
         default=None,
-        help="AdamW rate of the action head; default --critic-learning-rate",
+        help="AdamW rate of the action-conditioned head, dueling or "
+        "standalone Q; default --critic-learning-rate",
+    )
+    parser.add_argument(
+        "--entropy-target",
+        type=float,
+        default=None,
+        help="REPPO's entropy constraint: a temperature, tuned toward this "
+        "mean policy entropy (nats per emitted token), weights an exact "
+        "entropy bonus in the Delightful objective. It only raises entropy "
+        "below the target; above it the temperature decays toward zero. "
+        "Default: no entropy term",
+    )
+    parser.add_argument(
+        "--entropy-temperature-init",
+        type=float,
+        default=None,
+        help="initial entropy temperature; required with --entropy-target. "
+        "It trades entropy against Q, so it is set relative to Q's scale: "
+        "REPPO's ent_start 0.01 against MuJoCo Q of order 100 is a ratio of "
+        "about 1e-4",
+    )
+    parser.add_argument(
+        "--entropy-temperature-learning-rate",
+        type=float,
+        default=None,
+        help="Adam rate of the log temperature: about the largest change in "
+        "log temperature per actor step; default 0.05",
+    )
+    parser.add_argument(
+        "--actor-kl-bound",
+        type=float,
+        default=None,
+        help="per-step trust region: the mean token KL(old || new) of each "
+        "actor step, read in fp32 on its own minibatch before and after the "
+        "step, is held at or below this bound by backtracking the step along "
+        "its own direction. bf16 rounding alone puts 2-3e-4 between any two "
+        "nearby policies, so only the fp32 readout resolves bounds near it. "
+        "Default: unbounded",
+    )
+    parser.add_argument(
+        "--actor-kl-backtracks",
+        type=int,
+        default=None,
+        help="most backtracking passes per step under --actor-kl-bound; "
+        "default 3",
+    )
+    parser.add_argument(
+        "--actor-kl-shard-stride",
+        type=int,
+        default=None,
+        help="under --actor-kl-bound, measure the step's KL on every Nth "
+        "planned replay shard of its minibatch (shards are length-sorted, "
+        "so this samples across lengths); default 4",
     )
     parser.add_argument(
         "--nearby-reward-max",
@@ -420,6 +587,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # can be easier. Keep the optional operational circuit breaker available
     # without making it part of the selected production regime.
     parser.add_argument(
+        "--bench-stop-floor",
+        type=float,
+        default=None,
+        help="stop at the pool boundary (saving the final checkpoint) once "
+        "--bench-stop-evals consecutive periodic benchmark evaluations score "
+        "contract accuracy below this floor; default disabled",
+    )
+    parser.add_argument(
+        "--bench-stop-evals",
+        type=int,
+        default=2,
+        help="consecutive below-floor benchmark evaluations for --bench-stop-floor",
+    )
+    parser.add_argument(
         "--zero-reward-stop-pools",
         type=int,
         default=0,
@@ -448,6 +629,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "action-head warmup then rewinds the prompt cursor, so the first "
         "actor step matches a run that starts acting at the same checkpoint",
     )
+    parser.add_argument(
+        "--value-warmup-rewind",
+        action="store_true",
+        help="rewind the prompt cursor after a whole-critic warmup too, so a "
+        "fresh critic warmed from an --actor-init checkpoint leaves the first "
+        "actor step on the prompts a run acting at that checkpoint draws",
+    )
     # The BPB guard is a do-no-harm regression check, not an optimization
     # target. A deterministic 2M-token prefix takes ~2.5s on the 5090 versus
     # ~75s for all 62M validation tokens, while still giving the guard ample
@@ -473,6 +661,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "dedicated --output when used with --resume",
     )
     parser.add_argument("--bench-only-repeats", type=int, default=1)
+    parser.add_argument(
+        "--memory-eval-ablation", choices=MEMORY_EVAL_ABLATIONS, default="none",
+        help="--bench-only memory-carry ablation: zero_read zeroes the "
+        "actor's memory read-out; foreign_state (foreign_sample) makes every "
+        "read see another prompt's (another sample's) memory state at the "
+        "same tick (postraining.memory_eval_ablation)",
+    )
+    parser.add_argument(
+        "--bench-capture-problems", type=int, default=CAPTURE_PROBLEMS,
+        help="leading benchmark problems whose answers are saved",
+    )
+    parser.add_argument(
+        "--bench-capture-samples", type=int, default=CAPTURE_SAMPLES_PER_PROBLEM,
+        help="leading samples saved per captured benchmark problem",
+    )
     # Keep the hard and easy held-out math evaluations on the same cadence so
     # their learning curves remain directly aligned.
     parser.add_argument(
@@ -495,6 +698,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--bench-every", type=int, default=DEFAULT_MATH_EVAL_EVERY
     )
     parser.add_argument("--bench-samples", type=int, default=8)
+    parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=EVAL_TEMPERATURE,
+        help="sampling temperature of the periodic benchmark and AIME evaluations",
+    )
+    parser.add_argument(
+        "--eval-top-p",
+        type=float,
+        default=EVAL_TOP_P,
+        help="nucleus of the periodic benchmark and AIME evaluations; 1 "
+        "evaluates the untruncated policy",
+    )
     # Training-rollout transcripts (postraining/rollout_report.py): every N
     # actor steps, the first correct and first incorrect trajectory of each
     # RL source in that pool. Display only, so not a resume invariant; 0
@@ -601,6 +817,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=480.0,
         help="elapsed wall time between rolling exact-recovery checkpoints",
     )
+    parser.add_argument(
+        "--snapshot-every",
+        type=int,
+        default=0,
+        help=(
+            "also keep an exact checkpoint every N steps under snapshots/, "
+            "for analysing the policy at fixed points of a run (0 = off)"
+        ),
+    )
     # Compile the compute-bound parallel replay surfaces independently of the
     # narrow-cache rollout. The rejected old path coupled compilation to
     # full-5K static attention, which measured 2.6x slower.
@@ -699,12 +924,57 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="save every frozen-policy gate response and verifier verdict as JSONL",
     )
     parser.add_argument(
+        "--rollout-dataset", action="store_true",
+        help="record every frozen-policy trajectory as a hash-bound "
+        "rollout dataset (one parquet per pool) for offline critic studies",
+    )
+    parser.add_argument(
         "--rollout-only-repeats",
         type=int,
         default=1,
         help="production-shape rollout pools to collect in one process; "
         "repeat zero includes compile/cold-start cost and later repeats "
         "measure steady state",
+    )
+    parser.add_argument(
+        "--perturbation-sweep", nargs="+", default=None,
+        choices=("writer", "reader_out"),
+        help="--rollout-only memory policies: per pool, re-collect the same "
+        "prompts and token noise with these parameter sets moved by +/- each "
+        "--perturbation-scales along each direction "
+        "(postraining.perturbation_sweep); --rollout-only-repeats is the pool count",
+    )
+    parser.add_argument(
+        "--perturbation-scales", nargs="+", type=float, default=None,
+        help="per-element move relative to each tensor's RMS",
+    )
+    parser.add_argument(
+        "--perturbation-random-directions", type=int, default=0,
+        help="fresh Gaussian directions per target and pool",
+    )
+    parser.add_argument(
+        "--perturbation-gradient-direction", action="store_true",
+        help="also test the token-path gradient direction, the mean of the "
+        "warmup pools' estimates; needs the --curriculum-init snapshot's "
+        "critic as baseline",
+    )
+    parser.add_argument(
+        "--perturbation-gradient-warmup-pools", type=int, default=0,
+        help="leading pools that only estimate the token-path gradient for "
+        "--perturbation-gradient-direction; counted in --rollout-only-repeats",
+    )
+    parser.add_argument(
+        "--perturbation-radial-direction", action="store_true",
+        help="also test theta -> (1 +/- scale) theta",
+    )
+    parser.add_argument(
+        "--write-noise-sweep", nargs="+", type=float, default=None,
+        metavar="SCALE",
+        help="--rollout-only memory policies: per pool, re-collect the same "
+        "prompts and token noise with the memory writes explored at +/- each "
+        "absolute pre-activation noise scale, one noise pattern per prompt "
+        "(postraining.perturbation_sweep.run_write_noise_sweep); "
+        "--rollout-only-repeats is the pool count",
     )
     parser.add_argument("--gate-min-within-group-reward-std", type=float, default=0.01)
     parser.add_argument(
@@ -724,6 +994,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "without refitting it, e.g. when the changed reward never applied "
         "to a row the critic saw; the changed fields and this acceptance "
         "are recorded in the manifest",
+    )
+    parser.add_argument(
+        "--study-critic-init",
+        default=None,
+        help="initialize the token Q critic (trunk and head) from a "
+        "token_q_critic_study_checkpoint/v2 fit against this --checkpoint; "
+        "the critic's optimizer starts fresh",
     )
     parser.add_argument(
         "--critic-only-init", default=None,
@@ -842,6 +1119,99 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_perturbation_sweep(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """The antithetic memory sweep's flag contract."""
+    options = (
+        args.perturbation_scales is not None,
+        args.perturbation_random_directions != 0,
+        args.perturbation_gradient_direction,
+        args.perturbation_radial_direction,
+        args.perturbation_gradient_warmup_pools != 0,
+    )
+    if args.perturbation_sweep is None:
+        if any(options):
+            parser.error("--perturbation-* options need --perturbation-sweep")
+        return
+    if not args.rollout_only:
+        parser.error("--perturbation-sweep requires --rollout-only")
+    if not mode_carries_memory(args.reasoning_mode):
+        parser.error("--perturbation-sweep perturbs the memory carry: --reasoning-mode memory")
+    if len(set(args.perturbation_sweep)) != len(args.perturbation_sweep):
+        parser.error("--perturbation-sweep targets must be distinct")
+    if args.gate_transcripts or args.rollout_dataset:
+        parser.error(
+            "--perturbation-sweep writes its own artifact; perturbed pools must "
+            "not enter --gate-transcripts or --rollout-dataset"
+        )
+    scales = args.perturbation_scales
+    if not scales:
+        parser.error("--perturbation-sweep needs --perturbation-scales")
+    if any(not (math.isfinite(scale) and scale > 0) for scale in scales) or len(set(scales)) != len(scales):
+        parser.error("--perturbation-scales must be distinct, finite and positive")
+    if args.perturbation_random_directions < 0:
+        parser.error("--perturbation-random-directions must be nonnegative")
+    if not any(options[1:4]):
+        parser.error(
+            "--perturbation-sweep needs a direction: --perturbation-random-directions, "
+            "--perturbation-gradient-direction or --perturbation-radial-direction"
+        )
+    if args.perturbation_gradient_direction:
+        # The token path measured is the trainer's sampled-baseline estimator,
+        # REINFORCE with the snapshot critic's state value: unbiased for any
+        # state-only baseline, and the critic only lowers its variance.
+        if not (args.mean_actor_critic and args.mac_estimator == "sampled_baseline"):
+            parser.error(
+                "--perturbation-gradient-direction measures the sampled-baseline "
+                "token path: --mean-actor-critic --mac-estimator sampled_baseline"
+            )
+        if args.curriculum_init is None:
+            parser.error(
+                "--perturbation-gradient-direction takes its baseline critic from "
+                "the --curriculum-init snapshot"
+            )
+        warmup = args.perturbation_gradient_warmup_pools
+        if warmup < 1 or warmup >= args.rollout_only_repeats:
+            parser.error(
+                "--perturbation-gradient-direction needs --perturbation-gradient-warmup-pools "
+                "of at least 1 and below --rollout-only-repeats"
+            )
+    elif args.perturbation_gradient_warmup_pools:
+        parser.error("--perturbation-gradient-warmup-pools needs --perturbation-gradient-direction")
+
+
+def validate_write_noise_sweep(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """The write-space antithetic sweep's flag contract."""
+    scales = args.write_noise_sweep
+    if scales is None:
+        return
+    if args.perturbation_sweep is not None:
+        parser.error("--write-noise-sweep and --perturbation-sweep are separate sweeps")
+    if not args.rollout_only:
+        parser.error("--write-noise-sweep requires --rollout-only")
+    if not mode_carries_memory(args.reasoning_mode):
+        parser.error("--write-noise-sweep explores the memory carry: --reasoning-mode memory")
+    if args.rollout_scheduler != "lockstep":
+        parser.error("--write-noise-sweep decodes through the lockstep arena")
+    if args.gate_transcripts or args.rollout_dataset:
+        parser.error(
+            "--write-noise-sweep writes its own artifact; explored pools must "
+            "not enter --gate-transcripts or --rollout-dataset"
+        )
+    if not scales or any(not (math.isfinite(s) and s > 0) for s in scales) or len(set(scales)) != len(scales):
+        parser.error("--write-noise-sweep scales must be distinct, finite and positive")
+    if args.samples_per_prompt < 2 or args.prompts_per_rollout < 2:
+        # The signal estimate pairs distinct samples of one prompt; its
+        # control pairs distinct prompts.
+        parser.error(
+            "--write-noise-sweep needs at least two samples per prompt and "
+            "two prompts per pool"
+        )
+
+
 def validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
@@ -852,10 +1222,88 @@ def validate_args(
         # spend 50 pools of prompts refitting values it has. A resume
         # restores its run's count through the exact-resume check, which
         # names this field when the two disagree.
-        loads_trained_critic = bool(args.critic_only_init) or bool(
-            args.actor_init and not args.fresh_critic
+        loads_trained_critic = (
+            bool(args.critic_only_init) or bool(args.study_critic_init)
+            or bool(args.actor_init and not args.fresh_critic)
         )
         args.value_warmup_steps = 0 if loads_trained_critic else 50
+    if not (math.isfinite(args.eval_temperature) and args.eval_temperature > 0):
+        parser.error("--eval-temperature must be positive and finite")
+    if not 0 < args.eval_top_p <= 1:
+        parser.error("--eval-top-p must lie in (0, 1]")
+    if args.bench_stop_floor is not None and not (
+        0 <= args.bench_stop_floor <= 1 and args.bench_stop_evals >= 1
+        and args.bench_data and args.bench_every >= 1
+    ):
+        parser.error(
+            "--bench-stop-floor needs a [0, 1] floor, --bench-stop-evals >= 1 "
+            "and a periodic benchmark (--bench-data, --bench-every)"
+        )
+    if args.critic_q_direction_learning_rate is not None and not (
+        args.critic_q_head_hidden is not None
+        and math.isfinite(args.critic_q_direction_learning_rate)
+        and args.critic_q_direction_learning_rate > 0
+    ):
+        parser.error("--critic-q-direction-learning-rate needs a token Q critic and a positive rate")
+    if args.critic_q_twin and args.critic_q_head_hidden is None:
+        parser.error("--critic-q-twin pairs a second head with --critic-q-head-hidden's")
+    if not (math.isfinite(args.critic_q_pessimism) and args.critic_q_pessimism >= 0):
+        parser.error("--critic-q-pessimism must be finite and nonnegative")
+    if args.critic_q_pessimism and (
+        args.critic_q_head_hidden is None or args.critic_post_action_q_hidden is not None
+    ):
+        parser.error("--critic-q-pessimism regularizes the bilinear token Q critic (--critic-q-head-hidden)")
+    if args.critic_q_pessimism and not args.mean_actor_critic:
+        parser.error("--critic-q-pessimism reads the policy from --mean-actor-critic's readout")
+    if args.study_critic_init is not None:
+        if args.critic_q_head_hidden is None:
+            parser.error("--study-critic-init loads a token Q critic; pass --critic-q-head-hidden")
+        if args.resume or args.actor_init or args.curriculum_init or args.critic_only_init or args.fresh_critic:
+            parser.error(
+                "--study-critic-init starts a run at --checkpoint; it excludes "
+                "--resume, --actor-init, --curriculum-init, --critic-only-init "
+                "and --fresh-critic"
+            )
+    if args.mean_actor_critic:
+        # Token-only policies whose replay rebuilds every input from stored
+        # data: cot, and the memory carry, whose reads replay through one
+        # scan over the recorded beliefs.
+        if args.reasoning_mode not in ("cot", "memory"):
+            parser.error("--mean-actor-critic supports --reasoning-mode cot or memory")
+        if args.delightful_policy_gradient or args.target_policy_optimization:
+            parser.error("--mean-actor-critic replaces the DG and TPO actor objectives")
+        if args.critic_q_head_hidden is None:
+            parser.error("--mean-actor-critic needs a token Q critic (--critic-q-head-hidden)")
+        if args.source_success_actor_gate or args.zero_reward_actor_freeze:
+            parser.error(
+                "MAC's objective uses no sampled outcome; pass "
+                "--no-source-success-actor-gate --no-zero-reward-actor-freeze"
+            )
+        if args.entropy_target is not None or args.actor_kl_bound is not None:
+            parser.error("--mean-actor-critic has no entropy or KL trust-region term")
+        if args.mac_vocab_chunk < 1:
+            parser.error("--mac-vocab-chunk must be positive")
+        if args.mac_estimator is None:
+            parser.error("--mean-actor-critic needs --mac-estimator")
+        if args.mac_estimator in SEQUENCE_ESTIMATORS:
+            # The group is the baseline and the answer the action: a
+            # leave-one-out mean needs a second sample, and the clusters
+            # need the verifier's single graded answer span.
+            if args.samples_per_prompt < 2:
+                parser.error(f"--mac-estimator {args.mac_estimator} needs "
+                             "--samples-per-prompt of at least 2")
+            if not args.answer_fence:
+                parser.error(f"--mac-estimator {args.mac_estimator} clusters the graded "
+                             "<answer> span: pass --answer-fence")
+            # U is the verifier's grade and clusters key (answer, reward):
+            # partial credit for a wrong answer or an abstention payout
+            # would move U off the grade and split one graded answer.
+            if args.nearby_reward_max != 0 or args.abstention_penalty is not None:
+                parser.error(f"--mac-estimator {args.mac_estimator} needs the pure "
+                             "verifier reward: drop --nearby-reward-max and "
+                             "--abstention-penalty")
+    elif args.mac_estimator is not None:
+        parser.error("--mac-estimator selects a --mean-actor-critic estimator")
     if args.eval_context_tokens is not None:
         if args.eval_context_tokens < 1:
             parser.error("--eval-context-tokens must be positive")
@@ -956,11 +1404,13 @@ def validate_args(
         or args.critic_learning_rate <= 0.0
     ):
         parser.error("--critic-learning-rate must be finite and positive")
-    if args.critic_action_head_hidden is None:
+    if (args.critic_action_head_hidden is None and args.critic_q_head_hidden is None
+            and args.critic_post_action_q_hidden is None):
         if args.critic_action_head_learning_rate is not None:
             parser.error(
                 "--critic-action-head-learning-rate needs "
-                "--critic-action-head-hidden"
+                "--critic-action-head-hidden, --critic-q-head-hidden, or "
+                "--critic-post-action-q-hidden"
             )
     else:
         if args.critic_action_head_learning_rate is None:
@@ -1003,6 +1453,29 @@ def validate_args(
     ):
         if not math.isfinite(value) or value <= 0.0:
             parser.error(f"{name} must be finite and positive")
+    if args.fresh_learning_rate is None and args.reasoning_mode == "memory":
+        args.fresh_learning_rate = MEMORY_FRESH_LEARNING_RATE
+    if args.fresh_learning_rate is None:
+        if args.fresh_muon_learning_rate is not None:
+            parser.error("--fresh-muon-learning-rate requires --fresh-learning-rate")
+    else:
+        if args.reasoning_mode in ("cot", "none"):
+            parser.error(
+                "--fresh-learning-rate needs fresh modules the policy uses: "
+                f"{args.reasoning_mode} has none"
+            )
+        if args.fresh_muon_learning_rate is None:
+            args.fresh_muon_learning_rate = (
+                args.fresh_learning_rate
+                * (0.025 / 0.015)
+                * POLAR_EXPRESS_STEP_COMPENSATION
+            )
+        for name, value in (
+            ("--fresh-learning-rate", args.fresh_learning_rate),
+            ("--fresh-muon-learning-rate", args.fresh_muon_learning_rate),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                parser.error(f"{name} must be finite and positive")
     if args.reset_optimizers_on_resume and not args.resume:
         parser.error("--reset-optimizers-on-resume requires --resume")
     if args.allow_dg_topology_migration and not args.resume:
@@ -1080,6 +1553,8 @@ def validate_args(
         parser.error(
             "--checkpoint-interval-seconds must be between 300 and 600"
         )
+    if args.snapshot_every < 0:
+        parser.error("--snapshot-every must be nonnegative")
     if args.eval_batch_trajectories < 1:
         parser.error("--eval-batch-trajectories must be positive")
     if args.eval_tail_batch < 0:
@@ -1179,6 +1654,13 @@ def validate_args(
         parser.error("--rollout-sample-every must be nonnegative")
     if args.prompts_per_rollout < 1:
         parser.error("--prompts-per-rollout must be positive")
+    args.exclude_rl_sources = ",".join(sorted(set(
+        name.strip() for name in args.exclude_rl_sources.split(",") if name.strip()
+    )))
+    if args.exclude_rl_sources and not args.rl_mixture_manifest:
+        parser.error("--exclude-rl-sources requires --rl-mixture-manifest")
+    if args.exclude_rl_sources and args.consume_all_prompts:
+        parser.error("source exclusions currently require an explicit --steps budget")
     if args.rl_mixture_manifest and args.exclude_modules:
         parser.error("--exclude-modules is not supported with an RL mixture")
     if args.prompts_per_minibatch < 1:
@@ -1206,8 +1688,25 @@ def validate_args(
         parser.error("--rollout-only-repeats must be positive")
     if args.gate_transcripts and not args.rollout_only:
         parser.error("--gate-transcripts requires --rollout-only")
+    if args.rollout_dataset and not args.rollout_only:
+        parser.error("--rollout-dataset requires --rollout-only")
+    if args.rollout_dataset and args.reasoning_mode != "cot":
+        # Only a token policy's stream is a function of its token ids, which
+        # is what lets a recorded trajectory be replayed exactly.
+        parser.error("--rollout-dataset requires --reasoning-mode cot")
+    if args.rollout_dataset and (args.actor_init or args.resume):
+        # The dataset binds the policy it sampled: --checkpoint, or the
+        # --curriculum-init snapshot whose actor replaces it (its hash is
+        # bound too). An --actor-init or resumed run would sample one policy
+        # under another's cursor and critic.
+        parser.error(
+            "--rollout-dataset samples --checkpoint or a --curriculum-init "
+            "policy; it refuses --actor-init and --resume"
+        )
     if args.rollout_only_repeats != 1 and not args.rollout_only:
         parser.error("--rollout-only-repeats requires --rollout-only")
+    validate_perturbation_sweep(parser, args)
+    validate_write_noise_sweep(parser, args)
     exclusive_modes = sum(
         (args.bpb_only, args.bench_only, args.rollout_only)
     )
@@ -1215,6 +1714,11 @@ def validate_args(
         parser.error(
             "--bpb-only, --bench-only, and --rollout-only are mutually exclusive"
         )
+    if args.memory_eval_ablation != "none":
+        if not args.bench_only:
+            parser.error("--memory-eval-ablation is an evaluation ablation: it requires --bench-only")
+        if not mode_carries_memory(args.reasoning_mode):
+            parser.error("--memory-eval-ablation ablates the memory carry: --reasoning-mode memory")
     if (
         args.bench_only
         and args.resume
@@ -1273,6 +1777,151 @@ def validate_args(
                 "--critic-action-head-hidden needs an actor objective that "
                 "consumes its advantages; TPO does not"
             )
+    if args.critic_post_action_q_hidden is not None:
+        if args.critic_post_action_q_hidden < 1:
+            parser.error("--critic-post-action-q-hidden must be positive")
+        if not math.isfinite(args.critic_post_action_q_prior) or not (
+            0.0 < args.critic_post_action_q_prior < 1.0
+        ):
+            parser.error("--critic-post-action-q-prior must lie strictly in (0, 1)")
+        if args.critic_action_head_hidden is not None or args.critic_q_head_hidden is not None:
+            parser.error("post-action Q cannot be combined with another critic head")
+        if not args.delightful_policy_gradient or args.target_policy_optimization:
+            parser.error("post-action Q requires --delightful-policy-gradient")
+        if args.reasoning_mode == "latent":
+            parser.error("post-action binary Q supports token actions only")
+        if args.prompts_per_rollout != args.prompts_per_minibatch:
+            parser.error("post-action Q requires one fresh rollout minibatch")
+        if args.actor_gae_lambda not in (None, 0.0):
+            parser.error("post-action Q requires --actor-gae-lambda 0")
+        if args.q_critic_lambda not in (None, 1.0):
+            parser.error("post-action binary Q requires --q-critic-lambda 1")
+        args.actor_gae_lambda = 0.0
+        args.q_critic_lambda = 1.0
+        if args.nearby_reward_max != 0 or args.abstention_penalty is not None:
+            parser.error("post-action binary Q forbids fractional or shaped rewards")
+        if args.python_reward_mode != "binary":
+            parser.error("post-action binary Q requires --python-reward-mode binary")
+        if not args.think_tokens or not args.answer_fence:
+            parser.error("post-action Q requires --think-tokens and --answer-fence")
+        if args.source_success_actor_gate or args.zero_reward_actor_freeze:
+            parser.error("post-action Q forbids sampled-outcome actor masking; use "
+                         "--no-source-success-actor-gate --no-zero-reward-actor-freeze")
+        if args.entropy_target is not None or args.actor_kl_bound is not None:
+            parser.error("post-action binary Q uses only its conditional binary-DG objective")
+        if args.actor_init and not args.fresh_critic and not args.resume:
+            parser.error("post-action Q needs --fresh-critic with --actor-init")
+        if not args.resume and not args.critic_only_init and args.critic_init != "actor":
+            parser.error("post-action Q requires --critic-init actor for an informed independent trunk")
+    if args.critic_q_head_hidden is not None:
+        if args.critic_q_head_hidden < 1:
+            parser.error("--critic-q-head-hidden must be positive")
+        if args.critic_action_head_hidden is not None:
+            parser.error(
+                "a standalone Q critic has no V for --critic-action-head-hidden "
+                "to add to"
+            )
+        if not (args.delightful_policy_gradient or args.mean_actor_critic):
+            parser.error(
+                "--critic-q-head-hidden drives the Delightful or MAC actor "
+                "with policy-centered Q; pass --delightful-policy-gradient "
+                "or --mean-actor-critic"
+            )
+        if args.reasoning_mode == "latent":
+            parser.error(
+                "a Q critic needs fused behavior statistics, which latent "
+                "thoughts do not have"
+            )
+        if args.prompts_per_rollout != args.prompts_per_minibatch:
+            parser.error(
+                "a Q critic forms its targets and advantages in the one fresh "
+                "minibatch's critic pass; --prompts-per-minibatch must equal "
+                "--prompts-per-rollout"
+            )
+        if args.actor_gae_lambda is not None:
+            parser.error(
+                "a Q critic's actor advantage has no lambda; it belongs to its "
+                "targets: pass --q-critic-lambda instead of --actor-gae-lambda"
+            )
+        if args.q_critic_lambda is not None and not (
+            0.0 <= args.q_critic_lambda <= 1.0
+        ):
+            parser.error("--q-critic-lambda must lie in [0, 1]")
+        if args.actor_init and not args.fresh_critic and not args.resume:
+            parser.error(
+                "a Q critic starts fresh from an --actor-init checkpoint; pass "
+                "--fresh-critic"
+            )
+        if not (args.resume or args.critic_only_init) and args.critic_init != "actor":
+            # The action table is the trunk's readout, zero in a fresh trunk,
+            # where Q has no token contrast and no gradient that leaves it.
+            parser.error("a token Q critic requires --critic-init actor: its action "
+                         "table is the trunk's readout, zero in a fresh trunk")
+    elif args.q_critic_lambda is not None and args.critic_post_action_q_hidden is None:
+        parser.error("--q-critic-lambda needs a standalone or post-action Q critic")
+    if args.entropy_target is None:
+        for name in (
+            "entropy_temperature_init", "entropy_temperature_learning_rate"
+        ):
+            if getattr(args, name) is not None:
+                parser.error(
+                    f"--{name.replace('_', '-')} needs --entropy-target"
+                )
+    else:
+        if args.entropy_temperature_init is None:
+            parser.error(
+                "--entropy-target needs --entropy-temperature-init, set "
+                "relative to the scale of Q"
+            )
+        if args.entropy_temperature_learning_rate is None:
+            args.entropy_temperature_learning_rate = 0.05
+        if not math.isfinite(args.entropy_target) or args.entropy_target <= 0.0:
+            parser.error("--entropy-target must be finite and positive")
+        if not args.delightful_policy_gradient:
+            parser.error(
+                "--entropy-target is a term of the Delightful objective"
+            )
+        for name, value in (
+            ("--entropy-temperature-init", args.entropy_temperature_init),
+            (
+                "--entropy-temperature-learning-rate",
+                args.entropy_temperature_learning_rate,
+            ),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                parser.error(f"{name} must be finite and positive")
+    if args.actor_kl_bound is None:
+        if args.actor_kl_backtracks is not None:
+            parser.error("--actor-kl-backtracks needs --actor-kl-bound")
+        if args.actor_kl_shard_stride is not None:
+            parser.error("--actor-kl-shard-stride needs --actor-kl-bound")
+    else:
+        if args.actor_kl_backtracks is None:
+            args.actor_kl_backtracks = 3
+        if args.actor_kl_shard_stride is None:
+            args.actor_kl_shard_stride = 4
+        if args.actor_kl_shard_stride < 1:
+            parser.error("--actor-kl-shard-stride must be positive")
+        if not math.isfinite(args.actor_kl_bound) or args.actor_kl_bound <= 0.0:
+            parser.error("--actor-kl-bound must be finite and positive")
+        if args.actor_kl_backtracks < 1:
+            parser.error("--actor-kl-backtracks must be positive")
+        if args.reasoning_mode == "latent":
+            parser.error(
+                "--actor-kl-bound measures token KL only, not latent thoughts"
+            )
+    if args.value_warmup_rewind:
+        if args.value_warmup_steps < 1 or args.value_warmup_scope != "critic":
+            parser.error(
+                "--value-warmup-rewind applies to a whole-critic warmup with "
+                "--value-warmup-steps > 0; an action-head warmup always rewinds"
+            )
+        # A resume carries the --actor-init cursor in its checkpoint.
+        if not (args.actor_init or args.resume):
+            parser.error(
+                "--value-warmup-rewind returns to an --actor-init checkpoint's "
+                "prompt cursor"
+            )
     if args.value_warmup_scope == "action-head":
         if args.critic_action_head_hidden is None:
             parser.error(
@@ -1297,13 +1946,17 @@ def validate_args(
     ):
         if samples < 1:
             parser.error(f"{name} must be positive")
+    if args.bench_capture_problems < 1 or args.bench_capture_samples < 1:
+        parser.error("--bench-capture-problems and --bench-capture-samples must be positive")
+    if 0 < args.bench_max_rows < args.bench_capture_problems:
+        parser.error("--bench-capture-problems exceeds --bench-max-rows")
     if (
         (args.bench_every > 0 or args.bench_only)
-        and args.bench_samples < CAPTURE_SAMPLES_PER_PROBLEM
+        and args.bench_samples < args.bench_capture_samples
     ):
         parser.error(
-            "--bench-samples must be at least "
-            f"{CAPTURE_SAMPLES_PER_PROBLEM} for automatic answer capture"
+            "--bench-samples must be at least --bench-capture-samples "
+            f"({args.bench_capture_samples}) for answer capture"
         )
     # A profiled run perturbs what it measures, so it must never be mistaken
     # for a training run whose numbers are quoted.

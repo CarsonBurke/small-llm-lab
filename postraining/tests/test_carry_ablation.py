@@ -1,5 +1,7 @@
 """Carry-ablation evaluation: paired stats, arm isolation, count plumbing."""
 
+import math
+
 import pytest
 import torch
 
@@ -182,7 +184,7 @@ def test_prompt_correct_counts_keep_original_row_order(monkeypatch):
 
     def _by_truth(
         emitted, truth, tokenizer, stop_ids, style, prefix_ids=(),
-        answer_fence_ids=None,
+        answer_fence_ids=None, think_fence_ids=None, min_think_tokens=1,
     ):
         return truth == "42", truth
 
@@ -196,3 +198,30 @@ def test_prompt_correct_counts_keep_original_row_order(monkeypatch):
     assert sum(metrics["prompt_correct_counts"]) == int(
         round(metrics["accuracy"] * metrics["samples"])
     )
+    # Per prompt in the same order: the vote, pass@k and the answer entropy.
+    counts = metrics["contract_prompt_correct_counts"]
+    assert len(metrics["contract_prompt_majority_scores"]) == 2
+    assert metrics["contract_prompt_majority_scores"][1] == 0
+    assert metrics["contract_majority_accuracy"] == pytest.approx(
+        sum(metrics["contract_prompt_majority_scores"]) / 2)
+    assert metrics["contract_pass_at_samples"] == sum(c > 0 for c in counts) / 2
+    assert metrics["contract_mean_log_kt_success"] == pytest.approx(
+        sum(math.log((c + 0.5) / 4) for c in counts) / 2)
+    assert len(metrics["prompt_answer_cluster_entropy"]) == 2
+
+
+def test_majority_vote_breaks_ties_in_expectation_and_ungraded_samples_abstain():
+    from postraining.latent_eval import answer_cluster_entropy, majority_vote_score
+
+    assert majority_vote_score([("4", True), ("4", True), ("5", False)]) == 1
+    assert majority_vote_score([("4", True), ("5", False), ("5", False)]) == 0
+    # A two-way tie scores its random break; ungraded samples cast no vote.
+    assert majority_vote_score([("4", True), ("5", False), (None, False), (None, False),
+                                (None, False)]) == 0.5
+    assert majority_vote_score([(None, False)] * 3) == 0
+    assert majority_vote_score([]) == 0
+    # One normalized prediction graded both ways is two answers.
+    assert majority_vote_score([("34", True), ("34", False), ("34", False)]) == 0
+    assert answer_cluster_entropy(["4"] * 4) == 0
+    assert answer_cluster_entropy(["4", "4", None, None]) == pytest.approx(math.log(2))
+    assert answer_cluster_entropy(["1", "2", "3", "4"]) == pytest.approx(math.log(4))

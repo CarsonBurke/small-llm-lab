@@ -35,6 +35,7 @@ state. Replay rebuilds those reads with one parallel scan over the record.
 from __future__ import annotations
 
 import gc
+import math
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
@@ -45,7 +46,19 @@ from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
 from postraining.core import top_p_sample as _core_top_p_sample
-from postraining.memory_carry import memory_write_mask
+from postraining.counter_noise import counter_bits
+from postraining.memory_carry import (
+    MemoryWriter,
+    WriteNoise,
+    memory_write_mask,
+    replay_write_noise,
+)
+from postraining.memory_eval_ablation import (
+    foreign_donor_rows,
+    foreign_read_state,
+    record_foreign_state,
+)
+from postraining.nano_backbone import policy_action_offsets_
 from postraining.nucleus_threshold import nucleus_threshold
 from postraining.latent_thought import (
     EMIT,
@@ -151,24 +164,58 @@ def trajectory_token_seeds(
     )
 
 
-_MASK32 = (1 << 32) - 1
-# Multipliers stay below 2**31 so every int64 product of a 32-bit lane is
-# exact (no signed overflow) on CPU and in generated Triton code alike.
-_MIX32 = 0x045D9F3B
-_SLOT_STRIDE = 0x2545F491
-_HIGH_LANE_SALT = 0x3C6EF372
 # The largest float32 below one. A 32-bit lane rounds to exactly 1.0 in its
 # top 128 values, which would make that token's race noise infinite and
 # veto it -- ~3e-8 per draw, i.e. hundreds of forced off-policy tokens over
 # a training run, each replacing a near-certain token.
 _UNIFORM_CEILING = 1.0 - 2.0**-24
+# Salts a pool seed into the write-noise seed namespace, so a trajectory's
+# noise seed is never its token seed.
+_WRITE_NOISE_POOL_SALT = 0x6A09E667F3BCC908
 
 
-def _mix32(value: Tensor) -> Tensor:
-    """Bijective 32-bit avalanche mix (Mueller's hash) on int64 lanes."""
-    value = (((value >> 16) ^ value) * _MIX32) & _MASK32
-    value = (((value >> 16) ^ value) * _MIX32) & _MASK32
-    return (value >> 16) ^ value
+@dataclass(frozen=True)
+class WriteNoisePlan:
+    """One pool's memory write-noise exploration.
+
+    Every trajectory explores at the signed ``scale``. With
+    ``shared_per_prompt`` the samples of a prompt share one noise pattern
+    (keyed on the prompt alone) while sampling their tokens independently --
+    the antithetic sweep's design, under which cross-sample products of the
+    antithetic return difference isolate the noise's effect from the
+    continuation noise. Otherwise each trajectory draws its own.
+    """
+
+    scale: float
+    shared_per_prompt: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.scale):
+            raise ValueError("a write noise scale must be finite")
+
+    def inputs(
+        self,
+        pool_seed: int,
+        request_ids: Sequence[int],
+        samples: int,
+        device: torch.device | str = "cpu",
+    ) -> tuple[Tensor, Tensor]:
+        """Prompt-major ``(write_noise_seeds, write_noise_scale)``."""
+        noise_pool = pool_seed ^ _WRITE_NOISE_POOL_SALT
+        seeds = torch.tensor(
+            [
+                signed64(request_seed(
+                    noise_pool, request_id, 0 if self.shared_per_prompt else sample
+                ))
+                for request_id in request_ids
+                for sample in range(samples)
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        return seeds, torch.full(
+            seeds.shape, self.scale, dtype=torch.float32, device=device
+        )
 
 
 def counter_gumbel_scores(
@@ -181,13 +228,8 @@ def counter_gumbel_scores(
     scores = logits.float()
     if temperature != 1.0:
         scores = scores / temperature
-    slot_key = _mix32((slot * _SLOT_STRIDE) & _MASK32)
-    low_lane = _mix32((row_seeds & _MASK32) ^ slot_key)
-    high_lane = _mix32(
-        ((row_seeds >> 32) & _MASK32) ^ _mix32(slot_key ^ _HIGH_LANE_SALT)
-    )
     vocab = torch.arange(scores.size(-1), dtype=torch.int64, device=scores.device)
-    bits = _mix32(_mix32(low_lane[:, None] ^ vocab) ^ high_lane[:, None])
+    bits = counter_bits(row_seeds, slot, vocab)
     uniform = ((bits.float() + 0.5) * (1.0 / 2**32)).clamp_max(_UNIFORM_CEILING)
     exponential = -torch.log1p(-uniform)
     return scores - exponential.log()
@@ -410,6 +452,22 @@ class LatentRolloutBatch:
     # rewards use this to distinguish policy failures from infrastructure
     # failures instead of hiding an inactive verifier behind reward zero.
     verifier_status: Tensor | None = None
+    # (batch,) int64 seeds and fp32 signed scales of a memory-carry
+    # rollout's write noise (a zero scale is noiseless); both None for a
+    # rollout that never drew it. Replay regenerates the noise from them
+    # (``recorded_write_noise``). The seeds are not the token seeds: rows may
+    # share a noise draw while sampling their tokens independently.
+    write_noise_seeds: Tensor | None = None
+    write_noise_scale: Tensor | None = None
+    # (batch,) fp32 group terms of the answer-level sequence estimators,
+    # stamped when a prompt group is scored and following its rows like
+    # ``source_id``; both None otherwise. ``group_advantage`` is the
+    # leave-one-out advantage R_i - mean_{j != i} R_j over the group's
+    # terminal rewards; ``answer_surprisal`` is -log(n_k / G), the share of
+    # the group whose graded answer falls in this row's cluster
+    # (``mean_actor_critic.answer_cluster_surprisal``).
+    group_advantage: Tensor | None = None
+    answer_surprisal: Tensor | None = None
 
     def to(
         self, device: torch.device, non_blocking: bool = False
@@ -694,6 +752,9 @@ def rollout_continuations(
     tail_decode_mask: DecodeRangeMask | None = None,
     top_k: int | None = None,
     token_seeds: Tensor | None = None,
+    write_noise_seeds: Tensor | None = None,
+    write_noise_scale: Tensor | None = None,
+    foreign_memory_reads: str | None = None,
 ) -> LatentRolloutBatch:
     """Roll the gate-conditioned stream forward from a (batch, P) prompt.
 
@@ -765,6 +826,11 @@ def rollout_continuations(
     over the whole tempered distribution, or over its ``top_p`` nucleus
     (evaluation only; training samples the untruncated policy), and refuses
     top-k.
+    ``write_noise_seeds``/``write_noise_scale`` (memory carry only, one int64
+    and one fp32 per output trajectory, given together) add
+    ``memory_carry.write_noise`` at that signed scale to every generated
+    belief's write, keyed on the row's noise seed and the belief's own
+    unpadded slot; both are recorded for replay.
     ``compact_finished`` removes completed rows and their KV cache entries at
     the existing 16-position synchronization points once at least 25% of the
     current rows have finished. With ``finished_batch_size``, compaction waits
@@ -833,6 +899,12 @@ def rollout_continuations(
     artifact. Both paths attend the whole cache under the mask, so caches are
     zero-filled at allocation: an unwritten slot inside a live block would
     otherwise be uninitialized memory.
+
+    ``foreign_memory_reads`` (memory carry, evaluation only), a
+    ``memory_eval_ablation.FOREIGN_READ_ABLATIONS`` name, makes every decode
+    read see another prompt's (``foreign_state``) or another sample's
+    (``foreign_sample``) memory state at the same tick, through the row's own
+    query; each row still writes its own state.
     """
     if prompt_ids.dim() != 2 or prompt_ids.size(1) < 1:
         raise ValueError("prompt_ids must be (batch, length>=1)")
@@ -872,6 +944,30 @@ def rollout_continuations(
         ):
             raise ValueError("token_seeds must be one int64 seed per trajectory")
         token_seeds = token_seeds.to(prompt_ids.device)
+    if (write_noise_seeds is None) != (write_noise_scale is None):
+        raise ValueError("write noise takes seeds and scales together")
+    if write_noise_scale is not None:
+        if not memory_carry:
+            raise ValueError("write noise explores a memory carry's writes")
+        if caches is not None:
+            raise ValueError(
+                "write-noise rollouts on a static arena belong to "
+                "graph_decode.PinnedDecodeArena"
+            )
+        write_noise_seeds, write_noise_scale = validated_write_noise(
+            write_noise_seeds,
+            write_noise_scale,
+            prompt_ids.size(0) * prompt_repeats,
+            prompt_ids.device,
+        )
+    if foreign_memory_reads:
+        if not memory_carry:
+            raise ValueError("foreign memory reads need a memory-carry rollout")
+        if caches is not None or replay_storage or write_noise_scale is not None:
+            raise ValueError(
+                "foreign memory reads are an evaluation ablation: allocated "
+                "caches, no replay record, no write noise"
+            )
     required_stream_steps = max_new_tokens + (0 if pin_emit else 1)
     if max_stream_steps < required_stream_steps:
         raise ValueError(
@@ -1249,6 +1345,14 @@ def rollout_continuations(
         memory_state = wrapper.memory_prompt_state(
             prefix_beliefs, prefix_key_valid
         ).repeat_interleave(prompt_repeats, dim=0)
+    # Foreign reads: every original row's latest state and its donor, both
+    # indexed by original row so compaction leaves them alone.
+    foreign_states = foreign_donors = None
+    if foreign_memory_reads:
+        foreign_states = memory_state.clone()
+        foreign_donors = foreign_donor_rows(
+            prefix_batch, prompt_repeats, foreign_memory_reads, device
+        )
 
     if prompt_repeats > 1:
         expanded_caches = expansion_target
@@ -1725,7 +1829,11 @@ def rollout_continuations(
             # The belief that produced this token is already in the memory
             # (written after the step that computed it); the input reads it.
             next_input = wrapper.memory_input(
-                next_token_ids, belief, memory_state
+                next_token_ids,
+                belief,
+                memory_state
+                if foreign_states is None
+                else foreign_read_state(foreign_states, foreign_donors, live_rows),
             )
         elif hidden_carry:
             # Every decode input carries the belief that produced its token.
@@ -1765,7 +1873,22 @@ def rollout_continuations(
         if memory_state is not None:
             # The write, at the network output. Finished rows write stale
             # beliefs into memories nothing reads again.
-            memory_state = wrapper.memory_write(memory_state, output.belief)
+            noise = None
+            if write_noise_scale is not None:
+                noise = wrapper.memory_write_noise(
+                    write_noise_seeds.index_select(0, live_rows),
+                    next_position
+                    if pad_lengths is None
+                    else next_position - pad_lengths,
+                    write_noise_scale.index_select(0, live_rows),
+                )
+            memory_state = wrapper.memory_write(
+                memory_state, output.belief, noise
+            )
+            if foreign_states is not None:
+                record_foreign_state(
+                    foreign_states, live_rows, memory_state, active
+                )
         caches = output.caches
         position = next_position
 
@@ -1809,6 +1932,8 @@ def rollout_continuations(
         prompt_length=prompt_length,
         carry_injected=hidden_carry,
         memory_carry=memory_carry,
+        write_noise_seeds=write_noise_seeds,
+        write_noise_scale=write_noise_scale,
     )
     return rolled if not filler_rows else _drop_filler_rows(rolled, filler_rows)
 
@@ -1982,7 +2107,10 @@ def pack_rollout_groups_for_replay(
                 sum(counts) if all(c is not None for c in counts) else None
             )
             continue
-        if field.name in ("source_id", "verifier_status"):
+        if field.name in (
+            "source_id", "verifier_status", "write_noise_seeds",
+            "write_noise_scale", "group_advantage", "answer_surprisal",
+        ):
             values = [getattr(group, field.name) for group in groups]
             if all(value is None for value in values):
                 combined[field.name] = None
@@ -2254,6 +2382,42 @@ def validate_carry_policy(
         )
 
 
+def validated_write_noise(
+    seeds: Tensor, scales: Tensor, rows: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """One int64 noise seed and one fp32 scale per trajectory, on ``device``."""
+    if seeds.shape != (rows,) or seeds.dtype != torch.int64:
+        raise ValueError("write_noise_seeds must be one int64 seed per trajectory")
+    if scales.shape != (rows,) or scales.dtype != torch.float32:
+        raise ValueError("write_noise_scale must be one fp32 scale per trajectory")
+    return seeds.to(device), scales.to(device)
+
+
+def recorded_write_noise(
+    batch: LatentRolloutBatch, writer: MemoryWriter
+) -> WriteNoise | None:
+    """The write noise ``batch``'s rollout drew, at every replay slot.
+
+    Both the actor and the critic replay the memory through here, so both
+    read the writes the rollout made.
+    """
+    if (batch.write_noise_seeds is None) != (batch.write_noise_scale is None):
+        raise ValueError("write noise is recorded as seeds and scales together")
+    if batch.write_noise_scale is None:
+        return None
+    if not batch.memory_carry:
+        raise ValueError("only a memory-carry rollout draws write noise")
+    return replay_write_noise(
+        batch.kind,
+        batch.action_mask,
+        batch.write_noise_seeds,
+        batch.write_noise_scale,
+        writer.heads,
+        writer.head_dim,
+        PAD_SLOT,
+    )
+
+
 def assemble_stream_latents(
     wrapper: LatentThoughtModel, batch: LatentRolloutBatch
 ) -> Tensor:
@@ -2269,6 +2433,7 @@ def assemble_stream_latents(
             hiddens,
             memory_write_mask(batch.kind, PAD_SLOT),
             generated_slot_mask(batch),
+            recorded_write_noise(batch, wrapper.combiner.writer),
         )
         return inputs * pad_scale
     if batch.carry_injected:
@@ -2359,6 +2524,128 @@ def compact_emit_token_logprobs(
         return backbone.target_logprobs_from_features(features, emit_targets)
     logprobs = backbone.logits_from_features(features).float().log_softmax(-1)
     return logprobs.gather(-1, emit_targets[:, None]).squeeze(-1)
+
+
+def compact_emit_token_logprobs_and_entropy(
+    wrapper, emit_inputs: Tensor, emit_beliefs: Tensor, emit_targets: Tensor
+) -> tuple[Tensor, Tensor]:
+    """``compact_emit_token_logprobs`` and each slot's policy entropy.
+
+    For an actor objective with an entropy term: the log-probabilities are
+    the single-output helper's exactly, and the entropy is differentiable.
+    """
+    if emit_targets.ndim != 1:
+        raise ValueError("emit targets must be [actions]")
+    features = wrapper.renderer_features(emit_inputs, emit_beliefs)
+    backbone = wrapper.backbone
+    if hasattr(backbone, "target_logprobs_and_entropy_from_features"):
+        return backbone.target_logprobs_and_entropy_from_features(
+            features, emit_targets
+        )
+    logprobs = backbone.logits_from_features(features).float().log_softmax(-1)
+    entropy = -(logprobs.exp() * logprobs).sum(-1)
+    return logprobs.gather(-1, emit_targets[:, None]).squeeze(-1), entropy
+
+
+def compact_emit_token_logprobs_entropy_and_advantages(
+    wrapper,
+    emit_inputs: Tensor,
+    emit_beliefs: Tensor,
+    emit_targets: Tensor,
+    directions: Tensor,
+    action_latents: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """``compact_emit_token_logprobs_and_entropy`` plus each slot's exact
+    policy-centered token Q, A = Q(s, a_t) - sum_a pi(a | s) Q(s, a), and
+    the taken token's offset from the policy's mean action row,
+    x(a_t) - sum_a pi(a | s) x(a), which centres the critic's own fit
+    (``value_model.policy_centered_q``).
+
+    ``directions`` are the token Q critic's u at the same compact slots and
+    ``action_latents`` its x table (``SeparateCritic.action_latents``); the
+    advantage and offset are detached.
+    """
+    if emit_targets.ndim != 1:
+        raise ValueError("emit targets must be [actions]")
+    features = wrapper.renderer_features(emit_inputs, emit_beliefs)
+    backbone = wrapper.backbone
+    if hasattr(backbone, "target_logprobs_entropy_and_advantages_from_features"):
+        return backbone.target_logprobs_entropy_and_advantages_from_features(
+            features, emit_targets, directions, action_latents
+        )
+    logits = backbone.logits_from_features(features).float()
+    logprobs = logits.log_softmax(-1)
+    entropy = -(logprobs.exp() * logprobs).sum(-1)
+    offsets = policy_action_offsets_(logits.detach().softmax(-1), emit_targets, action_latents)
+    return (
+        logprobs.gather(-1, emit_targets[:, None]).squeeze(-1),
+        entropy,
+        # ``policy_centered_token_values``, from the offsets already formed.
+        (directions.detach().float() * offsets).sum(-1),
+        offsets,
+    )
+
+
+def replay_policy_action_offsets(
+    wrapper, batch: LatentRolloutBatch, action_latents: Tensor, chunk: int
+) -> Tensor:
+    """x(a_t) - sum_a pi(a | s_t) x(a) at each of ``batch``'s EMIT slots,
+    (emits, dim) fp32 in ``slot_index`` order, a_t the token taken there
+    (``nano_backbone.policy_action_offsets_``).
+
+    For a token Q critic's fit outside an actor update, which has no
+    readout of its own to take the offset from: one replay of the policy
+    and its readout over ``chunk`` slots at a time.
+
+    The replay runs grad-enabled and is detached, as in
+    ``refresh_old_statistics``: grad mode is a torch.compile guard, and a
+    no-grad trace would compile the trunk a second time for the value-only
+    warmup. Only the readout runs without a graph.
+    """
+    if chunk < 1:
+        raise ValueError("the readout chunk must be positive")
+    beliefs, inputs = replay_head_inputs(wrapper, batch)
+    beliefs, inputs = beliefs.detach(), inputs.detach()
+    index = slot_index(batch.emit_mask.bool())
+    targets = compact_next_slots(batch.token_ids, index)
+    offsets = []
+    with torch.no_grad():
+        for start in range(0, index.numel(), chunk):
+            part = index[start : start + chunk]
+            features = wrapper.renderer_features(
+                compact_slots(inputs, part), compact_slots(beliefs, part)
+            )
+            logits = wrapper.backbone.logits_from_features(features)
+            offsets.append(policy_action_offsets_(
+                logits.float().softmax(-1), targets[start : start + chunk], action_latents
+            ))
+    if not offsets:
+        return action_latents.new_zeros((0, action_latents.size(-1)), dtype=torch.float32)
+    return torch.cat(offsets)
+
+
+def policy_action_offsets_at_actions(
+    wrapper, policy_batch: LatentRolloutBatch, action_latents: Tensor, chunk: int,
+    critic_batch: LatentRolloutBatch | None = None,
+) -> Tensor:
+    """``replay_policy_action_offsets`` of ``policy_batch``, placed at the
+    action slots of ``critic_batch`` (default: the same batch), (rows,
+    stream, dim) fp32 with zeros elsewhere: the offsets a token Q critic's
+    ``token_values`` reads. A critic that sees a different context holds
+    the same trajectories, action for action, in its own layout.
+    """
+    critic_batch = policy_batch if critic_batch is None else critic_batch
+    if not torch.equal(policy_batch.emit_mask.sum(1), critic_batch.action_mask.sum(1)):
+        raise ValueError("the policy and critic views disagree on a trajectory's action count")
+    policy_index = slot_index(policy_batch.emit_mask.bool())
+    index = slot_index(critic_batch.action_mask.bool())
+    if not torch.equal(compact_next_slots(policy_batch.token_ids, policy_index),
+                       compact_next_slots(critic_batch.token_ids, index)):
+        raise ValueError("the policy and critic views took different tokens")
+    offsets = replay_policy_action_offsets(wrapper, policy_batch, action_latents, chunk)
+    return scatter_slots(
+        critic_batch.action_mask.new_zeros((*critic_batch.action_mask.shape, offsets.size(-1))),
+        index, offsets)
 
 
 def compact_emit_token_log_odds(

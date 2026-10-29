@@ -51,15 +51,32 @@ every stored action.
 The critic reads the actor's memory (detached) through its own reader, so
 its value at a slot conditions on everything the actor will read next and
 the TD error carries the value of each write.
+
+**Write noise.** A rollout may explore around the deterministic writer
+(DDPG-style, ``docs/memory_write_critic_plan_20261020.md``): each generated
+write adds absolute Gaussian noise ``sigma * eps`` to the writer's
+pre-activations -- the pre-normalization key, the value, the decay logit and
+the write logit -- with ``sigma`` one signed scale per trajectory and
+``eps`` counter-keyed on (the trajectory's noise seed, the producing slot's
+unpadded index) in its own hash domain (``write_noise``). Replay regenerates
+the same noise from the recorded seeds and scales (``replay_write_noise``),
+so the token log-probs stay exact, and a zero scale is exactly the
+noiseless writer. Noise seeds are separate from token seeds, so responses
+sampled independently can share one noise pattern. Prompt writes are never
+noised: one prompt state is shared by every sample of its prompt, so the
+first generated token's producing belief, a prompt write, is noiseless too.
 """
 
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+from postraining.counter_noise import counter_normals
 
 DEFAULT_MEMORY_HEADS = 4
 DEFAULT_MEMORY_HEAD_DIM = 64
@@ -70,6 +87,49 @@ DEFAULT_MEMORY_HEAD_DIM = 64
 MEMORY_MIN_TIMESCALE = 16.0
 MEMORY_MAX_TIMESCALE = 1024.0
 _RMS_EPS = 1e-6
+# The write noise's hash domain: low/high seed salts that separate it from
+# the token race on the same trajectory seed and slot (SHA-1's round
+# constants; any distinct pair would do).
+WRITE_NOISE_DOMAIN = (0x8F1BBCDC, 0xCA62C1D6)
+
+
+class WriteNoise(NamedTuple):
+    """Absolute fp32 noise on the writer's pre-activations.
+
+    ``key``/``value`` are ``(..., H, K)``; the gate logits ``(..., H)``.
+    """
+
+    key: Tensor
+    value: Tensor
+    decay: Tensor
+    write: Tensor
+
+
+def write_noise(
+    row_seeds: Tensor,
+    slots: Tensor | int,
+    scale: Tensor,
+    heads: int,
+    head_dim: int,
+) -> WriteNoise:
+    """``scale * eps`` for writes keyed on (row seed, unpadded slot).
+
+    ``row_seeds``, ``slots`` and ``scale`` broadcast to the writes' leading
+    shape. Each write draws ``2 H K + 2 H`` normals from its own counter
+    lanes, so a key or value coordinate's noise is the same whatever else
+    is drawn, and ``-scale`` is the exact antithetic of ``scale``.
+    """
+    width = heads * head_dim
+    eps = counter_normals(row_seeds, slots, 2 * width + 2 * heads, WRITE_NOISE_DOMAIN)
+    key, value, decay, write = (eps * scale[..., None].float()).split(
+        (width, width, heads, heads), dim=-1
+    )
+    return WriteNoise(
+        key.unflatten(-1, (heads, head_dim)),
+        value.unflatten(-1, (heads, head_dim)),
+        decay,
+        write,
+    )
 
 
 def _unit_rms(x: Tensor) -> Tensor:
@@ -125,28 +185,39 @@ class MemoryWriter(nn.Module):
             self.decay_gate.weight.zero_()
             self.decay_gate.bias.copy_(initial_decay_bias(heads))
 
-    def forward(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(
+        self, hidden: Tensor, noise: WriteNoise | None = None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """fp32 ``(k, v, log_decay, beta)`` for beliefs ``(..., D)``.
 
         ``k``/``v`` are ``(..., H, K)``; the gates ``(..., H)``. The caller
         owns detaching: the actor's writer trains through the scan, but the
-        belief it reads is sampled data.
+        belief it reads is sampled data. ``noise`` is added to the
+        pre-activations; the writer's gradient is unchanged by it.
         """
         with torch.autocast(device_type=hidden.device.type, enabled=False):
             # Separate GEMMs on purpose: one concatenated projection saved
             # two launches but let Inductor fold its strided split into the
             # decode write's pass over the state, 6x slower (bench_graph_decode).
             unit = _unit_rms(hidden.float())
-            k = _head_l2norm(F.linear(unit, self.key.weight), self.heads)
+            key = F.linear(unit, self.key.weight)
             v = F.linear(unit, self.value.weight).unflatten(
                 -1, (self.heads, self.head_dim)
             )
-            beta = torch.sigmoid(
-                F.linear(unit, self.write_gate.weight, self.write_gate.bias)
+            write_logit = F.linear(
+                unit, self.write_gate.weight, self.write_gate.bias
             )
-            log_decay = F.logsigmoid(
-                F.linear(unit, self.decay_gate.weight, self.decay_gate.bias)
+            decay_logit = F.linear(
+                unit, self.decay_gate.weight, self.decay_gate.bias
             )
+            if noise is not None:
+                key = key + noise.key.flatten(-2)
+                v = v + noise.value
+                write_logit = write_logit + noise.write
+                decay_logit = decay_logit + noise.decay
+            k = _head_l2norm(key, self.heads)
+            beta = torch.sigmoid(write_logit)
+            log_decay = F.logsigmoid(decay_logit)
         return k, v, log_decay, beta
 
 
@@ -300,11 +371,46 @@ def memory_write_mask(kind: Tensor, pad_slot: int) -> Tensor:
     return mask
 
 
+def replay_write_noise(
+    kind: Tensor,
+    action_mask: Tensor,
+    row_seeds: Tensor,
+    row_scales: Tensor,
+    heads: int,
+    head_dim: int,
+    pad_slot: int,
+) -> WriteNoise:
+    """The decode's write noise at every slot of a replay record.
+
+    ``hiddens[:, j]`` holds the belief computed at slot ``j - 1``. Decode
+    noised that belief's write exactly when slot ``j - 1`` holds a generated
+    token -- the slot before it took an action -- keyed on its unpadded
+    index ``j - 1 - first``, ``first`` the row's first real slot. Every
+    other slot gets exactly zero. Derived from per-row data alone, so it
+    holds for packed and pad-stripped batches.
+    """
+    columns = torch.arange(kind.size(1), device=kind.device)
+    first = (kind != pad_slot).int().argmax(1, keepdim=True)
+    generated_producer = torch.zeros_like(kind, dtype=torch.bool)
+    generated_producer[:, 2:] = action_mask[:, :-2].bool()
+    noised = memory_write_mask(kind, pad_slot) & generated_producer
+    return write_noise(
+        row_seeds[:, None],
+        columns - 1 - first,
+        row_scales[:, None] * noised,
+        heads,
+        head_dim,
+    )
+
+
 def masked_write_terms(
-    writer: MemoryWriter, hiddens: Tensor, write_mask: Tensor
+    writer: MemoryWriter,
+    hiddens: Tensor,
+    write_mask: Tensor,
+    noise: WriteNoise | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Writer terms with masked slots turned into exact no-ops."""
-    k, v, log_decay, beta = writer(hiddens)
+    k, v, log_decay, beta = writer(hiddens, noise)
     flag = write_mask.to(torch.float32)
     return k, v, log_decay * flag[..., None], beta * flag[..., None]
 
@@ -351,9 +457,17 @@ class GatedDeltaMemory(nn.Module):
         # The kernel needs a query; its reads are discarded.
         return delta_scan(k, k, v, log_decay, beta)[1]
 
-    def write(self, state: Tensor, belief: Tensor) -> Tensor:
+    def write(
+        self, state: Tensor, belief: Tensor, noise: WriteNoise | None = None
+    ) -> Tensor:
         """Write one belief ``(R, D)`` per row into ``state``."""
-        return delta_write(state, *self.writer(belief))
+        return delta_write(state, *self.writer(belief, noise))
+
+    def write_noise(
+        self, row_seeds: Tensor, slots: Tensor | int, scale: Tensor
+    ) -> WriteNoise:
+        """``write_noise`` at this memory's shape."""
+        return write_noise(row_seeds, slots, scale, self.heads, self.head_dim)
 
     def read_input(
         self, base: Tensor, hidden: Tensor, state: Tensor
@@ -372,13 +486,17 @@ class GatedDeltaMemory(nn.Module):
         hiddens: Tensor,
         write_mask: Tensor,
         read_mask: Tensor,
+        noise: WriteNoise | None = None,
     ) -> Tensor:
         """Replay inputs ``(B, T, D)``: reads at ``read_mask`` slots.
 
         Gradient reaches every memory parameter through every earlier write;
-        ``hiddens`` are stored sampled data and receive none.
+        ``hiddens`` are stored sampled data and receive none. ``noise`` is
+        the rollout's write noise (``replay_write_noise``).
         """
-        terms = masked_write_terms(self.writer, hiddens.detach(), write_mask)
+        terms = masked_write_terms(
+            self.writer, hiddens.detach(), write_mask, noise
+        )
         return read_stream(self.reader, terms, base, hiddens, read_mask)
 
 
@@ -403,11 +521,14 @@ def read_stream(
 
 
 def borrowed_write_terms(
-    writer: MemoryWriter, hiddens: Tensor, write_mask: Tensor
+    writer: MemoryWriter,
+    hiddens: Tensor,
+    write_mask: Tensor,
+    noise: WriteNoise | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """The actor's write terms as constants, for a reader that only reads.
 
     The critic's value loss must not train the actor's writer.
     """
     with torch.no_grad():
-        return masked_write_terms(writer, hiddens, write_mask)
+        return masked_write_terms(writer, hiddens, write_mask, noise)

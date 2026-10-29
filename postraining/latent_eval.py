@@ -39,6 +39,35 @@ if TYPE_CHECKING:
 LATENT_EVAL_METRIC_SCHEMA = "forced_initial_isotropic_thought_policy/v9"
 
 
+def majority_vote_score(answers: list[tuple[str | None, bool]]) -> float:
+    """maj@k of one prompt's samples, given (graded answer or None,
+    correct) per sample: the share of correct answers among those tied for
+    the most votes, i.e. the expected score under a uniformly random tie
+    break. Ungraded samples (None) cast no vote; with no graded answer the
+    vote is lost (0). A vote is for the (answer, correct) pair: Minerva's
+    numeric gates can grade one normalized prediction both ways (``3 4``
+    and ``34`` both normalize to ``34``), and those are two answers."""
+    votes: dict[tuple[str, bool], int] = {}
+    for answer, is_correct in answers:
+        if answer is not None:
+            votes[answer, is_correct] = votes.get((answer, is_correct), 0) + 1
+    if not votes:
+        return 0.0
+    top = max(votes.values())
+    leaders = [key for key, count in votes.items() if count == top]
+    return sum(is_correct for _, is_correct in leaders) / len(leaders)
+
+
+def answer_cluster_entropy(answers: list[str | None]) -> float:
+    """Plug-in entropy (nats) of one prompt's answer clusters, ungraded
+    samples (None) forming one cluster."""
+    counts: dict[str | None, int] = {}
+    for answer in answers:
+        counts[answer] = counts.get(answer, 0) + 1
+    total = len(answers)
+    return -sum(n / total * math.log(n / total) for n in counts.values()) if total else 0.0
+
+
 COMPILED_EVAL_TAIL_BATCH = 16
 # The VAPO AIME protocol's sampling settings, shared by every panel.
 EVAL_TEMPERATURE = 1.0
@@ -138,6 +167,7 @@ def evaluate_latent_math(
     answer_fence_ids: tuple[int, int] | None = None,
     min_think_tokens: int = 1,
     decode_arena: PinnedDecodeArena | None = None,
+    foreign_memory_reads: str | None = None,
 ) -> dict[str, object]:
     """Batched verifier evaluation through the latent policy itself.
 
@@ -181,6 +211,11 @@ def evaluate_latent_math(
     batching, length ordering and compaction, and two checkpoints evaluated
     with one seed share their noise sample for sample.
 
+    ``foreign_memory_reads`` (``foreign_state`` or ``foreign_sample``)
+    evaluates the memory carry with every read seeing another prompt's or
+    another sample's memory (``memory_eval_ablation``); a decode arena must
+    have been built for the same ablation.
+
     Grading follows each row's ``answer_style`` unless
     ``answer_style_override`` forces one (AIME passes ``"aime"``: integer in
     [0, 999]).  Rows tagged with an ``extra_info.module`` additionally get a
@@ -216,6 +251,11 @@ def evaluate_latent_math(
                 "top_p differs from this evaluation's"
             )
         batch_trajectories = decode_arena.rows
+        if decode_arena.foreign_reads != foreign_memory_reads:
+            raise ValueError(
+                "the decode arena's foreign memory reads differ from this "
+                "evaluation's"
+            )
     if captured_attempts is not None:
         if capture_problem_count < 1 or len(rows) < capture_problem_count:
             raise ValueError(
@@ -260,6 +300,9 @@ def evaluate_latent_math(
     total = 0
     prompt_correct = [0] * len(rows)
     prompt_contract_correct = [0] * len(rows)
+    # Each prompt's samples as (graded answer or None, contract-correct),
+    # for majority voting and the answer-cluster entropy.
+    prompt_answers: list[list[tuple[str | None, bool]]] = [[] for _ in rows]
     module_correct: dict[str, int] = {}
     module_total: dict[str, int] = {}
     emitted_counts: list[int] = []
@@ -386,6 +429,7 @@ def evaluate_latent_math(
                                 pin_emit=pin_emit,
                                 hidden_carry=hidden_carry,
                                 top_k=top_k,
+                                foreign_memory_reads=foreign_memory_reads,
                             )
                         )
                 recurrent_steps_per_rollout.append(
@@ -475,6 +519,13 @@ def evaluate_latent_math(
                     prompt_contract_correct[original_index] += int(
                         is_contract_correct
                     )
+                    prompt_answers[original_index].append((
+                        parsed_answer
+                        if format_ok and stop_cut is not None
+                        and parsed_answer not in (None, "[INVALID]")
+                        else None,
+                        is_contract_correct,
+                    ))
                     if (
                         captured_attempts is not None
                         and original_index < capture_problem_count
@@ -612,6 +663,30 @@ def evaluate_latent_math(
         # per-prompt statistics instead of only aggregate accuracy.
         "prompt_correct_counts": list(prompt_correct),
         "contract_prompt_correct_counts": list(prompt_contract_correct),
+        # maj@samples: the vote of each prompt's graded answers, a tie scored
+        # as its uniformly random break; pass@samples; and the mean over
+        # prompts of log((k + 1/2) / (samples + 1)), the Krichevsky-Trofimov
+        # estimate of log p from k contract-correct samples.
+        "contract_prompt_majority_scores": [
+            majority_vote_score(answers) for answers in prompt_answers
+        ],
+        "contract_majority_accuracy": sum(
+            majority_vote_score(answers) for answers in prompt_answers
+        ) / max(len(prompt_answers), 1),
+        "contract_pass_at_samples": sum(
+            count > 0 for count in prompt_contract_correct
+        ) / max(len(prompt_contract_correct), 1),
+        "contract_mean_log_kt_success": sum(
+            math.log((count + 0.5) / (samples + 1))
+            for count in prompt_contract_correct
+        ) / max(len(prompt_contract_correct), 1),
+        # The plug-in entropy (nats) of each prompt's answer clusters, with
+        # ungraded samples as one cluster, as the answer-level estimators
+        # cluster a training group.
+        "prompt_answer_cluster_entropy": [
+            answer_cluster_entropy([answer for answer, _ in answers])
+            for answers in prompt_answers
+        ],
         "prompt_any_correct_fraction": sum(
             count > 0 for count in prompt_correct
         ) / max(len(prompt_correct), 1),

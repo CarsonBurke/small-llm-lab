@@ -513,6 +513,22 @@ def test_refresh_then_update_is_age_zero_exact_and_trains_through_the_memory():
     assert float(telemetry["memory/read_out_weight_rms"]) > 0.0
 
 
+def test_weight_telemetry_covers_the_critics_memory_inputs():
+    """The drill's critic: a memory reader plus twin belief-reading Q heads."""
+    wrapper = _memory_wrapper()
+    factory, _ = BACKBONES["nano"]
+    critic = SeparateCritic(
+        factory(11), actor_memory=wrapper.combiner, q_head_hidden=16,
+        q_head_reads_actor_belief=True, q_twin=True,
+    )
+    with torch.no_grad():
+        critic.combiner.out.weight.fill_(0.5)
+    telemetry = combiner_weight_telemetry(wrapper, critic)
+    assert float(telemetry["memory/critic_read_out_weight_rms"]) == pytest.approx(0.5)
+    assert float(telemetry["memory/critic_query_weight_rms"]) > 0.0
+    assert "memory/critic_q_actor_belief_weight_rms" in telemetry
+
+
 def test_packed_value_update_is_the_per_group_accumulation():
     """The critic warmup fits its pool as one packed minibatch.
 

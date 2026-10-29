@@ -27,7 +27,8 @@ def contract():
         combined_mlp_hidden=64,
         combined_mlp_blocks=2, prompt_tokens=256, continuation_tokens=2048,
         resolved_train_max_new_tokens=2048, resolved_train_max_stream_steps=2048,
-        delightful_policy_gradient=False,
+        delightful_policy_gradient=False, critic_q_pessimism=0.0,
+        fresh_learning_rate=None,
     )
     payload = dict(
         base_checkpoint_sha256="base", python_reward_schema="partial/v2",
@@ -156,6 +157,8 @@ def test_a_changed_value_contract_can_be_accepted_without_a_refit():
 @pytest.mark.parametrize("name, value", [
     ("temperature", 0.8), ("top_p", 0.95), ("answer_tokens", 16),
     ("continuation_tokens", 1024), ("resolved_train_max_stream_steps", 1024),
+    # The pessimistic prior shrinks the fit at rarely taken tokens.
+    ("critic_q_pessimism", 1e-3),
 ])
 def test_branch_that_changes_the_policy_or_horizon_must_refit(name, value):
     payload, args = branch(**{name: value})

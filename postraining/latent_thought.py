@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 
-from postraining.memory_carry import GatedDeltaMemory
+from postraining.memory_carry import GatedDeltaMemory, WriteNoise
 from pretraining.nanogpt_mini import nanogpt_mini_model
 
 THINK, EMIT = 0, 1
@@ -1776,9 +1776,18 @@ class LatentThoughtModel(nn.Module):
             self.embed_tokens(token_ids[:, None]), hidden, state
         )
 
-    def memory_write(self, state: Tensor, belief: Tensor) -> Tensor:
-        """``state`` with one new belief per row written in (functional)."""
-        return self.combiner.write(state, belief)
+    def memory_write(
+        self, state: Tensor, belief: Tensor, noise: WriteNoise | None = None
+    ) -> Tensor:
+        """``state`` with one new belief per row written in (functional),
+        with ``noise`` (``memory_write_noise``) on the write."""
+        return self.combiner.write(state, belief, noise)
+
+    def memory_write_noise(
+        self, row_seeds: Tensor, slots: Tensor | int, scale: Tensor
+    ) -> WriteNoise:
+        """Exploration noise for writes keyed on (row seed, unpadded slot)."""
+        return self.combiner.write_noise(row_seeds, slots, scale)
 
     def new_parameters(self):
         """Post-training parameters absent from the pretrained checkpoint."""

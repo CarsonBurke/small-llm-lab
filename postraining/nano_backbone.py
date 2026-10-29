@@ -89,6 +89,23 @@ def rational_softcap(raw: Tensor, cap: float) -> Tensor:
     return cap * raw * (raw.square() + cap**2).rsqrt()
 
 
+def _shifted_softcapped_logits(
+    raw: Tensor, cap: float
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """One shared capped row for normalization and selected-token scores.
+
+    Keeping the row maximum separate avoids adding a tiny normalization
+    correction to a large capped score. No clipping or nonfinite repair is
+    applied: invalid logits remain invalid and must fail downstream checks.
+    """
+    compute_dtype = torch.promote_types(raw.dtype, torch.float32)
+    capped = rational_softcap(raw.to(compute_dtype), cap)
+    row_max = capped.amax(-1)
+    shifted = capped - row_max[:, None]
+    log_norm = shifted.logsumexp(-1)
+    return capped, row_max, shifted, log_norm
+
+
 class SoftcappedTargetLogprobs(torch.autograd.Function):
     """Target log-probabilities of rationally softcapped logits.
 
@@ -97,8 +114,8 @@ class SoftcappedTargetLogprobs(torch.autograd.Function):
     vocabulary-wide fp32 tensors alive and runs its backward as zeros +
     scatter-add + log-softmax backward + softcap backward: several fp32
     passes over (rows, vocab). This function saves only the raw logits, in
-    the readout GEMM's own dtype, and the (rows,) logsumexp. Its backward is
-    a single elementwise pass that reforms the softmax from them::
+    the readout GEMM's own dtype, and two (rows,) normalization terms. Its
+    backward is a single elementwise pass that reforms the softmax from them::
 
         d raw = (onehot(target) - softmax(capped)) * g * cap'(raw)
         cap'(x) = cap^3 / (x^2 + cap^2)^(3/2)
@@ -112,29 +129,184 @@ class SoftcappedTargetLogprobs(torch.autograd.Function):
     def forward(ctx, raw: Tensor, targets: Tensor, cap: float) -> Tensor:
         if raw.ndim != 2 or targets.shape != raw.shape[:1]:
             raise ValueError("expected raw [rows, vocab] and targets [rows]")
-        compute_dtype = torch.promote_types(raw.dtype, torch.float32)
-        logsumexp = rational_softcap(raw.to(compute_dtype), cap).logsumexp(-1)
-        target_raw = raw.gather(-1, targets[:, None]).squeeze(-1)
-        target_raw = target_raw.to(compute_dtype)
-        ctx.save_for_backward(raw, targets, logsumexp)
+        _, row_max, shifted, log_norm = _shifted_softcapped_logits(raw, cap)
+        selected = shifted.gather(-1, targets[:, None]).squeeze(-1)
+        ctx.save_for_backward(raw, targets, row_max, log_norm)
         ctx.cap = cap
-        return rational_softcap(target_raw, cap) - logsumexp
+        return selected - log_norm
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad: Tensor):
-        # The saved logsumexp hides its dependence on raw from a
+        # Saved normalization terms hide their dependence on raw from a
         # create_graph backward, so a second derivative must refuse.
-        raw, targets, logsumexp = ctx.saved_tensors
+        raw, targets, row_max, log_norm = ctx.saved_tensors
         cap = ctx.cap
-        x = raw.to(logsumexp.dtype)
+        x = raw.to(log_norm.dtype)
         inverse_norm = (x.square() + cap**2).rsqrt()
-        probabilities = (cap * x * inverse_norm - logsumexp[:, None]).exp()
+        probabilities = (
+            (cap * x * inverse_norm - row_max[:, None]) - log_norm[:, None]
+        ).exp()
         vocabulary = torch.arange(raw.size(-1), device=raw.device)
         is_target = vocabulary[None, :] == targets[:, None]
         grad_capped = grad[:, None] * (is_target.to(x.dtype) - probabilities)
         grad_raw = grad_capped * cap**3 * inverse_norm**3
         return grad_raw.to(raw.dtype), None, None
+
+
+def policy_centered_token_values(
+    logits: Tensor, targets: Tensor, directions: Tensor, action_latents: Tensor
+) -> Tensor:
+    """Q(s, a_t) - sum_a pi(a | s) Q(s, a) for Q(s, a) = c + u . x(a).
+
+    ``logits`` are the policy's (rows, vocab) logits, ``directions`` the
+    critic's (rows, dim) u, ``action_latents`` its (vocab, dim) x. The state
+    term c cancels: A = u . (x(a_t) - sum_a pi(a) x(a)), the critic's own
+    offset (``policy_action_offsets_``) read by u. The offset is one GEMM
+    of pi - onehot(a_t), so as pi concentrates on a_t, A goes to zero with
+    its error rather than leaving the error of a separately rounded mean.
+    In a TF32 emulation (d 512, V 50,304) its relative error matched the
+    whole-vocabulary score GEMM's, about 3e-4 from pi(a_t) = 0.05 to 0.999,
+    without that GEMM's (rows, vocab) scores.
+    A detached statistic of the old policy; it has no gradient.
+    """
+    if logits.ndim != 2 or targets.shape != logits.shape[:1]:
+        raise ValueError("expected logits [rows, vocab] and targets [rows]")
+    if action_latents.shape != (logits.size(-1), directions.size(-1)):
+        raise ValueError("action latents must be [vocab, dim]")
+    with torch.no_grad(), torch.autocast(
+        device_type=logits.device.type, enabled=False
+    ):
+        offsets = policy_action_offsets_(logits.float().softmax(-1), targets, action_latents)
+        return (directions.to(offsets.dtype) * offsets).sum(-1)
+
+
+def policy_action_offsets_(probabilities: Tensor, targets: Tensor,
+                           action_latents: Tensor) -> Tensor:
+    """x(a_t) - sum_a pi(a | s) x(a) for the policy's (rows, vocab) fp32
+    ``probabilities``, taken ``targets`` and the critic's (vocab, dim)
+    action table: the offset that centres the token Q critic's fit
+    (``value_model.policy_centered_q``). Detached, in their dtype.
+
+    Formed whole, as -(pi - onehot(a_t)) @ x in one GEMM, so its rounding
+    shrinks with 1 - pi(a_t) the way the actor's advantage does
+    (``policy_centered_token_values``). Consumes ``probabilities``: they are
+    overwritten in place, which keeps a second (rows, vocab) tensor out of
+    every readout that calls this last.
+    """
+    if probabilities.ndim != 2 or targets.shape != probabilities.shape[:1]:
+        raise ValueError("expected probabilities [rows, vocab] and targets [rows]")
+    with torch.no_grad(), torch.autocast(device_type=probabilities.device.type, enabled=False):
+        probabilities.scatter_add_(
+            -1, targets[:, None], probabilities.new_full((targets.numel(), 1), -1.0))
+        return -(probabilities @ action_latents.to(probabilities.dtype))
+
+
+class SoftcappedTargetLogprobsEntropy(torch.autograd.Function):
+    """:class:`SoftcappedTargetLogprobs` plus each row's policy entropy.
+
+    The target log-probability is the same expression, so it is bit-for-bit
+    the single-output function's. The entropy of the capped softmax,
+    ``H = -sum(p * log p)``, avoids cancellation for peaked rows and costs
+    one more vocabulary pass in each direction. Its gradient is::
+
+        d H / d capped = -p * (log p + H)
+
+    so the backward reforms ``p`` once, as the single-output function does,
+    and adds this term before the shared softcap derivative. Only the raw
+    logits and three (rows,) statistics are saved. All three custom readouts
+    share the same selected-logit arithmetic; their target outputs must agree
+    bit-for-bit when evaluated by the same numerical implementation.
+    """
+
+    @staticmethod
+    def forward(ctx, raw: Tensor, targets: Tensor, cap: float):
+        if raw.ndim != 2 or targets.shape != raw.shape[:1]:
+            raise ValueError("expected raw [rows, vocab] and targets [rows]")
+        _, row_max, shifted, log_norm = _shifted_softcapped_logits(raw, cap)
+        log_probabilities = shifted - log_norm[:, None]
+        entropy = -(log_probabilities.exp() * log_probabilities).sum(-1)
+        selected = shifted.gather(-1, targets[:, None]).squeeze(-1)
+        ctx.save_for_backward(raw, targets, row_max, log_norm, entropy)
+        ctx.cap = cap
+        return selected - log_norm, entropy
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_logprob: Tensor, grad_entropy: Tensor):
+        return SoftcappedTargetLogprobsEntropy.raw_gradient(
+            ctx, grad_logprob, grad_entropy
+        ), None, None
+
+    @staticmethod
+    def raw_gradient(ctx, grad_logprob: Tensor, grad_entropy: Tensor) -> Tensor:
+        raw, targets, row_max, log_norm, entropy = ctx.saved_tensors
+        cap = ctx.cap
+        x = raw.to(log_norm.dtype)
+        inverse_norm = (x.square() + cap**2).rsqrt()
+        log_probabilities = (
+            (cap * x * inverse_norm - row_max[:, None]) - log_norm[:, None]
+        )
+        probabilities = log_probabilities.exp()
+        vocabulary = torch.arange(raw.size(-1), device=raw.device)
+        is_target = vocabulary[None, :] == targets[:, None]
+        grad_capped = grad_logprob[:, None] * (
+            is_target.to(x.dtype) - probabilities
+        ) - grad_entropy[:, None] * probabilities * (
+            log_probabilities + entropy[:, None]
+        )
+        grad_raw = grad_capped * cap**3 * inverse_norm**3
+        return grad_raw.to(raw.dtype)
+
+
+class SoftcappedTargetLogprobsEntropyAdvantages(torch.autograd.Function):
+    """:class:`SoftcappedTargetLogprobsEntropy` plus the token Q critic's
+    policy-centered advantage (:func:`policy_centered_token_values`) and the
+    taken token's action-row offset (:func:`policy_action_offsets_`) under
+    the same capped softmax.
+
+    The advantage is formed inside the forward from the capped logits the
+    log-probabilities already hold, so the readout GEMM runs once; it is a
+    detached statistic with no gradient. Owning it here also keeps the
+    softcap inside one traced subgraph: computed outside the function, a
+    dynamic-shape compile shares the cap's symbolic float across the
+    function boundary and fails to build the graph.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        raw: Tensor,
+        targets: Tensor,
+        cap: float,
+        directions: Tensor,
+        action_latents: Tensor,
+    ):
+        if raw.ndim != 2 or targets.shape != raw.shape[:1]:
+            raise ValueError("expected raw [rows, vocab] and targets [rows]")
+        capped, row_max, shifted, log_norm = _shifted_softcapped_logits(raw, cap)
+        selected = shifted.gather(-1, targets[:, None]).squeeze(-1)
+        log_probabilities = shifted - log_norm[:, None]
+        probabilities = log_probabilities.exp()
+        entropy = -(probabilities * log_probabilities).sum(-1)
+        # The offsets consume the probabilities, and the advantage is u
+        # read against them (``policy_centered_token_values``): one GEMM,
+        # one (slots, vocab) tensor.
+        offsets = policy_action_offsets_(probabilities, targets, action_latents)
+        advantages = (directions.to(offsets.dtype) * offsets).sum(-1)
+        ctx.save_for_backward(raw, targets, row_max, log_norm, entropy)
+        ctx.cap = cap
+        ctx.mark_non_differentiable(advantages, offsets)
+        return (
+            selected - log_norm, entropy, advantages, offsets
+        )
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_logprob: Tensor, grad_entropy: Tensor, _, _offsets):
+        return SoftcappedTargetLogprobsEntropy.raw_gradient(
+            ctx, grad_logprob, grad_entropy
+        ), None, None, None, None
 
 
 class _NanoPostrainingMixin:
@@ -210,6 +382,32 @@ class _NanoPostrainingMixin:
         belief = features[..., -self.model_dim:]
         return SoftcappedTargetLogprobs.apply(
             self._raw_logits(belief), targets, self.logit_softcap
+        )
+
+    def target_logprobs_and_entropy_from_features(
+        self, features: Tensor, targets: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """``target_logprobs_from_features`` and the full policy entropy:
+        see :class:`SoftcappedTargetLogprobsEntropy`."""
+        belief = features[..., -self.model_dim:]
+        return SoftcappedTargetLogprobsEntropy.apply(
+            self._raw_logits(belief), targets, self.logit_softcap
+        )
+
+    def target_logprobs_entropy_and_advantages_from_features(
+        self,
+        features: Tensor,
+        targets: Tensor,
+        directions: Tensor,
+        action_latents: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """``target_logprobs_and_entropy_from_features``, the policy-centered
+        token Q and the taken token's action-row offset, from one readout GEMM: see
+        :class:`SoftcappedTargetLogprobsEntropyAdvantages`."""
+        belief = features[..., -self.model_dim:]
+        return SoftcappedTargetLogprobsEntropyAdvantages.apply(
+            self._raw_logits(belief), targets, self.logit_softcap,
+            directions, action_latents,
         )
 
     def policy_logits(self, input_ids: Tensor) -> Tensor:

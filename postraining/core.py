@@ -1310,6 +1310,50 @@ def action_value_advantages(
     return torch.stack(columns[::-1], dim=1).to(values.dtype)
 
 
+def generalized_value_estimate_targets(
+    rewards: Tensor,
+    action_values: Tensor,
+    mask: Tensor,
+    lambdas: Tensor,
+) -> Tensor:
+    """REPPO's generalized value estimate: lambda-return targets for Q.
+
+    Undiscounted, with Q bootstrapped in the recursion itself::
+
+        G_t = r_t + [(1 - lambda) Q_{t+1} + lambda G_{t+1}]
+
+    where Q_{t+1} values the action actually taken at the next slot (on
+    policy, a fresh draw from the same distribution REPPO uses) and the
+    bracket is zero past a row's last action, so the final target is the
+    terminal reward itself. Lambda one is the Monte-Carlo return; lambda
+    zero is SARSA's r_t + Q_{t+1}. ``lambdas`` is one scalar per row. The
+    bootstrap values are detached: these are regression targets.
+    """
+    action_values = action_values.detach()
+    if rewards.size(1) == 0:
+        return torch.zeros_like(action_values)
+    # Everything off the recurrence is formed once for the whole stream, as
+    # in ``generalized_advantage_and_return_targets``: this reverse scan is
+    # dispatch bound, one column per eager step.
+    next_valids = torch.cat(
+        (mask[:, 1:], torch.zeros_like(mask[:, :1])), dim=1
+    ).to(action_values.dtype)
+    next_values = torch.cat(
+        (action_values[:, 1:], torch.zeros_like(action_values[:, :1])), dim=1
+    )
+    lambdas = lambdas.to(action_values.dtype)[:, None]
+    bootstrapped_rewards = (
+        rewards + (1.0 - lambdas) * next_values * next_valids
+    ) * mask
+    carries = lambdas * next_valids * mask
+    running = torch.zeros_like(action_values[:, 0])
+    columns: list[Tensor] = []
+    for t in range(rewards.size(1) - 1, -1, -1):
+        running = bootstrapped_rewards[:, t] + carries[:, t] * running
+        columns.append(running)
+    return torch.stack(columns[::-1], dim=1)
+
+
 def generalized_advantage_and_return_targets(
     rewards: Tensor,
     values: Tensor,

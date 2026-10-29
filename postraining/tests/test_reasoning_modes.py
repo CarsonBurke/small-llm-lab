@@ -333,6 +333,22 @@ def test_rollout_diagnostics_pinned_reports_token_actions():
     assert metrics["trajectories"] == 2
 
 
+def test_length_reward_covariance_is_within_prompt():
+    wrapper = _wrapper()
+    torch.manual_seed(19)
+    batch = trim_stream(
+        _pinned_rollout(wrapper, max_new_tokens=3, max_stream_steps=3)
+    )
+    batch.action_mask[0, 4] = 0
+    # One prompt group: lengths (2, 3) with rewards (1, 0) covary at -1/4.
+    batch.reward_scalar = torch.tensor([1.0, 0.0])
+    metrics = rollout_diagnostics(batch, samples_per_prompt=2)
+    assert metrics["length_reward_covariance"] == pytest.approx(-0.25)
+    # Two singleton groups: a length gap between prompts is not within-prompt.
+    metrics = rollout_diagnostics(batch, samples_per_prompt=1)
+    assert metrics["length_reward_covariance"] == 0.0
+
+
 def test_evaluate_latent_math_pin_emit_with_prompt_suffix(monkeypatch):
     wrapper = _wrapper()
 

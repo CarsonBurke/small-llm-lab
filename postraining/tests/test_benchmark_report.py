@@ -436,3 +436,16 @@ def test_periodic_writer_rejects_non_capture_rectangles(tmp_path):
 
     with pytest.raises(ValueError, match="exactly the first four"):
         write_benchmark_report(tmp_path, 80, _payload()["metrics"], attempts)
+
+
+def test_report_records_and_enforces_a_larger_capture_grid(tmp_path):
+    attempts = [_attempt(problem, sample) for problem in range(6) for sample in range(2)]
+    metrics = _payload()["metrics"]
+    paths = write_benchmark_report(tmp_path, 80, metrics, attempts,
+                                   problem_count=6, samples_per_problem=2)
+    payload = json.loads(paths["history"].read_text())
+    assert (payload["problem_count"], payload["samples_per_problem"]) == (6, 2)
+    assert len(payload["attempts"]) == 12
+    with pytest.raises(ValueError, match="6-problem by 2-sample"):
+        write_benchmark_report(tmp_path, 80, metrics, attempts[:-1],
+                               problem_count=6, samples_per_problem=2)

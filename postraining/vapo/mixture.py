@@ -201,10 +201,17 @@ class MixedPromptSampler:
         cursor: int = 0,
         *,
         randomize_choice_options: bool = True,
+        excluded_sources: tuple[str, ...] = (),
     ):
         if cursor < 0:
             raise ValueError("sampler cursor must be nonnegative")
         self.sources = {source.name: source for source in sources}
+        self.excluded_sources = frozenset(excluded_sources)
+        unknown = self.excluded_sources - self.sources.keys()
+        if unknown:
+            raise ValueError(f"unknown excluded mixture sources: {sorted(unknown)}")
+        if self.excluded_sources == self.sources.keys():
+            raise ValueError("cannot exclude every mixture source")
         self.schedule = _balanced_schedule(
             {source.name: len(source.rows) for source in sources}
         )
@@ -247,11 +254,31 @@ class MixedPromptSampler:
             self._orders[key] = order
         return self._orders[key]
 
+    def positions(self, start: int, count: int):
+        """Yield retained original positions, preserving row and option RNG identity."""
+        if start < 0 or count < 0:
+            raise ValueError("prompt start/count must be nonnegative")
+        position = start
+        for _ in range(count):
+            while self.schedule[position % len(self.schedule)] in self.excluded_sources:
+                position += 1
+            yield position
+            position += 1
+
+    def cursor_after(self, start: int, count: int) -> int:
+        """Original-stream cursor after emitting count retained prompts."""
+        final = start - 1
+        for final in self.positions(start, count):
+            pass
+        return final + 1
+
+    def remaining_in_cycle(self) -> int:
+        phase = self.cursor % len(self.schedule)
+        return sum(name not in self.excluded_sources for name in self.schedule[phase:])
+
     def next_rows(self, count: int) -> list[dict]:
-        if count < 0:
-            raise ValueError("prompt count must be nonnegative")
         picked = []
-        for position in range(self.cursor, self.cursor + count):
+        for position in self.positions(self.cursor, count):
             epoch, phase = divmod(position, len(self.schedule))
             source = self.sources[self.schedule[phase]]
             order = self._source_order(source, epoch)
@@ -259,13 +286,11 @@ class MixedPromptSampler:
             if self.randomize_choice_options:
                 row = randomize_choice_row(row, seed=self.seed, cursor=position)
             picked.append(row)
-        self.cursor += count
+            self.cursor = position + 1
         return picked
 
     def source_counts(self, start: int, count: int) -> dict[str, int]:
-        return dict(
-            Counter(
-                self.schedule[position % len(self.schedule)]
-                for position in range(start, start + count)
-            )
-        )
+        return dict(Counter(
+            self.schedule[position % len(self.schedule)]
+            for position in self.positions(start, count)
+        ))
