@@ -193,6 +193,39 @@ wait for jobs. Do not bypass a busy queue because the device briefly appears
 idle. Read-only analysis, formatting, and tests that do not execute a model on
 the GPU may run directly.
 
+## Optimizer Facts (Read Before Reasoning About Step Sizes)
+
+Muon and Adam(W) are both invariant to the scale of a parameter's total
+gradient. This has been re-derived and then corrected in many sessions
+(NOTES 2026-09-22, 2026-10-14, 2026-10-21), so take it as settled:
+
+- A loss term's absolute size does not decide how far it moves the weights.
+  That includes its coefficient, a warmup ramp, a "tiny" critic estimate,
+  and a small gradient norm.
+- What decides it is the term's **share** of each parameter's gradient,
+  relative to the other terms on that parameter, and its **consistency**
+  across steps.
+  - Zero-mean noise random-walks the weights, roughly lr·√t.
+  - A term that dominates a parameter's gradient, or whose error persists
+    across steps, moves the weights at the full coherent rate, roughly
+    lr·t, however small its norm.
+- So never explain a failure, or propose a fix, in terms of "small signal,
+  so small steps". The same goes for "make the step proportional to the
+  signal": switching that term to SGD, shrinking its coefficient, or
+  gating it on.
+  - Under SGD the outcome depends on an arbitrary loss scale.
+  - A persistent bias accumulates linearly under any optimizer.
+- The fix belongs in the estimator:
+  - remove errors that are shared across samples or persist across steps
+    (e.g., a slowly fitted critic used as a direct gradient);
+  - combine estimators of one quantity by their variances, not with
+    equal coefficients.
+- Diagnose with:
+  - per-group gradient shares (the exact-split telemetry);
+  - Adam's |m̂|/√v̂;
+  - Muon displacement against the coherent bound lr·t·√(min dim) and the
+    random-walk bound.
+
 ## Research Workflow
 
 1. State the hypothesis, verifier, success criterion, and likely failure modes.

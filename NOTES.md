@@ -12052,3 +12052,6257 @@ v9 failure again.**
     - lambda-0 credit, i.e. Q(s,a)-V(s) from the shifted critic, where the
       signal outweighs the term;
     - eta or a surprisal cap, as partial patches.
+
+## REPPO-style Q critic for DG: A = Q, trust region, collapse (2026-10-11)
+
+- **Hypothesis.** A state-action critic Q(b_t, x_{t+1}) trained on GVE
+  targets (REPPO) gives DG a per-token advantage with less noise than V(s)
+  baselines. We accept bias in exchange for lower variance.
+  - Advantage: A_t = Q_t at every token, with no baseline.
+  - Gate: the DG gate.
+- **Design.**
+  - Critic: a standalone Q critic with a relu² MLP head over
+    (b_t, embedding of x_{t+1}).
+  - Targets: G_t = r_t + valid·[(1-lambda)Q_{t+1} + lambda·G_{t+1}].
+  - Code: `postraining/vapo/reppo.py`.
+  - Departures from REPPO:
+    - no soft Q;
+    - the entropy term lives only in the actor;
+    - the temperature has its own Adam.
+  - The DG paper analyses b = 0 with non-negative advantages, so A = Q is
+    within its regime and not an unusual choice.
+- **12815, dueling Q - V** (`kda8_dg_memory_qhead_lamdefault_rewind_20261011`).
+  - Bench rose from 0.009 to 0.054. The gain sits in copy-from-prompt
+    modules: comparison__closest 0.33, kth_biggest 0.22, gcd 0.25.
+  - Think spans were word salad by step 925.
+  - The bench gain is answer guessing, not reasoning. The collapse belongs to
+    the dueling Q - V arm, not to A = Q.
+- **Sampling diagnostics 12819-12821** (`samplingdiag_*_20261011`).
+  - Main without Q head, worktree without Q head and worktree with Q head
+    are identical: reward 0.017871, 387,099 think tokens.
+  - The Q head does not perturb sampling. These runs differ from r2's step 1
+    (0.020801, 383,747) for an unidentified reason.
+- **12877** (`kda8_dg_memory_aq_reppo_20261011`): aborted and confounded.
+  - The entropy temperature started at 0.01. Against Q ≈ 0.01 that is about
+    100 times REPPO's ratio (0.01 against MuJoCo Q ≈ 100). Its trunk
+    gradient was 0.0915, against 0.0019 for the policy term, a factor of
+    47.
+  - systemd-oomd then killed mlqd at above 90% RAM and swap; 142 idle MCP
+    servers were holding about 16 GB of swap. The run is not evidence
+    either way.
+  - Fix: `--entropy-temperature-init` is now required whenever
+    `--entropy-target` is set, and the default is off.
+- **KL trust region.**
+  - Each step backtracks (lerp toward the pre-step parameters, fraction
+    sqrt(bound/kl)) until the post-step token KL is within
+    `--actor-kl-bound`.
+  - The first version measured drift against the rollout's behaviour
+    log-probs. The diagnostic replay and the training replay differ by a
+    KL of 1.2-1.7e-4 before any step (`trust/behavior_floor_kl`), which is
+    close to the 2e-4 bound. The constraint was therefore mostly measuring
+    path mismatch.
+  - Fixed: drift is now measured against a pre-step replay on the same path
+    (`kl/post_update_token_pre_step`). The schema suffix is
+    `+post_step_token_kl_to_pre_step_replay_backtrack/v2`.
+  - The cause of the replay-path floor has not been investigated.
+- **12892** (`kda8_dg_memory_aq_reppo_20261011_r2`): collapsed.
+  - Setup: DG, memory mode, Q critic (hidden 1024) started fresh from the
+    r2 critic-warmup actor, entropy target 1.5 with temperature 1e-6, and
+    KL bound 2e-4. 950 steps.
+
+  | Step | Entropy | A mean ± std | MC EV | Step fraction | Reward | Think format | Think tokens | Ended | Bench |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 1 | 1.84 | 0.0068 ± 0.0049 | 0.002 | 1.00 | 0.018 | 0.73 | 403 | 0.97 | 0.009 |
+  | 100 | 3.96 | 0.0229 ± 0.0036 | 0.003 | 0.74 | 0.038 | 0.75 | 255 | 0.96 | 0.017 |
+  | 200 | 4.32 | 0.0211 ± 0.0038 | 0.005 | 0.75 | 0.036 | 0.74 | 161 | 0.96 | 0.022 |
+  | 300 | 4.58 | 0.0070 ± 0.0229 | 0.110 | 0.54 | 0.012 | 0.20 | 97 | 0.99 | 0.009 |
+  | 400 | 2.77 | 0.0042 ± 0.0061 | 0.020 | 1.00 | 0.003 | 0.18 | 38 | 0.99 | 0.002 |
+  | 600 | 2.23 | 0.0003 ± 0.0019 | 0.000 | 1.00 | 0.002 | 0.04 | 17 | 0.98 | 0.000 |
+  | 800 | 1.66 | 0.0012 ± 0.0009 | 0.002 | 1.00 | 0.002 | 0.02 | 26 | 0.93 | 0.000 |
+  | 950 | 1.45 | 0.0003 ± 0.0005 | 0.002 | 1.00 | 0.001 | 0.002 | 164 | 0.86 | 0.000 |
+
+  - The early rise in reward and bench (steps 100-200) came with think
+    spans shrinking from 403 to 161 tokens and entropy more than doubling.
+  - Around steps 290-330, MC explained variance briefly reached 0.07-0.11
+    (online 0.29-0.43) while A's std jumped about sixfold. Format collapsed
+    in the same window.
+  - Entropy later fell back to the 1.5 target as repetitive loops ("SoC SoC
+    ActuallyC strictC inferC infer…"). Bench and AIME were 0 from step 600
+    on. The zero-reward guard froze the actor 210 times.
+  - The trust region cut 22-50% of each step during the rise, but against
+    a measurement floor rather than the step (see below).
+- **Forensics** (from the run's logged sums, rollout samples and per-source
+  metrics; a subagent did an independent pass and agreed). Everything below
+  is measured unless marked as inference.
+  - **The reward is mostly multiple-choice guessing.**
+    - science_mc scores 0.15-0.33, against a 25% chance rate with
+      randomized options. Even its step-0 "correct" traces are word salad
+      followed by a letter.
+    - Its share of all successes was 43% (steps 0-50), 52% (50-150), 59%
+      (150-250), 82% (250-350) and 96% after step 500.
+    - The phase-1 bench gain is in guessable modules: comparison__pair
+      (modal-guess baseline 0.375), place_value, gcd and round_number.
+    - Little outcome signal for reasoning exists in this mixture for this
+      policy.
+  - **The critic learned a mean and little else.**
+    - MC explained variance was 0.002-0.005 through step 250, and the TD(0)
+      calibration slope was 0.50-0.55 throughout.
+    - Q/MC was 1.35-1.76 over steps 51-250: GVE bootstrapping from Q's own
+      values, with no discrimination, held Q above the true return.
+  - **A = Q was about 99.9% a common positive offset.**
+    - Every token had A > 0 from step 19 to step 210, so DG's
+      negative-advantage branch never acted.
+    - Successful rows had mean A only about 8% above failed rows (step 100:
+      0.0248 vs 0.0229). That gap is smaller than the spread of A within
+      failed rows (std 0.0035), and success rows are 1-2% of tokens.
+  - **The constant has no expected first-order push, but DG turns it into an
+    entropy gradient.**
+    - With sigmoid(A l) ≈ 1/2 + A l/4 and E[l ∇log pi] = ∇H, the expected
+      update carries (E[A²]/4η)·∇H + (β/2)·∇H, where β = cov(A, l)/Var(l)
+      over failed tokens.
+    - The first coefficient was 1-2e-4 over steps 25-120, about 1000 times
+      the explicit entropy temperature (2e-7 to 4e-8). Entropy doubled in
+      the same window, mostly between steps 75 and 125.
+    - Across 10-step windows the combined coefficient correlates r = 0.35
+      with the entropy change, and the E[A²] term alone r = 0.38 over
+      25-step windows; the β term alone r ≈ 0.08.
+    - Entropy per pool moves ±0.12 nats per step even on frozen steps, so
+      this is supporting evidence, not proof.
+  - **Scale-invariant optimizers moved the policy regardless of signal.**
+    Under Muon/Adam, mean A fell about 20x (0.022 to 0.001) while the
+    unbounded step KL stayed at 1-4e-4. A gradient that is mostly zero-mean
+    sampling noise still takes full-size steps.
+  - **Format collapse (steps 225-350) came when the critic first
+    discriminated, and what it discriminated was MC.**
+    - Online EV rose to 0.17-0.46 and MC EV to 0.11. A's std grew 5x, and
+      the success-minus-failed gap grew to 0.02-0.08, with 82% of
+      successes from science_mc.
+    - Think format collapsed in the non-MC sources first: deepmind 0.73 to
+      0.26, ultradata_math 0.75 to 0.18, dapo 0.85 to 0.19, while
+      science_mc held at 0.6-0.8.
+    - Failing math and code traces at steps 275-300 contain repeated
+      `</think>`/`<answer>` tokens, "option"/"correct"/"incorrect" and bare
+      letters.
+    - Inference (Q per token is not logged): with no baseline, every token
+      in high-Q MC rows is reinforced, and the MC answer pattern spreads
+      through shared parameters to every source. Parsing then fails, reward
+      goes to zero, the guard freezes the actor 210 times, and the
+      remaining updates from rare MC letter hits pull the policy into the
+      final "C"/"D" loops.
+    - Teacher-forced val_bpb improved slightly (2.337 to 2.313), so the
+      damage is to on-policy generation.
+  - **The trust region was not measuring the step.**
+    - At step 39 the step fraction was 0.217, so a quadratic KL predicts
+      5e-5, but it measured 1.53e-4, equal to the floor.
+    - KL(behavior, pre-step), KL(pre-step, post-step) and KL(behavior,
+      post-step) are all 1.2-1.5e-4. 406 of 414 binding steps used all
+      backtracks, and 96% still ended above 2e-4.
+    - Both replays use the same path, and the backtrack covers every
+      parameter the actor optimizers own.
+    - Inference, untested: each replay carries independent numerical noise
+      (about 0.017 nats per token in bf16). Until a repeat-replay check
+      runs on the GPU, the bound only scaled steps 100-375 by 0.5-0.7 for
+      a spurious reason.
+  - **The memory carry grew monotonically.** Its input perturbation went
+    from 4e-8 to 0.11 (step 200), 0.31 (400) and 0.48 (950). This is
+    confounded with everything else trending, so no attribution.
+- **What the logs cannot answer:**
+  - Q by token identity or position;
+  - advantages by source;
+  - whether cov(A, l) is within-state or between-state;
+  - the causal role of the carry;
+  - the cause of the KL floor.
+- **Implications.**
+  - What broke is the sampled form of A = Q under DG.
+  - REPPO's actor gradient is ∇_a Q under the policy's own action
+    distribution, which is invariant to Q's mean by construction.
+  - The discrete analogue is the expected gradient
+    ∇_θ Σ_a pi(a|s) Q(s,a). It needs no baseline, is invariant to Q's mean
+    (Σ ∇pi = 0) and has no action-sampling variance.
+  - The Q head's first layer separates into belief and action parts, so
+    scoring a top-k candidate set per position is cheap.
+  - DG's gate is not shift-invariant, so DG combined with an unbaselined Q
+    stays mean-sensitive in either form.
+  - Separately, a mixture whose learnable reward is chance-level MC teaches
+    any critic "MC ⇒ reward", whatever the estimator.
+
+## Token Q with an exact policy-mean baseline; the bf16 trust-region floor (2026-10-12)
+
+- **What changed from 12892's A = Q.**
+  - The advantage is A_t = Q(s_t, a_t) − Σ_a π(a|s_t) Q(s_t, a), summed
+    exactly over all 50304 tokens. It is invariant to Q's mean by
+    construction, which removes the common positive offset that DG turned
+    into an entropy gradient. There is no V baseline and no top-k.
+  - Raw units, η = 1. The DG gate is unchanged.
+- **Q head and readout.**
+  - Q(s_t, a) = c(f_t) + u(f_t)·x(a), with x(a) the critic trunk's token
+    embedding. The Q is learned through the critic backbone.
+  - f_t = relu²(W_b b_t + W_h rms_norm(h_t)). b_t is the critic belief; h_t
+    is the actor belief that sampled a_t, read only in carry modes.
+  - c and u are zero-initialised. The first gradient of u is
+    hidden ⊗ x(a_t), so the head has no saddle at zero.
+  - The full-vocabulary sum is one GEMM, u @ Xᵀ, inside the actor's fused
+    log-prob/entropy autograd Function. The taken entry is gathered from the
+    same GEMM output, so TF32 rounding cancels as π concentrates on a_t.
+  - The critic and actor passes interleave per shard, so u lives for only
+    one shard.
+  - Schemas: `standalone_token_bilinear_q_input_latent_actor_belief_gve_mse/v2`
+    and `+q_minus_exact_policy_mean_q_raw_units/v2`.
+- **GPU checks** (`postraining/tests/test_q_critic_cuda.py`, jobs
+  12934/12943/12952; KDA8 SFT checkpoint, memory carry, randomised Q
+  readouts).
+  - The fused TF32 advantage matches float64 to 3.1e-4 RMS, against an
+    advantage RMS of about 24.
+  - At the production budget of 24,576 slots, the Q readout peaks at
+    6.98 GiB against 2.40 GiB for the entropy readout (+4.6 GiB transient),
+    and takes 42 ms against 25 ms.
+  - 12892 peaked at 22.6 GiB, so about 27 GiB is expected (inference, not
+    yet measured in a run).
+- **The trust region was measuring bf16 rounding, not the step.**
+  - Measured on GPU (12947-12949, 12951), on the same model and a real
+    Muon step at 12892's rates (lr 4.83e-5 for Muon, 2e-5 for AdamW).
+  - Replays are bit-deterministic: a repeat read gives KL exactly 0 in
+    bf16, TF32 and fp32.
+  - The step-fraction curve, with a self-consistent pre-step reference in
+    each precision:
+
+    | Step fraction | bf16 KL | TF32 KL | fp32 KL |
+    |---|---|---|---|
+    | 1 | 4.5e-4 | 6.3e-5 | 5.7e-5 |
+    | 1/2 | 3.6e-4 | 1.9e-5 | 1.4e-5 |
+    | 1/4 | 3.3e-4 | 6.8e-6 | 3.6e-6 |
+    | 1/16 | 3.0e-4 | 3.0e-6 | 3.6e-7 |
+
+  - Per-parameter bisection: moving any single actor tensor by 1/16 of its
+    step, with every other parameter held, gives a bf16 KL of 2.0-2.2e-4.
+    This held for all 137 tensors, from norm gains to memory gates.
+  - So any change that flips a bf16 rounding cascades through depth and the
+    recurrence to a fixed KL of about 2-3e-4. The bf16 policy itself sits
+    2.8e-4 from its fp32 version.
+  - The 2026-10-11 entry guessed that each replay carries independent
+    noise. That guess was wrong: replays are deterministic, and the floor
+    is re-rolled by every parameter change. The conclusion stands. In
+    12892 every binding cut came from the floor (1.2-1.5e-4 there), not from
+    the step.
+  - At these rates the real step KL is about 6e-5, below the 2e-4 bound. A
+    TF32 trust region would rarely have bound in 12892.
+- **Fix: an fp32 self-referenced trust region** (`+post_step_token_kl_fp32_shard_subset_backtrack/v4`).
+  - `trust_region_token_logprobs` reads emitted-token log-probs on every
+    4th planned shard with autocast off. It uses an eager replay, the
+    compiled no-grad diagnostic readout and the trainer's TF32 matmuls.
+  - The trainer reads it once before the actor step as the reference, then
+    after the step and after each backtrack.
+  - On GPU, a zero step reads exactly 0. The half step reads 0.261 of the
+    full step and the quarter step 0.081, against 0.25 and 0.0625 expected.
+    The TF32 floor of a few 1e-6 shows at the quarter step.
+  - Cost: 10 ms per stride-4 read on 11.8k tokens, +0.62 GiB over live
+    memory. 12892-scale pools should add well under a second per step
+    (inference; `perf/trust_region_seconds` measures it).
+  - The reference no longer depends on the update's fused behaviour
+    statistics, so the TPO refusal and the single-minibatch-per-pool
+    restriction are gone.
+  - The periodic `measure_post_update_policy_drift` diagnostic still reads
+    in bf16, so its KL to the behaviour policy includes the 2-3e-4 floor.
+  - The critic now steps and frees its gradients before the reference
+    read, so the read runs over the actor's gradients alone.
+  - Caveats from the red-team review:
+    - Bounds set under v1-v3 are not comparable. 2e-4 now caps a real step
+      KL that measured 6e-5 to 1e-4, so it should bind rarely.
+    - The stride always includes shard 0, the longest trajectories.
+    - On MoE backbones, fp32 activations take the reference expert path,
+      whose cost is unmeasured.
+    - The bound constrains the fp32 policy. The deployed bf16 policy still
+      re-rolls its rounding floor every step.
+- **12955** (`kda8_dg_memory_tokenq_centered_20261012`): the token Q
+  readout was mis-scaled, and the run was cancelled at actor step 5.
+  - Critic schema v2 multiplied u by the raw input latents, which have RMS
+    13.5 and a row norm of about 309 on KDA8, with no output multiplier.
+  - Adam moves every element of a zero-init readout by about its rate, with
+    the gradient's sign. For a bilinear readout those signs agree across all
+    dim × hidden elements. So the first step moved Q by
+    rate·‖f‖₁·‖x‖₁, against rate·‖f‖₁ for the state term: about 5000 times
+    more.
+  - Warmup step 2: value mean 0 → 1.36 on rewards near 0.02, critic grad
+    norm 0.55 → 325, EV −158.
+  - It recovered only to EV −1.5 to −5 by step 50. 12892's scalar head sat
+    at about +0.003.
+  - Actor steps 1-5 had an advantage std of 0.07-0.08, about 15 times
+    12892's, and MC EV of −1.7 to −5.2.
+  - What it showed about the trust region: step KL 6e-6 to 1.1e-5 in fp32,
+    never binding at 2e-4; 136k measured tokens (stride 4); 0.6-2.3 s per
+    step against 10-22 s step times, plus 7 s of compile on step 1.
+  - Fix, critic schema v3:
+    - x(a) is the input latent at unit RMS;
+    - u carries a 1/dim readout multiplier.
+    - Both terms' first steps are now about rate·‖f‖₁. A CPU test checks
+      this on 50×-scaled embeddings, and it fails under v2.
+  - The run directory carries `RETIRED.md`. The rerun is job 12960
+    (`kda8_dg_memory_tokenq_centered_20261012_r2`), with 12892's arguments
+    plus `--snapshot-every 50`.
+- **12960 → bounded sessions, interim** (`kda8_dg_memory_tokenq_centered_20261012_r2`).
+  - The run alternates 30-minute `--time-limit` sessions with CASMI on the
+    GPU and resumes from its own checkpoint (12973, 12979, 12983, …).
+    Session 1 reached actor step 137; its checkpoint is at step 130.
+  - Warmup under critic schema v3: critic grad norm 0.04-0.6, value mean
+    0.00-0.04, EV +0.04 to +0.06 by step 50. Compare 12892 at +0.003 and
+    12955 at −1.5 to −5.
+  - Actor steps 1-137 against 12892 at the same steps:
+
+    | Metric | Step 1 | Step 60 | Step 100 | Step 137 | 12892 at step 137 |
+    |---|---|---|---|---|---|
+    | Policy entropy | 1.84 | 1.73 | 1.55 | 1.47 | 4.59 |
+    | Think format | 0.73 | 0.87 | 0.83 | 0.80 | 0.68 |
+    | Ended | 0.97 | 0.98 | 1.00 | 0.99 | 0.90 |
+
+  - Interpretation: removing Q's mean removed the entropy blow-up the
+    2026-10-11 forensics attributed to DG on an offset. This is consistent
+    with that account, not proof of it.
+  - Reward (0.02-0.05) and bench (0.026 against 0.020 at step 120) are not
+    distinguishable from 12892 at this length.
+  - Other telemetry:
+    - The advantage is centred: mean about 0, std 0.0014-0.0026.
+    - MC EV is 0.02-0.10.
+    - The fp32 step KL is 1-3e-5, so the bound has not bound.
+    - The trust region costs 0.2-0.8 s per step.
+- **Session 2 (12979)** resumed exactly: it purged 14 stale rows past the
+  step-130 checkpoint and reached step 280 (checkpoint 272).
+  - Thinking collapsed faster than in 12892: 403 → 59 tokens by step 200,
+    against 161. By step 280: 47 against 64.
+  - Think format fell to 0.60-0.70, mostly in science_mc and knowledge; math
+    held 0.70-0.90.
+  - Entropy fell to 1.03-1.15, below the 1.5 target. The entropy
+    temperature then climbed from 3e-7 to 1e-5.
+  - Reward and bench stayed flat (bench about 0.026).
+  - The fence-token advantage was positive (1-2e-4 per token against
+    roughly 1e-6 to 1e-5 noise) through step 160. MC answer letters had the
+    largest advantage, 0.9-1.1e-3 at steps 80-160.
+  - The trust region cut 33 of 280 steps, at steps 167-182 and 252-273,
+    down to 0.48 of the step. The largest unbounded KL was 8.8e-4. Those were
+    real policy jumps, coinciding with the entropy and format drops.
+  - The run is stopped (`STOPPED.md`).
+- **Ablation 12986** (`kda8_dg_memory_tokenq_centered_noent_notr_20261012`).
+  It is the same run, fresh from the same `--actor-init`, seed and warmup,
+  without `--entropy-target`/`--entropy-temperature-init` and without
+  `--actor-kl-bound`. The comparison against the run above isolates the
+  effect of those two together.
+  - Its first session (steps 1–81) logged no `entropy/policy_mean`. The
+    metric had been a side output of the entropy term, so removing the term
+    removed the metric too. The token Q's fused readout already computed the
+    exact entropy and discarded it. The metric is now reported on every
+    Q-critic run, whether or not an entropy term is active, from session 2
+    on. The objective is unchanged.
+- **Resume with `--value-warmup-rewind`.**
+  - Resume was impossible: the config required `--actor-init`, which
+    excludes `--resume`, while resume binds the flag exactly. 12892 and its
+    reruns could never have resumed.
+  - The checkpoint already carries the rewind cursor in
+    `actor_init_provenance`. The config now accepts the flag under
+    `--resume`, and the trainer fails closed if a pending rewind finds no
+    cursor.
+  - This matters for running 12960 in bounded `--time-limit` sessions,
+    alternating with the CASMI work on the shared GPU.
+- **Not changed:** the reward. science_mc remains chance-guessable, and the
+  2026-10-11 forensics found it dominates the learnable signal. A centred A
+  removes the mean offset, not this confound.
+
+### Why length and within-group reward std collapse (r2 and ablation 12986, steps 0–280)
+
+The ablation (no entropy term, no trust region) tracks r2 almost exactly
+on every series below. The two removed mechanisms do not drive this
+dynamic.
+
+- **Length falls in two phases.** Mean actions per trajectory: 505 → 165 by
+  step 110, then → 95 by step 260. Mean thinking tokens: 383 → 113 → 57.
+  - Up to step 110, reward rises (0.025 → 0.044). knowledge and science_mc
+    format improves, and ended_fraction goes from 0.98 to 0.998. Early long
+    traces are where degeneration and repeated fences occur. Sampled thinking
+    is mostly incoherent even when the MC letter is right. That points to
+    shortening as genuinely reward-favoured here: removing tokens removes
+    failure risk, and the thinking carries little causal value. This is an
+    inference. The within-prompt length–reward covariance was not logged.
+  - After step 110, length keeps falling while reward falls. science_mc
+    thinking reaches about 30 tokens and knowledge about 28, under
+    `--think-min-tokens 33`. A short think is a format failure scored 0.
+    science_mc think_format_fraction goes 0.95 → 0.34. Its gate-zeroed
+    correct fraction goes 0.005 → 0.16. Counting those rows, MC accuracy is
+    about 0.23, the same as at its peak: the floor, not lost competence,
+    removes the reward.
+- **Math converges on answer guesses.** The saved bench attempts answer "0"
+  in 0/16 at step 0, 4/16 at step 160 and 14/16 at step 240. "0" is the
+  ground truth for 5.2% of ultradata_math and 3.1% of deepmind_easy.
+  ultradata_math reward rose 0.014 → about 0.055, close to the "0" base
+  rate. Short think, then `\boxed{0}`, is one mode. It keeps the
+  shortening pressure alive from the math sources, which are 75% of
+  trajectories, after the floor starts costing MC.
+- **Group std falls for three reasons.**
+  - Mean reward falls: the floor eats MC.
+  - Entropy falls: 1.9 → 1.3.
+  - Reward becomes fixed by the prompt instead of by the sample. Take the
+    mean within-group std over its binomial(16, p) expectation at the same
+    p, where 1 means every prompt has the same p. It drops from 0.66 to 0.18
+    on ultradata_math, 0.78 to 0.15 on dapo and 0.76 to 0.22 on
+    deepmind_easy. MC stays at about 0.55 because letters stay random.
+  - The third is the signature of the guess mode: a prompt whose answer is
+    "0" scores 16/16, others 0/16. It also explains much of the EV decline.
+    The remaining variance is between prompts and is not predictable from
+    the prompt.
+- **DG is inert.** The gate is sigmoid(A·surprisal/η). With raw-unit token
+  advantages of RMS about 1.5e-3 and η = 1, it stays at 0.500 ± 0.001
+  throughout. The update is plain token policy gradient at half weight. DG
+  neither drives nor damps any of this.
+- **Critic.**
+  - The `</think>` fence token's mean advantage is positive through step 180
+    in both runs (1e-4 to 4e-4, against a token RMS of about 1.5e-3). It
+    then turns negative once thinking crosses the floor. That is the direct
+    length lever: a small positive A on the closing token raises the
+    per-token stop hazard, and length responds roughly as 1/hazard.
+  - The logs cannot separate a correct causal judgement from a correlation
+    with short-trace sources.
+  - The state-value TD(0) calibration slope is about 0.5 from the start:
+    one-step value differences are noise-dominated. The critic cannot
+    represent the position-dependent cliff (close before 33 → 0) sharply,
+    and its corrective negative fence advantage arrived around step 180,
+    after MC had crossed.
+- **Added telemetry.** Per-group `length_reward_covariance` is the
+  within-prompt covariance of reward and action count, averaged over
+  groups, overall and per source. Its sign is the direction the reward
+  itself pulls length under a group-mean baseline, so it separates a
+  reward-driven trend from a critic- or optimizer-driven one. Per-source
+  `think_gate_zeroed_correct_fraction` is now also in TensorBoard. Both
+  apply from the session after 12993.
+
+### The token-Q advantage shows no outcome separation (same day, follow-up)
+
+- **Measurement.** The trainer's own group sums give the mean token
+  advantage on failed rows (`failed_advantage_sum / failed_count`) and,
+  from the totals, on successful rows. Over steps 0–300 of the ablation,
+  in units of the token advantage std, failed rows sit at ±0.0007 and
+  successful rows at −0.005 to +0.019. On average, correct rows' tokens
+  get no more credit than wrong rows'. Equal means do not prove the
+  absence of outcome information: causal positive and negative tokens can
+  cancel within a row. Ranking Q against outcomes on identical
+  prompts/prefixes would settle it. Outcome-advantage DG would separate them by
+  (1 − p) − (−p) = 1 in reward units. At p = 0.03 that is about 6 standard
+  deviations of R − b.
+- **Why (structural, plus a conditional argument).**
+  - Structurally, the verifier's R enters the actor only through Q's
+    fitting. The actor coefficient is the detached u·x(a_t) minus its
+    policy mean (train_latent_vapo.py around 3495–3505,
+    nano_backbone.py 140–164); no term carries the realized R.
+  - If Q were Bellman-consistent, Q(s, a) = r + V(s'), a row's summed
+    advantage would telescope to Q(s_T, a_T) − V(s_0). That is the
+    critic's foresight, not the verifier's hindsight. The fitted head is
+    not constrained to be consistent, so this is the limit the estimator
+    aims at, not an identity. Exactly, sum_t A_t = R − V(s_0) + sum_t δ_t,
+    with Bellman residuals δ_t = Q_t − r_t − V(s_{t+1}). The terminal
+    residual Q_T − R is the part a critic that cannot verify answers
+    leaves open.
+  - The DG paper's own control experiments use a Retrace Q critic for U.
+    A critic-based U is within DG; this critic's quality is the problem.
+  - The critic cannot verify answers (MC EV 0.01–0.05), so little
+    correctness signal can reach the actor this way. What does reach it is what
+  the critic can predict from structure: closing the think, answer format,
+  the "0" prior.
+- **The gate.**
+  - DG is inert as a consequence: delight = A·surprisal, with A of about
+    1e-3, and A has no outcome content to gate on. Changing η would gate
+    noise, not breakthroughs, so the η suggestion above is withdrawn.
+  - In the reference DG (egg), U = R − group mean, broadcast. A success
+    token gets U ≈ 1 − p and gate σ((1 − p)·ℓ), for example 0.94 at
+    ℓ = 3. A 0/16 group gives no gradient at all.
+  - Here, every token of the 97% zero-reward rows receives
+    critic-structural updates.
+- **Not explained by this.** Think length fell from about 330 to about 90
+  by step 120 in the earlier GAE-advantage DG runs too (10-10 r2, 10-11
+  qhead). There the outcome reached the actor, and the gate was mildly
+  active (g+ 0.505–0.52). Those runs ran away in entropy (surprisal
+  → 7–10), while this one sharpens (surprisal 1.9 → 0.64 by step 300).
+  The advantage estimator decides the entropy direction. The shortening
+  is common to every estimator tried on this mixture.
+
+## Conditional binary DG with a post-action Q collapses into the tail (2026-10-14)
+
+- **Run.** Job 13471 (`dg_postaction_binary_rb_prior002_nocode_fresh_20261013`).
+  - The contract is in `docs/dg_postaction_binary_q_20261013.md`. Actor loss
+    is −Q·σ(s)·log π(a_t), with η = 1 and Q ≥ 0 on every token. There is no
+    baseline.
+  - It was cancelled at actor step 67 of 950 (`STOPPED.md`).
+- **Measured.**
+
+  | Step | Surprisal | Ended | Think format | Q mean | MC EV |
+  |---|---|---|---|---|---|
+  | 1 | 1.59 | 0.98 | 0.82 | 0.0146 | 0.004 |
+  | 20 | 2.30 | 0.97 | 0.85 | 0.0164 | 0.004 |
+  | 40 | 3.78 | 0.85 | 0.77 | 0.0137 | 0.006 |
+  | 67 | 6.00 | 0.38 | 0.31 | 0.0058 | 0.007 |
+
+  - Training rollouts sample at top_p 1.0 and collapsed.
+  - The bench and AIME panels sample at top_p 0.7 and did not. Bench ended
+    fraction was 0.75/0.78/0.78/0.77 and format 0.73/0.75/0.75/0.74 at steps
+    0/20/40/60. Accuracy stayed flat at 0.008–0.013. val_bpb improved from
+    2.337 to 2.319.
+  - The damage is mass moved into the low-probability tail. The head of the
+    distribution is intact.
+  - Step-50 training traces are coherent early and word salad late
+    ("samefrac{", "aacal 1967 times everyial").
+  - Mean emitted length rose from 427 to 1427 tokens, against a trained
+    context of 1024. Some of the rise in token-weighted surprisal is
+    therefore composition. How much is unresolved: see the decomposition
+    correction below.
+- **Mechanism (derivation, plus a simulation).**
+  - At η = 1, σ(s) = 1/(1+π). The expected per-position actor gradient is
+    therefore ∇ Σ_a Q_a log(1+π_a).
+  - When Q is nearly action-independent, this objective is maximised by the
+    uniform distribution. It is a rare-token bonus with coefficient ≈ mean Q,
+    and every token of every row receives it.
+  - Token b gains mass whenever Q_b/(1+π_b) exceeds its policy-weighted
+    mean. A rare token therefore beats the mode once Q_rare > Q_max/(1+π_max).
+  - Whether this also holds for an exact Q depends on the true ratio
+    Q(rare token)/Q(mode) at the positions where rare tokens are sampled.
+    That ratio is unmeasured. If one rare token usually derails this
+    model, as the collapsed traces suggest, the true ratio is low. The exact-Q
+    optimum then excludes those tokens, and the push comes from critic
+    flatness rather than from the estimator.
+  - The simulation (`runs/dg_postaction_binary_collapse_analysis_20261014/sim_estimators.py`)
+    uses one softmax state, Adam, garbage Q set to 0.75 of plausible-token Q,
+    and the same start for every estimator.
+    - Conditioned binary DG raises entropy from 2.29 to 2.68 with an exact
+      critic, and to 2.70 with a flat critic. The exact-critic result holds
+      only for the assumed 0.75 ratio, which sits above the support threshold.
+    - Gate-free sampled direct Q (−Q·log π(a_t)) and the all-action form
+      (−Σ_a π_a·sg(Q_a)) sharpen with an exact critic and stay put with a flat
+      one. The all-action form is exactly stationary.
+  - Optimizers: Muon at 4.83e-5 for the trunk matrices, AdamW at 2e-5 for the
+    rest. Both turn a small, sign-consistent bias into full-size steps, while
+    the zero-mean signal averages out. grad/trunk was only 0.002–0.006.
+  - This is the 2026-09-22 "sign-blind rare-token push" again, now on every
+    token of the 98% zero-reward rows instead of only on success rows.
+- **The critic had no outcome information to oppose the push.**
+  - MC EV was 0.001–0.02 throughout. A per-source constant predictor would
+    have reached EV 0.01–0.14 on the same pools (trajectory-mean
+    approximation).
+  - Per-source Q differed by about 12% (science_mc 0.0208, dapo 0.0185),
+    while realised reward was about 0.2 against 0.
+  - Inference: the critic is limited by its few positives and by noise. Each
+    step has 10–40 positive trajectories out of 1024. Under token-mean BCE,
+    each trajectory contributes thousands of perfectly correlated labels, and
+    deepmind_easy makes up 59% of tokens. Learning rate also contributes: the
+    head is on AdamW at 2e-5.
+  - Capacity is not the limit: the prompt identifies the source.
+- **Confounds not excluded.**
+  - Memory carry grew from 0 to 0.033 of input RMS. Eval also uses the carry
+    and stayed stable, so the carry alone is not sufficient.
+  - The last resume (about step 58) ran the corrected softcap readout without
+    resetting the optimizer. This came after surprisal had passed 3.
+- **Implications for direct Q.**
+  - Under a flat critic, the DG gate, not the absence of a baseline, makes nonnegative Q unstable.
+    Without the gate, direct-Q credit is invariant in expectation to any
+    state-dependent offset, because Σ_a ∇π_a = 0.
+  - The all-action form computes that expectation exactly: it subtracts
+    nothing and has no action-sampling noise.
+  - Normalising optimizers can still turn a near-zero gradient into
+    full-size noise steps. A null critic must therefore stop the actor
+    explicitly, not by gradient magnitude.
+  - Critic EV stayed at or below 0.02 in 2026-10-11, 2026-10-12 and this
+    run. That a critic without the answer cannot beat its actor twin is not
+    established: it sees the sampled answer, and checking an answer can be
+    easier than producing one.
+  - Conditioning the critic on the gold answer leaves the ideal Q unchanged.
+    Gold is a function of the displayed prompt: MC options are shuffled before
+    display (`vapo/mixture.py:287`) and code is excluded.
+    - It changes the learned Q, though. At answer tokens Q becomes the
+      verifier, so the actor's answer-span update is effectively SFT on the
+      gold answer, conditioned on its own think.
+    - Any use would need zero actor credit from `</think>` onward. Not
+      implemented or tested.
+
+### Why the post-action critic barely learned (13471, measured from checkpoints)
+
+- **Correction: the trunk did train, at Muon's full rate.**
+  - An earlier version of this note said it barely moved. Median relative
+    drift was 0.067%, but that is small only because pretrained weight norms
+    are large.
+  - The median ‖ΔW‖ is 0.64 of the fully coherent Muon displacement,
+    lr·50·√(min dim), with a maximum of 0.84. A random walk would give about
+    0.14.
+  - Muon is scale-invariant, so small head-mediated gradients still produce
+    full-size steps (red-team, 2026-10-14). The actor did not change during
+    warmup (maximum absolute difference 0).
+  - What remains specific to 13471 is the head.
+- **The readout was limited by its step size, at lr 2e-5.**
+  - |out.weight| averaged 3.3e-4. The AdamW ceiling is lr × steps = 1e-3,
+    so the weights used 33% of it. A pure random walk would give about 14%.
+  - Adam's |m̂|/√v̂ had a median of 0.31 for out.weight and 0.55 for the
+    feature projection. The gradient had a direction, and it was noisy.
+  - The bias moved 2.3e-5 in total. The 0.02 prior was correct, and its
+    gradient kept changing sign.
+- **Arithmetic.**
+  - The relu² features sum to about 750 (isotropic approximation, norm2
+    gains RMS 2.1). Common-mode logit capacity is therefore about
+    lr·Σf ≈ 0.015 per step, which matches the measured drift of the
+    prediction mean during the actor phase.
+  - The discriminative part was far smaller. science_mc and dapo were
+    separated by about 0.12 logits after warmup. The realised reward rates
+    (about 0.2 against under 0.01) need about 3 logits.
+  - At the observed rate that takes on the order of 1,000 steps, against 50
+    warmup steps (inference).
+- **Too few independent labels per step.**
+  - Each label is per trajectory and repeats across hundreds of tokens.
+    Each step has 1024 trajectories from 64 prompts and about 20 positives.
+  - Each prompt is seen once, so per-prompt Q must generalise.
+  - Token-mean BCE gives deepmind_easy 59% of the weight.
+- **Timescales are inverted.** Actor-critic needs the critic to be faster than
+  the actor. Here the actor took full Muon and AdamW steps on a
+  sign-consistent rare-token push, while the critic was step-capped and its
+  head was step-capped. 13471 therefore tested DG with a null critic, not
+  DG with a working one. 2026-09-23 already conditioned DG on critic EV
+  "well above 0.01".
+
+### Cross-run model: gate activity, centering, Q and the two collapse modes (2026-10-14)
+
+Table: `runs/dg_postaction_binary_collapse_analysis_20261014/compare_runs.py`.
+
+- **Correction: the surprisal decomposition is not evidence.** The fit
+  a·(clean token share) + b·(unended-token share) gave R² 0.967 on 13471, with
+  a 1.62 and b 6.73.
+  - Step number alone gives 0.969, so the fit only follows the time trend.
+  - In first differences the slope is 1.70, with R² 0.11, against the 5.11
+    the model predicts. Unscaled gives 3.04 against 5.78, and λa0 2.66
+    against 4.40.
+  - Implied per-step levels suggest clean rows rose by about 0.3–0.6 nats
+    over steps 1–40, before most rows derailed. "Clean rows did not flatten"
+    is withdrawn.
+  - The unended-share estimator itself is valid: unended rows emit exactly
+    2048 tokens, and emitted tokens equal actions.
+  - **Two terminal modes remain distinguishable** by the content of the
+    unended rows:
+    - Salad in 13471, unscaled and λa0.
+    - Low-entropy loops in the centred small-A runs (qtarget_mc, dir1e-6).
+- **Gate activity.** The gate σ(A·s/η) stayed at 0.500 ± 0.002 in every
+  centred run with A std 1e-3 to 8e-3: 12960, 12986, qtarget_mc and dir1e-6.
+  DG there was PG at half weight.
+  - It was mildly active with A std 0.03–0.25: g+ 0.51–0.58 and g− 0.42–0.49
+    in qcredit, unscaled and λa0.
+  - 13471 is the only run with a fully active gate. Q sits outside the gate,
+    so it is σ(s), from 0.68 to 0.93, with A > 0 on 100% of tokens.
+  - 12892 (A = Q inside the gate) also had A > 0 on 100% of tokens over steps
+    25–200, but its gate reached only 0.51–0.52.
+- **The sign-blind push sets the entropy direction.** DG's weight has an
+  always-nonnegative surprisal term: about E[A²]/(4η) for centred A, and
+  Q·σ'(s) for 13471.
+
+  | Run | Push magnitude | Surprisal | Outcome |
+  |---|---|---|---|
+  | Centred, small A (12960/12986/qtarget/dir1e-6) | ~1e-6 to 2e-5 | 1.6 → 0.5–1.1 | Think length 370 → 50, guessing, then loops |
+  | A = Q (12892) | ~1e-4 | 1.8 → 4.5 | Moderate rise, then MC-driven format collapse |
+  | Centred, large A, critic EV < 0 (unscaled, λa0) | ~1e-3 to 2.5e-3 | → 6–7 | Salad by step ~100 |
+  | G_λ − E_π Q, critic EV ≈ 0.06 (qcredit) | ~2e-4 to 2.5e-3 | 2.5 at step 100, → 7 by 300 | Terminating salad |
+  | Q·σ(s) on every token (13471) | ~3e-3 | → 6 by step 67 | Fastest salad |
+
+  - The ordering is consistent with the push magnitudes, but confounded.
+    These are order-of-magnitude estimates, not a fitted law.
+    - For centred A, E[A²] is the advantage noise, and no run has large
+      noisy A without the gate. So the gate's term cannot be separated from
+      an optimizer random walk on noisy credit.
+    - The fastest runs also had broken critics.
+    - 12892 also had an entropy target, a trust region and the code source.
+      12960 and 12986 show ent+TR changed little in the centred case.
+- **qcredit recovered termination, not coherence.** It flattened on ended
+  rows first: surprisal 3.05 over steps 100–150 with ended at 0.98.
+  - It derailed at steps 150–200 (unended share 0.65), then returned to
+    ended 0.96–0.99.
+  - Surprisal stayed at 6.7–7.3 from step 300 on, and the samples at steps
+    400 and 925 are salad that terminates after 70–130 tokens.
+  - Inference: realised-failure credit restored ending, not coherence.
+  - 13471 had no negative credit at all (Q ≥ 0).
+- **qcredit's gains are guessing.** Reward rose to 0.10–0.16 and bench to
+  0.069. The bench gain sits in comparison__closest 0.34,
+  comparison__kth_biggest 0.33, numbers__gcd 0.22 and place_value 0.13,
+  which are the copy-from-prompt modules seen in 12815. Think length
+  fell to about 70 tokens.
+- **Correction to the critic note above.** Fresh, randomly initialized
+  critics did learn fast in the qtarget family: MC targets, an MSE bilinear
+  head and head lr 1e-4 reached warmup EV 0.04–0.05 by step 40–50. 13471
+  (0.002) and 12892 (0.003, bootstrapped GVE targets) are the slow ones.
+  - 13471 differs in several ways at once: a Bernoulli logit head
+    (dp/dlogit = p(1−p) ≈ 0.02 at the base rate), head lr 2e-5 instead of
+    1e-4, an actor-copy trunk and successor conditioning. The data cannot
+    separate them.
+  - Inference: the logit parametrisation combined with the 5× lower lr is the
+    likely cause.
+- **Correction: qcredit is not noise-free centred Q.** Its actor (from the
+  run's source snapshot, `q_lambda_actor_correction`) is
+  A = G_λ − Σ_a π Q(s_t, a).
+  - G_λ mixes realised reward with bootstrapped Q. Actor λ is length-adaptive
+    at α = 0.05: 1 for responses under 20 tokens, 0.95 for medium ones, and a
+    horizon of α·l for long ones.
+  - At λ = 1 this is R − E_π Q(s_t), a learned state-value baseline under
+    Bernoulli outcome noise. Its A std of 0.03–0.1 is 10–30× that of pure
+    centred Q. That variance was never decomposed into outcome, TD and
+    critic parts.
+  - The noise-free form, A = Q − E_π Q with the state term excluded, is what
+    12960, 12986, qtarget_mc and dir1e-6 ran (and λa0, where the correction
+    is zero). Gate inert, no outcome separation, sharpening.
+
+### Red team of the noise-free qmean plan (2026-10-14, analysis only)
+
+- **The DG gate turns zero-mean critic error into a rare-token push.**
+  - Expanding σ(A·s/η) ≈ 1/2 + A·s/(4η), a zero-mean error e still adds
+    E[e²·s]/(4η) ≥ 0. Centering removes the mean term, not this one.
+  - Raising the gate's activity (smaller η) raises this push in proportion.
+    DG nets out positive only when signal is much larger than critic error.
+  - The all-action DG variant is the exact expectation of sampled DG, so it
+    keeps this bias.
+  - Gate-free all-action PG on Q − E_π Q (Mean Actor-Critic) has neither the
+    offset nor this term.
+- **Noise-free means zero variance, not zero bias.** The action-varying
+  critic error passes through centering unchanged, as a persistent bias of
+  the same sign.
+- **Action differences are barely supervised.**
+  - Each state gets one sampled label, so Q(s,a) − Q(s,a′) is learned only by
+    generalising across states.
+  - Label std is about 0.14 at p ≈ 0.02, against token advantages of about
+    1.5e-3.
+  - Branch rollouts from (s, a) against (s, a′) are the only direct ground
+    truth for these differences.
+- **The current head is unscaled.** The main-tree TokenQHead has the
+  unscaled direction readout without the 1/dim multiplier (value_model.py
+  docstring). That is the head of the unscaled and λa0 runs, whose critic
+  EV fell from −0.8 to −107.
+  - The fast-critic evidence (qtarget, about 0.04) used the v3 scaled head.
+  - Measure the first-step change in Q before comparing learning rates.
+- **There is no in-pool leakage.** Q comes from the critic pass before the
+  step, with a single fused minibatch per pool.
+- **The proposed gates measure the wrong thing.**
+  - EV against a per-source constant measures c(s), which cancels from A.
+  - Trajectory AUC rewards answer-reading.
+- **Better gates, on think tokens:**
+  - sign agreement of Â with branch-rollout Q gaps;
+  - a held-out slope of R on Â with prompt fixed effects;
+  - a short exploitation test against a frozen critic.
+- **The study needs a pool with p between 0.2 and 0.8** and no chance-level
+  MC. At p ≈ 0.02, frozen-pool arms cannot resolve token effects of
+  about 1e-3.
+
+### Frozen-policy branch critic study launched (2026-10-14)
+
+User authorized implementation and execution of the revised frozen-policy study.
+The actor stays frozen throughout; no DG gate or actor update is part of this run.
+
+- Full job **13594**, priority 1, max parallel runs 1, 8-hour session ceiling.
+  Frozen source: `.worktrees/frozen-critic-study-20261014/`; source manifest
+  SHA256 `45e88d94d06f16ee9d7ec1086ba0bd5718edb9fd84be959b0d6a8c727b64e529`.
+  Canonical output: `postraining/runs/frozen_critic_branch_study_20261014/`.
+  Exact launch command and queue receipt are in the adjacent `.launch.json`.
+- Policy: the original KDA8 SFT base plus
+  `kda8_pg_reviewed_v2_memory_20261010_r2/critic_warmup_checkpoint.pt` actor
+  (actor step 0, warmup 50). Input file SHA256 identities are recorded in
+  `protocol.json`; policy provenance is recorded separately.
+- Candidate corpus: 4,096 generated integer arithmetic problems across 1–4
+  digit difficulty bands plus 4,096 reviewed DeepMind easy problems. The
+  DeepMind subset includes arithmetic, linear algebra and rounding; it excludes
+  the comparison/copy-choice modules, GCD and place value that confounded
+  previous gains. These are local diagnostic tasks, not a pretraining-clean
+  benchmark. Learnability is **unmeasured until calibration**, not inferred
+  from task difficulty. Corpus and generator provenance are in
+  `postraining/data/frozen_critic_pool_20261014.manifest.json`.
+- Canonical prompts are deduplicated and split before calibration. Up to 2,048
+  candidates are screened with 16 draws each, stopping at fixed batch
+  boundaries once each split supplies 32 prompts with observed success in
+  [0.2, 0.8]. Screening labels are never critic training or branch labels.
+  Each chosen prompt then gets 16 fresh trajectories.
+- At two reasoning positions per tuning/test prompt, two fresh independent
+  policy-drawn actions each get K=64 forced continuations. A third independent
+  group of 64 continuations samples its own next actions from the full policy,
+  providing the reward baseline for the **centered-advantage sign** test.
+  Pairwise action ranking is reported separately. Fence/stop action pairs are
+  excluded without redrawing, and coverage is recorded; associations apply to
+  the retained interior reasoning-action pairs. Original response budgets
+  include the teacher-forced prefix, rather than restarting the token budget.
+- Critical implementation correction from review: generated prefix tokens
+  cannot be passed to ordinary prompt prefill for a memory policy. Branches
+  prefill only the original prompt, then teacher-force the reasoning through
+  the ordinary captured memory/decode tick. Actual next-token distributions
+  are recorded before the intervention for exact policy centering.
+- Eight matched arms: gold context on/off, head learning rate 2e-5/1e-4,
+  equal-rollout/equal-token loss. Each fresh critic gets **1,000 total updates**,
+  evaluates every 20, and uses the inverse-dimension token-Q direction readout
+  with hidden size 1,024. The critic is an independent causal token trunk,
+  without the actor's memory or belief inputs; the deterministic token history
+  specifies policy state, while cached policy probabilities come from the
+  actor's actual memory state. Gold context is critic-only. Every training or
+  evaluated action is before the closing reasoning fence; malformed unclosed
+  traces also stop eligibility at answer/fence/stop tokens.
+- Training rows with no eligible reasoning actions are excluded from critic
+  loss, with explicit counts and reward rates over both all and usable rows.
+  This does not remove them from policy reward reporting.
+- Arm selection uses tuning sign-agreement lower confidence bounds, then
+  association p-value. Only that fixed arm is tested on final prompts. Passing
+  requires at least 16 prompt clusters and positive lower 95% bounds for
+  centered sign agreement minus 0.5, prompt-fixed prediction slope, and
+  state-fixed prediction slope. Duplicate action draws still inform the
+  centered sign test but provide no pairwise contrast. Undefined or weak
+  results are inconclusive, never fabricated zero scores.
+- Power limit: K=64 has worst-case independent pair-difference SE about 0.088.
+  This cannot resolve individual advantages around 1e-3. Confidence intervals,
+  resolved-branch coverage, and detectable-effect diagnostics are mandatory.
+  A pass motivates a separate frozen-critic exploitation experiment; it is
+  not itself evidence of actor reward improvement.
+- Exact recovery preserves optimizer states, RNG, and the cumulative update
+  ceiling every 20 updates; completed arms are reused. Branch records are
+  durably journaled per state. `--resume` checks the protocol and file hashes,
+  recovers an interrupted final journal append, and reuses complete data.
+- Verification: **38 CPU bookkeeping/statistical/recovery tests passed**.
+  Queued CUDA jobs **13592** and **13593** both passed the production KDA
+  captured-memory prefix/state/probability parity check; the second includes
+  the independent-reference rows. These checks establish implementation
+  semantics, not critic quality or reward improvement. At this entry the full
+  job reached its calibration stage; no scientific outcome is available yet.
+
+Early measured progress for job 13594: calibration filled all three prompt
+quotas (32 train, 32 tuning, 32 final test). Independent fresh trajectories
+reached reward 282/512 = 0.55078125 on the training pool and 286/512 =
+0.55859375 on the tuning pool, with no empty-reasoning rows in either.
+These are pool learnability measurements, not critic or actor improvements.
+The run proceeded to tuning branch collection.
+
+#### Original study stopped; separate choice-probe revision
+
+Job 13594 failed while evaluating after update 40 (last recovery checkpoint:
+update 20). The two nominally shared states had policy-baseline differences
+up to about 9e-7. The evaluator unnecessarily included the forced token after
+the evaluated prefix. This is now fixed structurally: one forward of the
+shared prefix only, then score both forced actions against that same vocabulary
+table and policy baseline. No gate tolerance was relaxed. The independent
+reviewer checked the correction; the fitting/data suite passed 20 tests.
+
+Separately, reward-blind coverage analysis showed 61/64 action pairs identical
+in each tuning and test set, leaving just three prompts with an action
+contrast. The mean full-policy collision probabilities were 0.9520 and
+0.9595; median top-token probabilities were about 0.99996 and 0.99994. This is
+consistent with the observed duplicates. The original 8-arm study will not be
+resumed because those probes cannot support its prompt-clustered ranking gate.
+`cull_decision.json` preserves the decision. No 1000-update comparison or
+final critic-quality inference came from job 13594.
+
+A separately preregistered replacement uses the same frozen policy and
+learnable pools, reusing only calibration/fresh trajectories, never critic
+weights or old branch outcomes. It scans at most 64 randomly ordered reasoning
+positions per prompt, retaining the first two distinct interior-token pairs.
+Rejection happens at the intervention point, before consuming a forced action,
+running its continuations, evaluating Q, or observing any reward. New branch
+and policy-reference seeds are offset by 1,000,000. It requires at least 16
+informative prompt clusters in each evaluation split before fitting any arm.
+All eight arms start fresh with 1000 updates each. The question is now explicitly
+conditional on distinct-action choice probes; this is not representative of
+all-token policy credit. Even these probes can remain inconclusive at K=64.
+
+Replacement job **13597** is running from frozen source
+`.worktrees/frozen-critic-choice-study-20261014/` (manifest SHA256
+`718389d95c60008b1a047574c326e68907f894e1b6421924dcc03c42dc15ca58`).
+Canonical output: `postraining/runs/frozen_critic_choice_study_20261014/`;
+exact argv/receipt: adjacent `.launch.json`. Its preregistered protocol and
+`pool_reuse.json` record the new sampling rule and the copied artifact hashes.
+Priority 1, max parallel runs 1, explicit 1000 updates/arm, eval every20,
+8-hour session limit. All existing learned critic weights were discarded.
+
+Verification after the shared-state fix and choice-probe implementation:
+**45 CPU tests passed**; queued CUDA check **13596 passed**, including an
+interrupted/rejected branch followed by correct memory-prefix reconstruction.
+Jobs13592/13593 had already passed the initial captured-prefix parity checks.
+At this note the replacement is collecting tuning branches, with13 retained
+choice states journaled. No critic-quality claim is available yet, and the
+actor remains frozen.
+
+## MAC with an online critic still collapses: off-support critic extrapolation (2026-10-19)
+
+- **Run.** Job 14134 (`mac_online_allstates_drill_20261019`), stage 1 of
+  `docs/mac_online_critic_plan_20261019.md`. It is 10-15's
+  `dg_full_mac_actor_20261015` with the same SFT actor and study critic, two
+  changes: the critic refits on every pool, and MAC credits every generated
+  state (the answer span adds about 7.3k of about 258k states per pool). It
+  stopped itself at step 140 (two benches below 0.55).
+- **Bench (contract accuracy / mean tokens).** 0.596/223 (step 0),
+  0.630/228, 0.650/235, 0.657/239, 0.641/244, 0.592/251, 0.506/258,
+  0.468/249. 10-15 reached 0.353/307 at step 140 and 0.185/356 at 160.
+- **What the online critic fixed.** Value calibration: predicted mean
+  tracked the MC target within 0.01 in every 20-step window (10-15's frozen
+  critic ended +0.2 to +0.34 optimistic). Integer families held or improved
+  (add_integer_d4 0.74 to 0.82). Length stayed about 250 tokens.
+- **What it did not.** Every decimal family broke at steps 100-140, on 10-15's
+  schedule (add_decimal_d1 0.78 to 0.38, mul_decimal_d1 0.76 to 0.20). 10-15's
+  collapse also started with decimals; integers followed later there.
+- **Traces** (full 512x4 bench captures, `..._traces/`). Steps 0-60 improved
+  the procedure mix (multiplication's place-value expansion methods, accuracy
+  about 0.03, fell from about 22% to 6%). By step 120:
+  - the taught setup line "Drop the points and add whole numbers: N + N."
+    (93% at step 0) became "Drop the points and add up..." (59% at 140); its
+    variants without operands score 0.14, and "add up as you go" leads into
+    the multiplication template (multiplication text in add_decimal traces
+    1% to 19%, in sub_integer 0% to 13%);
+  - correctly worked subtraction traces render 1704 with 3 places as 17.04.
+- **Mechanism, measured** (`scripts/probe_mac_decision_states.py`,
+  `..._traces/decision_state_probe.json`). Fixed start-policy prefixes, read
+  under each snapshot's own actor and critic:
+  - After "Drop the points and add", the study critic gave the never-sampled
+    " up" A = +0.139 (pi = 0.0000) against " whole" at 0.000. Typical
+    |A| in the run is about 0.01. pi(" up") went 0.0000, 0.0005 (60), 0.071
+    (100), 0.765 (120), 0.939 (140). Only once it was sampled did the critic
+    learn its value: A(" up") 0.0095 at 120, -0.0002 at 140. By then the
+    policy had left the taught line, and nothing pulls back a choice the
+    critic now scores as neutral.
+  - At the first answer token of 288 traces whose result line fixes the
+    answer, the critic's highest-Q token among the policy's top 8 was the
+    correct one only 20% of the time at step 0 and 8-9% from step 60.
+    A(correct) turned negative from step 60; pi(correct) fell 0.945 to 0.620.
+  - So MAC follows the critic's Q on actions outside the policy's support,
+    where the critic has no data. The bilinear Q = c(s) + u(s).x(a) assigns
+    rare tokens large extrapolated advantages, and MAC's full-vocabulary
+    gradient grows their log-probability at a rate set by A, not by pi. An
+    online critic corrects an action only after it is sampled, too late
+    for choices the critic then calls neutral. A frozen critic (10-15)
+    never corrects.
+- **Not measured.** Counterfactual returns of the forced alternatives at these
+  states, and a sampled-token-advantage control. The " up" and answer-start
+  cases are two decision points, not a census of all states.
+
+## What TD7 latent-Q offers the MAC collapse, and a correction to its mechanism (2026-10-19)
+
+- **TD7 latent-Q, measured** (cleanrl `td7/latentq`, HalfCheetah-v4, one seed
+  each, eval return at 1M steps). TD7 `fast_sdnoise_v1` 17,743;
+  `latentq_preaction_v5` 18,445 (18,860 last-10 at 1.39M); `dual_smooth_v3`
+  18,437. In its delight line, removing the alpha-tuned sigma floor dropped
+  16.2k to 10.1k (`hermite_ablation_v7_nofloor`, at 639k steps), and zeroing
+  target smoothing changed little (16.9k). The floor is the component that
+  measured large.
+- **What carries over.** v5's Hermite critic regresses returns on the
+  Gaussian policy's own score functions (eps, eps^2-1), and the actor ascends
+  that fitted slope. It works because the floor makes the noise cover every
+  direction the actor moves in. The discrete form of "fit the action slope
+  along the policy's sampled score" is the score-function control variate:
+  MAC plus the sampled token's residual G - Q(s,a_t), unbiased for any
+  critic. A 50k vocabulary cannot be covered, so the floor's discrete form is
+  to shrink where Q is used to where the policy samples. SALE, LAP, hard
+  targets, the value clamp and checkpoint selection fix replay or bootstrap
+  problems this setup does not have. Clipped double Q was dropped too
+  quickly: its job in TD3 is to stop the actor exploiting the critic. It
+  would need bootstrap-masked heads, since two heads on one x(a) would
+  extrapolate together.
+- **Implemented.** `--mac-estimator {all_action, control_variate,
+  sampled_baseline}` (required with `--mean-actor-critic`). Each has its own
+  actor-objective schema. `sampled_baseline` is -stopgrad[G - E_pi Q] log
+  pi(a_t), REINFORCE with the critic's state value. CPU oracles pin each
+  estimator's gradient. An exact-expectation test shows control_variate and
+  sampled_baseline both equal MAC under the true Q for an arbitrarily wrong
+  bilinear critic. Compiled-vs-eager CUDA parity is judged against eager's
+  own resharding floor: the control variate's gradient is a small remainder
+  of large per-token terms, eager-vs-eager differs by 5.8% on the worst
+  gain, and compiled by 8.1%.
+- **Correction to the 10-19 mechanism (red-team re-read of the probe file).**
+  - The step-0 logit of " up" rose 0.7, 1.15, 1.37, 1.98, 3.03, 3.75 and
+    1.55 nats per 20 steps while pi(" up") grew about 3,500x. If the
+    local pi*A term drove it, the velocity would have grown with pi; it
+    grew about 5x, and kept rising after A reached 0.
+  - At the 96 setup states, all 7 non-top tokens had A > 0 at 100% of
+    states for steps 0-80 (mean about +0.10). At a confident state, A(a) is
+    about -u.x(top) for every unrelated token: on-policy data does not
+    identify the c/u split there.
+  - Embeddings, readout and gains are on AdamW (`build_optimizers`), whose
+    per-element normalization steps a rare token's row at about lr whenever
+    its gradient sign is consistent, however small pi is.
+  - So the likely driver is a consistently signed, pi-independent
+    optimizer step on every off-support token, not "MAC follows Q at that
+    state". This is inferred, not yet measured. Under a sampled estimator
+    those rows get zero-mean noise instead. It also predicts that plain
+    `control_variate` keeps drifting: its correction arrives as rare lumps,
+    which Adam suppresses.
+- **The critic's action contrast is too small to matter yet.** The policy
+  variance of Q per state is about 1e-4 (`mac/*_policy_q_variance`), against
+  a residual return variance of about 0.1-0.2. So beyond a V baseline,
+  any all-action term can only reduce variance, by about 0.1%. The useful
+  work is a critic that resolves actions: labels at alternatives, e.g.
+  forced-branch rollouts at fork states. That is the real analogue of
+  TD7's noise floor.
+- **Next.** `mac_sampled_baseline_allstates_drill_20261019`: stage 1 with
+  only the estimator changed. Prediction: no off-support drift and no
+  decimal collapse. If it holds, the all-action term caused 14134's
+  collapse.
+
+## sampled_baseline holds on the drill pool; stage 2 queued without science MC (2026-10-19)
+
+- **Run.** Job 14165 (`mac_sampled_baseline_allstates_drill_20261019`, cot, no
+  memory). Stage 1 with only `--mac-estimator sampled_baseline` changed.
+- **Bench (contract accuracy).** 0.596 (step 0), 0.674 (60), 0.716 (100),
+  0.737 (140), 0.764 (200), 0.787 (240). Stage 1 was 0.657 at its peak
+  (step 60) and 0.468 at 140. All 22 cells rose, decimals most:
+  add_decimal_d4 0.47 to 0.79, mul_decimal_d2 0.43 to 0.79, sub_decimal_d4
+  0.28 to 0.48. Mean length was 222 at the start and stayed at about 245.
+  Training reward over the last 20 pools was about 0.81 (bench 0.787). The
+  pool has cycled about 7x.
+- **Diagnostics.**
+  - Policy entropy fell 0.085 to about 0.03.
+  - The sampled coefficient G - E_pi Q had RMS about 0.35-0.41 with mean
+    within +/-0.07, so the baseline stayed calibrated.
+  - Critic MC EV fell from 0.39 to 0.10-0.17 (noisy) as reward variance
+    shrank.
+  - Within-group reward std fell 0.395 to 0.275.
+- **Traces.** Bench traces moved from place-value expansion to the column
+  method (for example, add_integer_d4 now carries correctly, where step 0
+  summed expanded places to the wrong total). All were well-formed, with no
+  answer-format shortcuts.
+- **Reading.** The all-action term caused 14134's collapse. With the critic
+  as a state-value baseline only, the same data, rates and critic hold and
+  improve. Its action contrast is unused.
+- **Not yet measured.** Off-support drift on these snapshots (probe queued,
+  job 14167). There is no no-critic group-baseline control, so the
+  critic's value as a baseline over a 16-sample mean is unknown.
+- **Stage 2 queued** (job 14168, `mac_sampled_baseline_nocode_nosci_20261019`,
+  `scripts/submit_mac_sampled_baseline_nocode_20261019.sh`).
+  - Corpus: the reviewed mixture without `ultradata_code_l3` and without
+    `science_mc`. Science MC is 4-option. In the 10-13 nocode run it sat at
+    0.21-0.24 (chance 0.25) for all 950 steps, while its within-group
+    reward std (0.32-0.38) was 5-10x the other sources' (0.01-0.14).
+    Under a sampled estimator it would supply most of the gradient as
+    guessing noise.
+  - Setup: SFT actor in cot; a fresh token-Q head on an actor-copy trunk,
+    50 value-only warmup pools; drill-run rates.
+  - Evaluations and budget follow the 10-13 nocode runs: deepmind
+    interpolate-easy bench, AIME-2024, 950 steps, 256 prompt tokens.
+  - 10-13 reference (memory, DG, a different actor init): bench 0.009 to
+    0.068, rollout reward 0.034 to 0.088.
+- **Drill run final and probe (2026-10-19, later).**
+  - 14165 completed all 360 steps: 0.792 (260), 0.797 (300), 0.805 (360),
+    still rising slowly.
+  - Probe on its snapshots (job 14167, the same start-policy states as
+    14134's probe): the critic still scores the never-sampled " up" as good,
+    A = +0.139, 0.119, 0.117, 0.100, 0.086, 0.059 at steps 0/60/100/140/
+    200/260. Yet pi(" up") stayed at or below 0.0001 throughout (14134:
+    0.071 at 100, 0.939 at 140). At determined answer starts,
+    pi(correct) held at 0.942-0.946 (14134: 0.945 to 0.620).
+  - Same critic bias, no drift: the all-action term was the channel that
+    turned it into policy movement.
+- **Stage 2 restarted** as `mac_sampled_baseline_nocode_nosci_20261019_v2`
+  (job 14169). The first attempt (job 14168) was cancelled about 10 minutes
+  in; see its `ABANDONED.md`. From v2 on, `advantage/*` for sampled_baseline
+  reports the policy gradient's weight, G - E_pi Q. Runs before it (14165)
+  report the critic's centered Q of the taken token there; their PG weight is
+  `mac/*_coefficient_{mean,rms}`.
+
+## Twin token-Q heads for all-action MAC, and what a baseline would mean with Q (2026-10-19)
+
+- **A correction to my earlier framing.** I treated "Q is real-time and V is a
+  step behind" as a claim about critic staleness. The user meant this: Q
+  scores the token at the decision that produced it, while V(s_{t+1}) sees
+  that token only one step later, as part of the next state. That is
+  correct. I also called E_pi Q the same thing as V, which holds only as a
+  state baseline. As a result, `sampled_baseline` (G - E_pi Q) uses the
+  critic only as a state baseline and throws away the per-token judgement
+  that is the reason to fit Q at all. 14165 holding up therefore says the
+  all-action channel needs fixing, not that Q should be reduced to a
+  baseline.
+- **Baselines with Q.**
+  - In all-action MAC, sum_a grad pi(a|s) = 0, so subtracting any b(s) has
+    exactly zero effect. A state baseline is a no-op there.
+  - A sampled Q-gradient with baseline E_pi Q is a noisier estimate of the
+    MAC gradient (MAC is its Rao-Blackwellization), so it is strictly
+    worse.
+  - When the sampled term is the MC return G, the useful baseline depends on
+    the action. It is the critic's own Q(s,a_t) plus the all-action
+    correction, which is `control_variate` (Q-Prop's form, without its
+    adaptive eta). That is the only baseline that keeps using Q's token
+    judgement.
+- **Design (user decision: twin heads, no baseline).** This is TD3/TD7
+  clipped double Q, ported to tokens.
+  - Two `TokenQHead`s sit on one critic trunk and share the action table
+    x(a). Their hidden layers are independently random and their readouts
+    start at zero.
+  - Each head regresses the same generalized value estimate (length-adaptive
+    lambda, about 0.92). The estimate bootstraps from min_i Q_i of the next
+    taken token.
+  - The actor reads the twins' mean. Because Q is bilinear, the mean
+    direction gives the mean Q for every token.
+  - Cost is a second head of about 1M parameters on the shared trunk, not a
+    second critic.
+  - It runs with `--critic-q-twin` and schema `CRITIC_TWIN_Q_SCHEMA`. Study
+    init, resume and the checkpoint config all check the head count.
+  - MAC no longer forces lambda = 1: twin targets bootstrap, and they need
+    lambda < 1 for the min to matter.
+  - Twin telemetry is `twin/gap_rms` and `twin/min_shift_mean`. Tests:
+    `tests/test_twin_q_critic.py` and twin cases in `test_mac_update*.py`.
+- **Caveat on the design.** The heads share x(a) and the trunk. If the
+  off-support drift (10-19 above) comes from x(a) or the trunk rather than
+  the head readouts, both twins will extrapolate together and the min will
+  not stop it. This run tests whether head-level independence is enough.
+- **Compile-boundary bug, found by the CUDA parity test.**
+  - Compiling `token_value_members` and indexing `[0]` eagerly for a single
+    head gave a wrong compiled actor gradient for all_action. Its cosine to
+    eager was -0.89 (job 14172), while control_variate and sampled_baseline
+    were at 0.998.
+  - Single-head critics now compile `token_values`, which does no stack and
+    no index. Twin critics compile `token_value_members`.
+  - Job 14173 then passed all four cases, with compiled-vs-eager actor
+    cosine 0.99999 (all_action), 0.99982 (CV), 0.99980 (SB) and 0.99999
+    (twin), each within eager's own resharding floor.
+  - The root cause is not established. My guess is an eager view of a
+    compiled output being aliased, but I have not checked it.
+- **Twin study fit** (job 14176, `dg_twin_critic_study_20261019`). It uses
+  the same data and 640-update budget as `dg_full_critic_convergence_20261015`.
+  It tracks the single-head study within noise:
+  - held-out EV for the twin mean vs single: 0.3249 vs 0.3234 at step 300
+    (each head alone 0.323), and 0.345 vs 0.344 at step 640;
+  - branch agreement 0.729 vs 0.755 at step 300 and 0.766 vs 0.776 at step
+    640, on the same 192 pairs with CIs overlapping;
+  - gates match: slope passes and branch fails, in both studies;
+  - between-head Q gap RMS about 0.037, while the advantage gap at think
+    actions is only 0.002.
+
+  So the twins mostly differ in state value, which the clipped target does
+  see, and agree closely on action contrasts. That is consistent with the caveat above,
+  though it does not show off-support extrapolation itself.
+- **Stage 2 v2 paused** at step about 158 (see its `PAUSED.md`). Rollout
+  reward went from 0.018 to 0.028 and bench from 0.0095 to 0.0139, within
+  noise. The fresh in-run critic's policy-Q variance stayed at about 1e-6,
+  against 1.5e-4 for the drill-pool study critic, so its action contrast
+  never formed.
+- **Queued.** Job 14177, `mac_twin_allaction_drill_20261019`
+  (`scripts/submit_mac_twin_drill_20261019.sh`). It is stage 1 (14134) with
+  twin heads, the twin study warm start and bootstrapped GVE targets. This is
+  a joint change, not an isolated twin ablation. Prediction if twins are
+  enough: no " up" drift in the decision-state probe and no decimal
+  collapse by step 140. If both heads drift together, the next arm is
+  `control_variate`.
+- **Correction: the AdamW off-support-row mechanism is not supported**
+  (CPU read of stage 1's snapshot optimizer state, steps 20-140).
+  - Readout (`backbone.proj`) rows of truly rare tokens get MAC gradients of
+    about 5e-11 RMS, below Adam's eps of 1e-8. Their bias-corrected step is
+    0.002-0.005 lr at the median, so Adam does not amplify them to about lr.
+  - " up" (510) and " whole" (2187) are common tokens. Their rows step at
+    0.2-1.5 lr throughout (top 1% of rows), and the two move alike: by
+    2.3e-2 vs 2.3e-2 over steps 60-100, against a median row of 1e-4.
+  - Both rows' gradient RMS rose about 30x at step 100, when pi(" up")
+    reached 0.07.
+  - So the " up" drift is not a rare-row optimizer artifact. It must run
+    through the shared dense parameters (the state's belief) or the
+    direction of the rows' moves. Row norms alone cannot separate those.
+  - That leaves the critic's extrapolated off-support advantage as the
+    leading candidate. A conservative (CQL-style) penalty on the twins is
+    therefore the next arm if 14177 collapses.
+- **Result: 14177 collapsed on stage 1's schedule; culled at step 120.**
+  - Bench at steps 0-120: 0.596, 0.631, 0.644, 0.654, 0.637, 0.581, 0.512.
+    Stage 1 was 0.596 ... 0.657, 0.641, 0.592, 0.506; every evaluation is
+    within 0.011.
+  - sub_decimal_d1 fell 0.76 to 0.64 by step 80 in both runs.
+  - The twin critic ran 0.08-0.17 below the MC return (stage 1: about
+    -0.02 to +0.09). Advantage std was about 20% smaller. Head gap RMS
+    shrank from 0.033 to 0.027 over 33 steps.
+  - Reading: the min enters only the target, at the next taken token. It
+    never evaluates the off-support tokens the actor's full-vocabulary
+    gradient acts on, and the heads agree on per-token contrasts to within
+    about 0.002. So clipped double Q cannot reach this failure.
+  - Probe on its snapshots (job 14182, the same start-policy states as
+    stage 1's). The twins' extrapolated A(" up") at a never-sampled token
+    started a little lower than stage 1's, +0.117 against +0.139, and fell
+    on the same path. pi(" up") followed stage 1's climb about 10-20 steps
+    later:
+
+    | step | pi(" up") twin | pi(" up") stage 1 | pi(correct) twin | pi(correct) stage 1 |
+    |---|---|---|---|---|
+    | 60 | 0.0003 | 0.0005 | 0.919 | 0.927 |
+    | 80 | 0.0019 | 0.0037 | 0.864 | 0.894 |
+    | 100 | 0.022 | 0.071 | 0.750 | 0.813 |
+    | 120 | 0.43 | 0.76 | 0.661 | 0.716 |
+
+    The critic preferred the correct first answer token among the policy's
+    top 8 at 18% of determined states at step 0 and about 10% from step
+    60, as in stage 1.
+- **Next: a conservative twin critic** (`--critic-q-conservatism`,
+  `postraining/conservative_q.py`). It adds CQL(H),
+  alpha * [logsumexp_a Q - Q(a_t)] per head, and ILQL carries the same
+  idea to token Q over a vocabulary. For bilinear Q the state term cancels,
+  so this is the cross-entropy of the scores u.x(a) against the taken
+  token; it trains u and the action table x.
+  - Tabular fixed point: Q(a) = target(a) + alpha/2 (1 - mu(a)/pi(a)),
+    where mu is the softmax of Q. Tokens sampled far more often than
+    mu (about 1/V) gain the same alpha/2, which cancels in A. Tokens never
+    sampled are pushed down.
+  - The frozen-policy study planned as a gate (alpha 0.01 and 0.1 against
+    a refit twin arm, job 14185) was cancelled before it ran. The run
+    itself logs the support census instead: every update, the all-action
+    MAC pass sums the actor's A over the whole vocabulary by support
+    (pi < 1e-4; ranks 2-8; top token) as `support/*`.
+  - Run `mac_twin_cql_allaction_drill_20261019`
+    (`scripts/submit_mac_twin_cql_drill_20261019.sh`) is job 14177 with
+    only `--critic-q-conservatism 0.1` added: the same twin study critic,
+    fit without CQL, as warm start, and no warmup. Success means
+    `support/offsupport_advantage_mean` and
+    `support/rank2to8_positive_fraction` fall before step 60, where
+    pi(" up") began to climb in both earlier runs, and pi(" up") stays
+    flat on the probe.
+  - Predicted side effect (red-team review). The penalty's gradient sums to
+    zero over the vocabulary, so the mass it pushes off unsampled tokens
+    returns to the sampled support: about alpha/2 (1 - m) on average, where
+    m is the mass softmax Q keeps on the support. GVE targets with
+    length-adaptive lambda bootstrap that gain at every step, worth
+    (1 - lambda) alpha/2 (1 - m) per token, and about 10 alpha (1 - m) summed
+    over a response at alpha_GAE 0.05. That favors tokens that lengthen the
+    episode, think-close included. While m stays near 0 it is up to 1.0 at
+    alpha 0.1, the scale of the reward itself. In tabular form, with every
+    token's Q free, unsampled tokens fall to -inf and m -> 1. A bilinear Q
+    cannot do that, so m is an empirical question.
+    `support/offsupport_critic_mass` logs 1 - m every update. Cull the run
+    if response length or think length grows while bench falls, or if
+    early-token Q pulls away from the Monte Carlo return.
+  - Job 14188, the first CUDA parity run after the census entered the
+    compiled MAC function, failed: MAC log-probs off the readout by up to
+    0.156 on 9,794 of 14,899 tokens. It ran while these modules were being
+    edited. Two isolated probes (compiled vs eager MAC with the census on
+    and off, then the real KDA8 readout) matched to 3.8e-6, and re-runs of
+    the same parity command (14191; 14193 with the twin file too) passed
+    with gaps of 1.9e-6, as in 14184. The cause is unexplained.
+
+## 2026-10-20: CQL(H) collapsed the twin critic; a pessimistic Q prior replaces it
+
+- Job 14195 (`mac_twin_cql_allaction_drill_20261019`, alpha 0.1), culled at
+  step 62. The policy had barely moved: rollout reward 0.58-0.70, think
+  length 190-240 tokens, bench 0.596 / 0.624 / 0.628 / 0.597 at steps
+  0/20/40/60. The critic failed:
+
+  | step | grad/critic | grad/trunk | CQL CE | off-support A | MC EV | pi-weighted Q var |
+  |---|---|---|---|---|---|---|
+  | 1 | 22 | 0.0045 | 10.68 | -0.15 | 0.40 | 0.00018 |
+  | 31 | 56 | 0.025 | 8.89 | -2.03 | 0.20 | 0.0013 |
+  | 62 | 242 | 0.052 | 5.40 | -7.34 | -0.32 | 0.0062 |
+
+  `support/offsupport_critic_mass` stayed at 0.97-1.0 throughout. The
+  predicted length bias never showed.
+- Why. CQL(H) at temperature one only concentrates its softmax once score
+  gaps reach about log V = 10.8. A value of a [0, 1] reward never supports
+  gaps that large, so the gradient alpha (mu - onehot) never vanishes:
+  unsampled tokens are pushed down without bound. Tabular CQL tolerates
+  this because each Q(s, a) is free. A bilinear Q can only comply by
+  inflating its shared score geometry. Doing so drove off-support
+  advantages to -7, wrecked the value fit (EV negative), and inflated the
+  contrasts on the support 35x, which raised the actor's gradients 10x
+  through MAC.
+- Replacement: `--critic-q-pessimism` beta (`postraining/pessimistic_q.py`).
+  - **Form.** Per head, beta * sum_a relu(A_h(s, a))^2, with A_h centered
+    under the current policy and normalized as the squared error is. This
+    is the discrete form of mildly conservative Q-learning's pseudo-target
+    (Lyu et al. 2022): an unsupported token regresses toward the policy's
+    value, not toward -inf.
+  - **Why it cannot run away.** It is zero once no token reads better than
+    the policy, which data never contradicts. Inflating the scale
+    multiplies it by k^2.
+  - **Fixed point.** In tabular form a positive advantage shrinks by
+    pi/(pi + beta), and negative advantages are untouched.
+  - **Implementation.** It needs pi, so it runs in MAC actor updates only.
+    Each shard's critic backward waits for the actor pass, whose readout
+    chunks form the prior's exact gradients for each head's directions
+    and for the action table.
+  - **Removed.** CQL (`conservative_q.py`, its arms and flag); job 14195's
+    source snapshot keeps them.
+- Review and choices before the run.
+  - **u only.** The prior trains the directions u only. The action table x
+    is the critic trunk's input embedding, and a dense prior gradient
+    would give every unseen token's row an Adam-normalized step of its
+    own each update.
+  - **Exact tabular fixed point.** The policy value is preserved. A
+    positive advantage becomes pi/(pi + beta) (A_fit + beta R), where
+    R = sum_a relu(A); other tokens shift up by beta R.
+  - **beta.** beta = 1e-4 is the census's off-support threshold. Below it
+    the prior outweighs the data, above it the data outweighs the prior.
+    The prior's total weight per state is V beta, about 5 times the
+    data's. At 1e-3 the CUDA parity batch measured the critic gradient at
+    136 against 2.2 without the prior. That batch's perturbed twin rates
+    55% of tokens above the policy; the real critic rated about 10% at
+    job 14195's first update.
+  - **Memory.** Holding each shard's critic graph through the actor pass
+    adds about 40% peak memory on the parity batch (4.2-4.5 to
+    5.4-6.3 GiB).
+- Run `mac_twin_qprior_allaction_drill_20261020`
+  (`scripts/submit_mac_twin_qprior_drill_20261020.sh`) is job 14177 plus
+  `--critic-q-pessimism 1e-4`.
+  - **Success:** grad/critic and grad/trunk stay near job 14177's, MC EV
+    holds, `support/offsupport_positive_fraction` and
+    `support/rank2to8_positive_fraction` fall, and pi(" up") stays flat
+    past step 60.
+  - **Cull:** EV going negative or gradients growing as they did in 14195.
+
+### Result: the Q prior delayed the collapse about 20 steps; culled at step 144
+
+- **Run.** Job 14198. Bench contract accuracy 0.597 (0), 0.661 (60), 0.660
+  (80), 0.642 (100), 0.611 (120), 0.520 (140); job 14177 was 0.654 at 60 and
+  0.512 at 120. Rollout reward held at 0.60-0.65 to step 120, then fell to
+  0.42. Every family moved together: peak at 60-80, then about -0.15 by 140,
+  integers as much as decimals (add_integer 0.70 to 0.52, sub_decimal 0.66
+  to 0.51).
+- **Telemetry.** grad/critic 2.4-5 and grad/trunk 0.002-0.003 throughout,
+  with no CQL-style blow-up. Policy entropy fell 0.14 to 0.035. MAC think
+  Q variance fell 1.4e-4 to 2.2e-5. MC EV fell 0.32 to 0.09, and online
+  epoch EV 0.84 to 0.60. The prior did its job: penalty per state 8.7 to
+  0.04, off-support positive fraction 0.10 to 0.0015.
+- **Probe** (job 14203, the same start-policy states as 14182,
+  `scripts/summarize_decision_probe.py`).
+  - The off-support channel is closed. A(" up") was +0.117 at step 0,
+    +0.026 at 20 and negative from 100. pi(" up") reached 0.006 at 140,
+    against 0.43 at 120 in 14177.
+  - pi(correct) at determined answer starts still fell, 0.945 to 0.825
+    (14177: 0.661 at 120).
+- **Mechanism: the critic has no on-support action contrast at answer
+  starts.**
+  - The alternatives were decoded against the truth. Genuinely wrong
+    answer tokens with pi > 0.01 (e.g. '333' for 433.62) read critic
+    A = -0.001 at step 0 and +0.006 at 140, positive 62-64% of the time.
+    Their true advantage at a determined state is about -V, roughly -0.6
+    to -0.9.
+  - Valid prefixes of the truth (' 6' for 6.05) read +0.007 at step 0 and
+    -0.013 at 140.
+  - MAC moves mass by pi A on these sampled tokens, and AdamW steps at a
+    fixed size however weak the contrast. The number of wrong
+    alternatives above 1% grew from 110 to 248 over the 288 states, and the
+    MAC push on wrong tokens grew from 0.04 to 0.15 (correct: 0.46 to 0.11).
+  - The pessimistic prior cannot reach this: it only acts where the
+    critic reads a token above the policy, and these tokens are sampled.
+- **Why the critic cannot express it (inferred, not yet measured).**
+  - x(a) is the critic trunk's input embedding at unit RMS. The trunk's
+    final belief is aligned with the untied readout `trunk.proj`, which the
+    critic carries from its actor copy but which no loss uses.
+  - To score "this token contradicts the computed result", u(s) must
+    rebuild the readout's mapping into input-embedding space through one
+    relu^2 layer, at a direction rate of 1.95e-7.
+  - The actor ranks the correct token first at 94% of these states. The
+    critic prefers it at 14-26%.
+
+### Design: the token Q action table becomes the trunk's readout (critic schema v5)
+
+Built 2026-10-20 in response to the mechanism above; CPU-tested, not yet run.
+
+- **Table.** x(a) = `trunk.proj.weight[a]` times one detached global scale,
+  rsqrt(mean(W^2) + eps32). The readout bias is excluded
+  (`SeparateCritic.action_rows`).
+  - The scale is global, not per row. Row norms span 1.9-6.2 and carry
+    how strongly a belief selects each token. A per-row norm changes the
+    argmax (rows [1,0] and [3,3], belief [1, 0.1]; pinned in
+    `test_readout_action_table.py`).
+  - The scale is detached, so only the rows a loss reads take gradients.
+  - The SFT readout's mean square is 0.0246; eps moves the scale by
+    2.4e-6.
+- **Direction.** u = D relu^2(B b [+ actor term]) + L b, with L a
+  zero-init Linear(d, d) (`TokenQHead.belief_direction`). It shares the
+  direction LR group through `direction_weights`. With L = s I, u.x(a) is
+  exactly the trunk's logit minus its bias, so the critic can read the
+  actor-like ranking through one linear map instead of rebuilding it
+  through relu^2.
+- **Evidence (CPU, weights only).**
+  - The best linear map from input latents to readout rows, fit on other
+    tokens, has held-out R^2 = -0.03 on numeric tokens. v4's table did not
+    linearly contain the readout's geometry.
+  - Toy learnability (d 16, V 256): the share of held-out states whose
+    highest-Q top-8 token is the readout argmax. Chance is 0.125.
+
+    | Table | relu^2 only | with L |
+    |---|---|---|
+    | readout | 0.44-0.49 | 0.60-0.65 |
+    | unrelated | 0.22-0.24 | 0.21-0.23 |
+
+- **Consequences.**
+  - A fresh trunk zeroes `proj`, an exact saddle: x = 0, and u and x each
+    wait on the other (pinned by test).
+  - The config therefore refuses a token Q critic without
+    `--critic-init actor` unless resuming or using critic-only-init.
+  - Study arms are actor-init only.
+- **Correction.** v1 study checkpoints carried no critic schema, so a v4
+  (input-latent) study critic would have loaded silently into a v5 run;
+  the keys are identical.
+  - Study checkpoint v2 records `critic_schema`.
+  - `validate_study_critic_init` refuses a mismatch.
+  - The twin study critic must be refit under v5.
+- **Not measured (GPU).**
+  - Whether the bias-free readout ranking matches the actor's at real
+    answer starts.
+  - Whether the real critic learns L at direction LR 1.95e-7.
+  - Self-sharpening: whether the critic learns to copy the policy's
+    logits and MAC then feeds the actor its own argmax.
+  - CUDA parity, the v5 study refit, and the drill run.
+- **Red-team review (same day): the design does not yet meet its own aim.**
+  - The L path's simplest solution is entropy minimisation. With
+    u = s b, A(a) = s'(z(a) - E_pi z) for z the bias-free logit, so MAC's
+    logit step pi(a) A(a) is exactly -s' dH/dz. The algebra is checked;
+    the softcap and bias are ignored.
+    - The Q fit is uncentred, Q(s, a_t) = c + u.x(a_t). Between-state
+      variation in E_pi z, which tracks confidence and therefore V(s), can
+      fit u instead of c.
+    - In a CPU toy (d 512, V 4096) the MAC step's cosine with the
+      entropy-minimising direction was about 0.27 for the first 50 critic
+      steps, even with returns independent of everything. It stayed near
+      0.2 when returns track confidence.
+  - Twin heads give no pessimism on L. Both start at zero and see the
+    same residual, so they differ by 0.16 relative after 200 toy steps,
+    against about 1.2 for D.
+  - Rare and pad rows (drill actor max norm 18.9; job 9040 pad rows mean 17.5) dominate the
+    prior's sum relu(A)^2 and the off-support census. `q_prior/*` and
+    `mac_q_variance_*` are not comparable across v4 and v5.
+  - `proj.weight` now trains in the critic trunk AdamW at the critic LR
+    with zero weight decay. It carries a dense gradient buffer and Adam
+    state, and Adam's bias correction gives a row first touched late an
+    outsized step (inferred).
+  - `scripts/diagnose_policy_q_precision.py` still rebuilds the v4 table.
+- The drill should not run until the Q fit is centred under the policy
+  and the twins can disagree on L.
+
+### Design: the token Q fit is centred under the policy (critic schema v6)
+
+Built 2026-10-20 in answer to the red-team above; CPU-tested, not yet run.
+
+- **Fit.** Q(s, a) = c(s) + u(s).(x(a) - xbar(s)), xbar(s) = sum_a pi(a|s) x(a)
+  under the behaviour policy (`value_model.policy_centered_q`). Then
+  c = V^pi, and the value regression's expected gradient on u is
+  2 (Cov_pi(x) u - Cov_pi(x, G)), whatever c's error. Uncentred, u also
+  takes 2 xbar (c + u.xbar - V): a fresh critic's c error pushes u along
+  the policy's mean row, and MAC's step then rewards the tokens that make
+  that row up.
+  - Behaviour = pi is what the trainer enforces: temperature 1, top_p 1,
+    one PPO epoch. In token-only mode every action is an emit, so the
+    offsets x(a_t) - xbar come straight out of the actor's fused readout
+    pass (`SoftcappedTargetLogprobsEntropyAdvantages` and the MAC function
+    return them as a non-differentiable output). Value-only updates replay
+    them (`replay_policy_action_offsets`, grad-enabled and detached like
+    `refresh_old_statistics`, so the warmup shares the update's compiled
+    trunk).
+  - The offset is formed whole, -(pi - onehot(a_t)) @ x, by
+    `nano_backbone.policy_action_offsets_`, in place on the readout's own
+    fresh softmax, so it costs no extra (slots, vocab) tensor.
+    - Why: x(a_t) minus a TF32 mean row keeps the rounding of pi(a_t) x(a_t)
+      as pi concentrates, while the offset itself shrinks.
+    - In a CPU emulation of TF32 input rounding (d 512, V 50,304), the
+      error as a share of the RMS of u . offset was:
+
+      | pi(a_t) | Mean-row form | Whole offset |
+      |---|---|---|
+      | 0.9 | 0.2% | 0.03% |
+      | 0.99 | 2.7% | 0.03% |
+      | 0.999 | 22% | 0.03% |
+
+    - The actor's A already cancelled this way; the critic's fit now does
+      too.
+  - The fused readout's A is now u . offset, from the same GEMM.
+    - Its relative TF32 error matched the score-GEMM form's, about 3e-4
+      from pi(a_t) = 0.05 to 0.999 (emulation). On the GPU it was 3.4e-4
+      against fp64 (job 14236, advantage RMS 14).
+    - The offset form first kept the score GEMM beside a materialized
+      probability matrix. That peaked at 11.6 GiB at the 24,576-slot budget
+      (job 14232), against 2.4 GiB for the entropy readout.
+    - Dropping the score GEMM brought it to 7.0 GiB, and 49 ms against 69 ms
+      (job 14236).
+- **CUDA parity (job 14236): all 8 pass.**
+  - The tests are `test_q_critic_cuda.py` and `test_mac_update_cuda.py`.
+    Compiled against eager gives actor cosine 0.99978 or better; eager
+    resharding's floor is 0.99983.
+  - The MAC fixture's study critic predates L. It now loads with a random
+    L at the direction readout's scale, so that path is compiled too.
+  - The per-parameter cosine bound is now four times the resharding floor's
+    deficit (minimum 1e-3), the angular form of the relative bound's 2x.
+  - In the critic study, the gold-context arm's critic reads the gold
+    prompt but centres under the actor's plain-prompt policy
+    (`policy_batch`, `policy_action_offsets_at_actions`).
+    - Both views must agree on every trajectory's action count and taken
+      tokens. The trainer asserts this on device; the helper raises.
+  - MAC residuals are now G - c. The control_variate coefficient is
+    G - Q(a_t), and sampled_baseline is G - c (= G - E_pi Q).
+- **Table fixed.** `action_rows` runs under no_grad. On a row's first
+  touch, AdamW moved it about 3.16 lr, and about 31 lr in total. In the
+  toy, a trained table gained nothing: corr 0.759 against 0.759, and 0.523
+  against 0.522.
+- **Rejected: a state-free direction u0.** It gains 0.02 corr
+  (0.779 against 0.759) but adds a global push on every token at every
+  state.
+- **Twin L stays identical at init.** The actor reads the twins' mean
+  direction, so drawing L randomly would put noise into the actor's step.
+  The pessimistic prior, not twin disagreement, is the off-support guard.
+- **Toy evidence** (CPU; d 512, V 4096, head hidden 1024; head LR 1e-4,
+  direction LR 1e-4 / d; batch 1024; step 800).
+  - cos is the MAC step's cosine with the entropy-minimising direction.
+  - corr is the pi-weighted correlation of the critic's A with the true
+    advantage.
+
+    | Returns | Uncentred cos / amp | Centred cos / amp |
+    |---|---|---|
+    | independent of everything | 0.86 / 0.037 | -0.00 / 0.007 |
+    | state only | 0.86 / 0.043 | -0.19 / 0.007 |
+
+    | Returns | Uncentred corr | Centred corr |
+    |---|---|---|
+    | the actor's argmax is right | 0.751 | 0.759 |
+    | right except 30% (2nd choice) | 0.516 | 0.522 |
+
+  - Uncentred, the spurious amplitude peaks at 0.08-0.10 around step 200,
+    while the critic is fresh.
+  - With returns independent of everything, the centred critic still
+    scores 45% of the tokens with pi < 1e-4 above the policy, at a mean
+    max A of 0.004. That is the pessimistic prior's job.
+  - The d 16 ranking toy in `test_readout_action_table.py` rises from
+    0.60-0.65 to 0.76-0.78 under the centred fit. An unrelated table
+    scores 0.16-0.19.
+- **Lesson.** The first centring toy ran at the default Adam LR on every
+  parameter. There the c error is gone within a few steps, and centring
+  looked irrelevant. Only at the trainer's LRs (direction LR / d) does c
+  stay wrong long enough to leak into u. A toy has to run the real
+  regime's timescales before its null is evidence.
+- **Pinned (CPU).**
+  - The exact expected-gradient identities, centred and uncentred, and
+    the uncentred step lowering entropy at every state.
+  - The production mean rows against an fp64 brute-force softmax.
+  - The gold arm's fit loss against an oracle centred under the plain
+    policy.
+- **Mutation checks** (against the critic suites):
+  - Uncentring (mean-row form) failed 5 tests.
+  - Zeroing the trainer's centring failed 8.
+  - Centring the gold arm under its own stream failed none, until the
+    gold-arm test above was added. It now runs at shard sizes 1, 2 and 64
+    and buckets 1 and 4.
+  - After the switch to offsets, dropping the onehot fails 18 and zeroing
+    the trainer's offsets fails 17.
+- **Red-team (subagent, CPU only).** No correctness defect found. Its fp64
+  oracles agreed with production on all of these:
+  - the gold arm's critic gradient across shard and bucket sizes, which a
+    `policy_batch=None` substitution misses by 210%;
+  - the MAC and DG critic gradients on cot and carry at lambda 1 and 0.5;
+    the latter bootstraps from the next state's centred Q;
+  - the value-only warmup on cot, carry and memory-carry;
+  - the compiled MAC function against eager.
+
+  Its three low findings are fixed: the TF32 offset above, the warmup's
+  no-grad replay, and per-row view checks. Its design note stands. With c
+  pinned at V, a fixed critic's Q(s, a) shifts by -u . (xbar_new - xbar_old)
+  after an actor step, so the next update's bootstrap targets lag the policy
+  by one step. Within an update, everything reads the same pi.
+- **Not measured (GPU).**
+  - The twin study refit under v6.
+  - Whether the real critic learns L at direction LR 1.95e-7.
+  - Answer-start rankings.
+  - The drill.
+  - v5 study critics are refused, and `q_prior/*` and MAC coefficient
+    dashboards are not comparable across v5 and v6.
+
+### Design: a belief gain at the head rate (critic schema v7)
+
+v6's only route to "Q follows the trunk's own ranking" is L = s I, and L
+trains at the direction rate 1e-4 / 512 = 1.95e-7. Adam moves an entry at
+most about lr per step, so 1.25e-4 over a 640-update study fit, while
+reading the logit at full scale needs s = r, the table RMS (about 0.157 on
+the SFT trunk). That arithmetic is checked; what follows is a CPU toy, not
+the real critic.
+
+**Real-regime toy** (`.scratch`, deleted): 512 dims, 4096 tokens, head
+width 1024, 1024 states per update, 640 updates at the trainer's rates.
+Synthetic readout with row norms spread like the SFT vocabulary; beliefs
+at temperatures putting 42% of states at pi > 0.9 ("determined"). Rewards
+Bernoulli 0.9 for the correct token, 0.1 otherwise. "Ranking" is the share
+of states whose highest-Q token among the actor's top 8 is the correct one.
+
+- v6 as built: ranking at determined states 0.37, L's diagonal 5e-6.
+  D only 0.33, L only 0.41. A 10x direction rate was worse (0.32).
+- Global scalar gain g, zero init, head rate, u = D f + L b + g b:
+
+  | Returns | v6 | gain | per-state gain g(f) |
+  |---|---|---|---|
+  | correct = actor argmax | 0.37 | 0.83 | 0.67 |
+  | 30% of argmaxes wrong (copying ceiling 0.70) | 0.27 | 0.60 | 0.55 |
+
+  g reached 0.009 and 0.0055. With returns blind to the token it reached
+  3e-4; the actor-step amplitude stayed 0.020 as in v6, though its cosine
+  with pure sharpening rose from 0.035 to 0.14. The per-state gain was
+  noisier everywhere (amplitude 0.16 under blind returns), so it was
+  dropped.
+
+**What g is.** u = g b gives u . (x(a) - xbar) = (g / r)(z(a) - zbar),
+the bias-free logit centred under the policy. It is L's identity component
+on its own rate. A positive g sharpens the actor wherever it applies, think
+tokens included, by an amount the returns set: from a fresh head
+E_pi[d/dg] = -2 sum_s Cov_pi(z, G), zero when returns ignore the token
+(pinned exactly in `test_readout_action_table.py`). Under a carry or a
+nonzero D/L the expectation is no longer this clean; that is inferred, not
+tested.
+
+**Ablation.** Study arm `frozen_belief_gain[_twin]` holds g at zero
+(not in any optimizer), which is exactly v6 from the same initial critic;
+the trainer refuses that arm's checkpoint, since it trains g. Study arm
+schema v3; critic schemas v7 and twin v4. Mutation (g dropped from
+forward) fails 6 tests.
+
+**Watch in the drill:** policy entropy and think length, since g sharpens.
+
+### Result (partial): v7 twin study, trained-gain arm only; job cancelled
+
+- **Verification.**
+  - CPU suite: 2391 passed, with the 11 known unrelated failures.
+  - CUDA parity, job 14241: 5 of 5 pass, after two changes. The floor is
+    now measured from two eager shardings. The per-tensor allowance is 3x
+    that floor, because compiled kernels round the block 7 MLP bias
+    1.75-2.2x its floor in every run since v6 (jobs 14236, 14239), while
+    the whole actor gradient matches its floor.
+  - Red-team: no blocking defect. Fixed: the study-init check order (a v6
+    payload failed with the "froze" message) and an overstated test
+    docstring. Added the `critic_q/belief_gain[_twin]` dashboard.
+- **Study.** Job 14240 (`dg_twin_critic_study_v7_20261020`) was cancelled
+  by request at fit step 540 of 640, in its first arm (actor_trunk_twin).
+  The frozen-gain arm never ran, so the ablation is unmeasured and none of
+  the comparisons below isolate g.
+- **Trained-gain arm against the v4 twin study at 640 updates.**
+  - Branch agreement (192 resolved pairs; policy prior 0.854):
+    - v7: 0.927 at step 20, 0.938 at 40-60, 0.906 at 160, then 0.865 at
+      520. Critic minus prior was +0.083 (cluster CI 0.01 to 0.16) at its
+      peak and +0.010 (-0.09 to 0.11) at 520.
+    - v4: 0.766, critic minus prior -0.089.
+  - Explained variance, all actions: 0.34 at 520 (v4: 0.345 at 640).
+    Training-probe Q EV: 0.46 (v4: 0.49).
+  - g was about 0.0015 by step 60 and flat after (0.0015-0.0017, heads
+    equal to 1e-5). L's diagonal stayed at 5e-7. Its later fall in
+    agreement therefore comes from D, c or the trunk, not g (inferred
+    from g being flat).
+- **Not measured.** The frozen-gain arm, answer-start rankings (decision
+  probe), and the drill.
+- **Frozen-gain arm cancelled.** Job 14242 was cancelled at update 40.
+  The drill trains g whatever the arm shows, so the ablation decides
+  nothing about it. Whether g mattered is read off the drill's
+  `critic_q/belief_gain` dashboard and its snapshot probes instead.
+- **Decision probe on the study critics** (jobs 14243-14244; the start
+  policy, the same 288 states as job 14203). At determined answer starts:
+
+  | Critic | Prefers the correct token | A(" up") | Non-top A > 0 |
+  |---|---|---|---|
+  | v4 twin study | 0.18 | +0.117 | 43% |
+  | v7, update 60 | 0.96 | -0.087 | 1.0% |
+  | v7, update 520 | 0.81 | -0.013 | 5.4% |
+
+  The actor ranks the correct token first at 0.94. The on-support
+  contrast that v4 lacked is present at update 60 and erodes with further
+  frozen-policy fitting.
+
+### Drill: v7 twin critic, warm-started at study update 60 (job 14245)
+
+`scripts/submit_mac_twin_v7_gain_drill_20261020.sh`. Matched to job 14198
+except for the critic: schema v7, warm-started from the study's update-60
+checkpoint.
+
+- **Hypothesis.** A critic with on-support contrast at answer starts
+  stops the decline 14198 showed from step 80, where it fell 0.661 to
+  0.520 by 140.
+- **Success.** Bench holds at or above its peak band through steps
+  120-160 (14198: 0.611 and 0.520), and pi(correct) at determined answer
+  starts does not fall (snapshot probe).
+- **Cull.** The built-in floor (0.55 for two evals), or bench below its
+  start (0.596) for two consecutive evals after its peak. Also watch
+  entropy and think length, since g sharpens.
+
+- **Result: held, then plateaued; culled at step 260.** No collapse.
+  Contract accuracy against the sampled-baseline drill 14165 at the same
+  steps:
+
+  | Step | 20 | 60 | 100 | 140 | 200 | 240 | 260 |
+  |---|---|---|---|---|---|---|---|
+  | 14245 (v7, all-action) | 0.630 | 0.667 | 0.700 | 0.732 | 0.765 | 0.768 | 0.763 |
+  | 14165 (v4, sampled baseline) | 0.620 | 0.674 | 0.716 | 0.737 | 0.764 | 0.787 | 0.792 |
+
+  It led at 20, trailed by 0.016-0.019 at 80-100 (paired bootstrap at 80:
+  CI -0.027 to -0.011), drew level at 180-200, and was flat from 200 while
+  14165 kept rising to 0.805 at 360. Its telemetry against 14165:
+  - trunk gradient norm fell 0.0044 to 0.0012, against about 0.012;
+  - think-state policy Q variance fell 1.2e-4 to 1-2e-5;
+  - entropy at 80-100 was 0.041, against 0.056;
+  - MC EV was 0.08-0.12, against 0.26-0.35;
+  - think length was the same.
+
+  Not a one-factor comparison: estimator, critic schema, twin heads,
+  lambda (adaptive against 1), the Q prior and the warm-start EV (0.19
+  against 0.345) all differ.
+
+## Estimator alignment at the start policy (2026-10-20)
+
+Do the all-action drill's gradients point the wrong way, or is the
+difference elsewhere? This measures each estimator's actor gradient
+against the true policy gradient on frozen inputs.
+
+- **Method.** `scripts/estimator_gradient_alignment.py` saves the actor
+  gradient `update_minibatch` forms (no step) on each of the 8 held-out
+  start-policy pools. The pools are 64 disjoint prompts each, 512 in all,
+  so they are independent draws of one update's data. For pools k != l,
+  E[g_E^k . g_U^l] = E[g_E] . grad J whenever U is unbiased (sampled
+  baseline or control variate). `scripts/analyze_estimator_alignment.py`
+  (CPU, tested on synthetic gradients with a known bias angle) reports:
+  - one update's cosine with grad J;
+  - the cosine of the estimator's mean (bias only);
+  - SNR;
+  - the cosine of an m-update average (the momentum proxy);
+  - first-order gains in each optimizer's geometry: Polar Express for
+    the Muon matrices (one update, and the polar factor of a 7-pool
+    mean), and sign and g/sqrt(v) for the AdamW groups.
+
+  Uncertainty is a leave-one-pool-out jackknife. Critics:
+  - **v4:** the 14165 warm start, run under 14165's own source snapshot;
+  - **v7_s60:** the 14245 warm start;
+  - **v7_s520:** the same study arm at update 520.
+
+  Gradients are in `postraining/runs/estimator_alignment_20261020/`.
+  Red-team: sampled baseline and control variate are unbiased in both
+  code trees (no whitening, clipping or gating), and nothing besides the
+  estimator reaches the actor gradient.
+- **Check.** The unbiased references agree. |E g_SB - E g_CV|^2 / |grad J|^2
+  is within 0.04 +/- 0.03-0.05 of zero for every pair across all three
+  critics.
+- **Whole actor (Euclidean):**
+
+  | Estimator | One update cos | Bias cos | SNR | 20-update cos |
+  |---|---|---|---|---|
+  | v4 sampled baseline | 0.366 +/- 0.018 | 1 | 0.154 | 0.870 |
+  | v4 control variate | 0.373 +/- 0.016 | 1 | 0.161 | 0.875 |
+  | v4 all-action | 0.859 +/- 0.037 | 0.882 +/- 0.039 | 18.5 | 0.880 |
+  | v7_s60 sampled baseline | 0.307 +/- 0.015 | 1 | 0.102 | 0.826 |
+  | v7_s60 all-action | 0.850 +/- 0.036 | 0.902 +/- 0.037 | 8.0 | 0.899 |
+  | v7_s60 all-action, g = 0 | 0.860 +/- 0.035 | 0.883 +/- 0.036 | 18.1 | 0.882 |
+  | v7_s520 sampled baseline | 0.370 +/- 0.016 | 1 | 0.158 | 0.874 |
+  | v7_s520 all-action | 0.829 +/- 0.031 | 0.901 +/- 0.031 | 5.5 | 0.897 |
+
+- **Muon matrices, first-order gain E[O(g)] . grad J:**
+
+  | Estimator | One update | O of a 7-pool mean |
+  |---|---|---|
+  | v4 sampled baseline | 0.053 +/- 0.004 | 0.087 +/- 0.004 |
+  | v4 all-action | 0.083 +/- 0.004 | 0.091 +/- 0.005 |
+  | v7_s60 all-action | 0.091 +/- 0.004 | 0.101 +/- 0.004 |
+  | v7_s60 all-action, g = 0 | 0.083 +/- 0.004 | 0.089 +/- 0.006 |
+
+  Paired differences:
+  - v7_s60 all-action minus v4 sampled baseline: +0.039 +/- 0.006 for one
+    update, +0.014 +/- 0.005 averaged.
+  - v7_s60 minus v4 all-action: +0.008 +/- 0.002.
+- **Reading.**
+  - The sampled estimators are noise-dominated. One update's SNR is about
+    0.15, and the control variate removes about 4% of the noise (SNR
+    +0.006 +/- 0.005), as the per-state Var_a Q of 1e-4 predicted.
+  - All-action is nearly noise-free (SNR 5-18) but biased: its mean sits
+    at about 25 degrees from grad J (cosine 0.88-0.90).
+  - Muon's momentum averages the sampled estimator to about the same
+    alignment (0.87 over 20 updates), so at the start policy one
+    all-action update is worth about 1.6-1.7 sampled ones, and an
+    averaged one 1.05-1.15.
+  - The belief gain g adds a direction at cosine 0.27 +/- 0.04 with grad J.
+    It lowers all-action's SNR (18 to 8) and raises its bias cosine and
+    Muon gain slightly (+0.019 and +0.008 +/- 0.004).
+  - v7_s60's state value is a worse baseline than v4's (sampled SNR 0.102
+    against 0.154); v7_s520's matches v4's.
+  - So at the start the v7 all-action update is the best measured, which
+    fits 14245's lead at step 20. The deficit from step 60 comes from
+    something that changes during the run: the online critic, or how a
+    fixed-angle bias compounds, against noise that momentum averages away.
+    The measurement at the step-240 policies with their own online critics
+    is queued (phase 2). Its first two submissions failed before any
+    measurement: the trainer was launched by path (14261-14265), then
+    main's trainer had no `--rollout-dataset` recorder (14268-14272; the
+    hook only ever lived in the 20261014 worktree). The recorder is now
+    ported to main. It accepts a `--curriculum-init` policy and binds that
+    snapshot's hash as `policy_state_sha256`. The critic study and branch
+    rollouts, which replay `--checkpoint`, refuse such a dataset, and the
+    gradient script refuses a dataset whose bound policy is not the one it
+    loads. Resubmitted as jobs 14306-14310.
+
+## MAC under the memory carry (2026-10-20)
+
+The user asked for mac_sampled_baseline_allstates_drill_20261019 (job
+14165, the drill leader) rerun with the memory carry on, unless the token-Q
+drills overtook it; none has.
+
+- **Implementation.**
+  - MAC accepts `--reasoning-mode memory`. The actor gradient reaches the
+    memory's writer and reader through the replay scan: each vocab chunk
+    backpropagates into a detached belief leaf, then the temporal graph
+    runs backward once.
+  - The critic reads the actor's memory through its own zero-init reader,
+    and the actor's writer terms are taken under no_grad.
+  - Memory MAC has its own actor-objective schemas (one per estimator), so
+    cot and memory checkpoints cannot resume as each other.
+  - A cot study critic warm-starts a memory critic exactly
+    (`load_study_critic`): the study's unused combiner is dropped and the
+    heads' actor-belief inputs are zeroed. A fresh memory policy reads
+    nothing, so at step 0 the run is the study critic on the cot policy.
+  - CPU: the MAC gradient matches a brute-force oracle under memory for
+    all-action and sampled-baseline. The warm start is exact for one head
+    and for twins.
+- **Compiled replay with and without grad round apart under memory.**
+  - The first CUDA parity run (job 14267) failed only its exactness check:
+    MAC's recorded log-probs against the shared readout differed by up to
+    0.24 nats, where cot is bit-exact.
+  - A diagnostic (job 14274) found the cause. A compiled replay with grad
+    and one under no_grad are two Inductor graphs. Under memory, the
+    memory read's inputs differ by about 3e-5 between them, and the trunk
+    turns that into beliefs 0.011 apart on average. Each graph is
+    deterministic, and cot's two graphs happen to round identically.
+  - MAC records its behavior statistics from its own grad-mode pass and
+    never refreshes, and sampled-baseline uses no ratio, so the drill is
+    unaffected. A memory PPO run's age-0 zero-clip canary would not be
+    bit-exact.
+  - The test now replays its reference with grad (job 14305).
+- **Drill.**
+  `scripts/submit_mac_sampled_baseline_memory_drill_20261020.sh`. It is
+  14165's argv with these changes:
+  - `--reasoning-mode memory`.
+  - The v7 twin study critic at update 520, since 14165's v4 critic needs
+    retired code. Sampled-baseline reads only c(s), and at the start policy
+    its SNR matches v4's (0.158 against 0.154). The twin heads only exist
+    to load that checkpoint: at lambda 1 both regress the same Monte Carlo
+    return.
+  - `--value-warmup-steps 0`, stated explicitly because a resume must
+    restate it.
+  - Sessions of at most 45 minutes (`--max-train-hours 0.62`, then
+    `--resume <run>/latent_vapo_checkpoint.pt`). 14165's 360 steps took 0.42 h of pool time, so one session
+    may cover it.
+
+### Result: memory converged onto 14165 (jobs 14311, 14316)
+
+Bench accuracy (512 held-out prompts x 16 samples) against 14165, step for step:
+
+| Step | 100 | 200 | 240 | 260 | 280 | 300 | 320 | 340 |
+|---|---|---|---|---|---|---|---|---|
+| Memory | 0.724 | 0.781 | 0.789 | 0.792 | 0.796 | 0.798 | 0.803 | 0.803 |
+| 14165 | 0.716 | 0.764 | 0.787 | 0.792 | 0.795 | 0.797 | 0.802 | 0.804 |
+
+- The memory run led by up to +0.017 (step 200), then matched 14165 within
+  0.001 from step 260 on. Session 2 was cancelled at step 342.
+- Two changes separate the runs, memory and the starting critic (v7 twin
+  study critic, not v4), so the early lead is not attributable to either.
+- The memory stayed nearly unused: its read reached 2.0% of the input RMS
+  at step 342 (0.8% at 107, 1.8% at 247); write beta 0.50 -> 0.63, mean log
+  decay timescale 4.85 -> 5.34. The token-path gradient grows the zero-init
+  read slowly, and the policy reached 14165's curve without it.
+- Cost: 7.0 s per pool against 4.1 s (1.7x).
+- Session 2's first submission (14314) failed on a wrong resume path in the
+  launch script (`checkpoint.pt`; the trainer saves
+  `latent_vapo_checkpoint.pt`).
+- Next: the delightful sampled baseline under memory (job 14321), and the
+  DDPG-style write critic (`docs/memory_write_critic_plan_20261020.md`).
+
+### Result: the delight gate is inert at this entropy (job 14321, cancelled)
+
+`--mac-estimator delightful_sampled_baseline` under memory, otherwise the
+memory drill's argv. Cancelled at step 16, before its first bench past step
+0, because the gate cannot differ from the sampled baseline here:
+
+- The gate sigmoid(r * -log pi(a)) sat at 0.499 (think), 0.495 (answer),
+  0.502 (r > 0) and 0.494 (r < 0) at every step. With |r| about 0.4 and
+  policy entropy 0.07-0.12 nats, r * surprisal is about 0.03 on a typical
+  token, so the gate is 1/2 + r * surprisal / 4.
+- The coefficient RMS was therefore half the sampled baseline's (0.19-0.21
+  against 0.38-0.42), and the dashboard otherwise tracked the memory drill
+  within noise (critic MSE 0.28-0.34 against 0.28-0.35).
+  Muon and AdamW are approximately invariant to a global gradient scale, so
+  this is the memory drill again.
+- DG's effect needs surprisal of order 1/|r| (several nats), i.e. a far
+  higher-entropy policy than an SFT-sharpened one at 0.07 nats per token.
+  A larger eta would only rescale the same near-linear regime until
+  eta * |r| * surprisal reaches about 1.
+- The run also slowed from 8 s to 29 s per pool, with token counts equal to
+  the memory drill's. The host was CPU-starved by unrelated work (load
+  average 71, 39 GB swapped, kswapd busy), not by the estimator.
+
+### Correction: the delight gate is active; the token mean hid it (job 14323)
+
+The section above is wrong in its conclusion. The token-mean gate is
+dominated by near-certain tokens, whose score e_a - pi is near zero, so
+it says nothing about the gate on the terms that make up the gradient.
+
+- **Telemetry added.** `mac/delight_gate_{positive,negative}_mass_mean`
+  weights the gate by |r| (1 - pi(a_t)), the size of the sampled-logit
+  term it scales. `mac/delight_{sign}_active_mass_share` is that mass's
+  share with |r * surprisal| > 1, where the gate leaves [0.27, 0.73].
+- **Measurement (job 14323).** `scripts/estimator_gradient_alignment.py`
+  at the DG drill's start: the SFT policy, the v7 study critic at update
+  520, 8 held-out step-0 pools (label `v7_s520_dg`). The memory policy at
+  step 0 is the cot policy, so cot pools stand in.
+  - Weighted gate 0.63-0.66 where r > 0 and 0.27-0.29 where r < 0. The
+    active share is 17-23% and 43-49%.
+  - Per pool, the DG gradient is at cosine 0.71-0.82 with SB's, at 0.42-0.48
+    of its norm. So the gate rotates the update; it does not rescale it.
+- **Against grad J** (Muon matrices, `alignment_v7_s520_dg.json`, jackknife
+  over pools; SB is the unbiased reference):
+
+  | | cos_bias | SNR | muon_gain_step | muon_gain_avg |
+  |---|---|---|---|---|
+  | sampled baseline | 1.000 | 0.161 | 0.053 | 0.087 |
+  | delightful | 0.759 +/- 0.043 | 0.172 | 0.047 | 0.073 |
+  | DG - SB | | +0.011 +/- 0.019 | -0.006 +/- 0.002 | -0.014 +/- 0.002 |
+
+  - The DG mean is about 40 degrees from grad J, and its SNR is SB's within
+    noise. Prop. 1's variance reduction does not appear here.
+  - A one-step gain against grad J cannot show Prop. 2's claimed benefit
+    (a bias toward the cross-entropy direction, which shifts budget to hard
+    prompts). PG is greedy-optimal for that measure by construction. The
+    drill decides.
+- **Nothing in the estimator needs changing for the gate to act.** It already
+  follows the paper: eta = 1, the current policy's surprisal, a detached
+  gate, U an advantage (G - c(s_t), within the paper's critic-based U).
+- **Drill resumed** from its step-17 checkpoint (job 14324, session 2,
+  logging the weighted gate). Its weighted gate held at 0.65 and 0.26-0.29
+  through step 40. Bench: 0.619 and 0.638 at steps 20 and 40, against the
+  memory SB drill's 0.624 and 0.653.
+
+### Result: phase 2, the step-240 policies (jobs 14308-14310)
+
+Each policy is analysed alone (its pools define its own grad J). Pooling the
+two, as a first pass did, mixed two gradients with disagreement 4.3 and is
+discarded. Muon matrices, with SB or the control variate as the reference:
+
+| Policy, critic | estimator | cos_bias | muon_gain_step | muon_gain_avg |
+|---|---|---|---|---|
+| 14245 @240, its online v7 | sampled baseline | 1 | 0.047 | 0.103 |
+| | all-action | 0.04 +/- 0.09 | 0.011 | 0.020 |
+| | all-action, g = 0 | -0.01 +/- 0.08 | 0.003 | 0.004 |
+| 14245 @240, frozen v7 s60 | all-action | 0.44 +/- 0.08 | 0.065 | 0.084 |
+| 14165 @240, its v4 | sampled baseline | 1 | 0.008 | 0.018 |
+| | all-action | 0.59 +/- 0.27 | 0.022 | 0.026 |
+
+- At 14245's own step-240 policy, all-action through the critic it trained
+  beside is orthogonal to grad J. At the start policy it was at cosine
+  0.89. On the same pools, the frozen v7 s60 critic still gives 0.44
+  (+0.39 +/- 0.08 paired).
+- 14165's v4 critic was trained beside a sampled-baseline actor, which never
+  followed its action slope. Its all-action direction stayed at 0.59 at
+  14165's step-240 policy.
+- Reading (inferred, not isolated): the critic an all-action actor ascends
+  becomes useless to that actor. That is the TD3 exploitation failure,
+  and it explains 14245's deficit from step 60. The s60 and v4 critics also
+  differ from the online v7 in training stage and architecture, so this is
+  consistent with exploitation, not proof of it.
+- 14165's policy at step 240 has a far smaller gradient (|grad J|^2 about
+  3e-6 on the Muon matrices, against 2.4e-5 at the start). Its SB SNR is
+  0.019, so updates there are noise-dominated. That fits the plateau.
+- **Drill result: DG loses (job 14324 cancelled at step 67).** Bench at
+  steps 20, 40, 60 was 0.619, 0.638, 0.647 against memory SB's 0.624,
+  0.653, 0.682: a gap of 0.005, 0.015, 0.034, still widening. The gate was
+  active throughout (weighted 0.65 and 0.27). That matches the measured
+  one-step loss, about 16% of averaged Muon gain. In this regime of
+  verified-reward drills at an SFT-sharpened policy, the rotation away from
+  grad J costs more than any rebalancing toward hard prompts returns.
+
+### Why DG lost here: its corner-escape mechanism is a sharpening brake (analysis)
+
+Source: Mei & Osband, "Delightful Gradients Accelerate Corner Escape"
+(arXiv 2605.11908, `papers/delightful_corner_escape_2605.11908.pdf`).
+- **Their mechanism.** Near a wrong corner pi(j) ~ 1, actions worse than j
+  ("harmful") pull the mean reward below r(j). That gives the incumbent a
+  positive advantage, so PG entrenches it (self-trapping). DG gates rare
+  harmful actions by sigma(-|U| log(1/pi)), at most about pi^|U|, which
+  removes the trap. Better actions are allies and always help.
+- **The same gate at a correct corner.** Exact expected drift (their eq. 3)
+  for a bandit whose incumbent is the optimal arm, at error eps. The ratio
+  is the logit-gap growth between the optimum and a rare harmful arm, DG
+  over PG:
+
+  | eps | K = 2 | K = 4 (rewards 1, .6, .3, 0) |
+  |---|---|---|
+  | 0.30 | 0.37 | 0.27-0.34 |
+  | 0.10 | 0.15 | 0.12-0.17 |
+  | 0.03 | 0.05 | 0.05-0.08 |
+  | 0.01 | 0.015 | 0.02-0.04 |
+
+  At a correct corner, PG's progress is the push-down of rare errors, and
+  that is exactly the term DG suppresses. Removing the trap at wrong
+  corners also brakes convergence into right ones, polynomially in the
+  error rate. Muon and Adam undo only a global scale, and DG gives common
+  terms about 1/2. Against that, the ratios are still 0.3 at eps = 0.1
+  and 0.1 at eps = 0.03.
+- **Prediction against the drill.**
+  - (a) DG's deficit sits on mostly-solved prompts.
+  - (b) Entropy stays higher, because rare errors are not pushed down.
+  - (c) Any gain sits on wrong-corner prompts.
+- **Data (bench, 512 prompts x 16, binned by step-0 correct count; step 60,
+  DG - SB, bootstrap 95%).**
+  - 5-11/16: -0.039 [-0.049, -0.028], n = 268.
+  - 12-15/16: -0.038 [-0.049, -0.028], n = 165.
+  - 1-4/16: -0.016 [-0.041, +0.010], n = 55.
+  - 0/16: +0.016 [-0.023, +0.070], n = 8.
+  - Policy entropy: DG 0.10-0.15 from step 40, against SB's 0.06-0.09.
+  - (a) and (b) hold. (c) is not significant.
+- **How much a corner escape could buy here.**
+  - At SB's plateau (step 340, bench 0.803), prompts at 4/16 or below are
+    28 of 512 and hold 25% of the remaining failures. Prompts at 12/16 or
+    above hold 35%.
+  - Self-trapping does occur under SB: 4 prompts went from 3-8/16 at step 0
+    to 0/16, and 48 prompts lost about 2.2/16 on average. It is a minority
+    of the residual.
+  - So in this distribution DG's gain is capped by a small wrong-corner
+    share, and its cost falls on the majority.
+- **Where DG could win.** A distribution dominated by wrong corners: the
+  0.000 families (`mul_decimal`, `percent_change`), or late in a plateau
+  whose residual is trapped prompts.
+  - The paper's own counterexample: with shared parameters and conflicting
+    advantages, the tabular guarantee can fail.
+  - The plateau test is cheap: switch the estimator at SB's step-300
+    checkpoint and score per-bin.
+
+### Our DG is not the paper's: it gates on outcome noise (analysis)
+
+The paper's U is the action's own advantage, with essentially no noise:
+- exact Q - V in the tabular theory, both papers;
+- a deterministic one-step reward minus a baseline on MNIST;
+- per-token deterministic rewards on Token Reversal (Bag-of-Tokens or
+  Sequential, H = 10);
+- a Retrace critic's advantage in control.
+
+Ours is the sequence outcome G - c(s_t), copied to every token. For a
+single token that is almost all noise from the other ~250 sampled tokens.
+PG is linear in U, so that noise averages out. The gate is not linear, so
+E[sigma(U l) U] != sigma(E[U] l) E[U], and DG turns the variance into a
+bias. That is a push toward surprising tokens, whatever their effect.
+
+- **An irrelevant token** (true advantage 0, G ~ Bernoulli(c), c
+  calibrated). The expected DG coefficient, divided by the common-token
+  gate 1/2, is a spurious advantage of 2 c (1 - c) [sigma((1 - c) l) -
+  sigma(-c l)]:
+
+  | | l = 1 | l = 2 | l = 3 | l = 5 |
+  |---|---|---|---|---|
+  | c = 0.2 | 0.08 | 0.14 | 0.18 | 0.23 |
+  | c = 0.4 or 0.6 | 0.12 | 0.22 | 0.30 | 0.40 |
+  | c = 0.8 | 0.08 | 0.14 | 0.18 | 0.23 |
+
+- **A harmful token** that lowers the success probability by d. It is still
+  reinforced, in expectation, for d up to:
+
+  | | l = 1 | l = 2 | l = 3 | l = 5 |
+  |---|---|---|---|---|
+  | c = 0.4 | 0.11 | 0.19 | 0.25 | 0.32 |
+  | c = 0.6 | 0.13 | 0.27 | 0.38 | 0.53 |
+  | c = 0.8 | 0.11 | 0.27 | 0.46 | 0.71 |
+
+  PG punishes every one of these. The paper's DG, on exact U, punishes
+  them too (weakly). Our DG reinforces them.
+- So the corner-escape mechanism inverts. The paper suppresses rare harmful
+  actions. Ours keeps them whenever their trajectory happens to succeed and
+  drops the failures. The two tables are an entropy pump. This explains
+  DG's entropy rise here (0.10-0.15 against 0.06-0.09), the earlier GAE-DG
+  runs' surprisal runaway to 7-10 (10-10, 10-11), the 40-degree rotation off
+  grad J, and the sharpening deficit. The correct-corner brake (section
+  above) is real too, but it applies to exact U. This bias comes on top.
+- **Paper-aligned form.** Token transitions are deterministic, so
+  Q(s_t, a_t) = V(s_{t+1}) exactly. The critic's per-action advantage is
+  A_t = c(s_{t+1}) - c(s_t), with R - c(s_T) at the last token.
+  - Gate on that and keep the unbiased multiplier:
+    omega_t = sigma(A_t l_t) (G - c(s_t)).
+  - The gate is then a function of (s, a) alone, independent of the
+    trajectory's later sampling. So E[omega | s, a] = sigma(A l)(Q - c):
+    the paper's DG with the critic's estimate of U in the gate.
+  - Critic error misplaces the gate but cannot manufacture drift. Where
+    A ~ 0, the gate is 1/2 and this is PG.
+  - Untested: whether the v7 critic's A_t carries enough per-token signal.
+    If it does not, the estimator reduces to SB rather than to an entropy
+    pump.
+
+### Correction: the outcome-noise analysis is not new, and the TD gate is not drift-free (red team)
+
+The section above overstated two things.
+
+- **The paper's sequence task broadcasts its outcome too.** The 2026-09-22
+  audit of the reference code (egg `dg.py`, section "Reference code"
+  above) found Token Reversal's reward is one sequence scalar minus the
+  group mean, copied to every token. "Per-token deterministic rewards" was
+  wrong. MNIST and control are noise-free, as stated.
+  - So the difference is one of degree: H = 10 tokens over vocab 2, every
+    one causal, against ~250 tokens of which most barely matter. The
+    09-22 simulation already showed the split: DG wins where every token
+    is causal and loses once junk tokens carry a small cost.
+  - The closed form is the 09-22 one (Osband 2603.20526 Prop. 3), here
+    divided by the common-token gate. The red team recomputed both tables.
+  - Rewards in the memory drill are binary, so the binary-G form applies.
+    To first order it is l E[U^2] / 4 for any reward distribution.
+- **The TD gate is still biased, though not by outcome noise.** With
+  c = V + e, A_hat = A + e_{t+1} - e_t and E[omega | s, a] =
+  sigma(A_hat l)(A - e_t).
+  - A signed first-order term: the baseline error e_t no longer cancels
+    where the gate varies with the token.
+  - A rectified term: per-token critic wobble is pumped toward surprising
+    tokens by about (1 - rho) l sigma_e^2 / 2. Monte Carlo at l = 3,
+    rho = 0 gives 0.004 / 0.015 / 0.051 for sigma_e 0.05 / 0.1 / 0.2,
+    against 0.318 for the outcome gate at c = 0.5.
+  - "Cannot manufacture drift" was wrong. "Cannot flip a token's expected
+    sign, and pumps at the critic error's variance instead of the
+    outcome's" is right. The docstring now says so.
+- **v10 is the precedent to watch.** `kda8_vapo_cot_v10_dg_td0` (09-22)
+  gated and stepped on TD(0) advantages from an EV ~0.01 critic. |A| was
+  about 0.01 and the gate mean 0.502, so the run was PG at half scale, and
+  the TD step then climbed the critic's errors.
+  - The TD gate keeps the step on G - c, and the v7 s520 critic has
+    all-action EV 0.34. Whether its per-token A is large enough to engage
+    the gate is the open question.
+
+Changes:
+
+- `mac/td_advantage_*` telemetry now covers non-terminal slots only. At a
+  row's last action A = r, which pulled the correlation toward 1.
+  `mac/td_advantage_calibration_slope` (r on A) is 1 for a calibrated
+  critic and about 1/2 when critic noise dominates.
+- The test oracle forms A from the rewards and c (rew_t + c_{t+1} - c_t),
+  not from the trainer's r_t - r_{t+1}, with a reward before the last
+  action.
+- CUDA parity covers `delightful_td_gate` (job 14353); the drill (job
+  14354) waits on it.
+- **Placebo dropped (job 14346 cancelled before start).** Permuting rewards
+  within a group leaves the critic intact. For the TD gate, the
+  multiplier's mean becomes p - c(s_t), nonzero because c tracks the real
+  outcome, so the placebo shows a drift that exists only in the placebo.
+  Even SB is not zero-mean there: a trajectory keeps its own reward with
+  probability 1/16. A clean null would need R' ~ Bernoulli(leave-one-out
+  group mean) and a constant group baseline. That would test only the
+  outcome gate's mechanism, which is already derived, so it was not built,
+  and `--placebo-seed` was removed from `estimator_gradient_alignment.py`.
+  `scripts/estimator_mean_gradients.py` (cross-pool Gram of any series
+  pairs) stays for reading TD against SB and DG.
+- **Drill evidence criterion.** The drill counts as evidence for the TD
+  gate only if the gate is active: a weighted gate mass away from 1/2 on
+  non-terminal tokens, and a TD advantage RMS not dominated by the last
+  slot.
+  - If it is inert, the run is SB under a rescale that Muon and Adam
+    undo, and its result says nothing about the gate.
+  - If it is active, it is compared with memory SB step for step and by
+    difficulty bin.
+
+### Result: the TD gate at the start policy (job 14345)
+
+The v7 s520 pools and critic, 8 pools, against `v7_s520` SB and DG.
+Output: `postraining/runs/estimator_alignment_20261020/alignment_v7_s520_td.json`.
+
+- **The critic's per-token advantage is mostly noise.** Over non-terminal
+  slots, the slope of r on A is 0.52 in every pool (0.516-0.523), the
+  pure-noise value. RMS(A) is 0.077 and corr(A, r) is 0.10. The critic
+  separates outcomes (EV 0.34) through its level, not through its token
+  differences.
+- **The gate is weakly active, and on noise.**
+
+  | | TD gate | outcome DG |
+  |---|---|---|
+  | gate mass mean, r > 0 / r < 0 | 0.517 / 0.452 | 0.647 / 0.278 |
+  | active mass share, r > 0 / r < 0 | 3% / 12% | 21% / 46% |
+  | non-terminal mass mean / active share (drill step 1) | 0.471 / 9.8% | - |
+
+- **It still rotates the mean and costs gain** (Muon matrices, paired
+  against SB, jackknife SE):
+
+  | | cos_bias | snr | muon_gain_step | muon_gain_avg |
+  |---|---|---|---|---|
+  | SB | 0.9998 | 0.161 | 0.0531 | 0.0870 |
+  | TD gate | 0.812 ± 0.030 | 0.172 | -0.0043 ± 0.0011 | -0.0076 ± 0.0011 |
+  | outcome DG | 0.763 ± 0.042 | 0.172 | -0.0059 ± 0.0021 | -0.0137 ± 0.0022 |
+
+  - It keeps about 80% of DG's rotation off grad J and about 55% of
+    DG's averaged-gain deficit. The SNR does not improve.
+  - A 10% active share moving cos to 0.81 fits the gradient's weight
+    sitting on surprising tokens, where l is large enough for
+    |A l| ~ 0.2-0.6 from noise alone. That is inferred, not measured.
+- **Reading.** The paper's DG needs U to be the action's advantage. This
+  critic's token differences are not that, so the TD gate is DG on critic
+  noise: smaller than outcome noise, but not signal. First-order, it should
+  land between SB and DG. Corner escape is a multi-step effect that this
+  measurement cannot see, so the drill (job 14354) decides.
+  - No early cull: the drill runs to its time limit, and is compared with SB
+    (bench 0.624 / 0.653 / 0.682 at steps 20 / 40 / 60) and DG (0.619 /
+    0.638 / 0.647).
+  - A paper-aligned DG here needs a critic whose differences track
+    advantages (slope near 1). The gate is then the cheap part.
+
+### Result: the TD-gated DG drill loses to SB and turns over (job 14354)
+
+`postraining/runs/mac_delightful_td_gate_memory_drill_20261020`, the memory
+SB drill's config with `--mac-estimator delightful_td_gate`. It ran to its
+45-minute limit, step 141, with no early cull.
+
+- **Bench** (8,192 samples, 512 prompts x 16):
+
+  | step | 20 | 40 | 60 | 80 | 100 | 120 | 140 |
+  |---|---|---|---|---|---|---|---|
+  | SB | 0.624 | 0.653 | 0.682 | 0.704 | 0.724 | 0.735 | 0.745 |
+  | TD gate | 0.621 | 0.645 | 0.668 | 0.684 | 0.691 | 0.691 | 0.680 |
+  | outcome DG | 0.619 | 0.638 | 0.647 | - | - | - | - |
+
+  - At step 140, paired by prompt: TD - SB = -0.065 ± 0.0045.
+  - By difficulty (step-0 correct count of the two runs, averaged):
+    - 1-4/16: -0.082 ± 0.019;
+    - 5-10: -0.074 ± 0.007;
+    - 11-15: -0.057 ± 0.005;
+    - 16: -0.035 ± 0.023;
+    - 0/16 (8 prompts): +0.016 ± 0.010.
+  - The hard prompts lose most. Nothing here looks like corner escape.
+  - At step 60 the deficit was -0.013 ± 0.003, mostly on 5-15/16, the
+    same shape as outcome DG's.
+- **Format degrades.** Structural format went 0.990 -> 0.978 and ended
+  0.998 -> 0.9955 (SB 0.994 -> 0.996 and 0.999).
+- **Train telemetry by 20-step block (TD; SB in brackets):**
+  - Policy entropy: 0.094 -> 0.079 at steps 60-100 [0.087 -> 0.044],
+    then 0.089 and 0.124 at steps 120-140 [0.047, 0.039].
+  - Stream length: 416 -> 507 [398 -> 350].
+  - The critic's slope stays at 0.515-0.520 [0.509-0.520]. Its token
+    resolution never improves.
+  - The gate grows more active as the policy sharpens:
+    - non-terminal active mass share 0.088 -> 0.178;
+    - r < 0 mass mean 0.450 -> 0.396;
+    - r > 0 mass mean about 0.51 throughout.
+  - `credit/failed_advantage_surprisal_corr` 0.16 -> 0.22 [0.13 -> 0.15].
+- **Reading (the mechanism is inferred from the telemetry):**
+  - The gate acts mainly on failures. sigma(A l) < 1/2 there removes
+    blame from surprising tokens, and the positive side stays near 1/2.
+  - As the policy sharpens, the surviving rare tokens carry larger l, so
+    critic noise moves the gate more. More blame is removed, and more rare
+    tokens survive. Entropy turns up at step 120 and accuracy follows.
+  - DG's suppression of blame on rare failing actions is by design, but
+    here it is fed by A that is about 96% critic error (slope 0.52).
+- **Verdict.**
+  - Gating DG on this critic's TD residual is not a fix. At step 60 it
+    trails SB by less than outcome DG did (-0.013 against -0.035). It
+    then plateaus and turns over, while SB keeps rising. Outcome DG was
+    cancelled at step 67, so the two cannot be compared past that point.
+  - Paper-aligned DG here needs per-token advantages that are mostly
+    signal, a critic with slope near 1. That is the same requirement
+    all-action MAC and the TD3 ideas have.
+  - The proposed next steps:
+    1. the action head's own advantage calibration;
+    2. sibling-branch supervision of critic differences at decision
+       tokens;
+    3. a shrinkage gate sigma(beta A l) with beta = 2 slope - 1 as the
+       safe default.
+
+### Analysis: decision tokens carry large Q gaps; the action head resolves part of them; DG's blame suppression does not need noise (2026-10-21)
+
+CPU only, existing artifacts:
+- the v7 critic study's `branch_predictions.jsonl`: 512 held-out think
+  positions with pi(a_t) <= 0.98, one per trajectory, the taken token and a
+  policy-drawn alternative, 32 continuations each, scored at every fit step;
+- `branches.parquet` from `dg_critic_study_branches_20261014_v2`.
+
+Script `scripts/analyze_branch_gap_signal.py`, output
+`postraining/runs/dg_twin_critic_study_v7_20261020/branch_gap_signal.json`.
+Red-teamed by a subagent; its key numbers reproduced.
+
+- **Real per-token signal exists at decision tokens.**
+  - The true gap D = Q(s, a_t) - Q(s, a') has SD 0.386 after subtracting
+    the binomial noise. The arms are independently seeded; their residual
+    correlation is 0.002.
+  - 42% of pairs are resolved at 2 noise SD, about 2.5 points of that from
+    degenerate 0/32 vs 32/32 arms.
+  - Positions are early (median 59). pi(a_t) is bimodal: 46% below 0.5,
+    36% above 0.9.
+- **The action head is partly calibrated, not fully.**
+  - Pooled, the slope of g on its predicted gap u.(x(a) - x(a')) is
+    0.89-1.01. But that is Simpson-inflated by between-bin structure that
+    the head under-predicts about 3.5x and the log-prior captures.
+
+    | pi(a_t) | n | mean g | mean predicted | within-bin slope |
+    |---|---|---|---|---|
+    | <= 0.3 | 195 | -0.008 | +0.010 | 0.69 |
+    | 0.3-0.6 | 53 | +0.055 | +0.073 | 0.80 |
+    | 0.6-0.9 | 82 | +0.256 | +0.052 | 0.87 |
+    | > 0.9 | 182 | +0.371 | +0.107 | 0.53 |
+
+  - Within bins the slope is 0.71 at fit step 520 (0.81 at step 20), with
+    R^2 about 0.11.
+  - Against the log-prior gap: R^2 0.156 for the prior, 0.21-0.22 jointly.
+    The critic's coefficient beyond the prior is 0.63-0.70 ± 0.09.
+  - Fitting barely improves it (pooled R^2 0.134 at step 20, 0.152 at
+    520).
+  - In sum over a trajectory it is calibrated: the within-prompt slope of
+    reward on the head's think advantages is 0.97 (0.89-1.05).
+  - At the rare-token tail it is shrunk. At pi <= 0.1, mean |A_head l| is
+    0.59 against 1.88 for the single-sample truth, which noise inflates.
+    Rare taken tokens at peaked states (n = 27) have g = -0.22, while the
+    head says -0.06.
+  - All of this is at the frozen step-0 policy. Calibration under the
+    drills' online fit and policy drift is unmeasured.
+- **This does not overturn the TD-gate reading.** Over all non-terminal
+  tokens, the r-on-A slope of 0.52 does mean about 4% signal for the
+  state-value difference.
+  - The shared -e_t is what puts the zero-signal slope at 1/2, for any
+    error autocorrelation. I briefly claimed it "contaminated" the
+    statistic. That was wrong, and so was the proposed G-on-A replacement:
+    it carries the same information under the same assumptions, and
+    critic shrinkage biases it.
+  - The two results fit together: the signal is concentrated on few
+    decision tokens, which the head partly resolves and the value
+    difference does not.
+- **DG's blame suppression is first-order and independent of U's quality**
+  (derived).
+  - With exact A, per state, DG - PG/2 = sum_a pi_a w_a (e_a - pi), with
+    w_a = (sigma(A_a l_a) - 1/2) A_a >= 0 for either sign of A.
+  - That is a nonnegative pseudo-reward for consequential surprising
+    tokens, bad ones included. It cannot flip a bad token's sign, but it
+    slows the decay of bad tail mass, from about pi|A| to about
+    pi^(1+|A|)|A|.
+  - So the expected entropy effect against SB is positive whether or not U
+    is correct.
+  - Here rare tokens at peaked states are bad on average (g = -0.22). On
+    failed rare tokens (pi < 0.3, n = 80), the head gate averages 0.467 and
+    the truth-based gate 0.416, which noise biases toward 1/2.
+  - A better U would suppress blame on the actual culprits more strongly,
+    not less. This is the direction of the pump that the TD-gate drill's
+    telemetry points to.
+  - Inference: a head-gated DG removes the noise-rectification term but
+    keeps the deliberate one.
+- **Hypotheses and what separates them:**
+  - "No per-token signal": refuted at decision tokens.
+  - "Signal exists, but the value difference cannot see it": supported
+    indirectly. The value difference was not measured at branch positions.
+  - "DG hurts here because of noisy U": the drill alone cannot separate
+    this from "DG hurts here because its suppression is wrong for a task
+    whose rare tokens are mostly bad". The second needs no noise.
+  - The memory perturbation sweep (job 14344, cancelled by request; the
+    records do not show by whom) is partial and local to one checkpoint
+    along one direction. It does not bound memory learning in general.
+- **Smallest discriminating experiment (proposed, not run):** one
+  alignment job like 14345, on the v7_s520 pools and critic.
+  - Three arms: SB; DG gated on A_head (the kernel's `target_advantages`
+    passed as `gate_advantages`); and DG gated on A_head shuffled across
+    tokens within pi(a_t) bins. The shuffle keeps |A| l's marginal and
+    drops the information.
+  - Readouts: cos_bias and Muon gains against SB, plus the projection of
+    each mean update on the entropy gradient.
+  - Reading:
+    - If head-gated is no better than shuffled and both project positively
+      on entropy, the suppression hurts regardless of U, and DG is retired
+      here.
+    - If head-gated matches SB while shuffled loses, U quality matters and
+      a drill is justified.
+  - It is first-order only, but 14345 did predict the TD drill's loss.
+
+## Antithetic memory perturbation sweep: pre-registration (2026-10-20)
+
+Step 1 of the revised order in `docs/memory_write_critic_plan_20261020.md`.
+No critic is trained and no optimizer step is taken. The question is whether
+moving the gated-delta memory writer (or, separately, the reader's output
+projection) changes the return by an amount we can detect. A second question
+is whether the token-path (truncated) policy gradient predicts that change.
+
+**Policy and pools.** The policy is the memory drill's final snapshot,
+`mac_sampled_baseline_memory_drill_20261020/snapshots/step_000340.pt`,
+loaded via `--curriculum-init` with `--rollout-only`. The environment flags
+are the drill's (`scripts/submit_memory_perturbation_sweep_20261020.sh main`):
+64 prompts x 16 samples per pool, temperature 1, and compiled decode.
+
+**Estimator.**
+- Common random numbers: Gumbel-max sampling is keyed by
+  `(seed << 32) ^ cursor`, so rewinding the cursor replays the same prompts
+  and the same noise.
+- For each direction d and scale delta, we collect at theta + delta d and at
+  theta - delta d. The estimate is D = E[G+ - G-] / (2 delta), with the SE
+  clustered by prompt.
+- Every direction lives in the RMS-relative metric: P = per-tensor rms^2, and
+  each direction has metric norm sqrt(n).
+- The parameter digest is checked after every pool, and restoring the
+  parameters is a copy-back.
+
+**Targets.**
+- `writer`: the key, value, write-gate and decay-gate weights, with biases
+  excluded. Key and value make up 98.5% of the elements, so this is in effect
+  a kv measurement.
+- `reader_out`: `combiner.reader.out.weight`.
+
+**Directions.**
+- (a) One seeded Gaussian direction per test pool, scaled by rms.
+- (b) The token-path gradient direction P g_bar, with g_bar the mean
+  sampled-baseline actor gradient over the first 16 warmup pools. Those
+  pools get a base collect and a gradient only. The snapshot critic is the
+  baseline, and the gradient is converted to grad J by -E/N.
+- (c) Radial (theta). For reader_out, the minus sign at delta = 1 is exactly
+  the read-ablated policy.
+
+**Scales and budget.** Scales are delta = 0.25 and 1. Every test pool also
+re-collects at theta as a null control, and is scored against the same-pool
+token prediction g_k . d.
+
+**Calibration, job 14335.** Two pools, with the direction taken from one
+prior pool. This is not evidence.
+- The null re-collect was bitwise: 0 of 2048 trajectories changed.
+- Collects take about 5 s, after a pool-0 compile of about 214 s.
+- Flip rates:
+  - random: writer 4-5% at 0.25 and 16-21% at 1; reader_out 3-5% at both
+    scales. The near-flat reader_out rate suggests a jitter floor (inferred,
+    not verified).
+  - gradient direction: writer 35-47%; reader_out 10-34%.
+- Writer gradient direction:
+  - delta = 1: D +0.0117 +/- 0.0041, against a same-pool token prediction of
+    +0.0115.
+  - Curvature at delta = 1: -0.086 +/- 0.022. So delta = 1 is past the linear
+    range and delta = 0.25 is the derivative scale.
+- One cross-pool pair puts the token-gradient signal fraction at about 0.016
+  (writer) and 0.021 (reader_out).
+
+**Predictions (stated before the run).**
+- Random directions: E[D^2] - floor stays within noise. The floor/signal
+  ratio is about 150-700, so a null here does not show the memory is inert.
+  It shows that isotropic ES is infeasible at this budget.
+- Averaging 16 warmup pools should lift cos(g_bar, grad J) to about 0.5,
+  assuming the cross-pool signal fraction holds. Predicted gradient-direction
+  D at delta = 0.25:
+  - writer: about 0.03-0.05
+  - reader_out: about 0.01-0.015
+- With about 12-15 test pools, the prompt-clustered SE should be about 0.004
+  (writer) at delta = 0.25.
+- If the token path is unbiased, measured minus token prediction is about 0.
+  Because the token gradient detaches the memory state across steps, it
+  misses the write -> later-read path. That path would show up as a residual.
+- Read ablation (reader_out radial, minus sign, delta = 1): |J(ablated) -
+  J(base)| < 0.02.
+
+**Success criteria.**
+- Signal exists if the writer gradient-direction D at delta = 0.25 is at
+  least 3 SE from 0.
+- Truncation matters if the residual (measured - token) is at least 3 SE
+  from 0 on either target.
+- The linearity check compares D(0.25) with D(1).
+
+**Failure modes.**
+- Batch-bucket schedule jitter adds variance. It does not add bias, but this
+  is inferred, not verified.
+- Under a 2x CPU slowdown the deadline may stop the run before 12 test pools.
+- Writer gradient flips near 50% at delta = 1 mean the CRN coupling is
+  mostly decorrelated there.
+- This is not the plan's per-slot rho^2. It measures ES feasibility and
+  token-path truncation bias.
+
+**Red-team changes before launch.**
+- The gradient direction is fixed from the warmup pools, so it is
+  independent of the test pools.
+- Random-direction statistics are computed per direction. rho^2 is
+  delta^2 (E[D^2] - floor) / Var(G), and linearity covers only the fixed
+  directions.
+- Restore is checked by digest.
+- The deadline estimate uses the slowest collect.
+
+The analysis is
+`.venv/bin/python scripts/analyze_perturbation_sweep.py postraining/runs/memory_perturbation_sweep_20261020 --json <path>`.
+
+## Antithetic memory perturbation sweep: result (2026-10-21)
+
+**Run.** Job 14344 (`postraining/runs/memory_perturbation_sweep_20261020`)
+was cancelled by request (SIGTERM) after 28 pools: 16 warmup and 12 test.
+The last test pool lacks some reader_out records. Records are written
+incrementally, so everything below comes from the completed records.
+The analysis is in
+`postraining/runs/memory_perturbation_sweep_20261020/perturbation_analysis.json`.
+SEs are clustered by prompt, over about 704-768 clusters.
+
+**Controls.**
+- Null re-collect: 0 trajectories changed in 12 of 12 pools.
+- Writer weights = 0 and reader.out = 0 gave bitwise-identical rewards and
+  lengths in all 11 shared pools. Both are the no-memory policy, which is
+  what the shared-noise coupling (CRN) predicts.
+
+**The memory is used.**
+- Read ablation: J(off) - J(base) = -0.0210 +/- 0.0029 (z -7.3), from a base
+  return of 0.857. That is outside the pre-registered |dJ| < 0.02, but only
+  just.
+- Doubling the weights also hurts:
+  - writer x2: -0.048 +/- 0.004
+  - reader.out x2: -0.014 +/- 0.003
+
+**Writer gradient direction (warmup-fixed).**
+- delta = 0.25: D = +0.0259 +/- 0.0051 (z 5.1), positive in 12 of 12 pools.
+  This meets the pre-registered signal criterion.
+- But both signs lose return:
+  - +0.25: -0.011 +/- 0.002
+  - -0.25: -0.024 +/- 0.003
+  - curvature: -0.56 +/- 0.07
+- delta = 1:
+  - +1: -0.126
+  - -1: -0.044
+  - So D = -0.041 +/- 0.004.
+- Reading: the snapshot is near a sharp, asymmetric local maximum along this
+  direction. Under a quadratic fit, the best step is about 0.05 metric units
+  for about +0.0006 return. Even delta = 0.25 is outside the linear range,
+  because P g concentrates the step on few elements.
+
+**reader_out gradient direction.**
+- delta = 0.25: D = +0.0078 +/- 0.0045 (z 1.7), against a token prediction
+  of +0.0072 +/- 0.0037. This agrees but is not significant.
+
+**Random directions.** E[D^2] - floor is consistent with 0 at both scales and
+on both targets, as predicted.
+- Two-SE upper bound on |P^1/2 grad J| at delta = 1: 0.0029 (writer) and
+  0.0012 (reader_out).
+- The token-path cross-pool estimates are 2.0e-4 (z 1.6) and 4e-5 (z 1.0).
+- So isotropic ES cannot see this gradient at this budget.
+
+**Token path versus measured: inconclusive.**
+- Writer same-pool prediction g_k . d: +0.048 +/- 0.044, measured +0.026.
+- The per-pool token gradient is too noisy along d to resolve truncation
+  bias. The delta = 0.25 slope also carries the nonlinearity.
+- The delta = 1 residuals (writer z -2.0, reader_out z -7.4) are curvature,
+  not evidence about truncation.
+- Resolving truncation needs smaller delta (about 0.05) and many more test
+  pools per prediction.
+
+## Antithetic write-noise sweep: pre-registration (2026-10-21)
+
+Stage B of `docs/memory_write_critic_plan_20261020.md`, the measurement gate
+for a write critic Q_w = b + A(eps). No critic is trained and no optimizer
+step is taken. The parameter sweep above measures moves of the writer's
+weights. This sweep measures what a DDPG-style write critic would learn
+from: per-slot exploration noise on the writes themselves.
+
+**Noise (Stage A, `postraining/memory_carry.py`).**
+- Absolute Gaussian noise sigma eps is added to the writer pre-activations:
+  the pre-norm key, the value, the decay logit and the write logit. That is
+  2HK + 2H = 520 coordinates per generated slot.
+- eps is counter-keyed on (the row's noise seed, the producing slot's
+  unpadded index), in its own hash domain. Replay regenerates it exactly.
+- -sigma is the exact antithetic, and sigma = 0 is the noiseless writer.
+- Prompt writes are never noised, so noise first moves the 3rd emitted
+  token.
+- The noise seeds are separate from the token seeds. Here every sample of a
+  prompt shares one noise pattern, while its tokens stay independently
+  seeded.
+
+**Policy and pools.** The policy is the memory drill's step-340 snapshot,
+with the same environment flags as the parameter sweep:
+`scripts/submit_memory_write_noise_sweep_20261021.sh`. The scales are 0.03,
+0.1, 0.3 and 1. Each pool collects:
+- a noiseless base;
+- a null re-collect, which must reproduce every token and is checked before
+  any explored collect;
+- +s and -s at each scale.
+
+That is 10 collects per pool. The run stops at a pool boundary by
+`--max-train-hours 0.68`.
+
+**Estimators (`scripts/analyze_write_noise_sweep.py`).**
+- Per trajectory:
+  - D = (G(+s) - G(-s)) / 2, the odd, first-order response.
+  - C = (G(+s) + G(-s)) / 2 - G(0), the even response.
+- `lower` is the within-prompt cross product of D. It is an unbiased
+  estimate of Var(E[D | prompt, eps]), the slope a prompt-and-noise critic
+  can learn.
+- `upper` is E[D^2], which also includes the continuation noise after a
+  flip.
+- `control` is the same product across neighbouring prompts, whose noise is
+  independent.
+- `even_lower` is the within-prompt cross product of C.
+- Both bounds are on the odd response only. A response to the noise's
+  magnitude appears only in `cost` and `even_lower`.
+
+**Predictions (stated before the run).**
+- Flip rates: about 1% or less at 0.03, 1-3% at 0.1, about 5% at 0.3 and
+  15-25% at 1.
+  - Anchor: a random writer parameter move of RMS-relative 0.25 flipped
+    4-5% of trajectories.
+  - This is uncertain. Per-slot independent noise may average out in the
+    memory state more than a coherent parameter move does.
+- `upper` scales roughly as s, because it is dominated by flips.
+- If there is signal, `lower` scales as s^2.
+- Given the null random-direction result above, I expect `lower` to be
+  consistent with 0 at 0.03 and 0.1. A detection, if any, should appear at
+  0.3-1.
+
+**Success criteria.**
+- Signal exists if, at some scale, `lower` is at least 3 SE above 0,
+  `|control|` is under 2 SE, and every null is bitwise.
+- Stage C (a state-independent write critic plus a DPG writer term) is
+  worth building only if:
+  - `pools_to_half_fidelity` is at most 340 (the drill's length);
+  - at a scale whose flip rate is at most 25%.
+- Otherwise, a write critic needs a state-conditioned A. Its headroom is
+  `upper`, which this sweep cannot split from flip noise. That is a
+  separate decision.
+
+**Known failure modes (from the red team, before launch).**
+- Samples are not exactly independent given the noise: decode batch shape
+  follows when other rows stop, and that moves low logit bits. `control` is
+  the check that this coupling is small next to `lower`.
+  - The null cannot see it, because base and null have the same shapes.
+- Code rewards run under wall-clock test timeouts, so identical tokens can
+  score differently. This adds verifier noise to D, and is logged per pool
+  as `null/reward_shift`.
+- Stage A replay materialises the noise hashes at every slot. That costs
+  memory in training replay, but not here (rollout-only).
+
+The analysis is
+`.venv/bin/python scripts/analyze_write_noise_sweep.py postraining/runs/memory_write_noise_sweep_20261021/write_noise_sweep --json <path>`.
+
+## Antithetic write-noise sweep: result (2026-10-21)
+
+The run is job 14376 (`memory_write_noise_sweep_20261021`), after CUDA
+parity job 14373 passed. I cancelled it by hand at 34 complete pools,
+roughly halfway through its 0.68 h budget, because the decision was already
+settled (below).
+
+The analysis is in `postraining/runs/memory_write_noise_sweep_20261021/analysis.json`.
+- It covers 34 pools x 1024 trajectories.
+- All 34 nulls were bitwise, with a null reward shift of 0.
+- The within-prompt return variance is 0.0952.
+
+| scale | flip rate | lower (rho2) | upper (rho2) | control | cost |
+|---|---|---|---|---|---|
+| 0.03 | 3.7% | -2e-5 +/- 6e-5 | 0.019 | +1e-6 +/- 2e-6 | +0.0002 +/- 0.0004 |
+| 0.1 | 3.7% | +4e-5 +/- 5e-5 | 0.022 | +2e-6 +/- 3e-6 | +0.0001 +/- 0.0004 |
+| 0.3 | 4.2% | -7e-5 +/- 6e-5 | 0.027 | -3e-6 +/- 3e-6 | +0.0002 +/- 0.0004 |
+| 1 | 8.3% | +3e-5 +/- 1.1e-4 | 0.039 | -9e-6 +/- 5e-6 | -0.0010 +/- 0.0006 |
+
+**No signal, so the gate fails.**
+- `lower` (rho2) is consistent with 0 at every scale.
+- The go condition needed pools_to_half_fidelity <= 340, that is
+  rho2_lower >= 520 / (340 x 1024) = 1.5e-3.
+- The two-SE upper limit at scale 1 is 2.5e-4, six times below that.
+- `even_lower` is also about 0 at every scale, so no magnitude response is
+  hiding from D.
+- Per the pre-registration, a state-independent write critic with a DPG
+  writer term (Stage C as planned) is not built.
+
+**A flip floor I did not predict.**
+- About 2.1% of trajectories flip under both +s and -s at every scale from
+  0.03 to 0.3. If the two signs flipped independently, about 0.14% would.
+- So the flip rate is flat at about 3.7-4.2% up to 0.3. Only at 1 does
+  noise-driven flipping add about 4.6 points, and the median first
+  divergence moves from token 130 to token 42.
+- My reading: any nonzero noise trips the same fragile trajectories. Two
+  mechanisms could do this, and this sweep cannot tell them apart:
+  - near-ties at bf16 resolution;
+  - the batch-shape cascade from rows whose length changed.
+- So `upper` at s <= 0.3 is mostly this floor, not a response to eps.
+- The noise-attributable state-conditioned headroom at scale 1 is roughly
+  rho2_upper(1) - rho2_upper(0.03), about 0.02. This is an inference from
+  the difference of two upper bounds, not a measurement.
+
+**Consistency with the parameter sweep.**
+- The memory is used: read ablation costs -0.021 (z -7.3).
+- But per-slot independent write exploration moves the return by nothing
+  measurable at the prompt level, and isotropic weight moves did not
+  either.
+- What the return responds to is coherent moves of the writer, such as the
+  token-gradient direction, which sits at a sharp local maximum.
+- Inference, not tested: i.i.d. per-slot perturbations average out through
+  the delta-rule accumulation and the normalized keys before any read.
+
+**Correction to the parameter-sweep pre-registration (2026-10-20).**
+- That entry says the token gradient "detaches the memory state across
+  steps" and so misses the write -> later-read path. That is wrong.
+- The replay scan backpropagates every read through every earlier write
+  (`postraining/memory_carry.py` docstring; the MAC-under-memory entry).
+- What is cut is different:
+  - the written beliefs are detached, so the trunk is never trained to put
+    anything into h_t for the memory;
+  - the read -> trunk -> next belief -> write loop is cut too.
+
+## Memory as a fresh module: optimizer diagnosis and drill pre-registration (2026-10-21)
+
+**Diagnosis (measured from the memory drill's snapshots).** The memory was
+never trained in any real sense. Weight RMS, and the RMS change from step 20
+to step 340:
+
+| parameter | RMS at 20 | change 20 -> 340 |
+|---|---|---|
+| writer key | 0.0441 | 0.0013 (3%) |
+| writer value | 0.0442 | 0.0019 (4%) |
+| reader query | 0.0312 | 0.0013 (4%) |
+| reader out (zero-init) | 0.0001 | 0.0007 |
+| write/decay gate weights | ~0.0002 | ~0.004 |
+
+- All of these sat in the actor's AdamW at the trunk's fine-tune rate, 2e-5.
+  The critic's memory reader sat in the critic's AdamW at 2e-5 too.
+- On top of that, the zero-init read projection gates the writer's and the
+  query's gradients.
+- So the write-noise sweep above measured a random-projection memory with a
+  near-silent reader. Its null says nothing about a trained memory.
+
+**Change.** `--fresh-learning-rate` (with `--fresh-muon-learning-rate`
+derived from it) moves the fresh modules into their own optimizers, using
+pretraining's partition:
+- What moves: the actor's `new_parameters()`, plus the critic's
+  `fresh_parameters()` (the memory reader and the Q heads' actor-belief
+  projections).
+- Matrices (ndim >= 2, gate projections included, as pretraining did for
+  KDA's) go under Muon: `<role>_fresh_muon`.
+- 1-D parameters go under AdamW: `<role>_fresh`.
+- The optimizer names are the resume layout. An initialization checkpoint
+  must have trained at the same fresh rate.
+
+**Drill (`scripts/submit_mac_sampled_baseline_memory_fresh_lr_drill_20261021.sh`).**
+- This is the memory drill (jobs 14311/14316) with one change:
+  `--fresh-learning-rate 3e-3`. That gives Muon 7.25e-3 and AdamW 3e-3, a
+  fifth of pretraining's from-scratch rates.
+- From the red team's arithmetic:
+  - each Muon step moves a 256x512 element by about 3.2e-4, about 0.7% of
+    the key/value init RMS;
+  - a gate logit can shift by up to about 0.16 per coherent step.
+
+**Predictions (before the run).**
+- The read share leaves the 2% regime: more than 10% of the input RMS by
+  step 100.
+- Key/value drift from init exceeds 20% by step 340.
+- I don't know whether the token-path gradient carries enough signal. In the
+  parameter sweep its cross-pool signal fraction was about 0.02. With Muon's
+  fixed-size steps, a signal-free gradient random-walks the memory.
+
+**Criteria.** Bench is 512 held-out prompts x 16 samples, compared step for
+step against 14165 and the memory drill.
+- Win: the mean over bench evals from step 200 to step 340 is at least
+  +0.015 above 14165's.
+- Null: within +/- 0.01.
+- Harm: below 14165 by more than 0.015, or the bench stop floor fires.
+- Also inspect:
+  - the read share and the gate distributions (write beta, decay timescale)
+    for saturation;
+  - the critic reader's weights;
+  - sampled traces if bench moves.
+- A null with a grown read share means the memory is used but not useful
+  under this gradient. That points at the detached-belief content path (the
+  multi-pass belief backward). A null with no growth means the rate or the
+  signal is still the limit.
+
+**Launch.** The first attempt (job 14391) crashed at its first train step,
+after the step-0 bench (0.5958): `combiner_weight_telemetry` used
+`MemoryReader` without importing it, and no CPU test passed it a memory
+critic (one does now). No update ran. The drill runs unchanged as
+`mac_sampled_baseline_memory_fresh_lr_drill_20261021_r2` (jobs 14395, then
+14396 resuming). The predictions above stand.
+
+**Early read and default (2026-10-21).** Bench against 14165 and the
+shared-AdamW memory drill at the same steps: step 20 0.676 vs 0.620 / 0.624;
+step 40 0.726 vs 0.649 / 0.653. On the user's call, `--reasoning-mode memory`
+now defaults to `--fresh-learning-rate 3e-3` (`MEMORY_FRESH_LEARNING_RATE`,
+`postraining/vapo/config.py`); carry and latent keep their fresh modules in
+the shared AdamW, untested at a fresh rate. Caveats:
+- This was decided at step 40. The pre-registered window is steps 200-340,
+  and the earlier memory drill's +0.017 lead at step 200 closed by step 260.
+- Memory runs can no longer select the shared-AdamW layout, so pre-change
+  memory checkpoints (14311/14316) cannot be resumed or used as
+  `--actor-init`; the init check refuses a fresh-rate mismatch.
+
+**Ended (2026-10-21).** Cancelled by the user at step about 300 of 360
+(snapshots through step 300). Bench 0.794-0.800 from step 180 to 300
+(0.7946, 0.7944, 0.7963, 0.7960, 0.7997, 0.7974, 0.798); 14165 was 0.787 at
+240. The pre-registered window was not completed. Read: a null or a small
+win over 14165 at matched steps, not the early +0.08.
+
+## Where the hard drill cells fail: a step-level error anatomy (2026-10-21)
+
+CPU analysis of full bench captures (512 problems x 16 samples, every
+answer saved) from the fresh-rate memory drill: the start policy (step 0),
+step 60 and step 300 (jobs 14406-14408,
+`scripts/submit_drill_step_error_bench_20261021.sh`; the captures reproduce
+the drill's own bench, 0.596 / 0.764 / 0.798). Tools:
+- `scripts/analyze_drill_step_errors.py`: rebuilds every held-out
+  problem's canonical working under each digit order from the cell seed,
+  compares computation lines (`=`, `->`, `Digits from`) and reports the
+  first divergent line. Restatements are skipped: the policy rewords and
+  corrupts them in correct attempts.
+- `scripts/analyze_sibling_prefix_credit.py`: the prefix trie of each
+  16-sample group, checked against the step checker's culprit token.
+Outputs are `step_errors.json` and `sibling_prefix_credit.json` in each
+capture's run directory.
+
+- **A divergent computation line is fatal.** P(correct | diverged) is
+  0.00-0.07 on integer add/sub and 0.01-0.04 on decimal sub at every step.
+  It is higher on mul/percent (0.2-0.7), where divergence includes
+  self-consistent alternative chains, so treat those modules' localisation
+  as approximate.
+- **Most errors are low-hazard slips.** Per (problem, line) with at least 6
+  siblings reaching it with a correct prefix, the failure rate is under 0.2
+  in about 88% of cells (sub_integer_d5/d6). They are not confident wrong
+  modes.
+- **But a few step types carry most of the hard cells' failures, and RL
+  does not lower them.**
+  - Subtraction, borrow decision. Of columns reached with a correct
+    prefix, wrong-decision rate (integers, steps 0 / 60 / 300):
+
+    | Case | Step 0 | Step 60 | Step 300 |
+    |---|---|---|---|
+    | Real borrow (top < bottom) | 0.297 | 0.074 | 0.030 |
+    | Equal digits | 0.145 | 0.182 | 0.201 |
+    | Equal digits, after a borrow | 0.169 | 0.127 | 0.160 |
+    | Top > bottom | 0.009 | 0.011 | 0.024 |
+
+    Decimals: equal-after-borrow 0.20 / 0.24 / 0.19. The step-0 real-borrow
+    rate is inflated: it was scored against the column method only.
+  - The real-borrow decision improved; the equal-digit decision stayed at
+    15-20% and phantom borrows on top > bottom doubled. The typical error is
+    "thousands: 4 is less than 4, borrow ten: 14 - 4 = 8".
+  - The template emits the decision (" is less than" vs " -") right after
+    the top digit, before the bottom digit appears on the line. The model
+    must look the digit up in the prompt and compare in one token. The
+    decrement is also folded into the copied digit ("5 after the borrow").
+  - sub_integer_d6 fell under RL: 0.530 / 0.484 / 0.467. Its operand errors
+    rose from 21 to 71.
+  - mul_decimal_d3: RL collapsed it onto the column method (151/185 to
+    336/0). Its column arithmetic lines have hazard 0.009-0.03. The partial
+    product readouts ("Digits from the ones place: 6 8 1 8 5 1 -> 158186,
+    shifted 1 place -> 1581860") have 0.12-0.22 per line, flat from step 60
+    (0.223) to 300 (0.205). They reverse a digit list and append zeros in
+    one line. The next error is misreading the leftmost digit of an earlier
+    partial product in the addition chain.
+- **Ungraded text degrades.** In correct attempts at step 300:
+  - "That whole-number sum is 77bt + 2952" on a subtraction;
+  - "multiply 438 by 9" for 99;
+  - the lead "Add the columns in turn ... carrying over" on subtractions.
+  Garbage also appears inside graded lines ("shifted 1 place -> 15818
+  degree herds or fractional toward theGeometric Mean").
+- **The sibling-prefix baseline (proposed, not built) would not fix the
+  slips.** It is a per-token baseline equal to the leave-one-out mean
+  reward of group members sharing the exact token prefix, with the critic
+  as fallback.
+  - At step 300 on sub_integer, the culprit token's state is shared and is
+    a split in 92-100% of failures. Its coefficient would be R - (mean of
+    sharers), about R - V(s), which is what SB already gives.
+  - Red team (CPU, code-checked): it is unbiased, and normalization and
+    Muon keep the cancellation exact. After the slip the trajectory is
+    unique and falls back to the critic. The gain is variance on shared
+    prefix tokens, where the update scales with 1 - pi, which is small at
+    entropy 0.023. On the cot frozen pools, 55-74% of tokens sit at
+    unanimous shared states and about 1% at splits.
+  - Worth at most one alignment job (SB vs kappa = 0 vs kappa = 1 on the
+    start and late pools; drill only if Muon gain improves at least 10% and
+    by more than 2 SE).
+  - Failing trajectories also keep sharing their prefix with siblings for
+    a median of 26-46 tokens after the culprit on sub_integer at step 300:
+    several siblings emit the same wrong token.
+- **1/p prompt weighting: retired before running.** Red team: hard cells
+  gained +0.099 ± 0.014 over steps 0-60 against +0.318 ± 0.012 for other
+  cells starting below 0.6, at the same p and PG budget. Alpha = 1 moves
+  their gradient share only from 35% to 47%.
+- **Reading (inference).** The hard cells are bounded by a few template
+  steps that demand a multi-operation transform in one emitted line or one
+  decision token. RL sharpened everything else and left those flat even
+  with mixed groups (failure 15-22%, so the right action is sampled often).
+  That pattern fits a capability limit at those step formats better than a
+  credit or allocation limit, but it is not proven. A learning-rate or
+  longer-run test cannot separate the two. A template change can.
+
+## DG head-gate retirement test: pre-registration (2026-10-21)
+
+The "smallest discriminating experiment" proposed in the DG analysis entry
+above (decision tokens carry large Q gaps, 2026-10-21). One alignment job
+like 14345: the start policy, the v7 s520 twin critic and the same 8
+held-out pools. `scripts/submit_dg_headgate_alignment_20261021.sh`, label
+`v7_s520_headgate` under `postraining/runs/estimator_alignment_20261020/`.
+
+**Arms** (`scripts/estimator_gradient_alignment.py`):
+- `sampled_baseline` and `control_variate`, the unbiased references.
+- `delightful_head_gate`, a new trainable MAC estimator: the sampled term
+  r = G - c under sigmoid(A(a_t) l), where A(a_t) = u.(x(a_t) - E_pi x) is
+  the readout's own `target_advantages` and l = -log pi(a_t). For the twin,
+  u is the mean of the two heads' directions, the same A the control
+  variate uses. A is the head's expected gap against a policy draw, not the
+  pairwise gap the analysis scored.
+- `delightful_shuffled_head_gate`, a measurement control (no schema, no
+  CLI choice). A loss-free prepass reads every emit state's A(a_t). A is
+  then permuted uniformly within strata, and the gate reads the result.
+  - Strata: surprisal bins with edges 2^-10 ... 2^3 (doubling; pi from
+    about 0.999 down to 3.4e-4), crossed with think/answer span. That makes
+    15 x 2 strata.
+  - Scope: each replay shard (128 length-sorted trajectories). One
+    generator per pool, seeded `(20261021 << 16) | pool`.
+- `entropy_bonus`: per pool, the gradient of minus the mean emit-state
+  entropy. For a series g, g . g_H > 0 means a descent step raises the
+  entropy.
+
+**Red-team correction to the proposed reading (before launch).** Shuffling
+within strata makes the gate independent of the token's outcome. So
+E[r sigmoid(U' l)] factors into E[r | token] times a stratum-only scale.
+That removes the pseudo-reward w_a = (sigma(U l) - 1/2) A_true. The
+analysis' derivation needs U to be coherent with A_true; noisy U keeps it,
+shuffled U does not.
+- So the shuffled arm is close to SB rescaled. It is not "the suppression
+  without the information".
+- Head minus shuffled measures the coherent (suppression plus
+  rectification) term itself.
+- As proposed, the reading "head no better than shuffled => suppression
+  hurts regardless of U" does not follow. "Head matches SB while shuffled
+  loses" is structurally implausible; if it appears, suspect a bug.
+- I report the reading as proposed, and decide by the amended one.
+
+**Amended reading.** Muon matrices; paired leave-one-pool-out jackknife
+over 8 pools; significance at t_7 = 2.36 SE.
+- Placebo validity, read from the shuffled arm's telemetry:
+  - corr(A', r) at most 0.25 x the head's corr(A, r);
+  - `shuffle_fixed_mass_share` below 1%.
+- Head matches SB: `muon_gain_avg` difference >= -0.003 (about 40% of the
+  TD gate's -0.0076), and cos_bias >= 0.95.
+- Head loses: difference below -0.003 and beyond 2.36 SE. DG is then
+  retired here.
+- The loss is the designed suppression if head minus shuffled raises
+  entropy significantly (`muon_entropy_avg`), and shuffled minus SB is
+  about 0.
+- A drill is justified only if head matches SB.
+- Entropy is read only as a difference against SB, or head against
+  shuffled, on `muon_entropy_*` and `entropy_cos`. Euclidean
+  `entropy_gain` scales with the gradient norm, and the gated arms' norm is
+  about half of SB's.
+
+**Also analyzed.** The existing outcome-DG and TD-gate series read the same
+pools and the same actor. Together they give a paired ladder of gate
+quality: outcome, TD, head, shuffled.
+
+**Prediction.** The red team's, which I share: head loses to SB by less
+than the TD gate does, shuffled stays near SB, and head minus shuffled
+raises entropy. This is inferred, not measured.
+
+## Memory belief adjoint (one hop): drill pre-registration (2026-10-21)
+
+**Change.** `--memory-belief-adjoint-hops 1`. Code was in the
+`.worktrees/memory-belief-adjoint-20261021` worktree, not merged; that
+worktree was removed 2026-10-21 and its diff and untracked files are archived
+at `.worktrees/_archive/memory-belief-adjoint-20261021.*`. The code also
+lives on, uncommitted, in `.worktrees/memory-write-actor-20261021`.
+- The memory beliefs are a fixed point of the replay, h = P·B(theta, h).
+  The update so far treats the replayed record as a constant
+  (Jacobian-free backprop). One hop adds the first term of the series that
+  carries the gradient back through that loop: the trunk's gradient
+  through what its own beliefs write for later reads.
+- K = 0 is bitwise identical to the old update (CPU tests on saved
+  gradients). Hops match a fully unrolled replay; CUDA parity job 14417
+  passed. Each hop costs one more replay forward and backward per shard
+  (+42% update time, warm).
+
+**Run.** `mac_sampled_baseline_memory_adjoint1_drill_20261021`, jobs 14428
+(s1), 14429 (s2), 14430 (s3), 75m sessions because the host CPU is
+congested.
+- Everything else is the fresh-rate memory drill's: v7 study-critic start,
+  `--fresh-learning-rate 3e-3`, seed 1337, the same pool and bench. The
+  step-0 bench is identical (0.5958).
+- Compare at matched steps, not wall time: whole steps take about 5-7 s
+  against 2.6-3.7 s.
+
+**Hypothesis.** The memory's read share stalled near 0.09 and bench went
+flat at about 0.80, possibly because the trunk gets no credit for writing
+useful beliefs: only the reader adapts to whatever the trunk happens to
+write. If so, the hop should let the trunk shape its writes.
+- The failing steps on the hard cells are lookups (the bottom digit for
+  the borrow decision, the digits of an earlier partial product, digit
+  reversal in readouts; see the error anatomy above). Better-written memory
+  could help exactly there.
+
+**Reference.** The fresh-rate drill's bench: 0.676 (step 20), 0.726 (40),
+0.764 (60), 0.7946 (180), 0.7944 (200), 0.7963 (220), 0.7960 (240), 0.7997
+(260), 0.7974 (280), 0.798 (300). Its mean over steps 200-300 is 0.7972.
+
+**Criteria** (mean bench over steps 200-300 against 0.7972):
+- Win: at least +0.010.
+- Null: within +/- 0.010.
+- Harm: below -0.010, or the bench stop floor fires.
+
+**Mechanistic predictions.**
+- Through step 40, within +/- 0.01 of the reference: the hop's share scales
+  with the zero-initialized read weight. Measured on s1:
+  `memory_adjoint/all/hop1_grad_ratio` was 0 at step 1, 0.004 at step 2,
+  0.013 at step 5 and 0.028 at step 9.
+- If the ratio stays below about 0.05 through step 200, the hop cannot
+  matter, and a null is by construction, not evidence against write
+  credit.
+- A win should show up as a growing read share and as lower hazards on the
+  lookup steps. Check this with the bench capture and the two analyzers on
+  the final snapshot: the equal-digit borrow decision is wrong 0.20 / 0.16
+  of the time, and mul readouts fail 0.12-0.21 per line at step 300 of the
+  reference.
+
+**Prior.** Null about 60%, win about 25%, harm about 15%.
+- Against a win: the read share is small, the reference plateau looks like
+  a template capability limit, and the perturbation sweeps found the
+  memory's local landscape flat.
+- For harm: an exact gradient term, but one that grows with the loop gain
+  and has no clip.
+
+## DG head-gate retirement test: result (job 14431, 2026-10-21)
+
+Pre-registration above ("DG head-gate retirement test: pre-registration").
+Job 14431 ran in about 4 minutes. Output:
+`postraining/runs/estimator_alignment_20261020/v7_s520_headgate/` and
+`alignment_v7_s520_headgate.json`. The analysis also reads the outcome-DG
+(`v7_s520_dg`) and TD-gate (`v7_s520_td`) series on the same pools, scored
+against this job's SB and CV.
+
+**Checks.**
+- The re-run SB differs from 14345's SB by 0.11-0.13% relative norm per
+  pool, so it is not bitwise. I attribute that to bf16/compile rounding,
+  not to the estimator; this is inferred.
+- The TD-gate and outcome-DG rows reproduce 14345's numbers under the new
+  references: cos_bias 0.812 / 0.763, `muon_gain_avg` -0.0076 / -0.0137.
+- The shuffled arm's prepass read the same head A as the head arm, to 1e-6 relative
+  on the A^2 and A r sums.
+
+**The head's A is calibrated but tiny.** Over non-terminal tokens: slope of
+r on A_head 0.976, RMS 0.0166, corr(A, r) 0.040. The TD residual had slope
+0.52 and RMS 0.077. As with the TD gate, the gate is mostly inert:
+
+| | head | shuffled |
+|---|---|---|
+| gate mass mean, r > 0 / r < 0 | 0.497 / 0.439 | 0.486 / 0.460 |
+| active mass share, r > 0 / r < 0 | 2.1% / 11.4% | 2.8% / 7.8% |
+
+**The placebo is weaker than pre-registered. It failed both validity
+criteria.**
+- corr(A', r) is 0.0111, against a limit of 0.25 x 0.040 = 0.010. Its slope
+  is 0.27, against 0.98 for the head.
+- corr(A', A) is 0.21, and the fixed-point mass share is 3.8% (limit 1%).
+- The strata's means and the small rare-token strata within each shard
+  keep roughly a quarter of A's outcome information.
+
+**Muon matrices**, paired jackknife over 8 pools; SB is this job's:
+
+| | cos_bias | muon_gain_step | muon_gain_avg | muon_entropy_avg |
+|---|---|---|---|---|
+| SB | 0.9998 | 0.0531 | 0.0869 | -0.711 ± 0.018 |
+| head - SB | -0.219 ± 0.032 | -0.0044 ± 0.0008 | -0.0085 ± 0.0011 | +0.722 ± 0.014 |
+| shuffled - SB | -0.093 ± 0.015 | -0.0019 ± 0.0007 | -0.0048 ± 0.0011 | +0.476 ± 0.011 |
+| head - shuffled | -0.126 ± 0.018 | -0.0025 ± 0.0003 | -0.0037 ± 0.0009 | +0.247 ± 0.006 |
+| TD gate - SB | -0.188 ± 0.029 | -0.0043 ± 0.0011 | -0.0076 ± 0.0011 | +0.765 ± 0.018 |
+| outcome DG - SB | -0.237 ± 0.042 | -0.0059 ± 0.0021 | -0.0137 ± 0.0022 | +1.267 ± 0.045 |
+
+- `entropy_cos` (all parameters) agrees: SB -0.26, head +0.06, shuffled
+  -0.06, TD +0.07, outcome DG +0.31.
+- The head gate's mean step is entropy-neutral (`muon_entropy_avg` +0.011
+  ± 0.024). Its bias cancels SB's sharpening almost exactly.
+- SNR is unchanged in every arm (0.17-0.18 against SB's 0.16).
+
+**Reading.**
+- *As proposed in the analysis.* Head is no better than shuffled; it is
+  worse on every gain. Both raise entropy against SB. So DG is retired
+  here.
+- *As amended (the decision).* Head loses to SB: -0.0085 ± 0.0011 on
+  `muon_gain_avg`, 7.8 SE below and past the -0.003 bound, with cos_bias
+  0.78. So DG is retired here, and no head-gate drill.
+- Attribution, partly against the prediction:
+  - Head minus shuffled is significantly entropy-raising (+0.247 ± 0.006,
+    about 1/3 of head - SB). That is the coherent suppression term, as the
+    analysis derived.
+  - Shuffled did not stay near SB: it costs 56% of head's gain deficit and
+    66% of its entropy push.
+  - Its leftover information (slope 0.27) can explain only part of that,
+    assuming the effect is linear in coherence (inferred).
+  - The rest comes from the gate's own marginal. A surprisal-dependent
+    rescale of the sampled term, coherent or not, already rotates the mean
+    toward entropy here.
+- A head that is calibrated in sum (slope 0.98) does no better than the
+  TD residual that is 96% noise. It is slightly worse on gain (-0.0085
+  against -0.0076, within 1 SE). That fits the analysis' claim that DG's
+  first-order cost does not depend on U's quality. It refutes "DG hurts
+  only because U is noisy" at this policy.
+- Limits:
+  - First-order only, at the start policy.
+  - The entropy target is the mean over visited states, not the peaked-
+    state tail mass the drill telemetry pointed to.
+  - The placebo cannot cleanly split marginal from coherence.
+  - 14345's first-order reading did predict the TD drill's loss.
+
+## Teacher-forced memory probe: pre-registration (2026-10-21)
+
+**Question.** The RL policy barely reads its gated-delta memory: read share
+about 2% in the shared AdamW, about 9% at `--fresh-learning-rate 3e-3`, with
+bench flat at about 0.80 (above). Three explanations:
+- (A) learning-signal limited: the memory could help, but a sparse outcome
+  gradient cannot find the use;
+- (B) information-redundant: h_{t-1} (written into the memory) roughly
+  duplicates what x_t plus the visible prefix already give the trunk;
+- (C) optimizer-rate limited: the signal is there, but the step size or the
+  step count is too small.
+
+Dense next-token CE on gold traces is the most signal a memory can get.
+If CE cannot adopt the memory at the RL rate, (A) is unlikely.
+
+**Tool.** `postraining/memory_ce_probe.py` (CPU contracts in
+`postraining/tests/test_memory_ce_probe.py`, 30 tests). Jobs are launched by
+`scripts/submit_memory_ce_probe_20261021.sh`.
+- **Model.** The RL start checkpoint
+  (`kda8_sft_omi2_drills_code30k_science_v1_e1`), built as the trainer
+  builds the memory actor: 4 heads x 64, zero-init `W_o`, with the
+  trainer's record and read masks.
+  - A CPU test checks the probe's input path against an actual memory
+    rollout: beliefs and token logprobs at the converged fixed point.
+- **Data.**
+  - Training: `memory_ce_probe_drills_20261021_v1.parquet`. 4,096 gold
+    canonical traces per study cell (22 cells) from pool seed 20261021,
+    with the held-out pool excluded.
+  - Evaluation, two panels:
+    - `heldout`: the 550-problem held-out pool rebuilt as
+      `analyze_drill_step_errors.py` does;
+    - `hazard`: `memory_ce_probe_hazard_panel_20261021_v2.parquet`.
+      Column-method subtraction (320 per cell) and multiplication (80 per
+      cell), seed 20261022, disjoint from training data and both pools.
+      sha 8654406582ca...; class counts below.
+- **Loss.** CE on completion tokens plus the stop target. Batches are 32
+  traces, cell-uniform.
+- **Beliefs.** A Jacobian-free fixed point with K = 2 no-grad passes.
+  - c_0 comes from a memory-off pass, and c_1 from a pass writing c_0. The
+    training pass writes c_1.
+  - This is exact through completion position P + K - 1 and approximate
+    after that. Tests check both.
+  - Every eval logs the movement c_1 vs c_0 and the residual c_2 vs c_1.
+  - The final eval repeats with K = 4 to price the truncation.
+  - Why this choice: the trainer replays recorded beliefs that the policy
+    itself produced (an exact fixed point). Teacher forcing has no record,
+    and a full fixed point costs L passes.
+- **Optimizers.** The trainer's fresh partition: Muon at
+  L x (0.025/0.015) x 1.45 for matrices, AdamW at L for vectors, constant
+  rate. Trunk arms use the SFT optimizers at the SFT `lr_scale` 0.1, with
+  20-step warmup and linear decay.
+- **Arms.** All share one data order and one memory init.
+
+  | Arm | Trunk | Memory |
+  |---|---|---|
+  | `off` | frozen | none |
+  | `mem` | frozen | trained at L = 3e-3 |
+  | `mem_lr_quarter` | frozen | trained at L/4 |
+  | `mem_lr_x4` | frozen | trained at 4L |
+  | `mem_midlayer` | frozen | writes the residual stream after block 4, not the final belief (a probe option only; the trainer's write contract is unchanged) |
+  | `mem_shuffled` | frozen | the whole carried stream comes from a deranged other trajectory: capacity control |
+  | `trunk_only` | trained | none |
+  | `mem_plus_trunk` | trained | trained |
+
+- **Eval-time read ablations** on the trained weights of every unshuffled
+  memory arm:
+  - `drop_last_write`: the state before slot t's write, S_{t-1}, removing
+    the one-step final-layer carry. This is not "the full state minus one
+    insertion": the last write's decay alpha_t and its delta-rule erase are
+    undone too (a 1 - alpha_t scale difference, about 6% on the 16-token head
+    at init);
+  - `last_write_only`: the one-step carry alone;
+  - `foreign_writes`: the shuffle's writes, with the row's own h in the
+    query.
+- **Schedule.** Evals run at doubling steps (3, 6, 12, 25, ...) plus step
+  340 (the RL run's length), so the three rates compare at matched
+  lr x step.
+
+**Hazard panel v2 class counts (target tokens).** all 532,156;
+borrow_equal 824; borrow_equal_after 565; borrow_none 6,137;
+borrow_real 4,585; pp_readout 1,938; pp_add_leftmost 1,190.
+
+**Definitions.** All are on the hazard panel, at the final step, as paired
+per-token CE differences with SEs clustered by problem.
+- **Primary class `flat`:** the union of borrow_equal, borrow_equal_after,
+  borrow_none, pp_readout and pp_add_leftmost. These are the step types RL
+  left flat; real borrows are excluded because RL fixed them.
+  - borrow_none makes up 58% of `flat`'s tokens, so each component is also
+    reported.
+- **Information effect:** I = CE(mem) - CE(mem_shuffled).
+- **Trunk effect:** dT = CE(trunk_only) - CE(off).
+
+**Validity gates.** The run is uninterpretable unless all of these hold.
+- Every memory arm at step 0 equals `off`. This is tested on CPU and
+  logged.
+- `fixed_point/residual` is under 0.01 on `mem`.
+- CE on `flat` with two extra passes differs from K = 2 by less than 10% of
+  |I|.
+- `mem_shuffled`'s read share is within 0.5x-2x of `mem`'s (capacity
+  matched).
+
+**Readings.**
+- **(A) supported:**
+  - I <= -max(3 SE, 0.15 x CE_off(flat));
+  - greedy accuracy rises by at least 5 points on borrow_equal or
+    pp_readout;
+  - the memory arm recovers at least 25% of |dT| on `flat`.
+
+  Then RL fails to find a use that dense supervision finds.
+- **(B) supported:**
+  - |I| < 2 SE, or under 5% of CE_off(flat);
+  - and `mem_plus_trunk` is within 2 SE of `trunk_only` on `flat`.
+
+  Caveat: writes are detached in every arm, so this (B) excludes "nothing
+  useful was written" only weakly.
+  - If `mem_midlayer`'s information effect is at least 2x `mem`'s and
+    beyond 3 SE, the reading is "the write site matters", not (B).
+- **(C) binding:**
+  - while CE is still falling, the three rate arms agree within 2 SE at
+    matched lr x step;
+  - and L needs more than 340 steps to reach half its final drop on `flat`.
+
+  If L reaches 90% of its drop within 100 steps, rate is not binding.
+- **Ablations.** If `drop_last_write` loses most of I while
+  `last_write_only` keeps it, the gain is the one-step final-layer carry,
+  a depth effect, not long-range memory.
+- **Side result.** If `trunk_only` takes `flat` CE below 0.5 x CE_off,
+  then under dense supervision these step formats are not a capability
+  limit at this size.
+
+**Predictions (mine, before the run).**
+- `trunk_only` cuts `flat` CE by well over 30% within the budget.
+- The memory arms grow a read share above 10%. `mem_shuffled` grows a
+  similar share.
+- I is small: under 5% of CE_off(flat), so (B) is favoured.
+- Any gain concentrates in `last_write_only` (the one-step carry).
+- The rate arms collapse at matched lr x step only early, if at all.
+
+I hold these loosely. RL's 9% read share at a 2%-signal gradient says
+little about what dense CE does.
+
+**Follow-up rule.** An RL warm start from `mem/memory_final.pt` is
+justified only if (A) holds, the ablations show the gain is not only the
+last write, and the deeper-pass gate passes.
+
+**Budget.** About 10-20 GPU minutes per arm, in two mlq jobs of at most
+75 minutes, with the step count set from the calibration job (14442,
+`mem` and `mem_plus_trunk`, 40 steps).
+
+## Memory belief adjoint (one hop): result. The drill is a pre-registered null, with a late edge (jobs 14428-14430)
+
+The run completed all 360 steps. Bench (contract accuracy) against the
+fresh-rate reference at matched steps:
+
+| Step | 200 | 220 | 240 | 260 | 280 | 300 | 320 | 340 | 360 |
+|---|---|---|---|---|---|---|---|---|---|
+| Adjoint | 0.7944 | 0.7950 | 0.7954 | 0.7925 | 0.8038 | 0.8081 | 0.8015 | 0.8094 | 0.8145 |
+| Reference | 0.7944 | 0.7963 | 0.7960 | 0.7997 | 0.7974 | 0.7980 | — | — | — |
+
+- **Pre-registered window (steps 200-300): null.** Mean 0.7982 against
+  0.7972. Paired per prompt over the same 512 bench prompts: +0.0013 ±
+  0.0044.
+- **Late edge: suggestive, not established.**
+  - Step 300 paired: +0.0101 ± 0.0064. Mean of 280 and 300: +0.0083 ±
+    0.0053.
+  - These SEs cover sampling on fixed prompts only, not run-to-run
+    variance (one seed per arm), so the real uncertainty is larger.
+  - The reference was cancelled at step 300, so 320-360 have no matched
+    comparison. The adjoint kept rising (0.795 at 240 to 0.8145 at 360)
+    while the reference was flat from 180 to 300 (0.7946 to 0.7980).
+- **Not on the hard cells.** Hard cells (mul_decimal_d3, sub_decimal_d3/d4,
+  sub_integer_d5/d6, 116 prompts): +0.014 ± 0.014 at step 280 and -0.004 ±
+  0.014 at step 300. The step-300 gain is on the other cells (+0.014 ±
+  0.007).
+- **Train reward was identical** (20-pool means 0.898 vs 0.897 at step
+  300), so the train-bench gap is smaller late (+0.090 vs +0.099) only
+  because bench differs. The user reads this as the adjoint helping
+  learning over memorization. That fits, but the evidence equals the
+  bench edge itself, and the lack of hard-cell gain argues against it.
+- **Telemetry.**
+  - The hop carried 17-27% of the gradient norm from step 100 on
+    (`hop1_grad_ratio` 0.17 / 0.19 / 0.27 / 0.21 / 0.22 at steps 100 /
+    200 / 250 / 300 / 340), so this is not the "too small to matter"
+    null.
+  - Memory timescale was longer with the adjoint: decay log-timescale 3.24
+    vs 2.95 at step 300 (about 25 vs 19 tokens). Policy entropy was lower
+    (0.016 vs 0.023).
+  - **The read-out weight's RMS is identical in both runs** (0.0239 /
+    0.0239 at step 200, 0.0295 / 0.0295 at step 300), although the
+    gradients differ by about 20%. W_o's growth is set by Muon's
+    fixed-size step and the step count, not by the gradient: the memory's
+    adoption speed is optimizer-rate limited (measured).
+- **Next.** A matched reference continued to 360 (or a second seed per
+  arm) is needed before calling the late edge. The dense-supervision
+  memory probe (in progress) tests the rate and signal limits directly.
+
+## Answer-level DG: pre-registration (2026-10-21)
+
+Written before any drill ran. The drills were queued and then held for
+red-team fixes, which are folded in below before any job started: clusters
+keyed on (answer, reward), shaped rewards refused, greedy scoring step and
+failure, and harm precedence. The code is in place and tested
+(`--mac-estimator rloo_sequence | delightful_answer_gate`,
+`postraining/mean_actor_critic.py`, `train_latent_vapo.py`).
+
+- **Estimator.** A group is one prompt's G = 16 rollouts. Every emitted
+  token's log pi gets the same coefficient w_i:
+  - `rloo_sequence` (control): w_i = U_i, with
+    U_i = R_i - mean(R_j, j != i), the leave-one-out advantage.
+  - `delightful_answer_gate`: w_i = sigmoid(U_i * l_i / eta) * U_i, with
+    eta = 1 and l_i = -log(n_k / G). n_k is the size of rollout i's answer
+    cluster. Clusters group rollouts by the verifier's (canonical
+    `parsed_answer`, reward) pair. The reward is in the key because
+    `verify_answer` canonicalizes "3 4" and "34" to one string yet grades
+    them differently; keyed on the string alone, a wrong row could join the
+    correct cluster. The bench's maj@16 votes on the same (answer, correct)
+    pairs.
+  - Neither arm uses a per-token critic baseline. The critic still trains,
+    for telemetry only. Token weights are the same global emitted-token
+    mean as `sampled_baseline`, so only the coefficient differs from SB.
+  - **Unparseable answers.** Rows with a failed format, no parse or
+    `[INVALID]` all share ONE "ungraded" cluster; they are not singletons.
+    This matches the verifier's own equivalence class (all score 0). With
+    singletons, a common format failure would read as maximally surprising,
+    so the gate would pass its blame at full strength. The two choices
+    agree when a group has at most one ungraded row.
+  - Both arms need the pure verifier reward, so config refuses
+    `--nearby-reward-max` > 0 and `--abstention-penalty`. Python-verified
+    sources are refused at scoring time.
+  - Schema ids are versioned per arm in `vapo/schemas.py`. Resume rejects a
+    change of estimator or of G.
+- **Hypothesis.** The gate shrinks updates on rollouts whose answer the
+  group already agrees on, so the update moves toward prompts where the
+  policy is split. DG's Prop. 2 says this targets sum_n log p_n rather than
+  mean accuracy. On hard prompts, DG should therefore raise log p more than
+  RLOO, and maj@16 should not fall.
+- **Design.** Matched to the SB reference
+  `mac_sampled_baseline_memory_fresh_lr_drill_20261021_r2`: same checkpoint,
+  data, memory and LR, 360 steps. The only change is `--mac-estimator`.
+  There are 2 arms x seeds {1337, 2026} = 4 chains, each made of 75-minute
+  sessions (`--max-train-hours 1.05`) that resume until step 360.
+  Deviations from the reference:
+  - `--snapshot-every 60`, against 20, to save disk (about 1.2 GB per
+    snapshot);
+  - the session hour cap;
+  - the seed.
+  Bench: every 20 steps, the 512 held-out prompts x 16 samples at T = 1.
+- **Greedy accuracy.** Measured after training from the snapshots at steps
+  0/60/.../360, one bench-only job per (run, step)
+  (`scripts/submit_greedy_bench_20261021.sh`). It uses `--eval-top-p 1e-6`,
+  which keeps only the argmax token, and 1 sample per prompt. It is a
+  separate pass because a greedy bench inside training would double the
+  bench cost in every session.
+  - It is scored at the last snapshot step that every run saved (360 if
+    all four chains finish).
+  - If any run lacks it, the analysis script stops with an error rather
+    than dropping the metric. `--allow-missing-greedy` gives only a verdict
+    labelled provisional.
+  - The step-0 greedy bench is one shared job. The memory reader's output
+    is zero-initialized and the bench subset is a seed-free hash sample, so
+    the seed cannot change the step-0 greedy policy except through an exact
+    logit tie.
+- **Hard panel.** 57 of the 512 bench prompts with step-0 correct count
+  1-4 of 16, i.e. p in (0, 0.25], taken from
+  `drill_step_error_bench_s000_20261021`:
+  `postraining/data/drill_rl_study_heldout_hard_s000_20261021_v1.parquet`
+  and `.manifest.json` (`scripts/build_hard_bench_panel.py`). The SB r2
+  step-0 bench counts match the capture on all 512 prompts. The panel is
+  selected on step-0 draws, so gains *over step 0* are biased upward by
+  regression to the mean. The DG - RLOO paired difference is not biased
+  this way.
+- **Primary metrics** (DG - RLOO, paired by prompt, averaged over seeds;
+  `scripts/analyze_answer_gate_drill.py`), at the last bench step shared by
+  every run:
+  1. hard panel: mean over prompts of log((k + 0.5) / 17) (KT log p);
+  2. full panel: maj@16 (a tie is scored as its random break);
+  3. full panel: greedy accuracy, if measured.
+- **Secondary metrics.** pass@16; T = 1 mean accuracy (the declared cost:
+  DG trades it for log p); token entropy; answer-cluster entropy. Training
+  telemetry: gate mean and quantiles, the share of unanimous rows
+  (l = 0), and coefficient RMS against the SB coefficient on the same
+  tokens.
+- **Decision rule.** SE is over prompts. It reflects bench sampling only,
+  not seed variance, so every rule also requires all seeds to agree in sign.
+  - **Win:** hard KT > 2 SE, both seeds positive, and mean >= +0.10 nats per
+    prompt.
+  - **Harm:** any primary metric < -2 SE with both seeds negative.
+  - **Precedence:** harm is checked first, so a hard-KT win alongside a
+    significant loss on maj@16 or greedy accuracy counts as harm.
+  - **Null:** anything else.
+  - For reference, SB r2 hard-panel KT was -1.63 at step 0, -0.82 at 140 and
+    -0.92 at 280.
+- **Failure modes to check.**
+  - Easy-prompt brake: unanimous-correct groups have U = 0 anyway, so the
+    gate acts on near-unanimous groups.
+  - No signal at 0/16 (U = 0 throughout, in both arms).
+  - Muon's fixed-size steps erasing the reallocation (compare coefficient
+    RMS against the updates).
+  - Noisy clustering from parse variants.
+  - Higher variance with no token critic: both arms share this, so compare
+    against SB as well as against each other.
+  - Format-failure pumping through the ungraded cluster.
+
+## Teacher-forced memory probe: calibration and launch deviations (2026-10-21)
+
+These amend "Teacher-forced memory probe: pre-registration" above. They were
+written before job a or b produced results.
+- **Out-of-memory failures.**
+  - Job 14442: training ran out of memory at a 32-trace batch of about 39k
+    padded slots.
+  - Job 14445: the step-0 eval ran out of memory in the full-vocabulary
+    readout, with the GPU shared with desktop processes.
+  - Fixes:
+    - training now accumulates gradients over micro-batches of at most
+      12,288 padded slots (`--train-slot-budget`), keeping the loss
+      normalizer and the optimizer step per 32-trace batch;
+    - the eval readout is chunked by 4,096 positions.
+  - CPU tests check that both are exact: the accumulated gradient equals
+    the whole-batch gradient, and chunked logprobs equal whole logprobs.
+  - The batch semantics are unchanged.
+- **Calibration** (job 14446; `mem` and `mem_plus_trunk`, 40 steps).
+  - Step times: 0.54 s for `mem`, 0.58 s for `mem_plus_trunk`, and 0.18 s
+    for `trunk_only` (from job 14449).
+  - An eval of both panels takes 12-17 s.
+- **The trunk rate changed from the pre-registration.**
+  - At the SFT `lr_scale` 0.1, `mem_plus_trunk` raised hazard CE from
+    0.0197 to 0.046 by step 25.
+  - This probe's batch carries about 7k supervised tokens, against SFT's
+    32k per step.
+  - At 1/8 of that, `--trunk-lr-scale 0.0125` (job 14449, `trunk_only`,
+    60 steps), CE falls: `flat` from 0.0436 to 0.0349, and pp_add_leftmost
+    from 0.052 to 0.013.
+  - Job b runs both trunk arms at 0.0125. That is still about 9x the RL
+    trunk's Muon rate.
+- **Step count.** STEPS = 1200 for both jobs (14450: off and the three
+  `mem` rates; 14451: shuffled, mid-layer and the two trunk arms). That is
+  about 11-15 minutes per memory arm with the final evals, and an
+  estimated 50-57 minutes per job.
+- **Base CE is low, which I did not anticipate.** Teacher-forced on gold
+  traces, at step 0:
+
+  | Panel or class | CE (nats/token) | greedy accuracy |
+  |---|---|---|
+  | hazard, all | 0.0197 | |
+  | heldout, all | 0.0288 | |
+  | flat | 0.0436 | 98.7% |
+  | borrow_equal | 0.117 | 96.2% |
+  | borrow_equal_after | 0.182 | 93.1% |
+  | pp_readout | 0.060 | |
+  | pp_add_leftmost | 0.052 | |
+
+  Every effect will therefore be small in absolute nats. The pre-registered
+  thresholds are relative (to CE_off and to SE), so they stand.
+- **The fixed-point residual sits at a floor of about 1.2%.**
+  - In the calibration, `mem` at step 40 has residual 0.0118, and passes
+    2-4 move 0.0118, 0.0116 and 0.0115: flat rather than geometric.
+  - CE with 2 extra passes equals K = 2's to 5 significant figures.
+  - I read the floor as bf16 recomputation noise rather than
+    non-convergence (inferred, not tested). So I judge the truncation gate
+    by its CE criterion, not by the 0.01 residual criterion.
+
+## Teacher-forced memory probe: result (jobs 14450, 14451, 2026-10-21)
+
+**Verdict.** Primarily (B), with (A) and (C) not supported.
+- Dense next-token CE at the RL fresh rate does adopt the memory, but
+  almost none of the gain is trajectory information.
+- A shuffled-stream memory recovers 85% of it.
+- When the trunk can learn, the memory is abandoned.
+- Readings against the pre-registration are below.
+
+Setup and data are as pre-registered, with the amendments in "calibration
+and launch deviations". Both jobs ran 1,200 steps of 32 traces; all arms
+succeeded. Run directories: `postraining/runs/memory_ce_probe_20261021_{a,b}`.
+The analysis is `memory_ce_probe analyze <a> <b>`, saved to
+`.../memory_ce_probe_20261021_b/analysis_ab.json`.
+
+**Final CE minus `off`.** Hazard panel, nats/token, SE clustered by
+problem, step 1200. CE_off is in the first row; "acc" is greedy accuracy.
+
+| arm | flat | borrow_equal | borrow_eq_after | borrow_none | borrow_real | pp_readout | pp_add_leftmost | all | read share |
+|---|---|---|---|---|---|---|---|---|---|
+| off (CE) | 0.0436 | 0.1172 | 0.1824 | 0.0142 | 0.0570 | 0.0597 | 0.0523 | 0.0197 | 0 |
+| mem (L = 3e-3) | -0.0081 ± 0.0017 | -0.0120 ± 0.0017 | -0.0161 ± 0.0024 | -0.0014 ± 0.0002 | +0.0050 ± 0.0005 | -0.0004 ± 0.0009 | -0.0488 ± 0.0146 | -0.0008 ± 0.0003 | 0.030 |
+| mem_lr_quarter | -0.0081 ± 0.0017 | -0.0072 ± 0.0020 | -0.0187 ± 0.0037 | -0.0016 ± 0.0002 | +0.0024 ± 0.0006 | -0.0004 ± 0.0011 | -0.0493 ± 0.0146 | -0.0008 ± 0.0003 | 0.038 |
+| mem_lr_x4 | +0.0007 ± 0.0007 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | +0.0041 ± 0.0036 | -0.0003 ± 0.0002 | +0.0003 ± 0.0002 | 0.018 |
+| mem_shuffled | -0.0069 ± 0.0017 | -0.0066 ± 0.0011 | -0.0106 ± 0.0019 | -0.0007 ± 0.0001 | +0.0038 ± 0.0004 | +0.0001 ± 0.0006 | -0.0488 ± 0.0145 | -0.0006 ± 0.0002 | 0.041 |
+| mem_midlayer | -0.0066 ± 0.0017 | -0.0050 ± 0.0008 | -0.0052 ± 0.0013 | -0.0006 ± 0.0001 | +0.0015 ± 0.0003 | -0.0000 ± 0.0006 | -0.0500 ± 0.0144 | -0.0008 ± 0.0002 | 0.031 |
+| trunk_only | -0.0152 ± 0.0020 | -0.0240 ± 0.0052 | -0.0511 ± 0.0089 | -0.0046 ± 0.0005 | -0.0118 ± 0.0017 | -0.0121 ± 0.0027 | -0.0519 ± 0.0148 | -0.0021 ± 0.0003 | - |
+| mem_plus_trunk | -0.0152 ± 0.0020 | -0.0236 ± 0.0053 | -0.0519 ± 0.0090 | -0.0046 ± 0.0005 | -0.0119 ± 0.0017 | -0.0122 ± 0.0026 | -0.0520 ± 0.0148 | -0.0021 ± 0.0003 | 0.0005 |
+
+**Information effect.** Each arm minus `mem_shuffled`, on the hazard panel.
+
+| arm | flat | borrow_equal | borrow_eq_after | borrow_none | borrow_real | pp_add_leftmost |
+|---|---|---|---|---|---|---|
+| mem: I | -0.0012 ± 0.0003 | -0.0054 ± 0.0017 | -0.0054 ± 0.0028 | -0.0007 ± 0.0002 | +0.0013 ± 0.0005 | +0.0000 ± 0.0012 |
+| mem_lr_quarter | -0.0012 ± 0.0003 | -0.0006 ± 0.0021 | -0.0080 ± 0.0037 | -0.0009 ± 0.0002 | -0.0014 ± 0.0006 | -0.0005 ± 0.0002 |
+| mem_midlayer | +0.0003 ± 0.0003 | +0.0016 ± 0.0011 | +0.0054 ± 0.0020 | +0.0001 ± 0.0001 | -0.0023 ± 0.0004 | -0.0012 ± 0.0015 |
+
+- The held-out panel agrees in sign. It is too small for the decision
+  classes: `mem` I on `flat` is -0.0011 ± 0.0007.
+- Greedy accuracy, `off` -> `mem` (hazard):
+  - borrow_equal 96.24% -> 96.24%;
+  - borrow_equal_after 93.10% -> 93.45%;
+  - pp_readout 98.76% -> 98.81%;
+  - pp_add_leftmost 98.32% -> 99.83% (`mem_shuffled` 99.92%).
+
+**Validity gates.**
+- **Step 0 equals `off`:** passed. Every arm's step-0 CE is 0.01970 / 0.02880.
+- **Fixed-point residual under 0.01:** failed. `mem` ends at 0.0143. As in
+  the calibration, the residual stays at about 0.0115 at every extra pass
+  (inferred to be a bf16 floor).
+- **Deeper-pass CE:** fails narrowly. `mem`'s `flat` CE with 2 extra passes
+  is 0.035651, against 0.035510 at K = 2. The difference is 0.00014, 12%
+  of |I|; the bound was 10%. `mem_shuffled` moves -0.00010.
+  - So I carries roughly ±0.0002 of truncation uncertainty on top of its
+    SE. That does not move it across any reading's threshold.
+- **Capacity match:** passed. `mem` reads 0.72x `mem_shuffled`'s share, and
+  `mem_lr_quarter` 0.92x.
+
+**Readings against the pre-registration.**
+- **(A) not supported (measured).**
+  - Needed I <= -max(3 SE, 0.15 x CE_off) = -0.0065; I is -0.0012 ± 0.0003.
+  - Neither borrow_equal nor pp_readout greedy accuracy rose by 5 points
+    (0.0 and +0.05).
+  - The memory recovers 54% of |dT| on `flat`, but 85% of that also comes
+    from the shuffled memory.
+  - Even with dense per-token supervision at the RL rate, the trajectory-
+    specific information the memory can carry is worth 2.8% of CE on the
+    flat step types. RL's small read share is not hiding a large win that
+    a sparse reward cannot find (inferred from the dense-signal ceiling).
+- **(B) supported (measured), within the probe's limits.**
+  - |I| is 2.8% of CE_off(flat), under the 5% bar. It is still about 4 SE
+    from zero: there is a small, real information effect. It concentrates
+    on equal-digit borrow decisions (borrow_equal -0.0054 ± 0.0017, 4.6% of
+    that class).
+  - `mem_plus_trunk` equals `trunk_only` on `flat` (+0.0000 ± 0.0001).
+  - Its read share fell from 0.015 at step 25 to 0.0005 by step 1200, so
+    once the trunk learns, the memory is switched off.
+  - Mid-layer writes carry no information (I = +0.0003 ± 0.0003). The
+    write site is not the limit.
+  - As pre-registered, detached writes leave "nothing useful was written"
+    excluded only weakly.
+- **(C) not binding (measured).**
+  - L/4 and L end identical: `flat` -0.0081 against `off` for both, and
+    I = -0.0012 for both.
+  - Both reach half their final drop by step 50, well inside 340.
+  - 4L is not faster; it breaks.
+    - CE spiked at step 6 (hazard all 0.0224 against 0.0197).
+    - The memory then shut itself off: write beta 0.000, decay timescale
+      exp(0.33), read slipping to about 0.002 by step 340.
+    - It ends at `off` or slightly worse.
+  - At matched lr x step the L/4 and L curves agree within their noise.
+    For example L/4 at step 400 and L at step 100 give `flat` 0.0382 and
+    0.0412; L/4 at 1200 and L at 340 give 0.0355 and 0.0377. That
+    agreement is weak evidence: the curves move by 0.003 between adjacent
+    evals.
+  - L reaches 90% of its drop only at step 1200: a slow tail, not a rate
+    wall.
+- **Ablations (inside `mem`).**
+  - `foreign_writes` costs +0.0043 ± 0.0012 on `flat`, about half of
+    `mem`'s gain; `drop_last_write` costs +0.0016 and `last_write_only`
+    +0.0020.
+  - So the trained read does use its own long-range content, not only the
+    one-step carry.
+  - Yet `mem_shuffled`, trained without that content, reaches 85% of the
+    same gain. The content is a learned preference that other channels can
+    replace (inferred).
+  - pp_add_leftmost shows this most clearly: -0.049 in both `mem` and
+    `mem_shuffled`. A token-conditioned input-path change that ignores the
+    trajectory fixes the leftmost-digit read (`trunk_only` gets the same).
+- **Write gates (measured).** Mean write beta fell from 0.5 at init:
+
+  | arm | write beta |
+  |---|---|
+  | mem | 0.016 |
+  | mem_shuffled | 0.004 |
+  | mem_midlayer | 0.005 |
+  | mem_lr_x4 | 0.000 |
+  | mem_lr_quarter | 0.341 |
+
+  At L and above, CE drives the memory toward near-silent writes plus a
+  grown read. I read that as the read path acting mostly as an input
+  re-mapping, not as storage (inferred).
+- **Side result (measured).** `trunk_only` cuts `flat` by 35% (0.0436 ->
+  0.0284) and borrow_equal_after by 28% (0.182 -> 0.131). That is about
+  twice the memory's total gain, at about 9x the RL trunk's Muon rate.
+  - It is not below the pre-registered 0.5 x CE_off, so the "capability
+    limit at these step formats" reading is not refuted at 1,200 steps.
+  - The trunk curves are unstable even at `lr_scale` 0.0125 (`flat` 0.029
+    -> 0.077 -> 0.027 between steps 50 and 400).
+
+**Implications for RL.**
+- The follow-up rule (warm-start RL from `mem/memory_final.pt` only if (A)
+  holds) fails, so there is no memory warm start.
+- Raising `--fresh-learning-rate` is contraindicated: 4L kills the memory
+  under dense CE. 3e-3 sits at or above the useful rate; L/4 did as well.
+- The mid-layer write site is no better, so no write-source change.
+- The flat step types respond far more to trunk-side learning than to the
+  carry. Template changes or trunk-side supervision on these formats are
+  the better lever (inferred). The NOTES error-anatomy reading points the
+  same way.
+- **Limits.**
+  - Teacher forcing on gold prefixes is not the policy's own distribution.
+    Errors that follow a policy's own earlier slips are not represented.
+  - Base CE on gold traces is tiny (0.020 nats/token), so all effects are
+    small in absolute terms.
+  - Writes are detached, as in the trainer.
+
+## Memory read ablation at evaluation: pre-registration (2026-10-21)
+
+**Question.** Do the RL-trained memory policies depend on their memory read,
+and if so, on trajectory-specific content or only on the read's extra input
+(capacity and bias)? Nobody has measured how much of either memory drill's
+bench runs through the read. The fresh-rate drill
+(`mac_sampled_baseline_memory_fresh_lr_drill_20261021_r2`) led the token-only
+reference 14165 early (0.7255 vs 0.6486 at step 40) and converged with it
+(0.7963 vs 0.7972 at step 300). The adjoint drill
+(`mac_sampled_baseline_memory_adjoint1_drill_20261021`) logged 0.8081 at
+step 300.
+
+**Tool.** `--memory-eval-ablation {none,zero_read,foreign_state}`
+(`postraining/memory_eval_ablation.py`). It is legal only with `--bench-only`
+and `--reasoning-mode memory`, and is recorded in the manifest (top-level
+`memory_eval_ablation` and `args`) and in each bench metrics record. CPU
+contracts are in `postraining/tests/test_memory_eval_ablation.py`.
+- `zero_read`: the actor's read-out `combiner.reader.out.weight` is zeroed
+  for the evaluation and restored bitwise after it. Every decode input is
+  the token embedding alone: the token-only policy on the RL-trained trunk.
+  A CPU test checks that it is token-for-token the trunk's `hidden_carry=False`
+  rollout.
+- `foreign_state`: at every decode read, each row reads another
+  trajectory's memory state, at the same tick, through its own query (its
+  own token and producing belief). It still writes its own state.
+  - The donor of original row i is row (i + 16) mod 1024: the same sample
+    index of the next prompt in the rollout. The bench sorts prompts by
+    length, so the donor's prompt has a similar length. The map is a
+    bijection and always crosses prompts (CPU test).
+  - A side buffer indexed by original row survives compaction. A finished
+    donor's entry stays at the state it ended with, so a row that outlives
+    its donor reads the donor's final state. CPU tests check this against
+    the rows' own writes, and check that the graph arena and the eager loop
+    agree through compaction.
+  - It runs in the CUDA-graph eval arena, the canonical bench path. A queued
+    CUDA test (job 14472) checks the compiled, captured tick's alignment.
+- Jobs: `scripts/submit_memory_eval_ablation_20261021.sh <fresh|adjoint>
+  <step> <arm>`, with the step-error bench's exact flags (512 x 16, all
+  answers captured), priority 11, 30 min each.
+
+**Runs.**
+- Fresh-rate r2, step 40 and step 300: `none`, `zero_read` and
+  `foreign_state`.
+- Adjoint, step 300: the same three arms.
+- Fresh-rate r2, steps 100 and 200: `zero_read` and `foreign_state`, for the
+  trajectory of the dependence (and `none` if the budget allows).
+- Each `none` replay is the paired baseline for its ablations, under the
+  same code and process. The logged in-run bench is the check that the
+  replay reproduces the run. Replay noise is already measured: the existing
+  step-300 replay (`drill_step_error_bench_s300_20261021`) gives 0.7980
+  against the logged 0.7963, paired +0.0017 ± 0.0015, with 121 of 512
+  prompts' counts differing (bf16 decode numerics; the token draws are
+  counter-keyed, so samples are paired).
+
+**Statistics.** All comparisons are paired per prompt: the difference in
+`contract_prompt_correct_counts` over the same 512 prompts, divided by 16.
+The SE is the per-prompt SD over sqrt(512). It covers sampling on fixed
+prompts, not run-to-run variance (one seed per drill).
+
+**Hypotheses** (at fresh-rate step 300; the adjoint at step 300 is read the
+same way):
+- **H1, the policy depends on its memory:** `zero_read` is below `none` by
+  at least 0.03.
+- **H2, the dependence is on content:** `foreign_state`'s drop is at least
+  half of `zero_read`'s.
+
+**Alternatives.**
+- **Capacity/bias:** H1 holds and `foreign_state` is close to `none` (drop
+  under half of `zero_read`'s). The read matters as an extra input, not as
+  memory of this trajectory.
+- **No reliance:** `zero_read` is within 0.03 of `none` (and within 2 SE).
+- **Trunk co-adaptation:** if `zero_read` falls well below 14165 at the same
+  step (more than 0.03 below, paired), then removing the read breaks a
+  trunk that co-adapted to its presence. The drop then measures
+  co-adaptation, not the memory's value. The policy without memory would
+  not simply revert to a token-only policy of equal skill.
+
+**Predictions (mine, before any result).**
+- H1 holds at step 300. The read is about 9% of the input RMS, and the trunk
+  trained 300 steps with it present, so I expect a drop of 0.03-0.10.
+- H2 fails: `foreign_state` loses well under half of that. The teacher-forced
+  probe found a shuffled-stream memory recovers 85% of the memory's CE gain,
+  and the write gates near-silent (inferred to carry over to RL; not
+  measured there).
+- At step 40, `zero_read` falls to or below 14165's 0.649. I expect the early
+  surge to run through the read.
+- Prior: capacity/bias about 55%, content (H2) about 20%, no reliance about
+  25%.
+
+**Inspection.** Sampled traces from the arm with the largest change, read
+against the same prompts' `none` traces.
+
+### Amendment before results (2026-10-21)
+
+Made after a red-team review, while every bench job was still queued and
+held. No ablation bench result existed or had been read. These supersede the
+hypotheses and statistics above where they differ.
+
+- **New arm, `foreign_sample`.** Each row reads the memory of the next
+  sample of its own prompt (row p·16 + ((s + 1) mod 16)), at the same tick,
+  with its own query. Same side buffer, same freezing of finished donors,
+  same CPU contracts (bijection inside each prompt group, always another
+  sample). It runs at every snapshot `foreign_state` runs at. The
+  ablation schema is now `memory_eval_ablation/v2`.
+  - `foreign_state` (another prompt) removes prompt content and trajectory
+    content. `foreign_sample` (same prompt) removes only what is specific
+    to this trajectory. Their difference separates dependence on prompt
+    content from dependence on trajectory content.
+- **H1, restated on the interval.** With D_zero = bench(none) − bench(zero_read),
+  paired per prompt:
+  - H1 holds if the lower end of the 95% interval (D_zero − 1.96 SE) is at
+    least 0.03.
+  - **Significant but small:** the interval excludes 0 but its lower end is
+    under 0.03. The policy uses the read, but a drop of the pre-registered
+    size is not established (whether or not the point estimate reaches
+    0.03). It is reported as that, not as H1.
+  - **No reliance:** the interval includes 0.
+- **H2 is tested only if H1 or the significant-but-small case holds.** The
+  test is the paired per-prompt statistic
+  d_i = (none_i − foreign_i) − 0.5 · (none_i − zero_i), averaged over the
+  512 prompts with its SE. H2 holds if d − 1.96 SE > 0; capacity/bias if
+  d + 1.96 SE < 0; otherwise unresolved. No ratio of point estimates. The
+  same test runs for `foreign_sample`.
+  - Wrong content can mislead the trunk, so a foreign drop larger than
+    `zero_read`'s is possible. It is read as "the read's content is
+    load-bearing, and foreign content is worse than none", not as a
+    failure of the ablation.
+- **The comparison with 14165 is indicative only.** It pairs prompts and
+  sample seeds across two different runs, so its SE leaves out seed
+  (run-to-run) variance. The trunk co-adaptation reading is reported as
+  indicative, never as established.
+- **One-prompt chunks.** A `foreign_state` rollout with a single prompt
+  (and `foreign_sample` with a single sample) refuses with a clear error.
+  The configured bench shape (64 prompts x 16 samples per rollout) never
+  produces one.
+
+## Memory writes as RL actions (Gaussian write policy + write DPG): drill pre-registration (2026-10-21)
+
+**Change.** `--memory-write-policy gaussian`. The code is in the
+`.worktrees/memory-write-actor-20261021` worktree and is not merged. The
+belief adjoint is off in this arm; config refuses the two together.
+- **Policy.** Every generated memory write is a sample
+  a = mu(h) + sigma(h) * eps over the writer's pre-activations: key, value,
+  decay logit and write logit, 520 coordinates at 4 x 64.
+  - The sigma heads are softplus heads with a mean-field state term
+    (W u / D), initialized state-independent at 0.3.
+  - eps is counter-keyed on (row noise seed, unpadded producer slot), so
+    replay regenerates it exactly.
+  - Prompt writes are noiseless, as is the write of each row's first emit
+    (its belief is the prompt's).
+  - Evaluation and bench write the mean.
+- **Critic.** A write credit head g(s) = dQ/da at mu, a relu^2 layer of
+  1024 with a zero-initialized mean-field readout.
+  - It reads detached features fixed before eps_p is drawn:
+    - the critic belief at p and its embedding of the sampled token;
+    - the actor belief h_p;
+    - the memory's recall of h_p's mean key through write p-1, plus its
+      log scale;
+    - the mean gate logits.
+  - It is fit jointly per trajectory: sum_rows (G - c(s_first) -
+    sum_p g_p . sigma_p eps_p)^2 / n_traj. So A(s, 0) = 0 by
+    construction, and state confounding cannot enter.
+  - Its fit is reported held out, on each fresh pool before the head
+    trains on it. A shuffled control replaces each row's eps with another
+    row's at the same slots.
+- **Actor.** A pure DPG term at the mean: -sum_p sg(g_p) . mu(h'_p) /
+  N_emit, at the replay's own beliefs (behavior age 0). It is coefficient
+  1, ramped linearly over 40 steps, on top of the unchanged sampled-baseline
+  MAC token loss.
+  - sigma trains on the token path (sigma * eps enters the replayed scan).
+  - A per-term Lagrange dual (Adam 1e-2, epsilon 1e-3 nats) holds mean
+    log sigma at log 0.3.
+- **Rates.**
+  - sigma heads: AdamW 3e-4.
+  - Credit head: Adam, readout 3e-6, features 3e-5.
+- **Telemetry**, to TensorBoard and metrics.jsonl, under `write_actor/*`:
+  - joint, slot and shuffled R^2 and correlation;
+  - per-term credit RMS, executed-perturbation RMS, sigma mean, quantiles
+    and min/max, entropy and dual;
+  - DPG vs token belief-gradient norms and their cosine, writer direct
+    norm, and the record error;
+  - every 10 steps, an exact split (one more replay per shard): group
+    gradient norms for the token path vs DPG (trunk, embedding, writer,
+    reader, sigma) and the writer's per-row token/DPG cosines;
+  - `grad/write_credit` apart from `grad/critic`.
+- **Tests.**
+  - `postraining/tests/test_memory_write_actor.py`: 25 CPU tests.
+    - Decode, the arena and replay agree on sigma-scaled noise under a
+      state-dependent sigma.
+    - The features are causal.
+    - The joint fit, the DPG term through the trunk, the sigma constraint
+      and the dual each match an autograd oracle.
+    - A zero coefficient with zero multipliers is bitwise the plain
+      update.
+    - The exact split recomposes the joint backward, and sharding
+      composes.
+    - Refusals, CLI, schemas, resume and the optimizer partition are
+      covered.
+  - The full CPU suite shows no new failures: its 21 failures are 18 that
+    fail identically in the main checkout plus 3 that need data files
+    absent from the worktree.
+  - `test_memory_write_actor_cuda.py`, job 14497, passed on the KDA8 SFT
+    checkpoint:
+    - graph decode vs replay 0.01107, eager 0.01111, noiseless floor
+      0.01107;
+    - the same record replayed without noise 0.057, under another sigma
+      0.073;
+    - graph vs eager shared-prefix gap 0.00895 noisy vs 0.00893 noiseless;
+    - compiled vs eager update, exact split vs joint: every tensor within
+      max(2e-2, 3 x the resharding floor);
+    - record error of mu at the replay belief: 0.011.
+  - The parametrization was then changed after the red-team review (mean-
+    field readout and sigma state term, dual epsilon), so the parity was
+    re-queued as job 14499. That job gates the drill.
+
+**Run.** `mac_sampled_baseline_memory_write_actor_drill_20261021`
+(`scripts/submit_mac_sampled_baseline_memory_write_actor_drill_20261021.sh`
+in the worktree). One seed (1337), by the user's ruling: drills run one
+seed only.
+- 360 steps, in chained 75-minute sessions (jobs 14500 -> 14501 -> 14502,
+  each after the previous succeeds) with `--max-train-hours 1.05`
+  per session, at priority 11, after job 14499.
+- Every other flag is the fresh-rate reference's
+  (`mac_sampled_baseline_memory_fresh_lr_drill_20261021_r2`): v7 twin study
+  critic start, `--fresh-learning-rate 3e-3`, the same pool, bench and
+  seed.
+  - The fresh head is excluded from the study-critic load.
+  - The only argv differences are the policy flag and the session cap.
+
+**Reference and criteria.** The comparison is at matched steps, never wall
+time. The reference's logged bench (metrics.jsonl, 512 prompts x 16
+samples): 0.6759 (20), 0.7255 (40), 0.7644 (60), 0.7944 (200), 0.7963
+(220), 0.7960 (240), 0.7997 (260), 0.7974 (280), 0.7963 (300). Its mean
+over the six evals 200-300 is **0.7967**. The adjoint pre-registration's
+0.7972 used a replayed 0.798 at step 300, not the logged value.
+- **Primary:** the mean bench over steps 200-300 against 0.7967.
+  - Win: at least +0.010.
+  - Null: within +/- 0.010.
+  - Harm: below -0.010, or the bench stop floor fires.
+- **Noise.** With one seed, run-to-run variance is unmeasured. For scale:
+  - eval-to-eval SD on the reference plateau is about 0.002;
+  - a paired bench replay differs by +0.0017 +/- 0.0015;
+  - the adjoint drill, a different arm on the same seed and inputs, sat
+    +0.0015 from the reference on this window (0.7982) with single-step
+    gaps up to 0.012.
+  - So a +/- 0.010 result is weak evidence either way. It will be
+    reported as one-seed, not as established.
+- **Steps 320-360** have no matched reference (it was cancelled near 300).
+  They are reported descriptively only. The adjoint drill's 0.8015 /
+  0.8094 / 0.8145 are a different arm and are context, not a control.
+- **Cost:** seconds per step (`train.seconds`, `pool_seconds`) against the
+  reference's medians over 305 steps (3.24 s `seconds`, 7.12 s pool). Reported, not a
+  criterion.
+
+**Mechanistic predictions** (made before any result):
+1. Step-0 bench equals the reference's 0.5958. The reader's output is
+   zero-initialized and evaluation writes the mean. A different value
+   means the eval path is not the mean policy, or bf16 decode
+   nondeterminism; that needs explaining before anything else is read.
+2. Held-out `joint_corr` stays indistinguishable from `shuffled_corr`.
+   The test is the mean of their per-step difference over steps 200-360,
+   within 2 SE of the per-step SD. I expect it to stay there.
+   - The write-noise sweep (job 14376) bounded the learnable signal at
+     sigma 0.3 near zero (rho^2 lower bound -7e-5 +/- 6e-5).
+   - The true slope is bounded at about 1.4e-5 to 1e-4 per coordinate
+     (the lower figure is a red-team inference from that rho^2 bound),
+     which is not clearly above g's own random-walk floor (about 3e-5
+     over 360 steps).
+   - If the difference is positive past 2 SE, the head learned real write
+     credit, and that is the result to inspect regardless of the bench.
+3. The trunk's DPG path is negligible: `belief_norm/dpg` /
+   `belief_norm/token` below 0.01 throughout.
+   - In the CUDA fixture an artificial g of RMS 0.064 gave a ratio of
+     about 1. At realistic |g| of 1e-4 to 1e-3 the ratio scales down to
+     1e-3 to 1e-2.
+   - The writer is the exception. Its matrices are under fresh Muon,
+     which is scale-invariant, so wherever the token path's writer
+     gradient is small (early, with a near-silent reader) the DPG
+     direction can set the whole writer step. The coefficient warmup
+     does not prevent this. Watch `grad_norm/memory_writer/{token,dpg}`
+     on the exact-split steps.
+4. sigma stays near target: |`sigma_violation/*`| below 0.05 nats after
+   step 50, with per-term q10-q90 within 0.2-0.45.
+5. The read share (`carry_input_delta_rms_ratio`) tracks the reference
+   within about +/- 25%. The noise perturbs what is read. If the read
+   share is far below the reference, the reader learned to ignore noisy
+   writes; that is a failure mode, not a win.
+
+**Reading rules.**
+- A bench win with prediction 2 failing (no held-out credit) is not
+  evidence for write credit. It goes to exploration noise or sigma
+  regularization of the memory, or to seed variance.
+- A null with prediction 2 failing means the critic could not resolve
+  per-write credit at this pool size and sigma. That is the outcome the
+  sweep predicted, not evidence against write credit in general.
+- Harm with a DPG-dominated writer (prediction 3's caveat) is read as
+  critic noise steering the writer.
+
+**Prior.** Null about 70%, harm about 20% (noisy writes plus noise-driven
+writer steps), win about 10%.
+
+**Coordinator constraints honoured.** The drill is not gated on a
+frozen-policy signal test, even though the red-team review recommended
+one: the instruction ruled it out. The sweep result above is the existing
+frozen-policy evidence, and it is why the prior is mostly null.
+
+**Deviations (written before any training-step result).**
+- Parity job 14499 failed by threshold margins: a 4.97x bound against 5x,
+  and cosine 0.99947 against 0.9995. The same margins appear on the
+  sampled-baseline arm, which has no write actor. The drill was
+  resubmitted ungated as job 14512.
+- Job 14512 died of CUDA OOM in a rollout. The step-0 bench was 0.5958,
+  the same as the reference. Partial directory: `..._oom_14512`.
+- **Cause: a pre-existing leak in `train_latent_vapo.py`, not the write
+  actor.**
+  - The update popped the retained device minibatch into
+    `retained_minibatch`, aliased it as `device_minibatch`, and deleted
+    only the alias. The 4.25 GiB packed batch therefore stayed live
+    through the next pool's rollout.
+  - Evidence from CUDA allocation snapshots at OOM: both arms OOM at the
+    same place (job 14543 with the write actor, 14544 without). The leaked
+    batch's 16 tensors are allocated at the minibatch H2D.
+  - In the reference, rollout 1, before any update, peaked at 18.64 GiB;
+    later rollouts peaked at 23.62. It fit then only because the desktop
+    held less of the card.
+  - Fixed in the worktree and in main by popping straight into
+    `device_minibatch`.
+  - Verification probe 14548, the write-actor arm at `--rollout-groups 64`:
+    rollout peaks 18.65 / 19.41 / 19.41 GiB, train peaks 13.70 / 14.41 /
+    14.44 GiB, and it completed.
+  - The write actor's own cost is the train-phase difference: 14.41 vs
+    the reference's 14.24 GiB.
+- A `--rollout-groups 32` workaround (job 14530) ran 22 steps before an
+  external kill. It is abandoned and kept as `..._rg32_14530`.
+- The drill restarts from step 0 with the reference's exact argv apart
+  from the policy flag, as jobs 14549 -> 14550 -> 14551 -> 14552 (four
+  75-minute sessions).
+
+**Result: harm, killed at step ~90 (job 14549).**
+- Bench (512 x 16) against the reference at matched steps: 0.6726 vs
+  0.6759 (20), 0.7042 vs 0.7255 (40), 0.6718 vs 0.7644 (60), 0.5824 (80).
+  At 80, format fell 0.990 -> 0.943, ended 0.998 -> 0.969, and mean length
+  rose 223 -> 296 tokens.
+- The credit head never had signal: held-out joint R^2 equals the
+  shuffled-noise control at every step (step 90: -0.0029 vs -0.0026;
+  joint corr <= shuffled corr). Yet credit_rms grew steadily
+  (8e-6 -> 3.8e-5), as did |dpg_loss| (3e-5 -> 1e-2) and
+  writer_direct_norm (0 -> 0.010).
+- Cause (inferred from the telemetry, not ablated): the DPG term steered
+  the writer on a signal-free credit head, and the optimizers
+  magnified it.
+  - The writer's gradient was about 50x the reference's (grad/combiner
+    0.13-0.19 vs 0.003), so roughly 98% of it is the DPG term. The token
+    path reaches the writer only through the still-small memory read.
+  - What matters is that the DPG term dominated the writer's gradient
+    and its error persisted across steps, not that it was small (CLAUDE.md,
+    Optimizer Facts). g comes from a head fitted slowly over many pools,
+    so its estimation error is shared by every write in a pool and
+    carries over from step to step. The DPG gradient therefore points the
+    same wrong way every step, and the writer integrates it at the
+    optimizer's coherent rate.
+  - Concretely, the decay gate went the opposite way to the reference:
+    mean log timescale 4.85 -> 6.50 (memory about 670 tokens long)
+    vs 4.85 -> 3.70 (about 40) in the reference. Combiner and trunk
+    gradients rose, and generation degraded.
+  - Not separated: the effect of training on sigma-0.3 noisy writes
+    without the DPG term. A DPG-off arm with noise on would isolate it.
+
+**Why a better estimator alone would not have rescued it (red-team
+review, 2026-10-21).**
+- A Q-Prop-style replacement is exactly unbiased whatever the head's
+  quality:
+  - actor direction v_p = sg(g_old) + r_i eps_p / sigma_p, with
+    r_i = G_i - b_i - sum_q g_old . d_q;
+  - g_old is the head before this pool's fit;
+  - b_i is the prompt's leave-one-out mean;
+  - the score uses d / sigma_eff^2.
+- It is still inert here. Per-slot i.i.d. write noise explains rho2 ~ 0 of
+  the return (job 14376, 2-SE upper limit 2.5e-4), so even a perfect head
+  removes almost no variance.
+  - Per-pool SNR for one writer weight is about 0.003-0.03.
+  - Optimal (convex, variance-weighted) combination with the token path
+    would give the noise term about 1e-4 of the weight.
+  - Its belief-level score term would dominate the trunk's gradient share
+    while being zero-mean.
+- The coefficient-1 sum with the token path also double counts: both
+  estimate the same writer gradient, so the weights must be convex.
+- Caveat: 14376 measured the 2e-5 memory drill's untrained memory. It
+  bounds this drill's start, not a memory the token path has trained.
+
+**Gate: write-noise sweep on the trained memory (job 14554).**
+- `scripts/submit_memory_write_noise_sweep_trained_20261021.sh` in the
+  worktree. It is the 14376 protocol on the fresh-rate reference's step-300
+  snapshot (bench about 0.796, memory trained at 3e-3).
+- Decision, fixed now:
+  - **Go:** rho2_lower >= 1.5e-3 at any scale, the same threshold as
+    14376. Rebuild the write actor on the unbiased estimator above, with:
+    - a convex token/noise combination;
+    - score surrogates on detached recorded writes;
+    - the trunk's score term measured on a frozen pool before it is
+      admitted.
+  - **No-go:** per-slot write exploration has nothing to learn from, even
+    on a trained memory. Write credit then has to come from somewhere
+    other than write-action RL.
+
+**Gate result: go, narrowly (job 14554, 2026-10-22).**
+- The job was cancelled "by request" after 84 of its 256 pools (86,016
+  trajectories). The cancellation came from outside this session; who
+  sent it is unknown. The analysis below uses the 84 complete pools,
+  via `scripts/analyze_write_noise_sweep.py` on
+  `postraining/runs/memory_write_noise_sweep_trained_20261021/write_noise_sweep`.
+- *Corrected 2026-10-22, after the sigma-atan2 arm: the sweep scales are
+  absolute pre-activation noise (`--write-noise-sweep` help;
+  `memory_carry.py` draws `scale * eps`), so the training point sigma 0.3
+  is the **0.3** row, not the 1 row. At the training point rho2_lower is
+  1.2e-4 +/- 1.9e-4, a null, and exploration costs about 0.1 points, not
+  1.8. The "go" below holds only at sigma 1. See "Correction: the write
+  gate was a null at the training scale" at the end of this file.*
+- Results by sweep scale (originally labelled "scale 1 is the training
+  point, sigma 0.3", which is wrong):
+
+  | scale | flip rate | reward cost | rho2_lower | rho2_upper | pools to half fidelity |
+  |---|---|---|---|---|---|
+  | 0.03 | 3.7% | -0.02% +/- 0.02% | 0.0 +/- 5e-5 | 0.027 | inf |
+  | 0.1 | 4.8% | -0.01% +/- 0.03% | 2e-5 +/- 8e-5 | 0.046 | 3.2e4 |
+  | 0.3 | 9.5% | -0.10% +/- 0.04% | 1.2e-4 +/- 1.9e-4 | 0.104 | 4.4e3 |
+  | 1 | 27.6% | -1.77% +/- 0.07% | **2.55e-3 +/- 0.52e-3** | 0.271 | 199 |
+
+- At the training scale rho2_lower clears the pre-registered 1.5e-3. Its
+  2-SE lower edge, 1.51e-3, also clears it, but only just. For
+  comparison, the untrained memory's 2-SE upper limit was 2.5e-4 (14376).
+  So a memory the token path has trained does respond, to first order, to
+  its write noise.
+- Below the training scale, nothing is detectable. Exploration at the
+  training scale is not free: it costs 1.8 points of reward on a
+  0.90-reward policy. That is the trade a return-trained, state-dependent
+  sigma(h) has to make.
+- Pools to half fidelity (199) is the noise-regression estimator's figure,
+  under the sweep's antithetic coupling. The training-time score
+  estimator has no coupling, so expect it to be noisier. The inverse-
+  variance mix should then give the noise path a small weight, and it
+  should grow only where measured variance justifies it.
+
+## Q-Prop memory write actor: drill pre-registration (2026-10-22)
+
+Written before the drill or its CUDA qualification ran. It continues the
+gate above. The code is in `.worktrees/memory-write-actor-20261021`, not
+merged.
+
+**Change.** `--memory-write-policy gaussian` rebuilt on the unbiased
+estimator the gate called for (`postraining/memory_write_actor.py`
+docstring):
+- **Policy.** Writes are sampled as before: state-dependent softplus
+  sigma(h) at 0.3, counter-keyed eps, and the mean at evaluation.
+- **Noise path Nz.** The write policy's own likelihood-ratio gradient: a
+  leave-one-out group baseline, with the credit head's g . d as a control
+  variate whose expectation is added back analytically. g comes from the
+  head before this pool's fit, so Nz is unbiased for any head and any eta.
+  A signal-free head costs variance, never a persistent direction, which
+  was the DPG writer's failure.
+- **Mix.** Per writer tensor the update is T_u + (1 - w) T_x + w Nz:
+  - T_x is the token path at explored writes;
+  - T_u is the token path at the prompt writes and each row's first
+    write, which are never mixed;
+  - w is the weight that minimizes that update's variance, from lagged
+    EMAs of within-shard row-half differences, clipped to [0, 1].
+- **sigma(h)** trains on the same mix, with no temperature and no dual
+  (the user's call: state-dependent noise should be enough).
+- **Trunk.** The trunk keeps the token path alone.
+
+**Review fixes before launch.** Two independent red-team passes ran.
+- The first pass (2026-10-22, before this entry) found the target
+  mismatch (T_u had been mixed), the resume device crash and the
+  between-shard variance bias. All three were fixed.
+- The second pass found no bias bug. It found:
+  - **The actor init differed from the reference (verified).** The sigma
+    heads' `nn.Linear` construction consumed the global RNG, so the fresh
+    reader's query weights started from a different draw than the
+    reference's. Fixed with `skip_init`. A CPU test now pins the reader's
+    init and the RNG stream against a deterministic memory, and fails on
+    the old construction.
+  - **The weight ignored T_u (inferred).** It was optimal for T_x and Nz
+    in isolation, not for the applied update, and T_u comes from the same
+    rows' losses. Fixed: the replay's write split now has four stand-in
+    masks (explored and unexplored, by row half), and
+    w = (V_T - C + C_uT - C_uN) / (V_T + V_N - 2 C). The objective schema
+    is now `/v3`. CPU tests check:
+    - the four parts partition the writer gradient against an autograd
+      oracle;
+    - the five moments against per-shard oracles (a mutation is caught);
+    - the closed form against a grid minimum.
+  - **New telemetry.** `write_actor/target_gap_ratio/{mean,sigma}` is
+    ||Nz - T_x||^2 over its sampling expectation V_T + V_N - 2 C. It is
+    about 1 when both paths estimate one gradient. An excess that persists
+    is the token path's truncation bias, which the weight cannot see.
+- CUDA tests: job 14566 (before these fixes) failed one power check. The
+  dropped-noise replay gap had to exceed 5x the bf16 floor, and it
+  measured 4.8-5.6x across jobs 14497/14499/14560/14566. The check is now
+  1.5x the regeneration bound, which every past draw clears. Regeneration
+  itself matched the floor (0.01099 against 0.01094).
+- The requalification is job 14574 (`test_memory_write_actor_cuda.py` plus
+  `test_memory_carry_cuda.py`). The drill is gated on it.
+- CPU: the write-actor suite passes (32), and so do the related suites
+  apart from 11 `test_latent_rollout.py` failures, which fail identically
+  in the main checkout.
+
+**Run.** `mac_sampled_baseline_memory_write_qprop_drill_20261022`
+(`scripts/submit_mac_sampled_baseline_memory_write_qprop_drill_20261022.sh`
+in the worktree).
+- Four chained 75-minute sessions at priority 11, one seed (1337).
+- The argv is the fresh-rate reference's
+  (`mac_sampled_baseline_memory_fresh_lr_drill_20261021_r2`), apart from
+  the policy flag, the write-actor defaults and the session cap. The
+  second reviewer verified this by parsing the drill's argv against the
+  reference manifest.
+- With the RNG fix the actor and critic start from the reference's draw.
+
+**Reference and criteria** are unchanged from the write-actor
+pre-registration above:
+- **Primary:** the mean bench (512 x 16) over steps 200-300 against
+  **0.7967**.
+  - Win: at least +0.010.
+  - Null: within +/- 0.010.
+  - Harm: below -0.010, or the bench stop floor fires.
+- One seed, so a +/- 0.010 result is weak evidence and will be reported as
+  one-seed.
+- Steps 320-360 are reported descriptively only.
+- **Manual stop:** bench more than 0.05 below the reference at two
+  consecutive matched evals, after inspecting sampled traces.
+
+**What this drill can and cannot test.** Expected outcome: w stays near
+zero.
+- At the trained memory, per-slot noise explains rho2 of about 2.5e-3 of
+  the return at sigma 0.3 (gate above). Nz's half-difference variance
+  should therefore dwarf T_x's.
+- If w stays near zero, the drill tests:
+  - training on sigma-0.3 noisy writes;
+  - sigma(h) learning from the pathwise token term;
+  - the credit head's held-out fit.
+  It does not test Q-Prop credit. That is the noise-on, DPG-off arm the
+  collapse analysis said was missing.
+- Read `write_actor/mix/*/weight` before attributing any bench change to
+  the mix.
+
+**Mechanistic predictions** (made before any result):
+1. The step-0 bench is the reference's 0.5958 (zero-initialized read-out,
+   mean writes at evaluation, the same init draw). Anything else is
+   explained before anything else is read.
+2. The mix weight on every mean-head tensor stays below 0.05 at every
+   update through step 360.
+3. The control weight `control_weight` stays at 0. Held-out `joint_corr`
+   stays within 2 SE of `shuffled_corr`, read as the mean of their
+   per-step difference over steps 200-360.
+4. `target_gap_ratio/mean` is within 1 +/- 0.3. A truncation bias, if any,
+   is invisible under Nz's variance.
+5. sigma barely moves. The per-term `sigma_mean` stays within 0.24-0.33.
+   The reviewer's bound is |delta log sigma| <= 0.2 over 360 steps at the
+   sigma heads' AdamW 3e-4. A drift toward the low end means noise costs
+   return where writes are read.
+6. The read share (`carry/input_delta_rms_ratio`) tracks the reference
+   within +/- 25%. The reference went 0.025 (20), 0.050 (50), 0.078 (150),
+   0.088 (300). Far below means the reader learned to ignore noisy writes,
+   a failure mode.
+7. Train reward falls below the reference by a growing margin, reaching
+   0.01-0.02 by step 300. The gate measured a 1.8-point return cost of
+   sigma 0.3 noise on the trained memory. Early, while reads are small, the
+   cost should be near zero.
+8. Cost: train-phase peak within 1 GiB of the reference's. Whole-step
+   seconds are reported against the reference's medians (3.24 s
+   `seconds`, 7.12 s pool), but are not a criterion. The four-mask split
+   adds two stand-in projections per replay.
+
+**Reading rules.**
+- **Win with prediction 2 holding (w near 0):** not a Q-Prop result.
+  Attribute it to noisy-write training or sigma regularization, or to seed
+  variance.
+- **Win with w above 0.1 on the mean heads and prediction 3 failing:** the
+  credit head learned. Inspect it before claiming anything.
+- **Harm:** compare the train-reward gap with prediction 7. A bench loss
+  beyond the gate's 1.8-point exploration cost points at the noise
+  corrupting what the reader learns, not at the estimator.
+
+**Prior.** Null about 60%, harm about 30%, win about 10%.
+
+**Launch (2026-10-22).** CUDA requalification job 14574, then the drill
+sessions 14575 -> 14576 -> 14577 -> 14578. Each starts only after the
+previous job succeeds.
+
+**Early read (step 40, job 14575).**
+- **Bench, against the reference:** 0.5958 vs 0.5958 at step 0
+  (bit-identical, prediction 1 holds), 0.6747 vs 0.6759 at step 20,
+  0.7198 vs 0.7255 at step 40.
+- **Train reward,** mean over steps 21-40: 0.6865 vs 0.6898.
+- **Read share** tracks the reference: 0.0473 vs 0.0452 at step 40.
+- **Mix weights** are at or below 2e-7 on every writer tensor
+  (prediction 2).
+- **`target_gap_ratio/mean`** is 0.995-1.027 (prediction 4).
+- **sigma_mean/key** is 0.29988 (prediction 5).
+- **Prediction 3 fails on eta.** `control_weight` swings between 0 and
+  1 and sits at the clip 1.0 for steps 19-33.
+  - The head has no signal: held-out joint R^2 is within +/- 6e-4 of 0,
+    and `residual_variance_ratio` is 0.9994-1.0004.
+  - Its predictions P are so small (credit RMS 2e-5) that the EMA slope
+    Cov(A, P) / Var(P) is the ratio of two noise sums.
+  - This costs no bias, because eta is lagged.
+  - It does not reach the writer: eta enters the update only through Nz,
+    whose mix weight is about 0.
+  - It would matter only if w grew. A slope estimate shrunk by its own
+    standard error would be the estimator fix. Left as is for this
+    drill, so the arm is not changed mid-run.
+
+**Interim read (step 238, job 14575 still running; window 200-300 not
+complete).** From `/dev/shm`-scratch analysis of both runs' metrics.jsonl.
+Paired bench SEs are over 512 prompts and cover sampling only (one seed).
+- **Bench, paired per prompt against the reference.**
+  - It tracks the reference within noise: steps 20-100 and 160-220 are all
+    within +/- 0.006.
+  - There is a dip at 120 (-0.021 +/- 0.006) and 140 (-0.016 +/- 0.006).
+    It recovered by 160 (+0.000).
+  - Steps 200 and 220: 0.7944 vs 0.7953, paired -0.0010 +/- 0.0049.
+  - Format, termination and length match the reference (format 0.994-0.996,
+    ended 0.997-1.000, about 247 tokens).
+- **Train reward (prediction 7 failing so far).** The gap per 20-step
+  window is between -0.010 (161-180) and +0.001 (221-240), with no growing
+  trend. That is well under the 1.8-point cost the gate measured for sigma
+  0.3 noise on the frozen trained memory. Read: the policy trained under
+  noise absorbs most of its cost (inferred).
+- **The Q-Prop path is inert, as predicted (2 holds).**
+  - The noise path's mean-head writer gradient norm is 1.1-1.3, against
+    the token path's 7-11e-4 (explored) and 3-7e-4 (unexplored). So V_N
+    dominates and w is at most 3e-4 on every tensor.
+  - The writer cosine between the two paths is within +/- 0.004.
+  - The arm is effectively noisy writes plus the token path.
+- **The credit head has no signal (3 holds on correlation; eta noisy as
+  noted).** Over steps 100-238, joint_corr - shuffled_corr = -0.0058 +/-
+  0.0039 (n 139).
+- **`target_gap_ratio`** is mean 0.99-1.02 and sigma 0.91-1.08
+  (prediction 4 holds), but the check is vacuous at this V_N (red team,
+  2026-10-22): 1.0009 +/- 0.0008 over steps 100-240 only bounds a
+  difference in target below about 0.05 ||Nz|| = 0.06, some 60x the token
+  path's whole gradient norm (about 9e-4).
+- **sigma barely moves (prediction 5 holds), but it is not frozen, and
+  the earlier reading of why was wrong (corrected after red team,
+  2026-10-22).**
+  - Per-term means at step 238: key 0.2993, value 0.2991, decay 0.3006,
+    write 0.2963. q10 = q90 to 4 decimals; min/max within 0.295-0.303.
+  - **The state spread is small by design.** The sigma state term is
+    W u / D with D = 512 (`MemoryWriter._sigma_preactivations`), so even
+    fully coherent Adam steps move log sigma by about lr per step. Pure
+    noise at full Adam steps would give q90/q10 of about 1.0003, and the
+    coherent bound over 130 steps is about 1.07. So q10 = q90 mostly
+    reflects /D, not Adam's epsilon.
+  - **Adam's epsilon also attenuates the weights.** Their sqrt(v) is
+    about 2.6e-10 against eps 1e-8, and PyTorch adds eps to the
+    bias-corrected sqrt(v-hat) = 2.18 sqrt(v) at step 237. So steps are
+    about 5% of lr (key/value sigma weights), 10% (decay) and 19% (write).
+    The biases are 97-99% unattenuated.
+  - **sigma is being shed coherently through its biases.**
+    - The key/value sigma biases' mean m-hat/sqrt(v-hat) is positive at
+      every snapshot from 20 to 240 (+0.03 to +0.054, SE about 0.014).
+    - Their mean displacement from init falls about linearly: -1e-3 at
+      step 80, -2.1e-3 at 160, about -3e-3 at 240. That is 8-10 SE from
+      zero over 256 elements, about 4% of the coherent rate lr*t.
+    - All four write-sigma biases fell (mean -1.4e-2, about 20% of
+      lr*t).
+    - The per-element median |m-hat|/sqrt(v-hat) (0.14-0.21, against a
+      pure-noise 0.154) cannot see a per-element SNR this weak; the
+      coordinate average can.
+  - So the token path's reparameterized term does carry a consistent
+    sigma preference: less noise, most on the write gate. That is the
+    reader's dislike of noise, as expected from the pathwise term, not
+    exploration value, which only the mixed-out score path would carry.
+  - An earlier draft of this bullet blamed "lr 3e-4 caps the drift" (the
+    small-signal fallacy). The draft after that blamed epsilon alone, and
+    called sigma's gradient noise. Both were wrong.
+  - The writer and reader drift (Muon) is identical to the deterministic
+    reference: key/value/read-out RMS growth agrees to 3 decimals, and in
+    both, write beta falls from 0.50 to about 0.32 and mean log decay
+    timescale from 4.85 to about 3.2 (128 to 25 tokens). The memory is
+    becoming a short-range channel whether or not the writes are noised.
+    hops = 0 (the trunk loop is cut).
+- **Read share** tracks the reference (6): 0.0847 vs 0.0808 at 200,
+  0.0867 vs 0.0919 at 238.
+- **Cost (8):**
+  - Whole-step seconds median 3.70 vs 3.15 (+17%); pool 7.98 vs 7.12 s
+    (+12%).
+  - Train peak 14.95 vs 14.26 GiB (+0.68, within the 1 GiB flag).
+  - Rollout peak 19.42 vs 23.62 GiB (the leak fix).
+- **Session 1 was lost, not cancelled.** Job 14575 ended "lost (runner
+  died; command exit status unknown)" after logging step 249 (bench 0.7986
+  at 240 against the reference's 0.7960). The last checkpoint is step 237.
+  Jobs 14576-14578 were skipped on its outcome. Resumed from step 237 as job
+  14585 (`ATTEMPT=r2`, session 2). Resume rewinds telemetry past the
+  checkpoint, so steps 238-249 are re-run, not double-logged.
+
+## Write-noise credit: analysis, and a sigma Adam epsilon fix not queued (2026-10-22)
+
+**Direction correction (user, 2026-10-22).** Belief-adjoint hops are
+truncated BPTT through generated history. They are excluded, both for cost
+and because they are unnecessary: a sampled token is also a one-hop,
+low-bandwidth action whose effect through later beliefs is never
+differentiated, and the token policy learns. The cut is the memory's credit
+contract, as it is a token's. I proposed hops (and a token-cost
+curriculum) as remedies earlier today; both changed the problem instead of
+the estimator. The docs now say this: CLAUDE.md (`memory` paragraph),
+`memory_belief_adjoint.py` (status: excluded), `memory_carry.py`,
+`memory_write_actor.py`, and a dated correction in
+`docs/memory_write_critic_plan_20261020.md`. The one-hop adjoint drill
+above was a null on its window.
+
+**A premise I dropped before building.** I proposed scoring each write with
+"the token's per-step GAE advantage". Under `--mac-estimator
+sampled_baseline` (this drill), tokens are not credited by GAE. A token's
+coefficient is G - c(s_t), the Monte Carlo return minus the critic's state
+value (`mean_actor_critic.py`). The write's is G - b, the leave-one-out
+group mean. That difference is a baseline, worth a few-fold variance at
+most, so the plan could not move the measured gap below.
+
+**What the score path is up against (measured, drill telemetry; revised
+after an independent red team the same day).** The ratio V_N / V_T of the
+noise path's to the token path's sampling variance per writer tensor (EMA
+moments, mean over steps 200-240; the session-2 resume rewound 241-249):
+
+| tensor | noised outputs | V_N / V_T |
+|---|---|---|
+| decay_gate.bias | 4 | 5.2e4 |
+| write_gate.bias | 4 | 6.0e4 |
+| write_gate.weight | 4 | 9.3e4 |
+| decay_gate.weight | 4 | 1.9e5 |
+| value.weight | 256 | 2.0e6 |
+| key.weight | 256 | 2.6e6 |
+| sigma heads | 4-256 | 2.3e5-6.4e6 |
+
+- **The spread across tensors is the token path's, not the noise path's.**
+  V_N per element is about 4.4e-6 for all six mean tensors, as a
+  fixed-size score predicts. V_T per element ranges from 1.7e-12 (key) to
+  9.4e-11 (decay_gate.bias). So the gate tensors look "closer" because
+  the token path couples to them more strongly, not because they have
+  fewer noised outputs (my first reading).
+- With two estimators, w = 1/(1+R) reaches 0.05 at R of about 19. The
+  logged w (at most 3e-4) is mostly noise in the covariance moment: for
+  decay_gate.bias, 1/(1+R) is 1.9e-5, and the correlation over steps
+  100-240 is +0.0006 +/- 0.012.
+- **The ratio falls on the gates because V_T grows.** write_gate.bias
+  went from 6.6e5 at step 40 to about 5e4 at 240, but V_T rose 9x while
+  V_N fell only 1.46x. key.weight's ratio has been flat since step 100
+  (2.6e6 to 2.5e6). So there is no defensible extrapolation to w = 0.05.
+  A constant late rate gives about 1,200 steps; a power law fitted to
+  steps 40-240 gives 5e4-7e4. It depends on whether the token path's
+  coupling keeps growing. I first wrote "stationary", then "a
+  thousand-plus steps"; neither holds.
+- **Return-side variance reductions are capped at about 7.4x.** The
+  trained sweep (job 14554) gives E[D^2]/Var(G) = 0.271 at the training
+  scale. So the noise-caused share of return variance,
+  E[Var(G | token seeds)]/Var(G), is 0.135. Any baseline, common random
+  numbers, Rao-Blackwellization over the token randomness, or antithetic
+  pairing with shared token seeds removes at most the other 86.5%. That
+  leaves a gap of at least about 7e3x on the gates.
+- **Mechanism.** A categorical score shrinks as the policy becomes
+  confident: at 0.028 nats/token, most of a trajectory's tokens add almost
+  nothing to the token estimator's variance. A Gaussian's Fisher
+  information for its mean is 1/sigma^2, which grows as sigma shrinks,
+  and every one of a trajectory's ~223 explored writes adds full variance
+  in every noised coordinate. Meanwhile the first-order effect on the
+  return is small (rho2_lower 2.5e-3 of within-prompt return variance at
+  sigma 0.3, job 14554).
+- **What could close the gap is the noise's structure, not its
+  credit.** This is inference, not measured.
+  - Noise shared across a trajectory's writes (one draw per trajectory,
+    or per long segment) cuts the score's variance for bias-like
+    directions by up to the ~223 explored writes, if the per-write
+    sensitivities are coherent. With common random numbers that is up to
+    about 800x, which puts write_gate.bias near R of about 60 (w of
+    about 0.016).
+  - For weight matrices it is about 2.3x worse (D/P).
+  - A discrete, confidence-vanishing write decision (token-like) is the
+    other structural option.
+  - Both change the exploration policy, so they are design decisions
+    for the user.
+- **Even w = 0.05 would not by itself make noise useful.** The mix is
+  variance-only: it cannot correct a bias in the token path, so with both
+  paths unbiased for one target, a larger w only lowers the update's
+  variance. Noise matters beyond that only through what the score path
+  sees and the token path cannot, the cut loop, and that is excluded by
+  contract.
+- **Consequence.** In this design, write noise shapes learning through the
+  pathwise token path:
+  - as reparameterized smoothing of what the reader is trained on (the
+    "conditioning" seen so far);
+  - through sigma's reparameterized gradient, which is coherent and
+    sheds noise, most on the write gate (interim read, corrected).
+- Write noise is also not adding token-level exploration. Within-group
+  return SD tracks the reward level in both arms: 0.2648 vs 0.2576 at
+  steps 121-180, at rewards 0.839 vs 0.844.
+
+**Sigma Adam epsilon fix: built, not queued.** *Superseded the same day:*
+the eps-1e-16 stopgap was replaced by Adam-atan2 and the /D scaling was
+removed before anything ran ("Sigma unscaled, under Adam-atan2" below).
+- **Change** (in `.worktrees/memory-write-sigma-eps-20261022`; the
+  running drill's worktree is untouched):
+  - The sigma heads' AdamW epsilon goes from 1e-8 to 1e-16
+    (`WRITE_SIGMA_ADAM_EPS`).
+  - The Gaussian writer's optimizer schema gains
+    `+write_sigma_adamw_eps1e-16/v1`, because resume restores epsilon
+    from optimizer state.
+  - `test_memory_write_actor.py` checks:
+    - one sigma step at gradient 2.6e-10 is lr (the default epsilon gives
+      under 5%);
+    - the partition carries the epsilon;
+    - the schema binds it.
+  - The full CPU suite matches the drill worktree: the same 21 failures
+    and 1 collection error, plus the two new passes.
+  - Submit script:
+    `scripts/submit_mac_sampled_baseline_memory_write_sigma_eps_20261022.sh`.
+- **Why it is not queued.**
+  - I pre-registered a ~130-step arm, then withdrew it before it ran.
+  - With the W u / 512 state scaling, even fully coherent steps move log
+    sigma by about lr per step. In 130 steps that is at most about 3.4% in
+    mean and about 7% in state spread, at an attenuation the biases never
+    had.
+  - The arm's gradient statistics would essentially be the drill's.
+  - My withdrawn predictions 2-3 also set "learned" thresholds (q90/q10
+    above 1.3, a mean shift above 0.05) that the /D scaling makes
+    unreachable, and they cited 0.3 as the noise level of |m-hat|/sqrt(v-hat)
+    (pure noise: median 0.154, RMS 0.229).
+  - The fix is correct and belongs in any long run of this policy; on its
+    own it is not an experiment.
+
+**Open for the user's decision.**
+- (a) Change the noise's structure (trajectory- or segment-shared noise,
+  or a discrete write decision) so the score path has an achievable
+  variance.
+- (b) Accept that write noise acts here as smoothing that the token path
+  sheds, and retire the score path (+17% step time).
+- (c) Read the rest of the Q-Prop drill (job 14585) for the bench verdict
+  and the V_T trend; this costs nothing extra.
+
+## Q-Prop memory write actor: drill result (jobs 14575 + 14585, 2026-10-22)
+
+Final read of `mac_sampled_baseline_memory_write_qprop_drill_20261022`
+against the pre-registration above. Session 1 (14575) was lost at step 249;
+session 2 (14585, resumed from the step-237 checkpoint) succeeded through
+step 360. Numbers come from the run's metrics.jsonl.
+
+**Primary: null.** Mean bench (512 x 16) over steps 200-300 is **0.8005**
+against the reference's **0.7967**, +0.0038, inside the +/- 0.010 null
+band. One seed.
+- Per eval, arm vs reference: 0.7931/0.7944 (200), 0.7957/0.7963 (220),
+  0.8002/0.7960 (240), 0.8060/0.7997 (260), 0.8026/0.7974 (280),
+  0.8055/0.7963 (300).
+- The arm is ahead at every eval from 240 on (+0.004 to +0.009). The
+  per-eval paired sampling SE is about 0.005 (interim read). The six evals
+  reuse the same 512 prompts, so they are not independent. Together with
+  the unmeasured seed variance, that makes the late lead suggestive at
+  most.
+- Steps 320-360, descriptive only (no matched reference): 0.7999, 0.8091,
+  0.8082.
+
+**Predictions:**
+1. Step-0 bench identical (0.5958 vs 0.5958). Held.
+2. Mean-head mix weight below 0.05 throughout. Held: the maximum over
+   every update and every mean-head tensor is 3.5e-4. The Q-Prop path
+   never carried weight, so this result is not a Q-Prop result (reading
+   rule: "win with w near 0" applies in spirit to the null too).
+3. Credit head without signal. Held on correlation: joint_corr -
+   shuffled_corr over steps 200-360 is +0.0042 +/- 0.0035 (n 161). It
+   failed on eta, as recorded at step 40: control_weight keeps swinging
+   (0.51 at 300, 0.04 at 360). That stays harmless, since eta only enters
+   Nz and Nz has weight about 0.
+4. target_gap_ratio/mean within 1 +/- 0.3. Held (1.014, 1.005, 1.007 at
+   240/300/360). Vacuous at this V_N, as noted in the interim read.
+5. sigma within 0.24-0.33. Held, still shed slowly through the biases.
+   Mean sigma at step 360: key 0.2990, value 0.2987, decay 0.2996, write
+   0.2940. The write gate is the lowest, the same pattern as the interim
+   read.
+6. Read share within +/- 25% of the reference. Held: 0.0869/0.0936 (240),
+   0.0907/0.0879 (300); 0.0943 at 360.
+7. Train reward falls below the reference by a growing margin. Failed.
+   Per window, arm vs reference: 0.8754/0.8762 (201-240), 0.8870/0.8892
+   (241-280), 0.8940/0.8965 (281-305). The gap stays at 0.001-0.003, far
+   below the gate's 1.8-point cost of sigma 0.3 noise on the frozen
+   trained memory. A policy trained under the noise absorbs it (inferred).
+8. Cost. Train-phase peak 14.95 GiB vs 14.26 (+0.69, within the 1 GiB
+   flag). Step seconds median 3.46 vs 3.24 over steps 238-360; pool 6.80
+   vs 7.12 s.
+
+**Conclusion.** The Q-Prop write actor is correct as built (CPU oracles,
+CUDA parity, two review passes) and inert in practice. Its noise path's
+sampling variance is 1e4-1e7 times the token path's per writer tensor
+(analysis section above), so the variance-optimal mix leaves the writer
+on the token path. What this drill measured is training with sigma-0.3
+noisy writes plus a sigma(h) that sheds noise slowly through its
+reparameterized gradient. That is a null on the primary window, with a
+small one-seed lead late. The bench does not support attributing any of
+it to write credit.
+
+**Not done here.** No second seed or continuation was queued. The
+structural options listed in the analysis section (trajectory-shared
+noise, a discrete write decision) and the sigma-epsilon fix
+(`.worktrees/memory-write-sigma-eps-20261022`, owned by a separate
+session) are design decisions for the user.
+
+## Sigma unscaled, under Adam-atan2: pre-registration (2026-10-22)
+
+User direction: remove the sigma heads' scale-down, and fix the epsilon bug
+if there is a good solution. Built in `.worktrees/memory-write-sigma-eps-20261022`.
+Nothing else differs from the Q-Prop drill.
+
+**Change.**
+- **sigma(h) = softplus(W u + b).** Before, W u was divided by D = 512. That
+  capped how far the state term could move per step at about the bias's
+  rate, so sigma stayed state-independent: the drill's `sigma_q10` and
+  `sigma_q90` agree to four decimals, and every coordinate stayed within
+  0.293-0.304 through step 360.
+- **Versioning.** The rollout-policy schema is now
+  `gated_delta_memory_carry_gaussian_write/v2` and the write actor objective
+  `/v4`. Every load path checks the rollout-policy schema, so a v1 Gaussian
+  checkpoint now fails closed instead of having its sigma weights act 512x
+  larger (red-team finding).
+- **The sigma heads step under Adam-atan2** (`postraining/adam_atan2.py`;
+  Everett et al. 2024, arXiv 2407.05872, with the paper's a = b = 1).
+  - The update is atan2(m-hat, sqrt(v-hat)) and has no epsilon. It is
+    exactly invariant to the gradient's scale and exactly atan of eps-free
+    Adam's step. That is Adam to first order in the noise regime, it is
+    bounded by lr pi/2, and a constant gradient steps lr pi/4.
+  - Removing /D alone would have lifted the weights' per-element gradients
+    about 512x, above AdamW's 1e-8. Adam-atan2 removes the dependence at
+    any gradient scale.
+  - The optimizer schema suffix is `+write_sigma_adam_atan2_...`. Carrying a
+    critic via `--actor-init` now ignores the suffix on either side, because
+    only critic optimizer state is carried.
+- **Numerics.** log sigma uses an exact `log_softplus`. An update fails
+  closed if any explored sigma falls below 1e-6 (`WRITE_SIGMA_FLOOR`). The
+  score divides by sigma and its moments square that, so a collapse would
+  otherwise end in fp32 overflow.
+- **New telemetry: `write_actor/log_sigma_state_std/<term>`.** It is the RMS
+  over coordinates of each coordinate's log-sigma SD across explored writes.
+  The existing sigma quantiles are of the coordinate-averaged sigma, which
+  hides opposite-signed state dependence across coordinates. The drill has
+  no equivalent of the new metric.
+- **Not changed.** The write credit head's 1/hidden readout is a critic's
+  fit rate, not a limit on the policy's state dependence.
+- **Qualification.**
+  - CPU: new `test_adam_atan2.py` covers scale invariance from 1e-12 to
+    1e3, the atan identity, the bound, a zero history, exact resume and
+    argument checks.
+  - The write-actor tests add: sigma is the plain head; log sigma is exact
+    past fp32 softplus underflow; the floor raises; the state-spread oracle;
+    v1 is rejected; the carried-critic suffix.
+  - CUDA qualification (job 14593) was cancelled once its decode/replay
+    parity read had printed: 0.0113 against a noiseless floor of 0.0111,
+    the same as the previous qualification. The rest was not worth holding
+    the run for, since a CUDA defect would fail the run at its first update.
+  - One red-team subagent pass found no defect in the split-delta order or
+    in the optimizer. Its three contract findings are fixed (the v2 schema,
+    the floor, the carried-critic check).
+
+**Run.** `mac_sampled_baseline_memory_write_sigma_state_atan2_20261022`
+(`scripts/submit_mac_sampled_baseline_memory_write_sigma_state_atan2_20261022.sh`
+in the worktree).
+- Job 14595 was lost at step 13 (16:01). systemd-oomd killed all of
+  `mlqd.service` (142 processes) with machine memory and zram swap both
+  above 90%. Our code did not crash: the step-0 bench was 0.5958
+  (prediction 1 held). The drill's session-1 loss (14575, 13:48) was the
+  same oomd kill; there were four `mlqd.service` kills today.
+- The run is about 1.5x slower than the drill under CPU contention from
+  other projects (steps 2-12: pool 14.2 s vs 10.1 s, update 8.5 s vs
+  5.0 s). Sessions 14596 and 14597 resume from its 16:00 checkpoint.
+- Sessions at priority 11, each cut by `--max-train-hours 1.3`.
+- The argv was diffed against the drill's. It differs only by having no
+  resume and `--max-train-hours 1.3`, a wall-clock cut: the drill ran 200
+  steps in about 35 min.
+- Seed 1337, 360 steps.
+
+**Criteria.**
+- **Primary control:** the Q-Prop drill, whose mean bench (512 x 16) over
+  steps 200-300 is **0.8005**.
+  - Win: at least +0.010.
+  - Null: within +/- 0.010.
+  - Harm: below -0.010, or the bench stop floor fires.
+- **Secondary:** the deterministic fresh-rate reference at **0.7967**. The
+  drill's +0.0038 over it was inside the null band.
+- One seed, so any result in or near the band is weak evidence.
+
+**What this can and cannot test.**
+- It tests whether a sigma that can depend on the state, stepping at its
+  full scale-invariant rate, changes what the writer learns. Any effect
+  enters through the pathwise token path (noisy-write smoothing) and
+  sigma's reparameterized gradient.
+- It does not test Q-Prop credit. The noise path's variance gap
+  (V_N/V_T of 1e4-1e7) is a property of per-write Gaussian scores, not of
+  sigma's parameterization.
+- It cannot cleanly separate state dependence from a faster shift in mean
+  sigma. The unscaled W u also acts on whatever component the beliefs
+  share, so the weights now move mean sigma too.
+- The metrics below test the predictions only partly. The state spread
+  mixes a random walk with signal, and the coherent-versus-noise
+  thresholds are heuristics, not derived bounds.
+
+**Mechanistic predictions** (made before any result; inferred from the
+drill's telemetry, not measured):
+1. The step-0 bench is the drill's 0.5958: the sigma weights start at zero
+   and evaluation uses mean writes. Training diverges from the drill from
+   the first sigma update.
+2. `log_sigma_state_std` leaves zero on every term at the first update.
+   - The noise-only floor: each weight random-walks about lr sqrt(t), so
+     across beliefs the state term spreads about lr sqrt(t) sqrt(D) c,
+     where c <= 1 is the beliefs' across-state RMS per dimension. Times
+     d log softplus/dx = 0.86 at sigma 0.3, that is up to about 0.06 at
+     step 100 and 0.11 at 360.
+   - A value in that range is the random walk, not learned state
+     dependence.
+3. Two reads separate coherent change from the random walk: the
+   state-spread growth from step 100 to 360 (about 1.9, sqrt(3.6), for a
+   random walk), and the final checkpoint's |m-hat|/sqrt(v-hat) on the
+   sigma weights (pure-noise median about 0.15).
+   - Key and value heads: random-walk-like, growth below 2.5 and median
+     below 0.25.
+   - Write and decay heads, whose sigma the drill shed coherently through
+     the biases: a coherent component, growth at least 3 or median at
+     least 0.3.
+   - About 50% confidence.
+4. Mean sigma falls faster than in the drill, most on the write gate.
+   - The drill at step 360: write 0.294; key, value and decay 0.299-0.300.
+   - Predicted at step 360: write below 0.28; key and value within
+     0.27-0.31.
+   - Reason: the weights now move the pre-activation along the beliefs'
+     shared direction, on top of the bias. About 55% confidence.
+   - Sigma below 0.1 on any term would be a surprise.
+5. The mean-head mix weights stay below 0.05 at every update (95%).
+6. The read share (`carry/input_delta_rms_ratio`) stays within +/- 25% of
+   the drill's (0.0907 at step 300).
+7. Cost matches the drill within noise. Adam-atan2 is elementwise over the
+   sigma heads' 266,760 parameters.
+8. Bench: null against the drill. Prior: null 70%, harm 15%, win 15%.
+
+**Reading rules.**
+- **Null with a random-walk-like prediction 3:** sigma's parameterization
+  was not what held the writer back, and it is no longer a candidate.
+  That points back at the noise's structure (option (a) above).
+- **Null with coherent state dependence:** sigma learned where to explore
+  without moving the bench in 360 steps. Inspect which slots get high or
+  low sigma before claiming anything.
+- **Win:** first separate a fall in mean sigma from state dependence. Less
+  noise alone is not obviously a win, since the noiseless reference is
+  lower. Get a second seed before attributing anything.
+- **Harm:** read mean sigma first. Collapse means shedding destabilized the
+  writer; growth means the noise corrupted the reader.
+- **Manual stop:** the bench more than 0.05 below the drill at two
+  consecutive matched evals (after inspecting traces), or any explored
+  sigma below 0.01. The 1e-6 floor aborts by itself.
+
+### Result: stopped early at step 99, bench null, sigma learned (job 14596, 2026-10-22)
+
+Stopped by the user's call at step 99 of 360 (last checkpoint step 97;
+session 3, 14597, cancelled before start). This departs from the
+pre-registration: the primary window (steps 200-300) was never reached, so
+there is no primary-criterion result.
+
+**Bench against the Q-Prop drill, matched steps (512 x 16):**
+
+| Step | 0 | 20 | 40 | 60 | 80 |
+|---|---|---|---|---|---|
+| Drill | 0.5958 | 0.6747 | 0.7200 | 0.7644 | 0.7728 |
+| This arm | 0.5958 | 0.6715 | 0.7181 | 0.7628 | 0.7634 |
+
+- Within 0.004 through step 60, then -0.0094 at step 80 (one eval, inside
+  the +/- 0.010 null band; the drill itself moved 0.7728 -> 0.7720 from 80
+  to 100).
+- 15 of the 16 saved step-20 bench answers are token-identical to the
+  drill's; the 16th diverges at token 128, both wrong. Rollout reward means
+  match the drill to four decimals at steps 20 and 30 (0.7070, 0.6348).
+- Read share (`carry/input_delta_rms_ratio`) tracks the drill: 0.0114 vs
+  0.0115 at step 10, 0.0554 vs 0.0575 at 60, 0.0701 vs 0.0700 at 99.
+
+**Sigma did change, and not like a random walk** (q10 / q50 / q90, min;
+`log_sigma_state_std`):
+
+| Term | step 10 spread | step 60 spread | step 99 spread | step 99 q10 / q50 / q90 | step 99 min |
+|---|---|---|---|---|---|
+| key | 0.025 | 0.095 | 0.121 | 0.290 / 0.294 / 0.298 | 0.102 |
+| value | 0.026 | 0.094 | 0.121 | 0.283 / 0.287 / 0.291 | 0.097 |
+| decay | 0.028 | 0.179 | 0.185 | 0.331 / 0.405 / 0.511 | 0.152 |
+| write | 0.025 | 0.093 | 0.111 | 0.236 / 0.253 / 0.274 | 0.151 |
+
+- From step 10 to 60 a random walk grows the spread about 2.4x; key and
+  value grew 3.7x, decay 6.3x (about linear, i.e. coherent). Prediction 3
+  (key/value random-walk-like) is wrong; the |m-hat|/sqrt(v-hat) read was
+  not taken.
+- Prediction 4 holds early: write sigma fell to 0.25 by step 60 (predicted
+  below 0.28 by 360). Decay sigma *rose* (median 0.27 -> 0.41), which was
+  not predicted.
+- Key's q10-q90 is narrow (0.290-0.298) while its log-sigma spread is
+  0.12 and its minimum 0.10, because they cover different populations:
+  the quantiles are over each write's coordinate-averaged sigma
+  (`explored.mean(-1)` in `memory_write_actor.py`), the spread is per
+  coordinate. Key and value sigma depend on the state coordinate by
+  coordinate, with signs that cancel in the average.
+
+**Why the bench could not move (checked in telemetry; mechanism inferred).**
+- Evaluation writes the mean, so only the mean heads shape the bench
+  policy; sigma acts only through training exploration noise.
+- The mean heads' noise-path mix weight never exceeded 9e-5 over 99 steps
+  (write-gate bias; decay gate 3.4e-5; key and value below 1e-6), the
+  consequence of V_noise/V_token of 1e4-1e7. The mean writer is therefore
+  trained by the token path alone, as in the plain write-actor and Q-Prop
+  drills, under the same counter-keyed token draws. Near-identical eval
+  policies follow.
+- So this arm (and its predecessors) could not test write credit. The
+  pre-registration's "does not test Q-Prop credit" caveat was the
+  decisive one and should have weighed against spending the run.
+- Separately, memory itself matters: the token-only reference 14165 trails
+  the fresh-rate memory drill early (0.620 vs 0.676 at step 20, 0.649 vs
+  0.726 at 40), converging by about step 260 (critic init also differs).
+
+**Next.** The lever is the write estimator's variance, not sigma or the
+combination rule: what the token path gets (a dense per-step signal through
+the read) the per-write Gaussian score does not. A variance decomposition
+and candidate estimators are being worked out before any further writer
+drill.
+
+**Host memory (found during this run).** The trainer held about 12 GiB of
+page-locked host memory: the pinned caching allocator rounds each block to
+a power of two and keeps it for the process lifetime, and the memory
+carry's replay record crosses the host in multi-GiB pinned buffers. Pinned
+pages cannot swap, so the rest of the machine was pushed into zram until
+systemd-oomd killed mlqd (4 times on 2026-10-22, including this arm's first
+session 14595). `postraining/__init__.py` in the
+`memory-write-sigma-eps-20261022` worktree now sets
+`pinned_max_cached_size_mb:256,pinned_use_cuda_host_register:True,pinned_num_register_threads:8`
+(blocks above 256 MiB pinned at exact size and returned on free), and the
+rollout rows log `host_pinned_bytes`, `host_pinned_peak_bytes`,
+`host_pinned_alloc_seconds` and `host_pinned_free_seconds`. Neither the
+footprint reduction nor its pinning-time cost has been measured on GPU yet.
+
+### Correction: the write gate was a null at the training scale (2026-10-22)
+
+Found by a variance-anatomy pass over the drills' telemetry and the
+trained write-noise sweep (job 14554's `collects.jsonl`, 84 pools). The
+sweep's scale scan is absolute, so sigma 0.3 corresponds to the 0.3 row.
+There, rho2_lower is 1.2e-4 +/- 1.9e-4: a write-noise signal is not
+detected at the scale every Gaussian write-actor drill explored at. The
+"go, narrowly" verdict that started the write-actor line holds only at
+sigma 1, which costs 1.8 reward points. Consequences:
+- The drills' failed prediction about exploration cost (about 0.1
+  points observed, not 1.8) is explained.
+- The "return-side cap about 7.4x" was computed from the sigma-1 row, and
+  it halved E[D^2] where it should have doubled it.
+- Measured decomposition of R = V_N / V_T (inferred where noted):
+  - V_N per element is about E[r^2] E[h^2] / (sigma^2 N_emit). It matches
+    the logs within 1.0-1.2x (1.46 for the state-dependent decay sigma in
+    the atan2 arm, Jensen on E[1/sigma^2]) and is the same on all six mean
+    tensors.
+  - The 50x spread of R across tensors is all V_T, the token path's
+    pathwise sensitivity. At steps 200-360: key and value about 2e6, gate
+    weights about 1e5, gate biases about 5e4.
+  - The return multipliers match (noise `advantage_rms` 0.29, token
+    `mac/think_coefficient_rms` 0.30). The credit head removes nothing
+    (`residual_variance_ratio` 1.0000 +/- 0.0005; joint r2 inside its
+    shuffled control).
+  - So the gap is the score's fixed 1/sigma^2 against the read's small
+    true sensitivity (inferred from the above).
+- Levers, measured or bounded: antithetic common-random-number pairs give
+  5.2x at sigma 0.3 (ceiling about 20x, a numerical token-flip floor);
+  causal baselines about 1.0-1.1x; a better credit head at most 1.005x;
+  noise shared across a trajectory's about 257 writes is unmeasured (1x to
+  257x, depending on the coherence of the per-write gradient). Gate biases
+  need about 2.6e3x to reach a mix weight of 0.05, key and value about
+  2e6x.
+- Scripts: `/var/tmp/write_credit_quantifier/` (scratch, not tracked).
+
+## Latent channel (`--reasoning-mode channel`): pre-registration (2026-10-22)
+
+Plan: `docs/latent_channel_plan_20261022.md` in the
+`memory-write-sigma-eps-20261022` worktree. No SFT stage (user ruling).
+
+**Policy.**
+- Every generated token also emits a continuous latent
+  z_t = W_mu rms(h_t) + sigma * eps_t, with k = 64 and eps counter-keyed on
+  (row seed, unpadded producing slot).
+- The next step consumes e(a_t) + R z_t. Evaluation reads z = mu.
+- Init: W_mu = 0, R = the PCA basis of the token inputs at their per-token
+  spread, and log sigma per coordinate. At init, `channel` with z = mu is
+  bitwise `cot`.
+
+**Credit.** No path differentiates through the generated history.
+- W_mu, sigma and R train pathwise through replay, at the fresh rate 3e-3
+  and with sigma on Adam-atan2 at 3e-4.
+- The trunk's content of h_t is credited by the latent's own likelihood
+  ratio at the producing slot. The coefficient is the token's
+  sampled-baseline G - c(s_t) times the emit weight, which needs behavior
+  age 0 (`--channel-trunk-credit score`).
+- The critic reads z through its own zero-init reader, so the v7 cot study
+  critic warm-starts it exactly.
+
+**Implementation status.**
+- 32 CPU tests in `tests/test_latent_channel.py`. Among them: bitwise cot
+  at init, decode z equal to replay z under padding and packing, the arena
+  equal to eager, and the MAC gradient equal to an oracle of the token
+  term plus the latent score.
+- CUDA parity, job 14609 (`tests/test_latent_channel_cuda.py`):
+  - The explored compiled bf16 arena's decode-vs-replay error is 0.0109,
+    against a cot floor of 0.0110.
+  - Replay without the recorded noise misses by 0.33, so the noise is
+    load-bearing.
+  - The compiled critic read is at its floor.
+  - One test failed by my own design. It asserted 98% token agreement
+    between a fresh channel arena and a cot arena, which are different
+    graph captures, and got 0.78. Inter-capture bf16 drift cascades through
+    sampling (the memory's zero-noise rows agree with a second capture at
+    0.53-0.70). It is replaced by bitwise equality of the replay inputs and
+    beliefs, and re-queued as job 14614 with the channel's foreign-read
+    graph test.
+- A submission meant as a dry parse (job 14607) really queued, because
+  `exec mlq` bypassed my stub. I cancelled it before its first pool; it
+  confirmed that the G1 argv validates and the model loads. G1 is now jobs
+  14615 (PCA) and 14616 (random), gated on 14614.
+
+**G1, frozen exploration sweep** (jobs 14615 PCA and 14616 random, both
+gated on 14614; `scripts/submit_latent_channel_noise_sweep_20261022.sh`).
+- The protocol is the antithetic write-noise sweep's: shared-per-prompt
+  noise at +/-s with independent tokens, on the drill's training data at
+  the drill base with a fresh channel.
+- `--latent-sigma-init 1`, so s is the effective sigma.
+- Cells: PCA reader at s 0.25, 0.5 and 1; random-orthonormal reader at
+  matched column norms (`--latent-reader-init random`) at s 0.5. Each job
+  is capped at 0.68 h.
+- Decision: sigma_0 for G3 is the largest PCA s whose frozen cost is at
+  most 2 points. G1 does not gate G3.
+- Predictions:
+  1. The cost rises with s and stays at most 2 points at s 0.5.
+  2. rho2_lower at s 0.5 is above 2.55e-3. Inferred: unlike the memory,
+     the latent is a primary input.
+  3. The PCA reader costs less than the random one at s 0.5.
+
+**G3, RL drill** (`scripts/submit_latent_channel_drill_20261022.sh`,
+ARM=channel and ARM=cot).
+- The Q-Prop memory drill's argv with the memory removed: the v7 twin
+  study critic, seed 1337, 360 steps, four 75-minute sessions.
+- The cot arm is the matched control. It has no fresh modules, so it gets
+  no fresh rate.
+- Primary measure: mean bench (512 x 16) over steps 200-300.
+  - Against cot: a win is above +0.010, a loss below -0.010, anything else
+    null.
+  - The same rule against the memory fresh-rate reference, 0.7967.
+- Predictions:
+  1. Step-0 bench is identical across the arms.
+  2. The channel beats cot by more than 0.010.
+  3. `channel/mean_noise_read_ratio` is above 1 by step 150.
+  4. sigma falls to about 0.5 sigma_0 by step 300.
+  5. `channel/mean_read_rms_ratio` is at least 0.1 by step 300.
+  6. `channel/score_token_belief_grad_ratio` is at most 3. If it goes
+     higher, the zero-mean score term dominates the trunk's direction, and
+     the `--channel-trunk-credit none` arm becomes the primary channel arm.
+  7. Step time is within 1.15x of cot.
+- Failure modes to read for:
+  - sigma collapsing before mu learns (below 0.2 sigma_0 by step 50);
+  - R decaying;
+  - entropy spikes as the input share grows;
+  - noise regularisation passing for use.
+- After G3, run evaluation ablations on the final checkpoint: z = mu, 0,
+  shuffled, and pool-mean. "Use" means acc(mu) - acc(0) above 0.02 and
+  acc(mu) - acc(pool-mean) above 0. The attribution arm
+  (`--channel-trunk-credit none`) runs only if the channel beats cot.
+
+**Amendments after the red-team review, before any G1 or G3 data.** A
+subagent found no sign, slot-alignment or double-counting bug. Its CPU run
+confirmed that at W_mu = 0 the mean head gets a nonzero gradient at once
+(through R and the noise) while the trunk's score term is exactly zero;
+that is now a test. Changes:
+- **The score's scale convention.** The surrogate's noise / sigma is the
+  score only at row scale +/-1 (at scale s it is noise / (sigma s^2)).
+  Training always uses 1, and the trunk credit now refuses any other
+  scale. The MAC oracle test had used scales 0.5 and 1.5 under the same
+  convention, so it would not have caught this; it now uses +/-1.
+- **Prediction 4 is read on the effective exploration.** That is
+  sigma_i * |R column i| (`channel/explore_rms`, `_min` and `_max`, with R's
+  column norms and singular values). R is on fresh Muon at 3e-3 and can
+  shrink a direction long before Adam-atan2 moves sigma, so "sigma falls"
+  alone does not measure exploration.
+- **Prediction 6 is descriptive only.** A belief-level norm ratio does not
+  decide the term's share of a trunk parameter's gradient: zero-mean
+  per-slot terms cancel in the sum and coherent ones add (Optimizer
+  Facts). Whether the score term steers the trunk is read from the trunk's
+  displacement against the cot arm's, not from that ratio.
+- **The `none` arm is not trunk-only attribution.** Without the score
+  term, the heads also lose the part of their gradient that flows through
+  z_t's shift of later latents' means. "score vs none" therefore changes
+  the head estimator too.
+- **A rising `mean_noise_read_ratio` shows size, not use.** Fresh Muon
+  random-walks W_mu to a spectral norm of about lr * sqrt(t) (inferred:
+  about 0.05 by step 300), which makes z a random projection of h. Only
+  the evaluation ablations decide use.
+- **Evaluation ablations** (`--memory-eval-ablation` now covers the
+  channel):
+  - `zero_read` is z = 0, exactly the token path.
+  - `foreign_state` and `foreign_sample` draw each latent from another
+    prompt's or another sample's belief at the same tick. That keeps z's
+    marginal distribution, its pool mean included, so `foreign_state`
+    replaces the pool-mean steering-vector control.
+  - `sampled_latent` benches the training policy (z = mu + sigma eps). The
+    bench reads the mean, and training optimizes the noisy policy, so
+    their gap is measured rather than assumed.
+  - "Use" means acc(mu) - acc(zero_read) above 0.02 and acc(mu) -
+    acc(foreign_state) above 0.
+- **Prediction 1 is equal inputs, not equal tokens.** At step 0 the
+  channel's inputs are bitwise cot. The two arms' benches are different
+  graph captures, so they agree only to the capture-level bf16 drift.
+
+
+### Jobs (2026-10-22)
+
+- CUDA parity r2: job 14626. Channel tests plus the memory-carry CUDA
+  tests, with `test_compiled_graph_arena_foreign_reads_are_aligned[memory]`
+  deselected (see the next subsection). In 14614 every channel case
+  passed, including the channel foreign-read graph test (aligned 1.0,
+  distinct prompts 0.0).
+- G1 sweeps, gated on 14626: PCA reader at s 0.25/0.5/1 is job 14627;
+  random reader at s 0.5 is job 14628.
+- G3 cot control, sessions 1-4: jobs 14629-14632, chained, gated on
+  14626, idempotency attempt `r2`. Skipped jobs 14617-14620 used `r1`.
+- G3 channel arm: queued only after G1 decides sigma_0.
+
+### The memory arena's compiled foreign reads fail their alignment test
+
+`test_compiled_graph_arena_foreign_reads_are_aligned[memory]` fails both in
+the pre-channel memory-write-actor worktree (job 14623, aligned 0.25,
+floor 1.0) and in this one (job 14622, aligned 0.0, floor 1.0). The
+failure predates the channel changes. The memory ablation benches
+pre-registered on 2026-10-21 have no result directories under
+`postraining/runs/`. I checked and found none, so as far as I can tell
+they never ran and no conclusion rests on them. If they did run, they
+would go through this path: `--eval-compile` defaults to on.
+
+The donor and recording logic is the same code the channel uses, and the
+channel passes. My hypothesis is that the cause is numerical: different
+fused graphs drift in bf16 and diverge at temperature 1, much like the
+cot decode-vs-replay floor of 0.011. A wrong donor is the alternative.
+Diagnostic job 14634 runs the same comparison with the eager tick and
+reports the first-divergence position.
+
+**Result (job 14634): compile numerics, not a donor bug.** The setup was
+16 identical prompts x 4 samples, a 64-token prompt and 256 new tokens
+(320 positions):
+
+| carry   | tick     | floor | aligned | mean first divergence |
+|---------|----------|-------|---------|-----------------------|
+| memory  | eager    | 1.0   | 1.0     | none (320)            |
+| memory  | compiled | 1.0   | 0.0     | 94.75                 |
+| channel | eager    | 1.0   | 1.0     | none (320)            |
+| channel | compiled | 1.0   | 1.0     | none (320)            |
+
+- On the eager tick, the memory's foreign reads decode exactly what the
+  unablated arena decodes. So the donor rows and the tick at which the
+  read happens are both correct.
+- On the compiled tick, the memory first diverges about 31 generated
+  tokens in, not at the first generated token, where a misaligned read
+  would show at once.
+- My inference, not verified at the kernel level: Inductor fuses the
+  donor gather into the memory read's reduction differently. That changes
+  the bf16 rounding, and at temperature 1 the drift eventually flips a
+  sample.
+- The bench statistics compare arms per prompt in distribution, never
+  trajectory by trajectory. So this drift does not bias a memory
+  `foreign_state` bench. It is the same kind of drift that separates any
+  two graph captures.
+
+The test is now `test_graph_arena_foreign_reads_are_aligned[carry-tick]`.
+- Eager tick: exact alignment is required.
+- Compiled tick: the mean first divergence must come at least 8 tokens
+  after the prompt.
+- Both ticks: distinct prompts must still disagree.
+
+It is queued as job 14635.
+
+Job 14635 passed all 4 cases. On the eager tick, both carries align
+exactly. On the compiled tick the channel aligns exactly, and the memory
+first diverges at a mean position of 112.5 (94.75 in job 14634: the
+drift varies from capture to capture). Distinct prompts agree on at
+most 0.03 of rows.
+
+### G1, first grid: every scale too large (job 14627, cancelled at 42 pools)
+
+The frozen sweep of a fresh channel used the PCA reader at
+`--latent-sigma-init 1`, with sweep scale s as the effective sigma. The
+base reward was about 0.59; the null re-collect changed 0 trajectories.
+
+| s    | cost (points) | flip rate | rho2 upper | rho2 lower |
+|------|---------------|-----------|------------|------------|
+| 0.25 | 13.3 ± 0.2    | 0.578     | 0.343      | 0.008      |
+| 0.5  | 54.6 ± 0.4    | 0.980     | 0.088      | 0.004      |
+| 1    | 58.7 ± 0.5    | 1.000     | 0.000      | 0.000      |
+
+- **Decision rule.** No scale has a frozen cost of at most 2 points, so
+  this grid cannot choose sigma_0.
+- **Why I cancelled it.** The SEs were already under a quarter point, so
+  more pools would not have changed the outcome. The random-reader sweep
+  at s 0.5 (job 14628) was cancelled before it started. At that scale it
+  would have compared the two readers where both destroy the policy.
+- **Cost grows about quadratically.** From s 0.25 to 0.5 the cost grows
+  4.1x for a 2x scale. Extrapolating that gives 2 points near s
+  0.25 · √(2/13.3) ≈ 0.10.
+- **The latent moves the return.** At s 0.25 the first-order part of the
+  noise (rho2 upper 0.34) can explain up to a third of the return's
+  variance. Noise of a quarter of the token spread, spread over 64
+  directions, is far from inert. This holds at a frozen, untrained
+  reader.
+- **Fine grid.** PCA at s 0.05, 0.07, 0.1, 0.14 is job 14636; random at s
+  0.07 and 0.1 is job 14637. Both have priority 12, so they run ahead of
+  the cot chain.
+- **The decision rule is unchanged:** sigma_0 is the largest PCA s with a
+  cost of at most 2 points.
+
+### G1, fine grid: sigma_0 = 0.1 (job 14636, stopped at 28 pools)
+
+| s    | cost (points) | flip rate | rho2 upper | rho2 lower |
+|------|---------------|-----------|------------|------------|
+| 0.05 | 0.37 ± 0.09   | 0.193     | 0.086      | 0.0003     |
+| 0.07 | 0.74 ± 0.10   | 0.237     | 0.114      | 0.0006     |
+| 0.1  | 1.40 ± 0.12   | 0.296     | 0.153      | 0.0009     |
+| 0.14 | 2.84 ± 0.16   | 0.368     | 0.206      | 0.0017     |
+
+- **The rule picks sigma_0 = 0.1.** It is the largest PCA scale with a cost
+  of at most 2 points. Its cost is 5 SE under the budget and 0.14 is 5 SE
+  over, so I stopped the sweep: more pools would not change the decision.
+- **What s 0.1 is.** It moves the input by about 1.75 in norm, which is
+  0.06 of the nearest-token distance
+  (`.scratch/latent_noise_geometry_20261022.py`).
+- **Common token noise barely helps.** In the coarse sweep, giving a ±
+  pair shared token noise cut the variance of its return difference only
+  1.5x at s 0.25 (0.26 against 0.40), because 58% of pairs flip apart
+  anyway (`.scratch/crn_variance_20261022.py`).
+- **Queue order.** The G3 channel arm (SIGMA 0.1) is jobs 14638-14641,
+  chained, at priority 12. The cot chain (jobs 14629-14632) runs after it.
+  The random-reader control (job 14637) dropped to priority 10, last.
+- **What to watch in G3.** The trunk's score term weights each coordinate
+  by eps/sigma. Its first-order signal does not depend on sigma, but its
+  variance grows as 1/sigma². The Q-Prop memory drill measured that
+  path's variance at 1e4-1e7 times the token path's. Read the trunk's
+  displacement against the cot arm's, and against the coherent and
+  random-walk bounds.
+
+### G3 channel session 1: collapse traced to the latent's mean read (job 14638, 2026-10-22)
+
+The run used SIGMA 0.1. The guard (`--bench-stop-floor 0.55`, 2 evals)
+stopped session 1 at step 60.
+- **Bench:** 0.596 (step 0), 0.600 (20), 0.458 (40), 0.205 (60).
+- **Training reward:** 0.59, falling to 0.31 by step 53. The cot drill
+  14165 and the memory drills rose to 0.62-0.69 over the same steps.
+
+**Step-40 ablations** (jobs 14642-14644; 512 x 16, paired per prompt):
+
+| arm           | accuracy | vs none        |
+|---------------|----------|----------------|
+| none          | 0.456    |                |
+| zero_read     | 0.621    | +0.165 ± 0.007 |
+| foreign_state | 0.494    | +0.038 ± 0.007 |
+
+**Removing the latent restores accuracy, above step 0's 0.596.** The
+trunk underneath is learning. The step-40 cot drill had 0.649, but that
+is a different run, so the comparison is indicative only.
+
+**A foreign latent hurts less than the row's own.** Content correlated
+with the row does more harm than uncorrelated content.
+- My inference: z = W_mu rms(h_t) is a projection of the belief that
+  predicted the token being input. So it is largely a re-encoding of that
+  token, written into the token-PCA subspace, which systematically
+  distorts how the token reads.
+- The traces fit this. With fixed eval seeds, the same prompt at step 0
+  and step 60 shows "8 - 4 = 4" become "8 - 4 = 6" inside an intact
+  template, plus bursts of off-distribution text.
+
+**W_mu is a random walk, not a learned direction.** I compared the
+snapshots against Muon (Nesterov, mu 0.95, lr 7.25e-3, exact polar)
+stepped on iid Gaussian gradients:
+
+| W_mu                                  | actual             | random-walk null   | coherent bound   |
+|---------------------------------------|--------------------|--------------------|------------------|
+| RMS at steps 20/40/60                 | 0.0033/0.0061/0.0090 | 0.0044/0.0081/0.0111 | 0.0064/-/0.0192 |
+| cosine of successive 20-step increments | 0.28, 0.39       | 0.49, 0.52         | 1                |
+
+- Its near-linear growth is what momentum Muon does on pure noise over 60
+  steps. My earlier reading of it as "coherent" was wrong.
+- **The fresh learning rate is 7.25e-3, not 3e-3.** The trainer scales
+  `--fresh-learning-rate` by the Muon/Adam ratio of 2.42. The memory
+  drills ran at the same rate.
+
+**The read's cost matches random noise of the same size.**
+- At step 40 the channel's input perturbation is 16.4% of the input RMS.
+  The frozen sweep's quadratic fit gives about 15 points for noise of
+  that size; the zero_read gap is 16.5.
+- At step 60 the perturbation is 21% of the input RMS. The memory's read
+  was 5% at step 60 and 9% at step 300 at the same learning rate. R's
+  token-spread scaling gives the channel's walk about 4x the input gain.
+
+**EV fell, but no more than in the memory drill**, which improved: 0.31 to
+0.23 in the channel, 0.32 to 0.20 in the memory, about 0.34 to 0.31 in
+cot. The channel's critic tracks the falling mean (prediction 0.085,
+target 0.091 at steps 55-60). Under `sampled_baseline` the critic is only
+the baseline, so its errors add variance, not direction.
+
+**Reading.**
+- No useful content was found; the head's estimator noise was written
+  into the token-identity subspace at high gain.
+- Nothing points in a consistent direction, so this is not a valley being
+  crossed toward something useful.
+- Session 2 (job 14639) resumes from step 60. My prediction is that the
+  decline continues.
+- I moved the random-reader frozen sweep (job 14637, priority 13) ahead of
+  it. Its cost per unit of input RMS against PCA's tests whether
+  directions outside token identity are cheaper.
+- **Step-60 zero_read (job 14645): 0.625**, against the in-run bench's 0.205.
+  The latent read now carries 42 points of damage. The trunk without it
+  is level with step 40 (0.621).
+
+### Random-reader frozen sweep (job 14637, stopped at 26 pools)
+
+R is random orthonormal, at the PCA basis's per-column norms, so it gives
+the same input RMS per scale.
+
+| s    | random cost (points) | PCA cost (points) | random flip | PCA flip |
+|------|----------------------|-------------------|-------------|----------|
+| 0.07 | 0.47 ± 0.09          | 0.74 ± 0.10       | 0.214       | 0.237    |
+| 0.1  | 0.97 ± 0.11          | 1.40 ± 0.12       | 0.265       | 0.296    |
+
+- **Directions outside token identity are cheaper, but only by about a
+  third.** At s 0.1 the gap is 0.43, about 2.7 SE.
+- **Input perturbation is costly in any direction.**
+- **Placement alone does not explain session 1's collapse.**
+
+### Is W_mu pursuing a direction? Its momentum buffers (2026-10-22)
+
+**Correction.** The earlier random-walk null was invalid: it simulated
+exact polar Muon on iid matrices, but the run uses Polar Express on
+structured gradients. The test below uses the raw-gradient EMAs instead.
+
+**Method.** Muon keeps b <- mu b + (1 - mu) g, before orthogonalization,
+and every snapshot stores b.
+- So b_cur - mu^20 b_prev is exactly the discounted sum of the 20
+  gradients that arrived between snapshots.
+
+**What the new gradients do.**
+- **Alignment with W_prev:** their cosine with -W_prev (the direction W
+  moved) is -0.032 (20->40) and -0.030 (40->60). That is about 3 SD below
+  a structured null (mean 0, SD 0.011 and 0.010).
+  - The null keeps the gradients' singular values and right vectors and
+    randomizes their left vectors.
+  - Their participation-ratio rank is about 11.6.
+- **What it means:** the consistent part of the gradient weakly pushes
+  W_mu back, toward smaller. It does not push it further out.
+- **Read-side direction:** stable (|cos v1| 0.71-0.88). An inference, not
+  checked: this is the shared mean component of the beliefs, which makes
+  even noise gradients pick that same direction.
+- **Write-side direction:** unstable (|cos u1| 0.02-0.18, about chance in
+  64 dimensions).
+
+**Displacement against a run-exact Muon null** (`.scratch/channel_displacement_20261022.py`,
+`.scratch/muon_null_sim{,2}_20261022.py` in the worktree).
+- **Measured.** One Muon step moves W_mu by |lr·orth(b)|_F = 0.059.
+  - Per 20-step window, |dW| is 0.51, 0.66 and 0.76 of the coherent
+    bound (20 steps).
+  - Cosine between successive windows: +0.28 and +0.39.
+  - cos(dW, W_prev): +0.28 and +0.30.
+  - |W| grows 0.61 -> 1.11 -> 1.63.
+- **The iid sqrt(n) bound is the wrong null.** With mu 0.95 the buffer
+  remembers about 20 gradients, so even pure iid gradients move nearly
+  coherently within a window.
+- **The run-exact simulation** uses `_polar_express`, Nesterov mu 0.95,
+  bf16 and lr 7.25e-3, with iid gradients of participation rank 7-29.
+  Pure noise gives:
+  - ratio 0.70-0.72 / 0.79-0.83 / 0.79-0.84;
+  - cross-window cosine about +0.50;
+  - |W60| about 2.1-2.2.
+  The real run is *less* coherent than pure noise.
+- **Adding a fixed outward drift** at gradient-energy share f only
+  increases every statistic: at f 0.01 the cross-window cosine is +0.57
+  to +0.69.
+- **Adding a restoring term along +W** at share 0.003-0.01 brackets the
+  run: ratio 0.58-0.65 / 0.72-0.78, cross +0.02-+0.27, |W60| 1.33-1.73.
+  This agrees with the buffer test's sign.
+- **Conclusion.** W_mu's growth fits zero-mean gradient noise, which the
+  scale-free update turns into full-size steps, plus a slight pull back
+  toward zero. No sustained outward push is detectable.
+- **Correction.** The earlier "lr·sqrt(t·tau), 35 lr vs 2 lr" arithmetic
+  in this entry was wrong and is replaced by the numbers above.
+- **Caveat.** The null assumes iid steps. Negatively autocorrelated
+  gradients would also lower coherence. Either way, nothing here points
+  outward.
+
+### W_mu scale benches at step 40 (jobs 14647-14650, 2026-10-22)
+
+Step-40 snapshot with W_mu scaled by alpha; everything else unchanged.
+Bench 512 x 16, `none` arm. Differences are paired by problem, with SEs
+clustered over the 512 problems.
+
+| alpha             | accuracy | vs alpha 0         |
+|-------------------|----------|--------------------|
+| 0 (zero_read)     | 0.621    | --                 |
+| +0.25             | 0.622    | +0.001 ± 0.003     |
+| +0.5              | 0.607    | -0.014 ± 0.004     |
+| +1 (as trained)   | 0.456    | -0.165 ± 0.007     |
+| -0.5              | 0.567    | -0.054 ± 0.004     |
+| -1                | 0.336    | -0.285 ± 0.009     |
+| foreign_state, +1 | 0.494    | +0.038 ± 0.007 vs +1 |
+
+- **No alpha beats zero.** +0.25 is +0.001 ± 0.003, so there is no
+  useful content being overshot.
+- **The even (magnitude) cost is steeper than quadratic:** 0.034 at
+  |alpha| 0.5 and 0.225 at 1, so 6.6x for a 2x scale.
+- **The pre-registered "even" prediction failed.** The odd part (+W less
+  harmful than -W) is 0.020 at 0.5 and 0.060 at 1. +1 vs -1 is
+  +0.120 ± 0.010.
+- **Candidate explanation (inference, under test).** The trunk trained 40
+  steps with the +W read present and partly adapted to it. -W doubles
+  the uncompensated part.
+  - The alternative is that +W carries directional content useful to the
+    base policy. But own content still loses to a foreign trajectory's
+    content (-0.038 ± 0.007), which counts against content that is
+    useful to the trajectory.
+- **Test:** the same ±W40 on the untrained base trunk
+  (`kda8_sft_omi2_drills_code30k_science_v1_e1`, sha c882966...).
+  - Snapshots: `postraining/runs/latent_channel_mean_scale_probe_20261022/base_trunk_snapshots/`.
+  - Jobs 14651-14653 (+1, -1, 0).
+  - Prediction under co-adaptation: +1 and -1 about equal on the base
+    trunk.
+- **Result** (jobs 14663-14665; the first submission, 14651-14653, failed
+  on relative snapshot paths). Co-adaptation is **refuted.**
+
+  | trunk            | 0 (read off) | +W40  | -W40  | +W40 vs -W40   |
+  |------------------|--------------|-------|-------|----------------|
+  | base (untrained) | 0.596        | 0.451 | 0.317 | +0.134 ± 0.010 |
+  | step 40          | 0.621        | 0.456 | 0.336 | +0.120 ± 0.010 |
+
+  - The asymmetry belongs to W40 relative to the base model.
+  - The trunk hardly adapted to its read: the +W cost is -0.144 ± 0.007
+    on the base trunk and -0.165 ± 0.007 on the trained one.
+  - The trunk's 40 steps with the read zeroed give +0.026 ± 0.003.
+  - The odd part grows faster than linearly in alpha (0.020 at 0.5, 0.060
+    at 1, on the trained trunk). So it is not a first-order benefit
+    masked by an even cost: +0.25 gains only +0.001 ± 0.003.
+
+### Session 2 (job 14639): cancelled externally at step 95, no recovery
+
+- **Not relaunched**, per standing rule; sessions 3-4 (14640, 14641) were
+  skipped.
+- **Bench:** 0.205 at step 60, then 0.059 at step 80. Structural format
+  0.84 and ended 0.92, so the answers are wrong rather than malformed.
+- **Input-delta RMS ratio:** 0.20 at step 56, 0.29 at step 91.
+- **Policy entropy:** 0.42 -> 0.83.
+- **Critic EV:** 0.26 at step 71, 0.07 at step 81, -1.0 at step 95.
+
+### Channel gradient probe (2026-10-22)
+
+**Method.**
+- `--gradient-probe` (`postraining/train_latent_vapo.py`
+  `save_gradient_probe`; validated in `vapo/config.py`) runs the training
+  loop with neither actor nor critic stepping.
+- Each pool saves its raw combiner gradients, read after the minibatch
+  backward and before any optimizer. So the K pools are draws of the
+  training estimator at one fixed state.
+- Analysis: `postraining/analyze_gradient_probe.py` (CPU).
+  - Unbiased signal energy |E g|^2 and the noise per pool.
+  - Split-half cosine against a sign-flip null.
+  - Muon leave-one-out cosine: the cosine of orth(g_i) with orth(the mean
+    of the others), i.e. the share of one pool's Muon step that lies
+    along the consistent direction, before momentum.
+- Submit: `scripts/submit_latent_channel_gradient_probe_20261022.sh`.
+  - `fresh`: the drill's step-0 state.
+  - `<step>`: `--resume` of a snapshot into a dedicated output.
+    `checkpoint_run_directory` now finds a snapshot's manifest one level
+    up.
+- The red-team found two caveats:
+  - Prompts are drawn without replacement within an epoch, and 64 pools
+    are about 1.9 epochs of the 2,156 prompts. Pools are therefore not
+    exactly independent, which shifts the SNR by at most about 1/(K-1)
+    (`design_bias_bound`).
+  - Pool 1 of the fresh probe is not a bit-exact replay of the drill's
+    step 1: 211.2 vs 213.4 actions per trajectory, reward 0.613 vs 0.616.
+    Not used as evidence.
+- **Provenance defect.** Job 14661's source archive includes a
+  `gradient_probe/state.pt` save that its process did not run. The edit
+  landed after Python imported the module but before
+  `capture_source_provenance` archived the tree. An archive taken in
+  `main()` can postdate the code that actually executes.
+  - Job 14667 (one fresh pool) is re-run to obtain that state file.
+
+**Fresh state, W_mu = 0** (job 14661, K = 64, design floor 0.016):
+
+| parameter | SNR / pool | split-half cos (null)    | other |
+|-----------|------------|--------------------------|-------|
+| W_mu      | 0.064      | +0.675 (0.000 ± 0.051)   | Muon LOO +0.136 ± 0.003 |
+| log sigma | 0.71       | +0.965                   | descent lowers sigma |
+| R         | 0.003      | +0.093 (0.000 ± 0.007)   | cos(mean, R) +0.200 ± 0.007, so descent shrinks R |
+
+- **The W_mu estimator holds a resolved direction at W = 0.** About 16
+  pools resolve it.
+- **This corrects my "the true gradient at W = 0 is about zero" inference.**
+  That claim was never measured.
+
+**Did the run follow it?**
+- Cosine of each window's displacement with -orth(G_fresh):
+  - +0.138 for steps 0-20;
+  - +0.032 for 20-40;
+  - +0.011 for 40-60;
+  - +0.018 for 60-80.
+- Chance is ±0.0055, and the two half-probes agree.
+- W's component along it grows 0.085 -> 0.109 -> 0.118 -> 0.136, while |W|
+  grows 0.61 -> 2.20.
+- So the first 20 steps partly followed the fresh direction. After that
+  the motion is nearly orthogonal to it.
+- Pending:
+  - the step-40 probe (14662): has the direction rotated, or has it become
+    restoring?
+  - a paired line search along -orth(G_fresh) at the fresh state (needs
+    14667's state file). Does the direction raise J?
+
+**Step-40 probe (job 14662, K=64), joint line test, and the score term.**
+- Step-40 probe: W_mu per-pool SNR 0.0012 (p 0.17, below the 0.016
+  design floor), split-half 0.042±0.033, Muon leave-one-out 0.006,
+  cos(mean, W) +0.060±0.015. Pool |g_W| 0.24 against 0.0082 fresh.
+- Joint line test from the fresh K=32 probe (job 14670; split-half
+  writer 0.52, trunk 0.71, joint 0.68). Each copy moves every actor
+  parameter c=10 constant-gradient optimizer steps (|delta| 1.41).
+  Bench 512 x 8 (jobs 14671/14672):
+  - descent 0.199, mirror 0.109, against about 0.596 unmoved (512 x 16);
+  - odd part (J+ - J-)/2 = +0.045±0.005 (problem-clustered SE);
+  - even part about -0.44.
+  - Reading: the direction's sign is right, but c=10 is far outside the
+    region where it helps. The construction also overstates the move:
+    sign(G) for AdamW gives full-size steps to elements whose mean is
+    noise-dominated (the 25.7M-entry embedding dominates |delta|), and
+    there is no random-direction control for the odd part's size. The
+    trunk/writer split was not run.
+- **Why the noise grew (telemetry, probes 14661 vs 14662):**
+  - grad/trunk 0.0136 -> 0.439 (x32), grad/combiner 0.0083 -> 0.242 (x29);
+  - log_sigma pool |g| x22, reader x105;
+  - advantage rms unchanged (0.403 -> 0.398), sigma unchanged (0.0999),
+    noise read ratio unchanged (0.061);
+  - `channel/score_token_belief_grad_ratio` = 32 at step 40. Pre-registered
+    limit: 3. It is exactly 0 at W_mu = 0.
+  - The score surrogate's belief gradient is coef * (eps/sigma) W^T, so it
+    grows with |W|/sigma. Through the replay graph it also reaches the
+    heads, via earlier positions' z = W rms(h) + sigma eps. That matches
+    a common ~30x factor in every actor group while the advantages stay
+    fixed.
+  - So the fresh probe measured the `none` estimator (the score term is
+    zero there), and the step-40 probe is dominated by the score term. Not
+    yet split per parameter: job 14674 probes the same step-40 state
+    with `--channel-trunk-credit none`. Same prompts, seeds and frozen
+    policy, so its pools pair with 14662's first 12; the difference is
+    the score term's contribution.
+- Lower sigma makes this worse, not better: the score's variance scales
+  as 1/sigma^2 while its mean does not.
+- **Job 14674 result (step-40 state, `--channel-trunk-credit none`, K=12).**
+  Pool rewards match 14662's to within 0.006, so the pools pair.
+  - Without the score term the writer's estimator is clean: W_mu SNR
+    0.87, split-half 0.85, Muon leave-one-out 0.33; R SNR 0.62; log_sigma
+    SNR 2.35.
+  - Its direction shrinks W_mu (cos(mean, W) +0.193±0.004) and R
+    (+0.152±0.004), and lowers sigma. The token-path estimator "knows"
+    that W40 hurts, as the scale curve does.
+  - The paired difference (the score term's part of the writer gradient)
+    has no resolvable signal: W_mu SNR −0.003, and noise energy 0.057
+    against the clean signal energy 1.1e-4, about 500x.
+  - grad/trunk 0.0187 without against 0.438 with, so the score term is
+    about 99.8% of the trunk's gradient energy.
+  - Reading: the run's random walk and its loss of accuracy came from the
+    score term's noise burying a coherent restoring signal. The trunk's
+    write credit was never delivered as signal, so G3 says nothing about
+    whether trunk write credit helps.
+- **Where the missing signal is (CPU, from G1's fine-sweep collects,
+  29 pools x 1024 trajectories, shared token keys between base and +/-s).**
+  - The latent changes the return only by flipping a sampled token. With
+    no flip, G(+s) = G(-s) = G0 exactly. At s 0.1, 57% of trajectories
+    flip under neither sign, yet every one of their ~250 slots x 64
+    coordinates still adds full score variance (k/sigma^2 per slot).
+  - Flips happen at intrinsic near-tie positions. The first divergence
+    under +0.05 and +0.14 is at the same slot 65% of the time; under +0.1
+    and -0.1 it is the same only 8% of the time (each sign tips a
+    different tie). Median first divergence is slot 129 (p10 33, p90 351),
+    about 2/3 of the length.
+  - A flip acts like a partial resample of the outcome:
+    E[dG^2 | flip] = 0.23 at s 0.1, against a within-prompt return
+    variance of 0.19, with mean dG | flip = -0.046. So the flip's expected
+    effect is about 1% of its variance.
+  - Flips hurt on average at every scale (-0.023, -0.046, -0.079 at
+    0.05/0.1/0.14). The return gradient on sigma is negative wherever
+    noise can flip a token and about zero where it cannot. Return-only
+    policy gradient lowers sigma exactly where exploration is
+    informative; a fixed entropy budget would move noise toward
+    confident positions, where it carries no signal. Matches sigma's
+    measured descent direction (SNR 0.71 fresh, 2.35 at step 40).
+
+### TD(0) latent coefficient (`--channel-trunk-credit td0`): pre-registration (2026-10-23)
+
+- **Change.** The latent's score term now uses the critic's one-step
+  advantage r_t + c(s_{t+1}) − c(s_t) in place of G − c(s_t). It is
+  computed as (G_t − c_t) − (G_{t+1} − c_{t+1}) at consumed latents. The
+  token path is unchanged. Own schema tail `_trunk_td0/v1`. CPU oracle
+  test built from `temporal_difference_residuals` over dense rewards and
+  scattered critic values.
+- **New telemetry:**
+  - `channel/score_coefficient_rms` against `channel/return_coefficient_rms`
+    (the G − c it replaced, on the same slots);
+  - `channel/critic_mean_noise_read_ratio`, the critic reader R_c's
+    content/exploration read split.
+- **What it is in expectation.** With terminal-only reward the
+  coefficient never contains R: it is c(s_{t+1}) − c(s_t). Only
+  c(s_{t+1}) sees eps_t, through R_c, so the expected gradient is the
+  critic's z-slope times dmu/dh. That is DPG in expectation: unbiased
+  only as far as the critic's slope is z's causal effect.
+- **A bias `score` did not have (red-team, existence high confidence,
+  size unknown).**
+  - R_c reads z = mu(h) + sigma eps, mostly mu (G3's actor
+    mean/noise read ratio reached 4.84).
+  - The critic can fit R_c as a view of the actor's state, so the slope
+    measures how value covaries with mu(h), not what the draw does.
+  - That is persistent across steps, so it accumulates at ~lr·t. It is
+    the memory DPG writer's failure (credit-head R² = shuffled control,
+    bench 0.76 → 0.58).
+  - G3's R_c rms grew linearly, 0.002 per 10 steps. That fits a coherent
+    fit, real or confounded, and cannot tell them apart.
+- **My earlier "ratio 30 → 5" claim was weak.** It is the step-40
+  coefficient rms ratio 0.071/0.414 applied to G3's belief ratio.
+  - At ratio 5 the latent term is still ~96% of the trunk's
+    belief-gradient energy. A dominant zero-mean term random-walks the
+    trunk as it did at 30; only well below 1 changes the dynamics.
+  - The eps-correlated part of the coefficient should grow with R_c, so
+    0.071 need not hold.
+- **Jobs.**
+  - Paired gradient probe at G3's step-40 snapshot, K = 12, which pairs
+    with 14662's first 12 pools and 14674 (`none`).
+  - Then the drill: G3's argv plus `--channel-trunk-credit td0`, run name
+    `mac_sampled_baseline_latent_channel_tctd0_drill_20261022`.
+- **Predictions (the red-team's probabilities and mine; the uncertainty
+  unit is G3's pre-registered ±0.010 null band, not a measured SE).**
+  - P1, probe: td0 score/token ratio in [2, 10] 55%; below 1 10%.
+    (score: 28-35 over the same pools.)
+  - P1b, probe: the td0-minus-none difference has W_mu SNR resolvably
+    nonzero 35%. Even if so, the probe cannot say whether that direction
+    is causal or the confound; only the bench can.
+  - P2, drill: bench below 0.45 by step 80 (collapse) 50%.
+  - P3, drill: no benefit, the bench holding at the cot/step-0 level
+    (0.596-0.70), 35%.
+  - P4, drill: beats the matched cot data (0.621/0.649/0.676/0.696 at
+    steps 20-80) by more than 2 SE, 10% or less.
+  - P5, drill: the latent gets ignored while the bench holds (W_mu or
+    mean-read ratio down more than 50%, or sigma up) 15-20%. That would
+    be cot again, not a success.
+  - P6, drill: R_c keeps growing linearly, the critic read ratio tracks
+    the actor's (content-dominated), and the bench falls. Read that as
+    the confound, not noise, about 30%.
+- **Falsification.** P4 needs the bench above cot at matched steps on
+  two consecutive evals and the latent in use (mean-read ratio not
+  falling). Anything else is not evidence for the TD(0) coefficient.
+- **Probe result (job 14678, step-40 state, td0, K = 12).** Pool rewards
+  match 14674 (`none`) to within 0.008, so the pools pair.
+  - Score/token belief ratio 5.65 (score 28-35 on the same pools): P1's
+    [2, 10] branch. Coefficient rms 0.070 against 0.398.
+  - grad/trunk 0.075, against 0.019 (`none`) and 0.438 (`score`). The
+    latent term is still about 94% of the trunk's gradient energy.
+  - Writer, paired td0 − none, i.e. the td0 term itself:
+    - W_mu noise/pool 1.8e-3 against score's 5.6e-2, about 31x less.
+      That is about 16x the `none` arm's clean signal energy (1.1e-4);
+      score's was about 500x.
+    - SNR +0.0065, split-half cos +0.04, below the K = 12 floor (0.091).
+      No resolvable direction (P1b: unresolved at this K). It cannot be
+      called signal, confound or zero.
+    - The whole td0 writer gradient has W_mu SNR 0.041, against `none`'s
+      0.87 (score's is lower still).
+  - Reading: td0 removes most of the score term's noise, as its
+    coefficient variance predicts. It does not make the latent term a
+    minority of the gradient at either the trunk or the writer. Whether
+    the ~20x better per-step SNR than score changes the drill's outcome
+    is open; the drill (14679) tests it.
+- **Drill result (job 14679, session 1; bench-stop floor at step 80).**
+
+  | step | td0   | score (G3) | cot   |
+  |------|-------|------------|-------|
+  | 0    | 0.596 | 0.596      | 0.596 |
+  | 20   | 0.638 | 0.600      | 0.621 |
+  | 40   | 0.593 | 0.458      | 0.649 |
+  | 60   | 0.480 | 0.205      | 0.676 |
+  | 80   | 0.403 | 0.059      | 0.696 |
+
+  - P2 (collapse below 0.45 by step 80) holds. td0 collapsed more slowly
+    than score.
+  - The score/token belief ratio rose from 1.9 to 7.6 as W_mu grew
+    (score 10 → 34). grad/trunk went 0.029 → 0.136 (score 0.13 → 0.26-0.45).
+  - **What did not change between the arms:**
+    - W_mu rms: 0.0021 / 0.0065 / 0.0108 at steps 10/40/80 (score
+      0.0018 / 0.0062 / 0.0122);
+    - the actor's mean/noise read ratio: 0.80 / 2.47 / 4.01 (score
+      0.70 / 2.49 / 4.15);
+    - the critic reader rms: 0.0128 against 0.0153 at step 80;
+    - sigma stayed at 0.0996-0.1.
+  - The critic read ratio tracked the actor's (3.77 at step 80).
+- **Where the collapse is: the mean read, not the trunk.** G3's
+  zero-read benches, already on record: the trunk with the read off
+  scored 0.621 at step 40 and 0.625 at step 60, against 0.456 and 0.205
+  as trained. The trunk lagged cot by only ~0.03-0.05. So the job-14674
+  reading needs narrowing: the score term's noise did the damage
+  through W_mu's random walk, not through the trunk's.
+- **Why td0 did not slow W_mu (CPU, from both arms' snapshots).**
+  - I first wrote that W_mu growing equally fast under 31x less noise
+    showed the score term was not driving it. That ignored Muon's scale
+    invariance: W_mu's step norm is fixed whatever the gradient's size,
+    and its direction is set by the coherent part's share.
+  - That share is still small under td0: the td0 term is ~16x the clean
+    signal energy at the writer, and the total writer SNR is 0.041.
+  - The two arms' W_mu are nearly orthogonal: cos 0.18 / 0.07 / 0.05 /
+    0.05 at steps 20-80. So no shared deterministic driver.
+  - W_mu's spectrum is flat: the top singular direction holds 3% of the
+    energy, as Muon steps of noise give.
+  - Per 20-step window |dW| is 0.78-0.98 against the coherent bound
+    lr·√64·20 ≈ 1.16. Muon momentum (beta 0.95, ~20-step memory) makes
+    noise locally coherent.
+  - Adjacent windows have cos 0.28-0.60, with a radial part
+    cos(dW, W) 0.2-0.4. Momentum carry-over explains part of that; I
+    have not separated it.
+  - The growing random mean read then costs accuracy faster than
+    quadratically (the step-40 scale benches).
+  - Not tested: whether a writer gradient whose coherent part dominates
+    would grow W_mu at all. The `none` probe's direction at step 40
+    shrinks W_mu (cos(mean, W) +0.19).
+- Zero-read benches on td0's step-60 and step-80 snapshots: jobs 14680
+  and 14681.
+- **td0 zero-read benches (jobs 14680, 14681).** The trunk with the read
+  off:
+
+  | step | zero read | as trained | cot   | G3 zero read |
+  |------|-----------|------------|-------|--------------|
+  | 60   | 0.638     | 0.480      | 0.676 | 0.625        |
+  | 80   | 0.648     | 0.403      | 0.696 | --           |
+
+  - Same split as G3: the read costs 0.16-0.25, and the trunk lags cot
+    by 0.04-0.05.
+  - The trunk still improved over the base (0.596). The td0-vs-score
+    trunk difference at step 60 (+0.013) is about one null band and is
+    not claimed.
+
+### Latent channel option 1: td0q with an exploration-read critic (pre-registration, 2026-10-23)
+
+- **What changes** (worktree `memory-write-sigma-eps-20261022`; flags
+  `--channel-trunk-credit td0q --channel-critic-read exploration`):
+  - The trunk's latent score coefficient is c(s_{t+1}) − Q(s_t, a_t),
+    the critic's one-step advantage of the draw z_t given the token a_t
+    (td0 used c(s_{t+1}) − c(s_t), which also carries the token's own
+    advantage).
+  - The critic's channel reader sees only sigma·eps_t, not mu(h_t) +
+    sigma·eps_t, and its Q heads no longer project the actor's belief
+    h_{t+1} (which depends on the full z_t). So the critic's dependence
+    on the draw is identified by randomization and cannot be a view of
+    the actor's state.
+  - Everything else is the G3 drill's argv; the run is
+    `mac_sampled_baseline_latent_channel_tctd0q_crexploration_drill_20261022`.
+- **Measure:** bench against cot's 0.596/0.621/0.649/0.676/0.696/0.714/
+  0.729/0.739/0.75 at steps 0-160, the zero-read split if it falls, and
+  W_mu's norm and per-window displacement from snapshots.
+- **Prediction, with honest odds.**
+  - The reasoning against it: under Muon, W_mu's step size is fixed, so
+    what matters is the coherent share of its gradient. td0's writer SNR
+    was 0.041. td0q removes the token advantage from the coefficient,
+    which I expect to cut its variance by a few times, not the ~25x
+    needed for the coherent part to dominate. The exploration critic's
+    reader also starts at zero, so early coefficients are TD error that
+    is unrelated to the draw.
+  - Collapse like td0 (bench-stop floor before step 120): ~50%.
+  - Survives but below cot by more than the null band: ~25%.
+  - Within the band of cot, the latent effectively unused: ~20%.
+  - Beats cot by more than the band: ~5%.
+  - I am not confident in these numbers. The critic-read change is
+    untested on the GPU, and its effect on the writer's noise is not
+    measured.
+- **Contrast predictions (added 2026-10-23, before job 14689 starts).**
+  The odds above are for one arm only, so they cannot test the model
+  behind them. My model is that W_mu's collapse is a Muon random walk
+  driven by the score term's variance. The arms it ranks differently:
+
+  | arm | collapse | W_mu if it fails | beats cot |
+  |---|---|---|---|
+  | td0q, exploration read (14689) | ~50% | random walk: flat spectrum, low cross-window cos | ~5% |
+  | option 2, pathwise z-slope | ~30% | coherent drift: low rank, high cross-window cos, aligned with the critic slope | ~8% |
+  | `none` (control, not a candidate) | ~20% | -- | ~3%; most likely ties cot, latent unused |
+
+  - `none` is the sharpest test of the model and costs no code. It has
+    the writer's clean pathwise term (probe SNR 0.87, direction shrinks
+    W_mu) and no score variance.
+  - If `none` also collapses, variance is not the cause. Then option 2,
+    whose case is variance reduction, should not be built yet.
+  - If `none` survives and td0q collapses, the model holds. Option 2's
+    remaining risk is the critic slope's bias, which the W_mu signature
+    in the table separates from noise.
+- **Job 14689 (td0q, exploration read), session 1.**
+  - Bench: 0.596 / 0.635 / 0.620 / 0.542 / 0.454 at steps 0-80.
+    td0 was 0.596 / 0.638 / 0.593 / 0.480 / 0.403.
+  - It hit the 0.55 bench-stop floor at step 80. That is "collapse" by
+    the pre-registered definition, but the stop came early. Session 2
+    (job 14692) resumes with a 0.30 floor to see whether the fall levels
+    off.
+  - The pre-registered mechanism was wrong in a checked way. The
+    coefficient ratio score/return is 0.19, td0's is 0.18, so the Q
+    baseline did not shrink the coefficient. Its noise is the critic's
+    one-step TD error, not the token advantage.
+  - W_mu's RMS and the mean-read ratio match across all three arms to
+    about 10% (0.0035-0.0039, 0.0063-0.0066, 0.0088-0.0091,
+    0.0107-0.0122 at steps 21/41/61/80).
+  - Their benches at step 80 differ widely: score 0.059, td0 0.403,
+    td0q 0.454.
+  - So under Muon the read's size is set by the optimizer, and the
+    estimator decides only its direction. My "less variance, slower
+    growth" picture predicted the opposite. I do not yet know why
+    same-size reads harm so differently.
+  - `none` should then grow W_mu at the same rate too, which makes it a
+    direction-quality control at matched norm.
+- **Job 14692 (td0q session 2, floor 0.30):** bench 0.391 / 0.307 /
+  0.172 at steps 100/120/140, falling steadily. So td0q collapses; it is
+  only slower than score (0.059 by step 80), like td0. The session ended
+  at step 140 (see the job log for the reason).
+- **Correction to the sim's interim reading.** The sim agent assumed a
+  fresh Muon lr of 3e-3. The real value is fresh_muon_learning_rate
+  7.25e-3 (checkpoint param group: lr 0.00725, wd 0, mu 0.95; W_mu is
+  64x512, so no rectangular scale).
+  - Scaled to 7.25e-3, its synthetic trajectories give per-entry RMS at
+    step 80 of about 0.0266 for a fixed gradient and 0.0140 for iid
+    noise.
+  - The GPU's 0.0107-0.0122 is therefore below the iid-noise rate, not
+    at the coherent bound.
+
+### Latent channel: a proxy that reproduces the collapse, and the mechanism it shows (2026-10-23)
+
+- **Proxy (v2).** Built by a subagent:
+  `postraining/sim_latent_channel_credit.py` in worktree
+  `memory-write-sigma-eps-20261022`; runs in
+  `postraining/runs/sim_latent_channel_credit_20261023/`.
+  - A tiny pretrained LM (128-d, 2 layers, k = 16, sigma 0.1) on
+    running-sum traces: base 0.598, about 83 latent writes per episode.
+  - It uses the GPU's optimizer split: fresh Muon 7.25e-3, trunk Muon
+    4.83e-5. It also uses the GPU's bench contract: eps = 0, so step 0
+    is bitwise cot.
+  - About 6 minutes per run on the CPU, 2 seeds.
+- **Why the first proxy (v1) could not show the failure:**
+  - it used the wrong fresh lr (3e-3 instead of 7.25e-3);
+  - its benches read the latent noise;
+  - it had a 6-step horizon and a trunk trained alongside the latent,
+    whose W_mu reached RMS 3-4.6 without harm.
+  - The horizon result below suggests 6 slots cost only about 11%.
+    That is inferred; E5 tests it.
+- **What v2 reproduces:**
+  - Score collapses (s80 about .07-.24 across reruns); cot rises
+    (.632); `none` holds (.641-.674).
+  - Zeroing the read recovers score (.60).
+  - |W_mu| is matched across arms.
+  - F8: at a matched read, td0's W harms about 4x less than score's.
+- **Fidelity gaps:**
+  - The proxy's critic is nearly flat (held-out EV .01-.14, against
+    the GPU's .25-.38). So its td0 credit is about 0.05x the clean
+    signal energy, against the GPU's 16x, and td0 survives instead of
+    decaying.
+  - Calibrating the critic to interior coefficient-RMS ratio .18 and EV
+    of about .3 is in progress. It gates any proxy test of option 2.
+- **Mechanism (measured in the proxy unless marked).**
+  1. Muon's polar factor gives every arm the same |W_mu| growth rate.
+     With Adam on W_mu, the same estimator walks about 3x slower and
+     the collapse is delayed, though not avoided.
+  2. With score credit, W_mu's direction is uninformed. A random W
+     with the same read magnitude does the same harm: .143 vs score's
+     .127/.240.
+  3. The increments are sum c_t eps_t x_t^T, with x the trunk features
+     rms(h). So the walk loads the features' high-variance directions
+     (top-16 energy .52 vs random .125) and gives about 1.7x the read
+     per |W|. At matched norm this hides as "score's direction is
+     worse". At matched read it is just a bigger random read.
+  4. The token-path gradient pushes W out of those directions
+     (cos(token grad, W) +.07 -> +.22). Where credit noise does not
+     outvote it about 7:1 (`none`, and the proxy's near-silent td0), W
+     ends in trunk-tolerated directions. At equal read, that W costs
+     about 4x less.
+  5. Harm: log success falls about linearly with the number of read
+     slots, at about 2% per slot for a random-direction read at score's
+     magnitude. That is an independent per-token hazard, not
+     super-linear compounding (5 window points).
+  6. Inferred for the GPU: td0's 16x credit noise also outvotes the
+     steering, which fits equal read ratios there and td0's slower
+     collapse.
+- **Failed predictions:**
+  - The restoring force slowing |W| growth: cos(step, W) is dominated
+    by momentum.
+  - The harm being a common-mode offset: centring removes only 15-30%.
+- **Open:**
+  - The steps are anti-persistent below both iid and h-shaped Muon
+    walks; cause unknown (candidate: the reader co-walking).
+  - The noise ratio at the writer that is tolerable: an E1
+    dose-response is running.
+  - Whether the latent's true gradient (the score mean) differs from
+    none's.
+
+### Latent channel: where credit leaks, what failed in the proxy, and the literature (2026-10-23)
+
+- **The score term reaches the writer one hop back (code fact).**
+  - `score_leaf.grad` is added to `emit_gradient`, then
+    `emit_beliefs.backward` runs through the replay. In the replay,
+    z_{t-1} = W_mu x_{t-1} + sigma eps is live.
+  - So W_mu, R and log sigma take latent t's likelihood-ratio credit
+    through the write at t-1. The term is proportional to W.detach(),
+    so it is zero at W = 0 and grows with the read.
+  - `score_surrogate`'s docstring ("only the trunk takes this term")
+    describes the function, not the system.
+- **Option 2 (pathwise / Stein critic slope) collapses in the proxy.**
+  - Bench at s80: none .682, score .440, pathwise .372, stein .25 .162,
+    stein 1 .110.
+  - The learned slope reader U is uninformed (slope_corr at the shuffled
+    null) but keeps growing.
+  - Its split-half of .999 holds by construction, since it is
+    deterministic given the state. So it is not evidence of signal.
+  - U persists across checkpoints: cos(U_s20, U_s40) about .6,
+    cos(U_s40, U_s80) about .4.
+  - Inside V, the learned reader puts the walking slope into td0. Its
+    debiased mean tracks pathwise.
+  - This is the Optimizer Facts failure: a slowly fitted, uninformed
+    critic used as a direct gradient moves W at the coherent rate.
+- **What a useful latent is worth (privileged running-sum latent).**
+  - Setup: the environment feeds the true running sum's digits through
+    the channel through a learned code E, trained by teacher-forced CE.
+  - It is a lower bound on the channel's value, not the best latent.
+  - Oracle vs control: .887 vs .644 at step 500, and .974 vs .920 at
+    step 3000. Cutting its read at evaluation gives .318.
+  - The control kept climbing because the base was undertrained. Bases
+    are now trained to a plateau (base search spooled).
+- **Arm (c), compatible natural actor-critic with spectral denoising:
+  shelved after red-team.**
+  - Momentum already does the pooling it offered.
+  - The noise frame is anisotropic, which gives false spikes.
+  - Its trunk credit is a fitted critic slope again.
+  - With N-hat = 0 it reduces to the token-path writer.
+- **Literature surveys (three agents, two passes each).**
+  - Coverage: about 150 papers touched and about 30 read in full or in
+    part. The rest are from abstracts or snippets. I did not verify the
+    papers myself.
+  - Taken as references, not as limits.
+  - No reported case of RL alone creating useful latent content from a
+    fresh writer without backprop through generated history.
+    - RL-only successes start from a pretrained recurrent substrate
+      (Ouro/RLTT) or from vocabulary-anchored soft tokens (2509.19170).
+    - Five of six latent-RL methods read in detail credit the latent by
+      likelihood ratio.
+    - SWITCH (2606.13106) runs its latents under no_grad, so they get
+      credit only through the KV cache.
+  - 2609.33169 (transformer policy, differentiable simulator):
+    representation credit is essential, while state-to-state credit can
+    be decayed (gamma .8) at no cost. One paper, smooth dense reward.
+  - TD on gradients:
+    - Tosatto ICML 2022 (2202.02396): a gradient critic learned by TD,
+      with a lambda blend; small lambda did best.
+    - Sobolev RL (2511.19165): Bellman-gradient targets through known
+      dynamics; evidence is a toy and Ant at equal final return.
+    - DNI and Czarnecki 2017: synthetic gradients can converge to wrong
+      critical points.
+    - 2606.21525 (one seed): a critic-gradient bootstrap fails at short
+      segments.
+  - PIPPS (1902.01240) and IVW-H (2604.18161): long pathwise chains go
+    chaotic, and estimators of the same quantity should be combined by
+    inverse variance across depths.
+  - Exact cheap RTRL exists only for diagonal or elementwise recurrences
+    (2605.24709, 2602.18131).
+  - LRT (2609.01117): learns recurrent content with backprop through
+    only its final cycle, under supervised answer CE (54.1 vs CoT 35.0).
+- **Red-team of the synthesis.**
+  - The one-hop credit is not exact dJ/dz. It is the exact derivative of
+    a surrogate built from the critic, so it carries the critic's noise.
+  - Competing explanation for "none learns no content": a coupled
+    reader/writer saddle rather than missing chain credit.
+    - At init, z is a linear readout of h_t, which later positions mostly
+      reach through attention already.
+    - So R gets little gradient until W carries something, and W gets
+      little until R reads it.
+  - Inverse-variance weighting measures variance, not bias, so a biased
+    low-variance gradient critic would win the weight. That is the slope
+    reader again.
+- **Discriminating tests spooled in the proxy (pre-registered there):**
+  - exact BPTT (sequential slot replay) vs none, with cos(BPTT, one-hop)
+    measured at content-bearing writers, not only near W = 0;
+  - the per-hop gain |dz_{t+1}/dz_t|;
+  - a writer-only oracle (privileged trunk and reader frozen, W_mu
+    trained from zero) and its mirror (privileged writer, fresh R);
+  - running-sum probe R^2 from h_t vs from z_t;
+  - the writer gradient's per-batch SNR vs its cos with BPTT.
+  - First CPU smoke at s40, not evidence: cos(BPTT, one-hop) .98 and
+    energy ratio 1.04. That is expected while |W_mu| is small, since
+    every path beyond one hop passes through W_mu.
+- **Next: exact BPTT without a sequential replay (design, 2026-10-23).**
+  The user accepts exact BPTT if it is fast. The rollout is a fixed point
+  of the parallel replay: z_out = W_mu rms(h(z_in)) + sigma eps,
+  shifted one slot, equals z_in.
+  - So the writer's adjoint solves lambda = g + J^T lambda, where g is
+    the one-hop dL/dz_in and J^T lambda is one activation-only VJP of
+    z_out -> z_in through the retained replay graph.
+  - J is strictly lower-triangular in time. Neumann iteration from
+    lambda_0 = g is therefore exact for every path of at most k hops
+    after k iterations, and exact BPTT at the longest chain.
+  - Cost: one forward, K activation-only backwards and one full
+    backward, all parallel over time. Its speed depends on how fast the
+    residual |lambda_{k+1} - lambda_k| falls at content-bearing writers.
+    The proxy measures that before any GPU code.
+  - Inference, from the td0q run's timings (pool 26 s: collect 14-16 s,
+    update about 12 s): each hop costs a fraction of the update. Not
+    measured.
+  - Real-trainer risks:
+    - the replay is bucketed and chunked (`--replay-max-trajectories`,
+      slot budgets), so the retained graph must span a whole
+      trajectory's slots;
+    - torch.compile must support repeated `autograd.grad` with
+      `retain_graph`;
+    - memory grows with retained activations.
+- **Inverse-variance combination (design).** The adjoint pathwise
+  gradient is low-variance, biased only by critic error. The score term
+  is unbiased and very noisy. Both estimate the gradient of expected
+  return through the latent mean.
+  - Combine them per tensor with w = var_score / (var_path +
+    var_score), using variances from per-group contributions.
+  - Because the score estimator is unbiased, the pooled mean of
+    (g_path - g_score) tests the pathwise bias directly. Weighting alone
+    cannot see bias, so this test is needed.
+- **Proxy batch 1 (lm_base t8_w1, the undertrained base; one seed,
+  bench SE about .008).**
+  - Bench s0-s80:
+    - bptt .615/.649/.651/.672/.677;
+    - none .615/.652/.661/.673/.673;
+    - cot .615/.632/.648/.667/.675.
+    - All within 1 SE at s80.
+    - Sequential BPTT costs 4.6x none's wall-clock.
+  - Gradient probes at s20/40/80, on both runs: cos(BPTT mean, one-hop
+    mean) .991-.997; energy ratio .98-1.04; per-pool cos .98-.99; equal
+    split-half and SNR (.07-.15).
+  - So the multi-hop share of the writer gradient is about 1-4%, and
+    training under BPTT did not move the state to where the chain
+    matters.
+  - This does not show that chain credit is unimportant. Three
+    confounds:
+    - "bptt" is the exact gradient of the REINFORCE token surrogate,
+      A times log pi of the sampled tokens, with per-pool SNR about .1.
+      It is not a clean dJ/dz.
+    - 80 steps at trunk lr 4.8e-5 barely move anything (cot .615 to
+      .675).
+    - The oracle's gain was measured under teacher-forced CE at lr
+      1e-3, where it appeared by step 250.
+  - Next: the same exact vs one-hop vs control comparison under the
+    oracle's CE setup (clean signal, no privileged input), and RL for
+    600 steps.
+  - Content: the oracle-fed trunk's final rms(h) predicts the
+    running-sum digits at held-out R^2 .24. The fed code itself reaches
+    .71, and the shuffled nulls are about 0.
+    - A linear writer from the final layer therefore has little
+      running-sum content to copy, even when the trunk is given it.
+    - Hypothesis (unverified): the final layer is shaped for the
+      unembedding.
+    - Next: per-layer, MLP-hidden and nonlinear probes to locate the
+      content, then a writer-source arm that keeps the read at the
+      input of t+1.
+- **Proxy batch 2 (one seed, bench SE about .008).**
+  - Chain probes at RL states (W rms .008-.020):
+    - cos(exact, one-hop) .993-.997.
+    - |J| mean 1.05-1.55, max up to 6.4.
+    - Adjoint increments .11-.17 at hop 1 and .01-.03 at hop 2. J is
+      nilpotent, so gains above 1 still die out.
+  - Chain probes at the oracle analogue (lstsq writer; it benches .24,
+    so it is not content-bearing):
+    - cos .92 and |J| 1.85.
+    - 29 hops to 1e-6.
+    - The exact gradient's per-pool SNR is .25, against one-hop's .51.
+  - Content: R^2(x) .16 and R^2(z) .04-.05 throughout the none and
+    bptt runs.
+  - Writer-only oracle (oracle trunk and reader frozen, W from 0, RL),
+    bench s0-s80:
+    - none .314/.365/.435/.401/.388;
+    - bptt .314/.210/.345/.375/.386.
+  - Mirror (oracle writer frozen, reader from 0): .314/.470/.648/.817/
+    .921.
+  - So credit trains a reader for an informative writer, but cannot
+    find a writer from rms(h_final), even when the reader is ready and
+    the credit is exact. That fits the write-source hypothesis.
+    - Caveat: the frozen oracle trunk never had to compute the sum, so
+      its x lacks it by construction.
+  - Adjoint (exact BPTT from the parallel replay) at s80: k0 .679, k1
+    .694, k2 .685, k4 .676, against none .673 and bptt .677. All are
+    within about 2 SE.
+    - k0 needs about 4 hops to 1e-3.
+    - Per-step cost: k0 .109 s, none .116 s, sequential bptt .752 s.
+      So in the proxy the adjoint gives exact BPTT at one-hop cost.
+  - Built next: a depth-summary writer, W times cat_l rms(r_l) for l =
+    0..L.
+    - r_0 is the input stream including the latent read, so the writer
+      can express a linear accumulator z_t = A z_{t-1} + B e(token).
+      That is exactly where chain credit should matter.
+    - Queued as job 14719: the clean-signal CE test (oracle setup;
+      control, final and depth writers, each with one-hop and exact
+      credit) and RL600 (cot, final none/adjoint, depth none/adjoint).
+- **p150 clean-signal CE test (oracle setup, 1000 steps, one seed;
+  mean bench over 625-1000, read-cut in brackets).**
+  - Bench: control .806; final one-hop .834 (.813); final exact .832
+    (.767); depth one-hop .862 (.178); depth exact .793 (.174). Without
+    its .561 dip, depth exact is .870.
+  - Between benches the arms swing .05-.09, so no difference is
+    separable with one seed.
+  - The depth writer makes the model depend on the latent (read-cut
+    .02-.08 at step 1000). But R^2(z) for the running sum is only .07,
+    and the copy map's spectral radius is .13, so it is not an
+    accumulator.
+  - Exact and one-hop credit agree: cos .975-.997.
+- **Confound found after p150 (my reading of the code; the proxy agent is
+  checking).**
+  - (1) Every result so far used t8_w1, whose SumTask has
+    write_every = 1. That is the token-sufficient task: every partial
+    sum is written in tokens, so a latent can add compute but no
+    information. Equal benches, R^2(z) near 0 and no accumulator are
+    then expected, whatever the credit.
+  - (2) `oracle_running_sum` includes a term as soon as its PLUS is
+    emitted, so the oracle hands the model the sum it is about to
+    write. Its .97 is the value of being given each step's arithmetic.
+    It leaks, and it is not a lower bound on what a self-computed
+    latent could reach. I was wrong to describe it as one.
+  - The tests are being re-run on a token-insufficient base (w >= 2),
+    against an honest oracle that gives the sum through the last
+    completed term, with a swap test (another episode's latent) for
+    the depth arms.
+- **Both confounds confirmed by the proxy agent from the code.**
+  - lm_base.pt is a legacy bare state dict, so it loads as SumTask
+    write_every = 1.
+  - The oracle reads s_{i-1} + a_i at the PLUS, before a_i's digits are
+    consumed.
+  - Every w1 result therefore carries the caveat: batches 1-2, p150,
+    RL600, and ivw.
+  - RL600 on w1 (mean bench s400-600): cot .759; final none .748, final
+    adjoint .751; depth none .725, depth adjoint .746. R^2(z) .04-.06.
+    Null, as the confound predicts.
+  - ivw on w1: path weight .9997, no detectable bias, so ivw is the
+    same as adjoint here.
+  - Next: w2/w3 bases (search running), honest and leaking oracles
+    trained in lockstep, and a swap test; then CE and RL600 on the
+    chosen base.
+- **Correction to "confound (1)" (user, 2026-10-23).** I framed the latent's
+  value as information missing from the tokens. That is wrong.
+  - Text is low bandwidth: about 16 bits per token, against 64 floats.
+  - Text cannot pass depth: it re-enters at the embedding, while z_t hands
+    step t's whole computation to t+1.
+  - Text cannot carry intermediate state or uncertainty.
+  - So w1 is not uninformative. While the trace copies a_i's digits, a
+    latent can carry a partially computed s_{i-1} + a_i across those
+    slots, which is extra depth.
+  - The leaking oracle is then the ceiling for exactly that use: the
+    result of the step's computation, delivered early. It is an upper
+    bound on compute-carry value, not a lower bound on the channel.
+  - The w1 nulls are still nulls: no arm found that use. They are not
+    explained away by the task.
+  - w >= 2 adds a second use, silent state, on top. It does not replace
+    w1.
+- **Program red-team (CPU checks on the proxy's artefacts, 2026-10-23).**
+  - t10_w2 is not depth-limited.
+    - t6_w2 went from .07-.21 at 8k to .92 at 20k. t10_w2's .074 is an
+      8k cosine schedule decaying just before the transition.
+    - Its errors are near-miss arithmetic: 364/400 wrong with correct
+      operands.
+    - So oracle ceilings on it measure grokking speed, with the oracles
+      acting as a curriculum.
+  - The depth writer's reliance is a token-identity shortcut.
+    - On the p150 depth states, z is explained at R^2 .92-.94 by ridge
+      on one-hots of the current token, the previous token and the
+      position (the previous token alone gives .60).
+    - Swap and mean-replacement benches fall to .04-.14 (final writer
+      .78-.80).
+    - The r_0 block carries the previous token through z. Depth sources
+      must exclude r_0.
+  - One-hop credit gives the trunk no gradient for what it writes, since
+    the sources are recorded. Exact credit adds that write gradient as
+    well as the chain, so the comparison conflates them. Adjoint k1 (one
+    hop, live sources) separates them.
+  - The linear one-hot content probe is insensitive: the control trunk
+    scores .17 while writing correct sums 80% of the time.
+  - Fidelity:
+    - The GPU model has KDA recurrent state in 6 of 8 layers, a native
+      per-layer carrier across tokens. The latent's unique role there is
+      the top-to-bottom loop: depth.
+    - So a proxy task is valid only if it is depth-limited at
+      convergence.
+  - Next: a depth ladder. No-latent 2L/3L/4L bases, trained to flat, on
+    depth-heavy tasks, scored by held-out CE on the EQ and answer
+    digits. Then 2L + latent under CE with exact credit, reported as its
+    recovery of the 2L to 4L gap.
+    - Also a writer over [rms(h), one-hot oracle digits] with R and the
+      trunk free, to separate source from coupling saddle.
+- **First-order analysis at W = 0 (mine and the mechanism agent's
+  derivation; test 0 pending).**
+  - grad_W = R0^T E[g_{t+1} s_t^T], and grad_R and the producer's
+    gradient through z are 0 at init.
+  - The greedy direction is a hint toward the next input, matching the
+    shortcut above. Carrying computed content needs producer, writer and
+    consumer to move together: a higher-order saddle.
+  - Candidate structural fixes, to be tested on the ladder task with
+    clean CE: an additive integrator (a = 1), a gated integrator, a
+    small recurrent latent cell z_t = f(z_{t-1}, src_t), and a rotation
+    integrator. All with sigma = 0 on the state.
+  - Held back pending red-team: a self-predictive auxiliary loss. With
+    InfoNCE across episodes, it can be solved by episode identity.
+- **GPU port plan (Plan agent; costs inferred from verified prior
+  measurements).**
+  - Depth writer: nine 512->64 maps summed per decode tick, with no
+    extra pass. Store z (256 B per slot) instead of hiddens. Schema v2;
+    v1 checkpoints cannot be resumed.
+  - Adjoint:
+    - One fresh hop was measured at +42% update time (NOTES 14954), so
+      K = 4 takes the pool step from about 26 s to about 37-39 s.
+    - A retained compiled second backward was wrong before: cos .70 in
+      job 14414, while eager agreed to 0.15%.
+    - Verify first: compiled vs eager J^T lambda parity on one recorded
+      shard of the v1 channel.
+  - If an integrator wins, exact credit along its own z -> z recurrence
+    is a cheap reverse scan, and the trunk can keep one-hop credit.
+  - No port until a proxy arm shows a real gain.
+- **Corrected swap test, and the final_exact characterization (p195; one
+  seed; benches are mean +- SE over 4 fresh sets of 1024x4).**
+  - The old swap test rolled by one row inside groups of 4 samples per
+    prompt, so 3 of every 4 rows read a latent from their own prompt.
+    Every earlier swap number is invalid. It is fixed: the shift is now
+    one prompt group.
+  - With the fixed swap, the oracle ceilings show swap about equal to
+    read-cut, so their lift comes from each row's own content.
+  - p150 w1 final writer (exact / one-hop):
+    - normal .871 / .816;
+    - read-cut .839 / .798;
+    - swap .547 / .752;
+    - swap - cut -.292 / -.046 (paired difference -.246 +- .0065).
+  - Content:
+    - The token/previous-token/position ridge explains z at R^2 .845
+      (exact) and .835 (one-hop).
+    - Residual-z probes for the sum being computed, the partial state,
+      the carry and the upcoming written sum come out equal for the two
+      arms (MLP .14-.35, linear about 0).
+    - The MLP residual may still be nonlinear identity structure.
+  - Slots: for exact, swapping only the operand-digit slots costs .097;
+    swapping everywhere else costs .289.
+  - Reading (inference):
+    - Exact credit made the trunk trust a mostly token-identity latent
+      more.
+    - A foreign latent then contradicts the real tokens, which is worse
+      than no latent. A missing one costs only .03.
+    - It is reliance on redundant content, not compute carried by the
+      channel.
+  - w1 is not depth-limited at this scale, so this says nothing about
+    the depth use. The depth ladder decides that.
+
+## 2026-10-23 — Latent-channel proxy: clean CE, ceilings, collapse diagnosis (sim)
+
+Proxy: `postraining/sim_latent_channel_credit.py` (worktree
+`memory-write-sigma-eps-20261022`). TinyLM beds; one seed per arm. Bench = sampled
+accuracy over 1024 prompts × 4 samples; the control's own bench drifts ±.01 run to
+run. Recovery ("rec") = (arm − control) / (L4 bench .991 − control at step 0) on the
+late mean of the last two benches. Each output is under
+`postraining/runs/sim_latent_channel_credit_20261023/` at the path given.
+
+### Measured
+
+**p210, memoryless CE, t10_w2** (`v5_ce/t10w2/ce_t10w2_memoryless`)
+- Arms: final/depth_delta × onehop/live1/exact.
+- The control's bench is .068-.070, and every arm is within ±.001 of it.
+- The gate tripped at step 1200 on a digit-CE rise of .0108.
+- Null.
+
+**p209, cell CE, t10_w2** (`v5_ce/t10w2/ce_t10w2_cells`)
+- Arms: additive/gated/gru × final/depth_delta, all with exact credit.
+- Recovery is ±.001, and read-cut and swap equal the arms' own bench.
+- Null.
+- The bed has headroom that a channel can use. In **p208** (`v5_ce/t10w2/ce_t10w2_oracle_features`; AdamW, base 2e-4, channel 2e-3, 1200 steps), the oracle-feature CE arm `opartial_final_exact` (W_mu reads the belief plus one-hot digits of the partial running sum) went .069 → .959 (rec +.964; read-cut .073, swap .074). `odigit_final_exact` (honest-sum digits) stayed at .069.
+- So on t10_w2 the null is in what the self-computed writers learn, not in a missing headroom. The clean-CE work moved to `v4_ladder2/lm_ladder2_t12_w4_L2` (L2 .652, L4 .960) to get a bed whose base already does the task partly, with the L2→L4 gap as the recovery target.
+
+**p221-p223, control lr screens on L2, warmup 200**
+- At 1e-4 the control collapses. At 5e-5 it dips .042 once. At 2e-5 it is stable: bench .624-.640, digit CE .0938 → .0896.
+
+**p225, clean CE on L2 at lr 2e-4: VOID**
+- The gate fired at step 750: the control's bench fell .634 → .441 and its digit CE rose +.107.
+- The base lr was unstable on this bed. No arm result is interpretable.
+
+**p226, oracle ceiling on L2: base 2e-5, channel 2e-3 (AdamW), warmup 200, sigma 0, 2000 steps** (`v7_clean_ce/t12w4_L2/ceiling_lr2e-5_ch2e-3_sig0`)
+- Partial oracle: .691 and .714 at steps 1750 and 2000, against the control's .644 and .650. That is a late mean of +.056, about 16% of the L2→L4 gap.
+- Leaking oracle: .695 and .677. Honest oracle: equal to the control.
+- Partial at step 2000: read-cut .462, swap .455. The arm depends on its code.
+- The ceiling is still rising at 2000 steps.
+- (p224, the ceiling at a single lr of 2e-4: partial adds nothing.)
+
+**p227, clean CE on L2: base 2e-5, channel AdamW 2e-3, warmup 200, sigma 0, 2000 steps** (`v7_clean_ce/t12w4_L2/clean_ce_lr2e-5`)
+- The control is stable, .621-.640.
+- Every channel arm except res_final_exact collapsed suddenly. Late bench .01-.37, held-out digit CE .20-1.21 against the control's .088.
+- res_final_exact: .639 (rec +.002; cut .599, swap .547).
+- Before collapsing, no arm beat the control.
+
+**p233, the p227 reproduction with 10-step telemetry** (`…/clean_ce_lr2e-5_collapse_diag`)
+- Event steps:
+
+  | Arm | Event step |
+  |---|---|
+  | depth_delta onehop | 280 |
+  | depth_delta live1 | 340 |
+  | depth_delta exact | 510 |
+  | final onehop | 1530 |
+  | final live1 | 1580 |
+  | final exact | 1850 (p227: 1250) |
+  | res_depth_delta | 1580 |
+  | res_final_exact | 300, small and recovered |
+
+- Timing is not reproducible at a fixed seed, which points to GPU nondeterminism.
+- Each arm has exactly one event, and it never recurs.
+- Sequence. The logged loss is the pre-update loss.
+  1. W and R step norms climb 2-5x over 20-60 steps, with the reader's step leading W's at about 1.5-2x.
+  2. In the row just before the spike, the update is already 2-11x its baseline while CE is still normal (gap ≤ .04).
+  3. The CE spike follows within ≤10 steps: loss +.45 to +.81, digit CE +5.7 to +11 nats.
+  4. W rms jumps (about 2x) only in the spike interval.
+- Adam |m̂|/√v̂ on W is .02-.08 at steady state, .18-.70 one interval before the spike and .51-1.01 at it. At the spike, |dW|_F is .08-.12, close to AdamW's per-step cap lr·√(k·d) = .09.
+- Loop gain J = dz_out/dz_in (geomean per hop) is .01-.03 for plain sources and .06-.12 for res_ sources before every event, and .18-.66 after. It is never near 1.
+- res_final_exact's step-300 event was the smallest of the eight (gap +.086), and the arm recovered to .642.
+
+**p234, as p227 but Muon 7.25e-3 on W and R** (base still AdamW 2e-5; `…/clean_ce_lr2e-5_muon7.25e-3`)
+- No sudden collapse, but chronic damage. Every channel arm drops at the first bench to .28-.57, then oscillates ±.1, with a late mean of .35-.56 against the control's .639.
+- Training digit CE is +.014 to +.09 above the control in every window, and held-out digit CE agrees (.10-.25).
+- Loop gain stays ≤ .22.
+- |dW|_F and |dR|_F are a constant .029, i.e. lr·√k.
+- R rms falls .081 → .015-.022.
+
+**p237, as p234 but Muon 3e-3** (`…/clean_ce_lr2e-5_muon3e-3`)
+- The lr is chosen so that the reader's relative step matches the GPU's (see Inferred).
+- Stable: after step 400 the maximum loss gap is ≤ +.016.
+- Late bench against the control's .642:
+  - final onehop/live1/exact: .621/.635/.620
+  - depth_delta onehop/live1/exact: .640/.648/.645
+  - res_final_exact: .646
+  - res_depth_delta_exact: .639
+- Recovery ranges from −.06 to +.016. Credit (onehop/live1/exact) makes no difference within a source.
+- Held-out digit CE is .078-.086 against .089, a small teacher-forced gain with no sampled gain.
+- Read-cut is .565-.589 and swap .489-.509, so swap − cut ≈ −.08: a wrong episode's latent hurts more than no latent.
+- Content probes at step 2000:
+  - Task content (honest/partial running sum) R² is .002-.026; the shuffled control is −.001.
+  - Identity (next-token embedding) R² is .29-.37 for plain sources and .09-.10 for res_ sources.
+  - p234 has the same pattern.
+- Restoring cosines:
+  - R's gradient: cos(−∇R, −R) is about +.02 early and about 0 late.
+  - R's Muon step: cos(ΔR, −R) is +.17 to +.23 over steps 0-300, +.04 to +.09 over 700-1100, and about 0 by 1900. Over that span R falls .082 → .045-.049.
+  - W's gradient: +.05 to +.09 early, falling to about 0.
+- Loop gain is ≤ .22.
+
+**p213, exact trunk split, RL, lm_base, PCA init, sigma .1, 300 steps** (`v7_trunk_split/rl600_base`)
+- Latent share of each trunk tensor's gradient (mean over steps):
+  - block0: .026-.043
+  - block1 qkv/fc/proj/out: .04/.10-.11/.14/.29
+  - embed: .02
+  - head: 0
+- Latent-part coherence |Σu|/n is .051-.070, against 1/√300 = .058. Token-part coherence is .075-.19.
+- Displacement along the accumulated latent direction is .001-.013. For comparison: the coherent bound is .164, the random-walk bound .0095, and token-direction displacement .03-.04 (total |Δθ| .056-.082).
+- Bench: none .723, live1 .706, adjoint .726, with no cot arm in this run.
+
+### GPU relative step (measured from snapshots)
+- Source: `mac_sampled_baseline_latent_channel{,_tctd0,_tctd0q_crexploration}_drill_20261022`, steps 20-140, k = 64, d = 512, Muon 7.25e-3.
+- The reader's rms is .094-.097 at every snapshot, essentially its PCA init. Its per-element step is lr/√512 = 3.2e-4, so it moves about 0.33% per step.
+- W grows from 0 (.003 at step 20 → .011-.012 at step 80), so its relative step has no stationary value to match.
+
+### Inferred (not tested)
+- **The AdamW collapse is an optimizer event in the channel, not a forward write→read instability.** The update grows first, then CE spikes, and the loop gain stays below 1 throughout. Directional consistency builds over about 10-20 steps, and Adam then takes steps near its cap. It looks like an edge-of-stability event; it is not a slow coherent bias.
+- **Muon 7.25e-3 is not the faithful proxy lr.** It moves R about 0.8% per step at init, and 3-4% once R has shrunk, against the GPU's 0.33%. Muon 3e-3 matches the GPU at init. The fixed-norm jitter at 7.25e-3 fits p234's oscillating bench, but that explanation is not proven.
+- **Read less.** In clean CE the reader's momentum-averaged step is restoring early, the same sign as the GPU's none probe, and fades to zero once R has shrunk by about 40%. The per-step gradient is nearly orthogonal to R (cos ≈ .02).
+- **Content.** At the faithful lr and 2000 steps, exact CE finds no non-identity content, and exact is no better than onehop. That null is weak: the partial ceiling recovered only about 16% of the gap and was still rising.
+- **Not consistency evidence.** W rms growth, on the GPU or in the proxy, is not evidence of consistent drift: Muon with momentum .95 grows rms near-linearly under iid noise.
+
+### Pending
+- p235 and p236: Muon 2e-3 and 7.25e-4 screens.
+- p238: clean CE at Muon 3e-3 for 6000 steps. Arms: control, final_exact, depth_delta_exact, res_depth_delta_exact, depth_delta_onehop. Benches and content probes every 1500 steps; the bench gate is loosened to .05, and the digit-CE gate stays at .01.
+- p239: the p226 ceiling recipe at 6000 steps (channel AdamW).
+- p238 also carries `opartial_final_exact`, an optimizer-matched partial ceiling (channel Muon 3e-3) that shares p238's control. Comparing it with p239 shows how much the ceiling depends on the optimizer. It is a different ceiling from p226/p239's oracle code table: the writer gets oracle partial-sum digits and must learn to write them.
+- Then the RL runs p230 (sigma-0 trunk split on L2) and p228 (adjoint k=16). p229 (k=4) is dropped.
+- Caveats on the CE base: it uses AdamW 2e-5, while the GPU's trunk uses Muon. The p226/p239 ceiling's channel uses AdamW, while p237/p238 use Muon.
+
+## 2026-10-28 — Continuous thought (hidden-state carry) on the token LM: null vs pause
+
+Protocol and full results:
+`.worktrees/latent-jepa-20261024/docs/latent_thought_carry_protocol_20261027.md`
+(amended 2026-10-28 before any run). Report:
+`postraining/runs/ljepa_thought_analysis_v1_20261028/report.md`.
+
+**Runs.** Each arm continues the 90k BPE token parent for 20k steps on the
+same corpus:
+- `none`: 0 slots (job 15330);
+- `pause`: 8 slots, mixed sampling (half K=8, half uniform 0..7; job 15329);
+- `carry`: the same slots, each reading C·h_prev and trained by
+  backpropagation through the chain (job 15328).
+
+The evaluation (job 15331) decides one 4,608-prompt dev panel greedily
+under bf16.
+
+**Result: no sign that the latent chain computes anything.**
+- Carry beats pause at K=8 by +0.13 pp [-0.52, +0.78], and their K-curves
+  are identical.
+- K=8 ablations: `foreign` (another prompt's clean chain) -0.56 pp, `mean`
+  chain -1.24 pp. The chain's content is prompt-independent.
+- `zero` gives -17.8 pp. This shows only that the model sits off
+  distribution without the carry term, since ‖C h‖ ≈ 12 x ‖embed(slot)‖.
+- Successive-slot cosine reaches 0.976 by slot 7: the chain converges to a
+  near fixed point.
+
+**The strong token baseline stays ahead.** `none` scores 40.06% at K=0;
+pause and carry at K=8 are 1.1-1.3 pp below it. Slots also took 14% of the
+DeepMind episodes per step, which is a likely contributor (inferred, not
+tested).
+
+**Next.** A pre-registered positive control: iterated permutation lookup
+(`build_iterate_corpus.py`, `data/datasets/latent_iterate_v1`), trained from
+scratch, to decide whether the mechanism can learn iterative content at
+this scale.
+
+## 2026-10-29 — Latent-JEPA RL Q critic: pure-Q warmup (15421) and stein target (15431), both negative
+
+Setup: the latent arm (think8, clipped score-function actor, MaxRL with a
+BackboneQ baseline Q = c + u . eps, `--q-credit action_value`). Control: the
+winning default, 15412 (about 0.25 dev deterministic accuracy). Every run
+uses the same plan prefix and seed and is single-pass.
+
+**15421 — return target, 720 s critic-only warmup (6827 updates), then joint.**
+Fact: the held-out action R^2 stayed negative through the warmup. The best
+dev deterministic accuracy was 0.139 (step 500), against about 0.25 for
+15412. The run plateaued at 4500 (0.115); sealed accuracy was 0.065. Mean
+reward on hard prompts at step 500: 15412 0.071, 15421 0.027.
+
+**Gate 15426 — `q_credit_probe` on 15421's transition.pt (sha cbda28b9...).**
+Fact: the replay and the Stein identity check out (mean z^2 1.007, slope
+1.16 +- 0.24). Var(G) is 0.0080 against an action-R^2 ceiling of
+0.0045 +- 0.0005. cos(u, u*) is -0.002 +- 0.004 and |u|^2 is 70x |u*|^2.
+The action_value actor gradient has cos -0.006 +- 0.066 with the return
+gradient, at a batch SNR of 4.6. The level term w(c - m) has zero expected
+actor gradient, so action_value credit was noise, not a biased signal.
+The small capacity heads were fit on 1.6k prompts and were negative. That
+is data-limited and does **not** rule out a representation problem.
+
+**15431 — stein target, pre-registered transition gate (commit 8f89cce,
+branch q-stein-target-20261028).** The critic regresses (G - c)^2 +
+|u - d|^2, where d = dG/d eps is the exact causal adjoint. In expectation
+this matches the return target's gradient and fixed point. It does not
+take the same optimizer step. The gate is enforced in code: over the last
+1000 warmup updates, the mean gain 2u.d - |u|^2 must be > 2 SE and the
+first-thought cos(u, u*) must be > 0.1.
+- Fact: stein updates cost more, so 720 s gave **1424** updates (vs 6827)
+  on 91,136 unique prompts. The replay residual stayed about 2.8e-4 sigma.
+- Fact: the **gate failed on both criteria**: gain -1.78e-4 (z = -44),
+  first-thought cos 0.024 (u.u* 1.19e-6; |u|^2 6.7e-5; |u*|^2 3.7e-5). It
+  exited with no joint phase.
+- Fact, trend over the warmup: |u|^2 grew steadily (3.8e-5 at update 200,
+  3.4e-4 at 1200). u.d stayed near zero, so the gain was about -|u|^2
+  throughout. cos_lower stayed at 0.015-0.03, and the per-sample E|d|^2
+  (about 1.2e-3) is about 30x the first thought's |u*|^2. Both the think
+  and answer regions match. Compared with 15426, u is no longer 70x
+  overscaled, but it is still unaligned.
+- Hypothesis, untested: the action signal is about 3% of d's per-sample
+  energy. On fresh single-pass batches, the normalized optimizer steps
+  random-walk u's norm faster than its aligned component grows. The cause
+  could be weight noise from per-batch d noise, or a backbone that cannot
+  represent u* well enough to generalize to new prompts. This run does not
+  separate optimization from representation. A lower-noise target removed
+  the 70x miscalibration but did not produce alignment within 1424 updates.
+
+Conclusion: under this recipe, neither the return target nor the stein
+target gives a Q critic whose action term transfers to fresh prompts.
+action_value credit should not go into the joint phase. 15412 remains the
+default.
+
+## 2026-10-29 — Latent-JEPA RL: no-critic control, thought necessity, sigma estimator, q control-variate bug, KL tails
+
+All runs use the 15412 recipe (latent arm, think 8, 64x16, MaxRL with exact decoder marginal, NorMuon, actor-lr 1e-5, std-lr 3e-4, initial std 0.1, plan prefix 768000 / seed 0, seed 0). Every job had a hard limit of 30m or less.
+
+**15438, no-critic MaxRL with group baseline.** PARTIAL: killed by the 30m limit at iteration 12191, with latest.pt at 12000 and no sealed bench. Dev det best 0.2550 at 10500, 0.2595 at 12000. Paired per-prompt comparison against 15412 at matched steps 500–6000: about −1 pp det at 9 of 12 benches. Those CIs are panel-only; training-trajectory variance is unmeasured, so this does not attribute anything to the critic.
+
+**Necessity v2 (15445)**, on the parent, 15412@7500 and 15438@12000, dev 256/module, 8 samples, CRN, Holm:
+- The parent is hurt by thought slots it never trained with: no_think +9.1 pp det. The parent's no-think det is 21.0, so the RL gain over the parent's native layout is +3.1 (15412) / +4.9 (15438) det, not +14.
+- For the RL checkpoints: foreign thoughts −2.9 / −3.6, constant panel_mean −1.5 / −1.6, token_swap −0.8 / −1.4, no_think −2.1 / −5.5. residual_swap (−4.0 / −5.5) is confounded, likely off-manifold.
+- Slots 0/1 decode to a single constant token; slots 3–6 carry the per-slot effect.
+- sigma ×0.5 gives +0.4 sampled and sigma ×2 gives −1.5 to −2.4; pass@8 is flat in both directions.
+- These are sanity checks only, not computation evidence.
+
+**Sigma probe (15446)**, std-head gradient at fixed weights, 256 unseen plan batches in 16 blocks:
+- The score estimator (as trained) resolves nothing at any checkpoint; implied per-batch SNR is about 1e-5. Sigma was an Adam random walk in every run so far.
+- The exact pathwise estimator (N c_i (d/sigma)·eps·∂sigma, d from action_derivatives) has about 540x lower second moment. At the parent it resolves: bias block SNR 0.10 ± 0.03 and W 0.17 ± 0.02, direction down. At 15412 it is unresolved; at 15438 it is weak and down.
+- The /128 on W is muP-style and not the constraint.
+
+**15482, sigma-only pathwise (`--std-estimator pathwise`)**, otherwise 15438's command. PARTIAL: killed by the 20m limit at iteration 1893, latest.pt at 1500. The cost of d is 0.2–0.55 s/iter.
+- Sigma moved coherently: component std 0.0968 vs 0.0998, state log-std spread 0.0045 vs 0.00015 (30x). That is still only about 3% of sigma in 1.9k steps at std-lr 3e-4.
+- Paired det vs 15438: +1.8 [+1.1, +2.6] at 500, +0.8 [−0.1, +1.6] at 1000, −0.6 [−1.4, +0.2] at 1500. These are panel-only CIs; with sigma barely moved, the early gap is more plausibly trajectory divergence than a sigma effect. No accuracy conclusion.
+
+**Bug: q control-variate double weighting**, fixed in q-stein-target-20261028 72c37fa.
+- Since af612b4, `--baseline q --q-credit control_variate --objective maxrl` used A = w (w (G − m) − b).
+- Affected: only perf_ljepa_20261029/run_q (MLQ 15440 profile). Its gradients are ~10x and its advantage std is 3.67 vs 0.434. 15412's source was correct; group and action_value runs are unaffected.
+- Replay 15465 of the fixed source matches 15412 bitwise at step 1.
+
+**KL tails (15438)**: exact replays (15481) of steps 1/23/65/110/145; step 1 is bitwise exact.
+- The per-action KL tail (24–45) comes from one prompt's rows per step, at the first answer latent. The mean moves 7–9.5 sigma (about 0.9 latent units, roughly 10% of the inter-prototype distance) on rows with large |N a_i|.
+- About 2/3 of the move is the predictor route and 1/3 the encoder route. There is no rare-embedding-row Adam spike and no abnormal state norm.
+- Reading: an intended prompt-level answer move, made large in KL by the small fixed sigma, not a numeric pathology. Whether it helps is unmeasured.
+- Step 697 cannot be replayed exactly: the replay diverges after about 200 steps (kernel nondeterminism), and at 697 the replay showed KL max 6.2 vs 225.
+
+**User constraint, 2026-10-29: no BPTT of any kind across latent thinking steps.**
+- The constraint retires the sigma-pathwise std estimator (`--std-estimator pathwise`, 15482) and the stein Q target, because both use the `action_derivatives` causal adjoint.
+- 15482 ended at its 20m limit (iteration 1893, latest.pt at 1500). Its artifacts are retained but it is not promoted. 15484 was cancelled before it started.
+- Paired deterministic accuracy vs 15438 (pp, CI): +1.8 [+1.1, +2.6] at 500, +0.8 [−0.1, +1.6] at 1000, −0.6 [−1.4, +0.2] at 1500. Sigma moved only 0.1 → 0.0968, so these differences are not attributable to sigma.
+- Learning paths must use detached sampled trajectories with local likelihood gradients.
+
+**Sampling-only sigma variance reduction: no proposal survives the existing measurements.**
+- A factorized scalar log-sigma gain is pooled exactly like 15446's score 'direction' statistic, which measured +0.20, +0.38 and −0.10 SE over 256 batches (null).
+- A return-trained Q control variate gains about 1/(1−ρ²) ≈ 1. Held-out action R² beyond the state term is −0.02 to −0.11 in every Q run.
+- ∇_sigma J points down (pathwise eval −2.5/−3.9 SE; sigma×0.5 gives +0.4 pp), so a better estimator would reduce exploration.
+- Decision: no sigma run. More state-dependent exploration would need an objective change, which is the user's call.
