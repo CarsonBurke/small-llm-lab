@@ -125,14 +125,15 @@ MUON_MOMENTUM_WARMUP_STEPS = 500
 IGNORE_INDEX = -100
 
 
-def register_special_tokens(backbone, tokenizer) -> None:
+def register_special_tokens(backbone, tokenizer, *, preserved_ids=()) -> None:
     """Prepare the padded-vocab slack rows for the registered special tokens.
 
     The rows already exist (pretraining pads 50257 -> 50304), but their
     READOUT rows were anti-trained: never a CE target, they only ever
     appeared in the softmax denominator, so pretraining pushed their logits
     toward the softcap floor. Zeroing each registered readout row restarts
-    it neutral. The embedding rows keep their pretraining init — inputs are
+    it neutral; rows already trained by a prior SFT stage are preserved.
+    The embedding rows keep their pretraining init — inputs are
     RMS-normalized immediately, so any full-rank init is a fine starting
     type embedding for the SFT gradient to shape.
     """
@@ -155,7 +156,23 @@ def register_special_tokens(backbone, tokenizer) -> None:
         )
     with torch.no_grad():
         for token_id in special_ids:
-            backbone.proj.weight[token_id].zero_()
+            if token_id not in preserved_ids:
+                backbone.proj.weight[token_id].zero_()
+
+
+def pretrained_special_ids(payload: dict, tokenizer) -> tuple[int, ...]:
+    """Preserve fence rows that a prior SFT stage already trained."""
+    metadata = payload.get("sft", {})
+    args = metadata.get("args", {})
+    ids = []
+    if args.get("think_tokens"):
+        ids.extend((tokenizer.think_open_id, tokenizer.think_close_id))
+    if args.get("answer_fence"):
+        require_answer_fence_prompt_schema(
+            metadata, answer_fence=True, source="base SFT checkpoint"
+        )
+        ids.extend((tokenizer.answer_open_id, tokenizer.answer_close_id))
+    return tuple(token_id for token_id in ids if token_id is not None)
 
 
 def muon_momentum_at(step: int) -> float:
@@ -1135,6 +1152,18 @@ def create_fresh_run_dir(path: Path) -> None:
         ) from error
 
 
+def initialize_sft_logging(run_dir: Path, *, resume: bool, step: int):
+    """Reserve a fresh run before the event writer creates its directories."""
+    from torch.utils.tensorboard import SummaryWriter
+
+    if not resume:
+        create_fresh_run_dir(run_dir)
+        (run_dir / "metrics.jsonl").write_text("")
+    return SummaryWriter(
+        run_dir / "tensorboard", purge_step=step + 1 if resume else None
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", required=True)
@@ -1157,6 +1186,9 @@ def main() -> None:
     # interpolate module: that gap is memorisation of the trace set, not
     # reasoning. A single pass over a large corpus is the idiomatic setting.
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--skip-sampling-gate", action="store_true",
+                        help="omit the MATH sampling gate for a code-only corpus; "
+                             "held-out completion CE is still evaluated")
     # None = the checkpoint's own pretraining context. Packing past that
     # window makes the model attend at positions RoPE never saw.
     parser.add_argument("--seq-len", type=int, default=None)
@@ -1276,7 +1308,8 @@ def main() -> None:
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
 
-    backbone = load_model(args.checkpoint, device)
+    base_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    backbone = load_model(args.checkpoint, device, payload=base_payload)
     if not hasattr(backbone, "target_logprobs_from_features"):
         parser.error(
             f"{type(backbone).__name__} has no fused target readout; SFT "
@@ -1366,7 +1399,11 @@ def main() -> None:
         ),
     )
     if args.think_tokens:
-        register_special_tokens(backbone, tokenizer)
+        register_special_tokens(
+            backbone, tokenizer,
+            preserved_ids=pretrained_special_ids(base_payload, tokenizer),
+        )
+    del base_payload
 
     instruction_suffix = (
         INSTRUCTION_SUFFIX_ANSWER if args.answer_fence else INSTRUCTION_SUFFIX
@@ -1380,7 +1417,13 @@ def main() -> None:
     # short panel would change what its accuracy means between runs, so the
     # shortfall is an error the caller resolves by raising
     # --holdout-problems.
-    if len(panel) < args.gate_prompts:
+    if args.skip_sampling_gate and any(
+        document.get("gradeable", True) for document in documents
+    ):
+        raise ValueError(
+            "--skip-sampling-gate requires a code-only, non-MATH-gradeable corpus"
+        )
+    if not args.skip_sampling_gate and len(panel) < args.gate_prompts:
         raise ValueError(
             f"sampling gate needs {args.gate_prompts} gradeable held-out "
             f"problems but the split yielded {len(panel)} from "
@@ -1390,7 +1433,8 @@ def main() -> None:
     # Checked here, not only inside the gate: the gate runs after the whole
     # training pass, and an ungradeable panel must not cost a full epoch to
     # discover.
-    assert_gate_panel_fits(panel, tokenizer, args, instruction_suffix)
+    if not args.skip_sampling_gate:
+        assert_gate_panel_fits(panel, tokenizer, args, instruction_suffix)
     train_tokens = tokenize_documents(
         tokenizer, train_docs, args.seq_len, args.min_completion_tokens,
         instruction_suffix=instruction_suffix,
@@ -1497,10 +1541,20 @@ def main() -> None:
     loss_fn = SupervisedCE(backbone, compiled=True)
     backbone.train()
     started = time.perf_counter() - progress["elapsed_seconds"]
+    tensorboard = initialize_sft_logging(
+        run_dir, resume=args.resume, step=step
+    )
 
     def log(entry: dict) -> None:
         with metrics_path.open("a") as stream:
             stream.write(json.dumps(entry) + "\n")
+        for key, tag in (
+            ("train_loss", "sft/train_completion_ce"),
+            ("val_loss", "sft/holdout_completion_ce"),
+            ("lr_scale", "sft/lr_scale"),
+        ):
+            if key in entry:
+                tensorboard.add_scalar(tag, entry[key], entry["step"])
 
     last_val_ce: float | None = progress["last_val_ce"]
 
@@ -1544,6 +1598,7 @@ def main() -> None:
 
     def save_checkpoint() -> None:
         flush_train_entry()
+        tensorboard.flush()
         fsync_path(metrics_path)
         progress.update(
             elapsed_seconds=time.perf_counter() - started,
@@ -1582,9 +1637,7 @@ def main() -> None:
             raise SystemExit(EXIT_CHECKPOINTED)
 
     previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
-    if step == 0:
-        create_fresh_run_dir(run_dir)
-        metrics_path.write_text("")
+    if not args.resume:
         log_val(0)
         # Resumable from the first moment the run dir exists.
         save_checkpoint()
@@ -1690,16 +1743,21 @@ def main() -> None:
     )
     print(f"saved {checkpoint_path}")
 
-    gate, captured = run_sampling_gate(
-        backbone, tokenizer, panel, args, device,
-        instruction_suffix=instruction_suffix,
-    )
-    print(
-        f"sampling gate: accuracy {gate['accuracy']:.4f}, "
-        f"mixed prompts {gate['mixed_prompt_fraction']:.3f}, "
-        f"within-group reward std {gate['within_group_reward_std_mean']:.4f}",
-        flush=True,
-    )
+    if args.skip_sampling_gate:
+        gate = {"status": "skipped", "reason": "code-only corpus requires execution grading"}
+        captured = []
+        print("sampling gate skipped: code-only corpus requires execution grading", flush=True)
+    else:
+        gate, captured = run_sampling_gate(
+            backbone, tokenizer, panel, args, device,
+            instruction_suffix=instruction_suffix,
+        )
+        print(
+            f"sampling gate: accuracy {gate['accuracy']:.4f}, "
+            f"mixed prompts {gate['mixed_prompt_fraction']:.3f}, "
+            f"within-group reward std {gate['within_group_reward_std_mean']:.4f}",
+            flush=True,
+        )
     (run_dir / "gate_transcripts.json").write_text(
         json.dumps(captured, indent=2)
     )
@@ -1720,6 +1778,7 @@ def main() -> None:
         for key, value in gate.items()
         if isinstance(value, (int, float))
     }})
+    tensorboard.close()
 
 
 if __name__ == "__main__":

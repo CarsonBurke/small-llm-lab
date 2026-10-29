@@ -891,3 +891,38 @@ def test_resume_binds_every_training_path_module():
     hashes = resume_source_sha256()
     assert set(hashes) == set(sft_train.RESUME_BOUND_MODULES)
     assert all(len(digest) == 64 for digest in hashes.values())
+
+
+def test_prior_sft_fence_rows_are_preserved():
+    from types import SimpleNamespace
+    from postraining.math_prompt import ANSWER_FENCE_PROMPT_SCHEMA
+
+    tokenizer = SimpleNamespace(think_open_id=1, think_close_id=2,
+                                answer_open_id=3, answer_close_id=4)
+    backbone = SimpleNamespace(proj=torch.nn.Linear(2, 8, bias=False))
+    before = backbone.proj.weight.detach().clone()
+    payload = {'sft': {'args': {'think_tokens': True, 'answer_fence': True},
+                       'answer_fence_prompt_schema': ANSWER_FENCE_PROMPT_SCHEMA}}
+    ids = sft_train.pretrained_special_ids(payload, tokenizer)
+    sft_train.register_special_tokens(backbone, tokenizer, preserved_ids=ids)
+    torch.testing.assert_close(backbone.proj.weight, before)
+    payload['sft']['args']['answer_fence'] = False
+    ids = sft_train.pretrained_special_ids(payload, tokenizer)
+    sft_train.register_special_tokens(backbone, tokenizer, preserved_ids=ids)
+    torch.testing.assert_close(backbone.proj.weight[1:3], before[1:3])
+    assert torch.count_nonzero(backbone.proj.weight[3:5]) == 0
+
+
+def test_sft_logging_creates_fresh_run_before_writer_and_preserves_resume(tmp_path):
+    run = tmp_path / "run"
+    writer = sft_train.initialize_sft_logging(run, resume=False, step=0)
+    writer.add_scalar("sft/holdout_completion_ce", 1.5, 0)
+    writer.close()
+    assert list((run / "tensorboard").glob("events.*"))
+    metrics = run / "metrics.jsonl"
+    metrics.write_text('{"step": 2}\n')
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        sft_train.initialize_sft_logging(run, resume=False, step=0)
+    writer = sft_train.initialize_sft_logging(run, resume=True, step=2)
+    writer.close()
+    assert metrics.read_text() == '{"step": 2}\n'
